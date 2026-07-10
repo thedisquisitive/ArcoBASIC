@@ -1,0 +1,63 @@
+#DESCRIPTION "Interactive ArcoSH administrator tutorial"
+
+FUNCTION Section(title)
+    PRINT ""
+    PRINT Color.Cyan(Color.Bold(title))
+END FUNCTION
+
+FUNCTION Continue()
+    ignored = Tutorial.ReadLine("press Enter to continue ")
+END FUNCTION
+
+PRINT Color.Bold("ArcoSH sysadmin tutorial")
+PRINT "This tutorial is written in ArcoBASIC and runs inside ArcoSH."
+PRINT "You will practice commands that inspect the host, run tools, handle errors,"
+PRINT "write tiny admin scripts, and return safely to the shell."
+Continue()
+
+Section("1. Use ArcoBASIC at the prompt")
+PRINT "ArcoSH is both a shell and a BASIC runtime."
+PRINT "Type this command exactly:"
+ok = Tutorial.Step("PRINT \"hello admin\"", "arco")
+
+Section("2. Run host commands")
+PRINT "Bare commands run through the host shell, and RUN() captures output for scripts."
+PRINT "Type this bare shell command:"
+ok = Tutorial.Step("printf service-ok", "shell")
+
+Section("3. Capture command results")
+PRINT "A sysadmin script usually needs an exit code and captured output."
+PRINT "Type this ArcoBASIC statement:"
+ok = Tutorial.Step("result = RUN(\"printf captured\") : PRINT result.Output : PRINT result.ExitCode", "arco")
+
+Section("4. Inspect files")
+PRINT "File.Exists and File.Find are available to ArcoBASIC scripts."
+PRINT "Type this command:"
+ok = Tutorial.Step("PRINT File.Exists(\"readme.md\")", "arco")
+
+Section("5. Ask the host about itself")
+PRINT "Host helpers let scripts adapt to the machine they are managing."
+PRINT "Type this command:"
+ok = Tutorial.Step("PRINT Host.OSName()", "arco")
+Continue()
+
+Section("6. Handle failures")
+PRINT "Use TRY/CATCH when an admin script should report an error and continue."
+PRINT "Here is a complete recovery block running as ArcoBASIC:"
+ignored = Tutorial.Run("TRY\nPRINT missing_setting\nCATCH err\nPRINT \"caught: \" + err.Message\nEND TRY", "arco")
+Continue()
+
+Section("7. Build a quick line-numbered script")
+PRINT "Line-numbered programs are good for quick loops at the REPL."
+PRINT "This script prints a small counter and uses STOP to return to ArcoSH:"
+ignored = Tutorial.Run("10 x = 0\n20 PRINT x\n30 x += 1\n40 IF x >= 3 THEN STOP\n50 GOTO 20", "arco")
+Continue()
+
+Section("8. Know the escape hatches")
+PRINT "STOP ends the current ArcoBASIC program and returns to ArcoSH."
+PRINT "Exit(), ExitProgram(), and ExitTheProgram() terminate the arcosh process."
+PRINT "If you misspell a host command, fix the next command with: oops <correct-command>"
+PRINT "Use HELP run, HELP files, HELP host, HELP try, and HELP lines for reference."
+
+PRINT ""
+PRINT Color.Green("Tutorial complete. You have run ArcoBASIC, host commands, capture, files, host inspection, error handling, and line-numbered scripts.")

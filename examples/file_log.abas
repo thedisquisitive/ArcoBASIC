@@ -1,0 +1,6 @@
+#IMPORT "sysadmin"
+
+logPath = Args[0]
+SysAdmin.AppendLog(logPath, "example log entry")
+PRINT File.ReadText(logPath) CONTAINS "example log entry"
+

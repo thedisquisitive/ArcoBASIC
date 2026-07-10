@@ -1,0 +1,20 @@
+' ArcoBASIC file helpers for ArcoSH scripts
+#IMPORT "text"
+
+FUNCTION Files.ReadLines(path)
+    RETURN Text.Lines(File.ReadText(path))
+END FUNCTION
+
+FUNCTION Files.WriteLines(path, lines)
+    File.WriteText(path, Text.Join(lines, "\n"))
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION Files.AppendLine(path, line)
+    File.AppendText(path, line + "\n")
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION Files.EnsureDirectory(path)
+    RETURN Directory.Create(path)
+END FUNCTION

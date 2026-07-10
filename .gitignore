@@ -1,0 +1,11 @@
+build/
+dist/
+
+*.o
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+
+.DS_Store

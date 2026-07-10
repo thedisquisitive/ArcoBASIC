@@ -1,0 +1,21 @@
+' ArcoBASIC text helpers
+
+FUNCTION Text.IsBlank(text)
+    RETURN String.Trim(text) == ""
+END FUNCTION
+
+FUNCTION Text.HasPrefix(text, prefix)
+    RETURN String.StartsWith(text, prefix)
+END FUNCTION
+
+FUNCTION Text.HasSuffix(text, suffix)
+    RETURN String.EndsWith(text, suffix)
+END FUNCTION
+
+FUNCTION Text.Join(lines, delimiter = "\n")
+    RETURN Array.Join(lines, delimiter)
+END FUNCTION
+
+FUNCTION Text.Lines(text)
+    RETURN String.Lines(text)
+END FUNCTION

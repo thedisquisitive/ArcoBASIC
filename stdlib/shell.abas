@@ -1,0 +1,24 @@
+' ArcoSH command helpers
+
+FUNCTION Shell.Run(command)
+    RETURN RUN(command)
+END FUNCTION
+
+FUNCTION Shell.Ok(command)
+    result = RUN(command)
+    RETURN result.ExitCode == 0
+END FUNCTION
+
+FUNCTION Shell.Output(command)
+    result = RUN(command)
+    RETURN result.Output
+END FUNCTION
+
+FUNCTION Shell.Status(command)
+    result = RUN(command)
+    RETURN result.ExitCode
+END FUNCTION
+
+FUNCTION Shell.StartJob(command)
+    RETURN ArcoSH.StartJob(command)
+END FUNCTION

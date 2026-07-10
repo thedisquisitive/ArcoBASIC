@@ -1,0 +1,19 @@
+' ArcoSH sysadmin helpers
+#IMPORT "shell"
+#IMPORT "files"
+
+FUNCTION SysAdmin.CommandExists(name)
+    RETURN Shell.Ok("command -v " + name)
+END FUNCTION
+
+FUNCTION SysAdmin.ProcessExists(name)
+    RETURN Process.Exists(name)
+END FUNCTION
+
+FUNCTION SysAdmin.HostSummary()
+    RETURN Host.OSName() + " " + Host.Hostname()
+END FUNCTION
+
+FUNCTION SysAdmin.AppendLog(path, message)
+    RETURN Files.AppendLine(path, $"[{DATE()}] {message}")
+END FUNCTION

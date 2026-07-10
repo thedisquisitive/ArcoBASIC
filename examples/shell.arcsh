@@ -1,0 +1,23 @@
+#!/usr/bin/env arcosh
+
+PRINT "ArcoSH on " + Host.OSName()
+PRINT "Host " + Host.Hostname()
+PRINT Color.Cyan("colored output ready")
+
+IF File.Exists("readme.md") THEN
+    PRINT "readme.md found"
+END IF
+
+result = RUN("printf shell-test")
+PRINT result.Output
+PRINT "Exit " + result.ExitCode
+
+FOR proc IN Host.Processes()
+    PRINT "Process " + proc.Name
+NEXT proc
+
+FOR file IN File.Find("*.md")
+    IF file CONTAINS "readme" THEN
+        PRINT "Doc " + file
+    END IF
+NEXT file

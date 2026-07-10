@@ -1,0 +1,10 @@
+#IMPORT "sysadmin"
+
+PRINT "Host: " + SysAdmin.HostSummary()
+
+IF SysAdmin.CommandExists("printf") THEN
+    PRINT Shell.Output("printf command-ok")
+ELSE
+    PRINT "printf not found"
+END IF
+
