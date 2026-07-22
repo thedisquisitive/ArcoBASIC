@@ -1,4 +1,5 @@
 #include "arco/shell.hpp"
+#include "arco/gui.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -51,12 +53,31 @@ struct ShellJob {
 std::vector<ShellJob> g_jobs;
 int g_next_job_id = 1;
 
+void ignore_sigint() {
+#ifndef _WIN32
+    struct sigaction action {};
+    action.sa_handler = SIG_IGN;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, nullptr);
+#endif
+}
+
+void restore_default_sigint() {
+#ifndef _WIN32
+    struct sigaction action {};
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, nullptr);
+#endif
+}
+
 bool set_environment_variable(const std::string& name, const std::string& value);
 const std::map<std::string, std::string>& help_catalog();
 bool is_arcosh_script_extension(const std::filesystem::path& path);
 std::vector<std::filesystem::path> stdlib_search_directories();
 std::vector<std::string> split_shell_words(const std::string& text);
 std::optional<std::filesystem::path> executable_directory();
+std::optional<std::filesystem::path> executable_path();
 
 const std::map<std::string, std::string>& color_codes() {
     static const std::map<std::string, std::string> codes = {
@@ -92,6 +113,13 @@ std::string lowercase(std::string value) {
     return value;
 }
 
+std::string uppercase(std::string value) {
+    for (char& c : value) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
 std::string trim(const std::string& value) {
     const auto start = value.find_first_not_of(" \t\r\n");
     if (start == std::string::npos) {
@@ -101,6 +129,345 @@ std::string trim(const std::string& value) {
     return value.substr(start, end - start + 1);
 }
 
+std::string repeat_char(char c, std::size_t count) {
+    return std::string(count, c);
+}
+
+std::string pad_right(const std::string& text, std::size_t width) {
+    if (text.size() >= width) {
+        return text;
+    }
+    return text + repeat_char(' ', width - text.size());
+}
+
+std::vector<std::string> split_lines(const std::string& text) {
+    std::vector<std::string> lines;
+    std::istringstream input(text);
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        lines.push_back(line);
+    }
+    if (!text.empty() && text.back() == '\n') {
+        lines.emplace_back();
+    }
+    return lines;
+}
+
+std::vector<std::string> wrap_line(const std::string& line, std::size_t width) {
+    std::vector<std::string> wrapped;
+    if (width == 0) {
+        wrapped.push_back(line);
+        return wrapped;
+    }
+    std::string remaining = line;
+    while (remaining.size() > width) {
+        std::size_t split = remaining.rfind(' ', width);
+        if (split == std::string::npos || split == 0) {
+            split = width;
+        }
+        wrapped.push_back(remaining.substr(0, split));
+        remaining = trim(remaining.substr(split));
+    }
+    wrapped.push_back(remaining);
+    return wrapped;
+}
+
+std::vector<std::string> wrap_lines(const std::string& text, std::size_t width) {
+    std::vector<std::string> wrapped;
+    for (const auto& line : split_lines(text)) {
+        for (const auto& item : wrap_line(line, width)) {
+            wrapped.push_back(item);
+        }
+    }
+    if (wrapped.empty()) {
+        wrapped.emplace_back();
+    }
+    return wrapped;
+}
+
+struct TuiTheme {
+    std::string name;
+    char top_left = '+';
+    char top_right = '+';
+    char bottom_left = '+';
+    char bottom_right = '+';
+    char horizontal = '-';
+    char vertical = '|';
+    char fill = ' ';
+    std::string bullet = "*";
+};
+
+const std::map<std::string, TuiTheme>& tui_themes() {
+    static const std::map<std::string, TuiTheme> themes = {
+        {"ascii", {"ascii", '+', '+', '+', '+', '-', '|', ' ', "*"}},
+        {"terminal", {"terminal", '[', ']', '[', ']', '=', '|', ' ', ">"}},
+        {"double", {"double", '#', '#', '#', '#', '=', '#', ' ', "#"}},
+        {"scroll", {"scroll", '/', '\\', '\\', '/', '~', '|', ' ', "~"}},
+        {"parchment", {"parchment", '(', ')', '(', ')', '~', ':', '.', "~"}},
+        {"circuit", {"circuit", '<', '>', '<', '>', '=', '!', ' ', "+"}},
+        {"minimal", {"minimal", ' ', ' ', ' ', ' ', '-', '|', ' ', "-"}}
+    };
+    return themes;
+}
+
+const TuiTheme& tui_theme(const std::string& name) {
+    const std::string key = lowercase(trim(name));
+    const auto& themes = tui_themes();
+    const auto found = themes.find(key.empty() ? "ascii" : key);
+    if (found != themes.end()) {
+        return found->second;
+    }
+    return themes.at("ascii");
+}
+
+std::string tui_rule_with_theme(const std::string& title, std::size_t width, const TuiTheme& theme) {
+    const std::string clean_title = trim(title);
+    if (clean_title.empty()) {
+        return std::string(1, theme.top_left) + repeat_char(theme.horizontal, width) + std::string(1, theme.top_right);
+    }
+    const std::string label = " " + clean_title + " ";
+    if (label.size() >= width) {
+        return std::string(1, theme.top_left) + " " + clean_title + " " + std::string(1, theme.top_right);
+    }
+    const std::size_t left = (width - label.size()) / 2;
+    const std::size_t right = width - label.size() - left;
+    return std::string(1, theme.top_left) + repeat_char(theme.horizontal, left) + label + repeat_char(theme.horizontal, right) + std::string(1, theme.top_right);
+}
+
+std::string tui_rule(const std::string& title, std::size_t width = 72) {
+    return tui_rule_with_theme(title, width, tui_theme("ascii"));
+}
+
+std::string tui_box_with_theme(const std::string& title, const std::string& body, const TuiTheme& theme) {
+    std::vector<std::string> lines = split_lines(body);
+    if (lines.empty()) {
+        lines.emplace_back();
+    }
+
+    std::size_t width = std::max<std::size_t>(48, trim(title).size() + 6);
+    for (const auto& line : lines) {
+        width = std::max(width, line.size() + 2);
+    }
+    width = std::min<std::size_t>(width, 96);
+    lines = wrap_lines(body, width - 2);
+
+    std::ostringstream output;
+    output << tui_rule_with_theme(title, width, theme) << '\n';
+    for (const auto& line : lines) {
+        output << theme.vertical << " " << line << repeat_char(theme.fill, width - line.size() - 1) << theme.vertical << "\n";
+    }
+    output << theme.bottom_left << repeat_char(theme.horizontal, width) << theme.bottom_right << "\n";
+    return output.str();
+}
+
+std::string tui_box(const std::string& title, const std::string& body) {
+    return tui_box_with_theme(title, body, tui_theme("ascii"));
+}
+
+std::string tui_scroll(const std::string& title, const std::string& body) {
+    std::vector<std::string> lines = wrap_lines(body, 66);
+    std::size_t width = std::max<std::size_t>(48, trim(title).size() + 10);
+    for (const auto& line : lines) {
+        width = std::max(width, line.size() + 4);
+    }
+    width = std::min<std::size_t>(width, 78);
+    lines = wrap_lines(body, width - 4);
+
+    std::ostringstream output;
+    output << "  .-" << repeat_char('~', width - 4) << "-.\n";
+    output << " / " << pad_right(trim(title), width - 4) << " \\\n";
+    output << "( " << repeat_char('-', width - 4) << " )\n";
+    for (const auto& line : lines) {
+        output << "|  " << pad_right(line, width - 4) << "  |\n";
+    }
+    output << "( " << repeat_char('-', width - 4) << " )\n";
+    output << " \\_" << repeat_char('~', width - 4) << "_/\n";
+    return output.str();
+}
+
+std::string tui_badge(const std::string& state) {
+    return "[" + uppercase(trim(state)) + "]";
+}
+
+std::string tui_status(const std::string& label, const std::string& state, const std::string& detail) {
+    std::ostringstream output;
+    output << tui_badge(state) << " " << label;
+    if (!trim(detail).empty()) {
+        output << " - " << detail;
+    }
+    return output.str();
+}
+
+std::string tui_progress(const std::string& label, double current, double total, std::size_t width) {
+    if (total <= 0) {
+        total = 1;
+    }
+    if (width < 8) {
+        width = 8;
+    }
+    const double ratio = std::max(0.0, std::min(1.0, current / total));
+    const std::size_t filled = static_cast<std::size_t>(ratio * static_cast<double>(width));
+    const int percent = static_cast<int>(ratio * 100.0 + 0.5);
+    std::ostringstream output;
+    if (!trim(label).empty()) {
+        output << label << " ";
+    }
+    output << "[" << repeat_char('#', filled) << repeat_char('.', width - filled) << "] " << percent << "%";
+    return output.str();
+}
+
+std::string tui_list(const std::string& title, const Value::Array& items, bool numbered) {
+    std::ostringstream body;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i != 0) {
+            body << '\n';
+        }
+        if (numbered) {
+            body << (i + 1) << ". ";
+        } else {
+            body << "* ";
+        }
+        body << items[i].to_string();
+    }
+    return tui_box(title, body.str());
+}
+
+std::string tui_key_values(const std::string& title, const Value::Object& object) {
+    std::size_t key_width = 0;
+    for (const auto& [key, value] : object) {
+        (void)value;
+        key_width = std::max(key_width, key.size());
+    }
+    std::ostringstream body;
+    bool first = true;
+    for (const auto& [key, value] : object) {
+        if (!first) {
+            body << '\n';
+        }
+        first = false;
+        body << pad_right(key, key_width) << " : " << value.to_string();
+    }
+    return tui_box(title, body.str());
+}
+
+std::string table_cell(const Value& row, const std::string& header, std::size_t index) {
+    if (row.is_array()) {
+        const auto& array = row.as_array();
+        if (index < array.size()) {
+            return array[index].to_string();
+        }
+        return "";
+    }
+    if (row.is_object()) {
+        const auto& object = row.as_object();
+        const auto found = object.find(header);
+        if (found != object.end()) {
+            return found->second.to_string();
+        }
+        return "";
+    }
+    return index == 0 ? row.to_string() : "";
+}
+
+std::string tui_table(const Value::Array& headers, const Value::Array& rows) {
+    std::vector<std::string> names;
+    std::vector<std::size_t> widths;
+    for (const auto& header : headers) {
+        names.push_back(header.to_string());
+        widths.push_back(header.to_string().size());
+    }
+    for (const auto& row : rows) {
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            widths[i] = std::max(widths[i], table_cell(row, names[i], i).size());
+        }
+    }
+
+    auto border = [&]() {
+        std::ostringstream line;
+        line << '+';
+        for (const auto width : widths) {
+            line << repeat_char('-', width + 2) << '+';
+        }
+        return line.str();
+    };
+
+    std::ostringstream output;
+    output << border() << '\n';
+    output << '|';
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        output << ' ' << pad_right(names[i], widths[i]) << " |";
+    }
+    output << '\n' << border() << '\n';
+    for (const auto& row : rows) {
+        output << '|';
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            output << ' ' << pad_right(table_cell(row, names[i], i), widths[i]) << " |";
+        }
+        output << '\n';
+    }
+    output << border() << '\n';
+    return output.str();
+}
+
+Value tui_parse_event(const std::string& sequence) {
+    Value::Object event{{"Type", "unknown"}, {"Raw", sequence}};
+    if (sequence.empty()) {
+        event["Type"] = "eof";
+        return event;
+    }
+
+    // SGR extended mouse reporting: CSI < button ; column ; row M/m.
+    if (sequence.size() >= 7 && sequence.compare(0, 3, "\033[<") == 0 &&
+        (sequence.back() == 'M' || sequence.back() == 'm')) {
+        const std::string fields = sequence.substr(3, sequence.size() - 4);
+        const std::size_t first = fields.find(';');
+        const std::size_t second = first == std::string::npos ? first : fields.find(';', first + 1);
+        try {
+            if (first == std::string::npos || second == std::string::npos) {
+                return event;
+            }
+            const int code = std::stoi(fields.substr(0, first));
+            const int x = std::stoi(fields.substr(first + 1, second - first - 1));
+            const int y = std::stoi(fields.substr(second + 1));
+            const bool wheel = (code & 64) != 0;
+            const bool motion = (code & 32) != 0;
+            const int button_code = code & 3;
+            std::string button = "none";
+            if (wheel) {
+                button = button_code == 0 ? "wheel-up" : "wheel-down";
+            } else if (button_code == 0) {
+                button = "left";
+            } else if (button_code == 1) {
+                button = "middle";
+            } else if (button_code == 2) {
+                button = "right";
+            }
+            event = Value::Object{
+                {"Type", "mouse"}, {"Action", wheel ? "scroll" : (sequence.back() == 'm' ? "release" : (motion ? "drag" : "press"))},
+                {"Button", button}, {"X", x}, {"Y", y},
+                {"Shift", (code & 4) != 0}, {"Alt", (code & 8) != 0}, {"Ctrl", (code & 16) != 0}, {"Raw", sequence}};
+            return event;
+        } catch (const std::exception&) {
+            return event;
+        }
+    }
+
+    event["Type"] = "key";
+    if (sequence.size() == 1 && sequence[0] == 3) {
+        event["Key"] = "ctrl-c";
+    } else if (sequence == "\r" || sequence == "\n") {
+        event["Key"] = "enter";
+    } else if (sequence == "\033") {
+        event["Key"] = "escape";
+    } else {
+        event["Key"] = sequence;
+    }
+    return event;
+}
+
 bool starts_basic_statement(const std::string& line) {
     const std::string text = trim(line);
     const auto space = text.find_first_of(" \t(");
@@ -108,7 +475,7 @@ bool starts_basic_statement(const std::string& line) {
     return first == "print" || first == "let" || first == "if" || first == "while" ||
            first == "for" || first == "run" || first == "next" || first == "wend" ||
            first == "else" || first == "end" || first == "flags" || first == "function" ||
-           first == "return" || first == "try" || first == "catch";
+           first == "class" || first == "interface" || first == "abstract" || first == "return" || first == "try" || first == "catch";
 }
 
 bool inline_if_statement(const std::string& lower_line) {
@@ -132,13 +499,13 @@ bool starts_multiline_block(const std::string& line) {
     }
     return lower.rfind("while ", 0) == 0 || lower.rfind("for ", 0) == 0 ||
            lower.rfind("function ", 0) == 0 || lower == "try" || lower.rfind("try ", 0) == 0 ||
-           lower.rfind("flags ", 0) == 0;
+           lower.rfind("flags ", 0) == 0 || lower.rfind("class ", 0) == 0 || lower.rfind("interface ", 0) == 0;
 }
 
 bool ends_multiline_block(const std::string& line) {
     const std::string lower = lowercase(trim(line));
     return lower == "wend" || lower.rfind("next", 0) == 0 || lower == "end if" ||
-           lower == "end function" || lower == "end try" || lower == "end flags";
+           lower == "end function" || lower == "end class" || lower == "end interface" || lower == "end try" || lower == "end flags";
 }
 
 int multiline_delta(const std::string& line) {
@@ -536,15 +903,38 @@ std::filesystem::path arcosh_plugins_directory() {
     return arcosh_home_directory() / "plugins";
 }
 
+std::filesystem::path arcosh_mods_directory() {
+    return arcosh_home_directory() / "mods";
+}
+
+std::filesystem::path arcosh_mods_enabled_file() {
+    return arcosh_mods_directory() / "enabled.txt";
+}
+
 std::filesystem::path arcosh_scripts_directory() {
     return arcosh_home_directory() / "scripts";
+}
+
+std::filesystem::path runtime_assets_directory() {
+    std::vector<std::filesystem::path> candidates;
+    candidates.emplace_back(std::filesystem::current_path() / "assets");
+    if (const auto executable = executable_directory()) {
+        candidates.emplace_back(executable->parent_path() / "assets");
+        candidates.emplace_back(executable->parent_path() / "share" / "arcobasic" / "assets");
+        candidates.emplace_back(*executable / ".." / "share" / "arcobasic" / "assets");
+    }
+    for (const auto& candidate : candidates) {
+        std::error_code error;
+        if (std::filesystem::is_directory(candidate, error)) return std::filesystem::weakly_canonical(candidate, error);
+    }
+    return candidates.front();
 }
 
 std::filesystem::path arcosh_history_file() {
     return arcosh_home_directory() / "history";
 }
 
-std::optional<std::filesystem::path> executable_directory() {
+std::optional<std::filesystem::path> executable_path() {
 #ifndef _WIN32
     std::array<char, 4096> path{};
     const ssize_t length = readlink("/proc/self/exe", path.data(), path.size() - 1);
@@ -552,10 +942,17 @@ std::optional<std::filesystem::path> executable_directory() {
         return std::nullopt;
     }
     path[static_cast<std::size_t>(length)] = '\0';
-    return std::filesystem::path(path.data()).parent_path();
+    return std::filesystem::path(path.data());
 #else
     return std::nullopt;
 #endif
+}
+
+std::optional<std::filesystem::path> executable_directory() {
+    if (const auto path = executable_path()) {
+        return path->parent_path();
+    }
+    return std::nullopt;
 }
 
 bool starts_with(const std::string& text, const std::string& prefix) {
@@ -589,7 +986,8 @@ std::string common_prefix(const std::vector<std::string>& values) {
 std::vector<std::string> shell_builtin_commands() {
     return {
         "alias", "bg", "cd", "cls", "color", "complete", "disown", "env", "exit", "export", "fg", "help", "history",
-        "jobs", "kill", "list", "new", "oops", "pwd", "run", "source", "tutorial", "unalias", "unset", "version",
+        "install-login", "jobs", "kill", "list", "load", "new", "oops", "pwd", "run", "source", "tutorial", "unalias",
+        "unset", "version",
         "PRINT", "LET", "IF", "WHILE", "FOR", "FUNCTION", "TRY", "FLAGS", "STOP", "GOTO"
     };
 }
@@ -614,6 +1012,7 @@ void ensure_arcosh_home() {
     const auto home = arcosh_home_directory();
     std::filesystem::create_directories(home);
     std::filesystem::create_directories(arcosh_plugins_directory());
+    std::filesystem::create_directories(arcosh_mods_directory());
     std::filesystem::create_directories(arcosh_scripts_directory());
     prepend_path_environment(arcosh_scripts_directory());
 }
@@ -704,7 +1103,7 @@ std::vector<std::string> profile_script_completions(const std::string& prefix) {
     return candidates;
 }
 
-std::vector<std::string> file_completions(const std::string& prefix) {
+std::vector<std::string> file_completions(const std::string& prefix, bool scripts_only = false) {
     std::vector<std::string> candidates;
     std::string expanded_prefix = prefix;
     std::string visible_prefix;
@@ -740,8 +1139,26 @@ std::vector<std::string> file_completions(const std::string& prefix) {
         std::string candidate = replacement_directory + name;
         if (entry.is_directory()) {
             candidate += "/";
+        } else if (scripts_only && !is_arcosh_script_extension(entry.path())) {
+            continue;
         }
         add_candidate(candidates, candidate);
+    }
+    sort_unique(candidates);
+    return candidates;
+}
+
+std::vector<std::string> script_launch_completions(const std::string& prefix, bool include_profile_scripts) {
+    std::vector<std::string> candidates;
+    const bool path_like = prefix.find('/') != std::string::npos || prefix.find('\\') != std::string::npos ||
+                           starts_with(prefix, ".") || starts_with(prefix, "~");
+    if (include_profile_scripts && !path_like) {
+        for (const auto& script : profile_script_completions(prefix)) {
+            add_candidate(candidates, script);
+        }
+    }
+    for (const auto& file : file_completions(prefix, true)) {
+        add_candidate(candidates, file);
     }
     sort_unique(candidates);
     return candidates;
@@ -755,6 +1172,7 @@ std::vector<std::string> completion_candidates(const std::string& buffer, std::s
     const std::string token = buffer.substr(start, safe_cursor - start);
     const std::string lower_before = lowercase(trim(before_token));
     const std::string lower_buffer = lowercase(buffer.substr(0, safe_cursor));
+    const std::string first_word = lowercase(first_shell_word(buffer.substr(0, safe_cursor)));
     std::vector<std::string> candidates;
 
     if (lower_buffer == "help " || starts_with(lower_buffer, "help ")) {
@@ -769,6 +1187,22 @@ std::vector<std::string> completion_candidates(const std::string& buffer, std::s
     }
 
     const bool first_token = trim(before_token).empty();
+    if (first_token && starts_with(token, "@")) {
+        const std::string launch_prefix = token.substr(1);
+        for (const auto& script : script_launch_completions(launch_prefix, true)) {
+            add_candidate(candidates, "@" + script);
+        }
+        sort_unique(candidates);
+        return candidates;
+    }
+
+    if (!first_token && (first_word == "load" || first_word == "run")) {
+        for (const auto& script : script_launch_completions(token, first_word == "run")) {
+            add_candidate(candidates, script);
+        }
+        return candidates;
+    }
+
     const bool path_like = token.find('/') != std::string::npos || token.find('\\') != std::string::npos ||
                            starts_with(token, ".") || starts_with(token, "~");
     if (!first_token || path_like) {
@@ -799,17 +1233,17 @@ public:
             return;
         }
         termios raw = original_;
-        raw.c_lflag &= static_cast<unsigned>(~(ECHO | ICANON));
+        raw.c_lflag &= static_cast<unsigned>(~(ECHO | ICANON | ISIG));
         raw.c_cc[VMIN] = 1;
         raw.c_cc[VTIME] = 0;
-        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) {
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
             enabled_ = false;
         }
     }
 
     ~RawTerminalGuard() {
         if (enabled_) {
-            tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_);
+            tcsetattr(STDIN_FILENO, TCSANOW, &original_);
         }
     }
 
@@ -822,6 +1256,41 @@ private:
     bool enabled_ = false;
 };
 #endif
+
+Value read_tui_event() {
+#ifndef _WIN32
+    RawTerminalGuard raw;
+    if (!raw.enabled()) {
+        return Value::Object{{"Type", "unsupported"}, {"Raw", ""}};
+    }
+
+    std::string sequence;
+    char c = 0;
+    if (read(STDIN_FILENO, &c, 1) != 1) {
+        return tui_parse_event("");
+    }
+    sequence.push_back(c);
+    if (c != '\033') {
+        return tui_parse_event(sequence);
+    }
+
+    // Mouse reports are short, terminated by M (press/move) or m (release).
+    // The same bounded read also preserves ordinary CSI key sequences.
+    for (int i = 0; i < 63; ++i) {
+        if (read(STDIN_FILENO, &c, 1) != 1) {
+            break;
+        }
+        sequence.push_back(c);
+        if ((sequence.size() >= 3 && sequence.compare(0, 3, "\033[<") == 0 && (c == 'M' || c == 'm')) ||
+            (sequence.size() > 2 && sequence.compare(0, 3, "\033[<") != 0 && c >= '@' && c <= '~')) {
+            break;
+        }
+    }
+    return tui_parse_event(sequence);
+#else
+    return Value::Object{{"Type", "unsupported"}, {"Raw", ""}};
+#endif
+}
 
 class LineEditor {
 public:
@@ -886,6 +1355,63 @@ private:
         redraw(prompt, buffer, cursor);
     }
 
+    void recall_history(const std::string& prompt, std::string& buffer, std::string& saved_current,
+                        std::size_t& cursor, std::size_t& history_index, int direction) {
+        const auto& entries = history_.entries();
+        if (direction < 0) {
+            if (!entries.empty() && history_index > 0) {
+                if (history_index == entries.size()) {
+                    saved_current = buffer;
+                }
+                history_index--;
+                buffer = entries[history_index];
+                cursor = buffer.size();
+                redraw(prompt, buffer, cursor);
+            }
+            return;
+        }
+
+        if (history_index < entries.size()) {
+            history_index++;
+            buffer = history_index == entries.size() ? saved_current : entries[history_index];
+            cursor = buffer.size();
+            redraw(prompt, buffer, cursor);
+        }
+    }
+
+    std::string read_escape_sequence() {
+        std::string sequence;
+        char first = 0;
+        if (read(STDIN_FILENO, &first, 1) != 1) {
+            return sequence;
+        }
+        sequence.push_back(first);
+
+        if (first == 'O') {
+            char second = 0;
+            if (read(STDIN_FILENO, &second, 1) == 1) {
+                sequence.push_back(second);
+            }
+            return sequence;
+        }
+
+        if (first != '[') {
+            return sequence;
+        }
+
+        for (int i = 0; i < 16; ++i) {
+            char next = 0;
+            if (read(STDIN_FILENO, &next, 1) != 1) {
+                break;
+            }
+            sequence.push_back(next);
+            if (next >= '@' && next <= '~') {
+                break;
+            }
+        }
+        return sequence;
+    }
+
     std::optional<std::string> read_terminal_line(const std::string& prompt) {
         RawTerminalGuard raw;
         if (!raw.enabled()) {
@@ -948,47 +1474,28 @@ private:
                 continue;
             }
             if (c == 27) {
-                char seq1 = 0;
-                char seq2 = 0;
-                if (read(STDIN_FILENO, &seq1, 1) != 1 || seq1 != '[' || read(STDIN_FILENO, &seq2, 1) != 1) {
-                    continue;
-                }
-                if (seq2 == 'A') {
-                    if (!history_.entries().empty() && history_index > 0) {
-                        if (history_index == history_.entries().size()) {
-                            saved_current = buffer;
-                        }
-                        history_index--;
-                        buffer = history_.entries()[history_index];
-                        cursor = buffer.size();
-                        redraw(prompt, buffer, cursor);
-                    }
-                } else if (seq2 == 'B') {
-                    if (history_index < history_.entries().size()) {
-                        history_index++;
-                        buffer = history_index == history_.entries().size() ? saved_current : history_.entries()[history_index];
-                        cursor = buffer.size();
-                        redraw(prompt, buffer, cursor);
-                    }
-                } else if (seq2 == 'C') {
+                const std::string sequence = read_escape_sequence();
+                if (sequence == "[A" || sequence == "OA") {
+                    recall_history(prompt, buffer, saved_current, cursor, history_index, -1);
+                } else if (sequence == "[B" || sequence == "OB") {
+                    recall_history(prompt, buffer, saved_current, cursor, history_index, 1);
+                } else if (sequence == "[C" || sequence == "OC") {
                     if (cursor < buffer.size()) {
                         cursor++;
                         redraw(prompt, buffer, cursor);
                     }
-                } else if (seq2 == 'D') {
+                } else if (sequence == "[D" || sequence == "OD") {
                     if (cursor > 0) {
                         cursor--;
                         redraw(prompt, buffer, cursor);
                     }
-                } else if (seq2 == 'H') {
+                } else if (sequence == "[H" || sequence == "OH" || sequence == "[1~" || sequence == "[7~") {
                     cursor = 0;
                     redraw(prompt, buffer, cursor);
-                } else if (seq2 == 'F') {
+                } else if (sequence == "[F" || sequence == "OF" || sequence == "[4~" || sequence == "[8~") {
                     cursor = buffer.size();
                     redraw(prompt, buffer, cursor);
-                } else if (seq2 == '3') {
-                    char tilde = 0;
-                    (void)read(STDIN_FILENO, &tilde, 1);
+                } else if (sequence == "[3~") {
                     if (cursor < buffer.size()) {
                         buffer.erase(cursor, 1);
                         redraw(prompt, buffer, cursor);
@@ -1058,6 +1565,141 @@ std::vector<std::filesystem::path> sorted_script_files(const std::filesystem::pa
     return files;
 }
 
+std::string mod_name_from_path(const std::filesystem::path& path) {
+    return path.stem().string();
+}
+
+std::string sanitize_mod_name(const std::string& requested) {
+    std::string name = std::filesystem::path(trim(requested)).stem().string();
+    if (name.empty()) {
+        name = "mod";
+    }
+    std::string safe;
+    for (char c : name) {
+        const unsigned char byte = static_cast<unsigned char>(c);
+        if (std::isalnum(byte) || c == '_' || c == '-' || c == '.') {
+            safe.push_back(c);
+        } else if (std::isspace(byte)) {
+            safe.push_back('-');
+        }
+    }
+    if (safe.empty() || safe == "." || safe == "..") {
+        safe = "mod";
+    }
+    return safe;
+}
+
+std::vector<std::string> read_enabled_mod_names() {
+    std::vector<std::string> names;
+    std::ifstream input(arcosh_mods_enabled_file());
+    std::string line;
+    while (std::getline(input, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        line = sanitize_mod_name(line);
+        if (!line.empty() && std::find(names.begin(), names.end(), line) == names.end()) {
+            names.push_back(line);
+        }
+    }
+    return names;
+}
+
+void write_enabled_mod_names(const std::vector<std::string>& names) {
+    std::filesystem::create_directories(arcosh_mods_directory());
+    std::ofstream output(arcosh_mods_enabled_file(), std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("could not write " + arcosh_mods_enabled_file().string());
+    }
+    for (const auto& name : names) {
+        output << sanitize_mod_name(name) << '\n';
+    }
+}
+
+std::optional<std::filesystem::path> find_installed_mod(const std::string& requested) {
+    const std::string name = sanitize_mod_name(requested);
+    for (const auto& file : sorted_script_files(arcosh_mods_directory())) {
+        if (mod_name_from_path(file) == name || file.filename().string() == requested) {
+            return file;
+        }
+    }
+    return std::nullopt;
+}
+
+bool mod_is_enabled(const std::string& name) {
+    const auto enabled = read_enabled_mod_names();
+    return std::find(enabled.begin(), enabled.end(), sanitize_mod_name(name)) != enabled.end();
+}
+
+std::vector<std::filesystem::path> enabled_mod_files() {
+    std::vector<std::filesystem::path> files;
+    for (const auto& name : read_enabled_mod_names()) {
+        if (const auto file = find_installed_mod(name)) {
+            files.push_back(*file);
+        }
+    }
+    return files;
+}
+
+Value mod_info_value(const std::filesystem::path& path) {
+    const std::string name = mod_name_from_path(path);
+    return Value::Object{
+        {"Name", name},
+        {"File", path.filename().string()},
+        {"Path", path.string()},
+        {"Active", mod_is_enabled(name)}
+    };
+}
+
+Value list_mods() {
+    Value::Array mods;
+    for (const auto& file : sorted_script_files(arcosh_mods_directory())) {
+        mods.push_back(mod_info_value(file));
+    }
+    return mods;
+}
+
+Value install_mod(const std::string& source_text, const std::string& requested_name) {
+    std::filesystem::path source = expand_shell_path(source_text);
+    if (!std::filesystem::exists(source) || !std::filesystem::is_regular_file(source)) {
+        throw std::runtime_error("mod source file not found: " + source.string());
+    }
+    if (!is_arcosh_script_extension(source)) {
+        throw std::runtime_error("mod source must be an ArcoBASIC script: " + source.string());
+    }
+    std::filesystem::create_directories(arcosh_mods_directory());
+    const std::string name = sanitize_mod_name(requested_name.empty() ? source.stem().string() : requested_name);
+    const auto destination = arcosh_mods_directory() / (name + source.extension().string());
+    std::filesystem::copy_file(source, destination, std::filesystem::copy_options::overwrite_existing);
+    return mod_info_value(destination);
+}
+
+Value activate_mod(const std::string& requested) {
+    const auto file = find_installed_mod(requested);
+    if (!file) {
+        throw std::runtime_error("mod is not installed: " + requested);
+    }
+    const std::string name = mod_name_from_path(*file);
+    auto enabled = read_enabled_mod_names();
+    if (std::find(enabled.begin(), enabled.end(), name) == enabled.end()) {
+        enabled.push_back(name);
+        write_enabled_mod_names(enabled);
+    }
+    return mod_info_value(*file);
+}
+
+Value deactivate_mod(const std::string& requested) {
+    const std::string name = sanitize_mod_name(requested);
+    auto enabled = read_enabled_mod_names();
+    enabled.erase(std::remove(enabled.begin(), enabled.end(), name), enabled.end());
+    write_enabled_mod_names(enabled);
+    if (const auto file = find_installed_mod(name)) {
+        return mod_info_value(*file);
+    }
+    return Value::Object{{"Name", name}, {"Active", false}};
+}
+
 std::optional<std::filesystem::path> resolve_profile_script_command(const std::string& command) {
     const std::string word = first_shell_word(command);
     if (word.empty()) {
@@ -1071,6 +1713,51 @@ std::optional<std::filesystem::path> resolve_profile_script_command(const std::s
         }
     }
     return std::nullopt;
+}
+
+std::optional<std::filesystem::path> resolve_local_script_command(const std::string& command) {
+    const std::string word = first_shell_word(command);
+    if (word.empty()) {
+        return std::nullopt;
+    }
+    const auto resolved = find_external_command(word);
+    if (resolved && is_arcosh_script_extension(*resolved)) {
+        return resolved;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::filesystem::path> resolve_script_launch_target(const std::string& target) {
+    if (target.empty()) {
+        return std::nullopt;
+    }
+
+    const auto expanded = expand_shell_path(target);
+    if (std::filesystem::exists(expanded) && std::filesystem::is_regular_file(expanded)) {
+        return expanded;
+    }
+
+    if (target.find('/') == std::string::npos && target.find('\\') == std::string::npos) {
+        if (const auto profile_script = resolve_profile_script_command(target)) {
+            return profile_script;
+        }
+        if (const auto local_script = resolve_local_script_command(target)) {
+            return local_script;
+        }
+    }
+
+    return expanded;
+}
+
+bool looks_like_script_launch_target(const std::string& target) {
+    if (target.empty()) {
+        return false;
+    }
+    if (is_arcosh_script_extension(std::filesystem::path(target))) {
+        return true;
+    }
+    const auto resolved = resolve_script_launch_target(target);
+    return resolved && std::filesystem::exists(*resolved) && std::filesystem::is_regular_file(*resolved) && is_arcosh_script_extension(*resolved);
 }
 
 bool set_environment_variable(const std::string& name, const std::string& value) {
@@ -1191,6 +1878,7 @@ PRINT Color.Bold("ArcoSH sysadmin tutorial")
 PRINT "This tutorial is written in ArcoBASIC and runs inside ArcoSH."
 PRINT "You will practice commands that inspect the host, run tools, handle errors,"
 PRINT "write tiny admin scripts, and return safely to the shell."
+PRINT "At practice prompts, type hint, skip, or quit if needed."
 Continue()
 
 Section("1. Use ArcoBASIC at the prompt")
@@ -1252,10 +1940,13 @@ const std::map<std::string, std::string>& help_catalog() {
             "  HELP topics\n"
             "  HELP if\n"
             "  HELP for\n"
+            "  HELP do\n"
+            "  HELP select\n"
             "  HELP run\n"
             "  TUTORIAL\n"
             "  arcosh --tutorial\n"
             "  arcosh --init-profile\n"
+            "  arcosh --install-shell\n"
             "  arcosh --doctor\n"
             "  arcosh --help if\n"
             "\n"
@@ -1279,6 +1970,7 @@ const std::map<std::string, std::string>& help_catalog() {
             "  types       TYPEOF, ISNULL, NUMBER, STRING\n"
             "  try         TRY, CATCH, END TRY error handling\n"
             "  function    Define user functions with FUNCTION and RETURN\n"
+            "  classes     CLASS records with fields, Init, and methods\n"
             "  bitwise     Bit.And(), Bit.Or(), shifts, and symbolic operators\n"
             "  directives  #VERSION, #TARGET, #DEFINE, #IFDEF, and compile controls\n"
             "  attributes  @EXPERIMENTAL, @DEPRECATED, @DOC, and symbol metadata\n"
@@ -1286,19 +1978,86 @@ const std::map<std::string, std::string>& help_catalog() {
             "  doctor      Check profile, stdlib, terminal, and process readiness\n"
             "  exit        Exit(), ExitProgram(), ExitTheProgram()\n"
             "  lines       Line-numbered REPL programs, LIST, RUN, NEW\n"
+            "  launch      Run .abas scripts from the REPL with @, RUN, and LOAD\n"
             "  run         Running host commands with RUN()\n"
             "  files       File helpers available to shell scripts\n"
             "  host        Host/process helpers available to shell scripts\n"
+            "  system      OS capabilities, GUI open, process launching, printers\n"
+            "  network     HTTP GET, POST, and file downloads\n"
+            "  gui         Desktop windows, drawing, and input events\n"
+            "  printers    Printer discovery and file printing helpers\n"
+            "  sudo        Request elevated permissions from scripts\n"
             "  colors      Color output and color-aware external commands\n"
+            "  tui         Retro terminal UI helpers for scripts\n"
             "  jobs        Background jobs with &, jobs, fg, and bg\n"
             "  shell       ArcoSH command-line and REPL usage\n"
             "  editing     Line editing and persistent history\n"
             "  profile     ~/.arcosh rc files, plugins, and reusable scripts\n"
+            "  login       Install ArcoSH as a login shell\n"
             "  aliases     alias, unalias, source, and script Args\n"
-            "  tutorial    Interactive ArcoSH sysadmin tutorial\n"
+            "  tutorial    Interactive ArcoBASIC tutorials\n"
             "  basic       Core ArcoBASIC syntax summary\n"
             "  values      Value types summary\n"
             "  examples    Short runnable examples\n"},
+        {"tui",
+            "Retro TUI helpers\n"
+            "\n"
+            "ArcoBASIC scripts can build terminal-native panels without depending on\n"
+            "ncurses or external UI libraries. Helpers return strings, so compose them\n"
+            "with PRINT, File.WriteText, logs, or tutorials.\n"
+            "\n"
+            "Helpers:\n"
+            "  TUI.Rule(title)\n"
+            "  TUI.Rule(title, width)\n"
+            "  TUI.ThemeRule(theme, title)\n"
+            "  TUI.ThemeRule(theme, title, width)\n"
+            "  TUI.Box(title, body)\n"
+            "  TUI.ThemeBox(theme, title, body)\n"
+            "  TUI.Scroll(title, body)\n"
+            "  TUI.Header(title)\n"
+            "  TUI.ThemeNames()\n"
+            "  TUI.Badge(state)\n"
+            "  TUI.Status(label, state)\n"
+            "  TUI.Status(label, state, detail)\n"
+            "  TUI.Progress(label, current, total)\n"
+            "  TUI.Progress(label, current, total, width)\n"
+            "  TUI.List(title, items)\n"
+            "  TUI.Menu(title, items)\n"
+            "  TUI.KeyValues(title, object)\n"
+            "  TUI.Table(headers, rows)\n"
+            "  TUI.Clear()\n"
+            "  TUI.Cursor(row, column)\n"
+            "  TUI.MouseEnable() / TUI.MouseDisable()\n"
+            "  TUI.ReadEvent()\n"
+            "  TUI.HitTest(event, x, y, width, height)\n"
+            "\n"
+            "Examples:\n"
+            "  PRINT TUI.Header(\"Deploy Check\")\n"
+            "  PRINT TUI.Box(\"STATUS\", \"web: ok\\ndb: warning\")\n"
+            "  PRINT TUI.ThemeBox(\"scroll\", \"Quest\", \"Patch the server\")\n"
+            "  PRINT TUI.Scroll(\"Ancient Manual\", \"Read HELP tui\")\n"
+            "  PRINT TUI.ThemeBox(\"circuit\", \"Report\", \"service bus online\")\n"
+            "  PRINT TUI.ThemeBox(\"parchment\", \"Notice\", \"Back up configs first\")\n"
+            "  PRINT TUI.Rule(\"NEXT\", 60)\n"
+            "  PRINT TUI.Status(\"database\", \"ok\", \"reachable\")\n"
+            "  PRINT TUI.Progress(\"backup\", 7, 10, 20)\n"
+            "  PRINT TUI.Menu(\"Actions\", [\"scan\", \"repair\", \"quit\"])\n"
+            "  PRINT TUI.KeyValues(\"Host\", {\"OS\": Host.OSName(), \"Name\": Host.Hostname()})\n"
+            "  rows = [[\"web\", \"ok\"], [\"db\", \"warn\"]]\n"
+            "  PRINT TUI.Table([\"Service\", \"State\"], rows)\n"
+            "  PRINT TUI.MouseEnable()\n"
+            "  event = TUI.ReadEvent()\n"
+            "  IF event.Type == \"mouse\" AND event.Action == \"press\" AND TUI.HitTest(event, 10, 5, 12, 1) THEN PRINT \"clicked\"\n"
+            "  PRINT TUI.MouseDisable()\n"
+            "  FOR theme IN TUI.ThemeNames()\n"
+            "      PRINT TUI.ThemeRule(theme, theme, 40)\n"
+            "  NEXT\n"
+            "\n"
+            "Layout helpers intentionally use ASCII borders for maximum compatibility\n"
+            "with old terminals, SSH sessions, logs, and Windows consoles. Mouse input\n"
+            "uses xterm SGR reporting on POSIX terminals; coordinates are 1-based. Always\n"
+            "disable mouse reporting before exiting. Clear and\n"
+            "cursor helpers return ANSI sequences for scripts that want screen control.\n"},
         {"tutorial",
             "Interactive tutorial\n"
             "\n"
@@ -1307,17 +2066,46 @@ const std::map<std::string, std::string>& help_catalog() {
             "\n"
             "Run it from the command line:\n"
             "  arcosh --tutorial\n"
+            "  arcosh --tutorial game\n"
+            "  arcosh --tutorial tool\n"
+            "  arcosh --tutorial adventure\n"
+            "  arcosh --tutorial adventure1\n"
+            "  arcosh --tutorial adventure2\n"
+            "  arcosh --tutorial adventure3\n"
+            "\n"
+            "Available tutorials:\n"
+            "  sysadmin    ArcoSH administrator workflow with status panels and tables\n"
+            "  game        Build a small interactive guessing game with scroll panels\n"
+            "  tool        Build a useful system report tool with circuit-style reports\n"
+            "  adventure   ArcoAdventures hub: original tutorial missions in The Arco Files world\n"
+            "  adventure1  Badge Bureau variables, strings, and decisions\n"
+            "  adventure2  Snackstorm loops, totals, and automation limits\n"
+            "  adventure3  Evidence locker classes and ArcoCompy packing\n"
+            "\n"
+            "Practice prompt controls:\n"
+            "  hint        Show the expected command again\n"
+            "  skip        Run the expected command and continue\n"
+            "  quit        Stop the tutorial cleanly\n"
             "\n"
             "Editable tutorial source:\n"
             "  tutorials/arcosh_sysadmin.abas\n"
+            "  tutorials/arcosh_game.abas\n"
+            "  tutorials/arcosh_tool.abas\n"
+            "  tutorials/arcoadventures_intro.abas\n"
+            "  tutorials/arcoadventure_badge_bureau.abas\n"
+            "  tutorials/arcoadventure_snackstorm.abas\n"
+            "  tutorials/arcoadventure_evidence_locker.abas\n"
             "\n"
-            "The tutorial itself is written in ArcoBASIC. It teaches:\n"
+            "The tutorials themselves are written in ArcoBASIC. They teach:\n"
             "  PRINT and direct ArcoBASIC at the prompt\n"
             "  bare host commands\n"
             "  RUN() output capture and ExitCode checks\n"
-            "  File.Exists and Host.OSName\n"
+            "  File.Exists, Host.OSName, Process.List, and profile paths\n"
             "  TRY/CATCH recovery\n"
-            "  line-numbered scripts with GOTO and STOP\n"},
+            "  variables, interpolation, arrays, loops, and conditions\n"
+            "  line-numbered scripts with GOTO and STOP\n"
+            "  TUI boxes, themed rules, scrolls, menus, progress bars, and tables\n"
+            "  small games and useful sysadmin tools\n"},
         {"if",
             "IF statement\n"
             "\n"
@@ -1362,8 +2150,34 @@ const std::map<std::string, std::string>& help_catalog() {
             "  x = 0\n"
             "  WHILE x < 3\n"
             "      x = x + 1\n"
+            "      IF x == 2 THEN CONTINUE WHILE\n"
             "      PRINT x\n"
+            "      IF x > 10 THEN EXIT WHILE\n"
             "  WEND\n"},
+        {"select",
+            "SELECT CASE statement\n"
+            "\n"
+            "Syntax:\n"
+            "  SELECT CASE expression\n"
+            "  CASE value\n"
+            "      statements\n"
+            "  CASE other, another\n"
+            "      statements\n"
+            "  CASE 1 TO 10\n"
+            "      statements\n"
+            "  CASE ELSE\n"
+            "      statements\n"
+            "  END SELECT\n"
+            "\n"
+            "Example:\n"
+            "  SELECT CASE status\n"
+            "  CASE \"ok\"\n"
+            "      PRINT \"ready\"\n"
+            "  CASE \"warn\", \"slow\"\n"
+            "      PRINT \"check it\"\n"
+            "  CASE ELSE\n"
+            "      PRINT \"unknown\"\n"
+            "  END SELECT\n"},
         {"for",
             "FOR loops\n"
             "\n"
@@ -1380,7 +2194,35 @@ const std::map<std::string, std::string>& help_catalog() {
             "Array loop:\n"
             "  FOR item IN [\"a\", \"b\"]\n"
             "      PRINT item\n"
-            "  NEXT\n"},
+            "  NEXT\n"
+            "\n"
+            "Loop control:\n"
+            "  IF i == 3 THEN CONTINUE FOR\n"
+            "  IF i == 8 THEN EXIT FOR\n"},
+        {"do",
+            "DO loops\n"
+            "\n"
+            "Pre-test loops:\n"
+            "  DO WHILE condition\n"
+            "      statements\n"
+            "  LOOP\n"
+            "\n"
+            "  DO UNTIL condition\n"
+            "      statements\n"
+            "  LOOP\n"
+            "\n"
+            "Post-test loops:\n"
+            "  DO\n"
+            "      statements\n"
+            "  LOOP WHILE condition\n"
+            "\n"
+            "  DO\n"
+            "      statements\n"
+            "  LOOP UNTIL condition\n"
+            "\n"
+            "Loop control:\n"
+            "  IF done THEN EXIT DO\n"
+            "  IF skip THEN CONTINUE DO\n"},
         {"print",
             "PRINT statement\n"
             "\n"
@@ -1405,14 +2247,33 @@ const std::map<std::string, std::string>& help_catalog() {
         {"arrays",
             "Arrays\n"
             "\n"
+            "Arrays are dynamic vector-style containers. They can grow, shrink,\n"
+            "and hold mixed ArcoBASIC values: numbers, strings, booleans, objects,\n"
+            "class instances, nested arrays, and NULL.\n"
+            "\n"
             "Syntax:\n"
             "  values = [1, 2, 3]\n"
             "\n"
             "Examples:\n"
+            "  values = Array.New()\n"
+            "  filled = Array.New(3, \"pending\")\n"
             "  PRINT values[0]\n"
             "  values[1] = 99\n"
-            "  Array.Push(values, 4)\n"
+            "  Array.Add(values, 4)\n"
+            "  Array.Append(values, {\"Name\": \"Ada\"})\n"
+            "  Array.Insert(values, 1, \"middle\")\n"
             "  last = Array.Pop(values)\n"
+            "  first = Array.Shift(values)\n"
+            "  Array.Unshift(values, \"first\")\n"
+            "  removed = Array.RemoveAt(values, 2)\n"
+            "  found_and_removed = Array.Remove(values, \"middle\")\n"
+            "  Array.Extend(values, [\"more\", \"items\"])\n"
+            "  Array.Resize(values, 10, NULL)\n"
+            "  Array.Clear(values)\n"
+            "  PRINT Array.Length(values)\n"
+            "  PRINT Array.Empty(values)\n"
+            "  PRINT Array.First(values)\n"
+            "  PRINT Array.Last(values)\n"
             "  index = Array.Find(values, 2)\n"
             "  reversed = Array.Reverse(values)\n"
             "  joined = Array.Join(values, \",\")\n"
@@ -1600,6 +2461,8 @@ const std::map<std::string, std::string>& help_catalog() {
             "  AND, OR, XOR, NOT, BITAND, BITOR, BITXOR, BITNOT, SHL, SHR\n"
             "  &, |, ^, ~, <<, >>\n"
             "\n"
+            "For short-circuit boolean logic, use ANDALSO / ORELSE, && / ||, and !.\n"
+            "\n"
             "Compound assignments also work:\n"
             "  x += 1\n"
             "  x -= 1\n"
@@ -1691,12 +2554,30 @@ const std::map<std::string, std::string>& help_catalog() {
             "  #IMPORT \"files\"     Files.ReadLines, Files.WriteLines, Files.AppendLine\n"
             "  #IMPORT \"shell\"     Shell.Output, Shell.Ok, Shell.Status, Shell.StartJob\n"
             "  #IMPORT \"sysadmin\"  SysAdmin.CommandExists, SysAdmin.AppendLog\n"
+            "  #IMPORT \"compy\"     ArcoCompy.Pack, ArcoCompy.Unpack, Save, Load\n"
+            "  #IMPORT \"compydb\"   ArcoCompyDB.Schema, PackRecord, TryUnpackRecord\n"
+            "  #IMPORT \"arcodb\"    ArcoDB.Open, Keep, RecallBy, Catalog, Write\n"
+            "  #IMPORT \"commons\"   Commons.Router, FeedItem, Report, AuditEntry\n"
+            "  #IMPORT \"arcology\"  Arcology.Open, CreateCommunity, FeedForUser\n"
+            "\n"
+            "Alias imports add a shorter namespace while keeping compatibility names:\n"
+            "  #IMPORT \"text\" AS Txt\n"
+            "  PRINT Txt.IsBlank(\"   \")\n"
             "\n"
             "Example:\n"
-            "  #IMPORT \"sysadmin\"\n"
-            "  IF SysAdmin.CommandExists(\"git\") THEN\n"
-            "      PRINT Shell.Output(\"git --version\")\n"
-            "  END IF\n"
+            "  #IMPORT \"compy\"\n"
+            "  packed = ArcoCompy.Pack({\"Name\": \"Ada\", \"Level\": 7})\n"
+            "  restored = ArcoCompy.Unpack(packed)\n"
+            "  PRINT restored.Name\n"
+            "\n"
+            "  #IMPORT \"compydb\"\n"
+            "  schema = ArcoCompyDB.Schema(\"Customer\", [\"id\", \"name\"])\n"
+            "  packed = ArcoCompyDB.PackRecord(schema, {\"id\": 1042, \"name\": \"Wanda\"})\n"
+            "\n"
+            "  #IMPORT \"arcodb\"\n"
+            "  db = ArcoDB.Open(\"people.arcodb\")\n"
+            "  ArcoDB.Catalog(db, schema, \"name\")\n"
+            "  id = ArcoDB.Keep(db, schema, {\"id\": 1042, \"name\": \"Wanda\"})\n"
             "\n"
             "The modules are regular viewable .abas files under stdlib/.\n"},
         {"doctor",
@@ -1729,8 +2610,28 @@ const std::map<std::string, std::string>& help_catalog() {
             "  RUN   Execute stored numbered lines\n"
             "  NEW   Clear stored numbered lines\n"
             "\n"
+            "LOAD script.abas switches the REPL to a loaded script instead.\n"
+            "Use NEW to clear either a loaded script or numbered scratch program.\n"
+            "\n"
             "Replace a line by typing the same number again.\n"
             "Delete a line by typing only its number.\n"},
+        {"launch",
+            "Launching ArcoBASIC scripts from ArcoSH\n"
+            "\n"
+            "Single-step launch from the REPL:\n"
+            "  @script.abas arg1 arg2\n"
+            "  RUN script.abas arg1 arg2\n"
+            "\n"
+            "Classic load/run flow:\n"
+            "  LOAD script.abas\n"
+            "  LIST\n"
+            "  RUN\n"
+            "  LOAD script.abas; RUN\n"
+            "  NEW\n"
+            "\n"
+            "@ and RUN script.abas populate Args, Script.Path, Script.Name, and Script.ArgCount.\n"
+            "RUN \"printf hello\" still runs a host command; only script-looking RUN targets launch files.\n"
+            "Profile scripts in ~/.arcosh/scripts can also be launched by name.\n"},
         {"basic",
             "ArcoBASIC syntax\n"
             "\n"
@@ -1740,12 +2641,22 @@ const std::map<std::string, std::string>& help_catalog() {
             "  LET name = expression\n"
             "  statement : statement\n"
             "  IF condition THEN ... ELSE ... END IF\n"
+            "  SELECT CASE value ... CASE item ... END SELECT\n"
             "  WHILE condition ... WEND\n"
+            "  DO WHILE condition ... LOOP\n"
+            "  DO ... LOOP UNTIL condition\n"
             "  FOR i = 1 TO 10 STEP 2 ... NEXT\n"
             "  FOR item IN array ... NEXT\n"
+            "  EXIT FOR, CONTINUE FOR, EXIT WHILE, CONTINUE WHILE, EXIT DO, CONTINUE DO\n"
+            "  CLASS Name ... END CLASS\n"
             "\n"
             "Expressions:\n"
             "  1 + 2 * 3\n"
+            "  10 MOD 3\n"
+            "  10 % 3\n"
+            "  safe ANDALSO object.Ready\n"
+            "  found || fallback\n"
+            "  !done\n"
             "  \"abc\" CONTAINS \"b\"\n"
             "  2 IN [1, 2, 3]\n"
             "  person.Name\n"
@@ -1760,12 +2671,82 @@ const std::map<std::string, std::string>& help_catalog() {
             "  40 PRINT x\n"
             "  50 WEND\n"
             "  RUN\n"},
+        {"classes",
+            "Classes\n"
+            "\n"
+            "Define lightweight object classes with fields and methods:\n"
+            "  CLASS Counter\n"
+            "      SHARED NextId = 0\n"
+            "      PRIVATE Secret = \"internal\"\n"
+            "      Value AS Number = 0\n"
+            "      CONSTRUCTOR(start AS Number)\n"
+            "          SELF.Value = start\n"
+            "      END CONSTRUCTOR\n"
+            "      SHARED FUNCTION Issue()\n"
+            "          Counter.NextId = Counter.NextId + 1\n"
+            "          RETURN Counter.NextId\n"
+            "      END FUNCTION\n"
+            "      FUNCTION Increment(amount AS Number = 1) AS Number\n"
+            "          SELF.Value = SELF.Value + amount\n"
+            "          RETURN SELF.Value\n"
+            "      END FUNCTION\n"
+            "  END CLASS\n"
+            "\n"
+            "Create and use instances:\n"
+            "  counter = Counter(10)\n"
+            "  PRINT counter.Increment()\n"
+            "  PRINT Counter.Issue()\n"
+            "  PRINT Counter.NextId\n"
+            "\n"
+            "Inheritance:\n"
+            "  CLASS Cat EXTENDS Animal\n"
+            "      FUNCTION Speak()\n"
+            "          RETURN SUPER.Speak() + \" and meows\"\n"
+            "      END FUNCTION\n"
+            "  END CLASS\n"
+            "\n"
+            "Inspection:\n"
+            "  PRINT CLASSOF(cat)\n"
+            "  PRINT ISA(cat, \"Animal\")\n"
+            "  PRINT IMPLEMENTS(writer, \"Writer\")\n"
+            "\n"
+            "Interfaces and abstract methods:\n"
+            "  INTERFACE Writer\n"
+            "      FUNCTION Write(text AS String) AS String\n"
+            "  END INTERFACE\n"
+            "  CLASS BufferWriter IMPLEMENTS Writer\n"
+            "      FUNCTION Write(text AS String) AS String\n"
+            "          RETURN text\n"
+            "      END FUNCTION\n"
+            "  END CLASS\n"
+            "  CLASS Shape\n"
+            "      ABSTRACT FUNCTION Area()\n"
+            "  END CLASS\n"
+            "\n"
+            "Current alpha model:\n"
+            "  Instances are objects marked with their class name.\n"
+            "  CONSTRUCTOR is the preferred initializer syntax.\n"
+            "  Init remains supported as the underlying compatibility hook.\n"
+            "  Methods use SELF to read and write instance fields.\n"
+            "  SHARED fields and methods live on ClassName.Member.\n"
+            "  Fields, parameters, and function returns may use AS Type runtime checks.\n"
+            "  Type checks support core values plus class and interface names.\n"
+            "  Typed fields may start as NULL; non-null assignments must match.\n"
+            "  PUBLIC is the default; PRIVATE blocks outside field and method access.\n"
+            "  PROTECTED allows access from the declaring class and subclasses.\n"
+            "  IMPLEMENTS validates required interface methods and typed signatures.\n"
+            "  Classes with unresolved ABSTRACT methods cannot be instantiated.\n"
+            "  EXTENDS inherits fields and falls back to parent methods.\n"},
         {"shell",
             "ArcoSH usage\n"
             "\n"
             "Run a script:\n"
             "  arcosh script.arcsh arg1 arg2\n"
             "  ./script.abas arg1 arg2\n"
+            "  @script.abas arg1 arg2\n"
+            "  RUN script.abas arg1 arg2\n"
+            "  LOAD script.abas\n"
+            "  RUN\n"
             "\n"
             "Executable script header:\n"
             "  #!/usr/bin/env arcosh\n"
@@ -1785,6 +2766,9 @@ const std::map<std::string, std::string>& help_catalog() {
             "Create ~/.arcosh defaults:\n"
             "  arcosh --init-profile\n"
             "\n"
+            "Open the login shell wizard:\n"
+            "  arcosh --install-shell\n"
+            "\n"
             "Check install/profile health:\n"
             "  arcosh --doctor\n"
             "\n"
@@ -1798,6 +2782,7 @@ const std::map<std::string, std::string>& help_catalog() {
             "REPL commands:\n"
             "  HELP [topic]\n"
             "  TUTORIAL\n"
+            "  INSTALL-LOGIN\n"
             "  VERSION\n"
             "  CLS\n"
             "  complete PREFIX\n"
@@ -1814,12 +2799,50 @@ const std::map<std::string, std::string>& help_catalog() {
             "  COLOR ON | COLOR OFF\n"
             "  oops <command> after an unknown command to retry with corrected spelling\n"
             "  EXIT\n"
-            "  Any other bare command, such as ls or git status, runs through RUN().\n"
+            "  Any other bare command, such as ls or git status, runs as a foreground host command.\n"
             "  Pipes, redirection, and final & background jobs are available for bare commands.\n"
+            "  Scripts can still use RUN(\"command\") when they need captured Output and ExitCode.\n"
             "  Temporary assignment prefixes work for one host command: NAME=value command\n"
             "  Multiline IF/WHILE/FOR/FUNCTION/TRY/FLAGS blocks can be typed directly.\n"
             "\n"
             "Shell scripts can use the same ArcoBASIC syntax plus host built-ins.\n"},
+        {"login",
+            "Install ArcoSH as a login shell\n"
+            "\n"
+            "Run the interactive wizard:\n"
+            "  arcosh --install-shell\n"
+            "  INSTALL-LOGIN         (from inside an ArcoSH session)\n"
+            "\n"
+            "The wizard is written in ArcoBASIC and can be inspected or edited:\n"
+            "  scripts/arcosh/install-login-shell.abas\n"
+            "  /usr/share/arcosh/scripts/install-login-shell.abas\n"
+            "\n"
+            "It can:\n"
+            "  create ~/.arcosh directories\n"
+            "  write a prompt preset to ~/.arcosh/rc.abas\n"
+            "  add arcosh to /etc/shells with sudo\n"
+            "  run chsh for the selected user\n"
+            "\n"
+            "The default mode is a dry run. Use arcosh --safe for recovery if a\n"
+            "startup file causes problems.\n"},
+        {"sudo",
+            "Elevated permissions\n"
+            "\n"
+            "Scripts can request sudo authentication before running privileged steps:\n"
+            "  IF ArcoSH.RequireSudo() THEN\n"
+            "      RUN(\"sudo systemctl restart example\")\n"
+            "  END IF\n"
+            "\n"
+            "Custom prompt:\n"
+            "  ok = ArcoSH.RequireSudo(\"Enter sudo password to continue > \")\n"
+            "  ok = Sudo.Require(\"Enter sudo password to continue > \")\n"
+            "\n"
+            "The helper runs sudo -v so later sudo commands can reuse the credential\n"
+            "timestamp. It returns TRUE on success and FALSE on failure.\n"
+            "\n"
+            "In an interactive ArcoSH terminal, bare commands that start with sudo\n"
+            "run in the foreground with inherited terminal input/output so password\n"
+            "prompts render normally instead of being captured by RUN().\n"},
         {"executable",
             "Executable ArcoBASIC scripts\n"
             "\n"
@@ -1911,6 +2934,16 @@ const std::map<std::string, std::string>& help_catalog() {
             "  ~/.arcosh/plugins/*.arcsh\n"
             "  Plugins are loaded in filename order after rc files.\n"
             "\n"
+            "User-space mods:\n"
+            "  ~/.arcosh/mods/*.abas       Installed mods\n"
+            "  ~/.arcosh/mods/enabled.txt  Active mod state for next startup\n"
+            "  Mod.Install(path)\n"
+            "  Mod.List()\n"
+            "  Mod.Activate(name)\n"
+            "  Mod.Deactivate(name)\n"
+            "  Mod.Load(name)              Load an installed mod now\n"
+            "  Active mods load after plugins and before login files.\n"
+            "\n"
             "Reusable scripts:\n"
             "  ~/.arcosh/scripts/\n"
             "  This directory is prepended to PATH. ArcoBASIC scripts in it can also\n"
@@ -1921,6 +2954,7 @@ const std::map<std::string, std::string>& help_catalog() {
             "Script helpers:\n"
             "  PRINT ArcoSH.Home()\n"
             "  PRINT ArcoSH.PluginsDir()\n"
+            "  PRINT ArcoSH.ModsDir()\n"
             "  PRINT ArcoSH.ScriptsDir()\n"
             "  ArcoSH.Source(ArcoSH.Home() + \"/extra.abas\")\n"
             "  ArcoSH.SetPrompt(\"{user}@{host}:{cwd:short} [{status}]> \")\n"
@@ -1940,6 +2974,10 @@ const std::map<std::string, std::string>& help_catalog() {
             "\n"
             "Statement form prints command output:\n"
             "  RUN \"printf hello\"\n"
+            "\n"
+            "REPL script launch form runs .abas files:\n"
+            "  RUN script.abas arg1 arg2\n"
+            "  @script.abas arg1 arg2\n"
             "\n"
             "Expression form returns an object:\n"
             "  result = RUN(\"printf hello\")\n"
@@ -2002,11 +3040,13 @@ const std::map<std::string, std::string>& help_catalog() {
             "  status = ArcoSH.WaitJob(job.Id)\n"
             "  ArcoSH.DisownJob(job.Id)\n"
             "\n"
-            "Terminal handoff and Ctrl-Z suspension are planned next.\n"},
+            "Foreground terminal handoff is available for interactive commands.\n"
+            "Ctrl-Z suspension is planned next.\n"},
         {"files",
             "File helpers\n"
             "\n"
             "  File.Exists(path)    Returns TRUE when path exists\n"
+            "  File.List(directory) Returns sorted file metadata objects\n"
             "  File.ReadText(path)  Reads a text file\n"
             "  File.WriteText(path, text)\n"
             "  File.AppendText(path, text)\n"
@@ -2016,6 +3056,7 @@ const std::map<std::string, std::string>& help_catalog() {
             "\n"
             "Path helpers:\n"
             "  Path.Join(a, b, ...)\n"
+            "  Path.Home()\n"
             "  Path.BaseName(path)\n"
             "  Path.DirName(path)\n"
             "  Path.Extension(path)\n"
@@ -2035,12 +3076,119 @@ const std::map<std::string, std::string>& help_catalog() {
             "  Host.Hostname()     Returns the current host name\n"
             "  Host.IsWindows()    Returns TRUE on Windows\n"
             "  Host.Processes()    Returns process objects with Pid and Name fields\n"
+            "  Host.Printers()     Returns printer objects with Name and Default fields\n"
             "\n"
             "Process helpers:\n"
             "  Process.List()\n"
             "  Process.Exists(name)\n"
             "  Process.Kill(pid)\n"
-            "  Process.Kill(pid, signal)\n"},
+            "  Process.Kill(pid, signal)\n"
+            "\n"
+            "System helpers:\n"
+            "  System.Capabilities()\n"
+            "  System.CommandExists(name)\n"
+            "  System.Open(pathOrUrl)\n"
+            "  System.Launch(command)\n"},
+        {"system",
+            "System runtime helpers\n"
+            "\n"
+            "Use System.Capabilities() before calling OS-backed features. It returns\n"
+            "an object with OS, Hostname, GUI, Networking, OpenCommand, Printing,\n"
+            "PrinterCommand, Processes, and Shell fields.\n"
+            "\n"
+            "Helpers:\n"
+            "  System.Capabilities()\n"
+            "  System.CommandExists(\"git\")\n"
+            "  System.Open(\"report.html\")       Opens with the desktop handler\n"
+            "  System.Open(\"https://example\")   Opens with the default browser\n"
+            "  System.Launch(\"gedit report.txt\")\n"
+            "\n"
+            "Printing:\n"
+            "  FOR printer IN Printer.List()\n"
+            "      PRINT printer.Name\n"
+            "  NEXT\n"
+            "  PRINT Printer.Default()\n"
+            "  result = Printer.PrintFile(\"report.pdf\")\n"
+            "\n"
+            "System.Open and Printer.PrintFile return clear runtime errors when the\n"
+            "host does not expose the needed OS command.\n"},
+        {"network",
+            "Network helpers\n"
+            "\n"
+            "HTTP networking is available when ArcoBASIC is built with libcurl.\n"
+            "Check Network.Available() or System.Capabilities().Networking before\n"
+            "presenting network-dependent workflows.\n"
+            "\n"
+            "Helpers:\n"
+            "  Network.Available()\n"
+            "  response = Network.Get(url)\n"
+            "  response = Network.Get(url, {\"Accept\": \"application/json\"})\n"
+            "  response = Network.Post(url, body, \"application/json\")\n"
+            "  response = Network.Download(url, path)\n"
+            "  encoded = Network.UrlEncode(\"hello world\")\n"
+            "  decoded = Network.UrlDecode(\"hello%20world\")\n"
+            "  query = Network.QueryString({\"q\": \"arco basic\"})\n"
+            "  dns = Network.ResolveDNS(\"localhost\")\n"
+            "  dns = Net.ResolveDNS(\"localhost\")\n"
+            "  client = Net.TcpConnect(\"example.com\", 80)\n"
+            "  Net.TcpSend(client.Client, \"GET / HTTP/1.0\\r\\nHost: example.com\\r\\n\\r\\n\")\n"
+            "  chunk = Net.TcpRead(client.Client, 4096)\n"
+            "  Net.TcpClose(client.Client)\n"
+            "\n"
+            "Responses are objects with Ok, Status, Body, Headers, Error, and Url.\n"
+            "Download also adds Path after a successful write.\n"
+            "DNS responses include Ok, Host, Addresses, and Error.\n"
+            "TCP connect responses include Ok, Client, Host, Port, Address, and Error.\n"
+            "\n"
+            "Example:\n"
+            "  IF Network.Available() THEN\n"
+            "      page = Network.Get(\"https://example.com\")\n"
+            "      IF page.Ok THEN PRINT page.Body\n"
+            "  END IF\n"},
+        {"gui",
+            "Desktop GUI helpers (Linux preview)\n"
+            "\n"
+            "The public API is independent of Wayland, X11, GTK, Qt, KDE, GNOME,\n"
+            "and Xfce. The current GLFW transport chooses Wayland or X11 at runtime.\n"
+            "Coordinates are logical window pixels and colors use 0.0 to 1.0 channels.\n"
+            "\n"
+            "  GUI.Available()              GUI.Backend()\n"
+            "  GUI.Application(id, name, iconPath)\n"
+            "  window = GUI.Window(title, width, height)\n"
+            "  GUI.Clear(window, r, g, b)\n"
+            "  GUI.Rectangle(window, x, y, width, height, r, g, b)\n"
+            "  GUI.RoundedRectangle(window, x, y, width, height, radius, r, g, b)\n"
+            "  GUI.Line(window, x1, y1, x2, y2, thickness, r, g, b)\n"
+            "  GUI.Circle(window, centerX, centerY, radius, r, g, b)\n"
+            "  GUI.Text(window, text, x, y, size, r, g, b)\n"
+            "  GUI.Image(window, pngPath, x, y, width, height, opacity)\n"
+            "  size = GUI.MeasureText(window, text, size)\n"
+            "  GUI.SetClip(window, x, y, width, height) / GUI.ResetClip(window)\n"
+            "  GUI.ClipboardText(window) / GUI.SetClipboardText(window, text)\n"
+            "  GUI.SetCursor(window, \"default\" | \"text\" | \"hand\")\n"
+            "  path = GUI.OpenFileDialog(window, title, initialPath)\n"
+            "  path = GUI.SaveFileDialog(window, title, initialPath)\n"
+            "  answer = GUI.Confirm(window, title, message)\n"
+            "  GUI.Present(window)\n"
+            "  event = GUI.PollEvent()\n"
+            "  event = GUI.WaitEvent(0.05)\n"
+            "  GUI.ShouldClose(window)      GUI.Size(window)\n"
+            "  GUI.SetTitle(window, title)  GUI.Close(window)\n"
+            "\n"
+            "Events include close, resize, key, text, pointer-move, pointer-button,\n"
+            "and scroll. See examples/gui_window.abas for an interactive button.\n"},
+        {"printers",
+            "Printer helpers\n"
+            "\n"
+            "  Host.Printers()\n"
+            "  Printer.List()\n"
+            "  Printer.Default()\n"
+            "  Printer.PrintFile(path)\n"
+            "  Printer.PrintFile(path, printerName)\n"
+            "\n"
+            "Linux and macOS use CUPS tools such as lpstat, lp, and lpr. Windows uses\n"
+            "the system print verb when available. Check System.Capabilities().Printing\n"
+            "before presenting print UI.\n"},
         {"values",
             "Values\n"
             "\n"
@@ -2116,10 +3264,91 @@ std::string read_file(const std::string& path) {
     return buffer.str();
 }
 
+#ifndef _WIN32
+int run_foreground_shell_command(const std::string& command) {
+    std::cout << std::flush;
+    std::cerr << std::flush;
+
+    struct sigaction previous_int {};
+    struct sigaction previous_ttou {};
+    struct sigaction ignore {};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    sigaction(SIGINT, &ignore, &previous_int);
+    sigaction(SIGTTOU, &ignore, &previous_ttou);
+
+    const pid_t shell_pgrp = getpgrp();
+    const pid_t previous_foreground_pgrp = isatty(STDIN_FILENO) ? tcgetpgrp(STDIN_FILENO) : -1;
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        sigaction(SIGINT, &previous_int, nullptr);
+        sigaction(SIGTTOU, &previous_ttou, nullptr);
+        throw std::runtime_error("could not start command");
+    }
+    if (pid == 0) {
+        setpgid(0, 0);
+        restore_default_sigint();
+        sigaction(SIGTTOU, &previous_ttou, nullptr);
+        execl("/bin/sh", "sh", "-c", command.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+
+    setpgid(pid, pid);
+    if (previous_foreground_pgrp >= 0) {
+        tcsetpgrp(STDIN_FILENO, pid);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        if (previous_foreground_pgrp >= 0) {
+            tcsetpgrp(STDIN_FILENO, previous_foreground_pgrp);
+        } else if (isatty(STDIN_FILENO)) {
+            tcsetpgrp(STDIN_FILENO, shell_pgrp);
+        }
+        sigaction(SIGINT, &previous_int, nullptr);
+        sigaction(SIGTTOU, &previous_ttou, nullptr);
+        throw std::runtime_error("could not wait for command");
+    }
+
+    if (previous_foreground_pgrp >= 0) {
+        tcsetpgrp(STDIN_FILENO, previous_foreground_pgrp);
+    } else if (isatty(STDIN_FILENO)) {
+        tcsetpgrp(STDIN_FILENO, shell_pgrp);
+    }
+    sigaction(SIGINT, &previous_int, nullptr);
+    sigaction(SIGTTOU, &previous_ttou, nullptr);
+    return status_from_wait_status(status);
+}
+
+std::string foreground_shell_command(const std::string& command) {
+    const auto words = split_shell_words(command);
+    if (!words.empty() && lowercase(words.front()) == "sudo") {
+        return "trap - INT; env -u SUDO_ASKPASS " + command;
+    }
+    return "trap - INT; " + force_command_color(command);
+}
+#endif
+
 Value run_command(const std::string& command) {
     std::array<char, 256> chunk{};
     std::string output;
-    const std::string captured_command = force_command_color(command) + " 2>&1";
+#ifndef _WIN32
+    const auto words = split_shell_words(command);
+    if (!words.empty() && lowercase(words.front()) == "sudo" && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) {
+        const int status = run_foreground_shell_command(foreground_shell_command(command));
+        return Value::Object{{"Output", ""}, {"ExitCode", static_cast<double>(status)}, {"Error", ""}};
+    }
+#endif
+    const std::string captured_command =
+#ifdef _WIN32
+        force_command_color(command) + " 2>&1";
+#else
+        "trap - INT; " + force_command_color(command) + " 2>&1";
+#endif
 #ifdef _WIN32
     FILE* pipe = _popen(captured_command.c_str(), "r");
 #else
@@ -2142,6 +3371,31 @@ Value run_command(const std::string& command) {
         output.pop_back();
     }
     return Value::Object{{"Output", output}, {"ExitCode", static_cast<double>(code)}, {"Error", ""}};
+}
+
+bool require_sudo_auth(const std::string& prompt) {
+#ifdef _WIN32
+    (void)prompt;
+    return false;
+#else
+    const std::string safe_prompt = prompt.empty() ? "ArcoSH sudo password > " : prompt;
+    // Print and flush the label ourselves instead of handing it to sudo's "-p": sudo
+    // writes its prompt from a separate process, so its write and arcosh's own buffered
+    // PRINT output (e.g. the wizard's preceding notice box) race for the terminal with
+    // no ordering guarantee, and password reading can start before either is visible.
+    // Flushing here first, then printing our own label with an explicit flush, and
+    // finally telling sudo to render an empty prompt ("-p ''") makes the visible order
+    // deterministic no matter how the two processes' writes would otherwise interleave.
+    std::cout << safe_prompt << std::flush;
+    // "trap - INT" restores default SIGINT handling for the shell child: arcosh
+    // ignores SIGINT for its own REPL loop, and that SIG_IGN disposition survives
+    // fork+exec unless explicitly reset.
+    const std::string command =
+        "trap - INT; env -u SUDO_ASKPASS timeout --foreground 60 sudo -v -p ''";
+    const int status = run_foreground_shell_command(command);
+    std::cout << '\n';
+    return status == 0;
+#endif
 }
 
 void reap_background_jobs() {
@@ -2185,6 +3439,7 @@ int start_background_job(const std::string& command, std::ostream& output) {
         return 1;
     }
     if (pid == 0) {
+        restore_default_sigint();
         setpgid(0, 0);
         execl("/bin/sh", "sh", "-c", job_command.c_str(), static_cast<char*>(nullptr));
         _exit(127);
@@ -2350,6 +3605,36 @@ Value jobs_value() {
     return jobs;
 }
 
+std::string shell_quote(const std::string& value) {
+#ifdef _WIN32
+    std::string quoted = "\"";
+    for (char c : value) {
+        if (c == '"') {
+            quoted += "\\\"";
+        } else {
+            quoted.push_back(c);
+        }
+    }
+    quoted += "\"";
+    return quoted;
+#else
+    std::string quoted = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted.push_back(c);
+        }
+    }
+    quoted += "'";
+    return quoted;
+#endif
+}
+
+bool command_exists(const std::string& command) {
+    return find_external_command(command).has_value();
+}
+
 std::string os_name() {
 #ifdef _WIN32
     return "Windows";
@@ -2498,6 +3783,166 @@ Value process_list() {
     return processes;
 }
 
+std::string system_open_command() {
+#ifdef _WIN32
+    return "start";
+#elif defined(__APPLE__)
+    return command_exists("open") ? "open" : "";
+#else
+    if (command_exists("xdg-open")) {
+        return "xdg-open";
+    }
+    if (command_exists("gio")) {
+        return "gio open";
+    }
+    return "";
+#endif
+}
+
+bool gui_available() {
+#ifdef _WIN32
+    return true;
+#elif defined(__APPLE__)
+    return true;
+#else
+    const char* display = std::getenv("DISPLAY");
+    const char* wayland = std::getenv("WAYLAND_DISPLAY");
+    return (display && *display) || (wayland && *wayland);
+#endif
+}
+
+bool network_available() {
+#if defined(ARCO_NETWORK_CURL)
+    return true;
+#else
+    return false;
+#endif
+}
+
+std::string hex_byte(unsigned char value) {
+    constexpr char digits[] = "0123456789ABCDEF";
+    std::string output;
+    output.push_back(digits[value >> 4]);
+    output.push_back(digits[value & 0x0f]);
+    return output;
+}
+
+bool printing_available() {
+#ifdef _WIN32
+    return command_exists("powershell") || command_exists("powershell.exe");
+#else
+    return command_exists("lp") || command_exists("lpr");
+#endif
+}
+
+Value system_capabilities() {
+    return Value::Object{
+        {"OS", os_name()},
+        {"Hostname", hostname()},
+        {"GUI", gui_available() && gui::available()},
+        {"GUIBackend", gui::backend()},
+        {"OpenCommand", system_open_command()},
+        {"Networking", network_available()},
+        {"Printing", printing_available()},
+        {"PrinterCommand", command_exists("lp") ? "lp" : (command_exists("lpr") ? "lpr" : "")},
+        {"Processes", true},
+        {"Shell", true}
+    };
+}
+
+Value open_target(const std::string& target) {
+    const std::string opener = system_open_command();
+    if (opener.empty()) {
+        throw std::runtime_error("System.Open is not available on this host");
+    }
+#ifdef _WIN32
+    const std::string command = "cmd /c start \"\" " + shell_quote(target);
+#else
+    const std::string command = opener + " " + shell_quote(target) + " >/dev/null 2>&1 &";
+#endif
+    const int status = std::system(command.c_str());
+    return status_from_wait_status(status) == 0;
+}
+
+Value printer_list() {
+    Value::Array printers;
+#ifdef _WIN32
+    Value result = run_command("powershell -NoProfile -Command \"Get-Printer | Select-Object -ExpandProperty Name\"");
+    const std::string output = result.get_property("Output").to_string();
+    std::istringstream input(output);
+    std::string line;
+    while (std::getline(input, line)) {
+        line = trim(line);
+        if (!line.empty()) {
+            printers.emplace_back(Value::Object{{"Name", line}, {"Default", false}});
+        }
+    }
+#else
+    if (!command_exists("lpstat")) {
+        return printers;
+    }
+    Value names_result = run_command("lpstat -e");
+    if (names_result.get_property("ExitCode").as_number() != 0.0) {
+        return printers;
+    }
+    std::string default_name;
+    Value default_result = run_command("lpstat -d");
+    if (default_result.get_property("ExitCode").as_number() == 0.0) {
+        const std::string output = default_result.get_property("Output").to_string();
+        const auto colon = output.find(':');
+        if (colon != std::string::npos) {
+            default_name = trim(output.substr(colon + 1));
+        }
+    }
+    std::istringstream input(names_result.get_property("Output").to_string());
+    std::string line;
+    while (std::getline(input, line)) {
+        line = trim(line);
+        if (!line.empty()) {
+            printers.emplace_back(Value::Object{{"Name", line}, {"Default", line == default_name}});
+        }
+    }
+#endif
+    return printers;
+}
+
+Value default_printer() {
+    const auto printers = printer_list().as_array();
+    for (const auto& printer : printers) {
+        if (printer.is_object() && printer.get_property("Default").truthy()) {
+            return printer.get_property("Name");
+        }
+    }
+    return "";
+}
+
+Value print_file(const std::string& path, const std::string& printer) {
+    if (!std::filesystem::exists(path) || std::filesystem::is_directory(path)) {
+        throw std::runtime_error("Printer.PrintFile could not find file: " + path);
+    }
+#ifdef _WIN32
+    std::string command = "powershell -NoProfile -Command \"Start-Process -FilePath " + shell_quote(path) + " -Verb Print\"";
+#else
+    std::string command;
+    if (command_exists("lp")) {
+        command = "lp ";
+        if (!printer.empty()) {
+            command += "-d " + shell_quote(printer) + " ";
+        }
+        command += shell_quote(path);
+    } else if (command_exists("lpr")) {
+        command = "lpr ";
+        if (!printer.empty()) {
+            command += "-P " + shell_quote(printer) + " ";
+        }
+        command += shell_quote(path);
+    } else {
+        throw std::runtime_error("Printer.PrintFile is not available on this host");
+    }
+#endif
+    return run_command(command);
+}
+
 } // namespace
 
 void set_color_enabled(bool enabled) {
@@ -2513,13 +3958,56 @@ std::string colorize(const std::string& text, const std::string& color) {
 }
 
 std::string help_text(const std::string& topic) {
-    const std::string key = topic.empty() ? "help" : lowercase(topic);
+    const std::string requested = trim(topic);
+    const std::string key = requested.empty() ? "help" : lowercase(requested);
     const auto& catalog = help_catalog();
+
+    if (starts_with_word(key, "search")) {
+        const std::string query = lowercase(trim(requested.substr(6)));
+        std::ostringstream matches;
+        if (query.empty()) {
+            matches << "Usage:\n  HELP search text\n";
+            return tui_box("ARCO MANUAL // SEARCH", matches.str());
+        }
+        matches << "Search: " << query << "\n\n";
+        bool any = false;
+        for (const auto& [name, text] : catalog) {
+            if (lowercase(name).find(query) != std::string::npos || lowercase(text).find(query) != std::string::npos) {
+                matches << "  " << name << "\n";
+                any = true;
+            }
+        }
+        if (!any) {
+            matches << "  no matching help topics\n";
+        }
+        matches << "\nTry:\n  HELP <topic>\n";
+        return tui_box("ARCO MANUAL // SEARCH", matches.str());
+    }
+
     const auto found = catalog.find(key);
     if (found != catalog.end()) {
-        return found->second;
+        return tui_box("ARCO MANUAL // " + key, found->second + "\nQuick keys:\n  HELP topics    HELP search <text>    TUTORIAL");
     }
-    return "Unknown help topic: " + topic + "\nRun HELP topics to list available topics.\n";
+
+    std::ostringstream body;
+    body << "Unknown help topic: " << topic << "\n\n";
+    body << "Closest options:\n";
+    int shown = 0;
+    for (const auto& [name, text] : catalog) {
+        (void)text;
+        if (!key.empty() && (name.find(key.substr(0, 1)) != std::string::npos || key.find(name.substr(0, 1)) != std::string::npos)) {
+            body << "  " << name << "\n";
+            shown++;
+            if (shown >= 8) {
+                break;
+            }
+        }
+    }
+    if (shown == 0) {
+        body << "  topics\n  basic\n  shell\n  tutorial\n";
+    }
+    body << "\nRun HELP topics to list available topics.\n";
+    return tui_box("ARCO MANUAL // NOT FOUND", body.str());
 }
 
 Value help_topics() {
@@ -2555,12 +4043,38 @@ void register_shell_builtins(Runtime& runtime) {
         return value ? Value(value) : Value("");
     });
 
+    auto input_function = [](const std::vector<Value>& args) -> Value {
+        if (args.size() > 1) {
+            throw std::runtime_error("Input expects 0 or 1 arguments");
+        }
+        if (!args.empty()) {
+            std::cout << args[0].to_string() << std::flush;
+        }
+        std::string answer;
+        if (!std::getline(std::cin, answer)) {
+            return "";
+        }
+        return answer;
+    };
+    runtime.register_function("Input", input_function);
+    runtime.register_function("ReadLine", input_function);
+
     runtime.register_function("RUN", [](const std::vector<Value>& args) -> Value {
         if (args.size() != 1) {
             throw std::runtime_error("RUN expects 1 argument");
         }
         return run_command(args[0].to_string());
     });
+
+    auto require_sudo_function = [](const std::vector<Value>& args) -> Value {
+        if (args.size() > 1) {
+            throw std::runtime_error("ArcoSH.RequireSudo expects 0 or 1 arguments");
+        }
+        const std::string prompt = args.empty() ? "ArcoSH sudo password > " : args[0].to_string();
+        return require_sudo_auth(prompt);
+    };
+    runtime.register_function("ArcoSH.RequireSudo", require_sudo_function);
+    runtime.register_function("Sudo.Require", require_sudo_function);
 
     runtime.register_function("Host.OSName", [](const std::vector<Value>& args) -> Value {
         if (!args.empty()) {
@@ -2587,11 +4101,235 @@ void register_shell_builtins(Runtime& runtime) {
 #endif
     });
 
+    runtime.register_function("System.Capabilities", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("System.Capabilities expects no arguments");
+        }
+        return system_capabilities();
+    });
+
+    runtime.register_function("System.CommandExists", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) {
+            throw std::runtime_error("System.CommandExists expects 1 argument");
+        }
+        return command_exists(args[0].to_string());
+    });
+
+    runtime.register_function("GUI.Available", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("GUI.Available expects no arguments");
+        return gui_available() && gui::available();
+    });
+    runtime.register_function("GUI.Backend", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("GUI.Backend expects no arguments");
+        return gui::backend();
+    });
+    runtime.register_function("GUI.Application", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2 || args.size() > 3) throw std::runtime_error("GUI.Application expects app id, display name, and optional icon path");
+        gui::set_application(args[0].to_string(), args[1].to_string(), args.size() == 3 ? args[2].to_string() : "");
+        return {};
+    });
+    runtime.register_function("GUI.Window", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 3) throw std::runtime_error("GUI.Window expects title, width, and height");
+        return gui::create_window(args[0].to_string(), static_cast<int>(args[1].as_number()), static_cast<int>(args[2].as_number()));
+    });
+    runtime.register_function("GUI.Close", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) throw std::runtime_error("GUI.Close expects a window");
+        gui::destroy_window(static_cast<int>(args[0].as_number())); return {};
+    });
+    runtime.register_function("GUI.ShouldClose", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) throw std::runtime_error("GUI.ShouldClose expects a window");
+        return gui::should_close(static_cast<int>(args[0].as_number()));
+    });
+    runtime.register_function("GUI.SetShouldClose", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) throw std::runtime_error("GUI.SetShouldClose expects a window and boolean");
+        gui::set_should_close(static_cast<int>(args[0].as_number()), args[1].truthy()); return {};
+    });
+    runtime.register_function("GUI.SetTitle", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) throw std::runtime_error("GUI.SetTitle expects a window and title");
+        gui::set_title(static_cast<int>(args[0].as_number()), args[1].to_string()); return {};
+    });
+    runtime.register_function("GUI.Size", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) throw std::runtime_error("GUI.Size expects a window");
+        return gui::window_size(static_cast<int>(args[0].as_number()));
+    });
+    runtime.register_function("GUI.Clear", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 4 || args.size() > 5) throw std::runtime_error("GUI.Clear expects window, red, green, blue, and optional alpha");
+        gui::clear(static_cast<int>(args[0].as_number()), args[1].as_number(), args[2].as_number(), args[3].as_number(), args.size() == 5 ? args[4].as_number() : 1.0); return {};
+    });
+    runtime.register_function("GUI.Rectangle", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 8 || args.size() > 9) throw std::runtime_error("GUI.Rectangle expects window, x, y, width, height, red, green, blue, and optional alpha");
+        gui::rectangle(static_cast<int>(args[0].as_number()), args[1].as_number(), args[2].as_number(), args[3].as_number(), args[4].as_number(),
+                       args[5].as_number(), args[6].as_number(), args[7].as_number(), args.size() == 9 ? args[8].as_number() : 1.0); return {};
+    });
+    runtime.register_function("GUI.RoundedRectangle", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 9 || args.size() > 10) throw std::runtime_error("GUI.RoundedRectangle expects window, x, y, width, height, radius, red, green, blue, and optional alpha");
+        gui::rounded_rectangle(static_cast<int>(args[0].as_number()), args[1].as_number(), args[2].as_number(), args[3].as_number(), args[4].as_number(), args[5].as_number(),
+                               args[6].as_number(), args[7].as_number(), args[8].as_number(), args.size() == 10 ? args[9].as_number() : 1.0); return {};
+    });
+    runtime.register_function("GUI.Line", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 9 || args.size() > 10) throw std::runtime_error("GUI.Line expects window, x1, y1, x2, y2, thickness, red, green, blue, and optional alpha");
+        gui::line(static_cast<int>(args[0].as_number()), args[1].as_number(), args[2].as_number(), args[3].as_number(), args[4].as_number(), args[5].as_number(),
+                  args[6].as_number(), args[7].as_number(), args[8].as_number(), args.size() == 10 ? args[9].as_number() : 1.0); return {};
+    });
+    runtime.register_function("GUI.Circle", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 7 || args.size() > 8) throw std::runtime_error("GUI.Circle expects window, centerX, centerY, radius, red, green, blue, and optional alpha");
+        gui::circle(static_cast<int>(args[0].as_number()), args[1].as_number(), args[2].as_number(), args[3].as_number(),
+                    args[4].as_number(), args[5].as_number(), args[6].as_number(), args.size() == 8 ? args[7].as_number() : 1.0); return {};
+    });
+    runtime.register_function("GUI.Text", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 8 || args.size() > 9) throw std::runtime_error("GUI.Text expects window, text, x, y, size, red, green, blue, and optional alpha");
+        gui::text(static_cast<int>(args[0].as_number()), args[1].to_string(), args[2].as_number(), args[3].as_number(), args[4].as_number(),
+                  args[5].as_number(), args[6].as_number(), args[7].as_number(), args.size() == 9 ? args[8].as_number() : 1.0); return {};
+    });
+    runtime.register_function("GUI.Image", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 6 || args.size() > 7) throw std::runtime_error("GUI.Image expects window, path, x, y, width, height, and optional opacity");
+        gui::image(static_cast<int>(args[0].as_number()), args[1].to_string(), args[2].as_number(), args[3].as_number(),
+                   args[4].as_number(), args[5].as_number(), args.size() == 7 ? args[6].as_number() : 1.0); return {};
+    });
+    runtime.register_function("GUI.MeasureText", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 3) throw std::runtime_error("GUI.MeasureText expects window, text, and size");
+        return gui::measure_text(static_cast<int>(args[0].as_number()), args[1].to_string(), args[2].as_number());
+    });
+    runtime.register_function("GUI.SetClip", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 5) throw std::runtime_error("GUI.SetClip expects window, x, y, width, and height");
+        gui::set_clip(static_cast<int>(args[0].as_number()), args[1].as_number(), args[2].as_number(), args[3].as_number(), args[4].as_number()); return {};
+    });
+    runtime.register_function("GUI.ResetClip", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) throw std::runtime_error("GUI.ResetClip expects a window");
+        gui::reset_clip(static_cast<int>(args[0].as_number())); return {};
+    });
+    runtime.register_function("GUI.ClipboardText", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) throw std::runtime_error("GUI.ClipboardText expects a window");
+        return gui::clipboard_text(static_cast<int>(args[0].as_number()));
+    });
+    runtime.register_function("GUI.SetClipboardText", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) throw std::runtime_error("GUI.SetClipboardText expects a window and text");
+        gui::set_clipboard_text(static_cast<int>(args[0].as_number()), args[1].to_string()); return {};
+    });
+    runtime.register_function("GUI.SetCursor", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) throw std::runtime_error("GUI.SetCursor expects a window and cursor name");
+        gui::set_cursor(static_cast<int>(args[0].as_number()), lowercase(args[1].to_string())); return {};
+    });
+    runtime.register_function("GUI.OpenFileDialog", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 1 || args.size() > 3) throw std::runtime_error("GUI.OpenFileDialog expects window, optional title, and optional initial path");
+        return gui::open_file_dialog(static_cast<int>(args[0].as_number()), args.size() >= 2 ? args[1].to_string() : "Open File", args.size() == 3 ? args[2].to_string() : "");
+    });
+    runtime.register_function("GUI.SaveFileDialog", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 1 || args.size() > 3) throw std::runtime_error("GUI.SaveFileDialog expects window, optional title, and optional initial path");
+        return gui::save_file_dialog(static_cast<int>(args[0].as_number()), args.size() >= 2 ? args[1].to_string() : "Save File", args.size() == 3 ? args[2].to_string() : "");
+    });
+    runtime.register_function("GUI.Confirm", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 3) throw std::runtime_error("GUI.Confirm expects window, title, and message");
+        return gui::confirm(static_cast<int>(args[0].as_number()), args[1].to_string(), args[2].to_string());
+    });
+    runtime.register_function("GUI.Present", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) throw std::runtime_error("GUI.Present expects a window");
+        gui::present(static_cast<int>(args[0].as_number())); return {};
+    });
+    runtime.register_function("GUI.PollEvent", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("GUI.PollEvent expects no arguments");
+        return gui::poll_event();
+    });
+    runtime.register_function("GUI.WaitEvent", [&runtime](const std::vector<Value>& args) -> Value {
+        if (args.size() > 1) throw std::runtime_error("GUI.WaitEvent expects optional timeout seconds");
+        Value event = gui::wait_event(args.empty() ? 0.05 : args[0].as_number());
+        runtime.reset_instruction_count();
+        return event;
+    });
+
+    runtime.register_function("System.Open", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) {
+            throw std::runtime_error("System.Open expects 1 argument");
+        }
+        return open_target(args[0].to_string());
+    });
+
+    runtime.register_function("System.Launch", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) {
+            throw std::runtime_error("System.Launch expects 1 argument");
+        }
+        const auto words = split_shell_words(args[0].to_string());
+        if (words.empty()) {
+            throw std::runtime_error("System.Launch expects a command");
+        }
+        if (!find_external_command(words.front())) {
+            throw std::runtime_error("System.Launch command not found: " + words.front());
+        }
+#ifdef _WIN32
+        const std::string command = "cmd /c start \"\" " + args[0].to_string();
+#else
+        const std::string command = args[0].to_string() + " >/dev/null 2>&1 &";
+#endif
+        const int status = std::system(command.c_str());
+        return status_from_wait_status(status) == 0;
+    });
+
+    runtime.register_function("Host.Printers", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("Host.Printers expects no arguments");
+        }
+        return printer_list();
+    });
+
+    runtime.register_function("Printer.List", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("Printer.List expects no arguments");
+        }
+        return printer_list();
+    });
+
+    runtime.register_function("Printer.Default", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("Printer.Default expects no arguments");
+        }
+        return default_printer();
+    });
+
+    runtime.register_function("Printer.PrintFile", [](const std::vector<Value>& args) -> Value {
+        if (args.empty() || args.size() > 2) {
+            throw std::runtime_error("Printer.PrintFile expects path and optional printer name");
+        }
+        return print_file(args[0].to_string(), args.size() == 2 ? args[1].to_string() : "");
+    });
+
     runtime.register_function("File.Exists", [](const std::vector<Value>& args) -> Value {
         if (args.size() != 1) {
             throw std::runtime_error("File.Exists expects 1 argument");
         }
         return std::filesystem::exists(args[0].to_string());
+    });
+
+    runtime.register_function("File.List", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) throw std::runtime_error("File.List expects a directory path");
+        const std::filesystem::path directory(args[0].to_string());
+        std::error_code error;
+        if (!std::filesystem::is_directory(directory, error)) throw std::runtime_error("not a directory: " + directory.string());
+        std::vector<std::filesystem::directory_entry> entries;
+        for (std::filesystem::directory_iterator iterator(directory, std::filesystem::directory_options::skip_permission_denied, error), end;
+             !error && iterator != end; iterator.increment(error)) entries.push_back(*iterator);
+        if (error) throw std::runtime_error("could not list directory: " + directory.string() + ": " + error.message());
+        std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+            std::error_code left_error, right_error;
+            const bool left_directory = left.is_directory(left_error);
+            const bool right_directory = right.is_directory(right_error);
+            if (left_directory != right_directory) return left_directory;
+            return lowercase(left.path().filename().string()) < lowercase(right.path().filename().string());
+        });
+        Value::Array result;
+        for (const auto& entry : entries) {
+            std::error_code entry_error;
+            const bool directory_entry = entry.is_directory(entry_error);
+            const auto name = entry.path().filename().string();
+            double size = 0;
+            if (!directory_entry) {
+                const auto bytes = entry.file_size(entry_error);
+                if (!entry_error) size = static_cast<double>(bytes);
+            }
+            result.emplace_back(Value::Object{{"Name", name}, {"Path", entry.path().string()}, {"IsDirectory", directory_entry},
+                                               {"IsFile", entry.is_regular_file(entry_error)}, {"IsHidden", !name.empty() && name.front() == '.'},
+                                               {"Size", size}, {"Extension", entry.path().extension().string()}});
+        }
+        return result;
     });
 
     runtime.register_function("File.ReadText", [](const std::vector<Value>& args) -> Value {
@@ -2656,6 +4394,14 @@ void register_shell_builtins(Runtime& runtime) {
         }
         return path.string();
     });
+    runtime.register_function("Path.Home", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("Path.Home expects no arguments");
+        return home_directory();
+    });
+    runtime.register_function("ArcoSH.AssetsDir", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("ArcoSH.AssetsDir expects no arguments");
+        return runtime_assets_directory().string();
+    });
 
     runtime.register_function("Path.BaseName", [](const std::vector<Value>& args) -> Value {
         if (args.size() != 1) {
@@ -2685,11 +4431,28 @@ void register_shell_builtins(Runtime& runtime) {
         return arcosh_home_directory().string();
     });
 
+    runtime.register_function("ArcoSH.ExecutablePath", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("ArcoSH.ExecutablePath expects no arguments");
+        }
+        if (const auto path = executable_path()) {
+            return path->string();
+        }
+        return "";
+    });
+
     runtime.register_function("ArcoSH.PluginsDir", [](const std::vector<Value>& args) -> Value {
         if (!args.empty()) {
             throw std::runtime_error("ArcoSH.PluginsDir expects no arguments");
         }
         return arcosh_plugins_directory().string();
+    });
+
+    runtime.register_function("ArcoSH.ModsDir", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("ArcoSH.ModsDir expects no arguments");
+        }
+        return arcosh_mods_directory().string();
     });
 
     runtime.register_function("ArcoSH.ScriptsDir", [](const std::vector<Value>& args) -> Value {
@@ -2754,6 +4517,58 @@ void register_shell_builtins(Runtime& runtime) {
         }
         return true;
     });
+
+    auto mod_list_function = [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("Mod.List expects no arguments");
+        }
+        return list_mods();
+    };
+    auto mod_install_function = [](const std::vector<Value>& args) -> Value {
+        if (args.empty() || args.size() > 2) {
+            throw std::runtime_error("Mod.Install expects path and optional name");
+        }
+        return install_mod(args[0].to_string(), args.size() == 2 ? args[1].to_string() : "");
+    };
+    auto mod_activate_function = [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) {
+            throw std::runtime_error("Mod.Activate expects mod name");
+        }
+        return activate_mod(args[0].to_string());
+    };
+    auto mod_deactivate_function = [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) {
+            throw std::runtime_error("Mod.Deactivate expects mod name");
+        }
+        return deactivate_mod(args[0].to_string());
+    };
+    auto mod_load_function = [&runtime](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) {
+            throw std::runtime_error("Mod.Load expects mod name");
+        }
+        const auto file = find_installed_mod(args[0].to_string());
+        if (!file) {
+            throw std::runtime_error("mod is not installed: " + args[0].to_string());
+        }
+        const auto result = runtime.run_string(read_file(file->string()));
+        if (!result.ok) {
+            throw std::runtime_error(result.error);
+        }
+        if (result.exited) {
+            throw ExitSignal(result.exit_code);
+        }
+        return mod_info_value(*file);
+    };
+    runtime.register_function("ArcoSH.ModList", mod_list_function);
+    runtime.register_function("ArcoSH.ModInstall", mod_install_function);
+    runtime.register_function("ArcoSH.ModActivate", mod_activate_function);
+    runtime.register_function("ArcoSH.ModDeactivate", mod_deactivate_function);
+    runtime.register_function("ArcoSH.ModLoad", mod_load_function);
+    runtime.register_function("Mod.List", mod_list_function);
+    runtime.register_function("Mod.Install", mod_install_function);
+    runtime.register_function("Mod.Activate", mod_activate_function);
+    runtime.register_function("Mod.Deactivate", mod_deactivate_function);
+    runtime.register_function("Mod.Load", mod_load_function);
 
     runtime.register_function("ArcoSH.StartJob", [](const std::vector<Value>& args) -> Value {
         if (args.size() != 1) {
@@ -2855,6 +4670,177 @@ void register_shell_builtins(Runtime& runtime) {
         return help_topics();
     });
 
+    runtime.register_function("TUI.Rule", [](const std::vector<Value>& args) -> Value {
+        if (args.size() > 2) {
+            throw std::runtime_error("TUI.Rule expects title and optional width");
+        }
+        const std::string title = args.empty() ? "" : args[0].to_string();
+        const std::size_t width = args.size() == 2 ? static_cast<std::size_t>(std::max(8.0, args[1].as_number())) : 72;
+        return tui_rule(title, width);
+    });
+
+    runtime.register_function("TUI.ThemeRule", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2 || args.size() > 3) {
+            throw std::runtime_error("TUI.ThemeRule expects theme, title, and optional width");
+        }
+        const std::size_t width = args.size() == 3 ? static_cast<std::size_t>(std::max(8.0, args[2].as_number())) : 72;
+        return tui_rule_with_theme(args[1].to_string(), width, tui_theme(args[0].to_string()));
+    });
+
+    runtime.register_function("TUI.Box", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) {
+            throw std::runtime_error("TUI.Box expects title and body");
+        }
+        return tui_box(args[0].to_string(), args[1].to_string());
+    });
+
+    runtime.register_function("TUI.ThemeBox", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 3) {
+            throw std::runtime_error("TUI.ThemeBox expects theme, title, and body");
+        }
+        return tui_box_with_theme(args[1].to_string(), args[2].to_string(), tui_theme(args[0].to_string()));
+    });
+
+    runtime.register_function("TUI.Scroll", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) {
+            throw std::runtime_error("TUI.Scroll expects title and body");
+        }
+        return tui_scroll(args[0].to_string(), args[1].to_string());
+    });
+
+    runtime.register_function("TUI.Header", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) {
+            throw std::runtime_error("TUI.Header expects title");
+        }
+        return tui_box(args[0].to_string(), "ArcoSH terminal workspace\nType HELP topics or HELP search <text>.");
+    });
+
+    runtime.register_function("TUI.ThemeNames", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("TUI.ThemeNames expects no arguments");
+        }
+        Value::Array names;
+        for (const auto& [name, theme] : tui_themes()) {
+            (void)theme;
+            names.emplace_back(name);
+        }
+        return names;
+    });
+
+    runtime.register_function("TUI.Badge", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) {
+            throw std::runtime_error("TUI.Badge expects state");
+        }
+        return tui_badge(args[0].to_string());
+    });
+
+    runtime.register_function("TUI.Status", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2 || args.size() > 3) {
+            throw std::runtime_error("TUI.Status expects label, state, and optional detail");
+        }
+        return tui_status(args[0].to_string(), args[1].to_string(), args.size() == 3 ? args[2].to_string() : "");
+    });
+
+    runtime.register_function("TUI.Progress", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 3 || args.size() > 4) {
+            throw std::runtime_error("TUI.Progress expects label, current, total, and optional width");
+        }
+        const std::size_t width = args.size() == 4 ? static_cast<std::size_t>(std::max(8.0, args[3].as_number())) : 24;
+        return tui_progress(args[0].to_string(), args[1].as_number(), args[2].as_number(), width);
+    });
+
+    runtime.register_function("TUI.List", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) {
+            throw std::runtime_error("TUI.List expects title and items array");
+        }
+        return tui_list(args[0].to_string(), args[1].as_array(), false);
+    });
+
+    runtime.register_function("TUI.Menu", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) {
+            throw std::runtime_error("TUI.Menu expects title and items array");
+        }
+        return tui_list(args[0].to_string(), args[1].as_array(), true);
+    });
+
+    runtime.register_function("TUI.KeyValues", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) {
+            throw std::runtime_error("TUI.KeyValues expects title and object");
+        }
+        return tui_key_values(args[0].to_string(), args[1].as_object());
+    });
+
+    runtime.register_function("TUI.Table", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) {
+            throw std::runtime_error("TUI.Table expects headers array and rows array");
+        }
+        return tui_table(args[0].as_array(), args[1].as_array());
+    });
+
+    runtime.register_function("TUI.Clear", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("TUI.Clear expects no arguments");
+        }
+        return "\033[2J\033[H";
+    });
+
+    runtime.register_function("TUI.Cursor", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) {
+            throw std::runtime_error("TUI.Cursor expects row and column");
+        }
+        return "\033[" + std::to_string(static_cast<int>(args[0].as_number())) + ";" +
+               std::to_string(static_cast<int>(args[1].as_number())) + "H";
+    });
+
+    runtime.register_function("TUI.MouseEnable", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("TUI.MouseEnable expects no arguments");
+        }
+        // Basic button events, drag/motion events, and unambiguous SGR coordinates.
+        return "\033[?1000h\033[?1002h\033[?1006h";
+    });
+
+    runtime.register_function("TUI.MouseDisable", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("TUI.MouseDisable expects no arguments");
+        }
+        return "\033[?1006l\033[?1002l\033[?1000l";
+    });
+
+    runtime.register_function("TUI.ParseEvent", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) {
+            throw std::runtime_error("TUI.ParseEvent expects one terminal sequence");
+        }
+        return tui_parse_event(args[0].to_string());
+    });
+
+    runtime.register_function("TUI.ReadEvent", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+            throw std::runtime_error("TUI.ReadEvent expects no arguments");
+        }
+        return read_tui_event();
+    });
+
+    runtime.register_function("TUI.HitTest", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 5 || !args[0].is_object()) {
+            throw std::runtime_error("TUI.HitTest expects event, x, y, width, and height");
+        }
+        const auto& event = args[0].as_object();
+        const auto type = event.find("Type");
+        const auto event_x = event.find("X");
+        const auto event_y = event.find("Y");
+        if (type == event.end() || event_x == event.end() || event_y == event.end() || type->second.to_string() != "mouse") {
+            return false;
+        }
+        const double x = args[1].as_number();
+        const double y = args[2].as_number();
+        const double width = args[3].as_number();
+        const double height = args[4].as_number();
+        const double px = event_x->second.as_number();
+        const double py = event_y->second.as_number();
+        return width > 0 && height > 0 && px >= x && px < x + width && py >= y && py < y + height;
+    });
+
     runtime.register_function("Color.Enabled", [](const std::vector<Value>& args) -> Value {
         if (!args.empty()) {
             throw std::runtime_error("Color.Enabled expects no arguments");
@@ -2948,6 +4934,7 @@ RunResult init_profile(std::ostream& output) {
         output << "Initialized " << home.string() << '\n';
         output << "  rc: " << rc.string() << '\n';
         output << "  plugins: " << arcosh_plugins_directory().string() << '\n';
+        output << "  mods: " << arcosh_mods_directory().string() << '\n';
         output << "  scripts: " << arcosh_scripts_directory().string() << '\n';
         return {};
     } catch (const std::exception& error) {
@@ -2981,6 +4968,12 @@ int doctor(std::ostream& output) {
         ok("plugins directory: " + arcosh_plugins_directory().string());
     } else {
         warn("plugins directory missing: " + arcosh_plugins_directory().string());
+    }
+
+    if (std::filesystem::exists(arcosh_mods_directory())) {
+        ok("mods directory: " + arcosh_mods_directory().string());
+    } else {
+        warn("mods directory missing: " + arcosh_mods_directory().string());
     }
 
     if (std::filesystem::exists(arcosh_scripts_directory())) {
@@ -3054,6 +5047,9 @@ RunResult load_startup(Runtime& runtime, std::ostream& output, bool login) {
     for (const auto& plugin : sorted_script_files(arcosh_plugins_directory())) {
         files.push_back(plugin);
     }
+    for (const auto& mod : enabled_mod_files()) {
+        files.push_back(mod);
+    }
     if (login) {
         for (const auto& filename : {"login.abas", "login.arcsh", "login.arc", "login.bas"}) {
             const auto file = home / filename;
@@ -3076,6 +5072,7 @@ RunResult load_startup(Runtime& runtime, std::ostream& output, bool login) {
 }
 
 int run_command_once(Runtime& runtime, const std::string& command, std::ostream& output) {
+    ignore_sigint();
     try {
         if (has_unquoted_trailing_background_marker(command)) {
             return start_background_job(command, output);
@@ -3096,7 +5093,6 @@ int run_command_once(Runtime& runtime, const std::string& command, std::ostream&
 }
 
 RunResult run_tutorial(Runtime& runtime, std::istream& input, std::ostream& output, const std::string& topic) {
-    (void)topic;
     runtime.set_output(output);
 
     auto run_practice = [&output](const std::string& command, const std::string& mode) -> Value {
@@ -3157,8 +5153,10 @@ RunResult run_tutorial(Runtime& runtime, std::istream& input, std::ostream& outp
             throw std::runtime_error("Tutorial.Step expects command and mode");
         }
         const std::string expected = args[0].to_string();
+        const std::string mode = args[1].to_string();
         output << style("Type:", "bold") << '\n';
         output << "  " << expected << '\n';
+        output << style("Commands:", "brightblack") << " hint, skip, quit\n";
         output << style("tutorial", "cyan") << style(">", "brightblack") << " " << std::flush;
 
         std::string answer;
@@ -3167,28 +5165,67 @@ RunResult run_tutorial(Runtime& runtime, std::istream& input, std::ostream& outp
                 output << "\nTutorial stopped.\n";
                 throw StopSignal();
             }
+            const std::string action = lowercase(trim(answer));
+            if (action == "quit" || action == "exit") {
+                output << "Tutorial stopped.\n";
+                throw StopSignal();
+            }
+            if (action == "hint" || action == "help" || action == "?") {
+                output << style("Hint:", "cyan") << " type this exactly, then press Enter:\n";
+                output << "  " << expected << '\n';
+                output << style("tutorial", "cyan") << style(">", "brightblack") << " " << std::flush;
+                continue;
+            }
+            if (action == "skip") {
+                output << style("Skipped.", "yellow") << " Running the expected command.\n";
+                return run_practice(expected, mode);
+            }
             if (same_command_text(answer, expected)) {
                 output << style("Correct", "green") << '\n';
-                break;
+                return run_practice(answer, mode);
             }
             output << style("Expected:", "yellow") << " " << expected << '\n';
-            output << style("Try again.", "yellow") << '\n';
+            output << style("Try again.", "yellow") << " Type hint, skip, or quit if needed.\n";
             output << style("tutorial", "cyan") << style(">", "brightblack") << " " << std::flush;
         }
-        return run_practice(answer, args[1].to_string());
     });
 
     try {
         std::string source = tutorial_source();
+        const std::string selected = lowercase(trim(topic));
+        std::string filename = "arcosh_sysadmin.abas";
+        if (selected == "game" || selected == "games") {
+            filename = "arcosh_game.abas";
+            source.clear();
+        } else if (selected == "tool" || selected == "tools" || selected == "utility" || selected == "useful") {
+            filename = "arcosh_tool.abas";
+            source.clear();
+        } else if (selected == "adventure" || selected == "adventures" || selected == "arcoadventure" || selected == "arcoadventures") {
+            filename = "arcoadventures_intro.abas";
+            source.clear();
+        } else if (selected == "adventure1" || selected == "badge" || selected == "badges" || selected == "badge-bureau") {
+            filename = "arcoadventure_badge_bureau.abas";
+            source.clear();
+        } else if (selected == "adventure2" || selected == "snack" || selected == "snacks" || selected == "snackstorm") {
+            filename = "arcoadventure_snackstorm.abas";
+            source.clear();
+        } else if (selected == "adventure3" || selected == "evidence" || selected == "locker" || selected == "evidence-locker") {
+            filename = "arcoadventure_evidence_locker.abas";
+            source.clear();
+        } else if (!selected.empty() && selected != "sysadmin" && selected != "admin" && selected != "shell") {
+            output << style("Unknown tutorial: " + topic, "yellow") << '\n';
+            output << "Available tutorials: sysadmin, game, tool, adventure, adventure1, adventure2, adventure3\n";
+            return {true, ""};
+        }
         std::vector<std::filesystem::path> tutorial_paths = {
-            std::filesystem::path("tutorials/arcosh_sysadmin.abas"),
-            std::filesystem::path("../tutorials/arcosh_sysadmin.abas"),
-            std::filesystem::path("share/arcosh/tutorials/arcosh_sysadmin.abas"),
-            std::filesystem::path("/usr/local/share/arcosh/tutorials/arcosh_sysadmin.abas"),
-            std::filesystem::path("/usr/share/arcosh/tutorials/arcosh_sysadmin.abas")
+            std::filesystem::path("tutorials") / filename,
+            std::filesystem::path("../tutorials") / filename,
+            std::filesystem::path("share/arcosh/tutorials") / filename,
+            std::filesystem::path("/usr/local/share/arcosh/tutorials") / filename,
+            std::filesystem::path("/usr/share/arcosh/tutorials") / filename
         };
         if (const auto exe_dir = executable_directory()) {
-            tutorial_paths.push_back(*exe_dir / "../share/arcosh/tutorials/arcosh_sysadmin.abas");
+            tutorial_paths.push_back(*exe_dir / "../share/arcosh/tutorials" / filename);
         }
         for (const auto& path : tutorial_paths) {
             if (std::filesystem::exists(path)) {
@@ -3196,16 +5233,45 @@ RunResult run_tutorial(Runtime& runtime, std::istream& input, std::ostream& outp
                 break;
             }
         }
+        if (source.empty()) {
+            output << style("Tutorial file not found: " + filename, "red") << '\n';
+            output << "Install ArcoSH tutorials or run from the repository checkout.\n";
+            return {true, ""};
+        }
         return runtime.run_string(source);
     } catch (const std::exception& error) {
         return {false, error.what()};
     }
 }
 
+RunResult run_login_shell_wizard(Runtime& runtime) {
+    std::vector<std::filesystem::path> wizard_paths = {
+        std::filesystem::path("scripts/arcosh/install-login-shell.abas"),
+        std::filesystem::path("../scripts/arcosh/install-login-shell.abas"),
+        std::filesystem::path("share/arcosh/scripts/install-login-shell.abas"),
+        std::filesystem::path("/usr/local/share/arcosh/scripts/install-login-shell.abas"),
+        std::filesystem::path("/usr/share/arcosh/scripts/install-login-shell.abas")
+    };
+    if (const auto exe_dir = executable_directory()) {
+        wizard_paths.push_back(*exe_dir / "../share/arcosh/scripts/install-login-shell.abas");
+    }
+
+    for (const auto& path : wizard_paths) {
+        if (std::filesystem::exists(path)) {
+            return run_file(runtime, path.string());
+        }
+    }
+
+    return {false, "ArcoSH login shell wizard not found. Expected install-login-shell.abas in share/arcosh/scripts."};
+}
+
 int repl(Runtime& runtime, std::istream& input, std::ostream& output, bool interactive) {
+    ignore_sigint();
     std::string line;
     std::string last_unknown_command;
     std::map<int, std::string> numbered_program;
+    std::string loaded_program_source;
+    std::string loaded_program_path;
     std::string multiline_source;
     int multiline_depth = 0;
     int last_status = 0;
@@ -3448,6 +5514,48 @@ int repl(Runtime& runtime, std::istream& input, std::ostream& output, bool inter
             }
             continue;
         }
+        auto run_script = [&](const std::filesystem::path& path, const std::vector<std::string>& args) -> std::optional<int> {
+            const auto result = run_file(runtime, path.string(), args);
+            if (!result.ok) {
+                output << style(result.error, "red") << '\n';
+                last_status = 1;
+            } else {
+                last_status = result.exited ? result.exit_code : 0;
+            }
+            if (result.exited) {
+                return result.exit_code;
+            }
+            return std::nullopt;
+        };
+        auto run_loaded_program = [&]() -> std::optional<int> {
+            set_script_context(runtime, loaded_program_path, {});
+            const auto result = runtime.run_string(loaded_program_source);
+            if (!result.ok) {
+                output << style(result.error, "red") << '\n';
+                last_status = 1;
+            } else {
+                last_status = result.exited ? result.exit_code : 0;
+            }
+            if (result.exited) {
+                return result.exit_code;
+            }
+            return std::nullopt;
+        };
+        if (!trim(line).empty() && trim(line)[0] == '@') {
+            const std::string launch_line = expand_shell_variables(trim(line).substr(1), last_status);
+            const auto words = split_shell_words(launch_line);
+            if (words.empty()) {
+                output << style("usage: @script.abas [args...]", "yellow") << '\n';
+                last_status = 1;
+                continue;
+            }
+            const auto path = resolve_script_launch_target(words[0]);
+            std::vector<std::string> args(words.begin() + 1, words.end());
+            if (const auto exit_code = run_script(*path, args)) {
+                return *exit_code;
+            }
+            continue;
+        }
         if (line == "PWD" || line == "pwd") {
             output << std::filesystem::current_path().string() << '\n';
             continue;
@@ -3511,16 +5619,8 @@ int repl(Runtime& runtime, std::istream& input, std::ostream& output, bool inter
             }
             continue;
         }
-        if (line == "LIST" || line == "list") {
-            output << stored_program_source(numbered_program);
-            continue;
-        }
-        if (line == "NEW" || line == "new") {
-            numbered_program.clear();
-            continue;
-        }
-        if (line == "RUN" || line == "run") {
-            const auto result = runtime.run_string(stored_program_source(numbered_program));
+        if (line == "INSTALL-LOGIN" || line == "install-login") {
+            const auto result = run_login_shell_wizard(runtime);
             if (!result.ok) {
                 output << style(result.error, "red") << '\n';
                 last_status = 1;
@@ -3531,6 +5631,93 @@ int repl(Runtime& runtime, std::istream& input, std::ostream& output, bool inter
                 return result.exit_code;
             }
             continue;
+        }
+        if (starts_with_word(lowercase(line), "load")) {
+            std::string load_command = line;
+            bool run_after_load = false;
+            if (const auto separator = line.find(';'); separator != std::string::npos) {
+                load_command = trim(line.substr(0, separator));
+                const std::string next_command = lowercase(trim(line.substr(separator + 1)));
+                if (next_command == "run") {
+                    run_after_load = true;
+                } else {
+                    output << style("usage: LOAD script.abas[; RUN]", "yellow") << '\n';
+                    last_status = 1;
+                    continue;
+                }
+            }
+            const auto words = split_shell_words(expand_shell_variables(load_command, last_status));
+            if (words.size() != 2) {
+                output << style("usage: LOAD script.abas[; RUN]", "yellow") << '\n';
+                last_status = 1;
+                continue;
+            }
+            try {
+                const auto path = resolve_script_launch_target(words[1]);
+                loaded_program_source = read_file(path->string());
+                loaded_program_path = path->string();
+                numbered_program.clear();
+                output << "Loaded " << loaded_program_path << '\n';
+                last_status = 0;
+            } catch (const std::exception& error) {
+                output << style(error.what(), "red") << '\n';
+                last_status = 1;
+            }
+            if (run_after_load && last_status == 0) {
+                if (const auto exit_code = run_loaded_program()) {
+                    return *exit_code;
+                }
+            }
+            continue;
+        }
+        if (line == "LIST" || line == "list") {
+            if (!loaded_program_source.empty()) {
+                output << loaded_program_source;
+                if (!loaded_program_source.empty() && loaded_program_source.back() != '\n') {
+                    output << '\n';
+                }
+            } else {
+                output << stored_program_source(numbered_program);
+            }
+            continue;
+        }
+        if (line == "NEW" || line == "new") {
+            numbered_program.clear();
+            loaded_program_source.clear();
+            loaded_program_path.clear();
+            continue;
+        }
+        if (line == "RUN" || line == "run") {
+            RunResult result;
+            if (!loaded_program_source.empty()) {
+                if (const auto exit_code = run_loaded_program()) {
+                    return *exit_code;
+                }
+                continue;
+            } else {
+                result = runtime.run_string(stored_program_source(numbered_program));
+            }
+            if (!result.ok) {
+                output << style(result.error, "red") << '\n';
+                last_status = 1;
+            } else {
+                last_status = result.exited ? result.exit_code : 0;
+            }
+            if (result.exited) {
+                return result.exit_code;
+            }
+            continue;
+        }
+        if (starts_with_word(lowercase(line), "run")) {
+            const auto words = split_shell_words(expand_shell_variables(line, last_status));
+            if (words.size() >= 2 && looks_like_script_launch_target(words[1])) {
+                const auto path = resolve_script_launch_target(words[1]);
+                std::vector<std::string> args(words.begin() + 2, words.end());
+                if (const auto exit_code = run_script(*path, args)) {
+                    return *exit_code;
+                }
+                continue;
+            }
         }
         if (line == "COLOR ON" || line == "color on") {
             set_color_enabled(true);
@@ -3582,29 +5769,46 @@ int repl(Runtime& runtime, std::istream& input, std::ostream& output, bool inter
             last_unknown_command.clear();
         }
         const std::string shell_line = expand_shell_variables(expand_alias(line), last_status);
+        auto run_script_command = [&](const std::filesystem::path& path) -> std::optional<int> {
+            const auto words = split_shell_words(shell_line);
+            std::vector<std::string> args;
+            if (words.size() > 1) {
+                args.assign(words.begin() + 1, words.end());
+            }
+            return run_script(path, args);
+        };
+        if (const auto profile_script = resolve_profile_script_command(shell_line)) {
+            if (const auto exit_code = run_script_command(*profile_script)) {
+                return *exit_code;
+            }
+            continue;
+        }
+        if (const auto local_script = resolve_local_script_command(shell_line)) {
+            if (const auto exit_code = run_script_command(*local_script)) {
+                return *exit_code;
+            }
+            continue;
+        }
         if (should_run_as_shell_command(shell_line)) {
             if (has_unquoted_trailing_background_marker(shell_line)) {
                 last_status = start_background_job(shell_line, output);
                 continue;
             }
-            if (const auto profile_script = resolve_profile_script_command(shell_line)) {
-                const auto words = split_shell_words(shell_line);
-                std::vector<std::string> args;
-                if (words.size() > 1) {
-                    args.assign(words.begin() + 1, words.end());
-                }
-                const auto result = run_file(runtime, profile_script->string(), args);
-                if (!result.ok) {
-                    output << style(result.error, "red") << '\n';
+#ifndef _WIN32
+            if (interactive && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) {
+                try {
+                    last_status = run_foreground_shell_command(foreground_shell_command(shell_line));
+                    if (last_status == 127) {
+                        last_unknown_command = shell_line;
+                        output << style("Unknown command. Type: oops <correct-command>", "yellow") << '\n';
+                    }
+                } catch (const std::exception& error) {
+                    output << style(error.what(), "red") << '\n';
                     last_status = 1;
-                } else {
-                    last_status = result.exited ? result.exit_code : 0;
-                }
-                if (result.exited) {
-                    return result.exit_code;
                 }
                 continue;
             }
+#endif
             try {
                 const Value result = runtime.call_host_function("RUN", {shell_line});
                 const std::string command_output = result.to_string();

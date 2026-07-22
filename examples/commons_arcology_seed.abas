@@ -1,0 +1,28 @@
+#DESCRIPTION "Commons framework seed for Arcology-style apps"
+#IMPORT "commons"
+
+router = Commons.Router()
+router = Commons.AddRoute(router, "GET", "/communities/:id", "ShowCommunity", "Community page by explicit path")
+router = Commons.AddRoute(router, "POST", "/reports", "CreateReport", "Submit a transparent moderation report")
+
+request = Commons.Request("GET", "/communities/photography")
+match = Commons.MatchRoute(router, request.Method, request.Path)
+
+PRINT "route=" + match.Handler
+PRINT "community=" + match.Params.id
+PRINT "reason=" + match.Reason
+
+items = [
+    Commons.FeedItem("event", "open-studio", "Open Studio Night", "From the Studios district you joined"),
+    Commons.FeedItem("post", "lost-camera", "Lost camera near the library", "From your Local feed")
+]
+feed = Commons.Feed(items, "Commons", "Posts from your communities and local districts, newest first")
+PRINT feed.Explanation
+FOR item IN feed.Items
+    PRINT item.Title + " -- " + item.Reason
+NEXT
+
+report = Commons.Report("post:lost-camera", "user:ada", "Spam", "Repeated unrelated sales links")
+action = Commons.ModerationAction(report, "spam", "limit_visibility", "The post matched the community spam rule.", "mod:grace")
+PRINT action.Action
+PRINT action.Explanation

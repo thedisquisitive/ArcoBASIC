@@ -92,6 +92,102 @@ Arco VM
 Arco Standard Library
 ```
 
+# Building
+
+## Linux / macOS
+
+```sh
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Build a Debian package and run the interactive installer:
+
+```sh
+scripts/build-deb.sh
+scripts/install-deb-wizard.sh --latest
+```
+
+The installer installs the `.deb`, runs the doctor, initializes the ArcoSH
+profile, offers prompt presets with live preview, can activate built-in mods
+such as ArcoGotchi, and can configure ArcoSH as the login shell.
+
+Build Linux packages for broader distro testing:
+
+```sh
+scripts/build-linux-packages.sh --all
+```
+
+This emits:
+
+* `.deb` for Debian, Ubuntu, Mint, Pop!_OS, and related distros.
+* `.rpm` for Fedora, RHEL, openSUSE, Mageia, and related distros when
+  `rpmbuild` is installed.
+* `-xbps-src.tar.gz` with a Void Linux `xbps-src` template.
+* `.tar.gz` portable install tree for unknown or unsupported distros.
+
+If you only need the portable fallback:
+
+```sh
+scripts/build-linux-packages.sh --tar
+```
+
+## ArcoFission Runtime Capsules
+
+ArcoFission can reveal compiler stages, write `.arcof-text` bytecode, run that
+bytecode, and build a Linux ELF64 runtime capsule from an ArcoBASIC source
+file:
+
+```sh
+ArcoFission build examples/hello.bas -o hello
+./hello
+```
+
+This is the default compiler model for alpha: native executable outside,
+ArcoFission bytecode VM inside. The generated ELF64 embeds the prepared bytecode
+and links it against the ArcoFission runtime from the active CMake build tree,
+which keeps behavior aligned with `ArcoFission compile-run` and gives the
+project a portable path for future Windows/macOS capsules.
+
+Use `.arcof` output or the explicit `bytecode` command when you want the
+intermediate bytecode artifact:
+
+```sh
+ArcoFission bytecode examples/hello.bas -o hello.arcof
+ArcoFission run hello.arcof
+```
+
+For a release Void Linux `.xbps`, build inside Void's `xbps-src` environment:
+
+```sh
+scripts/build-void-native-package.sh --void-packages /path/to/void-packages --out arcoalpha
+```
+
+That produces `arcoalpha/arcobasic-<version>_1.<arch>.xbps` and repository
+metadata. Testers can install from the folder with:
+
+```sh
+sudo xbps-install --repository=/path/to/arcoalpha arcobasic
+```
+
+Void packages should not be created by wrapping a host-built install tree with
+`xbps-create`; that can miss or mismatch runtime libraries such as GLFW and
+libcurl. The native `xbps-src` path records the correct Void dependencies.
+
+## Windows
+
+From Windows Terminal or PowerShell:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\build-windows.ps1 -RunTests
+```
+
+The script installs/checks CMake, Ninja, and Visual Studio Build Tools through
+`winget`, then builds `arcosh.exe` and `arco_cli.exe`. Use
+`-SkipDependencyInstall` on machines that already have the toolchain installed.
+
 ---
 
 # Project Layout
@@ -276,11 +372,18 @@ END FUNCTION
 
 # Classes
 
+See [docs/classes.md](docs/classes.md) for the full alpha class guide.
+
 ```basic
 CLASS Animal
+    Name AS String = "unknown"
 
-    FUNCTION Speak()
-        RETURN "..."
+    CONSTRUCTOR(name AS String)
+        SELF.Name = name
+    END CONSTRUCTOR
+
+    FUNCTION Speak() AS String
+        RETURN SELF.Name + " makes a sound"
     END FUNCTION
 
 END CLASS
@@ -293,8 +396,8 @@ END CLASS
 ```basic
 CLASS Cat EXTENDS Animal
 
-    FUNCTION Speak()
-        RETURN "Meow"
+    FUNCTION Speak() AS String
+        RETURN SUPER.Speak() + " and meows"
     END FUNCTION
 
 END CLASS
@@ -315,7 +418,7 @@ END FUNCTION
 # Object Creation
 
 ```basic
-cat = Cat.NEW()
+cat = Cat("Miso")
 ```
 
 ---
@@ -606,8 +709,29 @@ Driver Access
 Networking
 
 ```basic
+IF Network.Available() THEN
+    response = Network.Get("https://example.com")
+    IF response.Ok THEN PRINT response.Body
+END IF
+
+response = Network.Post("https://example.com/api", "{\"ok\":true}", "application/json")
+download = Network.Download("https://example.com/file.txt", "file.txt")
+
+PRINT Network.UrlEncode("arco basic")
+dns = Net.ResolveDNS("example.com")
+FOR address IN dns.Addresses
+    PRINT address
+NEXT
+
+client = Net.TcpConnect("example.com", 80)
+IF client.Ok THEN
+    Net.TcpSend(client.Client, "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
+    chunk = Net.TcpRead(client.Client, 4096)
+    PRINT chunk.Data
+    Net.TcpClose(client.Client)
+END IF
+
 Net.Ping()
-Net.ResolveDNS()
 
 TcpClient()
 TcpServer()
@@ -621,15 +745,237 @@ WebSocketClient()
 Features:
 
 ```text
-TCP
-UDP
 HTTP
 HTTPS
+TCP
+UDP
 DNS
 WebSockets
 File Transfer
 Network Discovery
 ```
+
+Current implementation: `Network.Available`, `Network.Get`, `Network.Post`,
+`Network.Download`, URL encoding helpers, query-string construction, and
+`Network.ResolveDNS` / `Net.ResolveDNS`, and synchronous TCP client helpers
+`Net.TcpConnect`, `Net.TcpSend`, `Net.TcpRead`, and `Net.TcpClose`. HTTP
+helpers use libcurl when available. UDP, ping, TCP servers, and WebSockets are
+planned.
+
+Networking utility scripts:
+
+```sh
+arcosh examples/network_probe.abas
+arcosh examples/network_fetch.abas https://example.com
+arcosh examples/network_download.abas https://example.com out.html
+arcosh examples/network_post.abas https://example.com/api '{"ok":true}'
+arcosh examples/network_dns.abas localhost
+arcosh examples/network_tcp_probe.abas example.com 80 "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n"
+```
+
+`network_probe.abas` is safe to run offline unless you pass a URL as its second
+argument.
+
+---
+
+# ArcoNav
+
+Terminal Web Browser
+
+```sh
+arcosh examples/arconav.abas https://example.com
+arcosh examples/arconav.abas https://example.com --dump
+```
+
+ArcoNav is a lightweight ArcoBASIC browser for terminal sessions. It fetches
+pages with `Network.Get`, renders readable text, extracts links, supports
+numbered link navigation, `g URL`, `b` back, `r` reload, and `q` quit.
+
+---
+
+# ArcoSH Mods
+
+User-space Shell Mods
+
+```basic
+Mod.Install("my-mod.abas", "my-mod")
+Mod.Activate("my-mod")
+FOR mod IN Mod.List()
+    PRINT mod.Name + " active=" + STRING(mod.Active)
+NEXT
+Mod.Deactivate("my-mod")
+```
+
+Mods install into `~/.arcosh/mods`. Active mod names are saved in
+`~/.arcosh/mods/enabled.txt`, so they load again on the next ArcoSH startup.
+Use `Mod.Load(name)` to load an installed mod immediately in the current
+session.
+
+There is also a small ArcoBASIC manager utility:
+
+```sh
+arcosh examples/arcosh_mods.abas list
+arcosh examples/arcosh_mods.abas install path/to/mod.abas my-mod
+arcosh examples/arcosh_mods.abas activate my-mod
+arcosh examples/arcosh_mods.abas deactivate my-mod
+```
+
+Built-in shipped mods can be installed by name:
+
+```sh
+arcosh examples/arcosh_mods.abas install-builtin arcogotchi
+arcosh examples/arcosh_mods.abas activate arcogotchi
+```
+
+ArcoGotchi adds a small terminal pet to ArcoSH. After activation and the next
+startup, use `gotchi`, `gotchi-feed`, `gotchi-play`, `gotchi-nap`, and
+`gotchi-rename NAME`.
+
+---
+
+# ArcoCompy
+
+Value packing and restoration
+
+```basic
+#IMPORT "compy"
+
+data = {"Name": "Ada", "Level": 7, "Inventory": ["key", "lamp"]}
+packed = ArcoCompy.Pack(data)
+restored = ArcoCompy.Unpack(packed)
+
+PRINT restored.Name
+```
+
+ArcoCompy is the alpha serialization library for ArcoBASIC values. It packs
+`NULL`, booleans, numbers, strings, arrays, objects, and object-backed class
+instances into the `ACPY1` text format. Use `ArcoCompy.TryUnpack()` when loading
+untrusted or user-editable data so corrupted payloads produce an error object
+instead of surprising script flow. See [docs/arcocompy.md](docs/arcocompy.md)
+and [docs/storage-architecture.md](docs/storage-architecture.md).
+
+ArcoCompyDB is the first database-oriented layer. It packs records by schema
+field order instead of repeating field names in every stored object:
+
+```basic
+#IMPORT "compydb"
+
+schema = ArcoCompyDB.Schema("Customer", ["customerNumber", "name", "email"])
+packed = ArcoCompyDB.PackRecord(schema, {
+    "customerNumber": 1042,
+    "name": "Wanda",
+    "email": "wanda@email.com"
+})
+```
+
+See [docs/arcocompydb.md](docs/arcocompydb.md).
+
+ArcoDB is the first persistent object-memory layer. The alpha version is a
+single-file store with explicit schemas, numeric object IDs, and compact
+ArcoCompyDB record payloads:
+
+```basic
+#IMPORT "arcodb"
+
+db = ArcoDB.Open("people.arcodb")
+schema = ArcoDB.Schema(db, "Customer", ["customerNumber", "name", "email"])
+ArcoDB.Catalog(db, schema, "email")
+id = ArcoDB.Keep(db, schema, customer)
+restored = ArcoDB.Recall(db, schema, id)
+byEmail = ArcoDB.RecallBy(db, schema, "email", customer.email)
+ArcoDB.Write(db)
+```
+
+ArcoDB also supports class-backed command objects for domain-specific queries.
+A class can expose a factory such as `whoLogQuery() AS ARCODBFUNCTION`, register
+it with `ArcoDB.RegisterCommand`, and run it with `ArcoDB.RunCommand`.
+ArcoDB also has durable object pointers through `ARCODBPOINTER`, useful for
+relationships like `Order -> Customer`. See `examples/arcodb_commands.abas` and
+`examples/arcodb_pointers.abas`.
+
+See [docs/arcodb.md](docs/arcodb.md).
+
+---
+
+# Commons Framework
+
+`#IMPORT "commons"` provides the first framework layer for community-style
+applications: request/response records, route matching, validation results,
+explainable feed items, moderation reports/actions, and audit entries.
+
+```basic
+#IMPORT "commons"
+
+router = Commons.Router()
+router = Commons.AddRoute(router, "GET", "/communities/:id", "ShowCommunity", "Community page")
+match = Commons.MatchRoute(router, "GET", "/communities/photo")
+PRINT match.Params.id
+```
+
+See [docs/commons.md](docs/commons.md) and
+`examples/commons_arcology_seed.abas`.
+
+---
+
+# Arcology v0.1a
+
+`#IMPORT "arcology"` starts the Arcology Commons domain layer on top of
+`commons` and `arcodb`.
+
+```basic
+#IMPORT "arcology"
+
+app = Arcology.Open("arcology.arcodb")
+ignored = Arcology.CreateUser(app, "ada", "Ada Lovelace")
+ignored = Arcology.CreateCommunity(app, "photography", "Photography")
+ignored = Arcology.JoinCommunity(app, "ada", "photography")
+post = Arcology.Post(app, "photography", "ada", "Sunset walk", "Meet at the library")
+
+feed = Arcology.FeedForUser(app, "ada")
+FOR item IN feed.Items
+    PRINT item.Title + " -- " + item.Reason
+NEXT
+```
+
+See [docs/arcology.md](docs/arcology.md) and `examples/arcology_v01a.abas`.
+
+Static HTML export is available before the live web server exists:
+
+```sh
+arcosh examples/arcology_export_site.abas arcology.arcodb dist/arcology
+```
+
+---
+
+# Safe References
+
+ArcoBASIC uses safe references instead of raw C/C++ pointers:
+
+```basic
+playerRef = REF(player)
+playerRef.Value.Name = "Grace"
+
+scoreRef = REF(score)
+scoreRef.Value = 25
+```
+
+References expose `.Value`, `.Exists()`, and `.Clear()` while staying inside
+the runtime object model. There is no pointer arithmetic or arbitrary memory
+access. See [docs/references.md](docs/references.md) and
+`examples/safe_refs.abas`.
+
+## ArcoMart demo
+
+`examples/arcomart.abas` is a small persistent storefront simulation built in
+ArcoBASIC:
+
+```sh
+arcosh --safe examples/arcomart.abas arcomart.arcodb
+```
+
+It supports adding/editing/removing products, receiving stock, customer
+checkout, low-stock reporting, sales reporting, saving, and compacting the
+underlying ArcoDB file.
 
 ---
 
@@ -782,7 +1128,7 @@ FD 100
 Modern API:
 
 ```basic
-t = Turtle.NEW()
+t = Turtle()
 
 t.Forward(100)
 t.Right(90)

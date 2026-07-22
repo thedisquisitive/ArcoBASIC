@@ -1,0 +1,35 @@
+#DESCRIPTION "Run a small networking self-check"
+
+PRINT "Network.Available: " + STRING(Network.Available())
+PRINT "Encode: " + Network.UrlEncode("hello world!")
+PRINT "Decode: " + Network.UrlDecode("hello%20world%21")
+PRINT "Query: " + Network.QueryString({"q": "arco basic", "page": 2})
+
+host = "localhost"
+IF LEN(Args) > 0 THEN host = Args[0]
+dns = Net.ResolveDNS(host)
+PRINT "DNS Host: " + dns.Host
+PRINT "DNS Ok: " + STRING(dns.Ok)
+IF dns.Ok THEN
+    FOR address IN dns.Addresses
+        PRINT "Address: " + address
+    NEXT
+ELSE
+    PRINT "DNS Error: " + dns.Error
+END IF
+
+IF LEN(Args) > 1 THEN
+    IF Network.Available() == FALSE THEN
+        PRINT "HTTP skipped: networking was not enabled in this build."
+    ELSE
+        response = Network.Get(Args[1])
+        PRINT "HTTP URL: " + response.Url
+        PRINT "HTTP Ok: " + STRING(response.Ok)
+        PRINT "HTTP Status: " + STRING(response.Status)
+        IF response.Ok THEN
+            PRINT "HTTP Bytes: " + STRING(LEN(response.Body))
+        ELSE
+            PRINT "HTTP Error: " + response.Error
+        END IF
+    END IF
+END IF

@@ -1,0 +1,25 @@
+#DESCRIPTION "POST text or JSON to a URL"
+
+IF LEN(Args) < 2 THEN
+    PRINT "Usage: arcosh examples/network_post.abas URL BODY [CONTENT_TYPE]"
+    ExitTheProgram(2)
+END IF
+
+IF Network.Available() == FALSE THEN
+    PRINT "Networking is not enabled in this ArcoBASIC build."
+    ExitTheProgram(1)
+END IF
+
+contentType = "application/json"
+IF LEN(Args) > 2 THEN contentType = Args[2]
+
+response = Network.Post(Args[0], Args[1], contentType)
+PRINT "URL: " + response.Url
+PRINT "Status: " + STRING(response.Status)
+PRINT "Ok: " + STRING(response.Ok)
+IF response.Ok THEN
+    PRINT response.Body
+ELSE
+    PRINT "POST error: " + response.Error
+    ExitTheProgram(1)
+END IF

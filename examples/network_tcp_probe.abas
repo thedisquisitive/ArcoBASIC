@@ -1,0 +1,35 @@
+#DESCRIPTION "Connect to a TCP server, send text, and print one response chunk"
+
+IF LEN(Args) < 3 THEN
+    PRINT "Usage: arcosh examples/network_tcp_probe.abas HOST PORT TEXT [MAX_BYTES]"
+    ExitTheProgram(2)
+END IF
+
+host = Args[0]
+port = NUMBER(Args[1])
+text = Args[2]
+maxBytes = 4096
+IF LEN(Args) > 3 THEN maxBytes = NUMBER(Args[3])
+
+client = Net.TcpConnect(host, port)
+IF client.Ok == FALSE THEN
+    PRINT "TCP connect error: " + client.Error
+    ExitTheProgram(1)
+END IF
+
+sent = Net.TcpSend(client.Client, text)
+PRINT "Sent: " + STRING(sent.Bytes)
+IF sent.Ok == FALSE THEN
+    PRINT "TCP send error: " + sent.Error
+    Net.TcpClose(client.Client)
+    ExitTheProgram(1)
+END IF
+
+chunk = Net.TcpRead(client.Client, maxBytes)
+IF chunk.Ok THEN
+    PRINT chunk.Data
+ELSE
+    PRINT "TCP read error: " + chunk.Error
+END IF
+
+Net.TcpClose(client.Client)

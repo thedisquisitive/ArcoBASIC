@@ -1,0 +1,22 @@
+#DESCRIPTION "Download a URL to a file"
+
+IF LEN(Args) < 2 THEN
+    PRINT "Usage: arcosh examples/network_download.abas URL OUTFILE"
+    ExitTheProgram(2)
+END IF
+
+IF Network.Available() == FALSE THEN
+    PRINT "Networking is not enabled in this ArcoBASIC build."
+    ExitTheProgram(1)
+END IF
+
+response = Network.Download(Args[0], Args[1])
+PRINT "URL: " + response.Url
+PRINT "Status: " + STRING(response.Status)
+IF response.Ok THEN
+    PRINT "Saved: " + response.Path
+    PRINT "Bytes: " + STRING(LEN(response.Body))
+ELSE
+    PRINT "Download error: " + response.Error
+    ExitTheProgram(1)
+END IF

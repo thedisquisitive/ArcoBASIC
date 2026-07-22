@@ -1,0 +1,46 @@
+#DESCRIPTION "Arcology Commons v0.1a seed demo"
+#IMPORT "arcology"
+
+path = "arcology-v01a.arcodb"
+IF LEN(Args) > 0 THEN path = Args[0]
+
+app = Arcology.Open(path)
+manifest = Arcology.Manifest()
+
+PRINT manifest.Name
+PRINT manifest.Motto
+
+ada = Arcology.CreateUser(app, "Ada", "Ada Lovelace", "Community steward", "moderator")
+grace = Arcology.CreateUser(app, "Grace", "Grace Hopper", "Systems neighbor")
+photo = Arcology.CreateCommunity(app, "photography", "Photography", "A place for local photos and walks")
+makers = Arcology.CreateCommunity(app, "makers", "Makers", "Projects, repairs, and workshops")
+
+ignored = Arcology.JoinCommunity(app, "Ada", "photography", "moderator")
+ignored = Arcology.JoinCommunity(app, "Grace", "photography")
+ignored = Arcology.JoinCommunity(app, "Grace", "makers")
+
+post = Arcology.Post(app, "photography", "Grace", "Sunset walk", "Meet at the library steps at 7.", ["local", "photo"])
+event = Arcology.Event(app, "makers", "Repair night", "2026-08-12 18:00", "Community center", "Bring broken lamps, radios, and bikes.")
+
+feed = Arcology.FeedForUser(app, "Grace")
+PRINT feed.Title
+PRINT feed.Explanation
+FOR item IN feed.Items
+    PRINT item.Kind + " " + item.Title + " -- " + item.Reason
+NEXT
+
+report = Arcology.ReportContent(app, "post:" + STRING(post.Value.__id), "Ada", "Spam", "Testing transparent report records", {"Snapshot": post.Value.Body})
+action = Arcology.Moderate(app, "post:" + STRING(post.Value.__id), "spam", "remove_content", "Demo removal with an explainable outcome.", "Ada")
+PRINT "Report: " + report.Value.Status
+PRINT "Action: " + action.Value.Action
+PRINT "Appeal: " + STRING(action.Value.AppealAvailable)
+
+communityFeed = Arcology.CommunityFeed(app, "photography")
+PRINT "Photography feed items after moderation: " + STRING(LEN(communityFeed.Items))
+
+info = Arcology.Inspect(app)
+PRINT "Users: " + STRING(info.Users)
+PRINT "Communities: " + STRING(info.Communities)
+PRINT "Posts: " + STRING(info.Posts)
+PRINT "Reports: " + STRING(info.Reports)
+PRINT "Saved: " + STRING(Arcology.Save(app))

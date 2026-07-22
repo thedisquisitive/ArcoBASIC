@@ -1,0 +1,160 @@
+' Commons: alpha application framework helpers for civic/community software.
+'
+' This module is intentionally policy-neutral. Arcology-specific social
+' networking features should build on these request, response, routing,
+' validation, feed, and moderation record primitives.
+
+FUNCTION Commons.Version()
+    RETURN "COMMONS_ALPHA1"
+END FUNCTION
+
+FUNCTION Commons.Ok(value = NULL)
+    RETURN {"Ok": TRUE, "Value": value, "Error": ""}
+END FUNCTION
+
+FUNCTION Commons.Error(message, code = "error")
+    RETURN {"Ok": FALSE, "Value": NULL, "Error": message, "Code": code}
+END FUNCTION
+
+FUNCTION Commons.Request(method, path, body = "", query = {}, headers = {}, user = NULL)
+    RETURN {"Method": Upper(method), "Path": path, "Body": body, "Query": query, "Headers": headers, "User": user}
+END FUNCTION
+
+FUNCTION Commons.Response(status, body = "", headers = {})
+    RETURN {"Status": status, "Body": body, "Headers": headers}
+END FUNCTION
+
+FUNCTION Commons.Text(status, text)
+    RETURN Commons.Response(status, text, {"Content-Type": "text/plain; charset=utf-8"})
+END FUNCTION
+
+FUNCTION Commons.Json(status, value)
+    RETURN Commons.Response(status, value, {"Content-Type": "application/json"})
+END FUNCTION
+
+FUNCTION Commons.Redirect(location, status = 302)
+    RETURN Commons.Response(status, "", {"Location": location})
+END FUNCTION
+
+FUNCTION Commons.NotFound(message = "Not found")
+    RETURN Commons.Text(404, message)
+END FUNCTION
+
+FUNCTION Commons.Router()
+    RETURN {"Format": Commons.Version(), "Routes": []}
+END FUNCTION
+
+FUNCTION Commons.Route(method, pattern, handler, description = "")
+    RETURN {"Method": Upper(method), "Pattern": pattern, "Handler": handler, "Description": description}
+END FUNCTION
+
+FUNCTION Commons.AddRoute(router, method, pattern, handler, description = "")
+    routes = router.Routes
+    ignored = Array.Push(routes, Commons.Route(method, pattern, handler, description))
+    router.Routes = routes
+    RETURN router
+END FUNCTION
+
+FUNCTION Commons.TrimSlashes(path)
+    text = String.Trim(path)
+    WHILE LEN(text) > 1 AND text[0] == "/"
+        text = String.Delete(text, 0, 1)
+    WEND
+    WHILE LEN(text) > 1 AND text[LEN(text) - 1] == "/"
+        text = String.Delete(text, LEN(text) - 1, 1)
+    WEND
+    RETURN text
+END FUNCTION
+
+FUNCTION Commons.PathParts(path)
+    clean = Commons.TrimSlashes(path)
+    IF clean == "" OR clean == "/" THEN RETURN []
+    RETURN String.Split(clean, "/")
+END FUNCTION
+
+FUNCTION Commons.MatchPattern(pattern, path)
+    patternParts = Commons.PathParts(pattern)
+    pathParts = Commons.PathParts(path)
+    IF LEN(patternParts) <> LEN(pathParts) THEN RETURN {"Ok": FALSE, "Params": {}, "Reason": "segment count mismatch"}
+
+    params = {}
+    index = 0
+    WHILE index < LEN(patternParts)
+        expected = patternParts[index]
+        actual = pathParts[index]
+        IF LEN(expected) > 0 AND expected[0] == ":" THEN
+            name = String.Delete(expected, 0, 1)
+            params = Object.Set(params, name, actual)
+        ELSE
+            IF expected <> actual THEN RETURN {"Ok": FALSE, "Params": {}, "Reason": "segment mismatch"}
+        END IF
+        index = index + 1
+    WEND
+
+    RETURN {"Ok": TRUE, "Params": params, "Reason": "matched"}
+END FUNCTION
+
+FUNCTION Commons.MatchRoute(router, method, path)
+    wanted = Upper(method)
+    FOR route IN router.Routes
+        IF route.Method == wanted THEN
+            match = Commons.MatchPattern(route.Pattern, path)
+            IF match.Ok THEN
+                RETURN {"Ok": TRUE, "Route": route, "Params": match.Params, "Handler": route.Handler, "Reason": route.Description}
+            END IF
+        END IF
+    NEXT
+    RETURN {"Ok": FALSE, "Route": NULL, "Params": {}, "Handler": "", "Reason": "no matching route"}
+END FUNCTION
+
+FUNCTION Commons.Validation()
+    RETURN {"Ok": TRUE, "Errors": []}
+END FUNCTION
+
+FUNCTION Commons.AddValidationError(result, field, message)
+    errors = result.Errors
+    ignored = Array.Push(errors, {"Field": field, "Message": message})
+    result.Errors = errors
+    result.Ok = FALSE
+    RETURN result
+END FUNCTION
+
+FUNCTION Commons.RequireField(result, value, field, message = "required")
+    IF ISNULL(value) THEN RETURN Commons.AddValidationError(result, field, message)
+    IF TYPEOF(value) == "String" AND String.Trim(value) == "" THEN RETURN Commons.AddValidationError(result, field, message)
+    RETURN result
+END FUNCTION
+
+FUNCTION Commons.MaxLength(result, value, field, limit)
+    IF ISNULL(value) THEN RETURN result
+    IF LEN(STRING(value)) > limit THEN RETURN Commons.AddValidationError(result, field, "must be at most " + STRING(limit) + " characters")
+    RETURN result
+END FUNCTION
+
+FUNCTION Commons.FeedItem(kind, id, title, reason, createdAt = "")
+    RETURN {"Kind": kind, "Id": id, "Title": title, "Reason": reason, "CreatedAt": createdAt}
+END FUNCTION
+
+FUNCTION Commons.Feed(items, title = "Feed", explanation = "")
+    RETURN {"Title": title, "Explanation": explanation, "Items": items, "CaughtUp": LEN(items) == 0}
+END FUNCTION
+
+FUNCTION Commons.CaughtUp(message = "You're caught up.")
+    RETURN {"CaughtUp": TRUE, "Message": message}
+END FUNCTION
+
+FUNCTION Commons.ModerationRule(id, title, description, severity = "normal")
+    RETURN {"Id": id, "Title": title, "Description": description, "Severity": severity}
+END FUNCTION
+
+FUNCTION Commons.Report(contentId, reporterId, reason, details = "", evidence = {})
+    RETURN {"Format": Commons.Version(), "ContentId": contentId, "ReporterId": reporterId, "Reason": reason, "Details": details, "Evidence": evidence, "Status": "open", "CreatedAt": Time.Now()}
+END FUNCTION
+
+FUNCTION Commons.ModerationAction(report, ruleId, action, explanation, actorId = "")
+    RETURN {"Report": report, "RuleId": ruleId, "Action": action, "Explanation": explanation, "ActorId": actorId, "CreatedAt": Time.Now(), "AppealAvailable": TRUE}
+END FUNCTION
+
+FUNCTION Commons.AuditEntry(actorId, verb, targetId, reason = "", metadata = {})
+    RETURN {"ActorId": actorId, "Verb": verb, "TargetId": targetId, "Reason": reason, "Metadata": metadata, "CreatedAt": Time.Now()}
+END FUNCTION
