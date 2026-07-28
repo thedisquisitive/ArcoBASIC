@@ -1,0 +1,40 @@
+#DESCRIPTION "ArcoAdventures Mission 3: Evidence Locker"
+#IMPORT "compy"
+
+FUNCTION Section(title)
+    PRINT ""
+    PRINT Color.Green(TUI.ThemeRule("circuit", title, 72))
+END FUNCTION
+
+FUNCTION Continue()
+    ignored = Tutorial.ReadLine("press Enter to continue ")
+END FUNCTION
+
+FUNCTION Demo(title, command)
+    PRINT Color.Bold(title)
+    ignored = Tutorial.Run(command, "arco")
+END FUNCTION
+
+PRINT TUI.Header("ArcoAdventures 3: Evidence Locker")
+PRINT TUI.ThemeBox("circuit", "MISSION", "Warehouse 27 has opened an Evidence Processing Annex, also named Warehouse 27.\n\nThe Obfuscator has labeled every shelf FINAL_REAL_USE_THIS_ONE. Build a small evidence capsule so the Silent Levels clue can travel safely through the annex.")
+PRINT TUI.Status("practice prompts", "ready", "type hint, skip, or quit when needed")
+Continue()
+
+Section("1. Define a tiny class")
+PRINT "Classes group fields and behavior. SELF means the current instance."
+Demo("Create and use an evidence capsule:", "CLASS EvidenceCapsule\nName AS String = \"\"\nRisk AS Number = 0\nCONSTRUCTOR(name AS String, risk AS Number)\nSELF.Name = name\nSELF.Risk = risk\nEND CONSTRUCTOR\nFUNCTION Label() AS String\nRETURN SELF.Name + \" risk=\" + STRING(SELF.Risk)\nEND FUNCTION\nEND CLASS\ncapsule = EvidenceCapsule(\"Silent Levels routing card\", 7)\nPRINT capsule.Label()")
+
+Section("2. Pack the case data")
+PRINT "ArcoCompy packs ArcoBASIC values so scripts can save and restore structured state."
+ok = Tutorial.Step("#IMPORT \"compy\"\ncaseData = {\"Case\": \"Silent Levels\", \"Suspect\": \"The Obfuscator\", \"Risk\": 7} : packed = ArcoCompy.Pack(caseData) : PRINT String.StartsWith(packed, \"ACPY1|\")", "arco")
+
+Section("3. Restore the data")
+Demo("Unpack and read fields:", "#IMPORT \"compy\"\ncaseData = {\"Case\": \"Silent Levels\", \"Suspect\": \"The Obfuscator\", \"Risk\": 7}\npacked = ArcoCompy.Pack(caseData)\nrestored = ArcoCompy.Unpack(packed)\nPRINT TUI.KeyValues(\"Restored\", {\"Case\": restored.Case, \"Suspect\": restored.Suspect, \"Risk\": STRING(restored.Risk)})")
+Continue()
+
+Section("4. Save to the profile directory")
+PRINT "Use the ArcoSH profile directory for tutorial scratch files instead of spraying evidence into random warehouses."
+Demo("Save and reload:", "#IMPORT \"compy\"\npath = Path.Join(ArcoSH.Home(), \"silent-levels-capsule.acpy\")\ncaseData = {\"Case\": \"Silent Levels\", \"Shelf\": \"Warehouse 27\", \"Risk\": 7}\nArcoCompy.Save(path, caseData)\nloaded = ArcoCompy.Load(path)\nPRINT TUI.Status(path, \"saved\", loaded.Case)")
+
+PRINT ""
+PRINT TUI.ThemeBox("circuit", "Mission complete", "You used classes, methods, object fields, ArcoCompy.Pack, ArcoCompy.Unpack, and profile-safe save files.")

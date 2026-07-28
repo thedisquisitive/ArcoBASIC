@@ -1,0 +1,896 @@
+#DESCRIPTION "ArcoWrite WordPad-style editor"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "ArcoWrite needs a Wayland or X11 desktop session."
+    ExitTheProgram(0)
+END IF
+
+title_icon = Path.Join(ArcoSH.AssetsDir(), "arconaut", "title-icon.png")
+initial_path = "untitled.txt"
+IF LEN(Args) > 0 THEN initial_path = Args[0]
+initial_text = ""
+has_path = FALSE
+IF File.Exists(initial_path) THEN
+    initial_text = File.ReadText(initial_path)
+    has_path = TRUE
+END IF
+
+TRY
+    GUI.Application("arcowrite", "ArcoWrite", title_icon)
+    window = GUI.Window("ArcoWrite - " + Path.BaseName(initial_path), 980, 680)
+CATCH err
+    PRINT "ArcoWrite window could not be opened: " + err.Message
+    ExitTheProgram(0)
+END TRY
+
+app = {
+    "Doc": Document.New(initial_text),
+    "Path": initial_path,
+    "HasPath": has_path,
+    "Caret": String.Length(initial_text),
+    "SelectionStart": String.Length(initial_text),
+    "SelectionEnd": String.Length(initial_text),
+    "Selecting": FALSE,
+    "ScrollY": 0,
+    "Dirty": FALSE,
+    "Running": TRUE,
+    "Status": "Ready",
+    "HoverAction": "",
+    "FontSize": 18,
+    "Bold": FALSE,
+    "Italic": FALSE,
+    "Align": "left",
+    "Wrap": TRUE,
+    "FindOpen": FALSE,
+    "FindText": "",
+    "ReplaceText": "",
+    "FindFocus": "find",
+    "PreferredColumn": 0,
+    "Undo": [],
+    "Redo": [],
+}
+
+FUNCTION Text()
+    RETURN Document.Text(app.Doc)
+END FUNCTION
+
+FUNCTION SetText(value)
+    app.Doc.Text = value
+END FUNCTION
+
+FUNCTION Snapshot()
+    ignored = Array.Add(app.Undo, {"Doc": app.Doc, "Caret": app.Caret, "SelectionStart": app.SelectionStart, "SelectionEnd": app.SelectionEnd})
+    WHILE LEN(app.Undo) > 80
+        ignored = Array.Shift(app.Undo)
+    WEND
+    app.Redo = []
+END FUNCTION
+
+FUNCTION SetCaret(offset)
+    app.Caret = offset
+    IF app.Caret < 0 THEN app.Caret = 0
+    IF app.Caret > String.Length(Text()) THEN app.Caret = String.Length(Text())
+    app.SelectionStart = app.Caret
+    app.SelectionEnd = app.Caret
+END FUNCTION
+
+FUNCTION HasSelection()
+    RETURN app.SelectionStart <> app.SelectionEnd
+END FUNCTION
+
+FUNCTION SelectionStart()
+    IF app.SelectionStart < app.SelectionEnd THEN RETURN app.SelectionStart
+    RETURN app.SelectionEnd
+END FUNCTION
+
+FUNCTION SelectionEnd()
+    IF app.SelectionStart > app.SelectionEnd THEN RETURN app.SelectionStart
+    RETURN app.SelectionEnd
+END FUNCTION
+
+FUNCTION ClearSelection()
+    app.SelectionStart = app.Caret
+    app.SelectionEnd = app.Caret
+    app.Selecting = FALSE
+END FUNCTION
+
+FUNCTION MarkDirty(message)
+    app.Dirty = TRUE
+    app.Status = message
+    GUI.SetTitle(window, "ArcoWrite - " + Path.BaseName(app.Path) + " *")
+END FUNCTION
+
+FUNCTION StatsText()
+    content = Text()
+    lines = LEN(String.Split(content, "\n"))
+    words = 0
+    in_word = FALSE
+    i = 0
+    WHILE i < String.Length(content)
+        ch = String.Slice(content, i, 1)
+        IF String.Contains(" \n\r\t", ch) THEN
+            in_word = FALSE
+        ELSE
+            IF in_word == FALSE THEN words = words + 1
+            in_word = TRUE
+        END IF
+        i = i + 1
+    WEND
+    RETURN STRING(lines) + " lines   " + STRING(words) + " words   " + STRING(String.Length(content)) + " chars"
+END FUNCTION
+
+FUNCTION SaveAs()
+    selected = GUI.SaveFileDialog(window, "Save ArcoWrite Document", app.Path)
+    IF selected == "" THEN RETURN FALSE
+    app.Path = selected
+    app.HasPath = TRUE
+    RETURN SaveDocument()
+END FUNCTION
+
+FUNCTION SaveDocument()
+    IF app.HasPath == FALSE THEN RETURN SaveAs()
+    IF String.EndsWith(Lower(app.Path), ".arwrite") THEN
+        Document.Save(app.Path, app.Doc)
+    ELSE
+        File.WriteText(app.Path, Text())
+    END IF
+    app.Dirty = FALSE
+    app.Status = "Saved " + app.Path
+    GUI.SetTitle(window, "ArcoWrite - " + Path.BaseName(app.Path))
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION OpenPath(path)
+    IF path == "" THEN RETURN FALSE
+    IF app.Dirty THEN
+        IF GUI.Confirm(window, "Unsaved changes", "Discard the current document and open another file?") == FALSE THEN RETURN FALSE
+    END IF
+    IF File.Exists(path) == FALSE THEN
+        app.Status = "File does not exist: " + path
+        RETURN FALSE
+    END IF
+    IF String.EndsWith(Lower(path), ".arwrite") THEN
+        app.Doc = Document.Load(path)
+    ELSE
+        app.Doc = Document.New(File.ReadText(path))
+    END IF
+    app.Path = path
+    app.HasPath = TRUE
+    app.Caret = String.Length(Text())
+    ClearSelection()
+    app.ScrollY = 0
+    app.Dirty = FALSE
+    app.Undo = []
+    app.Redo = []
+    app.Status = "Opened " + app.Path
+    GUI.SetTitle(window, "ArcoWrite - " + Path.BaseName(app.Path))
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION OpenDocument()
+    selected = GUI.OpenFileDialog(window, "Open ArcoWrite Document", app.Path)
+    RETURN OpenPath(selected)
+END FUNCTION
+
+FUNCTION NewDocument()
+    IF app.Dirty THEN
+        IF GUI.Confirm(window, "Unsaved changes", "Discard the current document and start another?") == FALSE THEN RETURN FALSE
+    END IF
+    app.Doc = Document.New("")
+    app.Path = "untitled.txt"
+    app.HasPath = FALSE
+    app.Caret = 0
+    ClearSelection()
+    app.ScrollY = 0
+    app.Dirty = FALSE
+    app.Undo = []
+    app.Redo = []
+    app.Status = "New document"
+    GUI.SetTitle(window, "ArcoWrite - untitled.txt")
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION RequestClose()
+    IF app.Dirty THEN
+        IF GUI.Confirm(window, "Unsaved changes", "Close ArcoWrite without saving?") == FALSE THEN
+            GUI.SetShouldClose(window, FALSE)
+            RETURN FALSE
+        END IF
+    END IF
+    app.Running = FALSE
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION InsertText(value)
+    Snapshot()
+    start = app.Caret
+    length = 0
+    IF HasSelection() THEN
+        start = SelectionStart()
+        length = SelectionEnd() - start
+    END IF
+    app.Doc = Document.ReplaceRange(app.Doc, start, length, value)
+    app.Caret = start + String.Length(value)
+    ClearSelection()
+    MarkDirty("Inserted text")
+END FUNCTION
+
+FUNCTION DeleteBackward()
+    IF HasSelection() THEN
+        Snapshot()
+        start = SelectionStart()
+        app.Doc = Document.ReplaceRange(app.Doc, start, SelectionEnd() - start, "")
+        app.Caret = start
+        ClearSelection()
+        MarkDirty("Deleted selection")
+        RETURN TRUE
+    END IF
+    IF app.Caret <= 0 THEN RETURN FALSE
+    Snapshot()
+    app.Doc = Document.ReplaceRange(app.Doc, app.Caret - 1, 1, "")
+    app.Caret = app.Caret - 1
+    ClearSelection()
+    MarkDirty("Deleted text")
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION DeleteForward()
+    IF HasSelection() THEN RETURN DeleteBackward()
+    IF app.Caret >= String.Length(Text()) THEN RETURN FALSE
+    Snapshot()
+    app.Doc = Document.ReplaceRange(app.Doc, app.Caret, 1, "")
+    ClearSelection()
+    MarkDirty("Deleted text")
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION Undo()
+    IF LEN(app.Undo) == 0 THEN RETURN FALSE
+    ignored = Array.Add(app.Redo, {"Doc": app.Doc, "Caret": app.Caret, "SelectionStart": app.SelectionStart, "SelectionEnd": app.SelectionEnd})
+    state = Array.Pop(app.Undo)
+    app.Doc = state.Doc
+    app.Caret = state.Caret
+    app.SelectionStart = state.SelectionStart
+    app.SelectionEnd = state.SelectionEnd
+    MarkDirty("Undo")
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION Redo()
+    IF LEN(app.Redo) == 0 THEN RETURN FALSE
+    ignored = Array.Add(app.Undo, {"Doc": app.Doc, "Caret": app.Caret, "SelectionStart": app.SelectionStart, "SelectionEnd": app.SelectionEnd})
+    state = Array.Pop(app.Redo)
+    app.Doc = state.Doc
+    app.Caret = state.Caret
+    app.SelectionStart = state.SelectionStart
+    app.SelectionEnd = state.SelectionEnd
+    MarkDirty("Redo")
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION CopyAll()
+    IF HasSelection() THEN
+        GUI.SetClipboardText(window, String.Slice(Text(), SelectionStart(), SelectionEnd() - SelectionStart()))
+        app.Status = "Copied selection"
+    ELSE
+        GUI.SetClipboardText(window, Text())
+        app.Status = "Copied document text"
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION CutAll()
+    IF HasSelection() THEN
+        Snapshot()
+        start = SelectionStart()
+        GUI.SetClipboardText(window, String.Slice(Text(), start, SelectionEnd() - start))
+        app.Doc = Document.ReplaceRange(app.Doc, start, SelectionEnd() - start, "")
+        app.Caret = start
+        ClearSelection()
+        MarkDirty("Cut selection")
+        RETURN TRUE
+    END IF
+    Snapshot()
+    GUI.SetClipboardText(window, Text())
+    SetText("")
+    app.Caret = 0
+    ClearSelection()
+    MarkDirty("Cut document text")
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION PasteText()
+    value = GUI.ClipboardText(window)
+    IF value == "" THEN RETURN FALSE
+    InsertText(value)
+    app.Status = "Pasted clipboard text"
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ApplyFormat()
+    IF HasSelection() == FALSE THEN
+        app.Status = "Select text to apply formatting"
+        RETURN FALSE
+    END IF
+    Snapshot()
+    app.Doc = Document.ApplyFormat(app.Doc, SelectionStart(), SelectionEnd() - SelectionStart(), {"Bold": app.Bold, "Italic": app.Italic, "FontSize": app.FontSize, "Align": app.Align})
+    MarkDirty("Applied formatting")
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ApplyParagraphAlignment(value)
+    app.Align = value
+    start = SelectionStart()
+    finish = SelectionEnd()
+    IF HasSelection() == FALSE THEN
+        pos = Document.LineColumnAt(app.Doc, app.Caret)
+        start = Document.OffsetAtLineColumn(app.Doc, pos.Line, 0)
+        finish = Document.OffsetAtLineColumn(app.Doc, pos.Line + 1, 0)
+    END IF
+    IF finish <= start THEN finish = start + 1
+    Snapshot()
+    app.Doc = Document.ApplyFormat(app.Doc, start, finish - start, {"Bold": app.Bold, "Italic": app.Italic, "FontSize": app.FontSize, "Align": app.Align})
+    MarkDirty("Aligned " + value)
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION OpenFindBar()
+    app.FindOpen = TRUE
+    app.FindFocus = "find"
+    app.Status = "Find"
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION FindNext()
+    IF app.FindText == "" THEN app.Status = "Enter find text" : RETURN FALSE
+    start = app.Caret
+    IF HasSelection() THEN start = SelectionEnd()
+    found = String.IndexOf(Text(), app.FindText, start)
+    IF found < 0 AND start > 0 THEN found = String.IndexOf(Text(), app.FindText, 0)
+    IF found < 0 THEN app.Status = "Not found: " + app.FindText : RETURN FALSE
+    app.Caret = found + String.Length(app.FindText)
+    app.SelectionStart = found
+    app.SelectionEnd = app.Caret
+    EnsureCaretVisible()
+    app.Status = "Found " + app.FindText
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ReplaceNext()
+    IF app.FindText == "" THEN app.Status = "Enter find text" : RETURN FALSE
+    selected = ""
+    IF HasSelection() THEN selected = String.Slice(Text(), SelectionStart(), SelectionEnd() - SelectionStart())
+    IF selected <> app.FindText THEN RETURN FindNext()
+    Snapshot()
+    start = SelectionStart()
+    app.Doc = Document.ReplaceRange(app.Doc, start, SelectionEnd() - start, app.ReplaceText)
+    app.Caret = start + String.Length(app.ReplaceText)
+    ClearSelection()
+    MarkDirty("Replaced text")
+    ignored = FindNext()
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION HandleFindText(value)
+    IF app.FindFocus == "replace" THEN
+        app.ReplaceText = app.ReplaceText + value
+    ELSE
+        app.FindText = app.FindText + value
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION HandleFindKey(event)
+    IF event.Key == "escape" THEN app.FindOpen = FALSE : app.Status = "Ready" : RETURN TRUE
+    IF event.Key == "tab" THEN
+        IF app.FindFocus == "find" THEN app.FindFocus = "replace" ELSE app.FindFocus = "find"
+        RETURN TRUE
+    END IF
+    IF event.Key == "enter" THEN
+        IF event.Ctrl THEN RETURN ReplaceNext()
+        RETURN FindNext()
+    END IF
+    IF event.Key == "backspace" THEN
+        IF app.FindFocus == "replace" AND String.Length(app.ReplaceText) > 0 THEN app.ReplaceText = String.Slice(app.ReplaceText, 0, String.Length(app.ReplaceText) - 1)
+        IF app.FindFocus <> "replace" AND String.Length(app.FindText) > 0 THEN app.FindText = String.Slice(app.FindText, 0, String.Length(app.FindText) - 1)
+        RETURN TRUE
+    END IF
+    RETURN FALSE
+END FUNCTION
+
+FUNCTION Activate(action)
+    IF action == "new" THEN RETURN NewDocument()
+    IF action == "open" THEN RETURN OpenDocument()
+    IF action == "save" THEN RETURN SaveDocument()
+    IF action == "saveas" THEN RETURN SaveAs()
+    IF action == "undo" THEN RETURN Undo()
+    IF action == "redo" THEN RETURN Redo()
+    IF action == "cut" THEN RETURN CutAll()
+    IF action == "copy" THEN RETURN CopyAll()
+    IF action == "paste" THEN RETURN PasteText()
+    IF action == "b" THEN app.Bold = NOT app.Bold : ignored = ApplyFormat() : app.Status = "Bold " + STRING(app.Bold) : RETURN TRUE
+    IF action == "i" THEN app.Italic = NOT app.Italic : ignored = ApplyFormat() : app.Status = "Italic " + STRING(app.Italic) : RETURN TRUE
+    IF action == "minus" THEN
+        IF app.FontSize > 10 THEN app.FontSize = app.FontSize - 1
+        ignored = ApplyFormat()
+        RETURN TRUE
+    END IF
+    IF action == "plus" THEN
+        IF app.FontSize < 40 THEN app.FontSize = app.FontSize + 1
+        ignored = ApplyFormat()
+        RETURN TRUE
+    END IF
+    IF action == "wrap" THEN app.Wrap = NOT app.Wrap : app.Status = "Wrap " + STRING(app.Wrap) : RETURN TRUE
+    IF action == "find" THEN RETURN OpenFindBar()
+    IF action == "leftalign" THEN RETURN ApplyParagraphAlignment("left")
+    IF action == "centeralign" THEN RETURN ApplyParagraphAlignment("center")
+    IF action == "rightalign" THEN RETURN ApplyParagraphAlignment("right")
+    RETURN FALSE
+END FUNCTION
+
+FUNCTION ToolbarActionAt(x, y)
+    IF y < 10 OR y > 50 THEN RETURN ""
+    names = ["new", "open", "save", "saveas", "undo", "redo", "cut", "copy", "paste", "b", "i", "minus", "plus", "wrap", "find", "leftalign", "centeralign", "rightalign"]
+    index = (x - 14) / 52
+    IF index < 0 OR index >= LEN(names) THEN RETURN ""
+    RETURN names[index]
+END FUNCTION
+
+FUNCTION EditorX()
+    RETURN 22
+END FUNCTION
+
+FUNCTION EditorY()
+    IF app.FindOpen THEN RETURN 126
+    RETURN 82
+END FUNCTION
+
+FUNCTION LineHeight()
+    RETURN app.FontSize + 6
+END FUNCTION
+
+FUNCTION EditorWidth()
+    size = GUI.Size(window)
+    RETURN size.Width - 80
+END FUNCTION
+
+FUNCTION EditorHeight()
+    size = GUI.Size(window)
+    RETURN size.Height - EditorY() - 50
+END FUNCTION
+
+FUNCTION ClampScroll()
+    rows = VisualLines()
+    max_scroll = LEN(rows) * LineHeight() - EditorHeight() + 24
+    IF max_scroll < 0 THEN max_scroll = 0
+    IF app.ScrollY < 0 THEN app.ScrollY = 0
+    IF app.ScrollY > max_scroll THEN app.ScrollY = max_scroll
+END FUNCTION
+
+FUNCTION VisualLines()
+    rows = []
+    lines = String.Split(Text(), "\n")
+    max_width = EditorWidth() - 38
+    line_number = 0
+    FOR text_line IN lines
+        line_length = String.Length(text_line)
+        IF app.Wrap == FALSE THEN
+            ignored = Array.Add(rows, {"Text": text_line, "Line": line_number, "Column": 0, "Offset": Document.OffsetAtLineColumn(app.Doc, line_number, 0), "Align": AlignAt(Document.OffsetAtLineColumn(app.Doc, line_number, 0))})
+        ELSE
+            column = 0
+            IF line_length == 0 THEN
+                ignored = Array.Add(rows, {"Text": "", "Line": line_number, "Column": 0, "Offset": Document.OffsetAtLineColumn(app.Doc, line_number, 0), "Align": AlignAt(Document.OffsetAtLineColumn(app.Doc, line_number, 0))})
+            END IF
+            WHILE column < line_length
+                next_column = column + 1
+                best_column = next_column
+                WHILE next_column <= line_length
+                    segment = String.Slice(text_line, column, next_column - column)
+                    measure = GUI.MeasureText(window, segment, app.FontSize)
+                    IF measure.Width > max_width AND next_column > column + 1 THEN
+                        next_column = line_length + 1
+                    ELSE
+                        best_column = next_column
+                        next_column = next_column + 1
+                    END IF
+                WEND
+                row_offset = Document.OffsetAtLineColumn(app.Doc, line_number, column)
+                ignored = Array.Add(rows, {"Text": String.Slice(text_line, column, best_column - column), "Line": line_number, "Column": column, "Offset": row_offset, "Align": AlignAt(row_offset)})
+                column = best_column
+            WEND
+        END IF
+        line_number = line_number + 1
+    NEXT
+    RETURN rows
+END FUNCTION
+
+FUNCTION AlignAt(offset)
+    runs = Document.Runs(app.Doc)
+    FOR style_run IN runs
+        run_start = style_run.Start
+        run_end = style_run.Start + style_run.Length
+        IF offset >= run_start AND offset <= run_end THEN RETURN Object.Get(style_run, "Align", "left")
+    NEXT
+    RETURN "left"
+END FUNCTION
+
+FUNCTION RowX(row)
+    x = EditorX() + 18
+    align = Object.Get(row, "Align", "left")
+    IF align == "center" THEN
+        measure = GUI.MeasureText(window, row.Text, app.FontSize)
+        x = EditorX() + 18 + (EditorWidth() - 38 - measure.Width) / 2
+    END IF
+    IF align == "right" THEN
+        measure = GUI.MeasureText(window, row.Text, app.FontSize)
+        x = EditorX() + 18 + (EditorWidth() - 38 - measure.Width)
+    END IF
+    IF x < EditorX() + 18 THEN x = EditorX() + 18
+    RETURN x
+END FUNCTION
+
+FUNCTION VisualRowAtOffset(offset)
+    rows = VisualLines()
+    index = 0
+    best = 0
+    FOR row IN rows
+        row_start = row.Offset
+        row_end = row.Offset + String.Length(row.Text)
+        IF offset >= row_start AND offset <= row_end THEN RETURN index
+        IF row_start <= offset THEN best = index
+        index = index + 1
+    NEXT
+    RETURN best
+END FUNCTION
+
+FUNCTION MoveCaretTo(offset, extend)
+    IF offset < 0 THEN offset = 0
+    IF offset > String.Length(Text()) THEN offset = String.Length(Text())
+    IF extend THEN
+        IF HasSelection() == FALSE THEN app.SelectionStart = app.Caret
+        app.Caret = offset
+        app.SelectionEnd = app.Caret
+    ELSE
+        app.Caret = offset
+        ClearSelection()
+    END IF
+    EnsureCaretVisible()
+END FUNCTION
+
+FUNCTION EnsureCaretVisible()
+    row_index = VisualRowAtOffset(app.Caret)
+    y = row_index * LineHeight()
+    IF y - app.ScrollY < 0 THEN app.ScrollY = y
+    IF y - app.ScrollY > EditorHeight() - LineHeight() THEN app.ScrollY = y - EditorHeight() + LineHeight()
+    ClampScroll()
+END FUNCTION
+
+FUNCTION MoveVisualRows(delta, extend)
+    rows = VisualLines()
+    IF LEN(rows) == 0 THEN RETURN FALSE
+    row_index = VisualRowAtOffset(app.Caret)
+    row = rows[row_index]
+    column = app.Caret - row.Offset
+    target_index = row_index + delta
+    IF target_index < 0 THEN target_index = 0
+    IF target_index >= LEN(rows) THEN target_index = LEN(rows) - 1
+    target = rows[target_index]
+    target_column = column
+    IF target_column > String.Length(target.Text) THEN target_column = String.Length(target.Text)
+    MoveCaretTo(target.Offset + target_column, extend)
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION MoveHome(extend)
+    rows = VisualLines()
+    row = rows[VisualRowAtOffset(app.Caret)]
+    MoveCaretTo(row.Offset, extend)
+END FUNCTION
+
+FUNCTION MoveEnd(extend)
+    rows = VisualLines()
+    row = rows[VisualRowAtOffset(app.Caret)]
+    MoveCaretTo(row.Offset + String.Length(row.Text), extend)
+END FUNCTION
+
+FUNCTION PreviousWord()
+    content = Text()
+    pos = app.Caret - 1
+    WHILE pos > 0 AND String.Contains(" \n\r\t", String.Slice(content, pos, 1))
+        pos = pos - 1
+    WEND
+    WHILE pos > 0 AND String.Contains(" \n\r\t", String.Slice(content, pos - 1, 1)) == FALSE
+        pos = pos - 1
+    WEND
+    RETURN pos
+END FUNCTION
+
+FUNCTION NextWord()
+    content = Text()
+    pos = app.Caret
+    WHILE pos < String.Length(content) AND String.Contains(" \n\r\t", String.Slice(content, pos, 1)) == FALSE
+        pos = pos + 1
+    WEND
+    WHILE pos < String.Length(content) AND String.Contains(" \n\r\t", String.Slice(content, pos, 1))
+        pos = pos + 1
+    WEND
+    RETURN pos
+END FUNCTION
+
+FUNCTION OffsetAtPoint(x, y)
+    row_index = FLOOR((y - EditorY() - 16 + app.ScrollY) / LineHeight())
+    rows = VisualLines()
+    IF row_index < 0 THEN row_index = 0
+    IF row_index >= LEN(rows) THEN row_index = LEN(rows) - 1
+    IF row_index < 0 THEN RETURN 0
+    row = rows[row_index]
+    rel_x = x - RowX(row)
+    IF rel_x <= 0 THEN RETURN row.Offset
+    text_line = row.Text
+    col = 0
+    WHILE col <= String.Length(text_line)
+        sample = String.Slice(text_line, 0, col)
+        measure = GUI.MeasureText(window, sample, app.FontSize)
+        IF measure.Width >= rel_x THEN RETURN row.Offset + col
+        col = col + 1
+    WEND
+    RETURN row.Offset + String.Length(text_line)
+END FUNCTION
+
+FUNCTION DrawSelection()
+    IF HasSelection() == FALSE THEN RETURN FALSE
+    start = SelectionStart()
+    finish = SelectionEnd()
+    rows = VisualLines()
+    row_index = 0
+    FOR row IN rows
+        row_start = row.Offset
+        row_end = row.Offset + String.Length(row.Text)
+        IF finish >= row_start AND start <= row_end THEN
+            col_start = 0
+            col_end = String.Length(row.Text)
+            IF start > row_start THEN col_start = start - row_start
+            IF finish < row_end THEN col_end = finish - row_start
+            before = String.Slice(row.Text, 0, col_start)
+            selected = String.Slice(row.Text, col_start, col_end - col_start)
+            before_size = GUI.MeasureText(window, before, app.FontSize)
+            selected_size = GUI.MeasureText(window, selected, app.FontSize)
+            x = RowX(row) + before_size.Width
+            y = EditorY() + 17 + row_index * LineHeight() - app.ScrollY
+            width = selected_size.Width
+            IF width < 3 THEN width = 3
+            GUI.Rectangle(window, x, y, width, app.FontSize + 4, 0.42, 0.66, 0.92, 0.55)
+        END IF
+        row_index = row_index + 1
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION DrawFormatRuns()
+    runs = Document.Runs(app.Doc)
+    rows = VisualLines()
+    FOR style_run IN runs
+        run_start = style_run.Start
+        run_end = style_run.Start + style_run.Length
+        font_size = Object.Get(style_run, "FontSize", app.FontSize)
+        bold = Object.Get(style_run, "Bold", FALSE)
+        italic = Object.Get(style_run, "Italic", FALSE)
+        row_index = 0
+        FOR row IN rows
+            row_start = row.Offset
+            row_end = row.Offset + String.Length(row.Text)
+            IF run_end >= row_start AND run_start <= row_end THEN
+                col_start = 0
+                col_end = String.Length(row.Text)
+                IF run_start > row_start THEN col_start = run_start - row_start
+                IF run_end < row_end THEN col_end = run_end - row_start
+                before = String.Slice(row.Text, 0, col_start)
+                segment = String.Slice(row.Text, col_start, col_end - col_start)
+                before_size = GUI.MeasureText(window, before, app.FontSize)
+                x = RowX(row) + before_size.Width
+                y = EditorY() + 16 + row_index * LineHeight() - app.ScrollY
+                red = 0.02
+                green = 0.02
+                blue = 0.02
+                IF italic THEN blue = 0.30
+                IF bold THEN
+                    GUI.Text(window, segment, x + 1, y, font_size, red, green, blue)
+                END IF
+                GUI.Text(window, segment, x, y, font_size, red, green, blue)
+            END IF
+            row_index = row_index + 1
+        NEXT
+    NEXT
+END FUNCTION
+
+FUNCTION DrawPlainRows()
+    rows = VisualLines()
+    row_index = 0
+    FOR row IN rows
+        y = EditorY() + 16 + row_index * LineHeight() - app.ScrollY
+        IF y > EditorY() - LineHeight() AND y < EditorY() + EditorHeight() THEN
+            GUI.Text(window, row.Text, RowX(row), y, app.FontSize, 0.08, 0.08, 0.08)
+        END IF
+        row_index = row_index + 1
+    NEXT
+END FUNCTION
+
+FUNCTION DrawCaret()
+    rows = VisualLines()
+    row_index = VisualRowAtOffset(app.Caret)
+    IF row_index < 0 OR row_index >= LEN(rows) THEN RETURN FALSE
+    row = rows[row_index]
+    column = app.Caret - row.Offset
+    IF column < 0 THEN column = 0
+    IF column > String.Length(row.Text) THEN column = String.Length(row.Text)
+    before = String.Slice(row.Text, 0, column)
+    measure = GUI.MeasureText(window, before, app.FontSize)
+    caret_x = RowX(row) + measure.Width
+    caret_y = EditorY() + 17 + row_index * LineHeight() - app.ScrollY
+    GUI.Rectangle(window, caret_x, caret_y, 2, app.FontSize + 3, 0.1, 0.38, 0.72)
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION DrawButton(x, label, action)
+    selected = FALSE
+    IF action == "b" AND app.Bold THEN selected = TRUE
+    IF action == "i" AND app.Italic THEN selected = TRUE
+    IF action == "wrap" AND app.Wrap THEN selected = TRUE
+    IF action == "leftalign" AND app.Align == "left" THEN selected = TRUE
+    IF action == "centeralign" AND app.Align == "center" THEN selected = TRUE
+    IF action == "rightalign" AND app.Align == "right" THEN selected = TRUE
+    IF app.HoverAction == action OR selected THEN
+        GUI.RoundedRectangle(window, x, 10, 46, 40, 6, 0.20, 0.40, 0.62)
+    ELSE
+        GUI.RoundedRectangle(window, x, 10, 46, 40, 6, 0.12, 0.14, 0.18)
+    END IF
+    GUI.Text(window, label, x + 7, 21, 13, 0.88, 0.92, 0.96)
+END FUNCTION
+
+FUNCTION DrawToolbar()
+    size = GUI.Size(window)
+    GUI.Rectangle(window, 0, 0, size.Width, 62, 0.075, 0.082, 0.105)
+    labels = ["New", "Open", "Save", "As", "Undo", "Redo", "Cut", "Copy", "Paste", "B", "I", "-", "+", "Wrap", "Find", "L", "C", "R"]
+    actions = ["new", "open", "save", "saveas", "undo", "redo", "cut", "copy", "paste", "b", "i", "minus", "plus", "wrap", "find", "leftalign", "centeralign", "rightalign"]
+    row = 0
+    FOR label IN labels
+        DrawButton(14 + row * 52, label, actions[row])
+        row = row + 1
+    NEXT
+END FUNCTION
+
+FUNCTION DrawFindBar()
+    IF app.FindOpen == FALSE THEN RETURN FALSE
+    size = GUI.Size(window)
+    GUI.Rectangle(window, 0, 62, size.Width, 48, 0.90, 0.92, 0.95)
+    find_red = 1.0
+    replace_red = 1.0
+    IF app.FindFocus == "find" THEN find_red = 0.78
+    IF app.FindFocus == "replace" THEN replace_red = 0.78
+    GUI.Text(window, "Find", 20, 78, 14, 0.12, 0.15, 0.18)
+    GUI.RoundedRectangle(window, 60, 72, 260, 28, 5, find_red, 1.0, 1.0)
+    GUI.Text(window, app.FindText, 68, 78, 14, 0.05, 0.06, 0.08)
+    GUI.Text(window, "Replace", 340, 78, 14, 0.12, 0.15, 0.18)
+    GUI.RoundedRectangle(window, 410, 72, 260, 28, 5, replace_red, 1.0, 1.0)
+    GUI.Text(window, app.ReplaceText, 418, 78, 14, 0.05, 0.06, 0.08)
+    GUI.Text(window, "Enter=find  Ctrl+Enter=replace  Tab=switch  Esc=close", 690, 78, 13, 0.28, 0.34, 0.42)
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION DrawEditor()
+    size = GUI.Size(window)
+    editor_x = EditorX()
+    editor_y = EditorY()
+    editor_w = size.Width - 44
+    editor_h = EditorHeight()
+    GUI.RoundedRectangle(window, editor_x, editor_y, editor_w, editor_h, 7, 0.96, 0.97, 0.985)
+    GUI.SetClip(window, editor_x + 16, editor_y + 12, editor_w - 32, editor_h - 24)
+    ignored = DrawSelection()
+    DrawPlainRows()
+    DrawFormatRuns()
+    ignored = DrawCaret()
+    GUI.ResetClip(window)
+END FUNCTION
+
+FUNCTION DrawStatus()
+    size = GUI.Size(window)
+    GUI.Rectangle(window, 0, size.Height - 38, size.Width, 38, 0.075, 0.082, 0.105)
+    GUI.Text(window, app.Status, 18, size.Height - 27, 13, 0.68, 0.76, 0.86)
+    GUI.Text(window, StatsText(), size.Width - 330, size.Height - 27, 13, 0.48, 0.56, 0.68)
+END FUNCTION
+
+WHILE app.Running
+    size = GUI.Size(window)
+    GUI.Clear(window, 0.82, 0.84, 0.88)
+    DrawToolbar()
+    ignored = DrawFindBar()
+    DrawEditor()
+    DrawStatus()
+    GUI.Present(window)
+
+    event = GUI.WaitEvent(0.04)
+    IF event.Type == "close" THEN ignored = RequestClose()
+    IF event.Type == "text" THEN
+        IF app.FindOpen THEN ignored = HandleFindText(event.Text) ELSE InsertText(event.Text)
+    END IF
+    IF event.Type == "scroll" THEN
+        app.ScrollY = app.ScrollY - event.DeltaY * 34
+        ClampScroll()
+    END IF
+    IF event.Type == "pointer-move" THEN
+        app.HoverAction = ToolbarActionAt(event.X, event.Y)
+        IF app.Selecting THEN
+            app.Caret = OffsetAtPoint(event.X, event.Y)
+            app.SelectionEnd = app.Caret
+        END IF
+        IF app.HoverAction == "" THEN GUI.SetCursor(window, "text") ELSE GUI.SetCursor(window, "hand")
+    END IF
+    IF event.Type == "pointer-button" THEN
+        IF event.Button == "left" THEN
+            IF event.Action == "press" THEN
+                action = ToolbarActionAt(event.X, event.Y)
+                IF action <> "" THEN
+                    ignored = Activate(action)
+                ELSE
+                    IF app.FindOpen AND event.Y >= 62 AND event.Y <= 110 THEN
+                        IF event.X >= 410 THEN app.FindFocus = "replace" ELSE app.FindFocus = "find"
+                    ELSE
+                        app.Caret = OffsetAtPoint(event.X, event.Y)
+                        IF event.Shift THEN
+                            app.SelectionEnd = app.Caret
+                        ELSE
+                            app.SelectionStart = app.Caret
+                            app.SelectionEnd = app.Caret
+                        END IF
+                        app.Selecting = TRUE
+                    END IF
+                END IF
+            END IF
+            IF event.Action == "release" THEN
+                app.Selecting = FALSE
+            END IF
+        END IF
+    END IF
+    IF event.Type == "key" THEN
+        IF event.Action == "press" OR event.Action == "repeat" THEN
+            handled = FALSE
+            IF app.FindOpen THEN handled = HandleFindKey(event)
+            IF handled == FALSE THEN
+                IF event.Key == "escape" THEN ignored = RequestClose()
+                IF event.Key == "left" THEN
+                    IF event.Ctrl THEN MoveCaretTo(PreviousWord(), event.Shift) ELSE MoveCaretTo(app.Caret - 1, event.Shift)
+                END IF
+                IF event.Key == "right" THEN
+                    IF event.Ctrl THEN MoveCaretTo(NextWord(), event.Shift) ELSE MoveCaretTo(app.Caret + 1, event.Shift)
+                END IF
+                IF event.Key == "up" THEN ignored = MoveVisualRows(-1, event.Shift)
+                IF event.Key == "down" THEN ignored = MoveVisualRows(1, event.Shift)
+                IF event.Key == "pageup" THEN ignored = MoveVisualRows(0 - FLOOR(EditorHeight() / LineHeight()), event.Shift)
+                IF event.Key == "pagedown" THEN ignored = MoveVisualRows(FLOOR(EditorHeight() / LineHeight()), event.Shift)
+                IF event.Key == "home" THEN MoveHome(event.Shift)
+                IF event.Key == "end" THEN MoveEnd(event.Shift)
+                IF event.Key == "backspace" THEN ignored = DeleteBackward()
+                IF event.Key == "delete" THEN ignored = DeleteForward()
+                IF event.Key == "enter" THEN InsertText("\n")
+            END IF
+            IF event.Ctrl AND handled == FALSE THEN
+                IF event.Key == "n" THEN ignored = NewDocument()
+                IF event.Key == "o" THEN ignored = OpenDocument()
+                IF event.Key == "s" THEN ignored = SaveDocument()
+                IF event.Key == "z" THEN ignored = Undo()
+                IF event.Key == "y" THEN ignored = Redo()
+                IF event.Key == "x" THEN ignored = CutAll()
+                IF event.Key == "c" THEN ignored = CopyAll()
+                IF event.Key == "v" THEN ignored = PasteText()
+                IF event.Key == "f" THEN ignored = OpenFindBar()
+                IF event.Key == "h" THEN ignored = ReplaceNext()
+                IF event.Key == "b" THEN ignored = Activate("b")
+                IF event.Key == "i" THEN ignored = Activate("i")
+                IF event.Key == "q" THEN ignored = RequestClose()
+            END IF
+        END IF
+    END IF
+    IF GUI.ShouldClose(window) THEN ignored = RequestClose()
+WEND
+
+GUI.Close(window)

@@ -945,6 +945,18 @@ Static HTML export is available before the live web server exists:
 arcosh examples/arcology_export_site.abas arcology.arcodb dist/arcology
 ```
 
+Serve that static UI from ArcoBASIC:
+
+```sh
+scripts/serve-arcology.sh
+```
+
+Or choose paths and a port explicitly:
+
+```sh
+arcosh examples/arcology_serve_static.abas arcology.arcodb dist/arcology 8080
+```
+
 ---
 
 # Safe References

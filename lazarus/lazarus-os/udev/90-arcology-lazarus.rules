@@ -1,0 +1,7 @@
+# Arcology Lazarus OS udev rules.
+# The Lazarus application enforces source/destination roles from the bench profile.
+# These rules keep devices visible to the service while avoiding desktop-style automount hints.
+
+SUBSYSTEM=="block", ENV{UDISKS_IGNORE}="1"
+SUBSYSTEM=="block", ENV{UDISKS_AUTO}="0"
+SUBSYSTEM=="block", ENV{LazarusManaged}="1"

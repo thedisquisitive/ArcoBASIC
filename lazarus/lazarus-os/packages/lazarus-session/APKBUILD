@@ -1,0 +1,18 @@
+# Contributor: Arcology
+# Maintainer: Arcology
+pkgname=lazarus-session
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Arcology Lazarus kiosk X session"
+url="https://example.invalid/arcology-lazarus"
+arch="noarch"
+license="custom"
+depends="openrc xorg-server xinit arcology-lazarus"
+source="lazarus-session.initd lazarus-kiosk xinitrc"
+options="!check"
+
+package() {
+	install -Dm755 "$srcdir/lazarus-session.initd" "$pkgdir/etc/init.d/lazarus-session"
+	install -Dm755 "$srcdir/lazarus-kiosk" "$pkgdir/usr/local/bin/lazarus-kiosk"
+	install -Dm755 "$srcdir/xinitrc" "$pkgdir/etc/X11/xinit/xinitrc"
+}

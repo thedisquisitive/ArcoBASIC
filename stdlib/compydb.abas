@@ -1,0 +1,132 @@
+' ArcoCompyDB: schema-aware record packing for future ArcoDB storage.
+'
+' This is not the full database engine. It is the compact record layer:
+' known schema fields are stored by position, not by repeated field names.
+
+#IMPORT "compy"
+
+FUNCTION ArcoCompyDB.Format()
+    RETURN "ACDB1"
+END FUNCTION
+
+FUNCTION ArcoCompyDB.Schema(className, fields)
+    RETURN {"Class": className, "Version": 1, "Fields": fields}
+END FUNCTION
+
+FUNCTION ArcoCompyDB.SchemaVersion(className, fields, version)
+    RETURN {"Class": className, "Version": version, "Fields": fields}
+END FUNCTION
+
+FUNCTION ArcoCompyDB.EmptyRecord(schema)
+    record = {"__class": schema.Class, "__version": schema.Version}
+    FOR field IN schema.Fields
+        record = Object.Set(record, field, NULL)
+    NEXT
+    RETURN record
+END FUNCTION
+
+FUNCTION ArcoCompyDB.PackRecord(schema, value)
+    fields = schema.Fields
+    extras = Object.Get(value, "__unknown_values", [])
+    count = LEN(fields) + LEN(extras)
+    output = ArcoCompyDB.Format() + "|"
+    output = output + ArcoCompy.StringBody(schema.Class)
+    output = output + "N" + STRING(schema.Version) + ";"
+    output = output + "A" + STRING(count) + ":"
+
+    FOR field IN fields
+        output = output + ArcoCompy.PackValue(Object.Get(value, field, NULL))
+    NEXT
+
+    FOR extra IN extras
+        output = output + ArcoCompy.PackValue(extra)
+    NEXT
+
+    RETURN output
+END FUNCTION
+
+FUNCTION ArcoCompyDB.TryUnpackRecordWithLimits(schema, payload, maxDepth, maxItems)
+    prefix = ArcoCompyDB.Format() + "|"
+    IF String.StartsWith(payload, prefix) == FALSE THEN
+        RETURN {"Ok": FALSE, "Value": NULL, "Version": 0, "UnknownValues": [], "Error": "missing ACDB1 header"}
+    END IF
+
+    state = {"Text": payload, "Pos": String.Length(prefix), "Error": "", "MaxDepth": maxDepth, "MaxItems": maxItems}
+    TRY
+        classTag = ArcoCompy.ReadChar(state)
+        IF classTag <> "S" THEN
+            RETURN {"Ok": FALSE, "Value": NULL, "Version": 0, "UnknownValues": [], "Error": "record class name is missing"}
+        END IF
+        className = ArcoCompy.UnpackStringBody(state)
+        IF state.Error <> "" THEN
+            RETURN {"Ok": FALSE, "Value": NULL, "Version": 0, "UnknownValues": [], "Error": state.Error}
+        END IF
+        IF className <> schema.Class THEN
+            RETURN {"Ok": FALSE, "Value": NULL, "Version": 0, "UnknownValues": [], "Error": "record class " + className + " does not match schema " + schema.Class}
+        END IF
+
+        versionTag = ArcoCompy.ReadChar(state)
+        IF versionTag <> "N" THEN
+            RETURN {"Ok": FALSE, "Value": NULL, "Version": 0, "UnknownValues": [], "Error": "record version is missing"}
+        END IF
+        version = NUMBER(ArcoCompy.ReadUntil(state, ";"))
+
+        arrayTag = ArcoCompy.ReadChar(state)
+        IF arrayTag <> "A" THEN
+            RETURN {"Ok": FALSE, "Value": NULL, "Version": version, "UnknownValues": [], "Error": "record values are missing"}
+        END IF
+        count = ArcoCompy.ReadCount(state, "record")
+        IF state.Error <> "" THEN
+            RETURN {"Ok": FALSE, "Value": NULL, "Version": version, "UnknownValues": [], "Error": state.Error}
+        END IF
+        IF count < LEN(schema.Fields) THEN
+            RETURN {"Ok": FALSE, "Value": NULL, "Version": version, "UnknownValues": [], "Error": "record has fewer values than schema fields"}
+        END IF
+
+        record = {"__class": schema.Class, "__version": version}
+        unknown = []
+        index = 0
+        WHILE index < count
+            item = ArcoCompy.UnpackValueAtDepth(state, 0)
+            IF state.Error <> "" THEN
+                RETURN {"Ok": FALSE, "Value": NULL, "Version": version, "UnknownValues": unknown, "Error": state.Error}
+            END IF
+            IF index < LEN(schema.Fields) THEN
+                record = Object.Set(record, schema.Fields[index], item)
+            ELSE
+                ignored = Array.Push(unknown, item)
+            END IF
+            index = index + 1
+        WEND
+
+        IF state.Pos <> String.Length(state.Text) THEN
+            RETURN {"Ok": FALSE, "Value": NULL, "Version": version, "UnknownValues": unknown, "Error": "trailing data after ACDB record"}
+        END IF
+
+        IF LEN(unknown) > 0 THEN
+            record = Object.Set(record, "__unknown_values", unknown)
+        END IF
+        RETURN {"Ok": TRUE, "Value": record, "Version": version, "UnknownValues": unknown, "Error": ""}
+    CATCH err
+        RETURN {"Ok": FALSE, "Value": NULL, "Version": 0, "UnknownValues": [], "Error": err.Message}
+    END TRY
+END FUNCTION
+
+FUNCTION ArcoCompyDB.TryUnpackRecord(schema, payload)
+    RETURN ArcoCompyDB.TryUnpackRecordWithLimits(schema, payload, ArcoCompy.DefaultMaxDepth(), ArcoCompy.DefaultMaxItems())
+END FUNCTION
+
+FUNCTION ArcoCompyDB.UnpackRecord(schema, payload)
+    result = ArcoCompyDB.TryUnpackRecord(schema, payload)
+    IF result.Ok THEN RETURN result.Value
+    RETURN NULL
+END FUNCTION
+
+FUNCTION ArcoCompyDB.SaveRecord(path, schema, value)
+    File.WriteText(path, ArcoCompyDB.PackRecord(schema, value))
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoCompyDB.LoadRecord(path, schema)
+    RETURN ArcoCompyDB.UnpackRecord(schema, File.ReadText(path))
+END FUNCTION

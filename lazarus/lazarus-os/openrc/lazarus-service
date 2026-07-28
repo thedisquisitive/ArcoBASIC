@@ -1,0 +1,30 @@
+#!/sbin/openrc-run
+
+name="Arcology Lazarus service"
+description="Privileged backend for Arcology Lazarus imaging operations"
+command="/usr/sbin/lazarus-service"
+command_args="--config /etc/arcology-lazarus/bench.profile --socket /run/arcology-lazarus/service.sock"
+command_background="yes"
+pidfile="/run/arcology-lazarus/lazarus-service.pid"
+output_log="/var/log/arcology-lazarus/service.log"
+error_log="/var/log/arcology-lazarus/service.log"
+
+depend() {
+	need localmount dev-settle
+	use lazarus-storage
+	after udev-trigger hwdrivers
+	before lazarus-session
+}
+
+start_pre() {
+	checkpath -d -m 0755 /run/arcology-lazarus
+	checkpath -d -m 0750 -o root:lazarus /var/lib/arcology-lazarus
+	checkpath -d -m 0750 -o root:lazarus /var/log/arcology-lazarus
+	if [ -w /dev/ttyS0 ]; then
+		echo "lazarus-hardware: coldplug-complete" >/dev/ttyS0
+		lsblk -dn -o NAME,TYPE,SIZE,MODEL,SERIAL >/dev/ttyS0 2>&1 || true
+		echo "lazarus-core-inventory: begin" >/dev/ttyS0
+		/usr/bin/lazarus devices >/dev/ttyS0 2>&1 || true
+		echo "lazarus-core-inventory: end" >/dev/ttyS0
+	fi
+}

@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+
+name="Arcology Lazarus printer discovery"
+description="Discovers local driverless IPP printers and creates CUPS queues"
+command="/usr/sbin/cups-browsed"
+command_background="yes"
+pidfile="/run/cups-browsed.pid"
+output_log="/var/log/cups/cups-browsed.log"
+error_log="/var/log/cups/cups-browsed.log"
+
+depend() {
+	need cupsd avahi-daemon dbus
+	after lazarus-network
+}
+
+start_pre() {
+	checkpath --directory --mode 0755 /var/cache/cups /var/log/cups
+}

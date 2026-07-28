@@ -1,0 +1,39 @@
+#DESCRIPTION "Store and recall objects with the alpha ArcoDB file store"
+#IMPORT "arcodb"
+
+path = "arcodb-people.arcodb"
+IF LEN(Args) > 0 THEN path = Args[0]
+
+db = ArcoDB.Open(path)
+customerSchema = ArcoDB.SchemaVersion(db, "Customer", ["customerNumber", "name", "email"], 1)
+ignored = ArcoDB.Catalog(db, customerSchema, "email")
+
+customer = {"customerNumber": 1042, "name": "Wanda Goodburger", "email": "wanda@email.com"}
+id = ArcoDB.Keep(db, customerSchema, customer)
+
+restored = ArcoDB.Recall(db, customerSchema, id)
+PRINT restored.name
+PRINT restored.email
+byEmail = ArcoDB.RecallBy(db, customerSchema, "email", "wanda@email.com")
+PRINT byEmail.name
+
+restored.email = "wanda.goodburger@arcology.example"
+PRINT ArcoDB.Replace(db, customerSchema, id, restored)
+PRINT ArcoDB.Write(db)
+
+reopened = ArcoDB.Open(path)
+schema = ArcoDB.SchemaFor(reopened, "Customer")
+loaded = ArcoDB.Recall(reopened, schema, id)
+PRINT loaded.email
+loadedByEmail = ArcoDB.RecallBy(reopened, schema, "email", "wanda.goodburger@arcology.example")
+PRINT loadedByEmail.name
+
+PRINT ArcoDB.Count(reopened)
+PRINT ArcoDB.Forget(reopened, id)
+PRINT ArcoDB.Count(reopened)
+info = ArcoDB.Inspect(reopened)
+PRINT info.Tombstones
+compacted = ArcoDB.Compact(reopened)
+PRINT compacted.Removed
+after = ArcoDB.Inspect(reopened)
+PRINT after.Records

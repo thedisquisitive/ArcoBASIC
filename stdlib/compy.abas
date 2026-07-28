@@ -1,0 +1,231 @@
+' ArcoCompy: ArcoBASIC value packing and unpacking.
+'
+' Current readable exchange format:
+'   ACPY1|...
+'
+' Value tags:
+'   Z                 NULL
+'   T                 TRUE
+'   F                 FALSE
+'   N<number>;        Number
+'   S<length>:<text>  String
+'   A<count>:...      Array
+'   O<count>:...      Object as packed key/value pairs
+'
+' Class instances are object-backed in the alpha runtime. Their object fields,
+' including __class, are packed like normal object fields. If the class
+' definition is loaded before unpacking, CLASSOF/ISA and methods continue to
+' work with the restored value.
+
+FUNCTION ArcoCompy.Format()
+    RETURN "ACPY1"
+END FUNCTION
+
+FUNCTION ArcoCompy.DefaultMaxDepth()
+    RETURN 64
+END FUNCTION
+
+FUNCTION ArcoCompy.DefaultMaxItems()
+    RETURN 1000000
+END FUNCTION
+
+FUNCTION ArcoCompy.StringBody(value)
+    RETURN "S" + STRING(String.Length(value)) + ":" + value
+END FUNCTION
+
+FUNCTION ArcoCompy.PackValue(value)
+    kind = TYPEOF(value)
+
+    IF kind == "Null" THEN RETURN "Z"
+    IF kind == "Boolean" THEN
+        IF value THEN RETURN "T"
+        RETURN "F"
+    END IF
+    IF kind == "Number" THEN RETURN "N" + STRING(value) + ";"
+    IF kind == "String" THEN RETURN ArcoCompy.StringBody(value)
+
+    IF kind == "Array" THEN
+        output = "A" + STRING(LEN(value)) + ":"
+        FOR item IN value
+            output = output + ArcoCompy.PackValue(item)
+        NEXT
+        RETURN output
+    END IF
+
+    IF kind == "Object" THEN
+        keys = Object.Keys(value)
+        output = "O" + STRING(LEN(keys)) + ":"
+        FOR key IN keys
+            output = output + ArcoCompy.StringBody(key)
+            output = output + ArcoCompy.PackValue(Object.Get(value, key))
+        NEXT
+        RETURN output
+    END IF
+
+    RETURN "Z"
+END FUNCTION
+
+FUNCTION ArcoCompy.Pack(value)
+    RETURN ArcoCompy.Format() + "|" + ArcoCompy.PackValue(value)
+END FUNCTION
+
+FUNCTION ArcoCompy.SetError(state, message)
+    IF state.Error == "" THEN
+        state.Error = message
+    END IF
+    RETURN NULL
+END FUNCTION
+
+FUNCTION ArcoCompy.Remaining(state)
+    RETURN String.Length(state.Text) - state.Pos
+END FUNCTION
+
+FUNCTION ArcoCompy.ReadChar(state)
+    IF state.Error <> "" THEN RETURN ""
+    IF state.Pos >= String.Length(state.Text) THEN
+        ignored = ArcoCompy.SetError(state, "unexpected end of ACPY payload")
+        RETURN ""
+    END IF
+    ch = String.Slice(state.Text, state.Pos, 1)
+    state.Pos = state.Pos + 1
+    RETURN ch
+END FUNCTION
+
+FUNCTION ArcoCompy.ReadUntil(state, delimiter)
+    IF state.Error <> "" THEN RETURN ""
+    finish = String.IndexOf(state.Text, delimiter, state.Pos)
+    IF finish < 0 THEN
+        ignored = ArcoCompy.SetError(state, "missing delimiter " + delimiter)
+        RETURN ""
+    END IF
+    value = String.Slice(state.Text, state.Pos, finish - state.Pos)
+    state.Pos = finish + String.Length(delimiter)
+    RETURN value
+END FUNCTION
+
+FUNCTION ArcoCompy.ReadLength(state)
+    text = ArcoCompy.ReadUntil(state, ":")
+    IF state.Error <> "" THEN RETURN 0
+    length = NUMBER(text)
+    IF length < 0 THEN
+        ignored = ArcoCompy.SetError(state, "negative length in ACPY payload")
+        RETURN 0
+    END IF
+    RETURN length
+END FUNCTION
+
+FUNCTION ArcoCompy.ReadCount(state, label)
+    count = ArcoCompy.ReadLength(state)
+    IF state.Error <> "" THEN RETURN 0
+    IF count > state.MaxItems THEN
+        ignored = ArcoCompy.SetError(state, label + " count exceeds ArcoCompy limit")
+        RETURN 0
+    END IF
+    RETURN count
+END FUNCTION
+
+FUNCTION ArcoCompy.UnpackStringBody(state)
+    length = ArcoCompy.ReadLength(state)
+    IF state.Error <> "" THEN RETURN ""
+    IF length > ArcoCompy.Remaining(state) THEN
+        ignored = ArcoCompy.SetError(state, "string length exceeds remaining ACPY payload")
+        RETURN ""
+    END IF
+    value = String.Slice(state.Text, state.Pos, length)
+    state.Pos = state.Pos + length
+    RETURN value
+END FUNCTION
+
+FUNCTION ArcoCompy.UnpackValueAtDepth(state, depth)
+    IF state.Error <> "" THEN RETURN NULL
+    IF depth > state.MaxDepth THEN
+        ignored = ArcoCompy.SetError(state, "maximum ACPY nesting depth exceeded")
+        RETURN NULL
+    END IF
+
+    tag = ArcoCompy.ReadChar(state)
+    IF state.Error <> "" THEN RETURN NULL
+
+    IF tag == "Z" THEN RETURN NULL
+    IF tag == "T" THEN RETURN TRUE
+    IF tag == "F" THEN RETURN FALSE
+    IF tag == "N" THEN RETURN NUMBER(ArcoCompy.ReadUntil(state, ";"))
+    IF tag == "S" THEN RETURN ArcoCompy.UnpackStringBody(state)
+
+    IF tag == "A" THEN
+        count = ArcoCompy.ReadCount(state, "array")
+        values = []
+        index = 0
+        WHILE index < count
+            ignored = Array.Push(values, ArcoCompy.UnpackValueAtDepth(state, depth + 1))
+            IF state.Error <> "" THEN RETURN values
+            index = index + 1
+        WEND
+        RETURN values
+    END IF
+
+    IF tag == "O" THEN
+        count = ArcoCompy.ReadCount(state, "object")
+        object = {}
+        index = 0
+        WHILE index < count
+            key_tag = ArcoCompy.ReadChar(state)
+            IF key_tag <> "S" THEN
+                ignored = ArcoCompy.SetError(state, "object key is not a string")
+                RETURN object
+            END IF
+            key = ArcoCompy.UnpackStringBody(state)
+            IF state.Error <> "" THEN RETURN object
+            object = Object.Set(object, key, ArcoCompy.UnpackValueAtDepth(state, depth + 1))
+            IF state.Error <> "" THEN RETURN object
+            index = index + 1
+        WEND
+        RETURN object
+    END IF
+
+    ignored = ArcoCompy.SetError(state, "unknown value tag " + tag)
+    RETURN NULL
+END FUNCTION
+
+FUNCTION ArcoCompy.UnpackValue(state)
+    RETURN ArcoCompy.UnpackValueAtDepth(state, 0)
+END FUNCTION
+
+FUNCTION ArcoCompy.TryUnpackWithLimits(payload, maxDepth, maxItems)
+    prefix = ArcoCompy.Format() + "|"
+    IF String.StartsWith(payload, prefix) == FALSE THEN
+        RETURN {"Ok": FALSE, "Value": NULL, "Error": "missing ACPY1 header"}
+    END IF
+    state = {"Text": payload, "Pos": String.Length(prefix), "Error": "", "MaxDepth": maxDepth, "MaxItems": maxItems}
+    TRY
+        value = ArcoCompy.UnpackValue(state)
+    CATCH err
+        RETURN {"Ok": FALSE, "Value": NULL, "Error": err.Message}
+    END TRY
+    IF state.Error <> "" THEN
+        RETURN {"Ok": FALSE, "Value": NULL, "Error": state.Error}
+    END IF
+    IF state.Pos <> String.Length(state.Text) THEN
+        RETURN {"Ok": FALSE, "Value": NULL, "Error": "trailing data after ACPY value"}
+    END IF
+    RETURN {"Ok": TRUE, "Value": value, "Error": ""}
+END FUNCTION
+
+FUNCTION ArcoCompy.TryUnpack(payload)
+    RETURN ArcoCompy.TryUnpackWithLimits(payload, ArcoCompy.DefaultMaxDepth(), ArcoCompy.DefaultMaxItems())
+END FUNCTION
+
+FUNCTION ArcoCompy.Unpack(payload)
+    result = ArcoCompy.TryUnpack(payload)
+    IF result.Ok THEN RETURN result.Value
+    RETURN NULL
+END FUNCTION
+
+FUNCTION ArcoCompy.Save(path, value)
+    File.WriteText(path, ArcoCompy.Pack(value))
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoCompy.Load(path)
+    RETURN ArcoCompy.Unpack(File.ReadText(path))
+END FUNCTION

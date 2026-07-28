@@ -1,0 +1,43 @@
+# Template file for 'arcobasic'
+pkgname=arcobasic
+version=0.1.0
+revision=1
+wrksrc="${pkgname}-${version}"
+hostmakedepends="cmake pkg-config bsdtar"
+makedepends="libstdc++-devel libcurl-devel glfw-devel gtk+3-devel pango-devel cairo-devel libglvnd-devel glu-devel"
+short_desc="ArcoBASIC language tools and ArcoSH shell"
+maintainer="Daedalus <daedalus@localhost>"
+license="Proprietary"
+homepage="https://example.invalid/arcobasic"
+distfiles="arcobasic-${version}.tar.gz"
+checksum=1e2e5ad2face1501c3e1d9411f689a009dd9847f2b7cd6ea84ec843128fb3b35
+
+do_fetch() {
+	local source_file="${XBPS_SRCDISTDIR}/${pkgname}-${version}/arcobasic-${version}.tar.gz"
+	if [ ! -f "$source_file" ]; then
+		msg_error "${pkgver}: missing local source tarball: $source_file\n"
+	fi
+	echo "${checksum}  ${source_file}" | sha256sum -c - || msg_error "${pkgver}: source checksum failed\n"
+	cp "$source_file" "${XBPS_BUILDDIR}/arcobasic-${version}.tar.gz"
+}
+
+do_extract() {
+	bsdtar -xzf "${XBPS_BUILDDIR}/arcobasic-${version}.tar.gz" -C "${XBPS_BUILDDIR}"
+}
+
+do_build() {
+	cmake -S . -B build \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DARCO_ENABLE_GUI=ON \
+		-DARCO_ENABLE_NETWORK=ON
+	cmake --build build
+}
+
+do_check() {
+	ctest --test-dir build --output-on-failure -R 'arcosh_alpha_smoke|arcofission_alpha_smoke'
+}
+
+do_install() {
+	DESTDIR="$DESTDIR" cmake --install build
+}

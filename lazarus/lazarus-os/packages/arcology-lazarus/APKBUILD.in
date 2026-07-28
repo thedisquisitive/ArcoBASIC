@@ -1,0 +1,29 @@
+# Contributor: Arcology
+# Maintainer: Arcology
+pkgname=arcology-lazarus
+pkgver=@LAZARUS_VERSION@
+pkgrel=0
+pkgdesc="Arcology Lazarus imaging, restore, and recovery tools"
+url="https://example.invalid/arcology-lazarus"
+arch="x86_64"
+license="custom"
+makedepends="cmake ninja g++ openssl-dev zstd-dev gtk4.0-dev gtkmm4-dev hivex-dev"
+depends="openssl zstd gtk4.0 gtkmm4 smartmontools hivex"
+source="arcology-lazarus-$pkgver.tar.gz"
+builddir="$srcdir/arcology-lazarus-$pkgver/lazarus"
+
+build() {
+	cmake -S . -B build \
+		-G Ninja \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX=/usr
+	cmake --build build
+}
+
+check() {
+	ctest --test-dir build --output-on-failure
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+}

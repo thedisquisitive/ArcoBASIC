@@ -53,12 +53,26 @@ arcosh examples/arcology_export_site.abas arcology.arcodb dist/arcology
 This writes `index.html`, `style.css`, and one `community-<slug>.html` page per
 community.
 
+Serve the exported site directly from ArcoBASIC:
+
+```sh
+scripts/serve-arcology.sh
+```
+
+Or call the underlying example directly:
+
+```sh
+arcosh examples/arcology_serve_static.abas arcology.arcodb dist/arcology 8080
+```
+
+Then open `http://127.0.0.1:8080/`.
+
 Feed items carry explicit `Reason` text. Moderation actions carry rule IDs,
 action names, explanations, actor handles, timestamps, and appeal availability.
 
 This module is deliberately small. The next layers should be:
 
-* `Web.Listen` and request dispatch
+* dynamic `Web.App` routing and request dispatch
 * sessions and identity
 * permission checks
 * richer ArcoDB indexes/search

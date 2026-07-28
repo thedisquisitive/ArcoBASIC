@@ -1,0 +1,81 @@
+#DESCRIPTION "Register and run class-backed ArcoDB query commands"
+#IMPORT "arcodb"
+
+path = "arcodb-commands.arcodb"
+IF LEN(Args) > 0 THEN path = Args[0]
+
+CLASS SignInLog
+    User AS String = ""
+    SignedInAt AS String = ""
+    SignedOutAt AS String = ""
+    Location AS String = ""
+
+    CONSTRUCTOR(user AS String = "", signedInAt AS String = "", signedOutAt AS String = "", location AS String = "")
+        SELF.User = user
+        SELF.SignedInAt = signedInAt
+        SELF.SignedOutAt = signedOutAt
+        SELF.Location = location
+    END CONSTRUCTOR
+
+    FUNCTION Label() AS String
+        RETURN SELF.User + " @ " + SELF.Location + " from " + SELF.SignedInAt + " to " + SELF.SignedOutAt
+    END FUNCTION
+
+    SHARED FUNCTION whoLogQuery() AS ARCODBFUNCTION
+        RETURN WhoLogQuery()
+    END FUNCTION
+END CLASS
+
+FUNCTION IsoKey(moment)
+    key = String.Replace(moment, "-", "")
+    key = String.Replace(key, "T", "")
+    key = String.Replace(key, ":", "")
+    key = String.Replace(key, " ", "")
+    RETURN NUMBER(key)
+END FUNCTION
+
+CLASS WhoLogQuery EXTENDS ARCODBFUNCTION
+    CONSTRUCTOR()
+        SELF.Name = "who"
+        SELF.Description = "who was signed in at a given ISO date/time"
+    END CONSTRUCTOR
+
+    FUNCTION Execute(db, args)
+        IF LEN(args) == 0 THEN RETURN {"Ok": FALSE, "Error": "Usage: who YYYY-MM-DDTHH:MM", "Rows": []}
+        moment = args[0]
+        momentKey = IsoKey(moment)
+        schema = ArcoDB.SchemaFor(db, "SignInLog")
+        IF ISNULL(schema) THEN RETURN {"Ok": FALSE, "Error": "SignInLog schema is not registered.", "Rows": []}
+
+        rows = []
+        FOR log IN ArcoDB.Scan(db, schema)
+            IF IsoKey(log.SignedInAt) <= momentKey AND IsoKey(log.SignedOutAt) >= momentKey THEN
+                ignored = Array.Add(rows, log)
+            END IF
+        NEXT
+        RETURN {"Ok": TRUE, "Error": "", "Rows": rows}
+    END FUNCTION
+END CLASS
+
+db = ArcoDB.Open(path)
+schema = ArcoDB.SchemaVersion(db, "SignInLog", ["User", "SignedInAt", "SignedOutAt", "Location"], 1)
+ignored = ArcoDB.RegisterCommand(db, SignInLog.whoLogQuery())
+
+IF ArcoDB.Count(db) == 0 THEN
+    ignored = ArcoDB.Keep(db, schema, SignInLog("Ada", "2026-07-13T08:00", "2026-07-13T12:30", "Front Desk"))
+    ignored = ArcoDB.Keep(db, schema, SignInLog("Grace", "2026-07-13T11:15", "2026-07-13T15:45", "Workshop"))
+    ignored = ArcoDB.Keep(db, schema, SignInLog("Miso", "2026-07-13T16:00", "2026-07-13T18:00", "Snack Vault"))
+END IF
+
+moment = "2026-07-13T11:30"
+IF LEN(Args) > 1 THEN moment = Args[1]
+
+result = ArcoDB.RunCommand(db, "who", [moment])
+PRINT result.Ok
+PRINT "Query: who " + moment
+FOR row IN result.Rows
+    PRINT row.Label()
+NEXT
+info = ArcoDB.Inspect(db)
+PRINT "Registered commands: " + STRING(info.Commands)
+ignored = ArcoDB.Write(db)

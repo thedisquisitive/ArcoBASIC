@@ -1,0 +1,15 @@
+# Contributor: Arcology
+# Maintainer: Arcology
+pkgname=lazarus-os
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Arcology Lazarus OS appliance package set"
+url="https://example.invalid/arcology-lazarus"
+arch="noarch"
+license="custom"
+depends="alpine-base openrc eudev xorg-server xinit smartmontools hivex lazarus-config lazarus-service lazarus-session arcology-lazarus"
+options="!check"
+
+package() {
+	mkdir -p "$pkgdir"
+}

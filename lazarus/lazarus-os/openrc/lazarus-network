@@ -1,0 +1,49 @@
+#!/sbin/openrc-run
+
+name="Arcology Lazarus wired networking"
+description="Starts non-blocking wired interface discovery and DHCP"
+
+bootstrap_pidfile="/run/arcology-lazarus/network-bootstrap.pid"
+
+depend() {
+	need localmount
+	use lazarus-storage
+	after udev
+	before avahi-daemon cupsd
+	provide net
+}
+
+start_pre() {
+	checkpath -d -m 0755 /run/arcology-lazarus
+	checkpath -d -m 0755 /var/log/arcology-lazarus
+}
+
+start() {
+	ebegin "Starting Arcology Lazarus wired networking"
+	# Network discovery must never delay the imaging service or kiosk. Some NIC
+	# drivers can spend an unbounded amount of time negotiating or initializing
+	# broken hardware, so the complete bootstrap runs outside OpenRC's critical
+	# startup path.
+	start-stop-daemon --start --background --make-pidfile \
+		--pidfile "$bootstrap_pidfile" \
+		--exec /usr/local/sbin/lazarus-network-up \
+		--stdout /var/log/arcology-lazarus/network.log \
+		--stderr /var/log/arcology-lazarus/network.log \
+		-- --restart
+	eend $?
+}
+
+stop() {
+	ebegin "Stopping Arcology Lazarus wired networking"
+	if [ -s "$bootstrap_pidfile" ]; then
+		start-stop-daemon --stop --pidfile "$bootstrap_pidfile" --retry TERM/2/KILL/1 2>/dev/null || true
+		rm -f "$bootstrap_pidfile"
+	fi
+	for pidfile in /run/arcology-lazarus/udhcpc-*.pid; do
+		[ -s "$pidfile" ] || continue
+		pid="$(cat "$pidfile")"
+		kill "$pid" 2>/dev/null || true
+		rm -f "$pidfile"
+	done
+	eend 0
+}

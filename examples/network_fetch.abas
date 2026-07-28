@@ -1,0 +1,18 @@
+#DESCRIPTION "Fetch a URL with ArcoBASIC networking"
+
+IF Network.Available() == FALSE THEN
+    PRINT "Networking is not enabled in this ArcoBASIC build."
+    ExitTheProgram(1)
+END IF
+
+url = "https://example.com"
+IF LEN(Args) > 0 THEN url = Args[0]
+
+response = Network.Get(url)
+PRINT "URL: " + response.Url
+PRINT "Status: " + STRING(response.Status)
+IF response.Ok THEN
+    PRINT response.Body
+ELSE
+    PRINT "Network error: " + response.Error
+END IF

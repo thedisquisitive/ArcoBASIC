@@ -1,0 +1,52 @@
+#DESCRIPTION "First ArcoBASIC desktop window"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "No Wayland or X11 GUI backend is available."
+    ExitTheProgram(0)
+END IF
+
+TRY
+    window = GUI.Window("ArcoBASIC Desktop App", 640, 420)
+CATCH err
+    PRINT "GUI window could not be opened: " + err.Message
+    ExitTheProgram(0)
+END TRY
+running = TRUE
+hover = FALSE
+
+WHILE running
+    GUI.Clear(window, 0.07, 0.08, 0.11)
+    GUI.RoundedRectangle(window, 70, 60, 500, 250, 18, 0.12, 0.15, 0.21)
+    GUI.Text(window, "ArcoBASIC", 104, 88, 34, 0.86, 0.92, 1.0)
+    GUI.Text(window, "Desktop-neutral windows, drawing, text, and input", 104, 142, 17, 0.62, 0.70, 0.82)
+    GUI.Line(window, 104, 190, 536, 190, 2, 0.24, 0.32, 0.45)
+    GUI.Circle(window, 120, 244, 14, 0.35, 0.70, 1.0)
+    GUI.Text(window, "Wayland and X11 from one API", 150, 231, 18, 0.82, 0.86, 0.92)
+    IF hover THEN
+        GUI.Rectangle(window, 220, 325, 200, 56, 0.35, 0.70, 1.0)
+    ELSE
+        GUI.Rectangle(window, 220, 325, 200, 56, 0.18, 0.48, 0.80)
+    END IF
+    label_size = GUI.MeasureText(window, "Click me", 19)
+    GUI.Text(window, "Click me", 320 - label_size.Width / 2, 339, 19, 1.0, 1.0, 1.0)
+    GUI.Present(window)
+
+    event = GUI.WaitEvent(0.05)
+    IF event.Type == "close" THEN running = FALSE
+    IF event.Type == "key" THEN
+        IF event.Key == "escape" THEN running = FALSE
+    END IF
+    IF event.Type == "pointer-move" THEN
+        hover = event.X >= 220 AND event.X < 420 AND event.Y >= 325 AND event.Y < 381
+    END IF
+    IF event.Type == "pointer-button" THEN
+        IF event.Action == "press" AND event.Button == "left" THEN
+            IF event.X >= 220 AND event.X < 420 AND event.Y >= 325 AND event.Y < 381 THEN
+                GUI.SetTitle(window, "ArcoBASIC button clicked!")
+            END IF
+        END IF
+    END IF
+    IF GUI.ShouldClose(window) THEN running = FALSE
+WEND
+
+GUI.Close(window)

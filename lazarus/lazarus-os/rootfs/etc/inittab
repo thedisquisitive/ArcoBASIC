@@ -1,0 +1,14 @@
+# Arcology Lazarus reserves tty1 for kiosk startup and factual failure output.
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+# Maintenance consoles remain available away from the public kiosk display.
+tty2::respawn:/sbin/getty 38400 tty2
+tty3::respawn:/sbin/getty 38400 tty3
+tty4::respawn:/sbin/getty 38400 tty4
+tty5::respawn:/sbin/getty 38400 tty5
+tty6::respawn:/sbin/getty 38400 tty6
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/openrc shutdown

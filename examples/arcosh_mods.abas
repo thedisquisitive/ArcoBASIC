@@ -1,0 +1,92 @@
+#DESCRIPTION "Manage user-space ArcoSH mods"
+
+FUNCTION Usage()
+    PRINT "ArcoSH mods"
+    PRINT ""
+    PRINT "Usage:"
+    PRINT "  arcosh examples/arcosh_mods.abas list"
+    PRINT "  arcosh examples/arcosh_mods.abas install path [name]"
+    PRINT "  arcosh examples/arcosh_mods.abas install-builtin arcogotchi"
+    PRINT "  arcosh examples/arcosh_mods.abas activate name"
+    PRINT "  arcosh examples/arcosh_mods.abas deactivate name"
+    PRINT "  arcosh examples/arcosh_mods.abas load name"
+    PRINT ""
+    PRINT "Mods dir: " + ArcoSH.ModsDir()
+END FUNCTION
+
+FUNCTION BuiltinModPath(name)
+    name = Lower(name)
+    local_path = Path.Join("mods", name + ".abas")
+    IF File.Exists(local_path) THEN RETURN local_path
+    installed_path = Path.Join(Path.DirName(ArcoSH.AssetsDir()), "mods", name + ".abas")
+    RETURN installed_path
+END FUNCTION
+
+FUNCTION ListMods()
+    mods = Mod.List()
+    IF LEN(mods) == 0 THEN
+        PRINT "No mods installed in " + ArcoSH.ModsDir()
+        RETURN TRUE
+    END IF
+    rows = []
+    FOR mod IN mods
+        state = "off"
+        IF mod.Active THEN state = "on"
+        ignored = Array.Push(rows, [mod.Name, state, mod.File])
+    NEXT
+    PRINT TUI.Table(["Name", "Active", "File"], rows)
+    RETURN TRUE
+END FUNCTION
+
+IF LEN(Args) == 0 THEN
+    Usage()
+    ExitTheProgram(0)
+END IF
+
+command = Lower(Args[0])
+
+IF command == "list" THEN
+    ListMods()
+    ExitTheProgram(0)
+END IF
+
+IF command == "install" THEN
+    IF LEN(Args) < 2 THEN Usage() : ExitTheProgram(1)
+    name = ""
+    IF LEN(Args) > 2 THEN name = Args[2]
+    mod = Mod.Install(Args[1], name)
+    PRINT "Installed " + mod.Name + " -> " + mod.Path
+    ExitTheProgram(0)
+END IF
+
+IF command == "install-builtin" THEN
+    IF LEN(Args) < 2 THEN Usage() : ExitTheProgram(1)
+    path = BuiltinModPath(Args[1])
+    mod = Mod.Install(path, Lower(Args[1]))
+    PRINT "Installed " + mod.Name + " -> " + mod.Path
+    ExitTheProgram(0)
+END IF
+
+IF command == "activate" THEN
+    IF LEN(Args) < 2 THEN Usage() : ExitTheProgram(1)
+    mod = Mod.Activate(Args[1])
+    PRINT "Activated " + mod.Name + " for next ArcoSH startup"
+    ExitTheProgram(0)
+END IF
+
+IF command == "deactivate" THEN
+    IF LEN(Args) < 2 THEN Usage() : ExitTheProgram(1)
+    mod = Mod.Deactivate(Args[1])
+    PRINT "Deactivated " + mod.Name + " for next ArcoSH startup"
+    ExitTheProgram(0)
+END IF
+
+IF command == "load" THEN
+    IF LEN(Args) < 2 THEN Usage() : ExitTheProgram(1)
+    mod = Mod.Load(Args[1])
+    PRINT "Loaded " + mod.Name + " in this session"
+    ExitTheProgram(0)
+END IF
+
+Usage()
+ExitTheProgram(1)

@@ -1,0 +1,31 @@
+' Minimal clickable TUI. Run this in a terminal with ArcoSH.
+PRINT TUI.Clear()
+PRINT TUI.Cursor(2, 4) + TUI.Rule("Mouse demo", 32)
+PRINT TUI.Cursor(4, 6) + "[  Count  ]"
+PRINT TUI.Cursor(4, 20) + "[  Quit  ]"
+PRINT TUI.Cursor(6, 6) + "Click a button, or press q."
+PRINT TUI.MouseEnable()
+
+count = 0
+running = TRUE
+WHILE running
+    event = TUI.ReadEvent()
+    IF event.Type == "mouse" THEN
+        IF event.Action == "press" AND event.Button == "left" THEN
+            IF TUI.HitTest(event, 6, 4, 11, 1) THEN
+                count = count + 1
+                PRINT TUI.Cursor(8, 6) + "Count: " + STRING(count) + "   "
+            END IF
+            IF TUI.HitTest(event, 20, 4, 10, 1) THEN running = FALSE
+        END IF
+    ELSE
+        IF event.Type == "key" THEN
+            IF event.Key == "q" OR event.Key == "Q" OR event.Key == "ctrl-c" THEN running = FALSE
+        ELSE
+            running = FALSE
+        END IF
+    END IF
+WEND
+
+PRINT TUI.MouseDisable()
+PRINT TUI.Cursor(10, 1)

@@ -1,0 +1,152 @@
+' ArcoGotchi: a small terminal pet for ArcoSH.
+' Install with:
+'   arcosh examples/arcosh_mods.abas install-builtin arcogotchi
+' Then activate with:
+'   arcosh examples/arcosh_mods.abas activate arcogotchi
+
+FUNCTION ArcoGotchi.StatePath()
+    RETURN Path.Join(ArcoSH.Home(), "arcogotchi.state")
+END FUNCTION
+
+FUNCTION ArcoGotchi.LoadState()
+    path = ArcoGotchi.StatePath()
+    IF File.Exists(path) == FALSE THEN
+        RETURN {"Name": "Byte", "Hunger": 35, "Mood": 75, "Energy": 80, "LastSeen": Time.Timestamp()}
+    END IF
+
+    lines = String.Lines(File.ReadText(path))
+    state = {"Name": "Byte", "Hunger": 35, "Mood": 75, "Energy": 80, "LastSeen": Time.Timestamp()}
+    FOR line IN lines
+        parts = String.Split(line, "=")
+        IF LEN(parts) >= 2 THEN
+            key = parts[0]
+            value = parts[1]
+            IF key == "Name" THEN state.Name = value
+            IF key == "Hunger" THEN state.Hunger = NUMBER(value)
+            IF key == "Mood" THEN state.Mood = NUMBER(value)
+            IF key == "Energy" THEN state.Energy = NUMBER(value)
+            IF key == "LastSeen" THEN state.LastSeen = NUMBER(value)
+        END IF
+    NEXT
+    RETURN state
+END FUNCTION
+
+FUNCTION ArcoGotchi.Clamp(value)
+    IF value < 0 THEN RETURN 0
+    IF value > 100 THEN RETURN 100
+    RETURN value
+END FUNCTION
+
+FUNCTION ArcoGotchi.ApplyTime(state)
+    now = Time.Timestamp()
+    elapsed = now - state.LastSeen
+    IF elapsed < 0 THEN elapsed = 0
+    ticks = elapsed / 300
+    IF ticks > 48 THEN ticks = 48
+    state.Hunger = ArcoGotchi.Clamp(state.Hunger + ticks * 3)
+    state.Mood = ArcoGotchi.Clamp(state.Mood - ticks * 2)
+    state.Energy = ArcoGotchi.Clamp(state.Energy - ticks)
+    state.LastSeen = now
+    RETURN state
+END FUNCTION
+
+FUNCTION ArcoGotchi.SaveState(state)
+    text = "Name=" + state.Name + "\n"
+    text = text + "Hunger=" + STRING(state.Hunger) + "\n"
+    text = text + "Mood=" + STRING(state.Mood) + "\n"
+    text = text + "Energy=" + STRING(state.Energy) + "\n"
+    text = text + "LastSeen=" + STRING(state.LastSeen) + "\n"
+    File.WriteText(ArcoGotchi.StatePath(), text)
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoGotchi.Face(state)
+    IF state.Hunger >= 85 THEN RETURN "(x_x)"
+    IF state.Mood <= 25 THEN RETURN "(u_u)"
+    IF state.Energy <= 20 THEN RETURN "(-_-)"
+    IF state.Mood >= 80 THEN RETURN "(^_^)"
+    RETURN "(o_o)"
+END FUNCTION
+
+FUNCTION ArcoGotchi.StatusLine(label, value)
+    RETURN TUI.Progress(label, value, 100, 16)
+END FUNCTION
+
+FUNCTION ArcoGotchi.Render()
+    state = ArcoGotchi.ApplyTime(ArcoGotchi.LoadState())
+    ignored = ArcoGotchi.SaveState(state)
+    body = "   /\\_/\\\\\n"
+    body = body + "  " + ArcoGotchi.Face(state) + "\n"
+    body = body + "  /|_|\\\\    " + state.Name + "\n\n"
+    body = body + ArcoGotchi.StatusLine("hunger", state.Hunger) + "\n"
+    body = body + ArcoGotchi.StatusLine("mood", state.Mood) + "\n"
+    body = body + ArcoGotchi.StatusLine("energy", state.Energy) + "\n\n"
+    body = body + "Commands: gotchi, gotchi-feed, gotchi-play, gotchi-nap, gotchi-rename NAME"
+    RETURN TUI.ThemeBox("circuit", "ARCOGOTCHI", body)
+END FUNCTION
+
+FUNCTION ArcoGotchi.Status()
+    PRINT ArcoGotchi.Render()
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoGotchi.Feed()
+    state = ArcoGotchi.ApplyTime(ArcoGotchi.LoadState())
+    state.Hunger = ArcoGotchi.Clamp(state.Hunger - 30)
+    state.Mood = ArcoGotchi.Clamp(state.Mood + 5)
+    ignored = ArcoGotchi.SaveState(state)
+    PRINT TUI.Status("ArcoGotchi", "fed", state.Name + " crunches happily.")
+    PRINT ArcoGotchi.Render()
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoGotchi.Play()
+    state = ArcoGotchi.ApplyTime(ArcoGotchi.LoadState())
+    state.Mood = ArcoGotchi.Clamp(state.Mood + 25)
+    state.Energy = ArcoGotchi.Clamp(state.Energy - 15)
+    state.Hunger = ArcoGotchi.Clamp(state.Hunger + 8)
+    ignored = ArcoGotchi.SaveState(state)
+    PRINT TUI.Status("ArcoGotchi", "play", state.Name + " bounces around the prompt.")
+    PRINT ArcoGotchi.Render()
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoGotchi.Nap()
+    state = ArcoGotchi.ApplyTime(ArcoGotchi.LoadState())
+    state.Energy = ArcoGotchi.Clamp(state.Energy + 35)
+    state.Hunger = ArcoGotchi.Clamp(state.Hunger + 10)
+    ignored = ArcoGotchi.SaveState(state)
+    PRINT TUI.Status("ArcoGotchi", "nap", state.Name + " recharges.")
+    PRINT ArcoGotchi.Render()
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoGotchi.Rename(name)
+    state = ArcoGotchi.ApplyTime(ArcoGotchi.LoadState())
+    state.Name = String.Trim(name)
+    IF state.Name == "" THEN state.Name = "Byte"
+    ignored = ArcoGotchi.SaveState(state)
+    PRINT TUI.Status("ArcoGotchi", "renamed", state.Name)
+    PRINT ArcoGotchi.Render()
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoGotchi.InstallCommand(name, body)
+    path = Path.Join(ArcoSH.ScriptsDir(), name + ".abas")
+    File.WriteText(path, body)
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoGotchi.InstallCommands()
+    ignored = Directory.Create(ArcoSH.ScriptsDir())
+    ignored = ArcoGotchi.InstallCommand("gotchi", "PRINT ArcoGotchi.Render()\n")
+    ignored = ArcoGotchi.InstallCommand("gotchi-status", "PRINT ArcoGotchi.Render()\n")
+    ignored = ArcoGotchi.InstallCommand("gotchi-feed", "ArcoGotchi.Feed()\n")
+    ignored = ArcoGotchi.InstallCommand("gotchi-play", "ArcoGotchi.Play()\n")
+    ignored = ArcoGotchi.InstallCommand("gotchi-nap", "ArcoGotchi.Nap()\n")
+    ignored = ArcoGotchi.InstallCommand("gotchi-rename", "IF LEN(Args) > 0 THEN ArcoGotchi.Rename(Array.Join(Args, \" \")) ELSE PRINT \"usage: gotchi-rename NAME\"\n")
+    RETURN TRUE
+END FUNCTION
+
+ignored = ArcoGotchi.InstallCommands()
+PRINT TUI.Status("ArcoGotchi", "ready", "try: gotchi, gotchi-feed, gotchi-play, gotchi-nap")

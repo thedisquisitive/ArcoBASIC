@@ -1,5 +1,8 @@
 build/
+build-*/
 dist/
+CMakeFiles/
+CMakeCache.txt
 
 *.o
 *.a
@@ -9,3 +12,12 @@ dist/
 *.exe
 
 .DS_Store
+
+# Generated/runtime artifacts, not source
+arcoalpha/
+arcoalpha.zip
+arco-file-log-example.txt
+*.acpy
+*.acdb
+*.arcodb
+*.arcodb.journal

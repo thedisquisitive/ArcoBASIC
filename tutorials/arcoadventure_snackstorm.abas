@@ -1,0 +1,39 @@
+#DESCRIPTION "ArcoAdventures Mission 2: Snackstorm"
+
+FUNCTION Section(title)
+    PRINT ""
+    PRINT Color.Magenta(TUI.ThemeRule("scroll", title, 72))
+END FUNCTION
+
+FUNCTION Continue()
+    ignored = Tutorial.ReadLine("press Enter to continue ")
+END FUNCTION
+
+FUNCTION Demo(title, command)
+    PRINT Color.Bold(title)
+    ignored = Tutorial.Run(command, "arco")
+END FUNCTION
+
+PRINT TUI.Scroll("ArcoAdventures 2: Snackstorm", "A vending machine in the Procurement Depot has requested a deputy assistant vending machine for each snack it considers underrepresented.\n\nBaron Von Segfault denies involvement, which everyone treats as a form of punctuation.")
+PRINT TUI.Status("practice prompts", "ready", "type hint, skip, or quit when needed")
+Continue()
+
+Section("1. Repeat a safe inspection")
+PRINT "A FOR loop repeats a block a known number of times."
+ok = Tutorial.Step("FOR machine = 1 TO 3\nPRINT $\"inspect snack unit {machine}\"\nNEXT", "arco")
+
+Section("2. Keep a running total")
+PRINT "Initialize totals before the loop, then add inside the loop."
+ok = Tutorial.Step("totalSnacks = 0\nFOR crate = 1 TO 4\ntotalSnacks = totalSnacks + 6\nNEXT\nPRINT totalSnacks", "arco")
+
+Section("3. Loop over names")
+PRINT "Arrays let the program carry a list instead of repeating code by hand."
+Demo("Print the snack factions:", "factions = [\"pretzel caucus\", \"nougat guild\", \"raisin opposition\"]\nFOR faction IN factions\nPRINT TUI.Status(faction, \"heard\", \"complaint logged\")\nNEXT")
+Continue()
+
+Section("4. Stop automation before it becomes policy")
+PRINT "Loops should have limits. This simulation caps replacement orders."
+Demo("Run a bounded order plan:", "orders = 1\nlimit = 16\nWHILE orders < limit\norders = orders * 2\nPRINT $\"planned machines: {orders}\"\nWEND\nPRINT TUI.Status(\"Snackstorm\", \"contained\", STRING(orders) + \" maximum\")")
+
+PRINT ""
+PRINT TUI.ThemeBox("scroll", "Mission complete", "You practiced FOR loops, arrays, running totals, WHILE limits, and the civic importance of not letting vending machines write procurement policy.")

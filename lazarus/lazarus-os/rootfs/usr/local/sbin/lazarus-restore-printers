@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+source=/mnt/lazarus-storage/cups
+destination=/etc/cups
+
+[ -d "$source" ] || exit 0
+mkdir -p "$destination/ppd"
+for name in printers.conf printers.conf.O classes.conf classes.conf.O; do
+	[ -f "$source/$name" ] || continue
+	cp "$source/$name" "$destination/$name"
+	chown root:lp "$destination/$name"
+	chmod 0600 "$destination/$name"
+done
+if [ -d "$source/ppd" ]; then
+	cp -a "$source/ppd/." "$destination/ppd/"
+	chown -R root:lp "$destination/ppd"
+	chmod 0700 "$destination/ppd"
+	find "$destination/ppd" -type f -exec chmod 0600 {} +
+fi
+echo "lazarus-printers: restored persistent CUPS configuration" >/dev/ttyS0 2>/dev/null || true

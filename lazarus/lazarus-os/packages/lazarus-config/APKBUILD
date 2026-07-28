@@ -1,0 +1,17 @@
+# Contributor: Arcology
+# Maintainer: Arcology
+pkgname=lazarus-config
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Arcology Lazarus appliance configuration defaults"
+url="https://example.invalid/arcology-lazarus"
+arch="noarch"
+license="custom"
+depends="openrc eudev"
+source="bench.profile 90-arcology-lazarus.rules"
+options="!check"
+
+package() {
+	install -Dm644 "$srcdir/bench.profile" "$pkgdir/etc/arcology-lazarus/bench.profile"
+	install -Dm644 "$srcdir/90-arcology-lazarus.rules" "$pkgdir/etc/udev/rules.d/90-arcology-lazarus.rules"
+}

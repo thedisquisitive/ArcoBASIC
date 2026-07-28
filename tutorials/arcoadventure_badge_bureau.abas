@@ -1,0 +1,48 @@
+#DESCRIPTION "ArcoAdventures Mission 1: Badge Bureau"
+
+FUNCTION Section(title)
+    PRINT ""
+    PRINT Color.Cyan(TUI.ThemeRule("terminal", title, 72))
+END FUNCTION
+
+FUNCTION Continue()
+    ignored = Tutorial.ReadLine("press Enter to continue ")
+END FUNCTION
+
+FUNCTION Demo(title, command)
+    PRINT Color.Bold(title)
+    ignored = Tutorial.Run(command, "arco")
+END FUNCTION
+
+PRINT TUI.Header("ArcoAdventures 1: Badge Bureau")
+PRINT TUI.Box("MISSION", "The Arcology Badge Bureau has printed eight hundred visitor badges that all say KEVIN.\n\nDeputy Director Mara Vey needs a tiny verifier that records the case name, counts suspicious badges, and routes the investigation without starting a naming committee.")
+PRINT TUI.Status("practice prompts", "ready", "type hint, skip, or quit when needed")
+Continue()
+
+Section("1. Name the case")
+PRINT "Variables give facts stable names. Use a clear name instead of mystery letters."
+ok = Tutorial.Step("caseName = \"Badge Bureau Rebellion\" : PRINT caseName", "arco")
+
+Section("2. Count suspicious badges")
+PRINT "Numbers do not wear quotation marks when you intend to calculate with them."
+ok = Tutorial.Step("suspiciousBadges = 800 : correctedBadges = 127 : PRINT suspiciousBadges - correctedBadges", "arco")
+
+Section("3. Combine facts into a status line")
+PRINT "Interpolation keeps case reports readable."
+Demo("Build a line Mara can read:", "caseName = \"Badge Bureau Rebellion\"\nsuspiciousBadges = 800\nPRINT $\"{caseName}: {suspiciousBadges} badges require questions\"")
+Continue()
+
+Section("4. Make a decision")
+PRINT "The bureau terminal asks which badge stripe keeps flickering."
+stripe = Tutorial.ReadLine("stripe color> ")
+IF Lower(stripe) == "blue" THEN
+    PRINT Color.Green("Blue stripe confirmed. Send Pell to the printer closet.")
+ELSE
+    PRINT Color.Yellow("Not blue. Mara files this under suspicious but not yet municipal.")
+END IF
+
+Section("5. Final verifier shape")
+Demo("Run the finished verifier:", "caseName = \"Badge Bureau Rebellion\"\nsuspiciousBadges = 800\ncorrectedBadges = 127\nremainingBadges = suspiciousBadges - correctedBadges\nIF remainingBadges > 500 THEN\nPRINT TUI.Status(caseName, \"urgent\", STRING(remainingBadges) + \" badges remain\")\nELSE\nPRINT TUI.Status(caseName, \"watch\", STRING(remainingBadges) + \" badges remain\")\nEND IF")
+
+PRINT ""
+PRINT TUI.ThemeBox("terminal", "Mission complete", "You used strings, numeric variables, arithmetic, interpolation, user input, and IF decisions inside an original Arcology case.")

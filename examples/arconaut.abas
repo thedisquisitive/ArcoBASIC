@@ -1,0 +1,283 @@
+#DESCRIPTION "Arconaut desktop file navigator"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "Arconaut needs a Wayland or X11 desktop session."
+    ExitTheProgram(0)
+END IF
+
+home = Path.Home()
+title_icon = Path.Join(ArcoSH.AssetsDir(), "arconaut", "title-icon.png")
+arcobasic_icon = Path.Join(ArcoSH.AssetsDir(), "arconaut", "arcobasic-file.png")
+start_path = home
+IF LEN(Args) > 0 THEN start_path = Args[0]
+TRY
+    GUI.Application("arconaut", "Arconaut", title_icon)
+    window = GUI.Window("Arconaut", 1040, 680)
+CATCH err
+    PRINT "Arconaut window could not be opened: " + err.Message
+    ExitTheProgram(0)
+END TRY
+app = {"CurrentPath": "", "Entries": [], "BackStack": [], "ForwardStack": [], "SelectedIndex": -1, "ScrollY": 0, "Status": "Ready"}
+rail_open = TRUE
+hover_row = -1
+running = TRUE
+
+FUNCTION LoadDirectory(next_path, remember = TRUE)
+    IF File.Exists(next_path) == FALSE THEN
+        app.Status = "Location not found: " + next_path
+        RETURN FALSE
+    END IF
+    IF remember AND app.CurrentPath <> "" THEN ignored = Array.Push(app.BackStack, app.CurrentPath)
+    IF remember THEN app.ForwardStack = []
+    app.CurrentPath = next_path
+    app.Entries = File.List(app.CurrentPath)
+    app.SelectedIndex = -1
+    app.ScrollY = 0
+    app.Status = STRING(LEN(app.Entries)) + " items"
+    GUI.SetTitle(window, "Arconaut — " + Path.BaseName(app.CurrentPath))
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION GoBack()
+    IF LEN(app.BackStack) > 0 THEN
+        ignored = Array.Push(app.ForwardStack, app.CurrentPath)
+        destination = Array.Pop(app.BackStack)
+        ignored = LoadDirectory(destination, FALSE)
+    END IF
+END FUNCTION
+
+FUNCTION GoForward()
+    IF LEN(app.ForwardStack) > 0 THEN
+        ignored = Array.Push(app.BackStack, app.CurrentPath)
+        destination = Array.Pop(app.ForwardStack)
+        ignored = LoadDirectory(destination, FALSE)
+    END IF
+END FUNCTION
+
+FUNCTION GoUp()
+    parent = Path.DirName(app.CurrentPath)
+    IF parent <> app.CurrentPath THEN ignored = LoadDirectory(parent)
+END FUNCTION
+
+FUNCTION Refresh()
+    selected_name = ""
+    IF app.SelectedIndex >= 0 AND app.SelectedIndex < LEN(app.Entries) THEN
+        selected = app.Entries[app.SelectedIndex]
+        selected_name = selected.Name
+    END IF
+    ignored = LoadDirectory(app.CurrentPath, FALSE)
+    IF selected_name <> "" THEN
+        row = 0
+        FOR item IN app.Entries
+            IF item.Name == selected_name THEN app.SelectedIndex = row
+            row = row + 1
+        NEXT
+    END IF
+    app.Status = "Refreshed " + app.CurrentPath
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION Activate(index)
+    item = app.Entries[index]
+    IF item.IsDirectory THEN
+        ignored = LoadDirectory(item.Path)
+    ELSE
+        app.Status = "Opening " + item.Name
+        ignored = System.Open(item.Path)
+    END IF
+END FUNCTION
+
+FUNCTION SizeLabel(bytes)
+    IF bytes < 1024 THEN RETURN STRING(bytes) + " B"
+    IF bytes < 1048576 THEN RETURN STRING(bytes / 1024) + " KB"
+    RETURN STRING(bytes / 1048576) + " MB"
+END FUNCTION
+
+CLASS EntryPresenter
+    Item = NULL
+
+    CONSTRUCTOR(item)
+        SELF.Item = item
+    END CONSTRUCTOR
+
+    FUNCTION TypeLabel() AS String
+        IF SELF.Item.IsDirectory THEN RETURN "Folder"
+        IF SELF.Item.Extension == "" THEN RETURN "File"
+        RETURN SELF.Item.Extension
+    END FUNCTION
+
+    FUNCTION SizeText() AS String
+        IF SELF.Item.IsDirectory THEN RETURN "—"
+        RETURN SizeLabel(SELF.Item.Size)
+    END FUNCTION
+
+    FUNCTION Summary() AS String
+        RETURN SELF.Item.Name + " | " + SELF.TypeLabel() + " | " + SELF.SizeText()
+    END FUNCTION
+END CLASS
+
+ignored = LoadDirectory(start_path, FALSE)
+
+WHILE running
+    size = GUI.Size(window)
+    rail_width = 64
+    IF rail_open THEN rail_width = 210
+    inspector_width = 0
+    IF size.Width >= 900 THEN inspector_width = 238
+    content_x = rail_width + 16
+    content_width = size.Width - content_x - inspector_width - 16
+    list_top = 116
+    list_bottom = size.Height - 48
+
+    GUI.Clear(window, 0.045, 0.052, 0.07)
+
+    ' Arco constellation rail
+    GUI.Rectangle(window, 0, 0, rail_width, size.Height, 0.065, 0.076, 0.104)
+    GUI.Image(window, title_icon, 8, 6, 46, 46)
+    IF rail_open THEN GUI.Text(window, "ARCONAUT", 58, 18, 18, 0.78, 0.88, 1.0)
+    GUI.Line(window, 14, 58, rail_width - 14, 58, 1, 0.14, 0.18, 0.25)
+
+    GUI.Text(window, "H", 23, 81, 18, 0.62, 0.78, 0.96)
+    GUI.Text(window, "D", 23, 127, 18, 0.62, 0.78, 0.96)
+    GUI.Text(window, "↓", 22, 172, 20, 0.62, 0.78, 0.96)
+    IF rail_open THEN
+        GUI.Text(window, "Home", 58, 81, 16, 0.82, 0.87, 0.94)
+        GUI.Text(window, "Documents", 58, 127, 16, 0.82, 0.87, 0.94)
+        GUI.Text(window, "Downloads", 58, 173, 16, 0.82, 0.87, 0.94)
+        GUI.Text(window, "PLACES", 18, 229, 12, 0.38, 0.5, 0.68)
+        GUI.Text(window, app.CurrentPath, 18, 254, 12, 0.46, 0.55, 0.69)
+    END IF
+
+    ' Navigation and location band
+    GUI.RoundedRectangle(window, content_x, 16, 38, 38, 8, 0.10, 0.13, 0.18)
+    GUI.RoundedRectangle(window, content_x + 46, 16, 38, 38, 8, 0.10, 0.13, 0.18)
+    GUI.RoundedRectangle(window, content_x + 92, 16, 38, 38, 8, 0.10, 0.13, 0.18)
+    GUI.RoundedRectangle(window, content_x + 138, 16, 38, 38, 8, 0.10, 0.13, 0.18)
+    GUI.Text(window, "‹", content_x + 12, 18, 25, 0.75, 0.84, 0.95)
+    GUI.Text(window, "›", content_x + 58, 18, 25, 0.75, 0.84, 0.95)
+    GUI.Text(window, "↑", content_x + 104, 20, 21, 0.75, 0.84, 0.95)
+    GUI.Text(window, "R", content_x + 150, 24, 16, 0.75, 0.84, 0.95)
+    GUI.RoundedRectangle(window, content_x + 188, 16, content_width - 188, 38, 8, 0.075, 0.09, 0.125)
+    GUI.Text(window, app.CurrentPath, content_x + 204, 25, 15, 0.68, 0.77, 0.9)
+    GUI.Text(window, "NAME", content_x + 14, 84, 12, 0.4, 0.51, 0.68)
+    GUI.Text(window, "TYPE", content_x + content_width - 170, 84, 12, 0.4, 0.51, 0.68)
+    GUI.Text(window, "SIZE", content_x + content_width - 78, 84, 12, 0.4, 0.51, 0.68)
+    GUI.Line(window, content_x, 108, content_x + content_width, 108, 1, 0.13, 0.17, 0.23)
+
+    ' File surface
+    GUI.SetClip(window, content_x, list_top, content_width, list_bottom - list_top)
+    row = 0
+    FOR item IN app.Entries
+        row_y = list_top + row * 40 - app.ScrollY
+        IF row_y > list_top - 40 AND row_y < list_bottom THEN
+            presenter = EntryPresenter(item)
+            IF row == app.SelectedIndex THEN GUI.RoundedRectangle(window, content_x, row_y, content_width, 36, 7, 0.13, 0.34, 0.56)
+            IF row == hover_row AND row <> app.SelectedIndex THEN GUI.RoundedRectangle(window, content_x, row_y, content_width, 36, 7, 0.085, 0.11, 0.155)
+            IF Lower(item.Extension) == ".abas" THEN
+                GUI.Image(window, arcobasic_icon, content_x + 7, row_y + 4, 29, 29)
+            ELSE
+            IF item.IsDirectory THEN
+                GUI.RoundedRectangle(window, content_x + 10, row_y + 9, 20, 16, 3, 0.25, 0.62, 0.94)
+            ELSE
+                GUI.RoundedRectangle(window, content_x + 12, row_y + 7, 16, 20, 2, 0.45, 0.55, 0.7)
+            END IF
+            END IF
+            GUI.Text(window, item.Name, content_x + 42, row_y + 8, 16, 0.84, 0.88, 0.94)
+            GUI.Text(window, presenter.TypeLabel(), content_x + content_width - 170, row_y + 9, 14, 0.5, 0.61, 0.75)
+            GUI.Text(window, presenter.SizeText(), content_x + content_width - 78, row_y + 9, 14, 0.5, 0.61, 0.75)
+        END IF
+        row = row + 1
+    NEXT
+    GUI.ResetClip(window)
+
+    ' Context inspector: Konqueror-like utility, Arco visual language
+    IF inspector_width > 0 THEN
+        inspector_x = size.Width - inspector_width
+        GUI.Rectangle(window, inspector_x, 0, inspector_width, size.Height, 0.06, 0.07, 0.095)
+        GUI.Text(window, "DETAILS", inspector_x + 22, 25, 13, 0.38, 0.55, 0.78)
+        IF app.SelectedIndex >= 0 THEN
+            selected = app.Entries[app.SelectedIndex]
+            presenter = EntryPresenter(selected)
+            detail_y = 137
+            IF Lower(selected.Extension) == ".abas" THEN
+                GUI.Image(window, arcobasic_icon, inspector_x + 22, 58, 194, 194)
+                detail_y = 268
+            ELSE
+                GUI.Circle(window, inspector_x + 52, 91, 27, 0.18, 0.48, 0.75)
+            END IF
+            GUI.Text(window, selected.Name, inspector_x + 22, detail_y, 18, 0.86, 0.9, 0.96)
+            GUI.Text(window, presenter.SizeText(), inspector_x + 22, detail_y + 37, 14, 0.52, 0.62, 0.75)
+            GUI.Text(window, "Type: " + presenter.TypeLabel(), inspector_x + 22, detail_y + 58, 12, 0.43, 0.52, 0.65)
+            GUI.Text(window, selected.Path, inspector_x + 22, detail_y + 82, 12, 0.43, 0.52, 0.65)
+        ELSE
+            GUI.Text(window, "Select an item", inspector_x + 22, 74, 16, 0.48, 0.57, 0.69)
+            GUI.Text(window, "Double-click to travel", inspector_x + 22, 105, 13, 0.38, 0.47, 0.6)
+        END IF
+    END IF
+
+    GUI.Text(window, app.Status, content_x, size.Height - 31, 13, 0.47, 0.57, 0.7)
+    GUI.Text(window, "Enter open   Backspace up   R/F5 refresh   Esc quit", size.Width - 420, size.Height - 31, 13, 0.42, 0.5, 0.62)
+    GUI.Present(window)
+
+    event = GUI.WaitEvent(0.05)
+    IF event.Type == "close" THEN running = FALSE
+    IF event.Type == "scroll" THEN
+        app.ScrollY = app.ScrollY - event.DeltaY * 34
+        IF app.ScrollY < 0 THEN app.ScrollY = 0
+    END IF
+    IF event.Type == "pointer-move" THEN
+        hover_row = -1
+        row = 0
+        FOR item IN app.Entries
+            row_y = list_top + row * 40 - app.ScrollY
+            IF event.X >= content_x AND event.X < content_x + content_width AND event.Y >= row_y AND event.Y < row_y + 36 THEN hover_row = row
+            row = row + 1
+        NEXT
+        GUI.SetCursor(window, "default")
+        IF hover_row >= 0 OR event.X < rail_width OR event.Y < 58 THEN GUI.SetCursor(window, "hand")
+    END IF
+    IF event.Type == "pointer-button" THEN
+        IF event.Action == "press" AND event.Button == "left" THEN
+            IF event.X < rail_width AND event.Y < 58 THEN
+                IF rail_open THEN rail_open = FALSE ELSE rail_open = TRUE
+            END IF
+            IF event.X < rail_width AND event.Y >= 68 AND event.Y < 112 THEN ignored = LoadDirectory(home)
+            IF event.X < rail_width AND event.Y >= 114 AND event.Y < 158 THEN ignored = LoadDirectory(Path.Join(home, "Documents"))
+            IF event.X < rail_width AND event.Y >= 160 AND event.Y < 204 THEN ignored = LoadDirectory(Path.Join(home, "Downloads"))
+            IF event.Y >= 16 AND event.Y < 54 THEN
+                IF event.X >= content_x AND event.X < content_x + 38 THEN GoBack()
+                IF event.X >= content_x + 46 AND event.X < content_x + 84 THEN GoForward()
+                IF event.X >= content_x + 92 AND event.X < content_x + 130 THEN GoUp()
+                IF event.X >= content_x + 138 AND event.X < content_x + 176 THEN ignored = Refresh()
+            END IF
+            IF hover_row >= 0 THEN
+                app.SelectedIndex = hover_row
+                selected_item = app.Entries[app.SelectedIndex]
+                app.Status = selected_item.Path
+                IF event.Clicks >= 2 THEN Activate(app.SelectedIndex)
+            END IF
+        END IF
+    END IF
+    IF event.Type == "key" THEN
+        IF event.Action == "press" THEN
+            IF event.Key == "escape" THEN running = FALSE
+            IF event.Key == "enter" AND app.SelectedIndex >= 0 THEN Activate(app.SelectedIndex)
+            IF event.Key == "backspace" THEN GoUp()
+            IF event.Key == "r" OR event.Key == "f5" THEN ignored = Refresh()
+            IF event.Key == "down" THEN
+                IF app.SelectedIndex < LEN(app.Entries) - 1 THEN app.SelectedIndex = app.SelectedIndex + 1
+            END IF
+            IF event.Key == "up" THEN
+                IF app.SelectedIndex > 0 THEN app.SelectedIndex = app.SelectedIndex - 1
+            END IF
+            IF event.Key == "home" THEN
+                IF LEN(app.Entries) > 0 THEN app.SelectedIndex = 0
+            END IF
+            IF event.Key == "end" THEN
+                IF LEN(app.Entries) > 0 THEN app.SelectedIndex = LEN(app.Entries) - 1
+            END IF
+        END IF
+    END IF
+WEND
+
+GUI.Close(window)

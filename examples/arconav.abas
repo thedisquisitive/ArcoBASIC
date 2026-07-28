@@ -1,0 +1,408 @@
+#DESCRIPTION "ArcoNav terminal web browser"
+
+FUNCTION Usage()
+    PRINT "ArcoNav terminal web browser"
+    PRINT ""
+    PRINT "Usage:"
+    PRINT "  arcosh examples/arconav.abas [url]"
+    PRINT "  arcosh examples/arconav.abas [url] --dump"
+    PRINT "  arcosh examples/arconav.abas --help"
+    PRINT ""
+    PRINT "Commands:"
+    PRINT "  number, open URL, g URL, b, r, links, history"
+    PRINT "  bookmark, bookmarks, find TEXT, save PATH, q"
+END FUNCTION
+
+FOR arg IN Args
+    IF arg == "--help" OR arg == "-h" THEN
+        Usage()
+        ExitTheProgram(0)
+    END IF
+NEXT
+
+IF Network.Available() == FALSE THEN
+    PRINT "ArcoNav needs networking support in this ArcoBASIC build."
+    ExitTheProgram(1)
+END IF
+
+start_url = "https://example.com"
+dump_mode = FALSE
+FOR arg IN Args
+    IF arg == "--dump" THEN dump_mode = TRUE ELSE start_url = arg
+NEXT
+
+app = {"Url": start_url, "Title": "", "Text": "", "Links": [], "Back": [], "History": [], "Bookmarks": [], "Status": "Ready", "Running": TRUE}
+
+CLASS BrowserLink
+    Text AS String = ""
+    Url AS String = ""
+
+    CONSTRUCTOR(text AS String = "", url AS String = "")
+        SELF.Text = text
+        SELF.Url = url
+    END CONSTRUCTOR
+
+    FUNCTION Line(index AS Number) AS String
+        RETURN STRING(index) + ". " + SELF.Text + " -> " + SELF.Url
+    END FUNCTION
+END CLASS
+
+CLASS BrowserPage
+    Title AS String = ""
+    Url AS String = ""
+
+    CONSTRUCTOR(title AS String = "", url AS String = "")
+        SELF.Title = title
+        SELF.Url = url
+    END CONSTRUCTOR
+
+    FUNCTION Line(index AS Number) AS String
+        RETURN STRING(index) + ". " + SELF.Title + " -> " + SELF.Url
+    END FUNCTION
+END CLASS
+
+FUNCTION StartsWithHttp(url)
+    RETURN String.StartsWith(Lower(url), "http://") OR String.StartsWith(Lower(url), "https://") OR String.StartsWith(Lower(url), "file://")
+END FUNCTION
+
+FUNCTION NormalizeUrl(url)
+    url = String.Trim(url)
+    IF url == "" THEN RETURN app.Url
+    IF StartsWithHttp(url) THEN RETURN url
+    IF String.Contains(url, "://") THEN RETURN url
+    RETURN "https://" + url
+END FUNCTION
+
+FUNCTION BaseUrl(url)
+    slash = String.IndexOf(url, "://")
+    IF slash < 0 THEN RETURN url
+    after_host = String.IndexOf(url, "/", slash + 3)
+    IF after_host < 0 THEN RETURN url
+    RETURN String.Slice(url, 0, after_host)
+END FUNCTION
+
+FUNCTION DirectoryUrl(url)
+    slash = String.IndexOf(url, "://")
+    IF slash < 0 THEN RETURN url
+    last = -1
+    pos = slash + 3
+    WHILE pos >= 0
+        found = String.IndexOf(url, "/", pos)
+        IF found < 0 THEN pos = -1 ELSE last = found : pos = found + 1
+    WEND
+    IF last <= slash + 2 THEN RETURN BaseUrl(url) + "/"
+    RETURN String.Slice(url, 0, last + 1)
+END FUNCTION
+
+FUNCTION ResolveUrl(base, href)
+    href = String.Trim(href)
+    IF href == "" THEN RETURN base
+    IF StartsWithHttp(href) THEN RETURN href
+    IF String.StartsWith(href, "//") THEN
+        scheme_end = String.IndexOf(base, "://")
+        IF scheme_end >= 0 THEN RETURN String.Slice(base, 0, scheme_end) + ":" + href
+    END IF
+    IF String.StartsWith(href, "#") THEN RETURN base
+    IF String.StartsWith(href, "/") THEN RETURN BaseUrl(base) + href
+    RETURN DirectoryUrl(base) + href
+END FUNCTION
+
+FUNCTION HtmlDecode(text)
+    text = String.Replace(text, "&amp;", "&")
+    text = String.Replace(text, "&lt;", "<")
+    text = String.Replace(text, "&gt;", ">")
+    text = String.Replace(text, "&quot;", "\"")
+    text = String.Replace(text, "&#39;", "'")
+    text = String.Replace(text, "&nbsp;", " ")
+    RETURN text
+END FUNCTION
+
+FUNCTION Between(text, open_tag, close_tag)
+    lower_text = Lower(text)
+    start = String.IndexOf(lower_text, Lower(open_tag))
+    IF start < 0 THEN RETURN ""
+    start = start + String.Length(open_tag)
+    finish = String.IndexOf(lower_text, Lower(close_tag), start)
+    IF finish < 0 THEN RETURN ""
+    RETURN String.Slice(text, start, finish - start)
+END FUNCTION
+
+FUNCTION Attribute(tag, name)
+    lower_tag = Lower(tag)
+    pattern = Lower(name) + "="
+    at = String.IndexOf(lower_tag, pattern)
+    IF at < 0 THEN RETURN ""
+    pos = at + String.Length(pattern)
+    quote = String.Slice(tag, pos, 1)
+    IF quote == "\"" OR quote == "'" THEN
+        finish = String.IndexOf(tag, quote, pos + 1)
+        IF finish < 0 THEN RETURN ""
+        RETURN String.Slice(tag, pos + 1, finish - pos - 1)
+    END IF
+    finish = String.IndexOf(tag, " ", pos)
+    IF finish < 0 THEN finish = String.IndexOf(tag, ">", pos)
+    IF finish < 0 THEN finish = String.Length(tag)
+    RETURN String.Slice(tag, pos, finish - pos)
+END FUNCTION
+
+FUNCTION StripTags(html)
+    output = ""
+    in_tag = FALSE
+    i = 0
+    WHILE i < String.Length(html)
+        ch = String.Slice(html, i, 1)
+        IF ch == "<" THEN
+            in_tag = TRUE
+            lower_rest = Lower(String.Slice(html, i, 12))
+            IF String.StartsWith(lower_rest, "<br") THEN output = output + "\n"
+            IF String.StartsWith(lower_rest, "</p") THEN output = output + "\n\n"
+            IF String.StartsWith(lower_rest, "</h") THEN output = output + "\n\n"
+            IF String.StartsWith(lower_rest, "<li") THEN output = output + "\n* "
+        ELSE
+            IF ch == ">" THEN
+                in_tag = FALSE
+            ELSE
+                IF in_tag == FALSE THEN output = output + ch
+            END IF
+        END IF
+        i = i + 1
+    WEND
+    RETURN HtmlDecode(output)
+END FUNCTION
+
+FUNCTION CompactText(text)
+    text = String.Replace(text, "\r", "")
+    text = String.Replace(text, "\t", " ")
+    WHILE String.Contains(text, "  ")
+        text = String.Replace(text, "  ", " ")
+    WEND
+    WHILE String.Contains(text, "\n\n\n")
+        text = String.Replace(text, "\n\n\n", "\n\n")
+    WEND
+    RETURN String.Trim(text)
+END FUNCTION
+
+FUNCTION IsPositiveInteger(text)
+    IF text == "" THEN RETURN FALSE
+    i = 0
+    WHILE i < String.Length(text)
+        ch = String.Slice(text, i, 1)
+        IF String.Contains("0123456789", ch) == FALSE THEN RETURN FALSE
+        i = i + 1
+    WEND
+    RETURN NUMBER(text) > 0
+END FUNCTION
+
+FUNCTION ExtractLinks(html, base)
+    links = []
+    lower_html = Lower(html)
+    pos = 0
+    WHILE pos >= 0
+        start = String.IndexOf(lower_html, "<a", pos)
+        IF start < 0 THEN
+            pos = -1
+        ELSE
+            tag_end = String.IndexOf(lower_html, ">", start)
+            close = String.IndexOf(lower_html, "</a>", tag_end)
+            IF tag_end < 0 OR close < 0 THEN
+                pos = -1
+            ELSE
+                tag = String.Slice(html, start, tag_end - start + 1)
+                href = Attribute(tag, "href")
+                label_html = String.Slice(html, tag_end + 1, close - tag_end - 1)
+                label = CompactText(StripTags(label_html))
+                IF label == "" THEN label = href
+                IF href <> "" AND NOT String.StartsWith(Lower(href), "javascript:") THEN
+                    ignored = Array.Push(links, BrowserLink(label, ResolveUrl(base, href)))
+                END IF
+                pos = close + 4
+            END IF
+        END IF
+    WEND
+    RETURN links
+END FUNCTION
+
+FUNCTION Load(url, remember = TRUE)
+    url = NormalizeUrl(url)
+    IF remember THEN ignored = Array.Push(app.Back, app.Url)
+    app.Status = "Loading " + url
+    response = Network.Get(url, {"Accept": "text/html,text/plain;q=0.9,*/*;q=0.5"})
+    IF response.Ok == FALSE THEN
+        app.Status = "Network error: " + response.Error
+        RETURN FALSE
+    END IF
+    body = response.Body
+    IF String.Length(body) > 5000 THEN body = String.Slice(body, 0, 5000)
+    app.Url = response.Url
+    app.Title = CompactText(HtmlDecode(Between(body, "<title>", "</title>")))
+    IF app.Title == "" THEN app.Title = app.Url
+    app.Links = ExtractLinks(body, app.Url)
+    app.Text = CompactText(StripTags(body))
+    ignored = Array.Push(app.History, BrowserPage(app.Title, app.Url))
+    app.Status = "Loaded " + STRING(LEN(app.Links)) + " links"
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION PrintLinksOnly()
+    PRINT ""
+    PRINT TUI.Rule("LINKS", 72)
+    IF LEN(app.Links) == 0 THEN
+        PRINT "No links found on this page."
+        RETURN FALSE
+    END IF
+    index = 1
+    FOR link IN app.Links
+        PRINT link.Line(index)
+        index = index + 1
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION PrintHistory()
+    PRINT ""
+    PRINT TUI.Rule("HISTORY", 72)
+    IF LEN(app.History) == 0 THEN
+        PRINT "No pages loaded yet."
+        RETURN FALSE
+    END IF
+    index = 1
+    FOR page IN app.History
+        PRINT page.Line(index)
+        index = index + 1
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION PrintBookmarks()
+    PRINT ""
+    PRINT TUI.Rule("BOOKMARKS", 72)
+    IF LEN(app.Bookmarks) == 0 THEN
+        PRINT "No bookmarks yet. Use: bookmark"
+        RETURN FALSE
+    END IF
+    index = 1
+    FOR page IN app.Bookmarks
+        PRINT page.Line(index)
+        index = index + 1
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION BookmarkCurrent()
+    FOR page IN app.Bookmarks
+        IF page.Url == app.Url THEN
+            app.Status = "Already bookmarked"
+            RETURN FALSE
+        END IF
+    NEXT
+    ignored = Array.Push(app.Bookmarks, BrowserPage(app.Title, app.Url))
+    app.Status = "Bookmarked " + app.Title
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION FindInPage(term)
+    term = String.Trim(term)
+    IF term == "" THEN
+        app.Status = "Usage: find TEXT"
+        RETURN FALSE
+    END IF
+    lower_text = Lower(app.Text)
+    lower_term = Lower(term)
+    count = 0
+    pos = 0
+    WHILE pos >= 0
+        found = String.IndexOf(lower_text, lower_term, pos)
+        IF found < 0 THEN
+            pos = -1
+        ELSE
+            count = count + 1
+            context_start = found - 40
+            IF context_start < 0 THEN context_start = 0
+            context = String.Slice(app.Text, context_start, 120)
+            PRINT "..." + context + "..."
+            pos = found + String.Length(lower_term)
+        END IF
+    WEND
+    app.Status = "Found " + STRING(count) + " matches for " + term
+    IF count == 0 THEN PRINT app.Status
+    RETURN count > 0
+END FUNCTION
+
+FUNCTION SavePageText(path)
+    path = String.Trim(path)
+    IF path == "" THEN
+        app.Status = "Usage: save PATH"
+        RETURN FALSE
+    END IF
+    File.WriteText(path, app.Title + "\n" + app.Url + "\n\n" + app.Text)
+    app.Status = "Saved page text to " + path
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION DrawPage()
+    PRINT TUI.Clear()
+    PRINT TUI.ThemeRule("circuit", "ARCONAV", 72)
+    PRINT app.Title
+    PRINT app.Url
+    PRINT app.Status
+    PRINT TUI.Rule("", 72)
+    PRINT app.Text
+    PRINT ""
+    IF LEN(app.Links) > 0 THEN
+        PRINT TUI.Rule("LINKS", 72)
+        index = 1
+        FOR link IN app.Links
+            PRINT link.Line(index)
+            index = index + 1
+        NEXT
+    END IF
+    PRINT ""
+    PRINT "Commands: number/open/g, b, r, links, history, bookmark(s), find TEXT, save PATH, q"
+END FUNCTION
+
+FUNCTION GoBack()
+    IF LEN(app.Back) == 0 THEN
+        app.Status = "No back history"
+        RETURN FALSE
+    END IF
+    destination = Array.Pop(app.Back)
+    RETURN Load(destination, FALSE)
+END FUNCTION
+
+ignored = Load(start_url, FALSE)
+DrawPage()
+
+IF dump_mode THEN ExitTheProgram(0)
+
+WHILE app.Running
+    command = String.Trim(ReadLine("arconav> "))
+    handled = FALSE
+    IF command == "" THEN app.Running = FALSE : handled = TRUE
+    IF command == "q" OR command == "quit" OR command == "exit" THEN app.Running = FALSE : handled = TRUE
+    IF app.Running AND (command == "r" OR command == "reload") THEN handled = TRUE : ignored = Load(app.Url, FALSE) : DrawPage()
+    IF app.Running AND (command == "b" OR command == "back") THEN handled = TRUE : ignored = GoBack() : DrawPage()
+    IF app.Running AND command == "links" THEN handled = TRUE : ignored = PrintLinksOnly()
+    IF app.Running AND command == "history" THEN handled = TRUE : ignored = PrintHistory()
+    IF app.Running AND command == "bookmark" THEN handled = TRUE : ignored = BookmarkCurrent() : DrawPage()
+    IF app.Running AND command == "bookmarks" THEN handled = TRUE : ignored = PrintBookmarks()
+    IF app.Running AND String.StartsWith(command, "find ") THEN handled = TRUE : ignored = FindInPage(String.Trim(String.Slice(command, 5)))
+    IF app.Running AND String.StartsWith(command, "save ") THEN handled = TRUE : ignored = SavePageText(String.Trim(String.Slice(command, 5)))
+    IF app.Running AND String.StartsWith(command, "g ") THEN handled = TRUE : ignored = Load(String.Trim(String.Slice(command, 2))) : DrawPage()
+    IF app.Running AND String.StartsWith(command, "open ") THEN handled = TRUE : ignored = Load(String.Trim(String.Slice(command, 5))) : DrawPage()
+    IF app.Running AND String.StartsWith(command, "o ") THEN handled = TRUE : ignored = Load(String.Trim(String.Slice(command, 2))) : DrawPage()
+    IF app.Running AND IsPositiveInteger(command) THEN
+        handled = TRUE
+        index = NUMBER(command) - 1
+        IF index >= 0 AND index < LEN(app.Links) THEN
+            selected = app.Links[index]
+            ignored = Load(selected.Url)
+        ELSE
+            app.Status = "No link " + command
+        END IF
+        DrawPage()
+    END IF
+    IF app.Running AND command <> "" AND handled == FALSE THEN
+        app.Status = "Unknown command: " + command
+        DrawPage()
+    END IF
+WEND

@@ -56,6 +56,7 @@ CONTROL
 chmod 0755 "$PKG_ROOT/DEBIAN"
 find "$PKG_ROOT/usr/bin" -type f -exec chmod 0755 {} +
 find "$PKG_ROOT/usr/share" -type f -exec chmod 0644 {} +
+find "$PKG_ROOT/usr/share/arcobasic/scripts" -type f -name "*.sh" -exec chmod 0755 {} + 2>/dev/null || true
 
 DEB="$OUT_DIR/${PACKAGE}_${VERSION}_${ARCH}.deb"
 dpkg-deb --build --root-owner-group "$PKG_ROOT" "$DEB"

@@ -1,0 +1,34 @@
+#DESCRIPTION "Pack and unpack ArcoBASIC values with ArcoCompy"
+#IMPORT "compy"
+
+CLASS SaveSlot
+    Name AS String = ""
+    Level AS Number = 1
+
+    CONSTRUCTOR(name AS String, level AS Number)
+        SELF.Name = name
+        SELF.Level = level
+    END CONSTRUCTOR
+
+    FUNCTION Label() AS String
+        RETURN SELF.Name + "@" + STRING(SELF.Level)
+    END FUNCTION
+END CLASS
+
+slot = SaveSlot("Miso", 7)
+data = {"Player": slot, "Inventory": ["key", "lamp", 3], "Flags": {"HasMap": TRUE, "DoorOpen": FALSE}}
+
+packed = ArcoCompy.Pack(data)
+PRINT "Packed bytes: " + STRING(String.Length(packed))
+
+restored = ArcoCompy.Unpack(packed)
+restored_player = restored.Player
+PRINT restored_player.Label()
+PRINT restored.Inventory[1]
+PRINT restored.Flags.HasMap
+
+path = "arcocompy-save.acpy"
+ArcoCompy.Save(path, data)
+loaded = ArcoCompy.Load(path)
+loaded_player = loaded.Player
+PRINT loaded_player.Label()

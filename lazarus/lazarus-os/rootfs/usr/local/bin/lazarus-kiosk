@@ -1,0 +1,185 @@
+#!/bin/sh
+set -u
+
+export LAZARUS_BENCH_PROFILE="${LAZARUS_BENCH_PROFILE:-/etc/arcology-lazarus/bench.profile}"
+export LAZARUS_SERVICE_SOCKET="${LAZARUS_SERVICE_SOCKET:-/run/arcology-lazarus/service.sock}"
+export DISPLAY="${DISPLAY:-:0}"
+export XCURSOR_THEME="${XCURSOR_THEME:-Adwaita}"
+export XCURSOR_SIZE="${XCURSOR_SIZE:-32}"
+export XCURSOR_PATH="/usr/share/icons:${XCURSOR_PATH:-}"
+
+runtime_dir=/run/arcology-lazarus
+log_dir=/var/log/arcology-lazarus
+attempt_dir="$runtime_dir/xorg"
+client_marker="$runtime_dir/x-client-started"
+stopping=0
+
+session_mode="${LAZARUS_KIOSK_MODE:-}"
+if [ -z "$session_mode" ] && grep -Eq '(^|[[:space:]])lazarus\.mode=install([[:space:]]|$)' /proc/cmdline 2>/dev/null; then
+	session_mode=installer
+fi
+session_mode="${session_mode:-kiosk}"
+
+log() {
+	line="lazarus-kiosk: $*"
+	printf '%s\n' "$line" >>"$log_dir/kiosk.log" 2>/dev/null || true
+	printf '%s\n' "$line" >>/dev/ttyS0 2>/dev/null || true
+}
+
+console_message() {
+	title="$1"
+	detail="$2"
+	{
+		printf '\033[2J\033[H'
+		printf '\n  ARCOLOGY LAZARUS\n'
+		printf '  ==================\n\n'
+		printf '  %s\n\n' "$title"
+		printf '  %s\n\n' "$detail"
+		printf '  Diagnostics: %s\n' "$log_dir"
+		printf '  Maintenance console: Alt+F2\n'
+	} >/dev/tty1 2>/dev/null || true
+	chvt 1 >/dev/null 2>&1 || true
+}
+
+dump_log() {
+	name="$1"
+	path="$2"
+	[ -f "$path" ] || return 0
+	printf 'lazarus-kiosk: begin %s\n' "$name" >>/dev/ttyS0 2>/dev/null || true
+	tail -n 160 "$path" | sed "s/^/$name: /" >>/dev/ttyS0 2>/dev/null || true
+	printf 'lazarus-kiosk: end %s\n' "$name" >>/dev/ttyS0 2>/dev/null || true
+}
+
+stop_session() {
+	stopping=1
+	if [ -n "${x_pid:-}" ]; then
+		kill "$x_pid" 2>/dev/null || true
+	fi
+}
+trap stop_session INT TERM HUP
+
+uid="$(id -u lazarus)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/var/lib/arcology-lazarus/.cache}"
+
+mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CACHE_HOME/fontconfig" /var/cache/fontconfig "$log_dir" "$attempt_dir"
+chown lazarus:lazarus "$XDG_RUNTIME_DIR"
+chown -R lazarus:lazarus "$XDG_CACHE_HOME" /var/cache/fontconfig
+chmod 0700 "$XDG_RUNTIME_DIR"
+touch "$log_dir/gui.log" "$log_dir/gui-trace.log" "$log_dir/kiosk.log"
+chown lazarus:lazarus "$log_dir/gui.log" "$log_dir/gui-trace.log"
+
+if [ "$session_mode" = installer ]; then
+	log "starting Lazarus OS installer"
+	chvt 1 >/dev/null 2>&1 || true
+	exec openvt -w -s -c 1 -- /usr/local/sbin/lazarus-install-os
+fi
+
+console_message "Starting the appliance interface." "Detecting the display and input hardware."
+log "starting hardware-capable kiosk bootstrap"
+log "service socket: $LAZARUS_SERVICE_SOCKET"
+
+if command -v modprobe >/dev/null 2>&1; then
+	# hwdrivers normally loads these through modaliases. Explicit probes make
+	# startup deterministic on installed systems whose GPU was not needed to
+	# mount the root filesystem.
+	for module in drm drm_kms_helper simpledrm i915 xe amdgpu nouveau radeon virtio_gpu qxl bochs_drm vmwgfx xhci_pci xhci_hcd usbhid hid_generic; do
+		modprobe "$module" >/dev/null 2>&1 || true
+	done
+fi
+
+for _ in $(seq 1 30); do
+	if ls /dev/dri/card* /dev/fb0 >/dev/null 2>&1; then
+		break
+	fi
+	sleep 0.2
+done
+
+{
+	printf 'Kernel: '; uname -a
+	printf '\nPCI display devices:\n'
+	if command -v lspci >/dev/null 2>&1; then
+		lspci -nnk | sed -n '/VGA compatible controller/,+3p; /Display controller/,+3p; /3D controller/,+3p'
+	else
+		printf 'lspci unavailable\n'
+	fi
+	printf '\nDRM devices:\n'
+	ls -l /dev/dri /sys/class/drm 2>&1 || true
+	printf '\nFramebuffer devices:\n'
+	ls -l /dev/fb* 2>&1 || true
+} >"$log_dir/display-hardware.log" 2>&1
+dump_log display-hardware "$log_dir/display-hardware.log"
+
+cat >"$attempt_dir/modesetting.conf" <<'EOF'
+Section "Device"
+    Identifier "Lazarus GPU"
+    Driver "modesetting"
+EndSection
+EOF
+
+cat >"$attempt_dir/fbdev.conf" <<'EOF'
+Section "Device"
+    Identifier "Lazarus framebuffer"
+    Driver "fbdev"
+    Option "fbdev" "/dev/fb0"
+EndSection
+EOF
+
+cat >"$attempt_dir/vesa.conf" <<'EOF'
+Section "Device"
+    Identifier "Lazarus VESA"
+    Driver "vesa"
+EndSection
+EOF
+
+run_x_attempt() {
+	name="$1"
+	config="${2:-}"
+	xlog="$log_dir/Xorg.$name.log"
+	output_log="$log_dir/session-$name.log"
+	rm -f "$client_marker"
+	if ! pgrep -x Xorg >/dev/null 2>&1; then
+		rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
+	fi
+	log "trying Xorg display path: $name"
+	console_message "Starting the appliance interface." "Trying display mode: $name"
+	if [ -n "$config" ]; then
+		openvt -w -s -f -c 7 -- xinit /etc/X11/xinit/xinitrc -- \
+			/usr/bin/Xorg :0 vt7 -keeptty -nolisten tcp -noreset -ac \
+			-logfile "$xlog" -config "$config" >>"$output_log" 2>&1 &
+	else
+		openvt -w -s -f -c 7 -- xinit /etc/X11/xinit/xinitrc -- \
+			/usr/bin/Xorg :0 vt7 -keeptty -nolisten tcp -noreset -ac \
+			-logfile "$xlog" >>"$output_log" 2>&1 &
+	fi
+	x_pid=$!
+	wait "$x_pid"
+	status=$?
+	x_pid=""
+	if [ -f "$client_marker" ]; then
+		log "Xorg $name started the Lazarus client, which later exited with status $status"
+	else
+		log "Xorg $name could not start the Lazarus client (status $status)"
+	fi
+	dump_log "xorg-$name" "$xlog"
+	dump_log "session-$name" "$output_log"
+	return "$status"
+}
+
+while [ "$stopping" -eq 0 ]; do
+	for attempt in auto modesetting fbdev vesa; do
+		[ "$stopping" -eq 0 ] || break
+		case "$attempt" in
+			auto) config="" ;;
+			*) config="$attempt_dir/$attempt.conf" ;;
+		esac
+		run_x_attempt "$attempt" "$config" || true
+	done
+	[ "$stopping" -eq 0 ] || break
+	console_message "The graphical interface could not start." "Lazarus will retry all supported display modes in 10 seconds."
+	log "all Xorg display paths failed; retrying in 10 seconds"
+	sleep 10
+done
+
+log "kiosk session stopped"
+exit 0

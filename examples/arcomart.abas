@@ -1,0 +1,395 @@
+#DESCRIPTION "ArcoMart storefront and inventory management demo"
+#IMPORT "arcodb"
+
+db_path = "arcomart.arcodb"
+IF LEN(Args) > 0 THEN db_path = Args[0]
+
+app = {"Running": TRUE, "Dirty": FALSE, "Products": [], "Status": "Ready", "StoreName": "ArcoMart"}
+db = ArcoDB.Open(db_path)
+productSchema = ArcoDB.SchemaVersion(db, "Product", ["Id", "Sku", "Name", "Category", "Price", "Stock", "Reorder", "Sold"], 1)
+ignored = ArcoDB.Catalog(db, productSchema, "Sku")
+
+CLASS Product
+    Id AS Number = 0
+    Sku AS String = ""
+    Name AS String = ""
+    Category AS String = ""
+    Price AS Number = 0
+    Stock AS Number = 0
+    Reorder AS Number = 0
+    Sold AS Number = 0
+
+    CONSTRUCTOR(sku AS String = "", name AS String = "", category AS String = "", price AS Number = 0, stock AS Number = 0, reorder AS Number = 0)
+        SELF.Id = 0
+        SELF.Sku = Upper(sku)
+        SELF.Name = name
+        SELF.Category = category
+        SELF.Price = price
+        SELF.Stock = stock
+        SELF.Reorder = reorder
+        SELF.Sold = 0
+    END CONSTRUCTOR
+
+    FUNCTION IsLowStock()
+        RETURN SELF.Stock <= SELF.Reorder
+    END FUNCTION
+
+    FUNCTION Receive(amount AS Number) AS Number
+        SELF.Stock = SELF.Stock + amount
+        RETURN SELF.Stock
+    END FUNCTION
+
+    FUNCTION CanSell(quantity AS Number)
+        RETURN quantity > 0 AND quantity <= SELF.Stock
+    END FUNCTION
+
+    FUNCTION Sell(quantity AS Number) AS Number
+        IF SELF.CanSell(quantity) == FALSE THEN RETURN -1
+        SELF.Stock = SELF.Stock - quantity
+        SELF.Sold = SELF.Sold + quantity
+        RETURN SELF.Price * quantity
+    END FUNCTION
+
+    FUNCTION SalesRevenue() AS Number
+        RETURN SELF.Sold * SELF.Price
+    END FUNCTION
+
+    FUNCTION Line() AS String
+        marker = " "
+        IF SELF.IsLowStock() THEN marker = "!"
+        RETURN marker + " " + SELF.Sku + " | " + SELF.Name + " | " + SELF.Category + " | " + Money(SELF.Price) + " | stock " + STRING(SELF.Stock) + " | sold " + STRING(SELF.Sold)
+    END FUNCTION
+END CLASS
+
+FUNCTION Money(value)
+    RETURN "$" + STRING(value)
+END FUNCTION
+
+FUNCTION Ask(prompt)
+    RETURN String.Trim(ReadLine(prompt))
+END FUNCTION
+
+FUNCTION AskNumber(prompt, fallback)
+    answer = Ask(prompt)
+    IF answer == "" THEN RETURN fallback
+    TRY
+        RETURN NUMBER(answer)
+    CATCH err
+        PRINT "Not a number. Keeping " + STRING(fallback) + "."
+        RETURN fallback
+    END TRY
+END FUNCTION
+
+FUNCTION FindProductIndex(sku)
+    sku = Upper(String.Trim(sku))
+    index = 0
+    WHILE index < LEN(app.Products)
+        product = app.Products[index]
+        IF Upper(product.Sku) == sku THEN RETURN index
+        index = index + 1
+    WEND
+    RETURN -1
+END FUNCTION
+
+FUNCTION LoadProducts()
+    app.Products = []
+    FOR record IN db.Records
+        IF record.Deleted == FALSE AND record.Class == productSchema.Class THEN
+            product = ArcoDB.Recall(db, productSchema, record.Id)
+            IF ISNULL(product) == FALSE THEN ignored = Array.Add(app.Products, product)
+        END IF
+    NEXT
+    RETURN LEN(app.Products)
+END FUNCTION
+
+FUNCTION SaveProduct(product)
+    IF product.Id <= 0 THEN
+        product.Id = 0
+        id = ArcoDB.Keep(db, productSchema, product)
+        product.Id = id
+        ignored = ArcoDB.Replace(db, productSchema, id, product)
+    ELSE
+        ignored = ArcoDB.Replace(db, productSchema, product.Id, product)
+    END IF
+    app.Dirty = TRUE
+    RETURN product.Id
+END FUNCTION
+
+FUNCTION AddProductDirect(sku, name, category, price, stock, reorder)
+    product = Product(sku, name, category, price, stock, reorder)
+    id = SaveProduct(product)
+    product.Id = id
+    ignored = Array.Add(app.Products, product)
+    RETURN product
+END FUNCTION
+
+FUNCTION SeedProducts()
+    IF ArcoDB.Count(db) > 0 THEN RETURN FALSE
+    ignored = AddProductDirect("BOLT-01", "Pocket Lightning Bolts", "Hardware", 3.5, 18, 5)
+    ignored = AddProductDirect("SNAX-42", "Astro Crunch Rations", "Snacks", 2.25, 24, 8)
+    ignored = AddProductDirect("BOT-OIL", "Robot Elbow Oil", "Maintenance", 7.75, 6, 4)
+    ignored = AddProductDirect("CAP-9V", "Nine Volt Thinking Cap", "Electronics", 12.0, 3, 3)
+    ignored = ArcoDB.Write(db)
+    app.Dirty = FALSE
+    app.Status = "Seed inventory created"
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION PrintHeader(title)
+    PRINT ""
+    PRINT TUI.ThemeRule("circuit", title, 72)
+END FUNCTION
+
+FUNCTION ListProducts()
+    PrintHeader(app.StoreName + " INVENTORY")
+    IF LEN(app.Products) == 0 THEN
+        PRINT "No products yet."
+        RETURN FALSE
+    END IF
+    PRINT "! means stock is at or below reorder level."
+    PRINT ""
+    FOR product IN app.Products
+        PRINT product.Line()
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION AddProduct()
+    PrintHeader("ADD PRODUCT")
+    sku = Upper(Ask("SKU> "))
+    IF sku == "" THEN
+        app.Status = "Add canceled"
+        RETURN FALSE
+    END IF
+    IF FindProductIndex(sku) >= 0 THEN
+        app.Status = "SKU already exists: " + sku
+        RETURN FALSE
+    END IF
+    name = Ask("Name> ")
+    category = Ask("Category> ")
+    price = AskNumber("Price> ", 1)
+    stock = AskNumber("Starting stock> ", 0)
+    reorder = AskNumber("Reorder level> ", 3)
+    product = AddProductDirect(sku, name, category, price, stock, reorder)
+    app.Status = "Added " + product.Sku
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION EditProduct()
+    PrintHeader("EDIT PRODUCT")
+    sku = Ask("SKU> ")
+    index = FindProductIndex(sku)
+    IF index < 0 THEN
+        app.Status = "No product with that SKU"
+        RETURN FALSE
+    END IF
+    product = app.Products[index]
+    PRINT product.Line()
+    name = Ask("Name [" + product.Name + "]> ")
+    IF name <> "" THEN product.Name = name
+    category = Ask("Category [" + product.Category + "]> ")
+    IF category <> "" THEN product.Category = category
+    product.Price = AskNumber("Price [" + STRING(product.Price) + "]> ", product.Price)
+    product.Reorder = AskNumber("Reorder [" + STRING(product.Reorder) + "]> ", product.Reorder)
+    products = app.Products
+    products[index] = product
+    app.Products = products
+    ignored = SaveProduct(product)
+    app.Status = "Updated " + product.Sku
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ReceiveStock()
+    PrintHeader("RECEIVE STOCK")
+    sku = Ask("SKU> ")
+    index = FindProductIndex(sku)
+    IF index < 0 THEN
+        app.Status = "No product with that SKU"
+        RETURN FALSE
+    END IF
+    amount = AskNumber("Quantity received> ", 0)
+    IF amount <= 0 THEN
+        app.Status = "Receive canceled"
+        RETURN FALSE
+    END IF
+    product = app.Products[index]
+    ignored = product.Receive(amount)
+    products = app.Products
+    products[index] = product
+    app.Products = products
+    ignored = SaveProduct(product)
+    app.Status = "Received " + STRING(amount) + " of " + product.Sku
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION RemoveProduct()
+    PrintHeader("REMOVE PRODUCT")
+    sku = Ask("SKU> ")
+    index = FindProductIndex(sku)
+    IF index < 0 THEN
+        app.Status = "No product with that SKU"
+        RETURN FALSE
+    END IF
+    product = app.Products[index]
+    confirm = Lower(Ask("Remove " + product.Name + "? yes/no> "))
+    IF confirm <> "yes" THEN
+        app.Status = "Remove canceled"
+        RETURN FALSE
+    END IF
+    ignored = ArcoDB.Forget(db, product.Id)
+    ignored = Array.RemoveAt(app.Products, index)
+    app.Dirty = TRUE
+    app.Status = "Removed " + product.Sku
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION Checkout()
+    PrintHeader("CUSTOMER CHECKOUT")
+    total = 0
+    items = 0
+    runningCheckout = TRUE
+    WHILE runningCheckout
+        sku = Ask("SKU, list, or done> ")
+        IF Lower(sku) == "done" OR sku == "" THEN
+            runningCheckout = FALSE
+        ELSE
+            IF Lower(sku) == "list" THEN
+                ignored = ListProducts()
+            ELSE
+                index = FindProductIndex(sku)
+                IF index < 0 THEN
+                    PRINT "No product with that SKU."
+                ELSE
+                    product = app.Products[index]
+                    PRINT product.Line()
+                    qty = AskNumber("Quantity> ", 1)
+                    IF qty <= 0 THEN
+                        PRINT "Skipped."
+                    ELSE
+                        IF product.CanSell(qty) == FALSE THEN
+                            PRINT "Only " + STRING(product.Stock) + " in stock."
+                        ELSE
+                            lineTotal = product.Sell(qty)
+                            total = total + lineTotal
+                            items = items + qty
+                            products = app.Products
+                            products[index] = product
+                            app.Products = products
+                            ignored = SaveProduct(product)
+                            PRINT "Added " + STRING(qty) + " x " + product.Name + " = " + Money(lineTotal)
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+    WEND
+    app.Status = "Checkout: " + STRING(items) + " items, total " + Money(total)
+    PRINT app.Status
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION LowStockReport()
+    PrintHeader("LOW STOCK REPORT")
+    found = FALSE
+    FOR product IN app.Products
+        IF product.IsLowStock() THEN
+            PRINT product.Line()
+            found = TRUE
+        END IF
+    NEXT
+    IF found == FALSE THEN PRINT "All shelves are above reorder level."
+    RETURN found
+END FUNCTION
+
+FUNCTION SalesReport()
+    PrintHeader("SALES REPORT")
+    revenue = 0
+    units = 0
+    FOR product IN app.Products
+        IF product.Sold > 0 THEN
+            line = product.SalesRevenue()
+            revenue = revenue + line
+            units = units + product.Sold
+            PRINT product.Sku + " | " + product.Name + " | units " + STRING(product.Sold) + " | revenue " + Money(line)
+        END IF
+    NEXT
+    PRINT ""
+    PRINT "Units sold: " + STRING(units)
+    PRINT "Revenue: " + Money(revenue)
+    RETURN revenue
+END FUNCTION
+
+FUNCTION StoreStatus()
+    info = ArcoDB.Inspect(db)
+    PrintHeader("STORE STATUS")
+    PRINT "Database: " + info.Path
+    PRINT "Products in memory: " + STRING(LEN(app.Products))
+    PRINT "Active records: " + STRING(info.Active)
+    PRINT "Tombstones: " + STRING(info.Tombstones)
+    PRINT "Dirty: " + STRING(app.Dirty)
+    PRINT "Status: " + app.Status
+END FUNCTION
+
+FUNCTION SaveStore()
+    ignored = ArcoDB.Write(db)
+    app.Dirty = FALSE
+    app.Status = "Saved " + db.Path
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION CompactStore()
+    result = ArcoDB.Compact(db)
+    ignored = ArcoDB.Write(db)
+    app.Dirty = FALSE
+    app.Status = "Compacted store: removed " + STRING(result.Removed) + " tombstones"
+    PRINT app.Status
+    RETURN result.Removed
+END FUNCTION
+
+FUNCTION DrawMenu()
+    PRINT ""
+    PRINT TUI.ThemeRule("circuit", app.StoreName, 72)
+    PRINT "1. List products"
+    PRINT "2. Add product"
+    PRINT "3. Edit product"
+    PRINT "4. Receive stock"
+    PRINT "5. Customer checkout"
+    PRINT "6. Low-stock report"
+    PRINT "7. Sales report"
+    PRINT "8. Remove product"
+    PRINT "9. Store status"
+    PRINT "s. Save"
+    PRINT "c. Compact database"
+    PRINT "q. Quit"
+    PRINT ""
+    PRINT app.Status
+END FUNCTION
+
+ignored = LoadProducts()
+ignored = SeedProducts()
+ignored = LoadProducts()
+
+WHILE app.Running
+    DrawMenu()
+    choice = Lower(Ask("arcomart> "))
+    IF choice == "1" OR choice == "list" THEN ignored = ListProducts()
+    IF choice == "2" OR choice == "add" THEN ignored = AddProduct()
+    IF choice == "3" OR choice == "edit" THEN ignored = EditProduct()
+    IF choice == "4" OR choice == "receive" THEN ignored = ReceiveStock()
+    IF choice == "5" OR choice == "checkout" THEN ignored = Checkout()
+    IF choice == "6" OR choice == "low" THEN ignored = LowStockReport()
+    IF choice == "7" OR choice == "sales" THEN ignored = SalesReport()
+    IF choice == "8" OR choice == "remove" THEN ignored = RemoveProduct()
+    IF choice == "9" OR choice == "status" THEN StoreStatus()
+    IF choice == "s" OR choice == "save" THEN ignored = SaveStore()
+    IF choice == "c" OR choice == "compact" THEN ignored = CompactStore()
+    IF choice == "q" OR choice == "quit" OR choice == "exit" THEN app.Running = FALSE
+    IF choice == "" THEN app.Running = FALSE
+WEND
+
+IF app.Dirty THEN
+    answer = Lower(Ask("Save changes before exit? yes/no> "))
+    IF answer == "yes" OR answer == "y" OR answer == "" THEN ignored = SaveStore()
+END IF
+
+PRINT "ArcoMart closed."

@@ -1,0 +1,273 @@
+#DESCRIPTION "ArcoNote desktop text editor"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "ArcoNote needs a Wayland or X11 desktop session."
+    ExitTheProgram(0)
+END IF
+
+title_icon = Path.Join(ArcoSH.AssetsDir(), "arconaut", "title-icon.png")
+initial_path = "untitled.txt"
+IF LEN(Args) > 0 THEN initial_path = Args[0]
+initial_content = ""
+IF File.Exists(initial_path) THEN initial_content = File.ReadText(initial_path)
+
+TRY
+    GUI.Application("arconote", "ArcoNote", title_icon)
+    window = GUI.Window("ArcoNote - " + Path.BaseName(initial_path), 820, 600)
+CATCH err
+    PRINT "ArcoNote window could not be opened: " + err.Message
+    ExitTheProgram(0)
+END TRY
+GUI.SetCursor(window, "text")
+
+app = {"Path": initial_path, "HasPath": LEN(Args) > 0, "Content": initial_content, "Caret": String.Length(initial_content), "ScrollY": 0, "Dirty": FALSE, "Running": TRUE, "Status": initial_path, "SidebarOpen": TRUE, "HoverAction": "", "Recent": []}
+
+CLASS TextStats
+    Text AS String = ""
+
+    CONSTRUCTOR(text AS String = "")
+        SELF.Text = text
+    END CONSTRUCTOR
+
+    FUNCTION Lines() AS Number
+        IF SELF.Text == "" THEN RETURN 1
+        RETURN LEN(String.Split(SELF.Text, "\n"))
+    END FUNCTION
+
+    FUNCTION Words() AS Number
+        count = 0
+        in_word = FALSE
+        index = 0
+        WHILE index < String.Length(SELF.Text)
+            ch = String.Slice(SELF.Text, index, 1)
+            is_space = String.Contains(" \n\r\t", ch)
+            IF is_space THEN
+                in_word = FALSE
+            ELSE
+                IF in_word == FALSE THEN count = count + 1
+                in_word = TRUE
+            END IF
+            index = index + 1
+        WEND
+        RETURN count
+    END FUNCTION
+
+    FUNCTION Summary() AS String
+        RETURN STRING(SELF.Lines()) + " lines   " + STRING(SELF.Words()) + " words   " + STRING(String.Length(SELF.Text)) + " chars"
+    END FUNCTION
+END CLASS
+
+FUNCTION RememberPath(path)
+    IF path == "" THEN RETURN FALSE
+    next_recent = [path]
+    FOR recent_path IN app.Recent
+        IF recent_path <> path THEN ignored = Array.Add(next_recent, recent_path)
+    NEXT
+    WHILE LEN(next_recent) > 4
+        ignored = Array.Pop(next_recent)
+    WEND
+    app.Recent = next_recent
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION StatsText()
+    stats = TextStats(app.Content)
+    RETURN stats.Summary()
+END FUNCTION
+
+FUNCTION MarkDirty()
+    app.Dirty = TRUE
+    app.Status = "Modified"
+    GUI.SetTitle(window, "ArcoNote - " + Path.BaseName(app.Path) + " *")
+END FUNCTION
+
+FUNCTION SaveDocument()
+    IF app.HasPath == FALSE THEN
+        selected_path = GUI.SaveFileDialog(window, "Save ArcoNote Document", app.Path)
+        IF selected_path == "" THEN RETURN FALSE
+        app.Path = selected_path
+        app.HasPath = TRUE
+    END IF
+    File.WriteText(app.Path, app.Content)
+    ignored = RememberPath(app.Path)
+    app.Dirty = FALSE
+    app.Status = "Saved " + app.Path
+    GUI.SetTitle(window, "ArcoNote - " + Path.BaseName(app.Path))
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION OpenPath(selected_path)
+    IF app.Dirty THEN
+        IF GUI.Confirm(window, "Unsaved changes", "Discard the current document and open another file?") == FALSE THEN RETURN FALSE
+    END IF
+    IF selected_path == "" THEN RETURN FALSE
+    IF File.Exists(selected_path) THEN
+        app.Path = selected_path
+        app.HasPath = TRUE
+        app.Content = File.ReadText(selected_path)
+        app.Caret = String.Length(app.Content)
+        app.ScrollY = 0
+        app.Dirty = FALSE
+        app.Status = "Opened " + app.Path
+        ignored = RememberPath(app.Path)
+        GUI.SetTitle(window, "ArcoNote - " + Path.BaseName(app.Path))
+    ELSE
+        app.Status = "File does not exist: " + selected_path
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION OpenDocument()
+    selected_path = GUI.OpenFileDialog(window, "Open ArcoNote Document", app.Path)
+    RETURN OpenPath(selected_path)
+END FUNCTION
+
+FUNCTION NewDocument()
+    IF app.Dirty THEN
+        IF GUI.Confirm(window, "Unsaved changes", "Discard the current document and start a new one?") == FALSE THEN RETURN FALSE
+    END IF
+    app.Content = ""
+    app.Path = "untitled.txt"
+    app.HasPath = FALSE
+    app.Caret = 0
+    app.ScrollY = 0
+    app.Dirty = TRUE
+    app.Status = "New document - saves to " + app.Path
+    GUI.SetTitle(window, "ArcoNote - " + Path.BaseName(app.Path) + " *")
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION RequestClose()
+    IF app.Dirty THEN
+        IF GUI.Confirm(window, "Unsaved changes", "Close ArcoNote without saving your changes?") == FALSE THEN
+            GUI.SetShouldClose(window, FALSE)
+            RETURN FALSE
+        END IF
+    END IF
+    app.Running = FALSE
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION InsertText(value)
+    app.Content = String.Slice(app.Content, 0, app.Caret) + value + String.Slice(app.Content, app.Caret)
+    app.Caret = app.Caret + String.Length(value)
+    MarkDirty()
+END FUNCTION
+
+FUNCTION DeleteBackward()
+    IF app.Caret > 0 THEN
+        app.Content = String.Slice(app.Content, 0, app.Caret - 1) + String.Slice(app.Content, app.Caret)
+        app.Caret = app.Caret - 1
+        MarkDirty()
+    END IF
+END FUNCTION
+
+FUNCTION DeleteForward()
+    IF app.Caret < String.Length(app.Content) THEN
+        app.Content = String.Slice(app.Content, 0, app.Caret) + String.Slice(app.Content, app.Caret + 1)
+        MarkDirty()
+    END IF
+END FUNCTION
+
+WHILE app.Running
+    size = GUI.Size(window)
+    sidebar_width = 58
+    IF app.SidebarOpen THEN sidebar_width = 210
+    editor_x = sidebar_width + 14
+    editor_width = size.Width - editor_x - 14
+    GUI.Clear(window, 0.055, 0.062, 0.082)
+    GUI.Rectangle(window, 0, 0, sidebar_width, size.Height, 0.075, 0.086, 0.115)
+    GUI.Text(window, "=", 22, 15, 24, 0.78, 0.86, 0.98)
+    IF app.SidebarOpen THEN GUI.Text(window, "ArcoNote", 58, 18, 20, 0.82, 0.9, 1.0)
+    GUI.Line(window, 12, 57, sidebar_width - 12, 57, 1, 0.16, 0.19, 0.25)
+
+    IF app.HoverAction == "new" THEN GUI.RoundedRectangle(window, 8, 72, sidebar_width - 16, 42, 7, 0.14, 0.18, 0.25)
+    IF app.HoverAction == "open" THEN GUI.RoundedRectangle(window, 8, 120, sidebar_width - 16, 42, 7, 0.14, 0.18, 0.25)
+    IF app.HoverAction == "save" THEN GUI.RoundedRectangle(window, 8, 168, sidebar_width - 16, 42, 7, 0.16, 0.46, 0.78)
+    GUI.Text(window, "+", 20, 78, 24, 0.72, 0.82, 0.95)
+    GUI.Text(window, "O", 20, 127, 19, 0.72, 0.82, 0.95)
+    GUI.Text(window, "S", 20, 175, 19, 0.72, 0.82, 0.95)
+    IF app.SidebarOpen THEN
+        GUI.Text(window, "New", 58, 82, 17, 0.84, 0.88, 0.94)
+        GUI.Text(window, "Open", 58, 130, 17, 0.84, 0.88, 0.94)
+        GUI.Text(window, "Save", 58, 178, 17, 0.84, 0.88, 0.94)
+        GUI.Text(window, "RECENT", 18, 236, 12, 0.38, 0.5, 0.68)
+        recent_row = 0
+        FOR recent_path IN app.Recent
+            GUI.Text(window, Path.BaseName(recent_path), 18, 260 + recent_row * 25, 14, 0.62, 0.72, 0.86)
+            recent_row = recent_row + 1
+        NEXT
+        GUI.Text(window, Path.BaseName(app.Path), 18, size.Height - 62, 14, 0.48, 0.57, 0.7)
+        GUI.Text(window, StatsText(), 18, size.Height - 38, 12, 0.42, 0.51, 0.64)
+    END IF
+
+    GUI.SetClip(window, editor_x, 16, editor_width, size.Height - 62)
+    GUI.RoundedRectangle(window, editor_x, 16, editor_width, size.Height - 62, 9, 0.09, 0.105, 0.135)
+    GUI.Text(window, app.Content, editor_x + 16, 31 - app.ScrollY, 18, 0.9, 0.92, 0.96)
+
+    before_caret = String.Slice(app.Content, 0, app.Caret)
+    caret_lines = String.Split(before_caret, "\n")
+    caret_line = caret_lines[LEN(caret_lines) - 1]
+    caret_measure = GUI.MeasureText(window, caret_line, 18)
+    caret_x = editor_x + 16 + caret_measure.Width
+    caret_y = 32 + (LEN(caret_lines) - 1) * 24 - app.ScrollY
+    GUI.Rectangle(window, caret_x, caret_y, 2, 21, 0.4, 0.75, 1.0)
+    GUI.ResetClip(window)
+
+    GUI.Text(window, app.Status, editor_x, size.Height - 34, 14, 0.56, 0.64, 0.74)
+    GUI.Text(window, StatsText(), editor_x, size.Height - 17, 12, 0.42, 0.5, 0.61)
+    GUI.Text(window, "Ctrl+S save   Ctrl+C copy all   Ctrl+V paste   Ctrl+Q quit", size.Width - 455, size.Height - 34, 14, 0.45, 0.52, 0.62)
+    GUI.Present(window)
+
+    event = GUI.WaitEvent(0.04)
+    IF event.Type == "close" THEN ignored = RequestClose()
+    IF event.Type == "text" THEN InsertText(event.Text)
+    IF event.Type == "scroll" THEN
+        app.ScrollY = app.ScrollY - event.DeltaY * 32
+        IF app.ScrollY < 0 THEN app.ScrollY = 0
+    END IF
+    IF event.Type == "pointer-move" THEN
+        app.HoverAction = ""
+        IF event.X < sidebar_width AND event.Y >= 72 AND event.Y < 114 THEN app.HoverAction = "new"
+        IF event.X < sidebar_width AND event.Y >= 120 AND event.Y < 162 THEN app.HoverAction = "open"
+        IF event.X < sidebar_width AND event.Y >= 168 AND event.Y < 210 THEN app.HoverAction = "save"
+        IF event.X < sidebar_width THEN
+            GUI.SetCursor(window, "hand")
+        ELSE
+            GUI.SetCursor(window, "text")
+        END IF
+    END IF
+    IF event.Type == "pointer-button" THEN
+        IF event.Action == "press" AND event.Button == "left" THEN
+            IF event.X < sidebar_width AND event.Y >= 8 AND event.Y < 57 THEN
+                IF app.SidebarOpen THEN app.SidebarOpen = FALSE ELSE app.SidebarOpen = TRUE
+            END IF
+            IF event.X < sidebar_width AND event.Y >= 72 AND event.Y < 114 THEN ignored = NewDocument()
+            IF event.X < sidebar_width AND event.Y >= 120 AND event.Y < 162 THEN ignored = OpenDocument()
+            IF event.X < sidebar_width AND event.Y >= 168 AND event.Y < 210 THEN ignored = SaveDocument()
+            IF app.SidebarOpen AND event.X < sidebar_width AND event.Y >= 252 AND event.Y < 360 THEN
+                recent_index = (event.Y - 252) / 25
+                IF recent_index >= 0 AND recent_index < LEN(app.Recent) THEN ignored = OpenPath(app.Recent[recent_index])
+            END IF
+        END IF
+    END IF
+    IF event.Type == "key" THEN
+        IF event.Action == "press" OR event.Action == "repeat" THEN
+            IF event.Key == "escape" THEN ignored = RequestClose()
+            IF event.Key == "left" AND app.Caret > 0 THEN app.Caret = app.Caret - 1
+            IF event.Key == "right" AND app.Caret < String.Length(app.Content) THEN app.Caret = app.Caret + 1
+            IF event.Key == "backspace" THEN DeleteBackward()
+            IF event.Key == "delete" THEN DeleteForward()
+            IF event.Key == "enter" THEN InsertText("\n")
+            IF event.Ctrl THEN
+                IF event.Key == "s" THEN ignored = SaveDocument()
+                IF event.Key == "c" THEN GUI.SetClipboardText(window, app.Content)
+                IF event.Key == "v" THEN InsertText(GUI.ClipboardText(window))
+                IF event.Key == "q" THEN ignored = RequestClose()
+            END IF
+        END IF
+    END IF
+WEND
+
+GUI.Close(window)
+IF app.Dirty THEN PRINT "ArcoNote closed with unsaved changes in " + app.Path

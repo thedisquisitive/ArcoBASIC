@@ -1,0 +1,18 @@
+#DESCRIPTION "Fetch a page with a raw TCP client"
+
+host = "example.com"
+IF LEN(Args) > 0 THEN host = Args[0]
+
+client = Net.TcpConnect(host, 80)
+IF client.Ok == FALSE THEN
+    PRINT "TCP error: " + client.Error
+    ExitTheProgram(1)
+END IF
+
+request = "GET / HTTP/1.0\r\nHost: " + host + "\r\nUser-Agent: ArcoBASIC/0.1\r\n\r\n"
+sent = Net.TcpSend(client.Client, request)
+IF sent.Ok == FALSE THEN PRINT "Send error: " + sent.Error
+
+chunk = Net.TcpRead(client.Client, 4096)
+IF chunk.Ok THEN PRINT chunk.Data ELSE PRINT "Read error: " + chunk.Error
+Net.TcpClose(client.Client)

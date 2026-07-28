@@ -1,0 +1,152 @@
+#!/bin/sh
+set -eu
+
+config=/etc/arcology-lazarus/network.conf
+restart=false
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--config) config=$2; shift 2 ;;
+		--restart) restart=true; shift ;;
+		*) echo "Unknown network option: $1" >&2; exit 2 ;;
+	esac
+done
+
+read_setting() {
+	awk -F= -v key="$1" '$1 == key {print substr($0, index($0, "=") + 1); exit}' "$config" 2>/dev/null || true
+}
+
+mode="$(read_setting mode)"
+selected="$(read_setting interface)"
+address="$(read_setting address)"
+prefix="$(read_setting prefix)"
+gateway="$(read_setting gateway)"
+dns="$(read_setting dns)"
+[ -n "$mode" ] || mode=dhcp
+[ -n "$selected" ] || selected=auto
+[ -n "$prefix" ] || prefix=24
+
+mkdir -p /run/arcology-lazarus /var/log/arcology-lazarus
+log=/var/log/arcology-lazarus/network.log
+touch "$log"
+
+report() {
+	message="$(date -Iseconds) $*"
+	echo "$message" >> "$log"
+	echo "lazarus-network: $*" > /dev/ttyS0 2>/dev/null || true
+}
+
+interface_count() {
+	count=0
+	for candidate in /sys/class/net/*; do
+		[ -e "$candidate" ] || continue
+		[ "$(basename "$candidate")" = lo ] || count=$((count + 1))
+	done
+	echo "$count"
+}
+
+load_alias() {
+	alias="$1"
+	[ -n "$alias" ] || return 0
+	# A defective device or driver must not hold appliance startup indefinitely.
+	timeout -s KILL 4 modprobe -q "$alias" 2>/dev/null || true
+}
+
+# The live root starts udev after pivoting away from the initramfs. If udev has
+# already produced an interface, do not probe unrelated drivers. Otherwise,
+# cold-load only aliases belonging to detected PCI or USB network controllers.
+if [ "$(interface_count)" -eq 0 ]; then
+	report "No wired interface is present yet; cold-loading detected network controller drivers."
+	for device in /sys/bus/pci/devices/*; do
+		[ -r "$device/class" ] && [ -r "$device/modalias" ] || continue
+		case "$(cat "$device/class")" in
+			0x02*) load_alias "$(cat "$device/modalias")" ;;
+		esac
+	done
+	for device in /sys/bus/usb/devices/*; do
+		[ -r "$device/bInterfaceClass" ] && [ -r "$device/modalias" ] || continue
+		case "$(cat "$device/bInterfaceClass")" in
+			02|0a|e0) load_alias "$(cat "$device/modalias")" ;;
+		esac
+	done
+fi
+for _ in $(seq 1 20); do
+	[ "$(interface_count)" -gt 0 ] && break
+	sleep 0.25
+done
+
+# Firmware and virtual machines do not always expose usable modalias binding
+# before the live-root udev transition. This fallback is bounded and runs in
+# the background, so even a defective module cannot delay the kiosk.
+if [ "$(interface_count)" -eq 0 ]; then
+	for module in virtio_net e1000 e1000e r8169 igb igc tg3 alx atlantic bnxt_en ixgbe; do
+		load_alias "$module"
+		[ "$(interface_count)" -gt 0 ] && break
+	done
+fi
+
+wired_interfaces=""
+for interface_path in /sys/class/net/*; do
+	[ -e "$interface_path" ] || continue
+	interface="$(basename "$interface_path")"
+	[ "$interface" != lo ] || continue
+	[ "$(cat "$interface_path/type" 2>/dev/null || true)" = 1 ] || continue
+	[ ! -d "$interface_path/wireless" ] || continue
+	if [ "$selected" = auto ] || [ "$selected" = "$interface" ]; then
+		wired_interfaces="$wired_interfaces $interface"
+	fi
+done
+
+if [ -z "$wired_interfaces" ]; then
+	report "No matching wired network interface was detected for '$selected'; continuing offline."
+	# No network is a supported appliance state. The UI remains available for
+	# configuration and diagnostics, and a later retry can bring the link up.
+	exit 0
+fi
+
+stop_client() {
+	pidfile="/run/arcology-lazarus/udhcpc-$1.pid"
+	if [ -s "$pidfile" ]; then
+		pid="$(cat "$pidfile")"
+		kill "$pid" 2>/dev/null || true
+		rm -f "$pidfile"
+	fi
+}
+
+for interface in $wired_interfaces; do
+	pidfile="/run/arcology-lazarus/udhcpc-$interface.pid"
+	if [ "$restart" = true ] || [ "$mode" = static ]; then
+		stop_client "$interface"
+	fi
+	ip link set dev "$interface" up
+	report "$interface link enabled; network configuration continues independently."
+
+	if [ "$mode" = static ]; then
+		ip -4 addr flush dev "$interface"
+		ip -4 addr add "$address/$prefix" dev "$interface"
+		if [ -n "$gateway" ]; then
+			ip -4 route replace default via "$gateway" dev "$interface"
+		fi
+		if [ -n "$dns" ]; then
+			: > /etc/resolv.conf
+			old_ifs=$IFS; IFS=','
+			for server in $dns; do
+				server="$(echo "$server" | tr -d ' ')"
+				[ -n "$server" ] && echo "nameserver $server" >> /etc/resolv.conf
+			done
+			IFS=$old_ifs
+		fi
+		echo "$(date -Iseconds) $interface: static address $address/$prefix applied." >> "$log"
+		continue
+	fi
+
+	if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+		continue
+	fi
+	rm -f "$pidfile"
+	report "$interface: starting DHCP discovery."
+	start-stop-daemon --start --background --make-pidfile \
+		--pidfile "$pidfile" --exec "$(command -v udhcpc)" \
+		--stdout "$log" --stderr "$log" -- \
+		-f -S -t 5 -T 2 -A 10 -i "$interface" \
+		-x hostname:arcology-lazarus
+done

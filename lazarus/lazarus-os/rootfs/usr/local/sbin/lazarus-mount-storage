@@ -1,0 +1,99 @@
+#!/bin/sh
+set -eu
+
+config=/etc/arcology-lazarus/bench.profile
+mount_target=/mnt/lazarus-storage
+security_file=/var/lib/arcology-lazarus/admin.auth
+network_file=/etc/arcology-lazarus/network.conf
+
+device="$(awk -F= '$1 == "image_storage_device" {print substr($0, index($0, "=") + 1); exit}' "$config" 2>/dev/null || true)"
+volume="$(awk -F= '$1 == "image_storage_volume" {print substr($0, index($0, "=") + 1); exit}' "$config" 2>/dev/null || true)"
+[ -n "$device" ] || { echo "lazarus-storage: no image storage device configured" >/dev/ttyS0 2>/dev/null || true; exit 0; }
+
+for _ in $(seq 1 40); do
+	[ -b "$device" ] && break
+	sleep 0.25
+done
+
+if [ ! -b "$device" ]; then
+	echo "Lazarus image-storage device is not currently connected: $device" >&2
+	echo "lazarus-storage: device missing: $device" >/dev/ttyS0 2>/dev/null || true
+	# A fresh physical appliance will not have the QEMU demo storage device.
+	# Keep the backend and Admin installer available so storage can be configured.
+	exit 0
+fi
+
+resolved_device="$(readlink -f "$device")"
+[ -b "$resolved_device" ] || {
+	echo "Lazarus image-storage identity did not resolve to a block device: $device" >&2
+	exit 1
+}
+
+partition=""
+if [ -n "$volume" ]; then
+	for _ in $(seq 1 20); do
+		[ -b "$volume" ] && break
+		sleep 0.1
+	done
+	[ -b "$volume" ] && partition="$(readlink -f "$volume")"
+fi
+if [ -z "$partition" ]; then
+	partition="$resolved_device"
+	case "$resolved_device" in
+		/dev/nvme*n*|/dev/mmcblk*|/dev/loop*|/dev/nbd*) candidate="${resolved_device}p1" ;;
+		*) candidate="${resolved_device}1" ;;
+	esac
+	if [ -b "$candidate" ]; then
+		partition="$candidate"
+	fi
+fi
+
+mkdir -p "$mount_target"
+if mountpoint -q "$mount_target"; then
+	echo "lazarus-storage: already mounted at $mount_target" >/dev/ttyS0 2>/dev/null || true
+	exit 0
+fi
+
+if ! blkid "$partition" >/dev/null 2>&1; then
+	echo "Lazarus image-storage target has no filesystem: $partition" >&2
+	echo "Format it as ext4 from the administrator workflow before using it." >&2
+	echo "lazarus-storage: filesystem missing on $partition" >/dev/ttyS0 2>/dev/null || true
+	exit 1
+fi
+
+mount -o rw,nosuid,nodev "$partition" "$mount_target"
+mkdir -p "$mount_target/images"
+chgrp lazarus "$mount_target" "$mount_target/images"
+chmod 0750 "$mount_target"
+chmod 0770 "$mount_target/images"
+echo "lazarus-storage: mounted $partition at $mount_target" >/dev/ttyS0 2>/dev/null || true
+
+# A live system keeps its root overlay in RAM. Mirror the profile beside the
+# images so a later boot can restore the administrator's storage assignment.
+if [ -f "$mount_target/bench.profile" ]; then
+	cp "$mount_target/bench.profile" "$config"
+echo "lazarus-storage: restored persistent bench profile" >/dev/ttyS0 2>/dev/null || true
+fi
+cp "$config" "$mount_target/bench.profile"
+
+# Keep per-appliance administrator credentials with persistent state. Only
+# salted password and recovery-key hashes are stored; plaintext secrets are
+# never written here.
+mkdir -p "$(dirname "$security_file")"
+chmod 0750 "$(dirname "$security_file")"
+if [ -f "$mount_target/admin.auth" ]; then
+	cp "$mount_target/admin.auth" "$security_file"
+	chmod 0600 "$security_file"
+	echo "lazarus-storage: restored administrator credentials" >/dev/ttyS0 2>/dev/null || true
+elif [ -f "$security_file" ]; then
+	cp "$security_file" "$mount_target/admin.auth"
+	chmod 0600 "$mount_target/admin.auth"
+fi
+
+if [ -f "$mount_target/network.conf" ]; then
+	cp "$mount_target/network.conf" "$network_file"
+	chmod 0644 "$network_file"
+elif [ -f "$network_file" ]; then
+	cp "$network_file" "$mount_target/network.conf"
+	chmod 0644 "$mount_target/network.conf"
+fi

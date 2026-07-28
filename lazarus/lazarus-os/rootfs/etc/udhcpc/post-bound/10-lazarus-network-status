@@ -1,0 +1,5 @@
+#!/bin/sh
+
+message="Arcology Lazarus DHCP lease: $interface $ip/$mask"
+echo "$message" >> /var/log/arcology-lazarus/network.log
+echo "lazarus-network: $message" > /dev/ttyS0 2>/dev/null || true

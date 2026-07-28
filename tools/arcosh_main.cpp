@@ -114,6 +114,14 @@ int main(int argc, char** argv) {
         }
         return result.exited ? result.exit_code : 0;
     }
+    if (arg == "--install-shell") {
+        const auto result = arco::shell::run_login_shell_wizard(runtime);
+        if (!result.ok) {
+            std::cerr << result.error << '\n';
+            return 1;
+        }
+        return result.exited ? result.exit_code : 0;
+    }
 
     std::vector<std::string> script_args;
     for (int i = arg_index + 1; i < argc; ++i) {

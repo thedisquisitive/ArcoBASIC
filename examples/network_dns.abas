@@ -1,0 +1,14 @@
+#DESCRIPTION "Resolve a host with ArcoBASIC networking"
+
+host = "localhost"
+IF LEN(Args) > 0 THEN host = Args[0]
+
+result = Net.ResolveDNS(host)
+PRINT "Host: " + result.Host
+IF result.Ok THEN
+    FOR address IN result.Addresses
+        PRINT address
+    NEXT
+ELSE
+    PRINT "DNS error: " + result.Error
+END IF

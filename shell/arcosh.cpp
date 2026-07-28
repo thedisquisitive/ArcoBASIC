@@ -1984,6 +1984,7 @@ const std::map<std::string, std::string>& help_catalog() {
             "  host        Host/process helpers available to shell scripts\n"
             "  system      OS capabilities, GUI open, process launching, printers\n"
             "  network     HTTP GET, POST, and file downloads\n"
+            "  web         Static HTTP serving\n"
             "  gui         Desktop windows, drawing, and input events\n"
             "  printers    Printer discovery and file printing helpers\n"
             "  sudo        Request elevated permissions from scripts\n"
@@ -3145,6 +3146,21 @@ const std::map<std::string, std::string>& help_catalog() {
             "      page = Network.Get(\"https://example.com\")\n"
             "      IF page.Ok THEN PRINT page.Body\n"
             "  END IF\n"},
+        {"web",
+            "Web helpers\n"
+            "\n"
+            "The first web slice serves generated static sites from the core runtime.\n"
+            "It is a blocking development server suitable for Arcology exports and\n"
+            "small local tools. Dynamic route dispatch comes later.\n"
+            "\n"
+            "Helpers:\n"
+            "  Web.ServeStatic(root, port, host = \"127.0.0.1\", maxRequests = 0)\n"
+            "  Web.Static(root, port, host = \"127.0.0.1\", maxRequests = 0)\n"
+            "\n"
+            "Examples:\n"
+            "  Web.ServeStatic(\"dist/arcology\", 8080)\n"
+            "  Web.ServeStatic(\"dist/arcology\", 8080, \"127.0.0.1\", 1)\n"
+            "  arcosh examples/arcology_serve_static.abas arcology.arcodb dist/arcology 8080\n"},
         {"gui",
             "Desktop GUI helpers (Linux preview)\n"
             "\n"

@@ -1,0 +1,10 @@
+#!/sbin/openrc-run
+
+name="Arcology Lazarus printer configuration"
+description="Restores persistent CUPS printer definitions before CUPS starts"
+command="/usr/local/sbin/lazarus-restore-printers"
+
+depend() {
+	need lazarus-storage
+	before cupsd
+}

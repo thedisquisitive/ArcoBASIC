@@ -456,6 +456,234 @@ Value network_download(const std::string& url, const std::string& path, const Va
     return result;
 }
 
+std::string http_reason(int status) {
+    switch (status) {
+        case 200:
+            return "OK";
+        case 400:
+            return "Bad Request";
+        case 403:
+            return "Forbidden";
+        case 404:
+            return "Not Found";
+        case 405:
+            return "Method Not Allowed";
+        case 500:
+            return "Internal Server Error";
+        default:
+            return "OK";
+    }
+}
+
+std::string mime_type_for_path(const std::filesystem::path& path) {
+    const std::string ext = lower_copy(path.extension().string());
+    if (ext == ".html" || ext == ".htm") return "text/html; charset=utf-8";
+    if (ext == ".css") return "text/css; charset=utf-8";
+    if (ext == ".js") return "application/javascript; charset=utf-8";
+    if (ext == ".json") return "application/json; charset=utf-8";
+    if (ext == ".txt") return "text/plain; charset=utf-8";
+    if (ext == ".png") return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".gif") return "image/gif";
+    if (ext == ".svg") return "image/svg+xml";
+    if (ext == ".ico") return "image/x-icon";
+    return "application/octet-stream";
+}
+
+bool send_all(int fd, const std::string& data) {
+#ifdef _WIN32
+    (void)fd;
+    (void)data;
+    return false;
+#else
+    std::size_t sent_total = 0;
+    while (sent_total < data.size()) {
+        const ssize_t sent = send(fd, data.data() + sent_total, data.size() - sent_total, 0);
+        if (sent <= 0) {
+            return false;
+        }
+        sent_total += static_cast<std::size_t>(sent);
+    }
+    return true;
+#endif
+}
+
+std::string read_http_request(int fd) {
+#ifdef _WIN32
+    (void)fd;
+    return "";
+#else
+    std::string request;
+    char buffer[1024]{};
+    while (request.size() < 64 * 1024) {
+        const ssize_t count = recv(fd, buffer, sizeof(buffer), 0);
+        if (count <= 0) {
+            break;
+        }
+        request.append(buffer, static_cast<std::size_t>(count));
+        if (request.find("\r\n\r\n") != std::string::npos || request.find("\n\n") != std::string::npos) {
+            break;
+        }
+    }
+    return request;
+#endif
+}
+
+std::string http_response(int status, const std::string& content_type, const std::string& body, bool include_body = true) {
+    std::ostringstream out;
+    out << "HTTP/1.1 " << status << " " << http_reason(status) << "\r\n";
+    out << "Content-Type: " << content_type << "\r\n";
+    out << "Content-Length: " << body.size() << "\r\n";
+    out << "Connection: close\r\n";
+    out << "X-Content-Type-Options: nosniff\r\n";
+    out << "\r\n";
+    if (include_body) {
+        out << body;
+    }
+    return out.str();
+}
+
+bool path_is_inside(const std::filesystem::path& root, const std::filesystem::path& path) {
+    const auto root_text = root.lexically_normal().string();
+    const auto path_text = path.lexically_normal().string();
+    return path_text == root_text || path_text.rfind(root_text + "/", 0) == 0;
+}
+
+std::string static_response_body(const std::filesystem::path& root, const std::string& request_target,
+                                 int& status, std::string& content_type) {
+    std::string target = request_target.empty() ? "/" : request_target;
+    const auto query = target.find('?');
+    if (query != std::string::npos) {
+        target = target.substr(0, query);
+    }
+    target = url_decode(target);
+    if (target.empty() || target.front() != '/') {
+        status = 400;
+        content_type = "text/plain; charset=utf-8";
+        return "Bad Request\n";
+    }
+    if (target == "/") {
+        target = "/index.html";
+    }
+
+    std::filesystem::path relative = std::filesystem::path(target.substr(1)).lexically_normal();
+    if (relative.empty() || relative.string().rfind("..", 0) == 0 || relative.is_absolute()) {
+        status = 403;
+        content_type = "text/plain; charset=utf-8";
+        return "Forbidden\n";
+    }
+
+    std::filesystem::path file_path = (root / relative).lexically_normal();
+    if (std::filesystem::is_directory(file_path)) {
+        file_path = file_path / "index.html";
+    }
+    if (!path_is_inside(root, file_path)) {
+        status = 403;
+        content_type = "text/plain; charset=utf-8";
+        return "Forbidden\n";
+    }
+    if (!std::filesystem::exists(file_path) || std::filesystem::is_directory(file_path)) {
+        status = 404;
+        content_type = "text/plain; charset=utf-8";
+        return "Not Found\n";
+    }
+
+    status = 200;
+    content_type = mime_type_for_path(file_path);
+    std::ifstream input(file_path, std::ios::binary);
+    if (!input) {
+        status = 404;
+        content_type = "text/plain; charset=utf-8";
+        return "Not Found\n";
+    }
+    std::ostringstream body;
+    body << input.rdbuf();
+    return body.str();
+}
+
+Value serve_static_site(const std::string& root_path, int port, const std::string& host, int max_requests) {
+    if (port <= 0 || port > 65535) {
+        throw std::runtime_error("Web.ServeStatic port must be between 1 and 65535");
+    }
+    if (max_requests < 0) {
+        throw std::runtime_error("Web.ServeStatic max requests cannot be negative");
+    }
+    const std::filesystem::path root = std::filesystem::absolute(root_path).lexically_normal();
+    if (!std::filesystem::exists(root) || !std::filesystem::is_directory(root)) {
+        throw std::runtime_error("Web.ServeStatic root directory does not exist: " + root_path);
+    }
+#ifdef _WIN32
+    (void)host;
+    return Value::Object{{"Ok", false}, {"Host", host}, {"Port", static_cast<double>(port)}, {"Root", root.string()}, {"Requests", 0.0}, {"Error", "Web.ServeStatic is not implemented on Windows yet"}};
+#else
+    addrinfo hints {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    addrinfo* results = nullptr;
+    const std::string port_text = std::to_string(port);
+    const int lookup = getaddrinfo(host.empty() ? nullptr : host.c_str(), port_text.c_str(), &hints, &results);
+    if (lookup != 0) {
+        return Value::Object{{"Ok", false}, {"Host", host}, {"Port", static_cast<double>(port)}, {"Root", root.string()}, {"Requests", 0.0}, {"Error", gai_strerror(lookup)}};
+    }
+
+    int server_fd = -1;
+    std::string error;
+    for (addrinfo* item = results; item; item = item->ai_next) {
+        server_fd = socket(item->ai_family, item->ai_socktype, item->ai_protocol);
+        if (server_fd < 0) {
+            error = std::strerror(errno);
+            continue;
+        }
+        int reuse = 1;
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        if (bind(server_fd, item->ai_addr, item->ai_addrlen) == 0 && listen(server_fd, 16) == 0) {
+            break;
+        }
+        error = std::strerror(errno);
+        close(server_fd);
+        server_fd = -1;
+    }
+    freeaddrinfo(results);
+    if (server_fd < 0) {
+        return Value::Object{{"Ok", false}, {"Host", host}, {"Port", static_cast<double>(port)}, {"Root", root.string()}, {"Requests", 0.0}, {"Error", error.empty() ? "could not listen" : error}};
+    }
+
+    int served = 0;
+    while (max_requests == 0 || served < max_requests) {
+        const int client_fd = accept(server_fd, nullptr, nullptr);
+        if (client_fd < 0) {
+            error = std::strerror(errno);
+            break;
+        }
+        served++;
+        try {
+            const std::string request = read_http_request(client_fd);
+            std::istringstream input(request);
+            std::string method;
+            std::string target;
+            std::string version;
+            input >> method >> target >> version;
+            if (method.empty() || target.empty()) {
+                (void)send_all(client_fd, http_response(400, "text/plain; charset=utf-8", "Bad Request\n"));
+            } else if (method != "GET" && method != "HEAD") {
+                (void)send_all(client_fd, http_response(405, "text/plain; charset=utf-8", "Method Not Allowed\n"));
+            } else {
+                int status = 200;
+                std::string content_type;
+                const std::string body = static_response_body(root, target, status, content_type);
+                (void)send_all(client_fd, http_response(status, content_type, body, method != "HEAD"));
+            }
+        } catch (const std::exception& error_response) {
+            (void)send_all(client_fd, http_response(500, "text/plain; charset=utf-8", std::string("Internal Server Error\n") + error_response.what() + "\n"));
+        }
+        close(client_fd);
+    }
+    close(server_fd);
+    return Value::Object{{"Ok", error.empty()}, {"Host", host}, {"Port", static_cast<double>(port)}, {"Root", root.string()}, {"Requests", static_cast<double>(served)}, {"Error", error}};
+#endif
+}
+
 std::string object_runtime_class(const Value& value) {
     if (!value.is_object()) {
         return "";
@@ -2237,6 +2465,18 @@ Runtime::Runtime() : output_(&std::cout) {
     register_function("Net.TcpSend", tcp_send_function);
     register_function("Net.TcpRead", tcp_read_function);
     register_function("Net.TcpClose", tcp_close_function);
+    auto serve_static_function = [](const std::vector<Value>& args) -> Value {
+        if (args.empty() || args.size() > 4) {
+            throw std::runtime_error("Web.ServeStatic expects root, optional port, optional host, and optional max requests");
+        }
+        const std::string root = args[0].to_string();
+        const int port = args.size() >= 2 ? static_cast<int>(args[1].as_number()) : 8080;
+        const std::string host = args.size() >= 3 ? args[2].to_string() : "127.0.0.1";
+        const int max_requests = args.size() >= 4 ? static_cast<int>(args[3].as_number()) : 0;
+        return serve_static_site(root, port, host, max_requests);
+    };
+    register_function("Web.ServeStatic", serve_static_function);
+    register_function("Web.Static", serve_static_function);
     register_function("File.Exists", [](const std::vector<Value>& args) -> Value {
         expect_arg_count(args, "File.Exists", 1, 1);
         return std::filesystem::exists(args[0].to_string());

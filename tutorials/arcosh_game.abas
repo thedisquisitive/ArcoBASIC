@@ -1,0 +1,71 @@
+#DESCRIPTION "Interactive ArcoBASIC game tutorial"
+
+FUNCTION Section(title)
+    PRINT ""
+    PRINT Color.Magenta(TUI.ThemeRule("scroll", title, 72))
+END FUNCTION
+
+FUNCTION Continue()
+    ignored = Tutorial.ReadLine("press Enter to continue ")
+END FUNCTION
+
+FUNCTION Demo(title, command)
+    PRINT Color.Bold(title)
+    ignored = Tutorial.Run(command, "arco")
+END FUNCTION
+
+PRINT TUI.Scroll("ArcoBASIC Game Tutorial", "Build a tiny terminal guessing game in ArcoBASIC.\n\nThis lesson uses variables, IF/ELSE, loops, arrays, interpolation, input, and themed TUI output.")
+PRINT TUI.Status("practice prompts", "ready", "type hint, skip, or quit when needed")
+Continue()
+
+Section("1. Start with game state")
+PRINT "Games are state machines: values change as the player acts."
+ok = Tutorial.Step("secret = 7 : turns = 0 : PRINT $\"secret is {secret}\"", "arco")
+
+Section("2. Branch on a guess")
+PRINT "IF/ELSE makes the game respond to player choices."
+ok = Tutorial.Step("guess = 4 : IF guess < 7 THEN PRINT \"too low\" ELSE PRINT \"not low\"", "arco")
+
+Section("3. Track turns")
+PRINT "Compound assignment keeps counters readable."
+Demo("Count turns:", "turns = 0\nturns += 1\nturns += 1\nPRINT $\"turns = {turns}\"")
+Continue()
+
+Section("4. Add a tiny scoreboard")
+PRINT "Arrays are useful for player names, levels, inventory, and scores."
+Demo("Print scores as a table:", "rows = [[\"Ada\", 3], [\"Grace\", 5], [\"Linus\", 8]]\nPRINT TUI.Table([\"Player\", \"Score\"], rows)")
+Continue()
+
+Section("5. Style the game screen")
+PRINT "Themes help scripts feel distinct while staying terminal-native."
+Demo("Render a quest panel:", "PRINT TUI.ThemeBox(\"scroll\", \"QUEST\", \"Guess the secret number\\nUse the clues\\nWin the round\")\nPRINT TUI.Menu(\"Actions\", [\"guess\", \"hint\", \"quit\"])\nPRINT TUI.Progress(\"luck\", 3, 5, 16)")
+Continue()
+
+Section("6. Play the mini game")
+PRINT "Type guesses until you find the secret number."
+secret = "7"
+turns = 0
+playing = TRUE
+WHILE playing
+    answer = Tutorial.ReadLine("guess 1-9> ")
+    turns += 1
+    IF answer == secret THEN
+        PRINT Color.Green($"correct in {turns} turns")
+        playing = FALSE
+    ELSE
+        guess = NUMBER(answer)
+        IF guess < 7 THEN
+            PRINT "too low"
+        ELSE
+            PRINT "too high"
+        END IF
+    END IF
+WEND
+
+Section("7. The complete game shape")
+PRINT "A standalone game needs a general Input()/ReadLine() builtin later."
+PRINT "Inside tutorials, Tutorial.ReadLine() gives us interactive input today."
+Demo("Run the deterministic game loop body:", "secret = 7\nFOR guess IN [2, 9, 7]\nIF guess == secret THEN\nPRINT \"win\"\nELSE\nIF guess < secret THEN\nPRINT \"low\"\nELSE\nPRINT \"high\"\nEND IF\nEND IF\nNEXT")
+
+PRINT ""
+PRINT TUI.ThemeBox("scroll", "Game tutorial complete", "You used state, conditions, loops, arrays, interpolation, interactive input, menus, progress bars, tables, and themed panels.")

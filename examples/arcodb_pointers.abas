@@ -1,0 +1,66 @@
+#DESCRIPTION "Use ArcoDB pointers to connect stored objects"
+#IMPORT "arcodb"
+
+path = "arcodb-pointers.arcodb"
+IF LEN(Args) > 0 THEN path = Args[0]
+
+CLASS Customer
+    Name AS String = ""
+    Email AS String = ""
+
+    CONSTRUCTOR(name AS String = "", email AS String = "")
+        SELF.Name = name
+        SELF.Email = email
+    END CONSTRUCTOR
+
+    FUNCTION Label() AS String
+        RETURN SELF.Name + " <" + SELF.Email + ">"
+    END FUNCTION
+END CLASS
+
+CLASS Order
+    Number AS String = ""
+    Customer = NULL
+    Total AS Number = 0
+
+    CONSTRUCTOR(number AS String = "", customer = NULL, total AS Number = 0)
+        SELF.Number = number
+        SELF.Customer = customer
+        SELF.Total = total
+    END CONSTRUCTOR
+
+    FUNCTION Label(db) AS String
+        customerPtr = SELF.Customer
+        customer = customerPtr.Resolve(db)
+        IF ISNULL(customer) THEN RETURN SELF.Number + " missing customer"
+        RETURN SELF.Number + " for " + customer.Name + " = $" + STRING(SELF.Total)
+    END FUNCTION
+END CLASS
+
+db = ArcoDB.Open(path)
+customerSchema = ArcoDB.SchemaVersion(db, "Customer", ["Name", "Email"], 1)
+orderSchema = ArcoDB.SchemaVersion(db, "Order", ["Number", "Customer", "Total"], 1)
+
+customerPtr = ArcoDB.PointerTo(db, customerSchema, Customer("Wanda Goodburger", "wanda@email.com"))
+orderPtr = ArcoDB.PointerTo(db, orderSchema, Order("ORDER-1001", customerPtr, 42.5))
+
+PRINT customerPtr.Label()
+PRINT orderPtr.Label()
+PRINT ArcoDB.PointerExists(db, customerPtr)
+
+order = orderPtr.Resolve(db)
+PRINT order.Label(db)
+
+customer = ArcoDB.Resolve(db, customerPtr)
+customer.Email = "wanda.goodburger@arcology.example"
+PRINT ArcoDB.Replace(db, customerSchema, customerPtr.Id, customer)
+
+updatedOrder = orderPtr.Resolve(db)
+PRINT updatedOrder.Label(db)
+
+PRINT customerPtr.Forget(db)
+PRINT ArcoDB.PointerExists(db, customerPtr)
+orphanedOrder = orderPtr.Resolve(db)
+PRINT orphanedOrder.Label(db)
+
+ignored = ArcoDB.Write(db)

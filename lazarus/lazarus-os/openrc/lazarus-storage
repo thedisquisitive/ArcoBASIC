@@ -1,0 +1,10 @@
+#!/sbin/openrc-run
+
+name="Arcology Lazarus image storage"
+description="Mounts the administrator-selected persistent image storage device"
+command="/usr/local/sbin/lazarus-mount-storage"
+
+depend() {
+	need localmount dev-settle
+	after udev-trigger hwdrivers
+}

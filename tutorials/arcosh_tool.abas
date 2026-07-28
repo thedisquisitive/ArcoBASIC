@@ -1,0 +1,65 @@
+#DESCRIPTION "Interactive ArcoBASIC useful tool tutorial"
+
+FUNCTION Section(title)
+    PRINT ""
+    PRINT Color.Green(TUI.ThemeRule("circuit", title, 72))
+END FUNCTION
+
+FUNCTION Continue()
+    ignored = Tutorial.ReadLine("press Enter to continue ")
+END FUNCTION
+
+FUNCTION Demo(title, command)
+    PRINT Color.Bold(title)
+    ignored = Tutorial.Run(command, "arco")
+END FUNCTION
+
+PRINT TUI.Header("ArcoBASIC Useful Tool Tutorial")
+PRINT TUI.ThemeBox("circuit", "MISSION", "Build a small system report tool in ArcoBASIC.\n\nIt checks commands, gathers host facts, writes a report, and shapes reusable scripts for ~/.arcosh/scripts.")
+PRINT TUI.Status("practice prompts", "ready", "type hint, skip, or quit when needed")
+Continue()
+
+Section("1. Define the report path")
+PRINT "Tools should write predictable files. We will use the ArcoSH profile dir."
+ok = Tutorial.Step("report = Path.Join(ArcoSH.Home(), \"tutorial-report.txt\") : PRINT report", "arco")
+
+Section("2. Gather host facts")
+PRINT "Host helpers make scripts portable."
+Demo("Collect OS and host name:", "PRINT TUI.KeyValues(\"Host\", {\"OS\": Host.OSName(), \"Host\": Host.Hostname()})")
+Continue()
+
+Section("3. Check dependencies")
+PRINT "A useful admin tool checks whether required commands exist."
+Demo("Import sysadmin and check printf:", "#IMPORT \"sysadmin\"\nPRINT SysAdmin.CommandExists(\"printf\")")
+
+Section("4. Capture command output")
+PRINT "RUN() lets tools inspect command results and decide what to do next."
+Demo("Capture printf and render status:", "result = RUN(\"printf tool-ok\")\nIF result.ExitCode == 0 THEN PRINT TUI.Status(\"printf\", \"ok\", result.Output)")
+Continue()
+
+Section("5. Build report text")
+PRINT "String interpolation keeps reports readable."
+Demo("Create report text:", "reportText = $\"OS={Host.OSName()}\\nHost={Host.Hostname()}\\n\"\nPRINT reportText")
+Continue()
+
+Section("6. Write the report")
+PRINT "File.WriteText writes a complete file. File.AppendText adds more."
+Demo("Write and append:", "path = Path.Join(ArcoSH.Home(), \"tutorial-report.txt\")\nFile.WriteText(path, $\"OS={Host.OSName()}\\n\")\nFile.AppendText(path, $\"Host={Host.Hostname()}\\n\")\nPRINT TUI.Status(path, \"written\", STRING(File.Exists(path)))")
+Continue()
+
+Section("7. Turn it into a reusable script")
+PRINT "Put scripts in ~/.arcosh/scripts. They can read Args and Script.Name."
+Demo("Script argument pattern:", "PRINT TUI.Menu(\"Targets\", [\"web\", \"db\"])\nFOR arg IN [\"web\", \"db\"]\nPRINT TUI.Status(arg, \"planned\", \"would check\")\nNEXT")
+Continue()
+
+Section("8. Add failure handling")
+PRINT "Tools should fail clearly and keep going when possible."
+Demo("Catch a bad read:", "TRY\nPRINT File.ReadText(\"definitely-missing-file.txt\")\nCATCH err\nPRINT \"handled: \" + err.Message\nEND TRY")
+Continue()
+
+Section("9. Final tool skeleton")
+PRINT "This is the shape of a practical ArcoBASIC admin script."
+Demo("Run skeleton:", "#IMPORT \"sysadmin\"\nreport = Path.Join(ArcoSH.Home(), \"tutorial-report.txt\")\ntext = $\"OS={Host.OSName()}\\nHost={Host.Hostname()}\\nprintf={SysAdmin.CommandExists(\\\"printf\\\")}\\n\"\nFile.WriteText(report, text)\nPRINT TUI.ThemeBox(\"circuit\", \"REPORT\", TUI.Status(report, \"written\", \"ready\"))")
+
+PRINT ""
+PRINT TUI.ThemeBox("circuit", "Tool tutorial complete", "You built a useful report script with imports, host facts, command checks, capture, file output, args, error handling, and TUI reporting.")

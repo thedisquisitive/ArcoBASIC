@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Arconaut
+Comment=ArcoBASIC file manager
+Exec=@CMAKE_INSTALL_FULL_BINDIR@/arcosh @CMAKE_INSTALL_FULL_DATADIR@/arcobasic/examples/arconaut.abas %U
+Icon=arconaut
+Terminal=false
+Categories=System;FileTools;FileManager;
+MimeType=inode/directory;application/x-arcobasic;
+StartupWMClass=arconaut
+StartupNotify=true

@@ -1,0 +1,19 @@
+# Contributor: Arcology
+# Maintainer: Arcology
+pkgname=lazarus-service
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Privileged Lazarus appliance service"
+url="https://example.invalid/arcology-lazarus"
+arch="noarch"
+license="custom"
+depends="openrc arcology-lazarus smartmontools hivex"
+source="lazarus-service.initd"
+options="!check"
+
+package() {
+	install -Dm755 "$srcdir/lazarus-service.initd" "$pkgdir/etc/init.d/lazarus-service"
+	install -d "$pkgdir/run/arcology-lazarus"
+	install -d "$pkgdir/var/lib/arcology-lazarus"
+	install -d "$pkgdir/var/log/arcology-lazarus"
+}

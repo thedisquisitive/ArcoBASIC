@@ -1,0 +1,422 @@
+' ArcoDB: alpha single-file object store.
+'
+' This is the first persistent object-memory layer. It stores compact
+' ArcoCompyDB records inside one ArcoCompy-packed file. Pages, catalogs,
+' journals, compression, and replication come later.
+
+#IMPORT "compydb"
+
+CLASS ARCODBFUNCTION
+    Name AS String = ""
+    Description AS String = ""
+
+    CONSTRUCTOR(name AS String = "", description AS String = "")
+        SELF.Name = name
+        SELF.Description = description
+    END CONSTRUCTOR
+
+    FUNCTION Help() AS String
+        IF SELF.Description == "" THEN RETURN SELF.Name
+        RETURN SELF.Name + " - " + SELF.Description
+    END FUNCTION
+
+    FUNCTION Execute(db, args)
+        RETURN {"Ok": FALSE, "Error": "ArcoDB command " + SELF.Name + " has no Execute implementation.", "Rows": []}
+    END FUNCTION
+END CLASS
+
+CLASS ARCODBPOINTER
+    ClassName AS String = ""
+    Id AS Number = 0
+
+    CONSTRUCTOR(className AS String = "", id AS Number = 0)
+        SELF.ClassName = className
+        SELF.Id = id
+    END CONSTRUCTOR
+
+    FUNCTION Label() AS String
+        RETURN SELF.ClassName + "#" + STRING(SELF.Id)
+    END FUNCTION
+
+    FUNCTION Resolve(db)
+        schema = ArcoDB.SchemaFor(db, SELF.ClassName)
+        IF ISNULL(schema) THEN RETURN NULL
+        RETURN ArcoDB.Recall(db, schema, SELF.Id)
+    END FUNCTION
+
+    FUNCTION Exists(db)
+        RETURN ISNULL(SELF.Resolve(db)) == FALSE
+    END FUNCTION
+
+    FUNCTION Forget(db)
+        RETURN ArcoDB.Forget(db, SELF.Id)
+    END FUNCTION
+END CLASS
+
+FUNCTION ArcoDB.Format()
+    RETURN "ARCO_DB_ALPHA1"
+END FUNCTION
+
+FUNCTION ArcoDB.JournalFormat()
+    RETURN "ARCO_DB_JOURNAL1"
+END FUNCTION
+
+FUNCTION ArcoDB.JournalPath(path)
+    RETURN path + ".journal"
+END FUNCTION
+
+FUNCTION ArcoDB.New(path)
+    RETURN {"Format": ArcoDB.Format(), "Path": path, "NextId": 1, "Schemas": {}, "Catalogs": {}, "Records": [], "Commands": {}, "Dirty": FALSE}
+END FUNCTION
+
+FUNCTION ArcoDB.RecoverJournal(path)
+    journalPath = ArcoDB.JournalPath(path)
+    IF File.Exists(journalPath) == FALSE THEN RETURN {"Recovered": FALSE, "Ok": TRUE, "Error": ""}
+    journalText = File.ReadText(journalPath)
+    IF String.Length(journalText) == 0 THEN RETURN {"Recovered": FALSE, "Ok": TRUE, "Error": ""}
+
+    journalResult = ArcoCompy.TryUnpack(journalText)
+    IF journalResult.Ok == FALSE THEN RETURN {"Recovered": FALSE, "Ok": FALSE, "Error": journalResult.Error}
+    journal = journalResult.Value
+    IF Object.Get(journal, "Format", "") <> ArcoDB.JournalFormat() THEN
+        RETURN {"Recovered": FALSE, "Ok": FALSE, "Error": "invalid ArcoDB journal format"}
+    END IF
+    IF Object.Get(journal, "Target", "") <> path THEN
+        RETURN {"Recovered": FALSE, "Ok": FALSE, "Error": "ArcoDB journal target mismatch"}
+    END IF
+
+    payload = Object.Get(journal, "Payload", "")
+    dbResult = ArcoCompy.TryUnpack(payload)
+    IF dbResult.Ok == FALSE THEN RETURN {"Recovered": FALSE, "Ok": FALSE, "Error": dbResult.Error}
+    db = dbResult.Value
+    IF Object.Get(db, "Format", "") <> ArcoDB.Format() THEN
+        RETURN {"Recovered": FALSE, "Ok": FALSE, "Error": "journal payload is not an ArcoDB store"}
+    END IF
+
+    File.WriteText(path, payload)
+    File.WriteText(journalPath, "")
+    RETURN {"Recovered": TRUE, "Ok": TRUE, "Error": ""}
+END FUNCTION
+
+FUNCTION ArcoDB.Open(path)
+    recovered = ArcoDB.RecoverJournal(path)
+    IF File.Exists(path) THEN
+        result = ArcoCompy.TryUnpack(File.ReadText(path))
+        IF result.Ok THEN
+            db = result.Value
+            IF Object.Get(db, "Format", "") == ArcoDB.Format() THEN
+                db.Path = path
+                IF Object.Has(db, "Catalogs") == FALSE THEN db.Catalogs = {}
+                IF Object.Has(db, "Commands") == FALSE THEN db.Commands = {}
+                db.Dirty = FALSE
+                RETURN db
+            END IF
+        END IF
+    END IF
+    RETURN ArcoDB.New(path)
+END FUNCTION
+
+FUNCTION ArcoDB.Schema(db, className, fields)
+    RETURN ArcoDB.SchemaVersion(db, className, fields, 1)
+END FUNCTION
+
+FUNCTION ArcoDB.SchemaVersion(db, className, fields, version)
+    schema = ArcoCompyDB.SchemaVersion(className, fields, version)
+    db.Schemas = Object.Set(db.Schemas, className, schema)
+    db.Dirty = TRUE
+    RETURN schema
+END FUNCTION
+
+FUNCTION ArcoDB.SchemaFor(db, className)
+    RETURN Object.Get(db.Schemas, className, NULL)
+END FUNCTION
+
+FUNCTION ArcoDB.CatalogName(schema, field)
+    RETURN schema.Class + "." + field
+END FUNCTION
+
+FUNCTION ArcoDB.Catalog(db, schema, field)
+    name = ArcoDB.CatalogName(schema, field)
+    IF Object.Has(db.Catalogs, name) == FALSE THEN
+        db.Catalogs = Object.Set(db.Catalogs, name, {"Class": schema.Class, "Field": field, "Index": {}})
+        FOR record IN db.Records
+            IF record.Deleted == FALSE AND record.Class == schema.Class THEN
+                result = ArcoCompyDB.TryUnpackRecord(schema, record.Payload)
+                IF result.Ok THEN
+                    value = result.Value
+                    ignored = ArcoDB.CatalogPut(db, schema, field, Object.Get(value, field, NULL), record.Id)
+                END IF
+            END IF
+        NEXT
+    END IF
+    db.Dirty = TRUE
+    RETURN Object.Get(db.Catalogs, name)
+END FUNCTION
+
+FUNCTION ArcoDB.IndexKey(value)
+    RETURN TYPEOF(value) + ":" + STRING(value)
+END FUNCTION
+
+FUNCTION ArcoDB.CatalogPut(db, schema, field, value, id)
+    name = ArcoDB.CatalogName(schema, field)
+    IF Object.Has(db.Catalogs, name) == FALSE THEN ignored = ArcoDB.Catalog(db, schema, field)
+    catalog = Object.Get(db.Catalogs, name)
+    index = catalog.Index
+    index = Object.Set(index, ArcoDB.IndexKey(value), id)
+    catalog.Index = index
+    db.Catalogs = Object.Set(db.Catalogs, name, catalog)
+    db.Dirty = TRUE
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoDB.CatalogRemove(db, schema, field, value)
+    name = ArcoDB.CatalogName(schema, field)
+    IF Object.Has(db.Catalogs, name) == FALSE THEN RETURN FALSE
+    catalog = Object.Get(db.Catalogs, name)
+    index = catalog.Index
+    key = ArcoDB.IndexKey(value)
+    IF Object.Has(index, key) == FALSE THEN RETURN FALSE
+    index = Object.Set(index, key, NULL)
+    catalog.Index = index
+    db.Catalogs = Object.Set(db.Catalogs, name, catalog)
+    db.Dirty = TRUE
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoDB.UpdateCatalogsForValue(db, schema, value, id)
+    FOR name IN Object.Keys(db.Catalogs)
+        catalog = Object.Get(db.Catalogs, name)
+        IF catalog.Class == schema.Class THEN
+            field = catalog.Field
+            ignored = ArcoDB.CatalogPut(db, schema, field, Object.Get(value, field, NULL), id)
+        END IF
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoDB.RemoveCatalogsForValue(db, schema, value)
+    FOR name IN Object.Keys(db.Catalogs)
+        catalog = Object.Get(db.Catalogs, name)
+        IF catalog.Class == schema.Class THEN
+            field = catalog.Field
+            ignored = ArcoDB.CatalogRemove(db, schema, field, Object.Get(value, field, NULL))
+        END IF
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoDB.NextObjectId(db)
+    id = db.NextId
+    db.NextId = db.NextId + 1
+    db.Dirty = TRUE
+    RETURN id
+END FUNCTION
+
+FUNCTION ArcoDB.Keep(db, schema, value)
+    id = ArcoDB.NextObjectId(db)
+    payload = ArcoCompyDB.PackRecord(schema, value)
+    record = {"Id": id, "Class": schema.Class, "Version": schema.Version, "Payload": payload, "Deleted": FALSE}
+    ignored = Array.Push(db.Records, record)
+    ignored = ArcoDB.UpdateCatalogsForValue(db, schema, value, id)
+    db.Dirty = TRUE
+    RETURN id
+END FUNCTION
+
+FUNCTION ArcoDB.Pointer(schema, id)
+    RETURN ARCODBPOINTER(schema.Class, id)
+END FUNCTION
+
+FUNCTION ArcoDB.PointerTo(db, schema, value)
+    id = ArcoDB.Keep(db, schema, value)
+    RETURN ArcoDB.Pointer(schema, id)
+END FUNCTION
+
+FUNCTION ArcoDB.Resolve(db, pointer AS ARCODBPOINTER)
+    RETURN pointer.Resolve(db)
+END FUNCTION
+
+FUNCTION ArcoDB.PointerExists(db, pointer AS ARCODBPOINTER)
+    RETURN pointer.Exists(db)
+END FUNCTION
+
+FUNCTION ArcoDB.FindRecordIndex(db, id)
+    index = 0
+    WHILE index < LEN(db.Records)
+        record = db.Records[index]
+        IF record.Id == id THEN RETURN index
+        index = index + 1
+    WEND
+    RETURN -1
+END FUNCTION
+
+FUNCTION ArcoDB.Recall(db, schema, id)
+    index = ArcoDB.FindRecordIndex(db, id)
+    IF index < 0 THEN RETURN NULL
+    record = db.Records[index]
+    IF record.Deleted THEN RETURN NULL
+    IF record.Class <> schema.Class THEN RETURN NULL
+    result = ArcoCompyDB.TryUnpackRecord(schema, record.Payload)
+    IF result.Ok THEN RETURN result.Value
+    RETURN NULL
+END FUNCTION
+
+FUNCTION ArcoDB.Replace(db, schema, id, value)
+    index = ArcoDB.FindRecordIndex(db, id)
+    IF index < 0 THEN RETURN FALSE
+    record = db.Records[index]
+    IF record.Deleted THEN RETURN FALSE
+    oldValue = ArcoDB.Recall(db, schema, id)
+    ignored = ArcoDB.RemoveCatalogsForValue(db, schema, oldValue)
+    record.Class = schema.Class
+    record.Version = schema.Version
+    record.Payload = ArcoCompyDB.PackRecord(schema, value)
+    records = db.Records
+    records[index] = record
+    db.Records = records
+    ignored = ArcoDB.UpdateCatalogsForValue(db, schema, value, id)
+    db.Dirty = TRUE
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoDB.Forget(db, id)
+    index = ArcoDB.FindRecordIndex(db, id)
+    IF index < 0 THEN RETURN FALSE
+    record = db.Records[index]
+    IF record.Deleted THEN RETURN FALSE
+    schema = ArcoDB.SchemaFor(db, record.Class)
+    IF ISNULL(schema) == FALSE THEN
+        oldValue = ArcoDB.Recall(db, schema, id)
+        ignored = ArcoDB.RemoveCatalogsForValue(db, schema, oldValue)
+    END IF
+    record.Deleted = TRUE
+    records = db.Records
+    records[index] = record
+    db.Records = records
+    db.Dirty = TRUE
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoDB.FindByCatalog(db, schema, field, value)
+    name = ArcoDB.CatalogName(schema, field)
+    IF Object.Has(db.Catalogs, name) == FALSE THEN RETURN NULL
+    catalog = Object.Get(db.Catalogs, name)
+    storedId = Object.Get(catalog.Index, ArcoDB.IndexKey(value), NULL)
+    IF ISNULL(storedId) THEN RETURN NULL
+    RETURN storedId
+END FUNCTION
+
+FUNCTION ArcoDB.RecallBy(db, schema, field, value)
+    id = ArcoDB.FindByCatalog(db, schema, field, value)
+    IF ISNULL(id) THEN RETURN NULL
+    RETURN ArcoDB.Recall(db, schema, id)
+END FUNCTION
+
+FUNCTION ArcoDB.Count(db)
+    total = 0
+    FOR record IN db.Records
+        IF record.Deleted == FALSE THEN total = total + 1
+    NEXT
+    RETURN total
+END FUNCTION
+
+FUNCTION ArcoDB.EnsureCommands(db)
+    IF Object.Has(db, "Commands") == FALSE THEN db.Commands = {}
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoDB.RegisterCommand(db, command AS ARCODBFUNCTION)
+    ignored = ArcoDB.EnsureCommands(db)
+    IF command.Name == "" THEN RETURN FALSE
+    db.Commands = Object.Set(db.Commands, Lower(command.Name), command)
+    db.Dirty = TRUE
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoDB.Command(db, name)
+    ignored = ArcoDB.EnsureCommands(db)
+    RETURN Object.Get(db.Commands, Lower(name), NULL)
+END FUNCTION
+
+FUNCTION ArcoDB.CommandNames(db)
+    ignored = ArcoDB.EnsureCommands(db)
+    RETURN Object.Keys(db.Commands)
+END FUNCTION
+
+FUNCTION ArcoDB.RunCommand(db, name, args = [])
+    command = ArcoDB.Command(db, name)
+    IF ISNULL(command) THEN RETURN {"Ok": FALSE, "Error": "Unknown ArcoDB command: " + name, "Rows": []}
+    RETURN command.Execute(db, args)
+END FUNCTION
+
+FUNCTION ArcoDB.Scan(db, schema)
+    rows = []
+    FOR record IN db.Records
+        IF record.Deleted == FALSE AND record.Class == schema.Class THEN
+            result = ArcoCompyDB.TryUnpackRecord(schema, record.Payload)
+            IF result.Ok THEN
+                value = result.Value
+                value.__id = record.Id
+                ignored = Array.Add(rows, value)
+            END IF
+        END IF
+    NEXT
+    RETURN rows
+END FUNCTION
+
+FUNCTION ArcoDB.RebuildCatalogs(db)
+    rebuilt = {}
+    FOR name IN Object.Keys(db.Catalogs)
+        catalog = Object.Get(db.Catalogs, name)
+        rebuilt = Object.Set(rebuilt, name, {"Class": catalog.Class, "Field": catalog.Field, "Index": {}})
+    NEXT
+    db.Catalogs = rebuilt
+
+    FOR record IN db.Records
+        IF record.Deleted == FALSE THEN
+            schema = ArcoDB.SchemaFor(db, record.Class)
+            IF ISNULL(schema) == FALSE THEN
+                valueResult = ArcoCompyDB.TryUnpackRecord(schema, record.Payload)
+                IF valueResult.Ok THEN
+                    ignored = ArcoDB.UpdateCatalogsForValue(db, schema, valueResult.Value, record.Id)
+                END IF
+            END IF
+        END IF
+    NEXT
+    db.Dirty = TRUE
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoDB.Compact(db)
+    before = LEN(db.Records)
+    active = []
+    FOR record IN db.Records
+        IF record.Deleted == FALSE THEN
+            ignored = Array.Push(active, record)
+        END IF
+    NEXT
+    db.Records = active
+    ignored = ArcoDB.RebuildCatalogs(db)
+    db.Dirty = TRUE
+    RETURN {"Before": before, "After": LEN(db.Records), "Removed": before - LEN(db.Records), "Active": ArcoDB.Count(db)}
+END FUNCTION
+
+FUNCTION ArcoDB.Write(db)
+    ignored = ArcoDB.PrepareWrite(db)
+    File.WriteText(db.Path, ArcoCompy.Pack(db))
+    File.WriteText(ArcoDB.JournalPath(db.Path), "")
+    db.Dirty = FALSE
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoDB.PrepareWrite(db)
+    payload = ArcoCompy.Pack(db)
+    journal = {"Format": ArcoDB.JournalFormat(), "Target": db.Path, "Payload": payload}
+    File.WriteText(ArcoDB.JournalPath(db.Path), ArcoCompy.Pack(journal))
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ArcoDB.Inspect(db)
+    active = ArcoDB.Count(db)
+    ignored = ArcoDB.EnsureCommands(db)
+    RETURN {"Format": db.Format, "Path": db.Path, "Journal": ArcoDB.JournalPath(db.Path), "NextId": db.NextId, "Schemas": LEN(Object.Keys(db.Schemas)), "Catalogs": LEN(Object.Keys(db.Catalogs)), "Commands": LEN(Object.Keys(db.Commands)), "Records": LEN(db.Records), "Active": active, "Tombstones": LEN(db.Records) - active, "Dirty": db.Dirty}
+END FUNCTION

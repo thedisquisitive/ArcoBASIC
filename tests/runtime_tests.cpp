@@ -3,6 +3,7 @@
 #include "arco_c_api.h"
 
 #include <cstdlib>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -93,6 +94,53 @@ TcpTestServer start_tcp_test_server() {
         close(server_fd);
     });
     return server;
+}
+
+int free_loopback_port() {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    require(server_fd >= 0, "creates free-port probe socket");
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    require(bind(server_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "binds free-port probe socket");
+    socklen_t length = sizeof(address);
+    require(getsockname(server_fd, reinterpret_cast<sockaddr*>(&address), &length) == 0, "reads free-port probe socket port");
+    const int port = ntohs(address.sin_port);
+    close(server_fd);
+    return port;
+}
+
+std::string http_get_loopback(int port, const std::string& target) {
+    int fd = -1;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        require(fd >= 0, "creates HTTP test client socket");
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(static_cast<uint16_t>(port));
+        if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+            break;
+        }
+        close(fd);
+        fd = -1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    require(fd >= 0, "connects HTTP test client socket");
+    const std::string request = "GET " + target + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    send(fd, request.data(), request.size(), 0);
+    std::string response;
+    char buffer[1024]{};
+    while (true) {
+        const ssize_t count = recv(fd, buffer, sizeof(buffer), 0);
+        if (count <= 0) {
+            break;
+        }
+        response.append(buffer, static_cast<std::size_t>(count));
+    }
+    close(fd);
+    return response;
 }
 #endif
 
@@ -1099,6 +1147,27 @@ int main() {
         require(read_result.get_property("Data").to_string() == "tcp-ok", "receives TCP server response");
         require(network_runtime.call_host_function("Net.TcpClose", {client}).truthy(), "closes TCP clients");
         tcp_server.thread.join();
+    }
+    {
+        const auto site_dir = std::filesystem::temp_directory_path() / "arco-web-static-test";
+        std::filesystem::remove_all(site_dir);
+        std::filesystem::create_directories(site_dir);
+        write_text(site_dir / "index.html", "<h1>Arcology test</h1>");
+        write_text(site_dir / "style.css", "body{color:#202124}");
+        const int port = free_loopback_port();
+        arco::Value serve_result;
+        std::thread server_thread([&] {
+            arco::Runtime server_runtime;
+            serve_result = server_runtime.call_host_function("Web.ServeStatic", {site_dir.string(), port, "127.0.0.1", 1});
+        });
+        const std::string response = http_get_loopback(port, "/");
+        server_thread.join();
+        require(serve_result.is_object() && serve_result.get_property("Ok").truthy(), "serves static HTTP roots");
+        require(serve_result.get_property("Requests").as_number() == 1.0, "counts static HTTP requests");
+        require(response.find("HTTP/1.1 200 OK") != std::string::npos, "returns HTTP 200 for static index");
+        require(response.find("Content-Type: text/html; charset=utf-8") != std::string::npos, "returns HTML content type");
+        require(response.find("Arcology test") != std::string::npos, "returns static file body");
+        std::filesystem::remove_all(site_dir);
     }
 #endif
     const auto listed_files = shell_runtime.call_host_function("File.List", {".."});

@@ -1,0 +1,27 @@
+#DESCRIPTION "ArcoAdventures tutorial hub"
+
+FUNCTION Section(title)
+    PRINT ""
+    PRINT Color.Cyan(TUI.ThemeRule("terminal", title, 72))
+END FUNCTION
+
+FUNCTION Continue()
+    ignored = Tutorial.ReadLine("press Enter to continue ")
+END FUNCTION
+
+PRINT TUI.Header("ArcoAdventures")
+PRINT TUI.Box("CASE FILE", "Original interactive ArcoBASIC tutorial missions set in The Arco Files universe.\n\nThese are not chapter copies. They use the same Arcology setting, absurd civic failures, and suspiciously confident villains to teach programming by doing.")
+PRINT TUI.Status("practice prompts", "ready", "type hint, skip, or quit during exact prompts")
+Continue()
+
+Section("Available missions")
+missions = [["arcosh --tutorial adventure1", "Badge Bureau: variables, strings, and IF decisions"], ["arcosh --tutorial adventure2", "Snackstorm: FOR loops, arrays, totals, and limits"], ["arcosh --tutorial adventure3", "Evidence Locker: classes and ArcoCompy value packing"]]
+PRINT TUI.Table(["Command", "Mission"], missions)
+
+Section("Recommended order")
+PRINT "1. adventure1 if someone renamed the whole building Kevin again."
+PRINT "2. adventure2 if a snack machine starts using exponential confidence."
+PRINT "3. adventure3 if evidence needs to survive contact with Warehouse 27."
+
+PRINT ""
+PRINT TUI.ThemeBox("terminal", "ArcoAdventures ready", "Run one of the adventure topics above. Each mission is a normal .abas file under tutorials/, so the lessons are inspectable and hackable.")

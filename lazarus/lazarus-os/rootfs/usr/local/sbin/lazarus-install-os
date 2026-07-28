@@ -1,0 +1,301 @@
+#!/bin/sh
+set -eu
+
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+target="${1:-}"
+confirmation="${2:-}"
+mount_root="${MOUNT_ROOT:-/mnt/lazarus-install-root}"
+work_dir="${WORK_DIR:-/tmp/lazarus-install-os}"
+
+log() {
+	printf '%s\n' "$*"
+}
+
+die() {
+	printf 'lazarus-install-os: %s\n' "$*" >&2
+	exit 1
+}
+
+need_tool() {
+	command -v "$1" >/dev/null 2>&1 || die "$1 was not found in the live environment."
+}
+
+cleanup() {
+	set +e
+	for path in "$mount_root/boot/efi" "$mount_root/var/lib/arcology-lazarus" "$mount_root"; do
+		if mountpoint -q "$path"; then
+			umount "$path"
+		fi
+	done
+}
+trap cleanup EXIT INT TERM
+
+canonical_disk() {
+	path="$1"
+	[ -b "$path" ] || die "Target is not a block device: $path"
+	case "$path" in
+		/dev/*) ;;
+		*) die "Target must be a /dev block device." ;;
+	esac
+	if command -v readlink >/dev/null 2>&1; then
+		readlink -f "$path"
+	else
+		printf '%s\n' "$path"
+	fi
+}
+
+disk_basename() {
+	basename "$1"
+}
+
+is_whole_disk() {
+	name="$(disk_basename "$1")"
+	[ -d "/sys/block/$name" ]
+}
+
+disk_size_bytes() {
+	name="$(disk_basename "$1")"
+	sectors="$(cat "/sys/block/$name/size" 2>/dev/null || printf '0')"
+	printf '%s\n' $((sectors * 512))
+}
+
+human_size() {
+	bytes="$1"
+	awk -v bytes="$bytes" 'BEGIN {
+		split("B KB MB GB TB PB", units, " ");
+		value = bytes + 0;
+		unit = 1;
+		while (value >= 1000 && unit < 6) {
+			value = value / 1000;
+			unit++;
+		}
+		if (unit == 1) {
+			printf "%.0f %s", value, units[unit];
+		} else {
+			printf "%.1f %s", value, units[unit];
+		}
+	}'
+}
+
+device_model() {
+	name="$(disk_basename "$1")"
+	model="$(cat "/sys/block/$name/device/model" 2>/dev/null || true)"
+	vendor="$(cat "/sys/block/$name/device/vendor" 2>/dev/null || true)"
+	printf '%s %s\n' "$vendor" "$model" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]][[:space:]]*/ /g'
+}
+
+device_serial() {
+	name="$(disk_basename "$1")"
+	udevadm info --query=property --name="/dev/$name" 2>/dev/null | awk -F= '/^(ID_SERIAL_SHORT|ID_SERIAL)=/ {print $2; exit}'
+}
+
+list_disks() {
+	for sys in /sys/block/*; do
+		[ -d "$sys" ] || continue
+		name="$(basename "$sys")"
+		case "$name" in
+			loop*|ram*|zram*|dm-*|sr*) continue ;;
+		esac
+		[ -b "/dev/$name" ] || continue
+		size="$(disk_size_bytes "/dev/$name")"
+		[ "$size" -gt 0 ] || continue
+		model="$(device_model "/dev/$name")"
+		serial="$(device_serial "/dev/$name")"
+		printf '%s\t%s\t%s\t%s\n' "/dev/$name" "$(human_size "$size")" "${model:-unknown}" "${serial:-unknown}"
+	done
+}
+
+choose_target() {
+	tmp="$work_dir/disks.tsv"
+	mkdir -p "$work_dir"
+	list_disks > "$tmp"
+	if [ ! -s "$tmp" ]; then
+		die "No installable disks were detected."
+	fi
+	log "Arcology Lazarus OS Installer"
+	log
+	log "Select the physical disk that will become the Lazarus appliance system disk."
+	log "The selected disk will be erased."
+	log
+	i=1
+	while IFS='	' read -r path size model serial; do
+		printf '  %s. %s | %s | %s | serial %s\n' "$i" "$path" "$size" "$model" "$serial"
+		i=$((i + 1))
+	done < "$tmp"
+	log
+	printf 'Select disk number, or 0 to cancel: '
+	read -r choice
+	[ "$choice" != "0" ] || exit 0
+	case "$choice" in
+		*[!0-9]*|'') die "Invalid selection." ;;
+	esac
+	selected="$(awk -F '\t' -v n="$choice" 'NR == n {print $1}' "$tmp")"
+	[ -n "$selected" ] || die "Invalid selection."
+	printf '%s\n' "$selected"
+}
+
+assert_target_safe() {
+	disk="$1"
+	is_whole_disk "$disk" || die "Refusing to install to a partition. Select a whole disk such as /dev/sda or /dev/nvme0n1."
+
+	case "$disk" in
+		/dev/loop*|/dev/ram*|/dev/zram*|/dev/dm-*|/dev/sr*) die "Refusing unsupported target device: $disk" ;;
+	esac
+
+	root_source="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+	if [ -n "$root_source" ]; then
+		root_parent="$(lsblk -no PKNAME "$root_source" 2>/dev/null | head -n 1 || true)"
+		if [ -n "$root_parent" ] && [ "/dev/$root_parent" = "$disk" ]; then
+			die "Refusing to install over the currently running root disk."
+		fi
+	fi
+
+	name="$(disk_basename "$disk")"
+	if lsblk -nr -o MOUNTPOINT "$disk" 2>/dev/null | grep -q .; then
+		die "Refusing to install because $disk or one of its partitions is mounted."
+	fi
+
+	removable="$(cat "/sys/block/$name/removable" 2>/dev/null || printf '0')"
+	readonly="$(cat "/sys/block/$name/ro" 2>/dev/null || printf '0')"
+	[ "$readonly" = "0" ] || die "Refusing to install to read-only disk: $disk"
+	if [ "$removable" = "1" ]; then
+		log "Warning: $disk is marked removable. Only continue if this is the intended appliance disk."
+	fi
+}
+
+partition_path() {
+	disk="$1"
+	number="$2"
+	case "$disk" in
+		*nvme*n*|*mmcblk*|*nbd*) printf '%sp%s\n' "$disk" "$number" ;;
+		*) printf '%s%s\n' "$disk" "$number" ;;
+	esac
+}
+
+write_config_files() {
+	root_uuid="$1"
+	efi_uuid="$2"
+	state_uuid="$3"
+	mkdir -p "$work_dir"
+	cat > "$work_dir/fstab" <<EOF
+UUID=$root_uuid	/	ext4	rw,relatime	0 1
+UUID=$efi_uuid	/boot/efi	vfat	umask=0077	0 2
+UUID=$state_uuid	/var/lib/arcology-lazarus	ext4	rw,relatime	0 2
+EOF
+	install -Dm644 "$work_dir/fstab" "$mount_root/etc/fstab"
+
+	mkdir -p "$mount_root/boot/grub"
+	cat > "$work_dir/grub.cfg" <<EOF
+set timeout=3
+set default=0
+
+menuentry "Arcology Lazarus OS" {
+    linux /boot/vmlinuz-lts root=UUID=$root_uuid rw modules=ext4,nvme,ahci,sd_mod,usb_storage,virtio_blk console=tty0 console=ttyS0,115200
+    initrd /boot/initramfs-lts
+}
+EOF
+	install -Dm644 "$work_dir/grub.cfg" "$mount_root/boot/grub/grub.cfg"
+}
+
+install_to_disk() {
+	disk="$1"
+	assert_target_safe "$disk"
+	size_bytes="$(disk_size_bytes "$disk")"
+	min_size=$((12 * 1000 * 1000 * 1000))
+	[ "$size_bytes" -ge "$min_size" ] || die "Target disk is too small. Lazarus OS requires at least 12 GB."
+
+	if [ "$confirmation" != "ERASE" ]; then
+		log
+		log "The following disk will be erased:"
+		log "  $disk"
+		log "  $(human_size "$size_bytes")"
+		log "  $(device_model "$disk")"
+		log
+		printf 'Type ERASE to install Arcology Lazarus OS: '
+		read -r confirmation
+	fi
+	[ "$confirmation" = "ERASE" ] || die "Confirmation did not match ERASE."
+
+	printf '\033[2J\033[H'
+	log "Arcology Lazarus OS Installer"
+	log
+	log "Target disk selected: $disk"
+	log "All other disks remain untouched."
+	log
+	log "Partitioning $disk."
+	parted -s "$disk" mklabel gpt
+	parted -s "$disk" mkpart ESP fat32 1MiB 513MiB
+	parted -s "$disk" set 1 esp on
+	parted -s "$disk" mkpart LAZARUS_OS ext4 513MiB 8705MiB
+	parted -s "$disk" mkpart LAZARUS_STATE ext4 8705MiB 100%
+	partprobe "$disk" || true
+	sleep 2
+
+	efi_part="$(partition_path "$disk" 1)"
+	root_part="$(partition_path "$disk" 2)"
+	state_part="$(partition_path "$disk" 3)"
+	[ -b "$efi_part" ] || die "EFI partition did not appear: $efi_part"
+	[ -b "$root_part" ] || die "Root partition did not appear: $root_part"
+	[ -b "$state_part" ] || die "Persistent state partition did not appear: $state_part"
+
+	log "Formatting EFI, root, and persistent state partitions."
+	mkfs.vfat -F 32 -n LAZARUS_EFI "$efi_part"
+	mkfs.ext4 -F -L LAZARUS_OS "$root_part"
+	mkfs.ext4 -F -L LAZARUS_STATE "$state_part"
+
+	rm -rf "$mount_root"
+	mkdir -p "$mount_root"
+	mount "$root_part" "$mount_root"
+	mkdir -p "$mount_root/boot/efi" "$mount_root/var/lib/arcology-lazarus"
+	mount "$efi_part" "$mount_root/boot/efi"
+	mount "$state_part" "$mount_root/var/lib/arcology-lazarus"
+
+	log "Copying live Lazarus OS root filesystem."
+	rsync -aHAX --numeric-ids \
+		--exclude '/.root-ro' \
+		--exclude '/.root-rw' \
+		--exclude '/.root-work' \
+		--exclude '/boot/efi/*' \
+		--exclude '/dev/*' \
+		--exclude '/proc/*' \
+		--exclude '/sys/*' \
+		--exclude '/run/*' \
+		--exclude '/tmp/*' \
+		--exclude '/media/*' \
+		--exclude '/mnt/*' \
+		--exclude '/var/lib/arcology-lazarus/*' \
+		/ "$mount_root"/
+
+	mkdir -p "$mount_root/boot/efi" "$mount_root/var/lib/arcology-lazarus/images" "$mount_root/var/log/arcology-lazarus" "$mount_root/tmp" "$mount_root/var/tmp"
+	chmod 1777 "$mount_root/tmp" "$mount_root/var/tmp"
+	root_uuid="$(blkid -s UUID -o value "$root_part")"
+	efi_uuid="$(blkid -s UUID -o value "$efi_part")"
+	state_uuid="$(blkid -s UUID -o value "$state_part")"
+	write_config_files "$root_uuid" "$efi_uuid" "$state_uuid"
+
+	log "Installing UEFI bootloader."
+	grub-install \
+		--target=x86_64-efi \
+		--efi-directory="$mount_root/boot/efi" \
+		--boot-directory="$mount_root/boot" \
+		--removable \
+		--no-nvram \
+		--recheck
+
+	sync
+	log
+	log "Arcology Lazarus OS installed successfully."
+	log "Reboot and select the installed appliance disk from firmware boot options."
+}
+
+for tool in parted partprobe mkfs.vfat mkfs.ext4 rsync blkid grub-install findmnt lsblk udevadm awk; do
+	need_tool "$tool"
+done
+
+if [ -z "$target" ]; then
+	target="$(choose_target)"
+fi
+target="$(canonical_disk "$target")"
+install_to_disk "$target"

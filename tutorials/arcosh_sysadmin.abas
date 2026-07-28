@@ -2,17 +2,21 @@
 
 FUNCTION Section(title)
     PRINT ""
-    PRINT Color.Cyan(Color.Bold(title))
+    PRINT Color.Cyan(TUI.ThemeRule("terminal", title, 72))
 END FUNCTION
 
 FUNCTION Continue()
     ignored = Tutorial.ReadLine("press Enter to continue ")
 END FUNCTION
 
-PRINT Color.Bold("ArcoSH sysadmin tutorial")
-PRINT "This tutorial is written in ArcoBASIC and runs inside ArcoSH."
-PRINT "You will practice commands that inspect the host, run tools, handle errors,"
-PRINT "write tiny admin scripts, and return safely to the shell."
+FUNCTION Demo(title, command, mode)
+    PRINT Color.Bold(title)
+    ignored = Tutorial.Run(command, mode)
+END FUNCTION
+
+PRINT TUI.Header("ArcoSH Sysadmin Tutorial")
+PRINT TUI.Box("MISSION", "This tutorial is written in ArcoBASIC and runs inside ArcoSH.\n\nYou will practice shell commands, ArcoBASIC expressions, capture, files, host/process inspection, strings, errors, reusable scripts, line-numbered programs, TUI output, colors, and recovery.")
+PRINT TUI.Status("practice prompts", "ready", "type hint, skip, or quit when needed")
 Continue()
 
 Section("1. Use ArcoBASIC at the prompt")
@@ -20,44 +24,92 @@ PRINT "ArcoSH is both a shell and a BASIC runtime."
 PRINT "Type this command exactly:"
 ok = Tutorial.Step("PRINT \"hello admin\"", "arco")
 
-Section("2. Run host commands")
-PRINT "Bare commands run through the host shell, and RUN() captures output for scripts."
+Section("2. Use variables and interpolation")
+PRINT "ArcoBASIC strings can interpolate expressions with $\"...{...}\"."
+PRINT "Type this command exactly:"
+ok = Tutorial.Step("name = \"admin\" : PRINT $\"hello {name}\"", "arco")
+
+Section("3. Ask for help without leaving the shell")
+PRINT "Help topics are available from scripts too."
+Demo("Show that HELP IF is available:", "PRINT Help.Topic(\"if\") CONTAINS \"THEN\"", "arco")
+Demo("Search the manual from a script:", "PRINT Help.Topic(\"search profile\")", "arco")
+Continue()
+
+Section("4. Run host commands")
+PRINT "Bare commands run through the host shell."
 PRINT "Type this bare shell command:"
 ok = Tutorial.Step("printf service-ok", "shell")
 
-Section("3. Capture command results")
-PRINT "A sysadmin script usually needs an exit code and captured output."
+Section("5. Capture command results")
+PRINT "RUN() captures output and exit codes for scripts."
 PRINT "Type this ArcoBASIC statement:"
 ok = Tutorial.Step("result = RUN(\"printf captured\") : PRINT result.Output : PRINT result.ExitCode", "arco")
 
-Section("4. Inspect files")
+Section("6. Use command status in decisions")
+PRINT "Captured results are plain objects."
+Demo("Check an exit code:", "result = RUN(\"false\")\nIF result.ExitCode <> 0 THEN PRINT \"command failed safely\"", "arco")
+Continue()
+
+Section("7. Inspect files")
 PRINT "File.Exists and File.Find are available to ArcoBASIC scripts."
 PRINT "Type this command:"
 ok = Tutorial.Step("PRINT File.Exists(\"readme.md\")", "arco")
+Demo("Find markdown files:", "FOR file IN File.Find(\"*.md\")\nPRINT file\nNEXT", "arco")
+Continue()
 
-Section("5. Ask the host about itself")
+Section("8. Ask the host about itself")
 PRINT "Host helpers let scripts adapt to the machine they are managing."
 PRINT "Type this command:"
 ok = Tutorial.Step("PRINT Host.OSName()", "arco")
+Demo("Print basic host facts:", "PRINT Host.Hostname()\nPRINT Host.IsWindows()", "arco")
 Continue()
 
-Section("6. Handle failures")
+Section("9. Inspect processes")
+PRINT "Process helpers are useful for admin checks."
+Demo("Count whether any processes are visible:", "PRINT LEN(Process.List()) > 0", "arco")
+Demo("Check for a command you do not expect:", "PRINT Process.Exists(\"definitely-not-a-real-arcosh-process\")", "arco")
+Demo("Render a small process table:", "rows = [[\"visible\", STRING(LEN(Process.List()) > 0)], [\"missing\", STRING(Process.Exists(\"definitely-not-a-real-arcosh-process\"))]]\nPRINT TUI.Table([\"Check\", \"Result\"], rows)", "arco")
+Continue()
+
+Section("10. Work with strings and arrays")
+PRINT "ArcoBASIC has small helpers for the text wrangling common in shell work."
+Demo("Split text into lines:", "lines = String.Lines(\"alpha\\nbeta\")\nFOR line IN lines\nPRINT Upper(line)\nNEXT", "arco")
+Demo("Use arrays:", "items = [\"disk\", \"network\", \"service\"]\nFOR item IN items\nPRINT $\"check {item}\"\nNEXT", "arco")
+Continue()
+
+Section("11. Handle failures")
 PRINT "Use TRY/CATCH when an admin script should report an error and continue."
-PRINT "Here is a complete recovery block running as ArcoBASIC:"
-ignored = Tutorial.Run("TRY\nPRINT missing_setting\nCATCH err\nPRINT \"caught: \" + err.Message\nEND TRY", "arco")
+Demo("Recover from a missing variable:", "TRY\nPRINT missing_setting\nCATCH err\nPRINT \"caught: \" + err.Message\nEND TRY", "arco")
 Continue()
 
-Section("7. Build a quick line-numbered script")
+Section("12. Use readable bit helpers")
+PRINT "Bit helpers make flags readable without C-style operators."
+Demo("Build and inspect flags:", "flags = 0\nflags ADD SHIFT(1, 1)\nPRINT BitsToString(flags, 4)\nPRINT BIT(flags, 1)", "arco")
+Continue()
+
+Section("13. Build a quick line-numbered script")
 PRINT "Line-numbered programs are good for quick loops at the REPL."
 PRINT "This script prints a small counter and uses STOP to return to ArcoSH:"
-ignored = Tutorial.Run("10 x = 0\n20 PRINT x\n30 x += 1\n40 IF x >= 3 THEN STOP\n50 GOTO 20", "arco")
+Demo("Run a numbered loop:", "10 x = 0\n20 PRINT $\"x = {x}\"\n30 x += 1\n40 IF x >= 3 THEN STOP\n50 GOTO 20", "arco")
 Continue()
 
-Section("8. Know the escape hatches")
+Section("14. Know profiles and reusable scripts")
+PRINT "ArcoSH reads ~/.arcosh or ARCOSH_HOME for rc files, plugins, and scripts."
+Demo("Show profile locations as a panel:", "PRINT TUI.KeyValues(\"Profile\", {\"Home\": ArcoSH.Home(), \"Scripts\": ArcoSH.ScriptsDir(), \"Plugins\": ArcoSH.PluginsDir()})", "arco")
+PRINT "Reusable scripts can read Args and Script.Path when launched from ArcoSH."
+Continue()
+
+Section("15. Use TUI and colors for readable output")
+PRINT "TUI helpers return strings, so they work in scripts, logs, help, and tutorials."
+Demo("Render status and progress:", "PRINT TUI.Status(\"database\", \"ok\", \"reachable\")\nPRINT TUI.Progress(\"backup\", 7, 10, 20)\nPRINT TUI.ThemeBox(\"scroll\", \"ADMIN NOTE\", \"Keep logs readable and recovery obvious\")", "arco")
+Demo("Paint status text:", "PRINT Color.Green(\"ok\")\nPRINT Color.Yellow(\"warning\")\nPRINT Color.Red(\"failed\")", "arco")
+Continue()
+
+Section("16. Recover and exit safely")
 PRINT "STOP ends the current ArcoBASIC program and returns to ArcoSH."
 PRINT "Exit(), ExitProgram(), and ExitTheProgram() terminate the arcosh process."
 PRINT "If you misspell a host command, fix the next command with: oops <correct-command>"
-PRINT "Use HELP run, HELP files, HELP host, HELP try, and HELP lines for reference."
+PRINT "Use HELP run, HELP files, HELP host, HELP try, HELP jobs, and HELP lines for reference."
 
 PRINT ""
-PRINT Color.Green("Tutorial complete. You have run ArcoBASIC, host commands, capture, files, host inspection, error handling, and line-numbered scripts.")
+PRINT TUI.ThemeBox("terminal", "Tutorial complete", "You have practiced ArcoBASIC, host commands, capture, files, host/process inspection, strings, errors, flags, line-numbered scripts, profiles, TUI output, colors, and recovery.")

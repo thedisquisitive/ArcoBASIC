@@ -1,0 +1,186 @@
+#!/usr/bin/env arcosh
+#DESCRIPTION "ArcoSH login shell installation wizard"
+
+FUNCTION Section(title)
+    PRINT ""
+    PRINT Color.Cyan(TUI.Rule(title, 72))
+END FUNCTION
+
+FUNCTION Notice(title, body)
+    PRINT TUI.Box(title, body)
+END FUNCTION
+
+FUNCTION Ask(prompt, fallback)
+    answer = String.Trim(Input(prompt + " [" + fallback + "]: "))
+    IF answer == "" THEN
+        RETURN fallback
+    END IF
+    RETURN answer
+END FUNCTION
+
+FUNCTION AskYesNo(prompt, fallback)
+    answer = Lower(String.Trim(Input(prompt + " [" + fallback + "]: ")))
+    IF answer == "" THEN
+        answer = Lower(fallback)
+    END IF
+    IF answer == "y" THEN
+        RETURN TRUE
+    END IF
+    IF answer == "yes" THEN
+        RETURN TRUE
+    END IF
+    RETURN FALSE
+END FUNCTION
+
+FUNCTION RunOrShow(command, dryRun)
+    PRINT TUI.Box("COMMAND", "$ " + command)
+    IF dryRun THEN
+        RETURN TRUE
+    END IF
+
+    result = RUN(command)
+    IF result.Output <> "" THEN
+        PRINT result.Output
+    END IF
+    IF result.ExitCode <> 0 THEN
+        PRINT Color.Red($"command failed with exit code {result.ExitCode}")
+        RETURN FALSE
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION AppendLineIfMissing(path, line)
+    existing = ""
+    IF File.Exists(path) THEN
+        existing = File.ReadText(path)
+    END IF
+    IF existing CONTAINS line THEN
+        RETURN FALSE
+    END IF
+    File.AppendText(path, line + "\n")
+    RETURN TRUE
+END FUNCTION
+
+PRINT TUI.Header("ArcoSH Login Shell Wizard")
+Notice("MISSION", "Prepare ArcoSH for use as your sign-in shell.\n\nThis wizard can:\n  initialize ~/.arcosh\n  configure a prompt\n  add arcosh to /etc/shells\n  run chsh\n\nPrivileged changes are optional.\nDry run is the default.")
+
+Section("1. Choose shell path")
+detected = ArcoSH.ExecutablePath()
+IF detected == "" THEN
+    detected = "/usr/bin/arcosh"
+END IF
+shellPath = Ask("Path to arcosh", detected)
+IF File.Exists(shellPath) == FALSE THEN
+    Notice("WARNING", "That file does not exist.\nContinue only if you know it will exist after install.")
+END IF
+
+Section("2. Choose profile setup")
+profileHome = ArcoSH.Home()
+Notice("PROFILE", $"Home: {profileHome}\nScripts: {ArcoSH.ScriptsDir()}\nPlugins: {ArcoSH.PluginsDir()}")
+initProfile = AskYesNo("Create ~/.arcosh directories if needed", "y")
+configurePrompt = AskYesNo("Write a prompt preset to rc.abas", "y")
+promptPreset = "sysadmin"
+IF configurePrompt THEN
+    Notice("PROMPT PRESETS", "sysadmin  {shell}:{cwd:short}:{status}> \ncompact   {cwd:short}> \nclassic   arcosh> ")
+    promptPreset = Lower(Ask("Prompt preset", "sysadmin"))
+END IF
+
+Section("3. Choose login shell changes")
+userName = ENV("USER")
+IF userName == "" THEN
+    userName = Ask("User name for chsh", "")
+ELSE
+    userName = Ask("User name for chsh", userName)
+END IF
+addToEtcShells = AskYesNo("Add arcosh to /etc/shells with sudo if missing", "y")
+changeShell = AskYesNo("Run chsh to make ArcoSH your login shell", "n")
+dryRun = AskYesNo("Dry run only", "y")
+
+Section("4. Plan")
+Notice("INSTALL PLAN", $"Shell path: {shellPath}\nProfile: {profileHome}\nUser: {userName}\nAdd to /etc/shells: {addToEtcShells}\nRun chsh: {changeShell}\nDry run: {dryRun}")
+IF AskYesNo("Continue with this plan", "y") == FALSE THEN
+    Notice("ABORTED", "No changes made.")
+    STOP
+END IF
+
+Section("5. Apply profile configuration")
+IF initProfile THEN
+    Directory.Create(profileHome)
+    Directory.Create(ArcoSH.ScriptsDir())
+    Directory.Create(ArcoSH.PluginsDir())
+    Notice("OK", "Profile directories are ready.")
+END IF
+
+IF configurePrompt THEN
+    rcPath = Path.Join(profileHome, "rc.abas")
+    promptLine = "ArcoSH.Prompt = \"{shell}:{cwd:short}:{status}> \""
+    IF promptPreset == "compact" THEN
+        promptLine = "ArcoSH.Prompt = \"{cwd:short}> \""
+    ELSE
+        IF promptPreset == "classic" THEN
+            promptLine = "ArcoSH.Prompt = \"arcosh> \""
+        END IF
+    END IF
+    changed = AppendLineIfMissing(rcPath, promptLine)
+    IF changed THEN
+        Notice("UPDATED", $"Wrote prompt preset to:\n{rcPath}")
+    ELSE
+        Notice("UNCHANGED", $"Prompt line already exists in:\n{rcPath}")
+    END IF
+END IF
+
+Section("6. Apply login shell configuration")
+etcShellsText = ""
+IF File.Exists("/etc/shells") THEN
+    etcShellsText = File.ReadText("/etc/shells")
+END IF
+
+needsSudo = FALSE
+IF dryRun == FALSE THEN
+    IF addToEtcShells THEN
+        IF (etcShellsText CONTAINS shellPath) == FALSE THEN
+            needsSudo = TRUE
+        END IF
+    END IF
+END IF
+
+IF needsSudo THEN
+    Notice("ELEVATION", "ArcoSH needs sudo to update /etc/shells.\nYou will be prompted once before privileged commands run.")
+    IF ArcoSH.RequireSudo("Enter sudo password to continue > ") == FALSE THEN
+        Notice("ABORTED", "Sudo authentication failed or was cancelled.")
+        STOP
+    END IF
+END IF
+
+IF addToEtcShells THEN
+    IF etcShellsText CONTAINS shellPath THEN
+        Notice("UNCHANGED", $"{shellPath} is already listed in /etc/shells")
+    ELSE
+        ok = RunOrShow("printf '%s\\n' " + shellPath + " | sudo tee -a /etc/shells", dryRun)
+        IF ok == FALSE THEN
+            Notice("ACTION NEEDED", "Add the shell path manually, then rerun this wizard.")
+            STOP
+        END IF
+    END IF
+END IF
+
+IF changeShell THEN
+    IF userName == "" THEN
+        Notice("ERROR", "No user name available for chsh.")
+        STOP
+    END IF
+    ok = RunOrShow("chsh -s " + shellPath + " " + userName, dryRun)
+    IF ok THEN
+        Notice("OK", "Login shell command completed.")
+    END IF
+ELSE
+    Notice("SKIPPED", "chsh was skipped. You can rerun this wizard when ready.")
+END IF
+
+Section("7. Finish")
+IF dryRun THEN
+    Notice("DRY RUN COMPLETE", "No privileged login-shell changes were made.\n\nRerun and answer 'n' to dry run when ready.")
+ELSE
+    Notice("COMPLETE", "ArcoSH login shell setup complete.\n\nSign out and sign back in for login shell changes to take effect.")
+END IF
+Notice("RECOVERY", "If startup config breaks, run:\n  arcosh --safe")

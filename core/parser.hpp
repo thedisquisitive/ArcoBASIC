@@ -4,6 +4,7 @@
 #include "token.hpp"
 
 #include <memory>
+#include <iosfwd>
 #include <string>
 #include <vector>
 
@@ -12,14 +13,22 @@ namespace arco {
 struct Expr {
     virtual ~Expr() = default;
     virtual Value eval(Runtime& runtime) const = 0;
+    virtual void dump_ast(std::ostream& output, int indent) const;
 };
 
 struct Stmt {
     virtual ~Stmt() = default;
     virtual void exec(Runtime& runtime) const = 0;
+    virtual void dump_ast(std::ostream& output, int indent) const;
     int line_label = -1;
     int source_line = 1;
     int source_column = 1;
+};
+
+struct FunctionParam {
+    std::string name;
+    std::string type_name;
+    std::shared_ptr<Expr> default_value;
 };
 
 class Parser {
@@ -41,6 +50,7 @@ private:
     const Token& consume(TokenType type, const std::string& message);
     void skip_newlines();
     void skip_line_number();
+    std::string parse_type_name(const std::string& message);
 
     StmtPtr statement();
     StmtPtr print_statement();
@@ -50,16 +60,24 @@ private:
     StmtPtr flags_statement();
     StmtPtr expression_statement();
     StmtPtr if_statement();
+    StmtPtr select_statement();
     StmtPtr while_statement();
+    StmtPtr do_statement();
     StmtPtr for_statement();
     StmtPtr function_statement();
+    StmtPtr class_statement();
+    StmtPtr interface_statement();
     StmtPtr return_statement();
     StmtPtr try_statement();
     StmtPtr goto_statement();
     StmtPtr stop_statement();
+    StmtPtr loop_control_statement();
     std::vector<StmtPtr> block_until(std::initializer_list<TokenType> terminators);
+    std::vector<struct FunctionParam> parameter_list();
 
     ExprPtr expression();
+    ExprPtr logical_or();
+    ExprPtr logical_and();
     ExprPtr bit_or();
     ExprPtr bit_xor();
     ExprPtr bit_and();
@@ -74,6 +92,7 @@ private:
 
     std::vector<Token> tokens_;
     std::size_t current_ = 0;
+    std::string current_super_class_;
 };
 
 } // namespace arco

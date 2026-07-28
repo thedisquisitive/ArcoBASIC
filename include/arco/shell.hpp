@@ -14,6 +14,7 @@ RunResult load_startup(Runtime& runtime, std::ostream& output, bool login);
 RunResult init_profile(std::ostream& output);
 int doctor(std::ostream& output);
 RunResult run_tutorial(Runtime& runtime, std::istream& input, std::ostream& output, const std::string& topic);
+RunResult run_login_shell_wizard(Runtime& runtime);
 int run_command_once(Runtime& runtime, const std::string& command, std::ostream& output);
 int repl(Runtime& runtime, std::istream& input, std::ostream& output, bool interactive);
 std::string help_text(const std::string& topic);

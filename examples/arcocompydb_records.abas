@@ -1,0 +1,37 @@
+#DESCRIPTION "Pack schema-aware ArcoCompyDB records"
+#IMPORT "compydb"
+
+CLASS Customer
+    customerNumber AS Number = 0
+    name AS String = ""
+    email AS String = ""
+
+    CONSTRUCTOR(customerNumber AS Number, name AS String, email AS String)
+        SELF.customerNumber = customerNumber
+        SELF.name = name
+        SELF.email = email
+    END CONSTRUCTOR
+
+    FUNCTION Label() AS String
+        RETURN STRING(SELF.customerNumber) + ":" + SELF.name
+    END FUNCTION
+END CLASS
+
+schema = ArcoCompyDB.SchemaVersion("Customer", ["customerNumber", "name", "email"], 1)
+customer = Customer(1042, "Wanda Goodburger", "wanda@email.com")
+
+packed = ArcoCompyDB.PackRecord(schema, customer)
+PRINT "Packed record bytes: " + STRING(String.Length(packed))
+PRINT packed CONTAINS "customerNumber"
+
+result = ArcoCompyDB.TryUnpackRecord(schema, packed)
+PRINT result.Ok
+
+restored = result.Value
+PRINT restored.Label()
+PRINT restored.email
+
+path = "arcocompydb-customer.acdb"
+ArcoCompyDB.SaveRecord(path, schema, customer)
+loaded = ArcoCompyDB.LoadRecord(path, schema)
+PRINT loaded.Label()

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-arcobasic">
+    <comment>ArcoBASIC source file</comment>
+    <icon name="application-x-arcobasic"/>
+    <glob pattern="*.abas"/>
+    <glob pattern="*.arc"/>
+    <sub-class-of type="text/plain"/>
+  </mime-type>
+</mime-info>

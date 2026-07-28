@@ -1,0 +1,52 @@
+#DESCRIPTION "Safe modern references with REF"
+
+CLASS Player
+    Name AS String = ""
+    Score AS Number = 0
+
+    CONSTRUCTOR(name AS String = "", score AS Number = 0)
+        SELF.Name = name
+        SELF.Score = score
+    END CONSTRUCTOR
+
+    FUNCTION Label() AS String
+        RETURN SELF.Name + ":" + STRING(SELF.Score)
+    END FUNCTION
+END CLASS
+
+score = 10
+scoreRef = REF(score, "Number")
+PRINT CLASSOF(scoreRef)
+PRINT TYPEOF(scoreRef)
+PRINT scoreRef.TypeName
+PRINT scoreRef.Value
+scoreRef.Value = 25
+PRINT score
+
+player = Player("Ada", 100)
+playerRef = REF(player)
+playerRef.Value.Name = "Grace"
+playerRef.Value.Score = playerRef.Value.Score + 50
+PRINT player.Label()
+
+box = REF({"Status": "ready"})
+box.Value.Status = "running"
+PRINT box.Value.Status
+
+TRY
+    scoreRef.Value = "bad score"
+CATCH err
+    PRINT err.Message CONTAINS "Number"
+END TRY
+
+maybeName = NULL
+nameRef = REF(maybeName, "String")
+PRINT nameRef.Exists()
+PRINT ISNULL(nameRef.Value)
+nameRef.Value = "Miso"
+PRINT maybeName
+
+PRINT playerRef.Exists()
+playerRef.Clear()
+PRINT playerRef.Exists()
+PRINT ISNULL(playerRef.Value)

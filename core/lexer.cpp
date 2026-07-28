@@ -22,9 +22,14 @@ const std::unordered_map<std::string, TokenType> kKeywords = {
     {"IF", TokenType::If},
     {"THEN", TokenType::Then},
     {"ELSE", TokenType::Else},
+    {"SELECT", TokenType::Select},
+    {"CASE", TokenType::Case},
     {"END", TokenType::EndKeyword},
     {"WHILE", TokenType::While},
     {"WEND", TokenType::Wend},
+    {"DO", TokenType::Do},
+    {"LOOP", TokenType::Loop},
+    {"UNTIL", TokenType::Until},
     {"FOR", TokenType::For},
     {"FUNCTION", TokenType::Function},
     {"RETURN", TokenType::Return},
@@ -32,6 +37,18 @@ const std::unordered_map<std::string, TokenType> kKeywords = {
     {"CATCH", TokenType::Catch},
     {"GOTO", TokenType::Goto},
     {"STOP", TokenType::Stop},
+    {"CLASS", TokenType::Class},
+    {"EXTENDS", TokenType::Extends},
+    {"INTERFACE", TokenType::Interface},
+    {"IMPLEMENTS", TokenType::Implements},
+    {"SUPER", TokenType::Super},
+    {"SHARED", TokenType::Shared},
+    {"PUBLIC", TokenType::Public},
+    {"PRIVATE", TokenType::Private},
+    {"PROTECTED", TokenType::Protected},
+    {"ABSTRACT", TokenType::Abstract},
+    {"CONSTRUCTOR", TokenType::Constructor},
+    {"AS", TokenType::As},
     {"IN", TokenType::In},
     {"TO", TokenType::To},
     {"STEP", TokenType::Step},
@@ -48,6 +65,8 @@ const std::unordered_map<std::string, TokenType> kKeywords = {
     {"XOR", TokenType::BitXor},
     {"BITNOT", TokenType::BitNot},
     {"NOT", TokenType::BitNot},
+    {"ANDALSO", TokenType::AndAlso},
+    {"ORELSE", TokenType::OrElse},
     {"HAS", TokenType::Has},
     {"ADD", TokenType::Add},
     {"REMOVE", TokenType::Remove},
@@ -122,24 +141,31 @@ std::vector<Token> Lexer::scan_tokens() {
                 }
                 throw std::runtime_error("unexpected character at line " + std::to_string(line_));
             case '%':
-                binary_number(1);
+                if (peek() == '0' || peek() == '1') {
+                    binary_number(1);
+                } else {
+                    add(TokenType::Mod);
+                }
                 break;
             case '&':
                 if (peek() == 'H' || peek() == 'h') {
                     advance();
                     hex_number(2);
                 } else {
-                    add(match('=') ? TokenType::AmpersandEqual : TokenType::Ampersand);
+                    add(match('&') ? TokenType::LogicalAnd : (match('=') ? TokenType::AmpersandEqual : TokenType::Ampersand));
                 }
                 break;
             case '|':
-                add(match('=') ? TokenType::PipeEqual : TokenType::Pipe);
+                add(match('|') ? TokenType::LogicalOr : (match('=') ? TokenType::PipeEqual : TokenType::Pipe));
                 break;
             case '^':
                 add(match('=') ? TokenType::CaretEqual : TokenType::Caret);
                 break;
             case '~':
                 add(TokenType::Tilde);
+                break;
+            case '!':
+                add(match('=') ? TokenType::NotEqual : TokenType::Bang);
                 break;
             case '=':
                 match('=');
@@ -292,6 +318,9 @@ void Lexer::string() {
         }
         if (peek() == '\\') {
             advance();
+            if (at_end()) {
+                throw std::runtime_error("unterminated string at line " + std::to_string(line_));
+            }
             const char escaped = advance();
             switch (escaped) {
                 case 'n':
@@ -335,6 +364,9 @@ void Lexer::interpolated_string() {
         }
         if (peek() == '\\') {
             advance();
+            if (at_end()) {
+                throw std::runtime_error("unterminated interpolated string at line " + std::to_string(line_));
+            }
             const char escaped = advance();
             switch (escaped) {
                 case 'n':

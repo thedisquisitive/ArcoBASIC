@@ -1,0 +1,20 @@
+#!/sbin/openrc-run
+
+name="Arcology Lazarus kiosk session"
+description="Starts the unprivileged Lazarus Xorg kiosk"
+command="/usr/local/bin/lazarus-kiosk"
+command_background="yes"
+pidfile="/run/arcology-lazarus/lazarus-session.pid"
+output_log="/var/log/arcology-lazarus/session.log"
+error_log="/var/log/arcology-lazarus/session.log"
+
+depend() {
+	need localmount
+	use lazarus-storage lazarus-service
+	after udev-trigger udev-settle hwdrivers dbus seatd
+}
+
+start_pre() {
+	checkpath -d -m 0755 /run/arcology-lazarus
+	checkpath -d -m 0750 -o root:lazarus /var/log/arcology-lazarus
+}

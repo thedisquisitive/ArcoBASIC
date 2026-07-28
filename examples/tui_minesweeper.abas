@@ -1,0 +1,171 @@
+#DESCRIPTION "Mouse-enabled terminal Minesweeper"
+
+width = 9
+height = 9
+board_x = 4
+board_y = 5
+mine_count = 10
+mines = [3, 10, 17, 22, 36, 40, 53, 59, 68, 77]
+state = [[0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0]]
+cursor_x = 0
+cursor_y = 0
+revealed = 0
+flagged_count = 0
+playing = TRUE
+won = FALSE
+
+FUNCTION IsMine(x, y)
+    RETURN Array.Contains(mines, y * width + x)
+END FUNCTION
+
+FUNCTION NearbyMines(x, y)
+    count = 0
+    FOR dy IN [-1, 0, 1]
+        FOR dx IN [-1, 0, 1]
+            nx = x + dx
+            ny = y + dy
+            IF nx >= 0 AND nx < width AND ny >= 0 AND ny < height THEN
+                IF IsMine(nx, ny) THEN count = count + 1
+            END IF
+        NEXT
+    NEXT
+    RETURN count
+END FUNCTION
+
+FUNCTION DrawCell(x, y)
+    text = "[]"
+    IF state[y][x] == 2 THEN text = "F "
+    IF state[y][x] == 1 THEN
+        IF IsMine(x, y) THEN
+            text = "* "
+        ELSE
+            count = NearbyMines(x, y)
+            IF count == 0 THEN text = "  " ELSE text = STRING(count) + " "
+        END IF
+    END IF
+    IF playing AND x == cursor_x AND y == cursor_y THEN
+        text = Color.Yellow(text)
+    END IF
+    PRINT TUI.Cursor(board_y + y, board_x + x * 2) + text
+END FUNCTION
+
+FUNCTION DrawStatus(message)
+    PRINT TUI.Cursor(board_y + height + 1, board_x) + "Mines: " + STRING(mine_count) + "  Flags: " + STRING(flagged_count) + "  " + message + "                    "
+END FUNCTION
+
+FUNCTION DrawBoard()
+    FOR y IN [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        FOR x IN [0, 1, 2, 3, 4, 5, 6, 7, 8]
+            DrawCell(x, y)
+        NEXT
+    NEXT
+END FUNCTION
+
+FUNCTION Reveal(x, y)
+    IF state[y][x] <> 0 THEN RETURN FALSE
+    IF IsMine(x, y) THEN
+        state[y][x] = 1
+        RETURN TRUE
+    END IF
+
+    queue = [[x, y]]
+    WHILE LEN(queue) > 0
+        cell = Array.Pop(queue)
+        cx = cell[0]
+        cy = cell[1]
+        IF state[cy][cx] == 0 AND NOT IsMine(cx, cy) THEN
+            state[cy][cx] = 1
+            revealed = revealed + 1
+            IF NearbyMines(cx, cy) == 0 THEN
+                FOR dy IN [-1, 0, 1]
+                    FOR dx IN [-1, 0, 1]
+                        nx = cx + dx
+                        ny = cy + dy
+                        IF nx >= 0 AND nx < width AND ny >= 0 AND ny < height THEN
+                            IF state[ny][nx] == 0 AND NOT IsMine(nx, ny) THEN ignored = Array.Push(queue, [nx, ny])
+                        END IF
+                    NEXT
+                NEXT
+            END IF
+        END IF
+    WEND
+    RETURN FALSE
+END FUNCTION
+
+FUNCTION ToggleFlag(x, y)
+    IF state[y][x] == 0 THEN
+        state[y][x] = 2
+        flagged_count = flagged_count + 1
+    ELSE
+        IF state[y][x] == 2 THEN
+            state[y][x] = 0
+            flagged_count = flagged_count - 1
+        END IF
+    END IF
+END FUNCTION
+
+FUNCTION FinishGame(hit_mine)
+    IF hit_mine THEN
+        playing = FALSE
+        FOR my IN [0, 1, 2, 3, 4, 5, 6, 7, 8]
+            FOR mx IN [0, 1, 2, 3, 4, 5, 6, 7, 8]
+                IF IsMine(mx, my) THEN state[my][mx] = 1
+            NEXT
+        NEXT
+        DrawBoard()
+        DrawStatus("BOOM — game over. Press q.")
+    ELSE
+        IF revealed == width * height - mine_count THEN
+            playing = FALSE
+            won = TRUE
+            DrawBoard()
+            DrawStatus("You cleared the field! Press q.")
+        END IF
+    END IF
+END FUNCTION
+
+PRINT TUI.Clear()
+PRINT TUI.Cursor(2, board_x) + TUI.ThemeRule("circuit", "MINESWEEPER", 28)
+PRINT TUI.Cursor(3, board_x) + "Left click reveal | Right click flag"
+PRINT TUI.Cursor(4, board_x) + "Keys: WASD move, Space reveal, F flag, Q quit"
+DrawBoard()
+DrawStatus("")
+PRINT TUI.MouseEnable()
+
+running = TRUE
+WHILE running
+    event = TUI.ReadEvent()
+    IF event.Type == "mouse" THEN
+        IF TUI.HitTest(event, board_x, board_y, width * 2, height) THEN
+            cursor_x = (event.X - board_x) / 2
+            cursor_y = event.Y - board_y
+            IF playing AND event.Action == "press" THEN
+                IF event.Button == "left" THEN FinishGame(Reveal(cursor_x, cursor_y))
+                IF event.Button == "right" THEN ToggleFlag(cursor_x, cursor_y)
+            END IF
+            DrawBoard()
+            IF playing THEN DrawStatus("")
+        END IF
+    ELSE
+        IF event.Type == "key" THEN
+            key = Lower(event.Key)
+            IF key == "q" OR key == "ctrl-c" THEN running = FALSE
+            IF playing THEN
+                old_x = cursor_x
+                old_y = cursor_y
+                IF key == "a" AND cursor_x > 0 THEN cursor_x = cursor_x - 1
+                IF key == "d" AND cursor_x < width - 1 THEN cursor_x = cursor_x + 1
+                IF key == "w" AND cursor_y > 0 THEN cursor_y = cursor_y - 1
+                IF key == "s" AND cursor_y < height - 1 THEN cursor_y = cursor_y + 1
+                IF key == "f" THEN ToggleFlag(cursor_x, cursor_y)
+                IF key == " " THEN FinishGame(Reveal(cursor_x, cursor_y))
+                DrawCell(old_x, old_y)
+                DrawCell(cursor_x, cursor_y)
+                IF playing THEN DrawStatus("")
+            END IF
+        END IF
+    END IF
+WEND
+
+PRINT TUI.MouseDisable()
+PRINT TUI.Cursor(board_y + height + 3, 1)

@@ -1,0 +1,120 @@
+#!/bin/sh
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+/usr/bin/busybox --install -s
+
+message() {
+	echo "lazarus-live: $*"
+}
+
+rescue_shell() {
+	message "$*"
+	message "Dropping to recovery shell."
+	exec /bin/sh
+}
+
+load_module() {
+	module="$1"
+	if [ -f "$module" ]; then
+		insmod "$module" 2>/dev/null || true
+		return 0
+	fi
+	if [ -f "$module.gz" ]; then
+		tmp="/run/$(basename "$module").$$.ko"
+		gzip -dc "$module.gz" > "$tmp" 2>/dev/null || return 0
+		insmod "$tmp" 2>/dev/null || true
+		rm -f "$tmp"
+	fi
+}
+
+mount -t devtmpfs -o exec,nosuid,mode=0755,size=2M devtmpfs /dev 2>/dev/null || \
+	mount -t tmpfs -o exec,nosuid,mode=0755,size=2M tmpfs /dev
+[ -c /dev/null ] || mknod -m 666 /dev/null c 1 3
+[ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
+[ -c /dev/kmsg ] || mknod -m 660 /dev/kmsg c 1 11
+
+mkdir -p /proc /sys /run /tmp /media/boot /media/root-ro /sysroot
+mount -t proc -o noexec,nosuid,nodev proc /proc
+mount -t sysfs -o noexec,nosuid,nodev sysfs /sys
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+
+message "Loading USB, storage, and filesystem drivers."
+for module in \
+	scsi_mod sd_mod \
+	usbcore xhci_hcd xhci_pci ehci_hcd ehci_pci ohci_hcd ohci_pci uhci_hcd \
+	usb_storage uas \
+	vmd nvme_core nvme \
+	ahci libahci libata ata_piix ata_generic \
+	mmc_core mmc_block sdhci sdhci_pci \
+	virtio_pci virtio_blk \
+	isofs loop
+do
+	modprobe "$module" 2>/dev/null || true
+done
+kernel_release="$(uname -r)"
+load_module "/usr/lib/modules/$kernel_release/kernel/fs/squashfs/squashfs.ko"
+load_module "/usr/lib/modules/$kernel_release/kernel/fs/overlayfs/overlay.ko"
+
+message "Waiting for boot media."
+for attempt in $(seq 1 240); do
+	mdev -s 2>/dev/null || true
+	# USB and disk devices are checked before optical drives. Some systems
+	# expose an empty sr0 even when firmware booted Lazarus from USB.
+	for dev in /dev/sd? /dev/sd??* /dev/vd? /dev/vd??* /dev/nvme*n*; do
+		[ -b "$dev" ] || continue
+		mount -t iso9660 -o ro "$dev" /media/boot 2>/dev/null || continue
+		if [ -f /media/boot/boot/arcology-lazarus-live.marker ] &&
+		   [ -f /media/boot/boot/rootfs.squashfs ]; then
+			bootdev="$dev"
+			break 2
+		fi
+		umount /media/boot 2>/dev/null || true
+	done
+	# Retain optical boot support, but probe it less often to avoid repeatedly
+	# asking the kernel to open an empty optical device.
+	if [ $((attempt % 8)) -eq 0 ]; then
+		for dev in /dev/sr*; do
+			[ -b "$dev" ] || continue
+			mount -t iso9660 -o ro "$dev" /media/boot 2>/dev/null || continue
+			if [ -f /media/boot/boot/arcology-lazarus-live.marker ] &&
+			   [ -f /media/boot/boot/rootfs.squashfs ]; then
+				bootdev="$dev"
+				break 2
+			fi
+			umount /media/boot 2>/dev/null || true
+		done
+	fi
+	sleep 0.25
+done
+
+[ -n "${bootdev:-}" ] || rescue_shell "Could not find Arcology Lazarus boot media."
+message "Boot media mounted from $bootdev."
+
+mount -t squashfs -o ro,loop /media/boot/boot/rootfs.squashfs /media/root-ro || \
+	rescue_shell "Could not mount /boot/rootfs.squashfs."
+
+mount -t tmpfs -o mode=0755 tmpfs /sysroot || rescue_shell "Could not mount live tmpfs root."
+mkdir -p /sysroot/.root-ro /sysroot/.root-rw /sysroot/.root-work
+mount --move /media/root-ro /sysroot/.root-ro
+mount -t overlay -o lowerdir=/sysroot/.root-ro,upperdir=/sysroot/.root-rw,workdir=/sysroot/.root-work overlay /sysroot || \
+	rescue_shell "Could not create writable live overlay."
+
+mkdir -p /sysroot/proc /sysroot/sys /sysroot/dev /sysroot/run /sysroot/media/boot
+mount --move /proc /sysroot/proc
+mount --move /sys /sysroot/sys
+mount --move /dev /sysroot/dev
+mount --move /run /sysroot/run
+mount --move /media/boot /sysroot/media/boot
+
+message "Switching to Arcology Lazarus OS."
+if [ -f /sysroot/media/boot/boot/lazarus-installer.flag ]; then
+	message "Installer media marker detected."
+	chvt 1 2>/dev/null || true
+	exec switch_root /sysroot /usr/local/sbin/lazarus-install-os
+fi
+exec switch_root /sysroot /sbin/init
+
+rescue_shell "switch_root returned unexpectedly."

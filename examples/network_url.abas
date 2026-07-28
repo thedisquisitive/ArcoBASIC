@@ -1,0 +1,5 @@
+#DESCRIPTION "Build URL-safe text and query strings"
+
+PRINT Network.UrlEncode("hello world!")
+PRINT Network.UrlDecode("hello%20world%21")
+PRINT Network.QueryString({"q": "arco basic", "page": 2})
