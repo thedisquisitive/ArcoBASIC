@@ -21,5 +21,7 @@ Result compile_run_file(const std::string& path);
 Result build_native_file(const std::string& path, const std::string& output_path);
 Result reveal_ast(const std::string& source, const std::string& source_name);
 Result reveal_ast_file(const std::string& path);
+Result reveal_callconv(const std::string& source, const std::string& source_name);
+Result reveal_callconv_file(const std::string& path);
 
 } // namespace arco::fission

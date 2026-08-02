@@ -1,5 +1,6 @@
 #include "arco/fission.hpp"
 
+#include "arco/calling_convention.hpp"
 #include "arco/runtime.hpp"
 
 #include "../core/lexer.hpp"
@@ -2188,6 +2189,67 @@ std::string render_amir(const AmirModule& module) {
     return out.str();
 }
 
+std::string bare_parameter_name(const std::string& declared_parameter) {
+    const auto space = declared_parameter.find(' ');
+    return space == std::string::npos ? declared_parameter : declared_parameter.substr(0, space);
+}
+
+void render_argument_location(std::ostream& out, const systems::ArgumentLocation& location) {
+    if (location.in_register) {
+        out << location.register_name;
+    } else {
+        out << "STACK+" << location.stack_offset_bytes;
+    }
+}
+
+// Renders the Microsoft x64 calling convention (docs/systems/calling-conventions.md) computed
+// for each declared function's parameters and for each external/ABI-bound call site within its
+// body. This is a deterministic textual stand-in for real generated assembly (Packet WP-005
+// verification: "golden tests for generated assembly or machine-code disassembly") -- actual
+// instruction encoding is WP-008's job; this stage only answers "where does each argument live."
+std::string render_calling_convention(const AmirModule& module) {
+    std::ostringstream out;
+    out << "CALLING CONVENTION MICROSOFT_X64\n";
+    out << "SHADOW_SPACE " << systems::kShadowSpaceBytes << " bytes\n";
+    out << "STACK_ALIGNMENT " << systems::kStackAlignmentAtCallBytes << " bytes at CALL\n\n";
+
+    for (const auto& function : module.functions) {
+        out << "FUNCTION " << function.name << "\n";
+        if (!function.params.empty()) {
+            out << "    PARAMETERS\n";
+            const auto locations = systems::assign_argument_locations(static_cast<int>(function.params.size()));
+            for (std::size_t i = 0; i < function.params.size(); ++i) {
+                out << "        " << bare_parameter_name(function.params[i]) << " : ";
+                render_argument_location(out, locations[i]);
+                out << "\n";
+            }
+        }
+        out << "    RETURNS " << systems::integer_return_register() << " (" << function.return_type << ")\n";
+
+        bool printed_call_sites_header = false;
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (instruction.kind != AmirInstruction::Kind::CallExternal) {
+                    continue;
+                }
+                if (!printed_call_sites_header) {
+                    out << "    CALL SITES\n";
+                    printed_call_sites_header = true;
+                }
+                out << "        " << instruction.target << " (external)\n";
+                const auto call_locations = systems::assign_argument_locations(static_cast<int>(instruction.operands.size()));
+                for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
+                    out << "            ARG" << i << " : ";
+                    render_argument_location(out, call_locations[i]);
+                    out << "\n";
+                }
+            }
+        }
+        out << "END FUNCTION\n\n";
+    }
+    return out.str();
+}
+
 enum class BytecodeOp {
     Label = 0,
     Source = 1,
@@ -3322,6 +3384,30 @@ Result reveal_amir(const std::string& source, const std::string& source_name) {
 Result reveal_amir_file(const std::string& path) {
     try {
         return reveal_amir(read_file(path), path);
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+
+Result reveal_callconv(const std::string& source, const std::string& source_name) {
+    try {
+        Runtime runtime;
+        const std::string processed = runtime.preprocess_source(source);
+        Lexer lexer(processed);
+        auto tokens = lexer.scan_tokens();
+
+        Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
+        (void)parser.parse();
+
+        return {true, render_calling_convention(build_amir(tokens, source_name)), ""};
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+
+Result reveal_callconv_file(const std::string& path) {
+    try {
+        return reveal_callconv(read_file(path), path);
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }

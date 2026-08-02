@@ -342,6 +342,12 @@ an explicit project decision rather than an agent-chosen redesign.
 - New backend stage (WP-008/WP-009): A-MIR → x86-64 machine code → PE32+
   image, added alongside (not replacing) the existing A-MIR → bytecode → VM
   path, isolated behind its own backend interface per Packet §3.3.
+- New A-MIR instruction (WP-004): `CallExternal`, distinguishing a call
+  through a declared function parameter from an ordinary namespaced
+  host/stdlib call. See `.agents/reports/WP-004-amir-systems-primitives.md`.
+- New calling-convention model (WP-005): `include/arco/calling_convention.hpp`
+  plus `ArcoFission reveal FILE at CALLCONV`. See
+  `docs/systems/calling-conventions.md`.
 
 ## Acceptance
 

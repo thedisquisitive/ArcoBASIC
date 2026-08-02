@@ -1,5 +1,6 @@
 #include "arco/runtime.hpp"
 #include "arco/shell.hpp"
+#include "arco/calling_convention.hpp"
 #include "arco_c_api.h"
 
 #include <cstdlib>
@@ -1663,6 +1664,51 @@ int main() {
     require(c_runtime != nullptr, "creates C runtime");
     require(arco_run_string(c_runtime, "PRINT \"C API\"\n") == 0, "runs through C API");
     arco_destroy_runtime(c_runtime);
+
+    // Microsoft x64 calling convention (Packet WP-005, docs/systems/calling-conventions.md).
+    require(arco::systems::assign_argument_locations(0).empty(), "zero arguments assigns no locations");
+    {
+        const auto one = arco::systems::assign_argument_locations(1);
+        require(one.size() == 1 && one[0].in_register && one[0].register_name == "RCX",
+                "first argument assigns to RCX");
+    }
+    {
+        const auto two = arco::systems::assign_argument_locations(2);
+        require(two.size() == 2 && two[0].register_name == "RCX" && two[1].register_name == "RDX",
+                "two arguments assign to RCX, RDX in order");
+    }
+    {
+        const auto four = arco::systems::assign_argument_locations(4);
+        require(four.size() == 4 && four[0].register_name == "RCX" && four[1].register_name == "RDX" &&
+                    four[2].register_name == "R8" && four[3].register_name == "R9",
+                "four arguments assign to RCX, RDX, R8, R9");
+    }
+    {
+        const auto five = arco::systems::assign_argument_locations(5);
+        require(five.size() == 5 && !five[4].in_register && five[4].stack_offset_bytes == 40,
+                "fifth argument spills to the stack at shadow-space-plus-return-address offset 40");
+    }
+    {
+        const auto six = arco::systems::assign_argument_locations(6);
+        require(!six[5].in_register && six[5].stack_offset_bytes == 48,
+                "sixth argument follows the fifth at offset 48");
+    }
+    require(arco::systems::integer_return_register() == "RAX", "integer/pointer return register is RAX");
+    require(arco::systems::kShadowSpaceBytes == 32, "shadow space is always 32 bytes");
+    require(arco::systems::kStackAlignmentAtCallBytes == 16, "stack must be 16-byte aligned at CALL");
+    {
+        const auto& callee_saved = arco::systems::callee_saved_registers();
+        const auto& caller_saved = arco::systems::caller_saved_registers();
+        bool disjoint = true;
+        for (const auto& reg : callee_saved) {
+            for (const auto& other : caller_saved) {
+                if (reg == other) {
+                    disjoint = false;
+                }
+            }
+        }
+        require(disjoint, "callee-saved and caller-saved register sets do not overlap");
+    }
 
     return 0;
 }
