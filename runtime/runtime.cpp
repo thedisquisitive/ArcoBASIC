@@ -3013,6 +3013,41 @@ std::string Runtime::preprocess_source(const std::string& code, bool reset_metad
             metadata_.entry = args;
         } else if (directive == "TARGET") {
             metadata_.targets = split_words(args);
+            // Under a systems profile (docs/systems/uefi-target.md section 2), #TARGET's
+            // first word additionally selects the codegen architecture; outside a systems
+            // profile its existing platform-list meaning is unchanged.
+            if (metadata_.profile == "UEFI" && !metadata_.targets.empty()) {
+                const std::string requested_arch = upper_copy(metadata_.targets.front());
+                if (requested_arch != "X86_64") {
+                    throw std::runtime_error(
+                        "Unsupported architecture for the UEFI profile: " + metadata_.targets.front() +
+                        ". X86_64 is the only supported architecture in this milestone.");
+                }
+                metadata_.arch = requested_arch;
+            }
+        } else if (directive == "PROFILE") {
+            const std::string profile = upper_copy(args);
+            if (profile != "UEFI") {
+                throw std::runtime_error(
+                    "Unknown compilation profile: " + args + ". UEFI is the only accepted profile in this milestone.");
+            }
+            metadata_.profile = profile;
+        } else if (directive == "RUNTIME") {
+            const std::string mode = upper_copy(args);
+            if (mode != "NONE") {
+                throw std::runtime_error(
+                    "Unknown #RUNTIME value: " + args + ". NONE is the only accepted value in this milestone.");
+            }
+            metadata_.runtime_mode = mode;
+        } else if (directive == "CALLCONV") {
+            const std::string convention = upper_copy(args);
+            if (convention != "UEFI") {
+                throw std::runtime_error(
+                    "Unknown #CALLCONV value: " + args + ". UEFI is the only accepted calling convention in this milestone.");
+            }
+            metadata_.callconv = convention;
+        } else if (directive == "EXPORT") {
+            metadata_.export_symbol = unquote(args);
         } else if (directive == "REQUIRE") {
             metadata_.requirements.push_back(args);
         } else if (directive == "FEATURE") {
@@ -3072,7 +3107,7 @@ RunResult Runtime::run_string(const std::string& code) {
         reset_instruction_count();
         processed = preprocess_source(code);
         Lexer lexer(processed);
-        Parser parser(lexer.scan_tokens());
+        Parser parser(lexer.scan_tokens(), metadata_.runtime_mode == "NONE");
         auto statements = parser.parse();
         std::unordered_map<int, std::size_t> labels;
         for (std::size_t i = 0; i < statements.size(); ++i) {

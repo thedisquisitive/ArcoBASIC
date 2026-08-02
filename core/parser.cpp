@@ -117,6 +117,26 @@ std::string uppercase(std::string value) {
     return value;
 }
 
+// Namespace prefixes that unambiguously require the hosted runtime (docs/systems/uefi-target.md
+// section 7). Deliberately short and explicit: only names with no plausible freestanding meaning.
+// Matched as a whole leading dot-segment, not a substring, so "SystemTable" does not match "System".
+bool is_hosted_runtime_namespace(const std::string& first_segment) {
+    static const std::initializer_list<const char*> forbidden = {
+        "FILE", "NETWORK", "NET", "SYSTEM", "WEB", "PRINTER", "PROCESS", "HOST", "DOCUMENT",
+    };
+    const std::string upper = uppercase(first_segment);
+    for (const char* name : forbidden) {
+        if (upper == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string freestanding_diagnostic(const std::string& construct, const std::string& alternative) {
+    return construct + " is not available under #RUNTIME NONE.\n" + alternative;
+}
+
 void ast_indent(std::ostream& output, int indent) {
     for (int i = 0; i < indent; ++i) {
         output << "  ";
@@ -1473,7 +1493,8 @@ void Stmt::dump_ast(std::ostream& output, int indent) const {
     ast_line(output, indent, header);
 }
 
-Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
+Parser::Parser(std::vector<Token> tokens, bool freestanding_runtime_none)
+    : tokens_(std::move(tokens)), freestanding_runtime_none_(freestanding_runtime_none) {}
 
 std::vector<std::unique_ptr<Stmt>> Parser::parse() {
     std::vector<std::unique_ptr<Stmt>> statements;
@@ -1740,6 +1761,11 @@ Parser::StmtPtr Parser::statement() {
 }
 
 Parser::StmtPtr Parser::print_statement() {
+    if (freestanding_runtime_none_) {
+        throw std::runtime_error(token_error(previous(),
+            "UEFI target does not provide the standard console runtime.\n"
+            "Use UEFI.SystemTable.ConsoleOut or select a hosted runtime profile."));
+    }
     auto value = expression();
     return std::make_unique<PrintStmt>(std::move(value));
 }
@@ -2310,6 +2336,15 @@ Parser::ExprPtr Parser::call() {
             }
             consume(TokenType::RightParen, "expected ')' after arguments");
             const auto dot = variable->name.find('.');
+            if (freestanding_runtime_none_) {
+                const std::string first_segment = dot != std::string::npos ? variable->name.substr(0, dot) : variable->name;
+                if (is_hosted_runtime_namespace(first_segment)) {
+                    throw std::runtime_error(token_error(previous(),
+                        freestanding_diagnostic(first_segment + ".* calls",
+                            "Provide an explicit systems binding instead of the hosted " + first_segment + " runtime, "
+                            "or select a hosted runtime profile.")));
+                }
+            }
             if (dot != std::string::npos) {
                 if (uppercase(variable->name.substr(0, dot)) == "SUPER") {
                     if (current_super_class_.empty()) {

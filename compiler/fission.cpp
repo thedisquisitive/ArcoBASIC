@@ -3244,7 +3244,7 @@ Result reveal_amir(const std::string& source, const std::string& source_name) {
         Lexer lexer(processed);
         auto tokens = lexer.scan_tokens();
 
-        Parser parser(tokens);
+        Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
         (void)parser.parse();
 
         return {true, render_amir(build_amir(tokens, source_name)), ""};
@@ -3268,7 +3268,7 @@ Result reveal_bytecode(const std::string& source, const std::string& source_name
         Lexer lexer(processed);
         auto tokens = lexer.scan_tokens();
 
-        Parser parser(tokens);
+        Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
         (void)parser.parse();
 
         const AmirModule amir = build_amir(tokens, source_name);
@@ -3313,7 +3313,7 @@ Result compile_run(const std::string& source, const std::string& source_name) {
         Lexer lexer(processed);
         auto tokens = lexer.scan_tokens();
 
-        Parser parser(tokens);
+        Parser parser(tokens, preprocess_runtime.compile_metadata().runtime_mode == "NONE");
         (void)parser.parse();
 
         Runtime runtime;
@@ -3341,7 +3341,7 @@ Result build_native_file(const std::string& path, const std::string& output_path
         Lexer lexer(processed);
         auto tokens = lexer.scan_tokens();
 
-        Parser parser(tokens);
+        Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
         (void)parser.parse();
 
         const AmirModule amir = build_amir(tokens, path);
@@ -3359,7 +3359,7 @@ Result reveal_ast(const std::string& source, const std::string& source_name) {
         Lexer lexer(processed);
         auto tokens = lexer.scan_tokens();
 
-        Parser parser(tokens);
+        Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
         auto statements = parser.parse();
 
         return {true, emit_ast(statements, source_name), ""};

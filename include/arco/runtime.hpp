@@ -42,6 +42,12 @@ struct CompileMetadata {
     bool strict = false;
     bool experimental = false;
     bool deprecated = false;
+    // Systems-target directives (docs/systems/uefi-target.md section 2).
+    std::string profile;        // #PROFILE value, e.g. "UEFI"; empty = no systems profile
+    std::string runtime_mode;   // #RUNTIME value, e.g. "NONE"; empty = hosted runtime
+    std::string arch;           // architecture selected via #TARGET under a systems profile
+    std::string callconv;       // #CALLCONV value, e.g. "UEFI"
+    std::string export_symbol;  // #EXPORT value, e.g. "efi_main"
 };
 
 struct ClassMetadata {

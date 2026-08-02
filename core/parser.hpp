@@ -33,7 +33,7 @@ struct FunctionParam {
 
 class Parser {
 public:
-    explicit Parser(std::vector<Token> tokens);
+    explicit Parser(std::vector<Token> tokens, bool freestanding_runtime_none = false);
     std::vector<std::unique_ptr<Stmt>> parse();
 
 private:
@@ -94,6 +94,7 @@ private:
     std::vector<Token> tokens_;
     std::size_t current_ = 0;
     std::string current_super_class_;
+    bool freestanding_runtime_none_ = false;
 };
 
 } // namespace arco
