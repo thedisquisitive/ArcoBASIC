@@ -1,6 +1,7 @@
 #include "arco/runtime.hpp"
 #include "arco/shell.hpp"
 #include "arco/calling_convention.hpp"
+#include "arco/utf16.hpp"
 #include "arco_c_api.h"
 
 #include <cstdlib>
@@ -1709,6 +1710,50 @@ int main() {
         }
         require(disjoint, "callee-saved and caller-saved register sets do not overlap");
     }
+
+    // UTF-16 constant encoding (Packet WP-007, docs/systems/utf16-encoding.md).
+    {
+        const auto units = arco::systems::encode_utf16_null_terminated("Hello from ArcoBASIC");
+        const std::u16string expected = u"Hello from ArcoBASIC";
+        require(units.size() == expected.size() + 1, "hello string encodes to 21 code units plus a null terminator");
+        bool matches = true;
+        for (std::size_t i = 0; i < expected.size(); ++i) {
+            if (units[i] != expected[i]) {
+                matches = false;
+            }
+        }
+        require(matches, "hello string's UTF-16 code units match their ASCII values exactly");
+        require(units.back() == u'\0', "hello string's UTF-16 encoding ends with a null terminator");
+    }
+    {
+        const auto empty_units = arco::systems::encode_utf16_null_terminated("");
+        require(empty_units.size() == 1 && empty_units[0] == u'\0', "empty string encodes to just a null terminator");
+    }
+    {
+        // U+00E9 (LATIN SMALL LETTER E WITH ACUTE), UTF-8: 0xC3 0xA9 -- a single UTF-16 code unit.
+        const auto units = arco::systems::encode_utf16_null_terminated("\xC3\xA9");
+        require(units.size() == 2 && units[0] == 0x00E9 && units[1] == u'\0',
+                "a BMP character outside ASCII encodes to a single UTF-16 code unit");
+    }
+    {
+        // U+1F600 (GRINNING FACE), UTF-8: 0xF0 0x9F 0x98 0x80 -- a UTF-16 surrogate pair.
+        const auto units = arco::systems::encode_utf16_null_terminated("\xF0\x9F\x98\x80");
+        require(units.size() == 3 && units[0] == 0xD83D && units[1] == 0xDE00 && units[2] == u'\0',
+                "a character outside the BMP encodes to a correct UTF-16 surrogate pair");
+    }
+    const auto encoding_rejects = [](const std::string& text) {
+        try {
+            (void)arco::systems::encode_utf16_null_terminated(text);
+            return false;
+        } catch (const std::exception&) {
+            return true;
+        }
+    };
+    require(encoding_rejects(std::string("bad\0null", 8)), "embedded NUL byte is rejected");
+    require(encoding_rejects("\xFF"), "an invalid UTF-8 lead byte is rejected");
+    require(encoding_rejects("\xC3"), "a truncated UTF-8 sequence is rejected");
+    require(encoding_rejects("\xC3\x28"), "an invalid UTF-8 continuation byte is rejected");
+    require(encoding_rejects("\xED\xA0\x80"), "a UTF-8 encoding of a surrogate code point is rejected");
 
     return 0;
 }

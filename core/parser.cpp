@@ -3,6 +3,7 @@
 
 #include "arco/fixed_width_types.hpp"
 #include "arco/uefi_bindings.hpp"
+#include "arco/utf16.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1707,6 +1708,28 @@ void Parser::validate_uefi_field_chain(const Token& location, const std::string&
     }
 }
 
+// Validates that any plain string-literal argument to a call through a UEFI-typed parameter is
+// representable as null-terminated UTF-16 (Packet WP-007, docs/systems/utf16-encoding.md) -- the
+// encoding EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString's CHAR16* parameter requires. Only plain
+// string literals are checked here (matching the literal-only scope of
+// validate_fixed_width_initializer); non-literal arguments are not statically checked at this
+// stage. Scoped to calls through a UEFI-typed parameter only, so ordinary hosted-mode string
+// literals are never affected.
+void Parser::validate_utf16_arguments(const Token& location, const std::vector<ExprPtr>& args) {
+    for (const auto& argument : args) {
+        const auto* literal = dynamic_cast<const LiteralExpr*>(argument.get());
+        if (!literal || !literal->value.is_string()) {
+            continue;
+        }
+        try {
+            (void)systems::encode_utf16_null_terminated(literal->value.to_string());
+        } catch (const std::exception& error) {
+            throw std::runtime_error(token_error(location,
+                std::string("string argument cannot be encoded as UTF-16: ") + error.what() + "."));
+        }
+    }
+}
+
 std::vector<FunctionParam> Parser::parameter_list() {
     consume(TokenType::LeftParen, "expected '(' after function name");
     std::vector<FunctionParam> params;
@@ -2406,6 +2429,7 @@ Parser::ExprPtr Parser::call() {
                 const auto declared_type = current_function_parameter_types_.find(receiver_name);
                 if (declared_type != current_function_parameter_types_.end()) {
                     validate_uefi_field_chain(previous(), declared_type->second, variable->name.substr(dot + 1));
+                    validate_utf16_arguments(previous(), args);
                 }
                 if (uppercase(receiver_name) == "SUPER") {
                     if (current_super_class_.empty()) {

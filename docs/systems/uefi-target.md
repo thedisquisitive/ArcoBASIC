@@ -351,6 +351,9 @@ an explicit project decision rather than an agent-chosen redesign.
 - New UEFI bindings registry and compile-time field-chain validation
   (WP-006): `include/arco/uefi_bindings.hpp`,
   `Parser::validate_uefi_field_chain`. See `docs/systems/uefi-bindings.md`.
+- New UTF-16 constant encoder and compile-time validation (WP-007):
+  `include/arco/utf16.hpp`, `Parser::validate_utf16_arguments`. See
+  `docs/systems/utf16-encoding.md`.
 
 ## Acceptance
 
