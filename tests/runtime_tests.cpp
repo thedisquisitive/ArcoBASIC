@@ -2,6 +2,7 @@
 #include "arco/shell.hpp"
 #include "arco/calling_convention.hpp"
 #include "arco/utf16.hpp"
+#include "arco/x86_64_encoder.hpp"
 #include "arco_c_api.h"
 
 #include <cstdlib>
@@ -1754,6 +1755,94 @@ int main() {
     require(encoding_rejects("\xC3"), "a truncated UTF-8 sequence is rejected");
     require(encoding_rejects("\xC3\x28"), "an invalid UTF-8 continuation byte is rejected");
     require(encoding_rejects("\xED\xA0\x80"), "a UTF-8 encoding of a surrogate code point is rejected");
+
+    // x86-64 instruction encoder (Packet WP-008, docs/systems/x86-64-codegen.md). Every expected
+    // byte sequence below was independently verified with `nasm -f bin` (see the completion
+    // report for the exact .asm source used); this test only checks that the C++ encoder
+    // reproduces those same bytes, not that the bytes are correct x86-64 in the first place.
+    {
+        using namespace arco::systems::x86_64;
+        const auto bytes_equal = [](const std::vector<std::uint8_t>& actual, std::initializer_list<int> expected) {
+            if (actual.size() != expected.size()) {
+                return false;
+            }
+            std::size_t i = 0;
+            for (int value : expected) {
+                if (actual[i++] != static_cast<std::uint8_t>(value)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        {
+            Assembler asm_;
+            asm_.sub_rsp_imm8(0x38);
+            require(bytes_equal(asm_.bytes(), {0x48, 0x83, 0xEC, 0x38}), "sub rsp, imm8 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.add_rsp_imm8(0x38);
+            require(bytes_equal(asm_.bytes(), {0x48, 0x83, 0xC4, 0x38}), "add rsp, imm8 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.mov_store_disp8(Reg::RSP, 0x28, Reg::RCX);
+            require(bytes_equal(asm_.bytes(), {0x48, 0x89, 0x4C, 0x24, 0x28}), "mov [rsp+disp8], rcx matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.mov_store_disp8(Reg::RSP, 0x20, Reg::RDX);
+            require(bytes_equal(asm_.bytes(), {0x48, 0x89, 0x54, 0x24, 0x20}), "mov [rsp+disp8], rdx matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.mov_load_disp8(Reg::RAX, Reg::RSP, 0x20);
+            require(bytes_equal(asm_.bytes(), {0x48, 0x8B, 0x44, 0x24, 0x20}), "mov rax, [rsp+disp8] matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.mov_load_disp8(Reg::RAX, Reg::RAX, 0x40);
+            require(bytes_equal(asm_.bytes(), {0x48, 0x8B, 0x40, 0x40}), "mov rax, [rax+disp8] (non-RSP base, no SIB) matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.mov_reg_reg(Reg::RCX, Reg::RAX);
+            require(bytes_equal(asm_.bytes(), {0x48, 0x89, 0xC1}), "mov rcx, rax matches nasm");
+        }
+        {
+            Assembler asm_;
+            const std::size_t disp_offset = asm_.lea_rip_relative(Reg::RDX);
+            require(disp_offset == 3, "lea rip-relative disp32 field starts right after the 3-byte prefix/opcode/modrm");
+            require(bytes_equal(asm_.bytes(), {0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00}),
+                    "lea rdx, [rip+disp32] prefix/opcode/modrm matches nasm (disp32 left as an unpatched placeholder)");
+            asm_.patch_u32(disp_offset, 0x0A);
+            require(bytes_equal(asm_.bytes(), {0x48, 0x8D, 0x15, 0x0A, 0x00, 0x00, 0x00}), "patch_u32 writes little-endian");
+        }
+        {
+            Assembler asm_;
+            asm_.call_indirect_disp8(Reg::RAX, 0x08);
+            require(bytes_equal(asm_.bytes(), {0xFF, 0x50, 0x08}), "call qword [rax+disp8] matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.mov_reg_imm64(Reg::RAX, 0);
+            require(bytes_equal(asm_.bytes(), {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0}),
+                    "mov rax, imm64(0) uses the full 10-byte form, matching nasm's `strict qword` output "
+                    "(no attempt to use the shorter reg32,imm32 form -- Packet WP-008 non-goal: optimization)");
+        }
+        {
+            Assembler asm_;
+            asm_.mov_reg_imm64(Reg::RAX, 0x123456789ABCDEF0ULL);
+            require(bytes_equal(asm_.bytes(), {0x48, 0xB8, 0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12}),
+                    "mov rax, imm64(nonzero) matches nasm's `strict qword` output, byte order included");
+        }
+        {
+            Assembler asm_;
+            asm_.ret();
+            require(bytes_equal(asm_.bytes(), {0xC3}), "ret matches nasm");
+        }
+    }
 
     return 0;
 }

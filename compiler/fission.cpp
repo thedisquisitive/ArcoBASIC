@@ -2,6 +2,9 @@
 
 #include "arco/calling_convention.hpp"
 #include "arco/runtime.hpp"
+#include "arco/uefi_bindings.hpp"
+#include "arco/utf16.hpp"
+#include "arco/x86_64_encoder.hpp"
 
 #include "../core/lexer.hpp"
 #include "../core/parser.hpp"
@@ -2714,6 +2717,333 @@ std::string unquote_constant(const std::string& text) {
     return out;
 }
 
+std::string declared_parameter_type(const std::string& declared_parameter) {
+    const auto as_pos = declared_parameter.find(" AS ");
+    return as_pos == std::string::npos ? "" : declared_parameter.substr(as_pos + 4);
+}
+
+struct X86_64CodegenResult {
+    bool ok = true;
+    std::string error;
+    systems::x86_64::Assembler text;
+    std::vector<std::uint8_t> rdata;
+    struct DataRelocation {
+        std::size_t disp_field_offset;
+        std::size_t instruction_end_offset;
+        std::size_t rdata_offset;
+    };
+    std::vector<DataRelocation> relocations;
+    std::string entry_symbol;
+};
+
+// Generates x86-64 machine code for a single named function within `module` (Packet WP-008,
+// docs/systems/x86-64-codegen.md). Deliberately narrow: supports exactly the A-MIR instruction
+// kinds the milestone's hello-world program uses (CONST, LOAD, CALL_EXTERNAL, RETURN, plus the
+// non-semantic SOURCE/LABEL markers, skipped) with a uniform spill-everything strategy (Packet
+// non-goal: "register allocator sophistication beyond correctness" -- every named value gets its
+// own stack slot, always reloaded before use, never kept live in a register across instructions).
+// Any other instruction kind, or any construct this milestone's UEFI bindings/calling convention
+// do not cover, produces a clear error rather than an incorrect or silently wrong encoding.
+X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std::string& function_name) {
+    X86_64CodegenResult result;
+    result.entry_symbol = function_name;
+
+    const AmirFunction* target = nullptr;
+    for (const auto& function : module.functions) {
+        if (function.name == function_name) {
+            // Last match wins: the synthetic top-level wrapper is always named "Main" and is
+            // always emitted first, so a real user-declared function with the same name (as in
+            // the hello-world example) is always found after it.
+            target = &function;
+        }
+    }
+    if (!target) {
+        result.ok = false;
+        result.error = "no function named \"" + function_name + "\" was found";
+        return result;
+    }
+    if (target->blocks.size() != 1) {
+        result.ok = false;
+        result.error = "function \"" + function_name + "\" has control flow beyond a single "
+            "straight-line block, which this milestone's code generator does not support";
+        return result;
+    }
+
+    std::vector<std::string> slot_names;
+    std::unordered_map<std::string, int> slot_offsets;
+    const auto add_slot = [&](const std::string& name) {
+        if (name.empty() || slot_offsets.count(name) != 0) {
+            return;
+        }
+        slot_offsets[name] = 0;
+        slot_names.push_back(name);
+    };
+    for (const auto& declared_parameter : target->params) {
+        add_slot(bare_parameter_name(declared_parameter));
+    }
+    for (const auto& instruction : target->blocks.front().instructions) {
+        add_slot(instruction.result);
+    }
+
+    const int shadow = systems::kShadowSpaceBytes;
+    int frame_size = shadow + 8 * static_cast<int>(slot_names.size());
+    // RSP is kEntryRspMod16 (8) mod 16 at function entry; after `sub rsp, frame_size`, RSP must
+    // be 0 mod 16 immediately before any CALL this function makes, which requires
+    // frame_size % 16 == kEntryRspMod16.
+    while (frame_size % 16 != systems::kEntryRspMod16) {
+        ++frame_size;
+    }
+    if (frame_size > 255) {
+        result.ok = false;
+        result.error = "function \"" + function_name + "\" needs a stack frame larger than this "
+            "milestone's 8-bit immediate prologue/epilogue encoding supports";
+        return result;
+    }
+    for (std::size_t i = 0; i < slot_names.size(); ++i) {
+        slot_offsets[slot_names[i]] = shadow + 8 * static_cast<int>(i);
+    }
+    const auto slot_of = [&](const std::string& name) -> int {
+        const auto found = slot_offsets.find(name);
+        return found == slot_offsets.end() ? -1 : found->second;
+    };
+
+    static const std::unordered_map<std::string, systems::x86_64::Reg> kRegisterByName = {
+        {"RCX", systems::x86_64::Reg::RCX}, {"RDX", systems::x86_64::Reg::RDX},
+        {"R8", systems::x86_64::Reg::R8}, {"R9", systems::x86_64::Reg::R9},
+    };
+
+    using Reg = systems::x86_64::Reg;
+    result.text.sub_rsp_imm8(static_cast<std::uint8_t>(frame_size));
+
+    // Spill incoming register arguments (Packet WP-008 non-goal: general-purpose instruction
+    // selection -- only register-passed parameters are handled; a 5th+ stack-passed parameter is
+    // outside this milestone's hello-world shape and produces a clear error rather than silently
+    // mishandled code).
+    {
+        const auto locations = systems::assign_argument_locations(static_cast<int>(target->params.size()));
+        for (std::size_t i = 0; i < target->params.size(); ++i) {
+            const std::string name = bare_parameter_name(target->params[i]);
+            if (!locations[i].in_register) {
+                result.ok = false;
+                result.error = "function \"" + function_name + "\" parameter \"" + name +
+                    "\" is passed on the stack, which this milestone's code generator does not support";
+                return result;
+            }
+            result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(slot_of(name)),
+                                         kRegisterByName.at(locations[i].register_name));
+        }
+    }
+
+    for (const auto& instruction : target->blocks.front().instructions) {
+        switch (instruction.kind) {
+            case AmirInstruction::Kind::Source:
+            case AmirInstruction::Kind::Label:
+                break;
+
+            case AmirInstruction::Kind::Const: {
+                const std::string& text_operand = instruction.operands.front();
+                if (!text_operand.empty() && text_operand.front() == '"') {
+                    std::vector<char16_t> encoded;
+                    try {
+                        encoded = systems::encode_utf16_null_terminated(unquote_constant(text_operand));
+                    } catch (const std::exception& error) {
+                        result.ok = false;
+                        result.error = std::string("string constant cannot be encoded as UTF-16: ") + error.what();
+                        return result;
+                    }
+                    const std::size_t data_offset = result.rdata.size();
+                    for (char16_t unit : encoded) {
+                        result.rdata.push_back(static_cast<std::uint8_t>(unit & 0xFF));
+                        result.rdata.push_back(static_cast<std::uint8_t>((unit >> 8) & 0xFF));
+                    }
+                    const std::size_t disp_offset = result.text.lea_rip_relative(Reg::RAX);
+                    result.relocations.push_back({disp_offset, result.text.size(), data_offset});
+                    result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(slot_of(instruction.result)), Reg::RAX);
+                } else {
+                    std::uint64_t value = 0;
+                    try {
+                        std::size_t consumed = 0;
+                        const long long parsed = std::stoll(text_operand, &consumed, 10);
+                        if (consumed != text_operand.size()) {
+                            throw std::invalid_argument("trailing characters");
+                        }
+                        value = static_cast<std::uint64_t>(parsed);
+                    } catch (const std::exception&) {
+                        result.ok = false;
+                        result.error = "numeric constant \"" + text_operand + "\" is not an exact "
+                            "integer literal, which is all this milestone's code generator supports";
+                        return result;
+                    }
+                    result.text.mov_reg_imm64(Reg::RAX, value);
+                    result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(slot_of(instruction.result)), Reg::RAX);
+                }
+                break;
+            }
+
+            case AmirInstruction::Kind::Load: {
+                const int source_slot = slot_of(instruction.target);
+                if (source_slot < 0) {
+                    result.ok = false;
+                    result.error = "LOAD of \"" + instruction.target + "\" has no assigned stack slot";
+                    return result;
+                }
+                result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(source_slot));
+                result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(slot_of(instruction.result)), Reg::RAX);
+                break;
+            }
+
+            case AmirInstruction::Kind::CallExternal: {
+                const auto dot = instruction.target.find('.');
+                if (dot == std::string::npos) {
+                    result.ok = false;
+                    result.error = "external call target \"" + instruction.target + "\" is not a dotted field chain";
+                    return result;
+                }
+                const std::string receiver = instruction.target.substr(0, dot);
+                std::string receiver_type;
+                for (const auto& declared_parameter : target->params) {
+                    if (bare_parameter_name(declared_parameter) == receiver) {
+                        receiver_type = declared_parameter_type(declared_parameter);
+                        break;
+                    }
+                }
+                auto current_type = systems::lookup_uefi_type(receiver_type);
+                if (!current_type) {
+                    result.ok = false;
+                    result.error = "external call receiver \"" + receiver + "\" does not have a known UEFI binding type";
+                    return result;
+                }
+
+                const int receiver_slot = slot_of(receiver);
+                if (receiver_slot < 0) {
+                    result.ok = false;
+                    result.error = "external call receiver \"" + receiver + "\" has no assigned stack slot";
+                    return result;
+                }
+                result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(receiver_slot));
+
+                std::string remaining = instruction.target.substr(dot + 1);
+                const systems::UefiField* final_field = nullptr;
+                while (true) {
+                    const auto next_dot = remaining.find('.');
+                    const std::string segment = next_dot == std::string::npos ? remaining : remaining.substr(0, next_dot);
+                    const systems::UefiField* field = current_type->find_field(segment);
+                    if (!field) {
+                        result.ok = false;
+                        result.error = "external call field \"" + segment + "\" is not bound on " + current_type->name;
+                        return result;
+                    }
+                    if (next_dot == std::string::npos) {
+                        final_field = field;
+                        break;
+                    }
+                    result.text.mov_load_disp8(Reg::RAX, Reg::RAX, static_cast<std::uint8_t>(field->offset_bytes));
+                    const std::string next_type_name = field->result_type;
+                    current_type = systems::lookup_uefi_type(next_type_name);
+                    if (!current_type) {
+                        result.ok = false;
+                        result.error = "external call field \"" + segment + "\" does not resolve to a chainable systems type";
+                        return result;
+                    }
+                    remaining = remaining.substr(next_dot + 1);
+                }
+                if (!final_field || !final_field->is_method) {
+                    result.ok = false;
+                    result.error = "external call target \"" + instruction.target + "\" does not resolve to a bound method";
+                    return result;
+                }
+
+                // RAX now holds the resolved "This" pointer (docs/systems/uefi-bindings.md: the
+                // implicit first argument real UEFI protocol methods take in the underlying C ABI).
+                const int explicit_arg_count = static_cast<int>(instruction.operands.size());
+                const auto locations = systems::assign_argument_locations(
+                    explicit_arg_count + (final_field->implicit_this_argument ? 1 : 0));
+                std::size_t location_index = 0;
+                if (final_field->implicit_this_argument) {
+                    result.text.mov_reg_reg(kRegisterByName.at(locations[location_index].register_name), Reg::RAX);
+                    ++location_index;
+                }
+                for (int i = 0; i < explicit_arg_count; ++i, ++location_index) {
+                    if (!locations[location_index].in_register) {
+                        result.ok = false;
+                        result.error = "external call \"" + instruction.target + "\" has more arguments than "
+                            "this milestone's code generator supports in registers";
+                        return result;
+                    }
+                    const int argument_slot = slot_of(instruction.operands[static_cast<std::size_t>(i)]);
+                    if (argument_slot < 0) {
+                        result.ok = false;
+                        result.error = "external call argument \"" + instruction.operands[static_cast<std::size_t>(i)] +
+                            "\" has no assigned stack slot";
+                        return result;
+                    }
+                    result.text.mov_load_disp8(kRegisterByName.at(locations[location_index].register_name), Reg::RSP,
+                                                static_cast<std::uint8_t>(argument_slot));
+                }
+
+                result.text.call_indirect_disp8(Reg::RAX, static_cast<std::uint8_t>(final_field->offset_bytes));
+                result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(slot_of(instruction.result)), Reg::RAX);
+                break;
+            }
+
+            case AmirInstruction::Kind::Return: {
+                const std::string& value_ref = instruction.operands.front();
+                if (value_ref != "nothing") {
+                    const int value_slot = slot_of(value_ref);
+                    if (value_slot < 0) {
+                        result.ok = false;
+                        result.error = "RETURN of \"" + value_ref + "\" has no assigned stack slot";
+                        return result;
+                    }
+                    result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(value_slot));
+                }
+                result.text.add_rsp_imm8(static_cast<std::uint8_t>(frame_size));
+                result.text.ret();
+                break;
+            }
+
+            default:
+                result.ok = false;
+                result.error = "this milestone's code generator does not support this A-MIR instruction kind";
+                return result;
+        }
+    }
+
+    return result;
+}
+
+std::string render_x86_64(const X86_64CodegenResult& codegen) {
+    std::ostringstream out;
+    out << "X86_64 MICROSOFT_X64\n";
+    out << "ENTRY " << codegen.entry_symbol << "\n\n";
+    out << "TEXT " << codegen.text.size() << " bytes\n";
+    const auto& bytes = codegen.text.bytes();
+    for (std::size_t i = 0; i < bytes.size(); i += 8) {
+        std::ostringstream line;
+        line << "    " << std::hex << std::setw(4) << std::setfill('0') << i << ":";
+        for (std::size_t j = i; j < bytes.size() && j < i + 8; ++j) {
+            line << ' ' << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(bytes[j]);
+        }
+        out << line.str() << std::dec << "\n";
+    }
+    out << "\nRDATA " << codegen.rdata.size() << " bytes\n";
+    for (std::size_t i = 0; i < codegen.rdata.size(); i += 8) {
+        std::ostringstream line;
+        line << "    " << std::hex << std::setw(4) << std::setfill('0') << i << ":";
+        for (std::size_t j = i; j < codegen.rdata.size() && j < i + 8; ++j) {
+            line << ' ' << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(codegen.rdata[j]);
+        }
+        out << line.str() << std::dec << "\n";
+    }
+    out << "\nRELOCATIONS " << codegen.relocations.size() << "\n";
+    for (const auto& relocation : codegen.relocations) {
+        out << "    TEXT+" << std::hex << relocation.disp_field_offset << " RIP_REL32_TO RDATA+"
+            << relocation.rdata_offset << " (instruction ends at TEXT+" << relocation.instruction_end_offset
+            << ")" << std::dec << "\n";
+    }
+    return out.str();
+}
+
 Value parse_constant_value(const std::string& text) {
     if (text == "nothing") {
         return Value();
@@ -3408,6 +3738,34 @@ Result reveal_callconv(const std::string& source, const std::string& source_name
 Result reveal_callconv_file(const std::string& path) {
     try {
         return reveal_callconv(read_file(path), path);
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+
+Result reveal_x86_64(const std::string& source, const std::string& source_name, const std::string& entry_function) {
+    try {
+        Runtime runtime;
+        const std::string processed = runtime.preprocess_source(source);
+        Lexer lexer(processed);
+        auto tokens = lexer.scan_tokens();
+
+        Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
+        (void)parser.parse();
+
+        const auto codegen = generate_x86_64_function(build_amir(tokens, source_name), entry_function);
+        if (!codegen.ok) {
+            return {false, "", codegen.error};
+        }
+        return {true, render_x86_64(codegen), ""};
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+
+Result reveal_x86_64_file(const std::string& path, const std::string& entry_function) {
+    try {
+        return reveal_x86_64(read_file(path), path, entry_function);
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }

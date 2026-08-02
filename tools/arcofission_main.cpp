@@ -99,16 +99,23 @@ int main(int argc, char** argv) {
         const bool wants_bytecode = normalized_stage == "bytecode" || normalized_stage == "a-bc" ||
                                     normalized_stage == "abc" || normalized_stage == "arcof";
         const bool wants_callconv = normalized_stage == "callconv" || normalized_stage == "calling-convention";
+        const bool wants_x86_64 = normalized_stage == "x86-64" || normalized_stage == "x86_64" || normalized_stage == "native-asm";
 
-        if (!wants_ast && !wants_amir && !wants_bytecode && !wants_callconv) {
-            std::cerr << "ArcoFission: this alpha slice can reveal AST, A-MIR, BYTECODE, or CALLCONV\n";
+        if (!wants_ast && !wants_amir && !wants_bytecode && !wants_callconv && !wants_x86_64) {
+            std::cerr << "ArcoFission: this alpha slice can reveal AST, A-MIR, BYTECODE, CALLCONV, or X86_64\n";
             return 2;
+        }
+
+        std::string entry_function = "Main";
+        if (wants_x86_64 && argc >= 7 && lowercase(argv[5]) == "--entry") {
+            entry_function = argv[6];
         }
 
         const auto result = wants_ast ? arco::fission::reveal_ast_file(file)
                                       : wants_bytecode ? arco::fission::reveal_bytecode_file(file)
                                                        : wants_callconv ? arco::fission::reveal_callconv_file(file)
-                                                                        : arco::fission::reveal_amir_file(file);
+                                                                        : wants_x86_64 ? arco::fission::reveal_x86_64_file(file, entry_function)
+                                                                                       : arco::fission::reveal_amir_file(file);
         if (!result.ok) {
             std::cerr << "SOURCE INTAKE FAILED\n\n" << result.error << '\n';
             return 1;
@@ -124,6 +131,9 @@ int main(int argc, char** argv) {
         }
         if (wants_callconv) {
             std::cout << "CALLING CONVENTION COMPUTED\n";
+        }
+        if (wants_x86_64) {
+            std::cout << "X86_64 GENERATED\n";
         }
         std::cout << '\n';
         std::cout << result.output;

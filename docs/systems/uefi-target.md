@@ -354,6 +354,10 @@ an explicit project decision rather than an agent-chosen redesign.
 - New UTF-16 constant encoder and compile-time validation (WP-007):
   `include/arco/utf16.hpp`, `Parser::validate_utf16_arguments`. See
   `docs/systems/utf16-encoding.md`.
+- New x86-64 instruction encoder and single-function code generator
+  (WP-008): `include/arco/x86_64_encoder.hpp`,
+  `generate_x86_64_function` / `ArcoFission reveal FILE at X86_64`. See
+  `docs/systems/x86-64-codegen.md`.
 
 ## Acceptance
 
