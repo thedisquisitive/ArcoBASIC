@@ -1,0 +1,10 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+#EXPORT "efi_main"
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.ConsoleOut.Write("Hello from ArcoBASIC")
+    RETURN 0
+END FUNCTION
