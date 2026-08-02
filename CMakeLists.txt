@@ -83,6 +83,12 @@ add_test(
         $<TARGET_FILE:ArcoFission>
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
+add_test(
+    NAME systems_fixed_width_types_smoke
+    COMMAND bash
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/systems_fixed_width_types_smoke.sh
+        $<TARGET_FILE:ArcoFission>
+)
 
 install(TARGETS arcosh arco_cli ArcoFission
     RUNTIME DESTINATION bin

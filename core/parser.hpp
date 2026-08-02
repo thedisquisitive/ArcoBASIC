@@ -51,6 +51,7 @@ private:
     void skip_newlines();
     void skip_line_number();
     std::string parse_type_name(const std::string& message);
+    void validate_fixed_width_initializer(const Token& variable, const std::string& type_name);
 
     StmtPtr statement();
     StmtPtr print_statement();

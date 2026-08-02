@@ -1,6 +1,8 @@
 #include "parser.hpp"
 #include "lexer.hpp"
 
+#include "arco/fixed_width_types.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -16,6 +18,16 @@ namespace {
 
 long long as_int(const Value& value) {
     return static_cast<long long>(value.as_number());
+}
+
+std::string next_wider_type_name(const std::string& type_name) {
+    if (type_name == "U8") return "U16";
+    if (type_name == "U16") return "U32";
+    if (type_name == "U32") return "U64";
+    if (type_name == "I8") return "I16";
+    if (type_name == "I16") return "I32";
+    if (type_name == "I32") return "I64";
+    return type_name;
 }
 
 Value apply_binary(TokenType op, const Value& a, const Value& b) {
@@ -554,8 +566,9 @@ struct PrintStmt final : Stmt {
 };
 
 struct AssignStmt final : Stmt {
-    AssignStmt(std::string name, std::vector<std::unique_ptr<Expr>> indexes, std::unique_ptr<Expr> expr)
-        : name(std::move(name)), indexes(std::move(indexes)), expr(std::move(expr)) {}
+    AssignStmt(std::string name, std::vector<std::unique_ptr<Expr>> indexes, std::unique_ptr<Expr> expr,
+               std::string type_name = "")
+        : name(std::move(name)), indexes(std::move(indexes)), expr(std::move(expr)), type_name(std::move(type_name)) {}
     void exec(Runtime& runtime) const override {
         runtime.tick();
         if (indexes.empty()) {
@@ -570,7 +583,7 @@ struct AssignStmt final : Stmt {
         runtime.set_indexed(name, evaluated, expr->eval(runtime));
     }
     void dump_ast(std::ostream& output, int indent) const override {
-        ast_line(output, indent, "Assign " + name);
+        ast_line(output, indent, "Assign " + name + (type_name.empty() ? "" : " AS " + type_name));
         for (const auto& index : indexes) {
             ast_line(output, indent + 1, "Index");
             index->dump_ast(output, indent + 2);
@@ -581,6 +594,7 @@ struct AssignStmt final : Stmt {
     std::string name;
     std::vector<std::unique_ptr<Expr>> indexes;
     std::unique_ptr<Expr> expr;
+    std::string type_name;
 };
 
 struct CompoundAssignStmt final : Stmt {
@@ -1537,6 +1551,93 @@ std::string Parser::parse_type_name(const std::string& message) {
     throw std::runtime_error(token_error(token, message));
 }
 
+// Statically checks a fixed-width-typed LET declaration's initializer when it
+// is a plain integer literal (optionally negated). Non-literal initializers
+// (identifiers, calls, parenthesized expressions, ...) are not checked here;
+// they are left for later semantic-analysis/A-MIR work. See
+// docs/systems/uefi-target.md section 3 for the type contract this enforces.
+void Parser::validate_fixed_width_initializer(const Token& variable, const std::string& type_name) {
+    const auto fixed_type = systems::lookup_fixed_width_type(type_name);
+    if (!fixed_type) {
+        return;
+    }
+
+    std::size_t index = current_;
+    bool negative = false;
+    if (index < tokens_.size() && tokens_[index].type == TokenType::Minus) {
+        negative = true;
+        ++index;
+    }
+    if (index >= tokens_.size() || tokens_[index].type != TokenType::Number) {
+        return;
+    }
+
+    const Token& literal = tokens_[index];
+    if (literal.lexeme.find('.') != std::string::npos) {
+        throw std::runtime_error(token_error(literal,
+            type_name + " requires an integer literal; received " + literal.lexeme +
+            ". Use a whole-number literal for a fixed-width type."));
+    }
+    if (literal.lexeme.size() > 1 && literal.lexeme[0] == '0' &&
+        (literal.lexeme[1] == 'x' || literal.lexeme[1] == 'X' || literal.lexeme[1] == 'b' || literal.lexeme[1] == 'B')) {
+        // Hex/binary literal range-checking is not implemented yet (documented
+        // limitation); only decimal literals are statically range-checked in
+        // this milestone.
+        return;
+    }
+
+    const auto magnitude = systems::parse_u64_decimal_exact(literal.lexeme);
+    if (!magnitude) {
+        throw std::runtime_error(token_error(literal,
+            type_name + " literal is too large to represent in any 64-bit systems type: received " +
+            std::string(negative ? "-" : "") + literal.lexeme + "."));
+    }
+
+    if (fixed_type->is_bool) {
+        if (negative || *magnitude > 1) {
+            throw std::runtime_error(token_error(literal,
+                "BOOL literal must be 0 or 1; received " + std::string(negative ? "-" : "") + literal.lexeme + "."));
+        }
+        return;
+    }
+
+    if (fixed_type->is_pointer) {
+        throw std::runtime_error(token_error(literal,
+            "PTR cannot be initialized from an integer literal; assign a system-provided handle or pointer value instead."));
+    }
+
+    if (negative) {
+        if (!fixed_type->is_signed || *magnitude > fixed_type->negative_magnitude_max) {
+            std::string message;
+            if (!fixed_type->is_signed) {
+                message = type_name + " cannot represent negative values: expected 0.." +
+                    std::to_string(fixed_type->positive_max) + ", received -" + literal.lexeme +
+                    ". Use a signed type such as I" + type_name.substr(1) + " for negative values.";
+            } else {
+                message = type_name + " literal out of range: expected -" +
+                    std::to_string(fixed_type->negative_magnitude_max) + ".." +
+                    std::to_string(fixed_type->positive_max) + ", received -" + literal.lexeme + ".";
+                const std::string wider = next_wider_type_name(type_name);
+                message += wider == type_name
+                    ? " No wider fixed-width signed type is available; this literal cannot be represented."
+                    : " Use a wider signed type such as " + wider + ".";
+            }
+            throw std::runtime_error(token_error(literal, message));
+        }
+        return;
+    }
+
+    if (*magnitude > fixed_type->positive_max) {
+        std::string message = type_name + " literal out of range: expected 0.." +
+            std::to_string(fixed_type->positive_max) + ", received " + literal.lexeme + ".";
+        const std::string wider = next_wider_type_name(type_name);
+        message += wider == type_name
+            ? " No wider fixed-width type is available; this literal cannot be represented."
+            : " Use a value within range or a wider type such as " + wider + ".";
+        throw std::runtime_error(token_error(literal, message));
+    }
+}
+
 std::vector<FunctionParam> Parser::parameter_list() {
     consume(TokenType::LeftParen, "expected '(' after function name");
     std::vector<FunctionParam> params;
@@ -1643,15 +1744,22 @@ Parser::StmtPtr Parser::print_statement() {
     return std::make_unique<PrintStmt>(std::move(value));
 }
 
-Parser::StmtPtr Parser::assignment_statement(bool) {
+Parser::StmtPtr Parser::assignment_statement(bool had_let) {
     const Token name = consume(TokenType::Identifier, "expected variable name");
+    std::string type_name;
+    if (had_let && match(TokenType::As)) {
+        type_name = parse_type_name("expected type name after AS");
+    }
     std::vector<ExprPtr> indexes;
     while (match(TokenType::LeftBracket)) {
         indexes.push_back(expression());
         consume(TokenType::RightBracket, "expected ']' after index");
     }
     consume(TokenType::Equal, "expected '=' after variable name");
-    return std::make_unique<AssignStmt>(name.lexeme, std::move(indexes), expression());
+    if (!type_name.empty()) {
+        validate_fixed_width_initializer(name, type_name);
+    }
+    return std::make_unique<AssignStmt>(name.lexeme, std::move(indexes), expression(), type_name);
 }
 
 Parser::StmtPtr Parser::compound_assignment_statement() {

@@ -886,7 +886,8 @@ std::size_t matching_bracket(const std::vector<Token>& tokens, std::size_t open,
     return end;
 }
 
-bool lower_assignment(AmirBlock& block, const std::vector<Token>& tokens, std::size_t target_begin, std::size_t end, int& temporary) {
+bool lower_assignment(AmirBlock& block, const std::vector<Token>& tokens, std::size_t target_begin, std::size_t end, int& temporary,
+                       bool allow_type_annotation) {
     const auto instruction_count = block.instructions.size();
     const int original_temporary = temporary;
     const auto fail = [&]() {
@@ -903,6 +904,18 @@ bool lower_assignment(AmirBlock& block, const std::vector<Token>& tokens, std::s
     const auto property_parts = split_identifier_path(name);
     std::vector<std::string> indexes;
     std::size_t index = target_begin + 1;
+    if (allow_type_annotation && index < end && tokens[index].type == TokenType::As) {
+        // LET name AS Type = expr: the type annotation is validated by
+        // Parser::validate_fixed_width_initializer during the parse pass that
+        // always runs before A-MIR lowering (see reveal_amir/reveal_bytecode);
+        // A-MIR itself does not yet carry fixed-width type information
+        // (deferred to WP-004), so the annotation is skipped here and the
+        // declaration lowers exactly like an untyped LET.
+        if (index + 1 >= end || tokens[index + 1].type != TokenType::Identifier) {
+            return fail();
+        }
+        index += 2;
+    }
     if (property_parts.size() > 1) {
         for (std::size_t i = 1; i < property_parts.size(); ++i) {
             const std::string property = "%t" + std::to_string(temporary++);
@@ -1305,8 +1318,8 @@ private:
             const std::string value = lower_expression(out, tokens_, begin + 1, end, temporary_);
             out.instructions.push_back(amir_call("Runtime.Print", {value}));
         } else if (tokens_[begin].type == TokenType::Identifier && lower_compound_assignment(out, tokens_, begin, end, temporary_)) {
-        } else if (tokens_[begin].type == TokenType::Identifier && lower_assignment(out, tokens_, begin, end, temporary_)) {
-        } else if (tokens_[begin].type == TokenType::Let && lower_assignment(out, tokens_, begin + 1, end, temporary_)) {
+        } else if (tokens_[begin].type == TokenType::Identifier && lower_assignment(out, tokens_, begin, end, temporary_, false)) {
+        } else if (tokens_[begin].type == TokenType::Let && lower_assignment(out, tokens_, begin + 1, end, temporary_, true)) {
         } else if (tokens_[begin].type == TokenType::Return) {
             const std::string value = begin + 1 < end ? lower_expression(out, tokens_, begin + 1, end, temporary_) : "nothing";
             out.instructions.push_back(amir_return("VALUE", value));

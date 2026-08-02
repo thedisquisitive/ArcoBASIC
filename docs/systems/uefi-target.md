@@ -112,17 +112,18 @@ grammar change in the same place function parameters already parse `AS
 Type` (`match(TokenType::As)` then `parse_type_name(...)`). WP-002's
 acceptance tests should use `LET`, not `DIM`.
 
-**Type-name grammar decision:** `Parser::parse_type_name` currently accepts
-a single `Identifier` token only (`core/parser.cpp:1532`), so it cannot
-parse a dotted type name like `UEFI.Handle`. Every other namespaced name in
-ArcoBASIC (`System.Capabilities`, `Math.PI`, `File.Exists`, etc.) already
-uses `.`-separated identifiers, so dotted type names are consistent with
-existing naming conventions even though the type-name grammar specifically
-has not yet been extended to allow them. **Decision: extend
-`parse_type_name` to accept `Identifier ('.' Identifier)*` and join with
-`.`**, so `UEFI.Handle` and `UEFI.SystemTable` parse as single dotted type
-names. This is the smallest change that makes the hello-world source (§8)
-parseable without inventing a new naming convention.
+**Type-name grammar (corrected during WP-002):** WP-001 originally assumed
+`Parser::parse_type_name` needed to be extended to accept dotted type names.
+That assumption was wrong and was disproved empirically while implementing
+WP-002: the lexer's `identifier()` scanner already treats `.` as a valid
+identifier-continuation character (`core/lexer.cpp:251`), so `UEFI.Handle`
+lexes as a single `Identifier` token with lexeme `"UEFI.Handle"` — the same
+mechanism that already makes `System.Capabilities`, `Math.PI`, etc. work as
+plain identifiers today. `parse_type_name` therefore already accepts
+`UEFI.Handle`/`UEFI.SystemTable` verbatim with **no grammar change**,
+confirmed by running `ArcoFission reveal ... at AST` against `FUNCTION
+Greet(x AS UEFI.Handle) AS U64` before writing any parser code. No action
+was needed here.
 
 ---
 
@@ -253,8 +254,8 @@ Only two deviations from the Packet's illustrative §7 syntax:
    new public syntax beyond the minimum required (Packet §14 — must-stop
    list includes "new public ArcoBASIC syntax beyond the minimum required").
    Using the existing parenthesized-call convention avoids that.
-2. Dotted type names (`UEFI.Handle`, `UEFI.SystemTable`) require the small
-   `parse_type_name` extension recorded in §3.
+2. Dotted type names (`UEFI.Handle`, `UEFI.SystemTable`) require no grammar
+   change at all — see the corrected note in §3.
 
 Expected output (exact bytes, printed to the UEFI console / captured via
 QEMU serial or display text extraction per WP-010):
@@ -332,8 +333,8 @@ an explicit project decision rather than an agent-chosen redesign.
 - Extended directive: `#TARGET` (adds architecture-selection meaning under a
   systems profile; platform-list meaning unchanged elsewhere).
 - New types: `U8, U16, U32, U64, I8, I16, I32, I64, BOOL, PTR` (WP-002).
-- Extended grammar: `LET name AS Type = expr` for local variables;
-  `parse_type_name` accepts dotted identifiers.
+- Extended grammar: `LET name AS Type = expr` for local variables. (Dotted
+  type names like `UEFI.Handle` require no grammar change — see §3.)
 - New UEFI bindings (WP-006): `UEFI.Handle`, `UEFI.SystemTable`,
   `UEFI.SystemTable.ConsoleOut`, `.Write(text)` — minimal surface only,
   not a full UEFI binding set.
