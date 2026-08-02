@@ -6,6 +6,7 @@
 #include <memory>
 #include <iosfwd>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace arco {
@@ -52,6 +53,7 @@ private:
     void skip_line_number();
     std::string parse_type_name(const std::string& message);
     void validate_fixed_width_initializer(const Token& variable, const std::string& type_name);
+    void validate_uefi_field_chain(const Token& location, const std::string& root_type, const std::string& dotted_path);
 
     StmtPtr statement();
     StmtPtr print_statement();
@@ -95,6 +97,7 @@ private:
     std::size_t current_ = 0;
     std::string current_super_class_;
     bool freestanding_runtime_none_ = false;
+    std::unordered_map<std::string, std::string> current_function_parameter_types_;
 };
 
 } // namespace arco

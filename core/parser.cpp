@@ -2,6 +2,7 @@
 #include "lexer.hpp"
 
 #include "arco/fixed_width_types.hpp"
+#include "arco/uefi_bindings.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1659,6 +1660,53 @@ void Parser::validate_fixed_width_initializer(const Token& variable, const std::
     }
 }
 
+// Validates a dotted field/method access chain rooted at a value of a known UEFI systems type
+// (docs/systems/uefi-bindings.md), e.g. validating "ConsoleOut.Write" against UEFI.SystemTable for
+// a call written as `systemTable.ConsoleOut.Write(...)`. Only the smallest bound surface exists;
+// any segment not in that surface is rejected with a diagnostic naming what is actually bound.
+// root_type values that are not known UEFI types (ordinary hosted types, class names, ...) are
+// silently accepted here -- nothing to validate, matching Packet WP-006's "do not attempt to bind
+// the entire UEFI specification" scope.
+void Parser::validate_uefi_field_chain(const Token& location, const std::string& root_type, const std::string& dotted_path) {
+    auto current_type = systems::lookup_uefi_type(root_type);
+    if (!current_type) {
+        return;
+    }
+
+    std::string remaining = dotted_path;
+    std::string type_so_far = root_type;
+    while (true) {
+        const auto next_dot = remaining.find('.');
+        const std::string segment = next_dot == std::string::npos ? remaining : remaining.substr(0, next_dot);
+        const systems::UefiField* field = current_type->find_field(segment);
+        if (!field) {
+            std::string bound;
+            for (const auto& known_field : current_type->fields) {
+                if (!bound.empty()) {
+                    bound += ", ";
+                }
+                bound += known_field.arcobasic_name;
+            }
+            throw std::runtime_error(token_error(location,
+                type_so_far + " has no bound field or method \"" + segment + "\" in this milestone. " +
+                (bound.empty() ? "No fields are bound for this type yet." : "Bound fields: " + bound + ".") +
+                " See docs/systems/uefi-bindings.md."));
+        }
+        if (next_dot == std::string::npos) {
+            return;
+        }
+        const std::string next_type_name = field->result_type;  // field dangles once current_type is reassigned below
+        auto next_type = systems::lookup_uefi_type(next_type_name);
+        if (!next_type) {
+            throw std::runtime_error(token_error(location,
+                type_so_far + "." + segment + " does not resolve to a chainable systems type."));
+        }
+        type_so_far = next_type_name;
+        current_type = std::move(next_type);
+        remaining = remaining.substr(next_dot + 1);
+    }
+}
+
 std::vector<FunctionParam> Parser::parameter_list() {
     consume(TokenType::LeftParen, "expected '(' after function name");
     std::vector<FunctionParam> params;
@@ -2005,7 +2053,15 @@ Parser::StmtPtr Parser::function_statement() {
         return_type = parse_type_name("expected return type after AS");
     }
     skip_newlines();
+    const auto previous_parameter_types = current_function_parameter_types_;
+    current_function_parameter_types_.clear();
+    for (const auto& param : params) {
+        if (!param.type_name.empty()) {
+            current_function_parameter_types_[param.name] = param.type_name;
+        }
+    }
     auto body = std::make_shared<FunctionStmt::Body>(block_until({TokenType::EndKeyword}));
+    current_function_parameter_types_ = previous_parameter_types;
     consume(TokenType::EndKeyword, "expected END FUNCTION");
     consume(TokenType::Function, "expected FUNCTION after END");
     return std::make_unique<FunctionStmt>(name.lexeme, std::move(params), std::move(return_type), std::move(body));
@@ -2346,13 +2402,18 @@ Parser::ExprPtr Parser::call() {
                 }
             }
             if (dot != std::string::npos) {
-                if (uppercase(variable->name.substr(0, dot)) == "SUPER") {
+                const std::string receiver_name = variable->name.substr(0, dot);
+                const auto declared_type = current_function_parameter_types_.find(receiver_name);
+                if (declared_type != current_function_parameter_types_.end()) {
+                    validate_uefi_field_chain(previous(), declared_type->second, variable->name.substr(dot + 1));
+                }
+                if (uppercase(receiver_name) == "SUPER") {
                     if (current_super_class_.empty()) {
                         throw std::runtime_error(token_error(previous(), "SUPER can only be used inside a class method with EXTENDS"));
                     }
                     expr = std::make_unique<SuperCallExpr>(current_super_class_, variable->name.substr(dot + 1), std::move(args));
                 } else {
-                    expr = std::make_unique<MethodCallExpr>(variable->name, variable->name.substr(0, dot), variable->name.substr(dot + 1), std::move(args));
+                    expr = std::make_unique<MethodCallExpr>(variable->name, receiver_name, variable->name.substr(dot + 1), std::move(args));
                 }
             } else {
                 expr = std::make_unique<CallExpr>(variable->name, std::move(args));

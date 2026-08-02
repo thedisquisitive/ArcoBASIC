@@ -348,6 +348,9 @@ an explicit project decision rather than an agent-chosen redesign.
 - New calling-convention model (WP-005): `include/arco/calling_convention.hpp`
   plus `ArcoFission reveal FILE at CALLCONV`. See
   `docs/systems/calling-conventions.md`.
+- New UEFI bindings registry and compile-time field-chain validation
+  (WP-006): `include/arco/uefi_bindings.hpp`,
+  `Parser::validate_uefi_field_chain`. See `docs/systems/uefi-bindings.md`.
 
 ## Acceptance
 

@@ -46,9 +46,12 @@ SCRIPT
 "$ARCOFISSION" reveal "$TMP_ROOT/plain.abas" at A-MIR > "$TMP_ROOT/plain.amir"
 grep -q "RETURN VALUE" "$TMP_ROOT/plain.amir"
 
-# A call through a parameter is external even through a deeper dotted chain.
+# A call through a parameter is external even through a deeper dotted chain. Uses a type name not
+# in the UEFI bindings registry (WP-006) so field-chain validation doesn't apply here -- this test
+# is specifically about CallExternal classification (position/parameter-name based), not about
+# whether "Something.DeepChain.Call" is a real bound field of anything.
 cat > "$TMP_ROOT/chain.abas" <<'SCRIPT'
-FUNCTION Use(handle AS UEFI.Handle) AS U64
+FUNCTION Use(handle AS Custom.Opaque) AS U64
     handle.Something.DeepChain.Call(1)
     RETURN 0
 END FUNCTION

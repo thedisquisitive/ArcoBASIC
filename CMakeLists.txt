@@ -109,6 +109,13 @@ add_test(
         $<TARGET_FILE:ArcoFission>
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
+add_test(
+    NAME systems_uefi_bindings_smoke
+    COMMAND bash
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/systems_uefi_bindings_smoke.sh
+        $<TARGET_FILE:ArcoFission>
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 install(TARGETS arcosh arco_cli ArcoFission
     RUNTIME DESTINATION bin
