@@ -95,6 +95,13 @@ add_test(
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/systems_freestanding_profile_smoke.sh
         $<TARGET_FILE:ArcoFission>
 )
+add_test(
+    NAME systems_amir_primitives_smoke
+    COMMAND bash
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/systems_amir_primitives_smoke.sh
+        $<TARGET_FILE:ArcoFission>
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 install(TARGETS arcosh arco_cli ArcoFission
     RUNTIME DESTINATION bin

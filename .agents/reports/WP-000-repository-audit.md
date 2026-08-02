@@ -141,6 +141,24 @@ Final placement (especially the `tests/` layout) should be confirmed in WP-001 r
 - [x] Baseline test command documented (§2).
 - [x] Existing failures distinguished from new failures — **there are no existing failures; baseline is 3/3 green.**
 
+## 7a. Additional Finding (discovered during WP-004)
+
+The bytecode VM's user-defined-function call mechanism (`compiler/fission.cpp`, around the frame
+setup in `execute_bytecode`) binds argument `i` to whichever declared local's name equals
+`function.params[i]` verbatim. `function.params[i]` is the **whole joined parameter text**
+(e.g. `"name AS String"`), not just the bare parameter name, so this match never succeeds for any
+parameter that has an `AS Type` annotation — the argument silently fails to bind, and the function
+body then fails with `undefined bytecode local: <name>` the moment it references the parameter.
+This is a pre-existing bug (confirmed unrelated to WP-002/WP-003/WP-004's changes: it reproduces on
+a plain `FUNCTION Greet(name AS String)` with no fixed-width types, no `#RUNTIME NONE`, and no
+external calls involved). It does not block WP-004's acceptance (A-MIR generation for the
+hello-world source is valid and deterministic regardless), but it does mean `compile-run`/`run`
+cannot currently execute *any* function with a typed parameter, including the eventual
+`Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable)` entry point — moot for the
+mission's actual deliverable since that will run through WP-008's native codegen rather than this
+bytecode VM, but worth knowing before assuming `compile-run` is a reliable way to exercise typed
+systems functions end to end.
+
 ## 8. Stop Conditions Check
 
 None of WP-000's own stop conditions are active: the repository is available, it builds without undocumented prerequisites, and the compiler source is clearly identifiable. **WP-000 is COMPLETE.**

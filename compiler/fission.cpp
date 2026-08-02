@@ -196,6 +196,13 @@ struct AmirInstruction {
         Unary,
         Binary,
         CallValue,
+        // A call through a declared function parameter (docs/systems/uefi-target.md section 5)
+        // rather than a namespaced host/stdlib function -- e.g. calling a method reached off a
+        // UEFI protocol pointer received as a parameter. Structurally identical to CallValue;
+        // kept distinct so later work packages (ABI/codegen) can tell them apart without
+        // re-deriving the classification. See Packet WP-004 "external or ABI-bound function
+        // calls".
+        CallExternal,
         Array,
         Object,
         Index,
@@ -402,6 +409,20 @@ AmirInstruction amir_unsupported(std::string text) {
 bool is_terminal_instruction(const AmirInstruction& instruction) {
     return instruction.kind == AmirInstruction::Kind::Return || instruction.kind == AmirInstruction::Kind::Jump ||
            instruction.kind == AmirInstruction::Kind::Branch;
+}
+
+// function.params entries are whole joined-token parameter texts (e.g. "systemTable AS
+// UEFI.SystemTable" or just "count" when untyped); the parameter's bare name is always the
+// first whitespace-delimited word regardless of whether a type annotation follows.
+bool function_has_parameter(const AmirFunction& function, const std::string& name) {
+    for (const std::string& param : function.params) {
+        const auto space = param.find(' ');
+        const std::string param_name = space == std::string::npos ? param : param.substr(0, space);
+        if (param_name == name) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string upper_ascii(std::string text) {
@@ -1321,8 +1342,17 @@ private:
         } else if (tokens_[begin].type == TokenType::Identifier && lower_assignment(out, tokens_, begin, end, temporary_, false)) {
         } else if (tokens_[begin].type == TokenType::Let && lower_assignment(out, tokens_, begin + 1, end, temporary_, true)) {
         } else if (tokens_[begin].type == TokenType::Return) {
-            const std::string value = begin + 1 < end ? lower_expression(out, tokens_, begin + 1, end, temporary_) : "nothing";
-            out.instructions.push_back(amir_return("VALUE", value));
+            if (begin + 1 < end) {
+                const std::string value = lower_expression(out, tokens_, begin + 1, end, temporary_);
+                // function.return_type is "VALUE" by default (untyped) and the declared type
+                // name (e.g. "U64") when the function has an AS Type return clause -- see
+                // parse_function_signature. Propagating it here (docs/systems/uefi-target.md
+                // section 5 "function returns") is purely informational for the bytecode VM,
+                // which only ever reads operands[1] regardless of this tag.
+                out.instructions.push_back(amir_return(function.return_type, value));
+            } else {
+                out.instructions.push_back(amir_return("VALUE", "nothing"));
+            }
         } else if (tokens_[begin].type == TokenType::Stop) {
             out.instructions.push_back(amir_return("I32", "0"));
         } else if (tokens_[begin].type == TokenType::Goto && begin + 1 < end && tokens_[begin + 1].type == TokenType::Number) {
@@ -1330,7 +1360,23 @@ private:
         } else if (lower_loop_control(out, begin, end)) {
         } else if ((tokens_[begin].type == TokenType::Identifier || tokens_[begin].type == TokenType::Run) && begin + 1 < end &&
                    tokens_[begin + 1].type == TokenType::LeftParen) {
+            const std::size_t before = out.instructions.size();
             (void)lower_expression(out, tokens_, begin, end, temporary_);
+            // Packet WP-004 "external or ABI-bound function calls": a dotted call whose
+            // receiver is a parameter of the enclosing function (e.g. a UEFI protocol pointer
+            // received as an argument) is a call through that value, not an ordinary namespaced
+            // host/stdlib call -- reclassify the instruction lower_expression already built
+            // rather than duplicating its call-argument parsing.
+            if (out.instructions.size() > before) {
+                AmirInstruction& produced = out.instructions.back();
+                if (produced.kind == AmirInstruction::Kind::CallValue) {
+                    const auto dot = produced.target.find('.');
+                    const std::string receiver = dot == std::string::npos ? produced.target : produced.target.substr(0, dot);
+                    if (function_has_parameter(function, receiver)) {
+                        produced.kind = AmirInstruction::Kind::CallExternal;
+                    }
+                }
+            }
         } else {
             out.instructions.push_back(amir_unsupported(statement_comment(tokens_, begin, end)));
         }
@@ -2019,6 +2065,13 @@ void render_instruction(std::ostream& out, const AmirInstruction& instruction, c
             }
             out << "\n";
             break;
+        case AmirInstruction::Kind::CallExternal:
+            out << "    " << instruction.result << " := CALL_EXTERNAL " << instruction.target;
+            for (const auto& operand : instruction.operands) {
+                out << ' ' << operand;
+            }
+            out << "\n";
+            break;
         case AmirInstruction::Kind::Array:
             out << "    " << instruction.result << " := ARRAY";
             for (const auto& operand : instruction.operands) {
@@ -2157,7 +2210,8 @@ enum class BytecodeOp {
     DeclareClass = 18,
     DeclareInterface = 19,
     Return = 20,
-    Unsupported = 21,
+    CallExternal = 21,
+    Unsupported = 22,
 };
 
 struct BytecodeInstruction {
@@ -2230,6 +2284,8 @@ std::string bytecode_op_name(BytecodeOp op) {
             return "DECLARE_INTERFACE";
         case BytecodeOp::Return:
             return "RETURN";
+        case BytecodeOp::CallExternal:
+            return "CALL_EXTERNAL";
         case BytecodeOp::Unsupported:
             return "UNSUPPORTED";
     }
@@ -2323,6 +2379,16 @@ BytecodeModule build_bytecode(const AmirModule& amir) {
                         std::vector<std::string> operands{instruction.result, instruction.target};
                         operands.insert(operands.end(), instruction.operands.begin(), instruction.operands.end());
                         block.instructions.push_back(bytecode_instruction(BytecodeOp::CallValue, std::move(operands)));
+                        break;
+                    }
+                    case AmirInstruction::Kind::CallExternal: {
+                        // No hosted-runtime binding exists yet for external/ABI-bound calls
+                        // (that is WP-005/006/008's job); retained as bytecode so it surfaces
+                        // execute_bytecode's "not implemented yet" diagnostic instead of being
+                        // silently misrepresented as an ordinary host call.
+                        std::vector<std::string> operands{instruction.result, instruction.target};
+                        operands.insert(operands.end(), instruction.operands.begin(), instruction.operands.end());
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::CallExternal, std::move(operands)));
                         break;
                     }
                     case AmirInstruction::Kind::Array: {
