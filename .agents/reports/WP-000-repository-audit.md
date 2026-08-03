@@ -159,6 +159,32 @@ mission's actual deliverable since that will run through WP-008's native codegen
 bytecode VM, but worth knowing before assuming `compile-run` is a reliable way to exercise typed
 systems functions end to end.
 
+## 7b. Additional Finding (discovered during WP-011)
+
+`arco_tests` (`tests/runtime_tests.cpp`) can segfault inside `shell/arcosh.cpp`'s `Process.Exists`
+host-function implementation (`Runtime::call_host_function("Process.Exists", ...)` ->
+`arco::Value::get_property("Name")` on a malformed/corrupted `Value` while iterating whatever the
+process-enumeration code reads from `/proc`). **Confirmed pre-existing and unrelated to this
+mission's changes**: it reproduces identically, with the identical crash signature, on the
+pre-mission baseline commit (`a4c82e2`, before WP-000), built the same way. It does **not**
+reproduce with the project's standard build invocation (`cmake ..` with no explicit
+`CMAKE_BUILD_TYPE`, the configuration used throughout WP-000 through WP-010 and by every test run
+in every completion report in this directory) — it only appears with an optimized build
+(`-DCMAKE_BUILD_TYPE=Release` or `RelWithDebInfo`), and appears to also depend on the host
+machine's current process list at the moment `Process.Exists` enumerates it (it did not reproduce
+on this same machine during dozens of earlier unoptimized test runs across WP-002 through WP-010,
+before this session had accumulated many more background processes).
+
+This is a real, latent bug in a subsystem (`shell/arcosh.cpp`, the ArcoSH process helpers) entirely
+unrelated to the ArcoBASIC systems-language mission's scope, discovered only because WP-011's
+clean-checkout verification deliberately tried an optimized build for extra rigor. Per the Packet's
+repository safety rules ("do not perform a broad rewrite," stop conditions around modifying
+unrelated subsystems), it was **not fixed** as part of this mission. Documented here so it is not
+mistaken for something WP-000 through WP-010 introduced, and so a future agent working on ArcoSH's
+process helpers has a reproduction path: build with `-DCMAKE_BUILD_TYPE=RelWithDebInfo`, run
+`./arco_tests`, and inspect the resulting core dump (`coredumpctl gdb <pid>`, `bt`) if it crashes —
+it may not reproduce on every machine or every run given the process-list dependency.
+
 ## 8. Stop Conditions Check
 
 None of WP-000's own stop conditions are active: the repository is available, it builds without undocumented prerequisites, and the compiler source is clearly identifiable. **WP-000 is COMPLETE.**
