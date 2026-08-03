@@ -175,6 +175,22 @@ Void packages should not be created by wrapping a host-built install tree with
 `xbps-create`; that can miss or mismatch runtime libraries such as GLFW and
 libcurl. The native `xbps-src` path records the correct Void dependencies.
 
+## UEFI Systems Target (x86-64)
+
+ArcoFission can also compile a restricted "freestanding" subset of ArcoBASIC
+directly into a bootable UEFI application (PE32+), with no C, C++, or
+handwritten assembly involved at any point:
+
+```sh
+ArcoFission build tests/systems/uefi-hello/hello.abas -o hello.efi --target uefi-x86_64
+scripts/run-uefi-hello.sh hello.efi "Hello from ArcoBASIC"
+```
+
+See [`docs/systems/README.md`](docs/systems/README.md) for prerequisites, the
+full directive/type/binding surface this target supports, troubleshooting,
+and an architecture overview of the pipeline (lexer -> parser -> A-MIR ->
+x86-64 machine code -> PE32+ image).
+
 ## Windows
 
 From Windows Terminal or PowerShell:
