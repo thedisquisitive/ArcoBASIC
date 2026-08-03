@@ -43,30 +43,7 @@ field() {
 
 echo "PASS: PE32+ image structure (file/objdump/pefile-independent field checks)"
 
-# Real acceptance test (Packet WP-009: "OVMF loads the image without an invalid-image error"),
-# skipped gracefully rather than failed if the tools this needs are not installed in this
-# environment (matching the environment policy WP-010 documents for its own QEMU/OVMF harness).
-QEMU_BIN="$(command -v qemu-system-x86_64 || true)"
-OVMF_FD="$(find /usr/share/ovmf /usr/share/OVMF -iname 'OVMF*.fd' 2>/dev/null | grep -v -i secboot | head -1 || true)"
-if [ -z "$QEMU_BIN" ] || [ -z "$OVMF_FD" ]; then
-    echo "SKIP: qemu-system-x86_64 and/or an OVMF firmware image were not found; install qemu-system-x86 "
-    echo "      and the ovmf package to exercise the real boot check this test would otherwise run."
-    exit 0
-fi
-
-BOOT_DIR="$TMP_ROOT/efi_boot"
-mkdir -p "$BOOT_DIR/EFI/BOOT"
-cp "$TMP_ROOT/hello.efi" "$BOOT_DIR/EFI/BOOT/BOOTX64.EFI"
-
-OUTPUT="$(timeout 15 "$QEMU_BIN" \
-    -bios "$OVMF_FD" \
-    -drive file="fat:rw:$BOOT_DIR",format=raw \
-    -net none -vga none -display none -serial stdio -monitor none -no-reboot 2>/dev/null || true)"
-
-if ! printf '%s' "$OUTPUT" | grep -aq "Hello from ArcoBASIC"; then
-    echo "FAIL: OVMF did not print \"Hello from ArcoBASIC\" when booting the built image" >&2
-    printf '%s' "$OUTPUT" | tail -c 2000 >&2
-    exit 1
-fi
-
-echo "PASS: OVMF boots the image and it prints the expected UEFI console output"
+# The real "does OVMF actually load and run this" acceptance test lives in
+# tests/systems_qemu_ovmf_harness_smoke.sh (Packet WP-010), which uses the reusable
+# scripts/run-uefi-hello.sh harness. This test stays structural-only and dependency-free so it
+# always runs, independent of whether QEMU/OVMF are installed.

@@ -95,17 +95,17 @@ until a real boot test resolved it definitively.
 | **OVMF loads the image without an invalid-image error** | **Booted for real**: `qemu-system-x86_64 -bios <OVMF.fd> -drive file=fat:rw:<dir>,format=raw ...` with the built image at `EFI/BOOT/BOOTX64.EFI` -- OVMF's boot manager loads and starts it automatically (`BdsDxe: starting Boot0001 "UEFI QEMU HARDDISK..."`), and it prints `Hello from ArcoBASIC` to the UEFI console before returning control to the firmware, which then proceeds to its next boot option exactly as a well-behaved EFI application that returned `EFI_SUCCESS` should. |
 
 `tests/systems_pe_image_smoke.sh` automates the structural checks (dependency-free, using only
-`od`) and, when `qemu-system-x86_64` and an OVMF firmware image are present, the real boot check
-too -- skipping gracefully rather than failing if they are not installed, since not every
-environment running the test suite will have them (the same policy Packet WP-010 specifies for its
-own, more complete harness).
+`od`, so it always runs regardless of what else is installed). The real boot check now lives in
+`tests/systems_qemu_ovmf_harness_smoke.sh` via the reusable `scripts/run-uefi-hello.sh` harness --
+see `docs/systems/qemu-ovmf-harness.md` (Packet WP-010).
 
 ## What This Work Package Does Not Do
 
-- Does not build a proper, reusable, always-on test harness with FAT image creation via a dedicated
-  tool, structured timeout handling, and CI-friendly PASS/FAIL reporting beyond the smoke test
-  described above -- that is WP-010's explicit deliverable. This work package's QEMU check exists
-  because WP-009's own acceptance criterion requires it, not as a substitute for WP-010.
+- Does not itself run the real boot check as part of its own test (moved to WP-010's dedicated,
+  reusable harness after this work package proved the approach worked -- see
+  `docs/systems/qemu-ovmf-harness.md`). The boot verification described in this document was
+  performed manually while implementing this work package, establishing that it worked, before
+  WP-010 formalized it into `scripts/run-uefi-hello.sh`.
 - Does not handle programs whose code needs real relocations (any absolute 64-bit address
   reference). The current code generator (WP-008) never produces one, so this has not been an
   issue in practice, but it means this PE writer would need updating (real `.reloc` section

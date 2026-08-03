@@ -362,6 +362,8 @@ an explicit project decision rather than an agent-chosen redesign.
   `compiler/pe_image.cpp`, `ArcoFission build FILE -o OUT.efi --target
   uefi-x86_64`. The built hello-world image boots under real QEMU/OVMF
   and prints `Hello from ArcoBASIC`. See `docs/systems/pe32-image.md`.
+- New reusable QEMU/OVMF boot harness (WP-010): `scripts/run-uefi-hello.sh`.
+  See `docs/systems/qemu-ovmf-harness.md`.
 
 ## Acceptance
 
