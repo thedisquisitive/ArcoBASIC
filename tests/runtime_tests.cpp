@@ -1,6 +1,7 @@
 #include "arco/runtime.hpp"
 #include "arco/shell.hpp"
 #include "arco/calling_convention.hpp"
+#include "arco/pe_image.hpp"
 #include "arco/utf16.hpp"
 #include "arco/x86_64_encoder.hpp"
 #include "arco_c_api.h"
@@ -1842,6 +1843,55 @@ int main() {
             asm_.ret();
             require(bytes_equal(asm_.bytes(), {0xC3}), "ret matches nasm");
         }
+    }
+
+    // PE32+ image writer (Packet WP-009, docs/systems/pe32-image.md). Field offsets below were
+    // verified against Microsoft's PE/COFF format reference and cross-checked with `pefile` and
+    // `objdump -p` on real output before being hardcoded here.
+    {
+        using arco::systems::MachineCodeImage;
+        using arco::systems::MachineCodeRelocation;
+
+        MachineCodeImage image;
+        image.text = {0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00};  // a 7-byte placeholder LEA
+        image.rdata = {0xAA, 0xBB, 0xCC, 0xDD};
+        image.relocations.push_back(MachineCodeRelocation{3, 7, 0});
+        image.entry_symbol = "efi_main";
+
+        const auto pe = arco::systems::write_pe32plus_efi_image(image);
+
+        const auto u16_at = [&](std::size_t offset) {
+            return static_cast<unsigned>(pe[offset]) | (static_cast<unsigned>(pe[offset + 1]) << 8);
+        };
+        const auto u32_at = [&](std::size_t offset) {
+            return static_cast<std::uint32_t>(pe[offset]) | (static_cast<std::uint32_t>(pe[offset + 1]) << 8) |
+                   (static_cast<std::uint32_t>(pe[offset + 2]) << 16) | (static_cast<std::uint32_t>(pe[offset + 3]) << 24);
+        };
+
+        require(pe[0] == 'M' && pe[1] == 'Z', "PE image starts with the MZ DOS signature");
+        require(u32_at(0x3C) == 0x40, "e_lfanew points to offset 0x40, right after the 64-byte DOS header");
+        require(pe[0x40] == 'P' && pe[0x41] == 'E' && pe[0x42] == 0 && pe[0x43] == 0, "PE signature at e_lfanew");
+        require(u16_at(0x44) == 0x8664, "Machine is IMAGE_FILE_MACHINE_AMD64");
+        require(u16_at(0x46) == 2, "NumberOfSections is 2 (.text, .rdata)");
+        require(u16_at(0x54) == 0xF0, "SizeOfOptionalHeader is 240 bytes (standard + windows-specific + 16 data directories)");
+        require(u16_at(0x56) == 0x0022,
+                "Characteristics is EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE only -- IMAGE_FILE_RELOCS_STRIPPED "
+                "must NOT be set (docs/systems/pe32-image.md: OVMF refuses to load an image with this flag set "
+                "and no .reloc section, discovered by booting a real image under QEMU/OVMF)");
+        require(u16_at(0x58) == 0x020B, "Optional header Magic is PE32+");
+        require(u16_at(0x9C) == 10, "Subsystem is IMAGE_SUBSYSTEM_EFI_APPLICATION");
+        require(u32_at(0x68) == 0x1000, "AddressOfEntryPoint is the start of .text, right after one page of headers");
+        require(u32_at(0xD0) == 0 && u32_at(0xD4) == 0,
+                "Import Directory (DataDirectory[1]) is zero -- Packet WP-009 \"absence of host runtime imports\"");
+
+        // The relocation must be patched: displacement = rdata_rva - (text_rva + instruction_end_offset).
+        // text_rva = 0x1000 (one page of headers); rdata_rva = 0x1000 + round_up(7, 0x1000) = 0x2000.
+        const std::size_t patched_field_offset = 0x1000 + 3;  // text_file_offset (== text_rva) + text_offset
+        const std::uint32_t expected_displacement = 0x2000 - (0x1000 + 7);
+        require(u32_at(patched_field_offset) == expected_displacement,
+                "RIP-relative relocation is patched to the correct displacement between .text and .rdata");
+
+        require(pe.size() == 0x3000, "image size is headers(1 page) + text(1 page) + rdata(1 page) with 4096-byte alignment");
     }
 
     return 0;

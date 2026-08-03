@@ -18,6 +18,7 @@ void print_usage(std::ostream& output) {
         << "  ArcoFission reveal FILE --stage A-MIR\n"
         << "  ArcoFission reveal FILE --stage BYTECODE\n"
         << "  ArcoFission build FILE -o OUT\n"
+        << "  ArcoFission build FILE -o OUT.efi --target uefi-x86_64 [--entry NAME]\n"
         << "  ArcoFission bytecode FILE -o OUT.arcof\n"
         << "  ArcoFission native FILE -o OUT\n"
         << "  ArcoFission run FILE.arcof\n"
@@ -140,8 +141,26 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (argc == 5 && lowercase(argv[1]) == "build" && std::string(argv[3]) == "-o") {
+    if (argc >= 5 && lowercase(argv[1]) == "build" && std::string(argv[3]) == "-o") {
         const std::string output_path = argv[4];
+        std::string target;
+        std::string entry_function = "Main";
+        for (int i = 5; i + 1 < argc; i += 2) {
+            if (lowercase(argv[i]) == "--target") {
+                target = lowercase(argv[i + 1]);
+            } else if (lowercase(argv[i]) == "--entry") {
+                entry_function = argv[i + 1];
+            }
+        }
+        if (target == "uefi-x86_64" || target == "uefi-x86-64") {
+            const auto result = arco::fission::build_efi_image_file(argv[2], entry_function, output_path);
+            if (!result.ok) {
+                std::cerr << "EFI BUILD FAILED\n\n" << result.error << '\n';
+                return 1;
+            }
+            std::cout << result.output;
+            return 0;
+        }
         if (ends_with(lowercase(output_path), ".arcof")) {
             return write_bytecode_file(argv[2], output_path);
         }

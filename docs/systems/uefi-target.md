@@ -358,6 +358,10 @@ an explicit project decision rather than an agent-chosen redesign.
   (WP-008): `include/arco/x86_64_encoder.hpp`,
   `generate_x86_64_function` / `ArcoFission reveal FILE at X86_64`. See
   `docs/systems/x86-64-codegen.md`.
+- New PE32+ EFI image writer (WP-009): `include/arco/pe_image.hpp` /
+  `compiler/pe_image.cpp`, `ArcoFission build FILE -o OUT.efi --target
+  uefi-x86_64`. The built hello-world image boots under real QEMU/OVMF
+  and prints `Hello from ArcoBASIC`. See `docs/systems/pe32-image.md`.
 
 ## Acceptance
 

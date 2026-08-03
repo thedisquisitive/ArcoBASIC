@@ -2,6 +2,7 @@
 
 #include "arco/calling_convention.hpp"
 #include "arco/runtime.hpp"
+#include "arco/pe_image.hpp"
 #include "arco/uefi_bindings.hpp"
 #include "arco/utf16.hpp"
 #include "arco/x86_64_encoder.hpp"
@@ -3766,6 +3767,59 @@ Result reveal_x86_64(const std::string& source, const std::string& source_name, 
 Result reveal_x86_64_file(const std::string& path, const std::string& entry_function) {
     try {
         return reveal_x86_64(read_file(path), path, entry_function);
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+
+Result build_efi_image(const std::string& source, const std::string& source_name, const std::string& entry_function,
+                        const std::string& output_path) {
+    try {
+        Runtime runtime;
+        const std::string processed = runtime.preprocess_source(source);
+        Lexer lexer(processed);
+        auto tokens = lexer.scan_tokens();
+
+        Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
+        (void)parser.parse();
+
+        const auto codegen = generate_x86_64_function(build_amir(tokens, source_name), entry_function);
+        if (!codegen.ok) {
+            return {false, "", codegen.error};
+        }
+
+        systems::MachineCodeImage image;
+        image.text = codegen.text.bytes();
+        image.rdata = codegen.rdata;
+        image.entry_symbol = codegen.entry_symbol;
+        for (const auto& relocation : codegen.relocations) {
+            image.relocations.push_back({relocation.disp_field_offset, relocation.instruction_end_offset, relocation.rdata_offset});
+        }
+
+        const auto pe_bytes = systems::write_pe32plus_efi_image(image);
+        std::ofstream output(output_path, std::ios::binary);
+        if (!output) {
+            return {false, "", "could not open output file " + output_path};
+        }
+        output.write(reinterpret_cast<const char*>(pe_bytes.data()), static_cast<std::streamsize>(pe_bytes.size()));
+        if (!output) {
+            return {false, "", "failed while writing " + output_path};
+        }
+
+        std::ostringstream message;
+        message << "SOURCE ACCEPTED\n";
+        message << "STRUCTURE ASSEMBLED\n";
+        message << "X86_64 GENERATED\n";
+        message << "PE32+ WRITTEN " << output_path << " (" << pe_bytes.size() << " bytes)\n";
+        return {true, message.str(), ""};
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+
+Result build_efi_image_file(const std::string& path, const std::string& entry_function, const std::string& output_path) {
+    try {
+        return build_efi_image(read_file(path), path, entry_function, output_path);
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }

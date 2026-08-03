@@ -25,5 +25,8 @@ Result reveal_callconv(const std::string& source, const std::string& source_name
 Result reveal_callconv_file(const std::string& path);
 Result reveal_x86_64(const std::string& source, const std::string& source_name, const std::string& entry_function);
 Result reveal_x86_64_file(const std::string& path, const std::string& entry_function);
+Result build_efi_image(const std::string& source, const std::string& source_name, const std::string& entry_function,
+                        const std::string& output_path);
+Result build_efi_image_file(const std::string& path, const std::string& entry_function, const std::string& output_path);
 
 } // namespace arco::fission

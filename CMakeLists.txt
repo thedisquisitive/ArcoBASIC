@@ -14,6 +14,7 @@ add_library(arco
     runtime/runtime.cpp
     shell/arcosh.cpp
     compiler/fission.cpp
+    compiler/pe_image.cpp
     bindings/c/arco_c_api.cpp
 )
 
@@ -127,6 +128,13 @@ add_test(
     NAME systems_x86_64_codegen_smoke
     COMMAND bash
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/systems_x86_64_codegen_smoke.sh
+        $<TARGET_FILE:ArcoFission>
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(
+    NAME systems_pe_image_smoke
+    COMMAND bash
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/systems_pe_image_smoke.sh
         $<TARGET_FILE:ArcoFission>
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
