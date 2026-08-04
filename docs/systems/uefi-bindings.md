@@ -73,11 +73,16 @@ Total: 24 bytes (already 8-byte aligned; no trailing padding needed).
 `FirmwareRevision` (a `UINT32`) leaves a 4-byte gap before `ConsoleInHandle` (a pointer, requiring
 8-byte alignment) -- this padding is a real, necessary part of the layout, not an omission.
 
-**Bound in this milestone:** `ConOut` only, at offset `0x40`, exposed to ArcoBASIC as
-`UEFI.SystemTable.ConsoleOut` (renamed for readability; the underlying offset and pointee type are
-unchanged from the spec). This offset is the well-known `gST->ConOut` access pattern used throughout
-public UEFI hello-world tutorials, cross-checked here rather than assumed correct because it matched
-memory.
+**Bound:** `ConOut` at offset `0x40`, exposed as `UEFI.SystemTable.ConsoleOut`, and `BootServices`
+at offset `0x60`, exposed as `UEFI.SystemTable.BootServices`. The latter exists solely for Packet
+002's watchdog-disable call before an intentional permanent halt.
+
+### `EFI_BOOT_SERVICES` (376 bytes) -> ArcoBASIC `UEFI.BootServices`
+
+`SetWatchdogTimer` is the 30th function pointer after the 24-byte table header, so its x86-64 byte
+offset is `24 + 29 * 8 = 256 (0x100)`. Its signature has four explicit parameters (`Timeout`,
+`WatchdogCode`, `DataSize`, `WatchdogData`) and, unlike a protocol method, no implicit `This`
+argument. The hardware test calls `SetWatchdogTimer(0, 0, 0, 0)` to cancel the watchdog.
 
 ### `EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL` (80 bytes) -> ArcoBASIC `UEFI.SimpleTextOutputProtocol`
 
@@ -163,8 +168,9 @@ types), so it cannot produce false positives outside the systems surface it is s
 
 ## What This Work Package Does Not Do
 
-- Does not bind `ConIn`, `StdErr`, `RuntimeServices`, `BootServices`, or any other `EFI_SYSTEM_TABLE`
-  field beyond `ConOut`.
+- Does not bind `ConIn`, `StdErr`, `RuntimeServices`, or any other `EFI_SYSTEM_TABLE` field beyond
+  `ConOut` and the narrow `BootServices` chain.
+- Does not bind any other `EFI_BOOT_SERVICES` operation beyond `SetWatchdogTimer`.
 - Does not bind `Reset`, `TestString`, `QueryMode`, `SetMode`, `SetAttribute`, `ClearScreen`,
   `SetCursorPosition`, `EnableCursor`, or `Mode` on `EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL` beyond
   `OutputString`.

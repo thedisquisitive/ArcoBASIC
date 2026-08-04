@@ -97,6 +97,31 @@ public:
         emit(disp8);
     }
 
+    // call qword [base+disp32] -- FF /2, disp32
+    void call_indirect_disp32(Reg base, std::uint32_t disp32) {
+        if (reg_needs_rex_extension(base)) {
+            emit(0x41);  // REX.B only
+        }
+        emit(0xFF);
+        emit(static_cast<std::uint8_t>(0x90 | reg_low3(base)));  // mod=10 reg=010(/2)
+        if (reg_low3(base) == 0x4) {                             // RSP or R12 needs a SIB byte
+            emit(0x24);
+        }
+        emit(static_cast<std::uint8_t>(disp32 & 0xFF));
+        emit(static_cast<std::uint8_t>((disp32 >> 8) & 0xFF));
+        emit(static_cast<std::uint8_t>((disp32 >> 16) & 0xFF));
+        emit(static_cast<std::uint8_t>((disp32 >> 24) & 0xFF));
+    }
+
+    void cli() { emit(0xFA); }
+    void hlt() { emit(0xF4); }
+
+    // The displacement is relative to the instruction following this two-byte jump.
+    void jmp_rel8(std::int8_t displacement) {
+        emit(0xEB);
+        emit(static_cast<std::uint8_t>(displacement));
+    }
+
     void ret() { emit(0xC3); }
 
     std::size_t size() const { return code_.size(); }

@@ -40,13 +40,24 @@ expect_reject() {
 # required UEFI fields.
 expect_accept "hello_world_fixture" "$SOURCE_DIR/tests/systems/uefi-hello/hello.abas"
 
+# Packet 002's hardware test disables the firmware watchdog before intentionally halting. Boot
+# Services is a service table (not a protocol), so SetWatchdogTimer has four explicit arguments
+# and no implicit This argument.
+cat > "$TMP_ROOT/watchdog.abas" <<'SCRIPT'
+FUNCTION Main(systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    RETURN 0
+END FUNCTION
+SCRIPT
+expect_accept "watchdog_binding" "$TMP_ROOT/watchdog.abas"
+
 # An unknown field on a known UEFI type is rejected with a diagnostic naming what is bound.
 expect_reject "unknown_field" '
 FUNCTION Main(systemTable AS UEFI.SystemTable) AS U64
     systemTable.Foo.Bar(1)
     RETURN 0
 END FUNCTION' \
-    'UEFI.SystemTable has no bound field or method "Foo" in this milestone. Bound fields: ConsoleOut.'
+    'UEFI.SystemTable has no bound field or method "Foo" in this milestone. Bound fields: ConsoleOut, BootServices.'
 
 # A real UEFI field that this milestone deliberately did not bind is rejected honestly (not
 # silently accepted, and not confused with an invented/nonexistent field).

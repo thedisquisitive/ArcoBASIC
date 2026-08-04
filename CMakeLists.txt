@@ -104,6 +104,19 @@ add_test(
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 add_test(
+    NAME systems_frontend_amir_contract_smoke
+    COMMAND bash
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/systems_frontend_amir_contract_smoke.sh
+        $<TARGET_FILE:ArcoFission>
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(
+    NAME systems_hardware_semantics_smoke
+    COMMAND bash
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/systems_hardware_semantics_smoke.sh
+        $<TARGET_FILE:ArcoFission>
+)
+add_test(
     NAME systems_calling_convention_smoke
     COMMAND bash
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/systems_calling_convention_smoke.sh
@@ -142,6 +155,13 @@ add_test(
     NAME systems_qemu_ovmf_harness_smoke
     COMMAND bash
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/systems_qemu_ovmf_harness_smoke.sh
+        $<TARGET_FILE:ArcoFission>
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(
+    NAME systems_arcology_hardware_artifact_smoke
+    COMMAND bash
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/systems_arcology_hardware_artifact_smoke.sh
         $<TARGET_FILE:ArcoFission>
         ${CMAKE_CURRENT_SOURCE_DIR}
 )

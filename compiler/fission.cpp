@@ -118,57 +118,6 @@ std::string shell_quote(const std::string& text) {
     return out;
 }
 
-std::string token_text(const Token& token) {
-    switch (token.type) {
-        case TokenType::String:
-        case TokenType::InterpolatedString:
-            return "\"" + escaped(token.lexeme) + "\"";
-        case TokenType::Number: {
-            std::ostringstream out;
-            out << std::setprecision(15) << token.number;
-            return out.str();
-        }
-        case TokenType::TrueKeyword:
-            return "true";
-        case TokenType::FalseKeyword:
-            return "false";
-        case TokenType::NullKeyword:
-            return "nothing";
-        default:
-            return token.lexeme;
-    }
-}
-
-std::string join_expression(const std::vector<Token>& tokens, std::size_t begin, std::size_t end) {
-    std::ostringstream out;
-    bool first = true;
-    for (std::size_t i = begin; i < end; ++i) {
-        if (!first) {
-            out << ' ';
-        }
-        first = false;
-        out << token_text(tokens[i]);
-    }
-    return out.str();
-}
-
-std::size_t line_end(const std::vector<Token>& tokens, std::size_t index) {
-    while (index < tokens.size() && tokens[index].type != TokenType::Newline && tokens[index].type != TokenType::End) {
-        ++index;
-    }
-    return index;
-}
-
-bool is_line_number(const std::vector<Token>& tokens, std::size_t index) {
-    return index + 1 < tokens.size() && tokens[index].type == TokenType::Number &&
-           tokens[index + 1].type != TokenType::Newline && tokens[index + 1].type != TokenType::End;
-}
-
-std::string statement_comment(const std::vector<Token>& tokens, std::size_t begin, std::size_t end) {
-    const auto text = join_expression(tokens, begin, end);
-    return text.empty() ? "empty statement" : text;
-}
-
 std::vector<std::string> split_identifier_path(const std::string& name) {
     std::vector<std::string> parts;
     std::size_t start = 0;
@@ -184,11 +133,6 @@ std::vector<std::string> split_identifier_path(const std::string& name) {
         start = dot + 1;
     }
     return parts;
-}
-
-bool is_property_path(const std::string& name) {
-    const auto parts = split_identifier_path(name);
-    return parts.size() > 1;
 }
 
 struct AmirInstruction {
@@ -208,6 +152,8 @@ struct AmirInstruction {
         // re-deriving the classification. See Packet WP-004 "external or ABI-bound function
         // calls".
         CallExternal,
+        CpuHalt,
+        CpuHaltForever,
         Array,
         Object,
         Index,
@@ -411,23 +357,17 @@ AmirInstruction amir_unsupported(std::string text) {
     return instruction;
 }
 
-bool is_terminal_instruction(const AmirInstruction& instruction) {
-    return instruction.kind == AmirInstruction::Kind::Return || instruction.kind == AmirInstruction::Kind::Jump ||
-           instruction.kind == AmirInstruction::Kind::Branch;
+AmirInstruction amir_cpu_halt() {
+    return AmirInstruction{AmirInstruction::Kind::CpuHalt};
 }
 
-// function.params entries are whole joined-token parameter texts (e.g. "systemTable AS
-// UEFI.SystemTable" or just "count" when untyped); the parameter's bare name is always the
-// first whitespace-delimited word regardless of whether a type annotation follows.
-bool function_has_parameter(const AmirFunction& function, const std::string& name) {
-    for (const std::string& param : function.params) {
-        const auto space = param.find(' ');
-        const std::string param_name = space == std::string::npos ? param : param.substr(0, space);
-        if (param_name == name) {
-            return true;
-        }
-    }
-    return false;
+AmirInstruction amir_cpu_halt_forever() {
+    return AmirInstruction{AmirInstruction::Kind::CpuHaltForever};
+}
+
+bool is_terminal_instruction(const AmirInstruction& instruction) {
+    return instruction.kind == AmirInstruction::Kind::Return || instruction.kind == AmirInstruction::Kind::Jump ||
+           instruction.kind == AmirInstruction::Kind::Branch || instruction.kind == AmirInstruction::Kind::CpuHaltForever;
 }
 
 std::string upper_ascii(std::string text) {
@@ -439,599 +379,110 @@ std::string upper_ascii(std::string text) {
     return text;
 }
 
-bool identifier_is(const Token& token, const std::string& word) {
-    return token.type == TokenType::Identifier && upper_ascii(token.lexeme) == word;
+const std::vector<CanonicalAstNodePtr>& ast_group(const CanonicalAstNode& node, const std::string& role) {
+    static const std::vector<CanonicalAstNodePtr> empty;
+    for (const auto& group : node.groups) {
+        if (group.role == role) {
+            return group.nodes;
+        }
+    }
+    return empty;
 }
 
-bool is_loop_variable_token(const Token& token) {
-    return token.type == TokenType::Identifier || token.type == TokenType::Run;
+std::string ast_operator(TokenType op) {
+    switch (op) {
+        case TokenType::Plus: return "+";
+        case TokenType::Minus: return "-";
+        case TokenType::Star: return "*";
+        case TokenType::Slash: return "/";
+        case TokenType::Mod: return "MOD";
+        case TokenType::Ampersand:
+        case TokenType::BitAnd: return "&";
+        case TokenType::Pipe:
+        case TokenType::BitOr: return "|";
+        case TokenType::Caret:
+        case TokenType::BitXor: return "^";
+        case TokenType::Bang: return "!";
+        case TokenType::Tilde:
+        case TokenType::BitNot: return "~";
+        case TokenType::LogicalAnd: return "&&";
+        case TokenType::AndAlso: return "ANDALSO";
+        case TokenType::LogicalOr: return "||";
+        case TokenType::OrElse: return "ORELSE";
+        case TokenType::Equal: return "==";
+        case TokenType::NotEqual: return "!=";
+        case TokenType::Less: return "<";
+        case TokenType::LessEqual: return "<=";
+        case TokenType::Greater: return ">";
+        case TokenType::GreaterEqual: return ">=";
+        case TokenType::ShiftLeft:
+        case TokenType::ShiftLeftWord: return "<<";
+        case TokenType::ShiftRight:
+        case TokenType::ShiftRightWord: return ">>";
+        case TokenType::Contains: return "CONTAINS";
+        case TokenType::In: return "IN";
+        default: return "?";
+    }
 }
 
-class ExpressionLowerer {
-public:
-    ExpressionLowerer(AmirBlock& block, const std::vector<Token>& tokens, std::size_t begin, std::size_t end, int& temporary)
-        : block_(block), tokens_(tokens), end_(end), current_(begin), temporary_(temporary) {}
-
-    bool lower(std::string& result) {
-        result = expression();
-        return ok_ && current_ == end_ && !result.empty();
-    }
-
-private:
-    std::string expression() {
-        return logical_or();
-    }
-
-    std::string logical_or() {
-        std::string left = logical_and();
-        while (match(TokenType::LogicalOr) || match(TokenType::OrElse)) {
-            const Token op = previous();
-            left = binary(op.type == TokenType::OrElse ? "ORELSE" : "||", left, logical_and());
-        }
-        return left;
-    }
-
-    std::string logical_and() {
-        std::string left = bit_or();
-        while (match(TokenType::LogicalAnd) || match(TokenType::AndAlso)) {
-            const Token op = previous();
-            left = binary(op.type == TokenType::AndAlso ? "ANDALSO" : "&&", left, bit_or());
-        }
-        return left;
-    }
-
-    std::string bit_or() {
-        std::string left = bit_xor();
-        while (match(TokenType::Pipe) || match(TokenType::BitOr)) {
-            const Token op = previous();
-            left = binary(operator_text(op), left, bit_xor());
-        }
-        return left;
-    }
-
-    std::string bit_xor() {
-        std::string left = bit_and();
-        while (match(TokenType::Caret) || match(TokenType::BitXor)) {
-            const Token op = previous();
-            left = binary(operator_text(op), left, bit_and());
-        }
-        return left;
-    }
-
-    std::string bit_and() {
-        std::string left = equality();
-        while (match(TokenType::Ampersand) || match(TokenType::BitAnd)) {
-            const Token op = previous();
-            left = binary(operator_text(op), left, equality());
-        }
-        return left;
-    }
-
-    std::string equality() {
-        std::string left = comparison();
-        while (match(TokenType::Equal) || match(TokenType::NotEqual)) {
-            const Token op = previous();
-            left = binary(op.type == TokenType::Equal ? "==" : "!=", left, comparison());
-        }
-        return left;
-    }
-
-    std::string comparison() {
-        std::string left = shift();
-        while (match_any({TokenType::Less, TokenType::LessEqual, TokenType::Greater, TokenType::GreaterEqual, TokenType::Contains})) {
-            const Token op = previous();
-            left = binary(operator_text(op), left, shift());
-        }
-        return left;
-    }
-
-    std::string shift() {
-        std::string left = term();
-        while (match(TokenType::ShiftLeft) || match(TokenType::ShiftLeftWord) || match(TokenType::ShiftRight) || match(TokenType::ShiftRightWord)) {
-            const Token op = previous();
-            left = binary(operator_text(op), left, term());
-        }
-        return left;
-    }
-
-    std::string term() {
-        std::string left = factor();
-        while (match(TokenType::Plus) || match(TokenType::Minus)) {
-            const Token op = previous();
-            left = binary(op.type == TokenType::Plus ? "+" : "-", left, factor());
-        }
-        return left;
-    }
-
-    std::string factor() {
-        std::string left = unary();
-        while (match(TokenType::Star) || match(TokenType::Slash) || match(TokenType::Mod) || match_identifier("MOD")) {
-            const Token op = previous();
-            left = binary(op.type == TokenType::Slash ? "/" : op.type == TokenType::Star ? "*" : "MOD", left, unary());
-        }
-        return left;
-    }
-
-    std::string unary() {
-        if (match(TokenType::Minus) || match(TokenType::Bang) || match(TokenType::Tilde) || match(TokenType::BitNot) || match_identifier("NOT")) {
-            const Token op = previous();
-            return unary_instruction(operator_text(op), unary());
-        }
-        return postfix();
-    }
-
-    std::string postfix() {
-        std::string target = primary();
-        while (match(TokenType::LeftBracket)) {
-            skip_newlines();
-            std::string index = expression();
-            skip_newlines();
-            if (index.empty() || !match(TokenType::RightBracket)) {
-                ok_ = false;
-                return "";
+std::string render_ast_expression(const CanonicalAstNode& node) {
+    switch (node.kind) {
+        case AstKind::Literal:
+            return node.text;
+        case AstKind::InterpolatedString:
+            return "$\"" + escaped(node.text) + "\"";
+        case AstKind::Variable:
+            return node.name;
+        case AstKind::Unary:
+            return ast_operator(node.op) + (node.children.empty() ? "nothing" : render_ast_expression(*node.children.front()));
+        case AstKind::Binary:
+        case AstKind::Logical:
+            if (node.children.size() == 2) {
+                return render_ast_expression(*node.children[0]) + " " + ast_operator(node.op) + " " +
+                       render_ast_expression(*node.children[1]);
             }
-            target = index_value(target, index);
-        }
-        return target;
-    }
-
-    std::string primary() {
-        if (match(TokenType::Number) || match(TokenType::String) || match(TokenType::TrueKeyword) || match(TokenType::FalseKeyword) ||
-            match(TokenType::NullKeyword)) {
-            return constant(token_text(previous()));
-        }
-        if (match(TokenType::Identifier)) {
-            const std::string name = previous().lexeme;
-            if (match(TokenType::LeftParen)) {
-                return call_value(name);
+            return "nothing";
+        case AstKind::Call:
+        case AstKind::MethodCall: {
+            std::ostringstream out;
+            out << node.name << '(';
+            for (std::size_t i = 0; i < node.children.size(); ++i) {
+                if (i > 0) out << ", ";
+                out << render_ast_expression(*node.children[i]);
             }
-            if (is_property_path(name)) {
-                return property_path(name);
+            out << ')';
+            return out.str();
+        }
+        case AstKind::SuperCall: {
+            std::ostringstream out;
+            out << "SUPER." << node.secondary_name << '(';
+            for (std::size_t i = 0; i < node.children.size(); ++i) {
+                if (i > 0) out << ", ";
+                out << render_ast_expression(*node.children[i]);
             }
-            return load(name);
+            out << ')';
+            return out.str();
         }
-        if (match(TokenType::Run)) {
-            const std::string name = "RUN";
-            if (match(TokenType::LeftParen)) {
-                return call_value(name);
+        case AstKind::Index:
+            if (node.children.size() == 2) {
+                return render_ast_expression(*node.children[0]) + "[" + render_ast_expression(*node.children[1]) + "]";
             }
-            return load(name);
-        }
-        if (match(TokenType::LeftParen)) {
-            skip_newlines();
-            std::string result = expression();
-            skip_newlines();
-            if (!match(TokenType::RightParen)) {
-                ok_ = false;
-            }
-            return result;
-        }
-        if (match(TokenType::LeftBracket)) {
-            return array_literal();
-        }
-        if (match(TokenType::LeftBrace)) {
-            return object_literal();
-        }
-        ok_ = false;
-        return "";
-    }
-
-    std::string call_value(const std::string& name) {
-        std::vector<std::string> args;
-        skip_newlines();
-        if (!check(TokenType::RightParen)) {
-            while (true) {
-                std::string arg = expression();
-                if (arg.empty()) {
-                    ok_ = false;
-                    return "";
-                }
-                args.push_back(std::move(arg));
-                skip_newlines();
-                if (!match(TokenType::Comma)) {
-                    break;
-                }
-                skip_newlines();
-                if (check(TokenType::RightParen)) {
-                    break;
-                }
-            }
-        }
-        if (!match(TokenType::RightParen)) {
-            ok_ = false;
-            return "";
-        }
-
-        const std::string result = next_temp();
-        block_.instructions.push_back(amir_call_value(result, name, std::move(args)));
-        return result;
-    }
-
-    std::string array_literal() {
-        std::vector<std::string> items;
-        skip_newlines();
-        if (!check(TokenType::RightBracket)) {
-            while (true) {
-                std::string item = expression();
-                if (item.empty()) {
-                    ok_ = false;
-                    return "";
-                }
-                items.push_back(std::move(item));
-                skip_newlines();
-                if (!match(TokenType::Comma)) {
-                    break;
-                }
-                skip_newlines();
-                if (check(TokenType::RightBracket)) {
-                    break;
-                }
-            }
-        }
-        if (!match(TokenType::RightBracket)) {
-            ok_ = false;
-            return "";
-        }
-
-        const std::string result = next_temp();
-        block_.instructions.push_back(amir_array(result, std::move(items)));
-        return result;
-    }
-
-    std::string object_literal() {
-        std::vector<std::string> fields;
-        skip_newlines();
-        if (!check(TokenType::RightBrace)) {
-            while (true) {
-                std::string key;
-                if (match(TokenType::String)) {
-                    key = token_text(previous());
-                } else if (match(TokenType::Identifier)) {
-                    key = previous().lexeme;
-                } else {
-                    ok_ = false;
-                    return "";
-                }
-                if (!match(TokenType::Colon)) {
-                    ok_ = false;
-                    return "";
-                }
-                skip_newlines();
-                std::string value = expression();
-                if (value.empty()) {
-                    ok_ = false;
-                    return "";
-                }
-                fields.push_back(std::move(key) + ":" + value);
-                skip_newlines();
-                if (!match(TokenType::Comma)) {
-                    break;
-                }
-                skip_newlines();
-                if (check(TokenType::RightBrace)) {
-                    break;
-                }
-            }
-        }
-        if (!match(TokenType::RightBrace)) {
-            ok_ = false;
-            return "";
-        }
-
-        const std::string result = next_temp();
-        block_.instructions.push_back(amir_object(result, std::move(fields)));
-        return result;
-    }
-
-    std::string constant(const std::string& value) {
-        const std::string result = next_temp();
-        block_.instructions.push_back(amir_const(result, value));
-        return result;
-    }
-
-    std::string index_value(const std::string& target, const std::string& index) {
-        const std::string result = next_temp();
-        block_.instructions.push_back(amir_index(result, target, index));
-        return result;
-    }
-
-    std::string property_path(const std::string& name) {
-        const auto parts = split_identifier_path(name);
-        if (parts.empty()) {
-            ok_ = false;
-            return "";
-        }
-        std::string target = load(parts.front());
-        for (std::size_t i = 1; i < parts.size(); ++i) {
-            target = index_value(target, constant("\"" + escaped(parts[i]) + "\""));
-        }
-        return target;
-    }
-
-    std::string load(const std::string& name) {
-        const std::string result = next_temp();
-        block_.instructions.push_back(amir_load(result, name));
-        return result;
-    }
-
-    std::string unary_instruction(const std::string& op, const std::string& value) {
-        if (value.empty()) {
-            ok_ = false;
-            return "";
-        }
-        const std::string result = next_temp();
-        block_.instructions.push_back(amir_unary(result, op, value));
-        return result;
-    }
-
-    std::string binary(const std::string& op, const std::string& left, const std::string& right) {
-        if (left.empty() || right.empty()) {
-            ok_ = false;
-            return "";
-        }
-        const std::string result = next_temp();
-        block_.instructions.push_back(amir_binary(result, op, left, right));
-        return result;
-    }
-
-    std::string next_temp() {
-        return "%t" + std::to_string(temporary_++);
-    }
-
-    bool at_end() const {
-        return current_ >= end_;
-    }
-
-    const Token& previous() const {
-        return tokens_[current_ - 1];
-    }
-
-    bool match(TokenType type) {
-        if (at_end() || tokens_[current_].type != type) {
-            return false;
-        }
-        ++current_;
-        return true;
-    }
-
-    bool match_any(std::initializer_list<TokenType> types) {
-        for (TokenType type : types) {
-            if (match(type)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    bool check(TokenType type) const {
-        return !at_end() && tokens_[current_].type == type;
-    }
-
-    void skip_newlines() {
-        while (match(TokenType::Newline)) {}
-    }
-
-    bool match_identifier(const std::string& word) {
-        if (at_end() || !identifier_is(tokens_[current_], word)) {
-            return false;
-        }
-        ++current_;
-        return true;
-    }
-
-    std::string operator_text(const Token& token) const {
-        switch (token.type) {
-            case TokenType::Plus:
-                return "+";
-            case TokenType::Minus:
-                return "-";
-            case TokenType::Star:
-                return "*";
-            case TokenType::Slash:
-                return "/";
-            case TokenType::Mod:
-                return "MOD";
-            case TokenType::Ampersand:
-            case TokenType::BitAnd:
-                return "&";
-            case TokenType::Pipe:
-            case TokenType::BitOr:
-                return "|";
-            case TokenType::Caret:
-            case TokenType::BitXor:
-                return "^";
-            case TokenType::Bang:
-                return "!";
-            case TokenType::Tilde:
-            case TokenType::BitNot:
-                return "~";
-            case TokenType::Less:
-                return "<";
-            case TokenType::LessEqual:
-                return "<=";
-            case TokenType::Greater:
-                return ">";
-            case TokenType::GreaterEqual:
-                return ">=";
-            case TokenType::ShiftLeft:
-            case TokenType::ShiftLeftWord:
-                return "<<";
-            case TokenType::ShiftRight:
-            case TokenType::ShiftRightWord:
-                return ">>";
-            case TokenType::Contains:
-                return "CONTAINS";
-            default:
-                if (identifier_is(token, "NOT")) {
-                    return "NOT";
-                }
-                if (identifier_is(token, "MOD")) {
-                    return "MOD";
-                }
-                return token.lexeme;
-        }
-    }
-
-    AmirBlock& block_;
-    const std::vector<Token>& tokens_;
-    std::size_t end_;
-    std::size_t current_;
-    int& temporary_;
-    bool ok_ = true;
-};
-
-std::string lower_expression(AmirBlock& block, const std::vector<Token>& tokens, std::size_t begin, std::size_t end, int& temporary) {
-    const auto instruction_count = block.instructions.size();
-    const int original_temporary = temporary;
-    ExpressionLowerer lowerer(block, tokens, begin, end, temporary);
-    std::string result;
-    if (begin < end && lowerer.lower(result)) {
-        return result;
-    }
-
-    block.instructions.resize(instruction_count);
-    temporary = original_temporary;
-    const std::string temp = "%t" + std::to_string(temporary++);
-    const std::string expression = join_expression(tokens, begin, end);
-    block.instructions.push_back(amir_eval(temp, expression.empty() ? "nothing" : expression));
-    return temp;
-}
-
-std::size_t matching_bracket(const std::vector<Token>& tokens, std::size_t open, std::size_t end) {
-    int depth = 0;
-    for (std::size_t index = open; index < end; ++index) {
-        if (tokens[index].type == TokenType::LeftBracket) {
-            ++depth;
-        } else if (tokens[index].type == TokenType::RightBracket) {
-            --depth;
-            if (depth == 0) {
-                return index;
-            }
-        }
-    }
-    return end;
-}
-
-bool lower_assignment(AmirBlock& block, const std::vector<Token>& tokens, std::size_t target_begin, std::size_t end, int& temporary,
-                       bool allow_type_annotation) {
-    const auto instruction_count = block.instructions.size();
-    const int original_temporary = temporary;
-    const auto fail = [&]() {
-        block.instructions.resize(instruction_count);
-        temporary = original_temporary;
-        return false;
-    };
-
-    if (target_begin >= end || tokens[target_begin].type != TokenType::Identifier) {
-        return fail();
-    }
-
-    const std::string name = tokens[target_begin].lexeme;
-    const auto property_parts = split_identifier_path(name);
-    std::vector<std::string> indexes;
-    std::size_t index = target_begin + 1;
-    if (allow_type_annotation && index < end && tokens[index].type == TokenType::As) {
-        // LET name AS Type = expr: the type annotation is validated by
-        // Parser::validate_fixed_width_initializer during the parse pass that
-        // always runs before A-MIR lowering (see reveal_amir/reveal_bytecode);
-        // A-MIR itself does not yet carry fixed-width type information
-        // (deferred to WP-004), so the annotation is skipped here and the
-        // declaration lowers exactly like an untyped LET.
-        if (index + 1 >= end || tokens[index + 1].type != TokenType::Identifier) {
-            return fail();
-        }
-        index += 2;
-    }
-    if (property_parts.size() > 1) {
-        for (std::size_t i = 1; i < property_parts.size(); ++i) {
-            const std::string property = "%t" + std::to_string(temporary++);
-            block.instructions.push_back(amir_const(property, "\"" + escaped(property_parts[i]) + "\""));
-            indexes.push_back(property);
-        }
-    }
-    while (index < end && tokens[index].type == TokenType::LeftBracket) {
-        const std::size_t close = matching_bracket(tokens, index, end);
-        if (close >= end) {
-            return fail();
-        }
-        indexes.push_back(lower_expression(block, tokens, index + 1, close, temporary));
-        index = close + 1;
-    }
-
-    if (index >= end || tokens[index].type != TokenType::Equal) {
-        return fail();
-    }
-
-    const std::string value = lower_expression(block, tokens, index + 1, end, temporary);
-    if (indexes.empty()) {
-        block.instructions.push_back(amir_store(name, value));
-    } else {
-        indexes.push_back(value);
-        block.instructions.push_back(amir_store_index(property_parts.empty() ? name : property_parts.front(), std::move(indexes)));
-    }
-    return true;
-}
-
-bool is_compound_assignment(TokenType type) {
-    switch (type) {
-        case TokenType::PlusEqual:
-        case TokenType::MinusEqual:
-        case TokenType::StarEqual:
-        case TokenType::SlashEqual:
-        case TokenType::AmpersandEqual:
-        case TokenType::PipeEqual:
-        case TokenType::CaretEqual:
-        case TokenType::ShiftLeftEqual:
-        case TokenType::ShiftRightEqual:
-            return true;
+            return "nothing";
         default:
-            return false;
+            return node.text.empty() ? "nothing" : node.text;
     }
 }
 
-std::string compound_operator(TokenType type) {
-    switch (type) {
-        case TokenType::PlusEqual:
-            return "+";
-        case TokenType::MinusEqual:
-            return "-";
-        case TokenType::StarEqual:
-            return "*";
-        case TokenType::SlashEqual:
-            return "/";
-        case TokenType::AmpersandEqual:
-            return "&";
-        case TokenType::PipeEqual:
-            return "|";
-        case TokenType::CaretEqual:
-            return "^";
-        case TokenType::ShiftLeftEqual:
-            return "<<";
-        case TokenType::ShiftRightEqual:
-            return ">>";
-        default:
-            return "";
-    }
-}
-
-bool lower_compound_assignment(AmirBlock& block, const std::vector<Token>& tokens, std::size_t begin, std::size_t end, int& temporary) {
-    if (begin + 2 >= end || tokens[begin].type != TokenType::Identifier || !is_compound_assignment(tokens[begin + 1].type)) {
-        return false;
-    }
-
-    const std::string current = "%t" + std::to_string(temporary++);
-    block.instructions.push_back(amir_load(current, tokens[begin].lexeme));
-    const std::string value = lower_expression(block, tokens, begin + 2, end, temporary);
-    const std::string result = "%t" + std::to_string(temporary++);
-    block.instructions.push_back(amir_binary(result, compound_operator(tokens[begin + 1].type), current, value));
-    block.instructions.push_back(amir_store(tokens[begin].lexeme, result));
-    return true;
-}
-
-class AmirBuilder {
+// RFC-0012 canonical frontend -> A-MIR lowering. This builder consumes only the parser-produced
+// canonical AST. It never sees or reinterprets lexer tokens.
+class AstAmirBuilder {
 public:
-    AmirBuilder(const std::vector<Token>& tokens, std::string source_name) : tokens_(tokens) {
+    AstAmirBuilder(const std::vector<std::unique_ptr<Stmt>>& statements, std::string source_name) {
         module_.source_name = std::move(source_name);
+        roots_.reserve(statements.size());
+        for (const auto& statement : statements) {
+            roots_.push_back(statement->canonical_ast());
+        }
     }
 
     AmirModule build() {
@@ -1039,12 +490,9 @@ public:
         main.name = "Main";
         main.return_type = "I32";
         main.blocks.push_back(AmirBlock{"Entry"});
-
-        std::size_t index = 0;
-        const std::size_t final_block = lower_range(main, 0, index, tokens_.size(), {});
-        if (main.blocks.empty() || main.blocks[final_block].instructions.empty() || !is_terminal_instruction(main.blocks[final_block].instructions.back())) {
-            main.blocks[final_block].instructions.push_back(amir_return("I32", "0"));
-        }
+        current_block_ = 0;
+        lower_statements(main, roots_);
+        ensure_terminated(main, current_block_, "I32", "0");
         module_.functions.insert(module_.functions.begin(), std::move(main));
         validate_module();
         return module_;
@@ -1052,506 +500,427 @@ public:
 
 private:
     struct LoopTarget {
-        TokenType kind;
+        AstKind kind;
         std::string continue_target;
         std::string exit_target;
     };
 
-    std::string temp() {
-        return "%t" + std::to_string(temporary_++);
-    }
-
-    std::string hidden_name(const std::string& prefix) {
-        return "__fission_" + prefix + std::to_string(hidden_counter_++);
-    }
+    std::string temp() { return "%t" + std::to_string(temporary_++); }
+    std::string hidden_name(const std::string& prefix) { return "__fission_" + prefix + std::to_string(hidden_counter_++); }
 
     std::size_t add_block(AmirFunction& function, const std::string& prefix) {
         function.blocks.push_back(AmirBlock{prefix + std::to_string(block_counter_++)});
         return function.blocks.size() - 1;
     }
 
-    AmirBlock& current_block(AmirFunction& function) {
-        return function.blocks[current_block_];
-    }
+    AmirBlock& current_block(AmirFunction& function) { return function.blocks[current_block_]; }
+    AmirBlock& block(AmirFunction& function, std::size_t index) { return function.blocks[index]; }
+    std::string block_name(const AmirFunction& function, std::size_t index) const { return function.blocks[index].name; }
 
-    AmirBlock& block(AmirFunction& function, std::size_t block_index) {
-        return function.blocks[block_index];
-    }
-
-    void skip_newlines(std::size_t& index, std::size_t limit) const {
-        while (index < limit && tokens_[index].type == TokenType::Newline) {
-            ++index;
+    void ensure_terminated(AmirFunction& function, std::size_t index, const std::string& type, const std::string& value) {
+        if (block(function, index).instructions.empty() || !is_terminal_instruction(block(function, index).instructions.back())) {
+            block(function, index).instructions.push_back(amir_return(type, value));
         }
     }
 
-    bool at_terminator(std::size_t index, const std::vector<TokenType>& terminators) const {
-        if (index >= tokens_.size()) {
-            return true;
+    void jump_if_open(AmirFunction& function, std::size_t index, const std::string& target) {
+        if (block(function, index).instructions.empty() || !is_terminal_instruction(block(function, index).instructions.back())) {
+            block(function, index).instructions.push_back(amir_jump(target));
         }
-        for (TokenType terminator : terminators) {
-            if (tokens_[index].type == terminator) {
-                return true;
-            }
+    }
+
+    bool has_parameter(const AmirFunction& function, const std::string& name) const {
+        for (const auto& param : function.params) {
+            const auto space = param.find(' ');
+            if ((space == std::string::npos ? param : param.substr(0, space)) == name) return true;
         }
         return false;
     }
 
-    std::size_t after_line(std::size_t index, std::size_t limit) const {
-        index = line_end(tokens_, index);
-        if (index < limit && tokens_[index].type == TokenType::Newline) {
-            ++index;
-        }
-        return index;
-    }
-
-    std::size_t logical_line_end(std::size_t index, std::size_t limit) const {
-        int depth = 0;
-        while (index < limit && tokens_[index].type != TokenType::End) {
-            switch (tokens_[index].type) {
-                case TokenType::LeftParen:
-                case TokenType::LeftBracket:
-                case TokenType::LeftBrace:
-                    ++depth;
-                    break;
-                case TokenType::RightParen:
-                case TokenType::RightBracket:
-                case TokenType::RightBrace:
-                    if (depth > 0) {
-                        --depth;
-                    }
-                    break;
-                case TokenType::Newline:
-                    if (depth == 0) {
-                        return index;
-                    }
-                    break;
-                default:
-                    break;
-            }
-            ++index;
-        }
-        return index;
-    }
-
-    std::size_t after_logical_line(std::size_t begin, std::size_t limit) const {
-        std::size_t end = logical_line_end(begin, limit);
-        if (end < limit && tokens_[end].type == TokenType::Newline) {
-            ++end;
-        }
-        return end;
-    }
-
-    std::size_t find_line_token(std::size_t begin, std::size_t end, TokenType type) const {
-        for (std::size_t index = begin; index < end; ++index) {
-            if (tokens_[index].type == type) {
-                return index;
-            }
-        }
-        return end;
-    }
-
-    std::size_t find_end_pair(std::size_t body_begin, std::size_t limit, TokenType opener, TokenType closer) const {
-        int depth = 0;
-        for (std::size_t index = body_begin; index < limit;) {
-            skip_newlines(index, limit);
-            const std::size_t begin = is_line_number(tokens_, index) ? index + 1 : index;
-            if (begin >= limit) {
-                break;
-            }
-            if (tokens_[begin].type == opener) {
-                ++depth;
-            } else if (tokens_[begin].type == TokenType::EndKeyword && begin + 1 < limit && tokens_[begin + 1].type == closer) {
-                if (depth == 0) {
-                    return begin;
-                }
-                --depth;
-            }
-            index = after_line(begin, limit);
-        }
-        return limit;
-    }
-
-    std::size_t find_plain_terminator(std::size_t body_begin, std::size_t limit, TokenType opener, TokenType closer) const {
-        int depth = 0;
-        for (std::size_t index = body_begin; index < limit;) {
-            skip_newlines(index, limit);
-            const std::size_t begin = is_line_number(tokens_, index) ? index + 1 : index;
-            if (begin >= limit) {
-                break;
-            }
-            if (tokens_[begin].type == opener) {
-                ++depth;
-            } else if (tokens_[begin].type == closer) {
-                if (depth == 0) {
-                    return begin;
-                }
-                --depth;
-            }
-            index = after_line(begin, limit);
-        }
-        return limit;
-    }
-
-    std::size_t find_select_end(std::size_t body_begin, std::size_t limit) const {
-        int depth = 0;
-        for (std::size_t index = body_begin; index < limit;) {
-            skip_newlines(index, limit);
-            const std::size_t begin = is_line_number(tokens_, index) ? index + 1 : index;
-            if (begin >= limit) {
-                break;
-            }
-            if (tokens_[begin].type == TokenType::Select) {
-                ++depth;
-            } else if (tokens_[begin].type == TokenType::EndKeyword && begin + 1 < limit && tokens_[begin + 1].type == TokenType::Select) {
-                if (depth == 0) {
-                    return begin;
-                }
-                --depth;
-            }
-            index = after_line(begin, limit);
-        }
-        return limit;
-    }
-
-    std::vector<std::size_t> find_select_cases(std::size_t body_begin, std::size_t end_select, std::size_t limit) const {
-        std::vector<std::size_t> cases;
-        int depth = 0;
-        for (std::size_t index = body_begin; index < end_select;) {
-            skip_newlines(index, limit);
-            const std::size_t begin = is_line_number(tokens_, index) ? index + 1 : index;
-            if (begin >= end_select) {
-                break;
-            }
-            if (tokens_[begin].type == TokenType::Select) {
-                ++depth;
-            } else if (tokens_[begin].type == TokenType::EndKeyword && begin + 1 < limit && tokens_[begin + 1].type == TokenType::Select) {
-                if (depth > 0) {
-                    --depth;
-                }
-            } else if (tokens_[begin].type == TokenType::Case && depth == 0) {
-                cases.push_back(begin);
-            }
-            index = after_line(begin, limit);
-        }
-        return cases;
-    }
-
-    std::pair<std::size_t, std::size_t> find_if_parts(std::size_t body_begin, std::size_t limit) const {
-        int depth = 0;
-        std::size_t else_index = limit;
-        for (std::size_t index = body_begin; index < limit;) {
-            skip_newlines(index, limit);
-            const std::size_t begin = is_line_number(tokens_, index) ? index + 1 : index;
-            if (begin >= limit) {
-                break;
-            }
-            if (tokens_[begin].type == TokenType::If) {
-                ++depth;
-            } else if (tokens_[begin].type == TokenType::Else && depth == 0) {
-                else_index = begin;
-            } else if (tokens_[begin].type == TokenType::EndKeyword && begin + 1 < limit && tokens_[begin + 1].type == TokenType::If) {
-                if (depth == 0) {
-                    return {else_index, begin};
-                }
-                --depth;
-            }
-            index = after_line(begin, limit);
-        }
-        return {else_index, limit};
-    }
-
-    std::string block_name(const AmirFunction& function, std::size_t block_index) const {
-        return function.blocks[block_index].name;
-    }
-
-    std::size_t lower_range(AmirFunction& function, std::size_t initial_block, std::size_t& index, std::size_t limit, const std::vector<TokenType>& terminators) {
-        const std::size_t saved_block = current_block_;
-        current_block_ = initial_block;
-        while (index < limit) {
-            skip_newlines(index, limit);
-            if (index >= limit || tokens_[index].type == TokenType::End || at_terminator(index, terminators)) {
-                break;
-            }
-            lower_statement(function, index, limit);
-            if (!function.blocks[current_block_].instructions.empty() && is_terminal_instruction(function.blocks[current_block_].instructions.back())) {
-                skip_current_construct(index, limit);
-            }
-        }
-        const std::size_t final_block = current_block_;
-        current_block_ = saved_block;
-        return final_block;
-    }
-
-    void skip_current_construct(std::size_t& index, std::size_t limit) const {
-        while (index < limit && tokens_[index].type != TokenType::Newline && tokens_[index].type != TokenType::End) {
-            ++index;
-        }
-        if (index < limit && tokens_[index].type == TokenType::Newline) {
-            ++index;
-        }
-    }
-
-    void lower_statement(AmirFunction& function, std::size_t& index, std::size_t limit) {
-        const int source_line = tokens_[index].line;
-        const bool has_line_label = is_line_number(tokens_, index);
-        const std::size_t begin = has_line_label ? index + 1 : index;
-        const std::size_t end = logical_line_end(begin, limit);
-        if (begin >= end) {
-            index = after_line(begin, limit);
-            return;
-        }
-
-        if (has_line_label) {
-            current_block(function).instructions.push_back(amir_label("L" + token_text(tokens_[index])));
-        }
-        current_block(function).instructions.push_back(amir_source(source_line));
-
-        if (tokens_[begin].type == TokenType::If && lower_if(function, begin, end, index, limit)) {
-            return;
-        }
-        if (tokens_[begin].type == TokenType::While && lower_while(function, begin, end, index, limit)) {
-            return;
-        }
-        if (tokens_[begin].type == TokenType::Do && lower_do(function, begin, end, index, limit)) {
-            return;
-        }
-        if (tokens_[begin].type == TokenType::For && lower_for(function, begin, end, index, limit)) {
-            return;
-        }
-        if (tokens_[begin].type == TokenType::Select && lower_select(function, begin, end, index, limit)) {
-            return;
-        }
-        if (tokens_[begin].type == TokenType::Try && lower_try(function, begin, end, index, limit)) {
-            return;
-        }
-        if (tokens_[begin].type == TokenType::Function && lower_function(function, begin, end, index, limit)) {
-            return;
-        }
-        if (tokens_[begin].type == TokenType::Class && lower_class_or_interface(function, true, begin, index, limit)) {
-            return;
-        }
-        if (tokens_[begin].type == TokenType::Interface && lower_class_or_interface(function, false, begin, index, limit)) {
-            return;
-        }
-
-        lower_simple_statement(function, begin, end);
-        index = after_logical_line(begin, limit);
-    }
-
-    void lower_simple_statement(AmirFunction& function, std::size_t begin, std::size_t end) {
+    std::string lower_expression(AmirFunction& function, const CanonicalAstNode& node) {
         AmirBlock& out = current_block(function);
-        if (tokens_[begin].type == TokenType::Print) {
-            const std::string value = lower_expression(out, tokens_, begin + 1, end, temporary_);
-            out.instructions.push_back(amir_call("Runtime.Print", {value}));
-        } else if (tokens_[begin].type == TokenType::Identifier && lower_compound_assignment(out, tokens_, begin, end, temporary_)) {
-        } else if (tokens_[begin].type == TokenType::Identifier && lower_assignment(out, tokens_, begin, end, temporary_, false)) {
-        } else if (tokens_[begin].type == TokenType::Let && lower_assignment(out, tokens_, begin + 1, end, temporary_, true)) {
-        } else if (tokens_[begin].type == TokenType::Return) {
-            if (begin + 1 < end) {
-                const std::string value = lower_expression(out, tokens_, begin + 1, end, temporary_);
-                // function.return_type is "VALUE" by default (untyped) and the declared type
-                // name (e.g. "U64") when the function has an AS Type return clause -- see
-                // parse_function_signature. Propagating it here (docs/systems/uefi-target.md
-                // section 5 "function returns") is purely informational for the bytecode VM,
-                // which only ever reads operands[1] regardless of this tag.
-                out.instructions.push_back(amir_return(function.return_type, value));
-            } else {
-                out.instructions.push_back(amir_return("VALUE", "nothing"));
+        switch (node.kind) {
+            case AstKind::Literal: {
+                const std::string result = temp();
+                out.instructions.push_back(amir_const(result, node.text));
+                return result;
             }
-        } else if (tokens_[begin].type == TokenType::Stop) {
-            out.instructions.push_back(amir_return("I32", "0"));
-        } else if (tokens_[begin].type == TokenType::Goto && begin + 1 < end && tokens_[begin + 1].type == TokenType::Number) {
-            out.instructions.push_back(amir_jump("L" + token_text(tokens_[begin + 1])));
-        } else if (lower_loop_control(out, begin, end)) {
-        } else if ((tokens_[begin].type == TokenType::Identifier || tokens_[begin].type == TokenType::Run) && begin + 1 < end &&
-                   tokens_[begin + 1].type == TokenType::LeftParen) {
-            const std::size_t before = out.instructions.size();
-            (void)lower_expression(out, tokens_, begin, end, temporary_);
-            // Packet WP-004 "external or ABI-bound function calls": a dotted call whose
-            // receiver is a parameter of the enclosing function (e.g. a UEFI protocol pointer
-            // received as an argument) is a call through that value, not an ordinary namespaced
-            // host/stdlib call -- reclassify the instruction lower_expression already built
-            // rather than duplicating its call-argument parsing.
-            if (out.instructions.size() > before) {
-                AmirInstruction& produced = out.instructions.back();
-                if (produced.kind == AmirInstruction::Kind::CallValue) {
-                    const auto dot = produced.target.find('.');
-                    const std::string receiver = dot == std::string::npos ? produced.target : produced.target.substr(0, dot);
-                    if (function_has_parameter(function, receiver)) {
-                        produced.kind = AmirInstruction::Kind::CallExternal;
-                    }
+            case AstKind::InterpolatedString: {
+                const std::string result = temp();
+                out.instructions.push_back(amir_eval(result, render_ast_expression(node)));
+                return result;
+            }
+            case AstKind::Variable:
+                return lower_variable(out, node.name);
+            case AstKind::Unary: {
+                const std::string value = node.children.empty() ? lower_fallback(out, node) : lower_expression(function, *node.children[0]);
+                const std::string result = temp();
+                out.instructions.push_back(amir_unary(result, ast_operator(node.op), value));
+                return result;
+            }
+            case AstKind::Binary:
+            case AstKind::Logical: {
+                if (node.children.size() != 2) return lower_fallback(out, node);
+                const std::string left = lower_expression(function, *node.children[0]);
+                const std::string right = lower_expression(function, *node.children[1]);
+                const std::string result = temp();
+                out.instructions.push_back(amir_binary(result, ast_operator(node.op), left, right));
+                return result;
+            }
+            case AstKind::Call:
+            case AstKind::MethodCall:
+            case AstKind::SuperCall:
+                return lower_call(function, node);
+            case AstKind::Index: {
+                if (node.children.size() != 2) return lower_fallback(out, node);
+                const std::string target = lower_expression(function, *node.children[0]);
+                const std::string index = lower_expression(function, *node.children[1]);
+                const std::string result = temp();
+                out.instructions.push_back(amir_index(result, target, index));
+                return result;
+            }
+            case AstKind::Array: {
+                std::vector<std::string> items;
+                for (const auto& child : node.children) items.push_back(lower_expression(function, *child));
+                const std::string result = temp();
+                out.instructions.push_back(amir_array(result, std::move(items)));
+                return result;
+            }
+            case AstKind::Object: {
+                std::vector<std::string> fields;
+                for (const auto& [key, value] : node.named_children) {
+                    fields.push_back(key + ":" + lower_expression(function, *value));
                 }
+                const std::string result = temp();
+                out.instructions.push_back(amir_object(result, std::move(fields)));
+                return result;
             }
-        } else {
-            out.instructions.push_back(amir_unsupported(statement_comment(tokens_, begin, end)));
+            default:
+                return lower_fallback(out, node);
         }
     }
 
-    bool lower_loop_control(AmirBlock& out, std::size_t begin, std::size_t end) {
-        if (begin + 1 >= end || !identifier_is(tokens_[begin], "EXIT") && !identifier_is(tokens_[begin], "CONTINUE")) {
-            return false;
+    std::string lower_fallback(AmirBlock& out, const CanonicalAstNode& node) {
+        const std::string result = temp();
+        out.instructions.push_back(amir_eval(result, render_ast_expression(node)));
+        return result;
+    }
+
+    std::string lower_variable(AmirBlock& out, const std::string& name) {
+        const auto parts = split_identifier_path(name);
+        if (parts.size() <= 1) {
+            const std::string result = temp();
+            out.instructions.push_back(amir_load(result, name));
+            return result;
         }
-        TokenType kind;
-        if (tokens_[begin + 1].type == TokenType::For || tokens_[begin + 1].type == TokenType::While || tokens_[begin + 1].type == TokenType::Do) {
-            kind = tokens_[begin + 1].type;
+        std::string target = temp();
+        out.instructions.push_back(amir_load(target, parts.front()));
+        for (std::size_t i = 1; i < parts.size(); ++i) {
+            const std::string property = temp();
+            out.instructions.push_back(amir_const(property, "\"" + escaped(parts[i]) + "\""));
+            const std::string indexed = temp();
+            out.instructions.push_back(amir_index(indexed, target, property));
+            target = indexed;
+        }
+        return target;
+    }
+
+    std::string lower_call(AmirFunction& function, const CanonicalAstNode& node) {
+        std::vector<std::string> args;
+        std::string target = node.name;
+        if (node.kind == AstKind::SuperCall) {
+            target = node.name + "." + node.secondary_name;
+            args.push_back(lower_variable(current_block(function), "SELF"));
+        }
+        for (const auto& child : node.children) args.push_back(lower_expression(function, *child));
+        const std::string result = temp();
+        AmirInstruction instruction = amir_call_value(result, target, std::move(args));
+        if (node.kind == AstKind::MethodCall && has_parameter(function, node.secondary_name)) {
+            instruction.kind = AmirInstruction::Kind::CallExternal;
+        }
+        current_block(function).instructions.push_back(std::move(instruction));
+        return result;
+    }
+
+    void lower_statements(AmirFunction& function, const std::vector<CanonicalAstNodePtr>& statements) {
+        for (const auto& statement : statements) {
+            lower_statement(function, *statement);
+            const auto& instructions = current_block(function).instructions;
+            if (!instructions.empty() && instructions.back().kind == AmirInstruction::Kind::CpuHaltForever) {
+                break;
+            }
+        }
+    }
+
+    void lower_statement(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.line_label >= 0) {
+            current_block(function).instructions.push_back(amir_label("L" + std::to_string(node.line_label)));
+        }
+        current_block(function).instructions.push_back(amir_source(node.source_line));
+
+        switch (node.kind) {
+            case AstKind::Print:
+                lower_print(function, node);
+                break;
+            case AstKind::Assign:
+                lower_assignment(function, node);
+                break;
+            case AstKind::CompoundAssign:
+                lower_compound(function, node);
+                break;
+            case AstKind::FlagOperation:
+                lower_flag_operation(function, node);
+                break;
+            case AstKind::Flags:
+                lower_flags(function, node);
+                break;
+            case AstKind::HardwareSemantic:
+                current_block(function).instructions.push_back(
+                    node.name == "CPU.HaltForever" ? amir_cpu_halt_forever() : amir_cpu_halt());
+                break;
+            case AstKind::ExpressionStatement:
+                lower_expression_statement(function, node);
+                break;
+            case AstKind::NoOp:
+                break;
+            case AstKind::Return:
+                current_block(function).instructions.push_back(
+                    node.children.empty() ? amir_return("VALUE", "nothing")
+                                          : amir_return(function.return_type, lower_expression(function, *node.children[0])));
+                break;
+            case AstKind::Goto:
+                current_block(function).instructions.push_back(amir_jump("L" + std::to_string(node.integer)));
+                break;
+            case AstKind::Stop:
+                current_block(function).instructions.push_back(amir_return("I32", "0"));
+                break;
+            case AstKind::LoopControl:
+                lower_loop_control(function, node);
+                break;
+            case AstKind::Block:
+                lower_statements(function, ast_group(node, "body"));
+                break;
+            case AstKind::If:
+                lower_if(function, node);
+                break;
+            case AstKind::While:
+                lower_while(function, node);
+                break;
+            case AstKind::Do:
+                lower_do(function, node);
+                break;
+            case AstKind::For:
+                lower_for(function, node);
+                break;
+            case AstKind::ForEach:
+                lower_for_each(function, node);
+                break;
+            case AstKind::Select:
+                lower_select(function, node);
+                break;
+            case AstKind::Try:
+                lower_try(function, node);
+                break;
+            case AstKind::Function:
+                lower_function(function, node);
+                break;
+            case AstKind::Class:
+                lower_class(function, node);
+                break;
+            case AstKind::Interface:
+                current_block(function).instructions.push_back(amir_declare_interface(node.name, {}));
+                break;
+            default:
+                current_block(function).instructions.push_back(amir_unsupported("AST kind " + std::to_string(static_cast<int>(node.kind))));
+                break;
+        }
+    }
+
+    void lower_print(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.children.empty()) {
+            current_block(function).instructions.push_back(amir_unsupported("PRINT without expression"));
+            return;
+        }
+        const auto& expr = *node.children[0];
+        // RUN's parser-level representation is a Print(Call RUN). The bytecode backend has never
+        // supported that shell construct; retain the deterministic diagnostic without reparsing.
+        if (expr.kind == AstKind::Call && upper_ascii(expr.name) == "RUN") {
+            current_block(function).instructions.push_back(amir_unsupported("RUN " + render_ast_expression(expr)));
+            return;
+        }
+        current_block(function).instructions.push_back(amir_call("Runtime.Print", {lower_expression(function, expr)}));
+    }
+
+    void lower_assignment(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.children.empty()) return;
+        const auto parts = split_identifier_path(node.name);
+        std::vector<std::string> indexes;
+        for (std::size_t i = 1; i < parts.size(); ++i) {
+            const std::string property = temp();
+            current_block(function).instructions.push_back(amir_const(property, "\"" + escaped(parts[i]) + "\""));
+            indexes.push_back(property);
+        }
+        const std::size_t explicit_indexes = static_cast<std::size_t>(std::max(0, node.integer));
+        for (std::size_t i = 0; i < explicit_indexes && i < node.children.size() - 1; ++i) {
+            indexes.push_back(lower_expression(function, *node.children[i]));
+        }
+        const std::string value = lower_expression(function, *node.children.back());
+        if (indexes.empty()) {
+            current_block(function).instructions.push_back(amir_store(node.name, value));
         } else {
-            return false;
+            indexes.push_back(value);
+            current_block(function).instructions.push_back(amir_store_index(parts.empty() ? node.name : parts.front(), std::move(indexes)));
         }
+    }
+
+    void lower_compound(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.children.empty()) return;
+        const std::string current = temp();
+        current_block(function).instructions.push_back(amir_load(current, node.name));
+        const std::string value = lower_expression(function, *node.children[0]);
+        const std::string result = temp();
+        current_block(function).instructions.push_back(amir_binary(result, ast_operator(node.op), current, value));
+        current_block(function).instructions.push_back(amir_store(node.name, result));
+    }
+
+    void lower_flag_operation(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.children.empty()) return;
+        const std::string current = temp();
+        current_block(function).instructions.push_back(amir_load(current, node.name));
+        std::string mask = lower_expression(function, *node.children[0]);
+        std::string op = node.op == TokenType::Add ? "|" : node.op == TokenType::Toggle ? "^" : "&";
+        if (node.op == TokenType::Remove) {
+            const std::string inverted = temp();
+            current_block(function).instructions.push_back(amir_unary(inverted, "~", mask));
+            mask = inverted;
+        }
+        const std::string result = temp();
+        current_block(function).instructions.push_back(amir_binary(result, op, current, mask));
+        current_block(function).instructions.push_back(amir_store(node.name, result));
+    }
+
+    void lower_flags(AmirFunction& function, const CanonicalAstNode& node) {
+        std::vector<std::string> fields;
+        for (const auto& [name, value] : node.named_children) {
+            fields.push_back(name + ":" + lower_expression(function, *value));
+        }
+        const std::string result = temp();
+        current_block(function).instructions.push_back(amir_object(result, std::move(fields)));
+        current_block(function).instructions.push_back(amir_store(node.name, result));
+    }
+
+    void lower_expression_statement(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.children.empty()) {
+            current_block(function).instructions.push_back(amir_unsupported("empty expression statement"));
+            return;
+        }
+        const AstKind kind = node.children[0]->kind;
+        if (kind == AstKind::Call || kind == AstKind::MethodCall || kind == AstKind::SuperCall) {
+            (void)lower_expression(function, *node.children[0]);
+        } else {
+            current_block(function).instructions.push_back(amir_unsupported(render_ast_expression(*node.children[0])));
+        }
+    }
+
+    void lower_loop_control(AmirFunction& function, const CanonicalAstNode& node) {
+        const AstKind target_kind = node.integer == 0 ? AstKind::For : node.integer == 1 ? AstKind::While : AstKind::Do;
         for (auto loop = loop_stack_.rbegin(); loop != loop_stack_.rend(); ++loop) {
-            if (loop->kind == kind) {
-                out.instructions.push_back(amir_jump(identifier_is(tokens_[begin], "EXIT") ? loop->exit_target : loop->continue_target));
-                return true;
+            if (loop->kind == target_kind) {
+                current_block(function).instructions.push_back(amir_jump(node.flag ? loop->continue_target : loop->exit_target));
+                return;
             }
         }
-        out.instructions.push_back(amir_unsupported(statement_comment(tokens_, begin, end)));
-        return true;
+        current_block(function).instructions.push_back(amir_unsupported("loop control outside matching loop"));
     }
 
-    bool lower_if(AmirFunction& function, std::size_t begin, std::size_t line_end_index, std::size_t& index, std::size_t limit) {
-        const std::size_t then_index = find_line_token(begin + 1, line_end_index, TokenType::Then);
-        if (then_index >= line_end_index) {
-            return false;
-        }
-        const std::size_t body_begin = after_line(begin, limit);
-        const auto [else_index, end_if] = find_if_parts(body_begin, limit);
-        if (end_if >= limit) {
-            return false;
-        }
-
+    void lower_if(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.children.empty()) return;
         const std::size_t then_block = add_block(function, "IfThen");
         const std::size_t else_block = add_block(function, "IfElse");
         const std::size_t end_block = add_block(function, "IfEnd");
-        const std::string condition = lower_expression(current_block(function), tokens_, begin + 1, then_index, temporary_);
-        current_block(function).instructions.push_back(amir_branch(condition, block_name(function, then_block), block_name(function, else_block)));
+        const std::string condition = lower_expression(function, *node.children[0]);
+        current_block(function).instructions.push_back(
+            amir_branch(condition, block_name(function, then_block), block_name(function, else_block)));
 
-        std::size_t then_cursor = body_begin;
-        const std::size_t then_limit = else_index < end_if ? else_index : end_if;
-        const std::size_t then_final = lower_range(function, then_block, then_cursor, then_limit, {});
-        if (block(function, then_final).instructions.empty() || !is_terminal_instruction(block(function, then_final).instructions.back())) {
-            block(function, then_final).instructions.push_back(amir_jump(block_name(function, end_block)));
-        }
+        current_block_ = then_block;
+        lower_statements(function, ast_group(node, "then"));
+        const std::size_t then_final = current_block_;
+        jump_if_open(function, then_final, block_name(function, end_block));
 
-        std::size_t else_final = else_block;
-        if (else_index < end_if) {
-            std::size_t else_cursor = after_line(else_index, limit);
-            else_final = lower_range(function, else_block, else_cursor, end_if, {});
-        }
-        if (block(function, else_final).instructions.empty() || !is_terminal_instruction(block(function, else_final).instructions.back())) {
-            block(function, else_final).instructions.push_back(amir_jump(block_name(function, end_block)));
-        }
-
+        current_block_ = else_block;
+        lower_statements(function, ast_group(node, "else"));
+        const std::size_t else_final = current_block_;
+        jump_if_open(function, else_final, block_name(function, end_block));
         current_block_ = end_block;
-        index = after_line(end_if, limit);
-        return true;
     }
 
-    bool lower_while(AmirFunction& function, std::size_t begin, std::size_t line_end_index, std::size_t& index, std::size_t limit) {
-        const std::size_t body_begin = after_line(begin, limit);
-        const std::size_t wend = find_plain_terminator(body_begin, limit, TokenType::While, TokenType::Wend);
-        if (wend >= limit) {
-            return false;
-        }
-
+    void lower_while(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.children.empty()) return;
         const std::size_t cond_block = add_block(function, "WhileCond");
         const std::size_t body_block = add_block(function, "WhileBody");
         const std::size_t end_block = add_block(function, "WhileEnd");
         current_block(function).instructions.push_back(amir_jump(block_name(function, cond_block)));
 
         current_block_ = cond_block;
-        const std::string condition = lower_expression(current_block(function), tokens_, begin + 1, line_end_index, temporary_);
-        current_block(function).instructions.push_back(amir_branch(condition, block_name(function, body_block), block_name(function, end_block)));
+        const std::string condition = lower_expression(function, *node.children[0]);
+        current_block(function).instructions.push_back(
+            amir_branch(condition, block_name(function, body_block), block_name(function, end_block)));
 
-        std::size_t body_cursor = body_begin;
-        loop_stack_.push_back(LoopTarget{TokenType::While, block_name(function, cond_block), block_name(function, end_block)});
-        const std::size_t body_final = lower_range(function, body_block, body_cursor, wend, {});
+        current_block_ = body_block;
+        loop_stack_.push_back(LoopTarget{AstKind::While, block_name(function, cond_block), block_name(function, end_block)});
+        lower_statements(function, ast_group(node, "body"));
         loop_stack_.pop_back();
-        if (block(function, body_final).instructions.empty() || !is_terminal_instruction(block(function, body_final).instructions.back())) {
-            block(function, body_final).instructions.push_back(amir_jump(block_name(function, cond_block)));
-        }
-
+        const std::size_t body_final = current_block_;
+        jump_if_open(function, body_final, block_name(function, cond_block));
         current_block_ = end_block;
-        index = after_line(wend, limit);
-        return true;
     }
 
-    bool lower_do(AmirFunction& function, std::size_t begin, std::size_t line_end_index, std::size_t& index, std::size_t limit) {
-        const std::size_t body_begin = after_line(begin, limit);
-        const std::size_t loop_line = find_plain_terminator(body_begin, limit, TokenType::Do, TokenType::Loop);
-        if (loop_line >= limit) {
-            return false;
-        }
-
-        const bool has_pre_condition = begin + 1 < line_end_index && (tokens_[begin + 1].type == TokenType::While || tokens_[begin + 1].type == TokenType::Until);
-        const bool pre_until = has_pre_condition && tokens_[begin + 1].type == TokenType::Until;
+    void lower_do(AmirFunction& function, const CanonicalAstNode& node) {
+        const bool has_pre = node.integer != 0;
+        const bool has_post = node.children.size() > static_cast<std::size_t>(has_pre ? 1 : 0);
+        const CanonicalAstNode* pre = has_pre && !node.children.empty() ? node.children[0].get() : nullptr;
+        const CanonicalAstNode* post = has_post ? node.children[has_pre ? 1 : 0].get() : nullptr;
         const std::size_t body_block = add_block(function, "DoBody");
         const std::size_t end_block = add_block(function, "DoEnd");
         std::size_t cond_block = body_block;
 
-        if (has_pre_condition) {
+        if (pre) {
             cond_block = add_block(function, "DoCond");
             current_block(function).instructions.push_back(amir_jump(block_name(function, cond_block)));
             current_block_ = cond_block;
-            const std::string condition = lower_expression(current_block(function), tokens_, begin + 2, line_end_index, temporary_);
+            const std::string condition = lower_expression(function, *pre);
             current_block(function).instructions.push_back(
-                pre_until ? amir_branch(condition, block_name(function, end_block), block_name(function, body_block))
+                node.flag ? amir_branch(condition, block_name(function, end_block), block_name(function, body_block))
                           : amir_branch(condition, block_name(function, body_block), block_name(function, end_block)));
         } else {
             current_block(function).instructions.push_back(amir_jump(block_name(function, body_block)));
         }
 
-        std::size_t body_cursor = body_begin;
-        loop_stack_.push_back(LoopTarget{TokenType::Do, block_name(function, cond_block), block_name(function, end_block)});
-        const std::size_t body_final = lower_range(function, body_block, body_cursor, loop_line, {});
+        current_block_ = body_block;
+        loop_stack_.push_back(LoopTarget{AstKind::Do, block_name(function, cond_block), block_name(function, end_block)});
+        lower_statements(function, ast_group(node, "body"));
         loop_stack_.pop_back();
-        const std::size_t loop_end = line_end(tokens_, loop_line);
-        if (loop_line + 1 < loop_end && (tokens_[loop_line + 1].type == TokenType::While || tokens_[loop_line + 1].type == TokenType::Until)) {
-            const bool post_until = tokens_[loop_line + 1].type == TokenType::Until;
-            current_block_ = body_final;
-            const std::string condition = lower_expression(current_block(function), tokens_, loop_line + 2, loop_end, temporary_);
-            current_block(function).instructions.push_back(
-                post_until ? amir_branch(condition, block_name(function, end_block), block_name(function, body_block))
+        const std::size_t body_final = current_block_;
+        if (post && (block(function, body_final).instructions.empty() ||
+                     !is_terminal_instruction(block(function, body_final).instructions.back()))) {
+            const std::string condition = lower_expression(function, *post);
+            block(function, current_block_).instructions.push_back(
+                node.flag2 ? amir_branch(condition, block_name(function, end_block), block_name(function, body_block))
                            : amir_branch(condition, block_name(function, body_block), block_name(function, end_block)));
-        } else if (block(function, body_final).instructions.empty() || !is_terminal_instruction(block(function, body_final).instructions.back())) {
-            block(function, body_final).instructions.push_back(amir_jump(block_name(function, cond_block)));
+        } else {
+            jump_if_open(function, body_final, block_name(function, cond_block));
         }
-
         current_block_ = end_block;
-        index = after_line(loop_line, limit);
-        return true;
     }
 
-    bool lower_for(AmirFunction& function, std::size_t begin, std::size_t line_end_index, std::size_t& index, std::size_t limit) {
-        if (begin + 1 >= line_end_index || !is_loop_variable_token(tokens_[begin + 1])) {
-            return false;
-        }
-        const std::size_t body_begin = after_line(begin, limit);
-        const std::size_t next_line = find_plain_terminator(body_begin, limit, TokenType::For, TokenType::Next);
-        if (next_line >= limit) {
-            return false;
-        }
-
-        const std::string loop_var = tokens_[begin + 1].lexeme;
-        const std::size_t in_index = find_line_token(begin + 2, line_end_index, TokenType::In);
-        if (in_index < line_end_index) {
-            return lower_for_each(function, begin, line_end_index, index, limit, loop_var, in_index, body_begin, next_line);
-        }
-
-        const std::size_t equal_index = find_line_token(begin + 2, line_end_index, TokenType::Equal);
-        const std::size_t to_index = find_line_token(begin + 2, line_end_index, TokenType::To);
-        if (equal_index >= line_end_index || to_index >= line_end_index || to_index <= equal_index + 1) {
-            return false;
-        }
-        const std::size_t step_index = find_line_token(to_index + 1, line_end_index, TokenType::Step);
+    void lower_for(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.children.size() < 2) return;
         const std::string end_name = hidden_name("for_end");
         const std::string step_name = hidden_name("for_step");
-
-        const std::string start = lower_expression(current_block(function), tokens_, equal_index + 1, to_index, temporary_);
-        current_block(function).instructions.push_back(amir_store(loop_var, start));
-        const std::string end_value = lower_expression(current_block(function), tokens_, to_index + 1, step_index < line_end_index ? step_index : line_end_index, temporary_);
-        current_block(function).instructions.push_back(amir_store(end_name, end_value));
-        if (step_index < line_end_index) {
-            const std::string step_value = lower_expression(current_block(function), tokens_, step_index + 1, line_end_index, temporary_);
-            current_block(function).instructions.push_back(amir_store(step_name, step_value));
+        current_block(function).instructions.push_back(amir_store(node.name, lower_expression(function, *node.children[0])));
+        current_block(function).instructions.push_back(amir_store(end_name, lower_expression(function, *node.children[1])));
+        if (node.children.size() >= 3) {
+            current_block(function).instructions.push_back(amir_store(step_name, lower_expression(function, *node.children[2])));
         } else {
             const std::string one = temp();
             current_block(function).instructions.push_back(amir_const(one, "1"));
@@ -1559,69 +928,64 @@ private:
         }
 
         const std::size_t cond_block = add_block(function, "ForCond");
-        const std::size_t pos_cond_block = add_block(function, "ForCondPos");
-        const std::size_t neg_cond_block = add_block(function, "ForCondNeg");
+        const std::size_t pos_block = add_block(function, "ForCondPos");
+        const std::size_t neg_block = add_block(function, "ForCondNeg");
         const std::size_t body_block = add_block(function, "ForBody");
         const std::size_t inc_block = add_block(function, "ForInc");
         const std::size_t end_block = add_block(function, "ForEnd");
         current_block(function).instructions.push_back(amir_jump(block_name(function, cond_block)));
 
         current_block_ = cond_block;
-        const std::string step_check_value = temp();
-        const std::string zero_check_value = temp();
-        const std::string positive_step = temp();
-        current_block(function).instructions.push_back(amir_load(step_check_value, step_name));
-        current_block(function).instructions.push_back(amir_const(zero_check_value, "0"));
-        current_block(function).instructions.push_back(amir_binary(positive_step, ">=", step_check_value, zero_check_value));
-        current_block(function).instructions.push_back(amir_branch(positive_step, block_name(function, pos_cond_block), block_name(function, neg_cond_block)));
+        const std::string step_check = temp();
+        const std::string zero = temp();
+        const std::string positive = temp();
+        current_block(function).instructions.push_back(amir_load(step_check, step_name));
+        current_block(function).instructions.push_back(amir_const(zero, "0"));
+        current_block(function).instructions.push_back(amir_binary(positive, ">=", step_check, zero));
+        current_block(function).instructions.push_back(
+            amir_branch(positive, block_name(function, pos_block), block_name(function, neg_block)));
 
-        current_block_ = pos_cond_block;
-        const std::string current = temp();
-        const std::string limit_value = temp();
-        const std::string condition = temp();
-        current_block(function).instructions.push_back(amir_load(current, loop_var));
-        current_block(function).instructions.push_back(amir_load(limit_value, end_name));
-        current_block(function).instructions.push_back(amir_binary(condition, "<=", current, limit_value));
-        current_block(function).instructions.push_back(amir_branch(condition, block_name(function, body_block), block_name(function, end_block)));
+        current_block_ = pos_block;
+        emit_for_comparison(function, node.name, end_name, "<=", body_block, end_block);
+        current_block_ = neg_block;
+        emit_for_comparison(function, node.name, end_name, ">=", body_block, end_block);
 
-        current_block_ = neg_cond_block;
-        const std::string neg_current = temp();
-        const std::string neg_limit_value = temp();
-        const std::string neg_condition = temp();
-        current_block(function).instructions.push_back(amir_load(neg_current, loop_var));
-        current_block(function).instructions.push_back(amir_load(neg_limit_value, end_name));
-        current_block(function).instructions.push_back(amir_binary(neg_condition, ">=", neg_current, neg_limit_value));
-        current_block(function).instructions.push_back(amir_branch(neg_condition, block_name(function, body_block), block_name(function, end_block)));
-
-        std::size_t body_cursor = body_begin;
-        loop_stack_.push_back(LoopTarget{TokenType::For, block_name(function, inc_block), block_name(function, end_block)});
-        const std::size_t body_final = lower_range(function, body_block, body_cursor, next_line, {});
+        current_block_ = body_block;
+        loop_stack_.push_back(LoopTarget{AstKind::For, block_name(function, inc_block), block_name(function, end_block)});
+        lower_statements(function, ast_group(node, "body"));
         loop_stack_.pop_back();
-        if (block(function, body_final).instructions.empty() || !is_terminal_instruction(block(function, body_final).instructions.back())) {
-            block(function, body_final).instructions.push_back(amir_jump(block_name(function, inc_block)));
-        }
+        const std::size_t body_final = current_block_;
+        jump_if_open(function, body_final, block_name(function, inc_block));
 
         current_block_ = inc_block;
         const std::string old_value = temp();
         const std::string step_value = temp();
         const std::string next_value = temp();
-        current_block(function).instructions.push_back(amir_load(old_value, loop_var));
+        current_block(function).instructions.push_back(amir_load(old_value, node.name));
         current_block(function).instructions.push_back(amir_load(step_value, step_name));
         current_block(function).instructions.push_back(amir_binary(next_value, "+", old_value, step_value));
-        current_block(function).instructions.push_back(amir_store(loop_var, next_value));
+        current_block(function).instructions.push_back(amir_store(node.name, next_value));
         current_block(function).instructions.push_back(amir_jump(block_name(function, cond_block)));
-
         current_block_ = end_block;
-        index = after_line(next_line, limit);
-        return true;
     }
 
-    bool lower_for_each(AmirFunction& function, std::size_t, std::size_t line_end_index, std::size_t& index, std::size_t limit, const std::string& loop_var,
-                        std::size_t in_index, std::size_t body_begin, std::size_t next_line) {
+    void emit_for_comparison(AmirFunction& function, const std::string& loop_var, const std::string& end_name,
+                             const std::string& op, std::size_t body_block, std::size_t end_block) {
+        const std::string current = temp();
+        const std::string limit = temp();
+        const std::string condition = temp();
+        current_block(function).instructions.push_back(amir_load(current, loop_var));
+        current_block(function).instructions.push_back(amir_load(limit, end_name));
+        current_block(function).instructions.push_back(amir_binary(condition, op, current, limit));
+        current_block(function).instructions.push_back(
+            amir_branch(condition, block_name(function, body_block), block_name(function, end_block)));
+    }
+
+    void lower_for_each(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.children.empty()) return;
         const std::string items_name = hidden_name("each_items");
         const std::string index_name = hidden_name("each_index");
-        const std::string iterable = lower_expression(current_block(function), tokens_, in_index + 1, line_end_index, temporary_);
-        current_block(function).instructions.push_back(amir_store(items_name, iterable));
+        current_block(function).instructions.push_back(amir_store(items_name, lower_expression(function, *node.children[0])));
         const std::string zero = temp();
         current_block(function).instructions.push_back(amir_const(zero, "0"));
         current_block(function).instructions.push_back(amir_store(index_name, zero));
@@ -1633,27 +997,26 @@ private:
         current_block(function).instructions.push_back(amir_jump(block_name(function, cond_block)));
 
         current_block_ = cond_block;
-        const std::string i_value = temp();
+        const std::string index = temp();
         const std::string items = temp();
         const std::string length = temp();
         const std::string condition = temp();
-        const std::string item = temp();
-        current_block(function).instructions.push_back(amir_load(i_value, index_name));
+        current_block(function).instructions.push_back(amir_load(index, index_name));
         current_block(function).instructions.push_back(amir_load(items, items_name));
         current_block(function).instructions.push_back(amir_call_value(length, "LEN", {items}));
-        current_block(function).instructions.push_back(amir_binary(condition, "<", i_value, length));
-        current_block(function).instructions.push_back(amir_branch(condition, block_name(function, body_block), block_name(function, end_block)));
+        current_block(function).instructions.push_back(amir_binary(condition, "<", index, length));
+        current_block(function).instructions.push_back(
+            amir_branch(condition, block_name(function, body_block), block_name(function, end_block)));
 
         current_block_ = body_block;
-        current_block(function).instructions.push_back(amir_index(item, items, i_value));
-        current_block(function).instructions.push_back(amir_store(loop_var, item));
-        std::size_t body_cursor = body_begin;
-        loop_stack_.push_back(LoopTarget{TokenType::For, block_name(function, inc_block), block_name(function, end_block)});
-        const std::size_t body_final = lower_range(function, body_block, body_cursor, next_line, {});
+        const std::string item = temp();
+        current_block(function).instructions.push_back(amir_index(item, items, index));
+        current_block(function).instructions.push_back(amir_store(node.name, item));
+        loop_stack_.push_back(LoopTarget{AstKind::For, block_name(function, inc_block), block_name(function, end_block)});
+        lower_statements(function, ast_group(node, "body"));
         loop_stack_.pop_back();
-        if (block(function, body_final).instructions.empty() || !is_terminal_instruction(block(function, body_final).instructions.back())) {
-            block(function, body_final).instructions.push_back(amir_jump(block_name(function, inc_block)));
-        }
+        const std::size_t body_final = current_block_;
+        jump_if_open(function, body_final, block_name(function, inc_block));
 
         current_block_ = inc_block;
         const std::string old_index = temp();
@@ -1664,194 +1027,124 @@ private:
         current_block(function).instructions.push_back(amir_binary(next_index, "+", old_index, one));
         current_block(function).instructions.push_back(amir_store(index_name, next_index));
         current_block(function).instructions.push_back(amir_jump(block_name(function, cond_block)));
-
         current_block_ = end_block;
-        index = after_line(next_line, limit);
-        return true;
     }
 
-    bool lower_select(AmirFunction& function, std::size_t begin, std::size_t line_end_index, std::size_t& index, std::size_t limit) {
-        if (begin + 1 >= line_end_index || tokens_[begin + 1].type != TokenType::Case) {
-            return false;
-        }
-        const std::size_t body_begin = after_line(begin, limit);
-        const std::size_t end_select = find_select_end(body_begin, limit);
-        if (end_select >= limit) {
-            return false;
-        }
-        const auto cases = find_select_cases(body_begin, end_select, limit);
-        if (cases.empty()) {
-            index = after_line(end_select, limit);
-            return true;
-        }
-
+    void lower_select(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.children.empty()) return;
         const std::string target_name = hidden_name("select_value");
-        const std::string select_value = lower_expression(current_block(function), tokens_, begin + 2, line_end_index, temporary_);
-        current_block(function).instructions.push_back(amir_store(target_name, select_value));
+        current_block(function).instructions.push_back(amir_store(target_name, lower_expression(function, *node.children[0])));
+        std::vector<CanonicalAstNodePtr> branches = ast_group(node, "branches");
+        const auto& else_body = ast_group(node, "else");
+        if (!else_body.empty()) {
+            auto else_branch = std::make_shared<CanonicalAstNode>();
+            else_branch->kind = AstKind::SelectBranch;
+            else_branch->groups.push_back(CanonicalAstGroup{"body", else_body});
+            branches.push_back(std::move(else_branch));
+        }
+        if (branches.empty()) return;
 
         const std::size_t end_block = add_block(function, "SelectEnd");
         std::vector<std::size_t> test_blocks;
         std::vector<std::size_t> body_blocks;
-        test_blocks.reserve(cases.size());
-        body_blocks.reserve(cases.size());
-        for (std::size_t i = 0; i < cases.size(); ++i) {
+        for (std::size_t i = 0; i < branches.size(); ++i) {
             test_blocks.push_back(add_block(function, "SelectCase"));
             body_blocks.push_back(add_block(function, "SelectBody"));
         }
         current_block(function).instructions.push_back(amir_jump(block_name(function, test_blocks.front())));
 
-        for (std::size_t i = 0; i < cases.size(); ++i) {
-            const std::size_t case_line = cases[i];
-            const std::size_t case_line_end = line_end(tokens_, case_line);
-            const std::size_t body_begin_for_case = after_line(case_line, limit);
-            const std::size_t body_end = i + 1 < cases.size() ? cases[i + 1] : end_select;
-            const std::string next_target = i + 1 < cases.size() ? block_name(function, test_blocks[i + 1]) : block_name(function, end_block);
-
+        for (std::size_t i = 0; i < branches.size(); ++i) {
             current_block_ = test_blocks[i];
-            if (case_line + 1 < case_line_end && tokens_[case_line + 1].type == TokenType::Else) {
+            const auto& matches = ast_group(*branches[i], "matches");
+            const std::string next = i + 1 < branches.size() ? block_name(function, test_blocks[i + 1])
+                                                              : block_name(function, end_block);
+            if (matches.empty()) {
                 current_block(function).instructions.push_back(amir_jump(block_name(function, body_blocks[i])));
             } else {
-                const std::string condition = lower_case_match(function, target_name, case_line + 1, case_line_end);
-                current_block(function).instructions.push_back(amir_branch(condition, block_name(function, body_blocks[i]), next_target));
+                const std::string condition = lower_select_matches(function, target_name, matches);
+                current_block(function).instructions.push_back(
+                    amir_branch(condition, block_name(function, body_blocks[i]), next));
             }
-
-            std::size_t body_cursor = body_begin_for_case;
-            const std::size_t body_final = lower_range(function, body_blocks[i], body_cursor, body_end, {});
-            if (block(function, body_final).instructions.empty() || !is_terminal_instruction(block(function, body_final).instructions.back())) {
-                block(function, body_final).instructions.push_back(amir_jump(block_name(function, end_block)));
-            }
+            current_block_ = body_blocks[i];
+            lower_statements(function, ast_group(*branches[i], "body"));
+            const std::size_t body_final = current_block_;
+            jump_if_open(function, body_final, block_name(function, end_block));
         }
-
         current_block_ = end_block;
-        index = after_line(end_select, limit);
-        return true;
     }
 
-    std::string lower_case_match(AmirFunction& function, const std::string& target_name, std::size_t begin, std::size_t end) {
-        std::vector<std::string> matches;
-        std::size_t part_begin = begin;
-        for (std::size_t cursor = begin; cursor <= end; ++cursor) {
-            if (cursor == end || tokens_[cursor].type == TokenType::Comma) {
-                const std::size_t to_index = find_line_token(part_begin, cursor, TokenType::To);
-                const std::string target = temp();
-                current_block(function).instructions.push_back(amir_load(target, target_name));
-                if (to_index < cursor) {
-                    const std::string start = lower_expression(current_block(function), tokens_, part_begin, to_index, temporary_);
-                    const std::string stop = lower_expression(current_block(function), tokens_, to_index + 1, cursor, temporary_);
-                    const std::string ge = temp();
-                    const std::string le = temp();
-                    const std::string both = temp();
-                    current_block(function).instructions.push_back(amir_binary(ge, ">=", target, start));
-                    current_block(function).instructions.push_back(amir_binary(le, "<=", target, stop));
-                    current_block(function).instructions.push_back(amir_binary(both, "&&", ge, le));
-                    matches.push_back(both);
-                } else {
-                    const std::string value = lower_expression(current_block(function), tokens_, part_begin, cursor, temporary_);
-                    const std::string equal = temp();
-                    current_block(function).instructions.push_back(amir_binary(equal, "==", target, value));
-                    matches.push_back(equal);
-                }
-                part_begin = cursor + 1;
+    std::string lower_select_matches(AmirFunction& function, const std::string& target_name,
+                                     const std::vector<CanonicalAstNodePtr>& matches) {
+        std::vector<std::string> conditions;
+        for (const auto& match : matches) {
+            if (match->children.empty()) continue;
+            const std::string target = temp();
+            current_block(function).instructions.push_back(amir_load(target, target_name));
+            if (match->children.size() >= 2) {
+                const std::string start = lower_expression(function, *match->children[0]);
+                const std::string stop = lower_expression(function, *match->children[1]);
+                const std::string ge = temp();
+                const std::string le = temp();
+                const std::string both = temp();
+                current_block(function).instructions.push_back(amir_binary(ge, ">=", target, start));
+                current_block(function).instructions.push_back(amir_binary(le, "<=", target, stop));
+                current_block(function).instructions.push_back(amir_binary(both, "&&", ge, le));
+                conditions.push_back(both);
+            } else {
+                const std::string value = lower_expression(function, *match->children[0]);
+                const std::string equal = temp();
+                current_block(function).instructions.push_back(amir_binary(equal, "==", target, value));
+                conditions.push_back(equal);
             }
         }
-        if (matches.empty()) {
-            const std::string false_value = temp();
-            current_block(function).instructions.push_back(amir_const(false_value, "false"));
-            return false_value;
+        if (conditions.empty()) {
+            const std::string value = temp();
+            current_block(function).instructions.push_back(amir_const(value, "false"));
+            return value;
         }
-        std::string result = matches.front();
-        for (std::size_t i = 1; i < matches.size(); ++i) {
+        std::string result = conditions.front();
+        for (std::size_t i = 1; i < conditions.size(); ++i) {
             const std::string next = temp();
-            current_block(function).instructions.push_back(amir_binary(next, "||", result, matches[i]));
+            current_block(function).instructions.push_back(amir_binary(next, "||", result, conditions[i]));
             result = next;
         }
         return result;
     }
 
-    bool lower_try(AmirFunction& function, std::size_t begin, std::size_t, std::size_t& index, std::size_t limit) {
-        const std::size_t body_begin = after_line(begin, limit);
-        const auto [catch_index, end_try] = find_try_parts(body_begin, limit);
-        if (end_try >= limit) {
-            return false;
-        }
-
+    void lower_try(AmirFunction& function, const CanonicalAstNode& node) {
         const std::size_t catch_block = add_block(function, "Catch");
         const std::size_t end_block = add_block(function, "TryEnd");
-        std::string error_name;
-        if (catch_index < end_try) {
-            const std::size_t catch_line_end = line_end(tokens_, catch_index);
-            if (catch_index + 1 < catch_line_end && tokens_[catch_index + 1].type == TokenType::Identifier) {
-                error_name = tokens_[catch_index + 1].lexeme;
-            }
+        current_block(function).instructions.push_back(amir_try_begin(block_name(function, catch_block), node.name));
+        lower_statements(function, ast_group(node, "try"));
+        const std::size_t try_final = current_block_;
+        if (block(function, try_final).instructions.empty() || !is_terminal_instruction(block(function, try_final).instructions.back())) {
+            block(function, try_final).instructions.push_back(amir_try_end());
+            block(function, try_final).instructions.push_back(amir_jump(block_name(function, end_block)));
         }
-        current_block(function).instructions.push_back(amir_try_begin(block_name(function, catch_block), error_name));
-
-        std::size_t try_cursor = body_begin;
-        const std::size_t try_limit = catch_index < end_try ? catch_index : end_try;
-        const std::size_t try_final = lower_range(function, current_block_, try_cursor, try_limit, {});
-        current_block_ = try_final;
-        current_block(function).instructions.push_back(amir_try_end());
-        current_block(function).instructions.push_back(amir_jump(block_name(function, end_block)));
-
-        std::size_t catch_final = catch_block;
-        if (catch_index < end_try) {
-            std::size_t catch_cursor = after_line(catch_index, limit);
-            catch_final = lower_range(function, catch_block, catch_cursor, end_try, {});
-        }
-        if (block(function, catch_final).instructions.empty() || !is_terminal_instruction(block(function, catch_final).instructions.back())) {
-            block(function, catch_final).instructions.push_back(amir_jump(block_name(function, end_block)));
-        }
-
+        current_block_ = catch_block;
+        lower_statements(function, ast_group(node, "catch"));
+        const std::size_t catch_final = current_block_;
+        jump_if_open(function, catch_final, block_name(function, end_block));
         current_block_ = end_block;
-        index = after_line(end_try, limit);
-        return true;
     }
 
-    std::pair<std::size_t, std::size_t> find_try_parts(std::size_t body_begin, std::size_t limit) const {
-        int depth = 0;
-        std::size_t catch_index = limit;
-        for (std::size_t index = body_begin; index < limit;) {
-            skip_newlines(index, limit);
-            const std::size_t begin = is_line_number(tokens_, index) ? index + 1 : index;
-            if (begin >= limit) {
-                break;
-            }
-            if (tokens_[begin].type == TokenType::Try) {
-                ++depth;
-            } else if (tokens_[begin].type == TokenType::Catch && depth == 0) {
-                catch_index = begin;
-            } else if (tokens_[begin].type == TokenType::EndKeyword && begin + 1 < limit && tokens_[begin + 1].type == TokenType::Try) {
-                if (depth == 0) {
-                    return {catch_index, begin};
-                }
-                --depth;
-            }
-            index = after_line(begin, limit);
-        }
-        return {catch_index, limit};
+    std::string parameter_text(const CanonicalAstParameter& param) const {
+        std::string result = param.name;
+        if (!param.type_name.empty()) result += " AS " + param.type_name;
+        if (param.default_value) result += " = " + render_ast_expression(*param.default_value);
+        return result;
     }
 
-    bool lower_function(AmirFunction& owner, std::size_t begin, std::size_t line_end_index, std::size_t& index, std::size_t limit) {
-        if (begin + 1 >= line_end_index || tokens_[begin + 1].type != TokenType::Identifier) {
-            return false;
-        }
-        const std::size_t body_begin = after_line(begin, limit);
-        const std::size_t end_function = find_end_pair(body_begin, limit, TokenType::Function, TokenType::Function);
-        if (end_function >= limit) {
-            return false;
-        }
-
+    void lower_function(AmirFunction& owner, const CanonicalAstNode& node) {
         AmirFunction function;
-        function.name = tokens_[begin + 1].lexeme;
-        function.return_type = "VALUE";
-        parse_function_signature(function, begin + 2, line_end_index);
+        function.name = node.name;
+        function.return_type = node.type_name.empty() ? "VALUE" : node.type_name;
+        for (const auto& param : node.parameters) function.params.push_back(parameter_text(param));
         std::vector<std::string> metadata;
         if (!function.params.empty()) {
             std::ostringstream params;
             for (std::size_t i = 0; i < function.params.size(); ++i) {
-                if (i > 0) {
-                    params << ',';
-                }
+                if (i > 0) params << ',';
                 params << function.params[i];
             }
             metadata.push_back("params=" + params.str());
@@ -1859,175 +1152,99 @@ private:
         metadata.push_back("returns=" + function.return_type);
         current_block(owner).instructions.push_back(amir_declare_function(function.name, metadata));
         function.blocks.push_back(AmirBlock{"Entry"});
+
         const std::size_t saved_block = current_block_;
+        const auto saved_loops = loop_stack_;
         current_block_ = 0;
-        std::size_t body_cursor = body_begin;
-        const std::size_t function_final = lower_range(function, 0, body_cursor, end_function, {});
-        if (function.blocks[function_final].instructions.empty() || !is_terminal_instruction(function.blocks[function_final].instructions.back())) {
-            function.blocks[function_final].instructions.push_back(amir_return("VALUE", "nothing"));
-        }
+        loop_stack_.clear();
+        lower_statements(function, ast_group(node, "body"));
+        ensure_terminated(function, current_block_, "VALUE", "nothing");
         current_block_ = saved_block;
+        loop_stack_ = saved_loops;
         module_.functions.push_back(std::move(function));
-        index = after_line(end_function, limit);
-        return true;
     }
 
-    void parse_function_signature(AmirFunction& function, std::size_t begin, std::size_t end) const {
-        std::size_t index = begin;
-        if (index < end && tokens_[index].type == TokenType::LeftParen) {
-            ++index;
-            while (index < end && tokens_[index].type != TokenType::RightParen) {
-                const std::size_t param_begin = index;
-                while (index < end && tokens_[index].type != TokenType::Comma && tokens_[index].type != TokenType::RightParen) {
-                    ++index;
-                }
-                function.params.push_back(join_expression(tokens_, param_begin, index));
-                if (index < end && tokens_[index].type == TokenType::Comma) {
-                    ++index;
-                }
-            }
-        }
-        for (; index < end; ++index) {
-            if (tokens_[index].type == TokenType::As && index + 1 < end) {
-                function.return_type = join_expression(tokens_, index + 1, end);
-                break;
-            }
-        }
-    }
-
-    bool lower_class_or_interface(AmirFunction& function, bool is_class, std::size_t begin, std::size_t& index, std::size_t limit) {
-        if (begin + 1 >= limit || tokens_[begin + 1].type != TokenType::Identifier) {
-            return false;
-        }
-        const TokenType closer = is_class ? TokenType::Class : TokenType::Interface;
-        const std::size_t body_begin = after_line(begin, limit);
-        const std::size_t end_decl = find_end_pair(body_begin, limit, closer, closer);
-        if (end_decl >= limit) {
-            return false;
-        }
+    void lower_class(AmirFunction& owner, const CanonicalAstNode& node) {
         std::vector<std::string> metadata;
-        const std::size_t header_end = line_end(tokens_, begin);
-        if (begin + 2 < header_end) {
-            metadata.push_back(join_expression(tokens_, begin + 2, header_end));
+        std::ostringstream header;
+        if (!node.secondary_name.empty()) header << "EXTENDS " << node.secondary_name;
+        if (!node.names.empty()) {
+            if (header.tellp() > 0) header << ' ';
+            header << "IMPLEMENTS";
+            for (const auto& name : node.names) header << ' ' << name;
         }
-        if (is_class) {
-            current_block(function).instructions.push_back(amir_declare_class(tokens_[begin + 1].lexeme, std::move(metadata)));
-            lower_class_methods(tokens_[begin + 1].lexeme, body_begin, end_decl);
-        } else {
-            current_block(function).instructions.push_back(amir_declare_interface(tokens_[begin + 1].lexeme, std::move(metadata)));
-        }
-        index = after_line(end_decl, limit);
-        return true;
-    }
+        if (header.tellp() > 0) metadata.push_back(header.str());
+        current_block(owner).instructions.push_back(amir_declare_class(node.name, std::move(metadata)));
 
-    void lower_class_methods(const std::string& class_name, std::size_t body_begin, std::size_t end_decl) {
-        for (std::size_t scan = body_begin; scan < end_decl;) {
-            skip_newlines(scan, end_decl);
-            std::size_t begin = is_line_number(tokens_, scan) ? scan + 1 : scan;
-            if (begin >= end_decl) {
-                break;
-            }
-            while (begin < end_decl && (tokens_[begin].type == TokenType::Shared || tokens_[begin].type == TokenType::Public ||
-                                        tokens_[begin].type == TokenType::Private || tokens_[begin].type == TokenType::Protected)) {
-                ++begin;
-            }
-            if (begin >= end_decl) {
-                break;
-            }
-            const bool constructor = tokens_[begin].type == TokenType::Constructor;
-            if (tokens_[begin].type != TokenType::Function && !constructor) {
-                scan = after_line(begin, end_decl);
-                continue;
-            }
-            const std::size_t line_end_index = line_end(tokens_, begin);
-            if (!constructor && (begin + 1 >= line_end_index || tokens_[begin + 1].type != TokenType::Identifier)) {
-                scan = after_line(begin, end_decl);
-                continue;
-            }
-            const std::size_t method_body = after_line(begin, end_decl);
-            const std::size_t method_end = constructor ? find_end_pair(method_body, end_decl, TokenType::Constructor, TokenType::Constructor)
-                                                       : find_end_pair(method_body, end_decl, TokenType::Function, TokenType::Function);
-            if (method_end >= end_decl) {
-                scan = after_line(begin, end_decl);
-                continue;
-            }
-
-            AmirFunction method;
-            method.name = constructor ? class_name + ".__new" : class_name + "." + tokens_[begin + 1].lexeme;
-            method.return_type = constructor ? "VALUE" : "VALUE";
-            parse_function_signature(method, constructor ? begin + 1 : begin + 2, line_end_index);
-            method.blocks.push_back(AmirBlock{"Entry"});
-
+        for (const auto& method : ast_group(node, "methods")) {
+            if (method->kind != AstKind::ClassMethod || method->flag2) continue;
+            AmirFunction function;
+            function.name = node.name + "." + method->name;
+            function.return_type = method->type_name.empty() ? "VALUE" : method->type_name;
+            for (const auto& param : method->parameters) function.params.push_back(parameter_text(param));
+            function.blocks.push_back(AmirBlock{"Entry"});
             const std::size_t saved_block = current_block_;
-            auto saved_loop_stack = loop_stack_;
-            loop_stack_.clear();
+            const auto saved_loops = loop_stack_;
             current_block_ = 0;
-            std::size_t body_cursor = method_body;
-            const std::size_t method_final = lower_range(method, 0, body_cursor, method_end, {});
-            if (method.blocks[method_final].instructions.empty() || !is_terminal_instruction(method.blocks[method_final].instructions.back())) {
-                method.blocks[method_final].instructions.push_back(amir_return("VALUE", "nothing"));
-            }
+            loop_stack_.clear();
+            lower_statements(function, ast_group(*method, "body"));
+            ensure_terminated(function, current_block_, "VALUE", "nothing");
             current_block_ = saved_block;
-            loop_stack_ = std::move(saved_loop_stack);
-            module_.functions.push_back(std::move(method));
-            scan = after_line(method_end, end_decl);
+            loop_stack_ = saved_loops;
+            module_.functions.push_back(std::move(function));
         }
-    }
-
-    bool contains_name(const std::vector<std::string>& names, const std::string& name) const {
-        for (const auto& candidate : names) {
-            if (candidate == name) {
-                return true;
-            }
-        }
-        return false;
     }
 
     void validate_module() {
         for (const auto& function : module_.functions) {
             std::vector<std::string> targets;
-            for (const auto& block : function.blocks) {
-                targets.push_back(block.name);
-                for (const auto& instruction : block.instructions) {
-                    if (instruction.kind == AmirInstruction::Kind::Label) {
-                        targets.push_back(instruction.target);
-                    }
+            for (const auto& current : function.blocks) {
+                targets.push_back(current.name);
+                for (const auto& instruction : current.instructions) {
+                    if (instruction.kind == AmirInstruction::Kind::Label) targets.push_back(instruction.target);
                 }
             }
-
-            for (const auto& block : function.blocks) {
-                if (block.instructions.empty()) {
-                    module_.diagnostics.push_back("empty block " + function.name + "." + block.name);
+            for (const auto& current : function.blocks) {
+                if (current.instructions.empty()) {
+                    module_.diagnostics.push_back("empty block " + function.name + "." + current.name);
                     continue;
                 }
-                if (!is_terminal_instruction(block.instructions.back())) {
-                    module_.diagnostics.push_back("unterminated block " + function.name + "." + block.name);
+                if (!is_terminal_instruction(current.instructions.back())) {
+                    module_.diagnostics.push_back("unterminated block " + function.name + "." + current.name);
                 }
-
-                for (const auto& instruction : block.instructions) {
+                for (const auto& instruction : current.instructions) {
                     if (instruction.kind == AmirInstruction::Kind::Unsupported && !instruction.operands.empty()) {
-                        module_.diagnostics.push_back("unsupported lowering in " + function.name + "." + block.name + ": " + instruction.operands.front());
+                        module_.diagnostics.push_back("unsupported lowering in " + function.name + "." + current.name + ": " +
+                                                      instruction.operands.front());
                     } else if (instruction.kind == AmirInstruction::Kind::Jump) {
-                        validate_target(function.name, block.name, instruction.target, targets);
+                        validate_target(function.name, current.name, instruction.target, targets);
                     } else if (instruction.kind == AmirInstruction::Kind::Branch && instruction.operands.size() >= 3) {
-                        validate_target(function.name, block.name, instruction.operands[1], targets);
-                        validate_target(function.name, block.name, instruction.operands[2], targets);
+                        validate_target(function.name, current.name, instruction.operands[1], targets);
+                        validate_target(function.name, current.name, instruction.operands[2], targets);
                     } else if (instruction.kind == AmirInstruction::Kind::TryBegin) {
-                        validate_target(function.name, block.name, instruction.target, targets);
+                        validate_target(function.name, current.name, instruction.target, targets);
                     }
                 }
             }
         }
     }
 
-    void validate_target(const std::string& function, const std::string& block, const std::string& target, const std::vector<std::string>& targets) {
-        if (!contains_name(targets, target)) {
-            module_.diagnostics.push_back("unresolved A-MIR target " + target + " from " + function + "." + block);
+    void validate_target(const std::string& function, const std::string& source_block, const std::string& target,
+                         const std::vector<std::string>& targets) {
+        bool found = false;
+        for (const auto& candidate : targets) {
+            if (candidate == target) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            module_.diagnostics.push_back("unresolved A-MIR target " + target + " from " + function + "." + source_block);
         }
     }
 
     AmirModule module_;
-    const std::vector<Token>& tokens_;
+    std::vector<CanonicalAstNodePtr> roots_;
     std::vector<LoopTarget> loop_stack_;
     int temporary_ = 0;
     int hidden_counter_ = 0;
@@ -2035,8 +1252,8 @@ private:
     std::size_t current_block_ = 0;
 };
 
-AmirModule build_amir(const std::vector<Token>& tokens, const std::string& source_name) {
-    return AmirBuilder(tokens, source_name).build();
+AmirModule build_amir(const std::vector<std::unique_ptr<Stmt>>& statements, const std::string& source_name) {
+    return AstAmirBuilder(statements, source_name).build();
 }
 
 void render_instruction(std::ostream& out, const AmirInstruction& instruction, const std::string& source_name) {
@@ -2076,6 +1293,12 @@ void render_instruction(std::ostream& out, const AmirInstruction& instruction, c
                 out << ' ' << operand;
             }
             out << "\n";
+            break;
+        case AmirInstruction::Kind::CpuHalt:
+            out << "    CPU.HALT\n";
+            break;
+        case AmirInstruction::Kind::CpuHaltForever:
+            out << "    CPU.HALT_FOREVER\n";
             break;
         case AmirInstruction::Kind::Array:
             out << "    " << instruction.result << " := ARRAY";
@@ -2457,6 +1680,14 @@ BytecodeModule build_bytecode(const AmirModule& amir) {
                         block.instructions.push_back(bytecode_instruction(BytecodeOp::CallExternal, std::move(operands)));
                         break;
                     }
+                    case AmirInstruction::Kind::CpuHalt:
+                        module.diagnostics.push_back("hardware semantic CPU.Halt is unsupported by hosted bytecode backend");
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::Unsupported, {"CPU.Halt"}));
+                        break;
+                    case AmirInstruction::Kind::CpuHaltForever:
+                        module.diagnostics.push_back("hardware semantic CPU.HaltForever is unsupported by hosted bytecode backend");
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::Unsupported, {"CPU.HaltForever"}));
+                        break;
                     case AmirInstruction::Kind::Array: {
                         std::vector<std::string> operands{instruction.result};
                         operands.insert(operands.end(), instruction.operands.begin(), instruction.operands.end());
@@ -2893,6 +2124,18 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 break;
             }
 
+            case AmirInstruction::Kind::CpuHalt:
+                result.text.hlt();
+                break;
+
+            case AmirInstruction::Kind::CpuHaltForever:
+                // Disable maskable interrupts, halt, and return to HLT if a non-maskable
+                // event resumes execution. EB FD jumps back three bytes to the HLT.
+                result.text.cli();
+                result.text.hlt();
+                result.text.jmp_rel8(-3);
+                break;
+
             case AmirInstruction::Kind::CallExternal: {
                 const auto dot = instruction.target.find('.');
                 if (dot == std::string::npos) {
@@ -2982,7 +2225,11 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                                                 static_cast<std::uint8_t>(argument_slot));
                 }
 
-                result.text.call_indirect_disp8(Reg::RAX, static_cast<std::uint8_t>(final_field->offset_bytes));
+                if (final_field->offset_bytes <= 0x7F) {
+                    result.text.call_indirect_disp8(Reg::RAX, static_cast<std::uint8_t>(final_field->offset_bytes));
+                } else {
+                    result.text.call_indirect_disp32(Reg::RAX, static_cast<std::uint32_t>(final_field->offset_bytes));
+                }
                 result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(slot_of(instruction.result)), Reg::RAX);
                 break;
             }
@@ -3704,9 +2951,9 @@ Result reveal_amir(const std::string& source, const std::string& source_name) {
         auto tokens = lexer.scan_tokens();
 
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
-        (void)parser.parse();
+        auto statements = parser.parse();
 
-        return {true, render_amir(build_amir(tokens, source_name)), ""};
+        return {true, render_amir(build_amir(statements, source_name)), ""};
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }
@@ -3728,9 +2975,9 @@ Result reveal_callconv(const std::string& source, const std::string& source_name
         auto tokens = lexer.scan_tokens();
 
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
-        (void)parser.parse();
+        auto statements = parser.parse();
 
-        return {true, render_calling_convention(build_amir(tokens, source_name)), ""};
+        return {true, render_calling_convention(build_amir(statements, source_name)), ""};
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }
@@ -3752,9 +2999,9 @@ Result reveal_x86_64(const std::string& source, const std::string& source_name, 
         auto tokens = lexer.scan_tokens();
 
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
-        (void)parser.parse();
+        auto statements = parser.parse();
 
-        const auto codegen = generate_x86_64_function(build_amir(tokens, source_name), entry_function);
+        const auto codegen = generate_x86_64_function(build_amir(statements, source_name), entry_function);
         if (!codegen.ok) {
             return {false, "", codegen.error};
         }
@@ -3781,9 +3028,9 @@ Result build_efi_image(const std::string& source, const std::string& source_name
         auto tokens = lexer.scan_tokens();
 
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
-        (void)parser.parse();
+        auto statements = parser.parse();
 
-        const auto codegen = generate_x86_64_function(build_amir(tokens, source_name), entry_function);
+        const auto codegen = generate_x86_64_function(build_amir(statements, source_name), entry_function);
         if (!codegen.ok) {
             return {false, "", codegen.error};
         }
@@ -3833,9 +3080,9 @@ Result reveal_bytecode(const std::string& source, const std::string& source_name
         auto tokens = lexer.scan_tokens();
 
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
-        (void)parser.parse();
+        auto statements = parser.parse();
 
-        const AmirModule amir = build_amir(tokens, source_name);
+        const AmirModule amir = build_amir(statements, source_name);
         return {true, render_bytecode(build_bytecode(amir)), ""};
     } catch (const std::exception& error) {
         return {false, "", error.what()};
@@ -3878,12 +3125,12 @@ Result compile_run(const std::string& source, const std::string& source_name) {
         auto tokens = lexer.scan_tokens();
 
         Parser parser(tokens, preprocess_runtime.compile_metadata().runtime_mode == "NONE");
-        (void)parser.parse();
+        auto statements = parser.parse();
 
         Runtime runtime;
         std::ostringstream output;
         runtime.set_output(output);
-        (void)execute_bytecode(build_bytecode(build_amir(tokens, source_name)), runtime);
+        (void)execute_bytecode(build_bytecode(build_amir(statements, source_name)), runtime);
         return {true, output.str(), ""};
     } catch (const std::exception& error) {
         return {false, "", error.what()};
@@ -3906,9 +3153,9 @@ Result build_native_file(const std::string& path, const std::string& output_path
         auto tokens = lexer.scan_tokens();
 
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
-        (void)parser.parse();
+        auto statements = parser.parse();
 
-        const AmirModule amir = build_amir(tokens, path);
+        const AmirModule amir = build_amir(statements, path);
         const std::string bytecode = render_bytecode(build_bytecode(amir));
         return build_native_bytecode(bytecode, output_path);
     } catch (const std::exception& error) {

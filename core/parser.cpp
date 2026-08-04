@@ -174,6 +174,30 @@ std::string ast_value(const Value& value) {
     return value.to_string();
 }
 
+CanonicalAstNodePtr canonical_node(AstKind kind) {
+    auto node = std::make_shared<CanonicalAstNode>();
+    node->kind = kind;
+    return node;
+}
+
+CanonicalAstNodePtr canonical_statement_node(AstKind kind, const Stmt& statement) {
+    auto node = canonical_node(kind);
+    node->source_line = statement.source_line;
+    node->source_column = statement.source_column;
+    node->line_label = statement.line_label;
+    return node;
+}
+
+CanonicalAstGroup canonical_group(std::string role, const std::vector<std::unique_ptr<Stmt>>& statements) {
+    CanonicalAstGroup group;
+    group.role = std::move(role);
+    group.nodes.reserve(statements.size());
+    for (const auto& statement : statements) {
+        group.nodes.push_back(statement->canonical_ast());
+    }
+    return group;
+}
+
 std::string ast_token_name(TokenType type) {
     switch (type) {
         case TokenType::Plus: return "+";
@@ -255,12 +279,20 @@ private:
 };
 
 struct LiteralExpr final : Expr {
-    explicit LiteralExpr(Value value) : value(std::move(value)) {}
+    explicit LiteralExpr(Value value, std::string source_text = "")
+        : value(std::move(value)), source_text(std::move(source_text)) {}
     Value eval(Runtime&) const override { return value; }
     void dump_ast(std::ostream& output, int indent) const override {
         ast_line(output, indent, "Literal " + ast_value(value));
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Literal);
+        node->literal = value;
+        node->text = source_text.empty() ? ast_value(value) : source_text;
+        return node;
+    }
     Value value;
+    std::string source_text;
 };
 
 struct InterpolatedStringExpr final : Expr {
@@ -325,6 +357,11 @@ struct InterpolatedStringExpr final : Expr {
     void dump_ast(std::ostream& output, int indent) const override {
         ast_line(output, indent, "InterpolatedString " + ast_quote(text));
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::InterpolatedString);
+        node->text = text;
+        return node;
+    }
     std::string text;
 };
 
@@ -333,6 +370,11 @@ struct VariableExpr final : Expr {
     Value eval(Runtime& runtime) const override { return runtime.get_global(name); }
     void dump_ast(std::ostream& output, int indent) const override {
         ast_line(output, indent, "Variable " + name);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Variable);
+        node->name = name;
+        return node;
     }
     std::string name;
 };
@@ -356,6 +398,12 @@ struct UnaryExpr final : Expr {
         ast_line(output, indent, "Unary " + ast_token_name(op));
         right->dump_ast(output, indent + 1);
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Unary);
+        node->op = op;
+        node->children.push_back(right->canonical_ast());
+        return node;
+    }
     TokenType op;
     std::unique_ptr<Expr> right;
 };
@@ -373,6 +421,13 @@ struct BinaryExpr final : Expr {
         ast_line(output, indent, "Binary " + ast_token_name(op));
         left->dump_ast(output, indent + 1);
         right->dump_ast(output, indent + 1);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Binary);
+        node->op = op;
+        node->children.push_back(left->canonical_ast());
+        node->children.push_back(right->canonical_ast());
+        return node;
     }
 
     std::unique_ptr<Expr> left;
@@ -401,6 +456,13 @@ struct LogicalExpr final : Expr {
         ast_line(output, indent, "Logical " + ast_token_name(op));
         left->dump_ast(output, indent + 1);
         right->dump_ast(output, indent + 1);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Logical);
+        node->op = op;
+        node->children.push_back(left->canonical_ast());
+        node->children.push_back(right->canonical_ast());
+        return node;
     }
 
     std::unique_ptr<Expr> left;
@@ -434,6 +496,14 @@ struct CallExpr final : Expr {
         for (const auto& arg : args) {
             arg->dump_ast(output, indent + 1);
         }
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Call);
+        node->name = name;
+        for (const auto& arg : args) {
+            node->children.push_back(arg->canonical_ast());
+        }
+        return node;
     }
 
     std::string name;
@@ -472,6 +542,16 @@ struct MethodCallExpr final : Expr {
             arg->dump_ast(output, indent + 1);
         }
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::MethodCall);
+        node->name = full_name;
+        node->secondary_name = receiver;
+        node->text = method;
+        for (const auto& arg : args) {
+            node->children.push_back(arg->canonical_ast());
+        }
+        return node;
+    }
 
     std::string full_name;
     std::string receiver;
@@ -497,6 +577,15 @@ struct SuperCallExpr final : Expr {
         for (const auto& arg : args) {
             arg->dump_ast(output, indent + 1);
         }
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::SuperCall);
+        node->name = class_name;
+        node->secondary_name = method;
+        for (const auto& arg : args) {
+            node->children.push_back(arg->canonical_ast());
+        }
+        return node;
     }
 
     std::string class_name;
@@ -532,6 +621,12 @@ struct IndexExpr final : Expr {
         ast_line(output, indent + 1, "IndexValue");
         index->dump_ast(output, indent + 2);
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Index);
+        node->children.push_back(target->canonical_ast());
+        node->children.push_back(index->canonical_ast());
+        return node;
+    }
     std::unique_ptr<Expr> target;
     std::unique_ptr<Expr> index;
 };
@@ -552,6 +647,13 @@ struct ArrayExpr final : Expr {
             item->dump_ast(output, indent + 1);
         }
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Array);
+        for (const auto& item : items) {
+            node->children.push_back(item->canonical_ast());
+        }
+        return node;
+    }
     std::vector<std::unique_ptr<Expr>> items;
 };
 
@@ -571,6 +673,13 @@ struct ObjectExpr final : Expr {
             expr->dump_ast(output, indent + 2);
         }
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Object);
+        for (const auto& [key, expr] : fields) {
+            node->named_children.emplace_back(key, expr->canonical_ast());
+        }
+        return node;
+    }
     std::vector<std::pair<std::string, std::unique_ptr<Expr>>> fields;
 };
 
@@ -583,6 +692,11 @@ struct PrintStmt final : Stmt {
     void dump_ast(std::ostream& output, int indent) const override {
         ast_line(output, indent, "Print");
         expr->dump_ast(output, indent + 1);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Print, *this);
+        node->children.push_back(expr->canonical_ast());
+        return node;
     }
     std::unique_ptr<Expr> expr;
 };
@@ -613,6 +727,17 @@ struct AssignStmt final : Stmt {
         ast_line(output, indent + 1, "Value");
         expr->dump_ast(output, indent + 2);
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Assign, *this);
+        node->name = name;
+        node->type_name = type_name;
+        node->integer = static_cast<int>(indexes.size());
+        for (const auto& index : indexes) {
+            node->children.push_back(index->canonical_ast());
+        }
+        node->children.push_back(expr->canonical_ast());
+        return node;
+    }
     std::string name;
     std::vector<std::unique_ptr<Expr>> indexes;
     std::unique_ptr<Expr> expr;
@@ -630,6 +755,13 @@ struct CompoundAssignStmt final : Stmt {
     void dump_ast(std::ostream& output, int indent) const override {
         ast_line(output, indent, "CompoundAssign " + name + " " + ast_token_name(op));
         expr->dump_ast(output, indent + 1);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::CompoundAssign, *this);
+        node->name = name;
+        node->op = op;
+        node->children.push_back(expr->canonical_ast());
+        return node;
     }
     std::string name;
     TokenType op;
@@ -660,6 +792,13 @@ struct FlagOperationStmt final : Stmt {
         ast_line(output, indent, "FlagOperation " + name + " " + ast_token_name(op));
         mask->dump_ast(output, indent + 1);
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::FlagOperation, *this);
+        node->name = name;
+        node->op = op;
+        node->children.push_back(mask->canonical_ast());
+        return node;
+    }
     std::string name;
     TokenType op;
     std::unique_ptr<Expr> mask;
@@ -682,8 +821,32 @@ struct FlagsStmt final : Stmt {
             expr->dump_ast(output, indent + 2);
         }
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Flags, *this);
+        node->name = name;
+        for (const auto& [field, expr] : fields) {
+            node->named_children.emplace_back(field, expr->canonical_ast());
+        }
+        return node;
+    }
     std::string name;
     std::vector<std::pair<std::string, std::unique_ptr<Expr>>> fields;
+};
+
+struct HardwareSemanticStmt final : Stmt {
+    explicit HardwareSemanticStmt(std::string operation) : operation(std::move(operation)) {}
+    void exec(Runtime&) const override {
+        throw std::runtime_error(operation + " requires a freestanding compiler target");
+    }
+    void dump_ast(std::ostream& output, int indent) const override {
+        ast_line(output, indent, "HardwareSemantic " + operation);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::HardwareSemantic, *this);
+        node->name = operation;
+        return node;
+    }
+    std::string operation;
 };
 
 struct ExprStmt final : Stmt {
@@ -696,6 +859,11 @@ struct ExprStmt final : Stmt {
         ast_line(output, indent, "ExpressionStatement");
         expr->dump_ast(output, indent + 1);
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::ExpressionStatement, *this);
+        node->children.push_back(expr->canonical_ast());
+        return node;
+    }
     std::unique_ptr<Expr> expr;
 };
 
@@ -705,6 +873,9 @@ struct NoOpStmt final : Stmt {
     }
     void dump_ast(std::ostream& output, int indent) const override {
         ast_line(output, indent, "NoOp");
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        return canonical_statement_node(AstKind::NoOp, *this);
     }
 };
 
@@ -719,6 +890,13 @@ struct ReturnStmt final : Stmt {
         if (value) {
             value->dump_ast(output, indent + 1);
         }
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Return, *this);
+        if (value) {
+            node->children.push_back(value->canonical_ast());
+        }
+        return node;
     }
     std::unique_ptr<Expr> value;
 };
@@ -843,6 +1021,20 @@ struct FunctionStmt final : Stmt {
         }
         ast_line(output, indent + 1, "Body");
         dump_stmt_list(output, indent + 2, *body);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Function, *this);
+        node->name = name;
+        node->type_name = return_type;
+        for (const auto& param : params) {
+            node->parameters.push_back(CanonicalAstParameter{
+                param.name,
+                param.type_name,
+                param.default_value ? param.default_value->canonical_ast() : nullptr,
+            });
+        }
+        node->groups.push_back(canonical_group("body", *body));
+        return node;
     }
 
     std::string name;
@@ -1086,6 +1278,52 @@ struct ClassStmt final : Stmt {
             }
         }
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Class, *this);
+        node->name = name;
+        node->secondary_name = parent;
+        node->names = interfaces;
+
+        CanonicalAstGroup field_group;
+        field_group.role = "fields";
+        for (const auto& field : fields) {
+            auto field_node = canonical_node(AstKind::ClassField);
+            field_node->name = field.name;
+            field_node->type_name = field.type_name;
+            field_node->flag = field.shared;
+            field_node->integer = field.access;
+            if (field.default_value) {
+                field_node->children.push_back(field.default_value->canonical_ast());
+            }
+            field_group.nodes.push_back(std::move(field_node));
+        }
+        node->groups.push_back(std::move(field_group));
+
+        CanonicalAstGroup method_group;
+        method_group.role = "methods";
+        for (const auto& method : methods) {
+            auto method_node = canonical_node(AstKind::ClassMethod);
+            method_node->name = method.name;
+            method_node->secondary_name = method.super_class;
+            method_node->type_name = method.return_type;
+            method_node->flag = method.shared;
+            method_node->flag2 = method.abstract;
+            method_node->integer = method.access;
+            for (const auto& param : method.params) {
+                method_node->parameters.push_back(CanonicalAstParameter{
+                    param.name,
+                    param.type_name,
+                    param.default_value ? param.default_value->canonical_ast() : nullptr,
+                });
+            }
+            if (method.body) {
+                method_node->groups.push_back(canonical_group("body", *method.body));
+            }
+            method_group.nodes.push_back(std::move(method_node));
+        }
+        node->groups.push_back(std::move(method_group));
+        return node;
+    }
 
     std::string name;
     std::string parent;
@@ -1115,6 +1353,23 @@ struct InterfaceStmt final : Stmt {
                 }
             }
         }
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Interface, *this);
+        node->name = name;
+        CanonicalAstGroup method_group;
+        method_group.role = "methods";
+        for (const auto& method : methods) {
+            auto method_node = canonical_node(AstKind::InterfaceMethod);
+            method_node->name = method.name;
+            method_node->type_name = method.return_type;
+            for (const auto& type : method.param_types) {
+                method_node->parameters.push_back(CanonicalAstParameter{"", type, nullptr});
+            }
+            method_group.nodes.push_back(std::move(method_node));
+        }
+        node->groups.push_back(std::move(method_group));
+        return node;
     }
     std::string name;
     std::vector<MethodSignature> methods;
@@ -1151,6 +1406,13 @@ struct TryStmt final : Stmt {
         ast_line(output, indent + 1, error_name.empty() ? "Catch" : "Catch " + error_name);
         dump_stmt_list(output, indent + 2, catch_body);
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Try, *this);
+        node->name = error_name;
+        node->groups.push_back(canonical_group("try", try_body));
+        node->groups.push_back(canonical_group("catch", catch_body));
+        return node;
+    }
     std::vector<std::unique_ptr<Stmt>> try_body;
     std::string error_name;
     std::vector<std::unique_ptr<Stmt>> catch_body;
@@ -1165,6 +1427,11 @@ struct GotoStmt final : Stmt {
     void dump_ast(std::ostream& output, int indent) const override {
         ast_line(output, indent, "Goto " + std::to_string(line));
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Goto, *this);
+        node->integer = line;
+        return node;
+    }
     int line;
 };
 
@@ -1175,6 +1442,9 @@ struct StopStmt final : Stmt {
     }
     void dump_ast(std::ostream& output, int indent) const override {
         ast_line(output, indent, "Stop");
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        return canonical_statement_node(AstKind::Stop, *this);
     }
 };
 
@@ -1188,6 +1458,12 @@ struct LoopControlStmt final : Stmt {
         std::string text = action == LoopControlAction::Exit ? "Exit " : "Continue ";
         text += target == LoopControlTarget::For ? "For" : "While";
         ast_line(output, indent, text);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::LoopControl, *this);
+        node->flag = action == LoopControlAction::Continue;
+        node->integer = static_cast<int>(target);
+        return node;
     }
     LoopControlAction action;
     LoopControlTarget target;
@@ -1203,6 +1479,11 @@ struct BlockStmt final : Stmt {
     void dump_ast(std::ostream& output, int indent) const override {
         ast_line(output, indent, "Block");
         dump_stmt_list(output, indent + 1, statements);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Block, *this);
+        node->groups.push_back(canonical_group("body", statements));
+        return node;
     }
     std::vector<std::unique_ptr<Stmt>> statements;
 };
@@ -1227,6 +1508,13 @@ struct IfStmt final : Stmt {
             ast_line(output, indent + 1, "Else");
             dump_stmt_list(output, indent + 2, else_branch);
         }
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::If, *this);
+        node->children.push_back(condition->canonical_ast());
+        node->groups.push_back(canonical_group("then", then_branch));
+        node->groups.push_back(canonical_group("else", else_branch));
+        return node;
     }
     std::unique_ptr<Expr> condition;
     std::vector<std::unique_ptr<Stmt>> then_branch;
@@ -1304,6 +1592,31 @@ struct SelectStmt final : Stmt {
             dump_stmt_list(output, indent + 2, else_branch);
         }
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Select, *this);
+        node->children.push_back(target->canonical_ast());
+        CanonicalAstGroup branch_group;
+        branch_group.role = "branches";
+        for (const auto& branch : branches) {
+            auto branch_node = canonical_node(AstKind::SelectBranch);
+            CanonicalAstGroup match_group;
+            match_group.role = "matches";
+            for (const auto& match : branch.matches) {
+                auto match_node = canonical_node(AstKind::SelectMatch);
+                match_node->children.push_back(match.start->canonical_ast());
+                if (match.end) {
+                    match_node->children.push_back(match.end->canonical_ast());
+                }
+                match_group.nodes.push_back(std::move(match_node));
+            }
+            branch_node->groups.push_back(std::move(match_group));
+            branch_node->groups.push_back(canonical_group("body", branch.body));
+            branch_group.nodes.push_back(std::move(branch_node));
+        }
+        node->groups.push_back(std::move(branch_group));
+        node->groups.push_back(canonical_group("else", else_branch));
+        return node;
+    }
 
     std::unique_ptr<Expr> target;
     std::vector<SelectBranch> branches;
@@ -1337,6 +1650,12 @@ struct WhileStmt final : Stmt {
         condition->dump_ast(output, indent + 2);
         ast_line(output, indent + 1, "Body");
         dump_stmt_list(output, indent + 2, body);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::While, *this);
+        node->children.push_back(condition->canonical_ast());
+        node->groups.push_back(canonical_group("body", body));
+        return node;
     }
     std::unique_ptr<Expr> condition;
     std::vector<std::unique_ptr<Stmt>> body;
@@ -1387,6 +1706,20 @@ struct DoStmt final : Stmt {
             post_condition->dump_ast(output, indent + 2);
         }
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Do, *this);
+        node->flag = pre_until;
+        node->flag2 = post_until;
+        node->integer = pre_condition ? 1 : 0;
+        if (pre_condition) {
+            node->children.push_back(pre_condition->canonical_ast());
+        }
+        if (post_condition) {
+            node->children.push_back(post_condition->canonical_ast());
+        }
+        node->groups.push_back(canonical_group("body", body));
+        return node;
+    }
 
     std::unique_ptr<Expr> pre_condition;
     bool pre_until = false;
@@ -1435,6 +1768,17 @@ struct ForStmt final : Stmt {
         ast_line(output, indent + 1, "Body");
         dump_stmt_list(output, indent + 2, body);
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::For, *this);
+        node->name = name;
+        node->children.push_back(start->canonical_ast());
+        node->children.push_back(end->canonical_ast());
+        if (step) {
+            node->children.push_back(step->canonical_ast());
+        }
+        node->groups.push_back(canonical_group("body", body));
+        return node;
+    }
     std::string name;
     std::unique_ptr<Expr> start;
     std::unique_ptr<Expr> end;
@@ -1475,6 +1819,13 @@ struct ForEachStmt final : Stmt {
         ast_line(output, indent + 1, "Body");
         dump_stmt_list(output, indent + 2, body);
     }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::ForEach, *this);
+        node->name = name;
+        node->children.push_back(iterable->canonical_ast());
+        node->groups.push_back(canonical_group("body", body));
+        return node;
+    }
     std::string name;
     std::unique_ptr<Expr> iterable;
     std::vector<std::unique_ptr<Stmt>> body;
@@ -1486,6 +1837,10 @@ void Expr::dump_ast(std::ostream& output, int indent) const {
     ast_line(output, indent, "Expr");
 }
 
+CanonicalAstNodePtr Expr::canonical_ast() const {
+    return canonical_node(AstKind::Unsupported);
+}
+
 void Stmt::dump_ast(std::ostream& output, int indent) const {
     std::string header = "Stmt";
     if (line_label >= 0) {
@@ -1493,6 +1848,10 @@ void Stmt::dump_ast(std::ostream& output, int indent) const {
     }
     header += " @" + std::to_string(source_line) + ":" + std::to_string(source_column);
     ast_line(output, indent, header);
+}
+
+CanonicalAstNodePtr Stmt::canonical_ast() const {
+    return canonical_statement_node(AstKind::Unsupported, *this);
 }
 
 Parser::Parser(std::vector<Token> tokens, bool freestanding_runtime_none)
@@ -1805,7 +2164,9 @@ Parser::StmtPtr Parser::statement() {
         parsed = flags_statement();
     } else if (check(TokenType::Identifier)) {
         const std::string statement_name = uppercase(peek().lexeme);
-        if ((statement_name == "EXIT" || statement_name == "CONTINUE") && current_ + 1 < tokens_.size() &&
+        if (statement_name == "CPU.HALT" || statement_name == "CPU.HALTFOREVER") {
+            parsed = hardware_semantic_statement();
+        } else if ((statement_name == "EXIT" || statement_name == "CONTINUE") && current_ + 1 < tokens_.size() &&
             (tokens_[current_ + 1].type == TokenType::For || tokens_[current_ + 1].type == TokenType::While || tokens_[current_ + 1].type == TokenType::Do)) {
             parsed = loop_control_statement();
         } else if (current_ + 1 < tokens_.size() && (tokens_[current_ + 1].type == TokenType::PlusEqual ||
@@ -1917,6 +2278,13 @@ Parser::StmtPtr Parser::flags_statement() {
     consume(TokenType::EndKeyword, "expected END FLAGS");
     consume(TokenType::Flags, "expected FLAGS after END");
     return std::make_unique<FlagsStmt>(name.lexeme, std::move(fields));
+}
+
+Parser::StmtPtr Parser::hardware_semantic_statement() {
+    const Token operation = consume(TokenType::Identifier, "expected hardware semantic operation");
+    return std::make_unique<HardwareSemanticStmt>(uppercase(operation.lexeme) == "CPU.HALT"
+        ? "CPU.Halt"
+        : "CPU.HaltForever");
 }
 
 Parser::StmtPtr Parser::expression_statement() {
@@ -2457,19 +2825,19 @@ Parser::ExprPtr Parser::call() {
 
 Parser::ExprPtr Parser::primary() {
     if (match(TokenType::FalseKeyword)) {
-        return std::make_unique<LiteralExpr>(false);
+        return std::make_unique<LiteralExpr>(false, "false");
     }
     if (match(TokenType::TrueKeyword)) {
-        return std::make_unique<LiteralExpr>(true);
+        return std::make_unique<LiteralExpr>(true, "true");
     }
     if (match(TokenType::NullKeyword)) {
-        return std::make_unique<LiteralExpr>(Value());
+        return std::make_unique<LiteralExpr>(Value(), "null");
     }
     if (match(TokenType::Number)) {
-        return std::make_unique<LiteralExpr>(previous().number);
+        return std::make_unique<LiteralExpr>(previous().number, previous().lexeme);
     }
     if (match(TokenType::String)) {
-        return std::make_unique<LiteralExpr>(previous().lexeme);
+        return std::make_unique<LiteralExpr>(previous().lexeme, ast_quote(previous().lexeme));
     }
     if (match(TokenType::InterpolatedString)) {
         return std::make_unique<InterpolatedStringExpr>(previous().lexeme);

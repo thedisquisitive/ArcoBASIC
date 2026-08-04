@@ -6,7 +6,8 @@
 
 namespace arco::systems {
 
-// The smallest safe UEFI text-output binding surface (Packet WP-006). Field offsets are computed
+// The smallest safe UEFI text-output plus watchdog binding surface (Packets WP-006 and WP-023).
+// Field offsets are computed
 // for x86-64 natural alignment (8-byte pointers) from the TianoCore EDK2 reference implementation
 // of the UEFI Specification -- MdePkg/Include/Uefi/UefiSpec.h (EFI_SYSTEM_TABLE),
 // MdePkg/Include/Uefi/UefiMultiPhase.h (EFI_TABLE_HEADER), and
@@ -49,6 +50,18 @@ inline std::optional<UefiType> lookup_uefi_type(const std::string& name) {
             120,
             {
                 UefiField{"ConsoleOut", "ConOut", 0x40, "UEFI.SimpleTextOutputProtocol", false, false, ""},
+                UefiField{"BootServices", "BootServices", 0x60, "UEFI.BootServices", false, false, ""},
+            },
+        };
+    }
+    if (name == "UEFI.BootServices") {
+        return UefiType{
+            "UEFI.BootServices",
+            376,
+            {
+                // EFI_SET_WATCHDOG_TIMER is a service-table function, not a protocol method:
+                // its four explicit parameters begin in RCX and there is no implicit This.
+                UefiField{"SetWatchdogTimer", "SetWatchdogTimer", 0x100, "", true, false, "U64"},
             },
         };
     }

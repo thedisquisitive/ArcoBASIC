@@ -1827,6 +1827,25 @@ int main() {
         }
         {
             Assembler asm_;
+            asm_.call_indirect_disp32(Reg::RAX, 0x100);
+            require(bytes_equal(asm_.bytes(), {0xFF, 0x90, 0x00, 0x01, 0x00, 0x00}),
+                    "call qword [rax+disp32] matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.hlt();
+            require(bytes_equal(asm_.bytes(), {0xF4}), "hlt matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.cli();
+            asm_.hlt();
+            asm_.jmp_rel8(-3);
+            require(bytes_equal(asm_.bytes(), {0xFA, 0xF4, 0xEB, 0xFD}),
+                    "CPU.HaltForever sequence matches nasm");
+        }
+        {
+            Assembler asm_;
             asm_.mov_reg_imm64(Reg::RAX, 0);
             require(bytes_equal(asm_.bytes(), {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0}),
                     "mov rax, imm64(0) uses the full 10-byte form, matching nasm's `strict qword` output "

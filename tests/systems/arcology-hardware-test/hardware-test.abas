@@ -1,0 +1,11 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+#EXPORT "efi_main"
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("ARCOLOGY HARDWARE TEST\r\n\r\nHello from ArcoBASIC\r\n\r\nSystem halted intentionally.\r\n")
+    CPU.HaltForever
+END FUNCTION

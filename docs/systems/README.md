@@ -15,6 +15,9 @@ docs/systems/utf16-encoding.md       UTF-8 -> null-terminated UTF-16 constant en
 docs/systems/x86-64-codegen.md       The instruction encoder and single-function code generator
 docs/systems/pe32-image.md           The PE32+ writer, including the RELOCS_STRIPPED pitfall
 docs/systems/qemu-ovmf-harness.md    The reusable QEMU/OVMF boot-and-verify harness
+docs/systems/frontend-amir-contract.md  Authoritative AST -> A-MIR compiler contract
+docs/systems/hardware-semantics.md   CPU.Halt and CPU.HaltForever semantics/lowering
+docs/systems/arcology-hardware-bringup.md  Reproducible USB image and hardware checklist
 ```
 
 `.agents/reports/` holds one completion report per work package (`WP-000-repository-audit.md`
@@ -45,6 +48,9 @@ instruction encoder and PE writer against ground truth from tools that don't sha
 own reasoning. **None of them are required** to build, test, or use ArcoFission -- they were
 verification aids, not dependencies (docs/systems/x86-64-codegen.md, docs/systems/pe32-image.md).
 
+Python 3 is required only by `scripts/build-arcology-hardware-image.py`, which serializes the
+deterministic FAT32 USB image without depending on host filesystem-formatting utilities.
+
 ## Build Commands
 
 ```sh
@@ -73,8 +79,9 @@ Runs every test, including the systems-specific ones added by this mission
 (`systems_fixed_width_types_smoke`, `systems_freestanding_profile_smoke`,
 `systems_amir_primitives_smoke`, `systems_calling_convention_smoke`, `systems_uefi_bindings_smoke`,
 `systems_utf16_encoding_smoke`, `systems_x86_64_codegen_smoke`, `systems_pe_image_smoke`,
-`systems_qemu_ovmf_harness_smoke`). The last one skips gracefully (not a failure) if QEMU/OVMF are
-not installed. To run only the systems tests:
+`systems_qemu_ovmf_harness_smoke`, `systems_frontend_amir_contract_smoke`,
+`systems_hardware_semantics_smoke`, and `systems_arcology_hardware_artifact_smoke`). Firmware tests
+skip gracefully (not a failure) if QEMU/OVMF are not installed. To run only the systems tests:
 
 ```sh
 ctest --output-on-failure -R '^systems_'
@@ -84,6 +91,13 @@ To boot a built image directly, outside the test suite:
 
 ```sh
 scripts/run-uefi-hello.sh hello.efi "Hello from ArcoBASIC"
+```
+
+To build and boot-test Packet 002's USB-ready Arcology Seed artifact:
+
+```sh
+scripts/build-arcology-hardware-artifact.sh
+scripts/run-arcology-hardware-image.sh dist/arcology-seed-0.1/arcology-seed-0.1-x86_64.img
 ```
 
 ## Target Syntax
@@ -127,11 +141,17 @@ END FUNCTION
   (`docs/systems/uefi-target.md` section 7).
 - A-MIR representation of external/ABI-bound calls, distinct from ordinary host/stdlib calls
   (`.agents/reports/WP-004-amir-systems-primitives.md`).
+- A canonical compiler-facing AST consumed directly by A-MIR lowering; the compiler no longer
+  reparses the token stream (`docs/systems/frontend-amir-contract.md`).
 - The Microsoft x64 calling convention, including automatic injection of the implicit `This`
   argument real UEFI protocol methods require (`docs/systems/x86-64-codegen.md`).
 - `UEFI.SystemTable.ConsoleOut` (`EFI_SYSTEM_TABLE.ConOut`, offset `0x40`) and
   `UEFI.SimpleTextOutputProtocol.Write` (`EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString`, offset
   `0x08`), verified against the TianoCore EDK2 reference headers (`docs/systems/uefi-bindings.md`).
+- `UEFI.SystemTable.BootServices.SetWatchdogTimer` at offsets `0x60` then `0x100`, used narrowly to
+  disable the firmware watchdog before the intentional hardware-test halt.
+- Architecture-independent `CPU.Halt` and terminal `CPU.HaltForever` A-MIR operations, lowered by
+  the x86-64 backend to `HLT` and `CLI; HLT; JMP -3` respectively.
 - UTF-16 string constant encoding with correct surrogate-pair handling
   (`docs/systems/utf16-encoding.md`).
 - A single-function x86-64 code generator (prologue/epilogue, uniform spill-based value handling,
@@ -151,8 +171,9 @@ END FUNCTION
   documented, narrower-than-planned scope decision -- see `.agents/reports/
   WP-003-freestanding-profile.md` DEVIATIONS), but not lowered by the code generator either, so a
   program using them under `--target uefi-x86_64` fails at the X86_64 codegen stage.
-- **UEFI binding surface**: only `ConsoleOut`/`Write` are bound. Every other `EFI_SYSTEM_TABLE`
-  field (`ConIn`, `RuntimeServices`, `BootServices`, ...) and every other
+- **UEFI binding surface**: only `ConsoleOut`/`Write` and the narrow
+  `BootServices`/`SetWatchdogTimer` chain are bound. Every other `EFI_SYSTEM_TABLE`
+  field (`ConIn`, `RuntimeServices`, ...) and every other
   `EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL` method (`Reset`, `ClearScreen`, ...) is rejected with a
   diagnostic naming what is bound instead (`docs/systems/uefi-bindings.md`).
 - **Floating point, SIMD, interrupts, MMIO, page tables, DMA, PCI, USB, networking, multicore,
@@ -170,7 +191,7 @@ END FUNCTION
 |---|---|---|
 | `Unknown compilation profile: X` / `Unsupported architecture for the UEFI profile: X` | Only `#PROFILE UEFI` and `#TARGET X86_64` are accepted this milestone | `docs/systems/uefi-target.md` |
 | `... is not available under #RUNTIME NONE` | A hosted-runtime construct (`PRINT`, `File.*`, etc.) was used in a freestanding program | `docs/systems/uefi-target.md` section 7 |
-| `UEFI.SystemTable has no bound field or method "X" in this milestone. Bound fields: ConsoleOut.` | Only the listed UEFI surface is bound; `X` is real UEFI but not implemented here, or not real at all | `docs/systems/uefi-bindings.md` |
+| `UEFI.SystemTable has no bound field or method "X" ... Bound fields: ConsoleOut, BootServices.` | Only the listed UEFI surface is bound; `X` is real UEFI but not implemented here, or not real at all | `docs/systems/uefi-bindings.md` |
 | `string argument cannot be encoded as UTF-16: ...` | A string literal passed to a UEFI call had an embedded NUL byte or malformed UTF-8 | `docs/systems/utf16-encoding.md` |
 | `function "X" has control flow beyond a single straight-line block, which this milestone's code generator does not support` | The program uses `IF`/`WHILE`/`FOR`/etc.; the code generator only handles one block | `docs/systems/x86-64-codegen.md` |
 | `ERROR: qemu-system-x86_64 was not found` / `no OVMF UEFI firmware image was found` | Install guidance is printed directly to stderr; nothing is downloaded automatically | `docs/systems/qemu-ovmf-harness.md` |
@@ -184,16 +205,13 @@ ArcoBASIC source (.abas)
         |
     Lexer + shared preprocessor (#PROFILE/#RUNTIME/#TARGET/#CALLCONV/#EXPORT handled here)
         |
-    Parser -- builds the AST AND performs every compile-time systems check:
+    Parser -- builds the authoritative canonical AST and performs compile-time systems checks:
         |     fixed-width literal ranges, freestanding-profile rejections,
         |     UEFI field-chain resolution, UTF-16 constant validation
         |
         +-- (for `reveal ... at AST`: rendered directly from here)
         |
-    AmirBuilder -- ***re-derives structure from the raw token stream independently of the
-        |          AST above*** (a real, load-bearing architectural fact discovered during
-        |          this mission -- see .agents/reports/WP-000-repository-audit.md; any new
-        |          grammar must be taught to both the parser AND this builder)
+    AstAmirBuilder -- consumes that AST directly; it never receives or reinterprets lexer tokens
         |
         +-- A-MIR (typed function signatures, CallExternal for ABI-bound calls, ...)
         |
@@ -221,3 +239,4 @@ beyond the shared lexer, preprocessor, and parser-level validation.
 | `ArcoFission build FILE -o OUT.efi --target uefi-x86_64` | `OUT.efi`, wherever specified -- a self-contained PE32+ file; nothing else is written |
 | `ArcoFission reveal FILE at X86_64` | printed to stdout only; no file is written (use shell redirection to save it) |
 | `scripts/run-uefi-hello.sh` | no artifacts left behind -- its temporary FAT boot directory is created under `mktemp -d` and removed on exit, success or failure |
+| `scripts/build-arcology-hardware-artifact.sh` | `dist/arcology-seed-0.1/{BOOTX64.EFI,arcology-seed-0.1-x86_64.img,SHA256SUMS}` |
