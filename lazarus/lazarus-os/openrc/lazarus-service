@@ -4,10 +4,14 @@ name="Arcology Lazarus service"
 description="Privileged backend for Arcology Lazarus imaging operations"
 command="/usr/sbin/lazarus-service"
 command_args="--config /etc/arcology-lazarus/bench.profile --socket /run/arcology-lazarus/service.sock"
-command_background="yes"
+supervisor="supervise-daemon"
 pidfile="/run/arcology-lazarus/lazarus-service.pid"
 output_log="/var/log/arcology-lazarus/service.log"
 error_log="/var/log/arcology-lazarus/service.log"
+respawn_delay=1
+# This service is the appliance's safety boundary. A hardware-specific failure
+# must not leave every imaging workflow permanently dead until the next reboot.
+respawn_max=0
 
 depend() {
 	need localmount dev-settle
@@ -17,14 +21,37 @@ depend() {
 }
 
 start_pre() {
+	rm -f /run/arcology-lazarus/service.sock
 	checkpath -d -m 0755 /run/arcology-lazarus
 	checkpath -d -m 0750 -o root:lazarus /var/lib/arcology-lazarus
 	checkpath -d -m 0750 -o root:lazarus /var/log/arcology-lazarus
-	if [ -w /dev/ttyS0 ]; then
-		echo "lazarus-hardware: coldplug-complete" >/dev/ttyS0
-		lsblk -dn -o NAME,TYPE,SIZE,MODEL,SERIAL >/dev/ttyS0 2>&1 || true
-		echo "lazarus-core-inventory: begin" >/dev/ttyS0
-		/usr/bin/lazarus devices >/dev/ttyS0 2>&1 || true
-		echo "lazarus-core-inventory: end" >/dev/ttyS0
-	fi
+}
+
+start_post() {
+	for _ in $(seq 1 100); do
+		if [ -S /run/arcology-lazarus/service.sock ]; then
+			# A physical UART with no reader can block after its small transmit
+			# buffer fills. Inventory is diagnostic-only, so run it after the
+			# service is ready and enforce a hard deadline around the entire
+			# serial writer. It must never hold the service startup path.
+			if [ -w /dev/ttyS0 ]; then
+				timeout 15 /bin/sh -c '
+					echo "lazarus-service: socket ready"
+					echo "lazarus-hardware: coldplug-complete"
+					lsblk -dn -o NAME,TYPE,SIZE,MODEL,SERIAL 2>&1 || true
+					echo "lazarus-core-inventory: begin"
+					/usr/bin/lazarus devices 2>&1 || true
+					echo "lazarus-core-inventory: end"
+				' >/dev/ttyS0 2>/dev/null &
+			fi
+			return 0
+		fi
+		sleep 0.1
+	done
+	eerror "Lazarus service did not create its socket within 10 seconds."
+	return 1
+}
+
+stop_post() {
+	rm -f /run/arcology-lazarus/service.sock
 }

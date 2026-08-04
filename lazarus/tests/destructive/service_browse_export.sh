@@ -20,11 +20,17 @@ service_pid=
 destination_mount="$root/destination"
 
 cleanup() {
+    status=$?
+    if [ "$status" -ne 0 ] && [ -f "$root/service.log" ]; then
+        echo "Lazarus service log:" >&2
+        tail -n 80 "$root/service.log" >&2 || true
+    fi
     [ -z "$service_pid" ] || kill "$service_pid" 2>/dev/null || true
     umount "$destination_mount" 2>/dev/null || true
     qemu-nbd --disconnect "$source_device" 2>/dev/null || true
     qemu-nbd --disconnect "$destination_device" 2>/dev/null || true
     rm -rf "$root"
+    return "$status"
 }
 trap cleanup EXIT INT TERM
 
@@ -36,7 +42,7 @@ cat >"$profile" <<EOF
 name=Browse Export Integration
 image_storage=$root/images
 source=/sys/block/nbd8
-removable_media=/sys/block/nbd9
+removable_media=/dev/nbd9
 EOF
 
 image_directory="$root/images/T-BROWSE/Test/fixture.laz"

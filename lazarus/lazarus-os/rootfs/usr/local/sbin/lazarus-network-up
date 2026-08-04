@@ -136,6 +136,7 @@ for interface in $wired_interfaces; do
 			IFS=$old_ifs
 		fi
 		echo "$(date -Iseconds) $interface: static address $address/$prefix applied." >> "$log"
+		/usr/local/sbin/lazarus-mount-storage >>/var/log/arcology-lazarus/storage.log 2>&1 &
 		continue
 	fi
 

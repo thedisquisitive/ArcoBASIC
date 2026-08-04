@@ -4,10 +4,24 @@ set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
+# This must precede every external command. If early userspace cannot even
+# prepare BusyBox, the physical console still shows exactly where boot stopped.
+echo "lazarus-live: Entered initramfs /init."
+
 /usr/bin/busybox --install -s
 
 message() {
-	echo "lazarus-live: $*"
+	line="lazarus-live: $*"
+	echo "$line"
+	# tty0 is the primary console on physical machines. Keep a separate serial
+	# copy for headless diagnostics and the QEMU smoke tests.
+	serial_console=/dev/ttyS0
+	if [ ! -w "$serial_console" ] && [ -w /sysroot/dev/ttyS0 ]; then
+		serial_console=/sysroot/dev/ttyS0
+	fi
+	if [ -w "$serial_console" ]; then
+		echo "$line" >"$serial_console" 2>/dev/null || true
+	fi
 }
 
 rescue_shell() {
@@ -41,6 +55,7 @@ mount -t proc -o noexec,nosuid,nodev proc /proc
 mount -t sysfs -o noexec,nosuid,nodev sysfs /sys
 mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
 
+message "Early filesystems mounted."
 message "Loading USB, storage, and filesystem drivers."
 for module in \
 	scsi_mod sd_mod \
@@ -50,7 +65,8 @@ for module in \
 	ahci libahci libata ata_piix ata_generic \
 	mmc_core mmc_block sdhci sdhci_pci \
 	virtio_pci virtio_blk \
-	isofs loop
+	isofs loop \
+	ext4
 do
 	modprobe "$module" 2>/dev/null || true
 done
@@ -92,9 +108,21 @@ done
 
 [ -n "${bootdev:-}" ] || rescue_shell "Could not find Arcology Lazarus boot media."
 message "Boot media mounted from $bootdev."
+installer_media=false
+[ ! -f /media/boot/boot/lazarus-installer.flag ] || installer_media=true
 
 mount -t squashfs -o ro,loop /media/boot/boot/rootfs.squashfs /media/root-ro || \
 	rescue_shell "Could not mount /boot/rootfs.squashfs."
+
+# The squashfs loop keeps its backing inode alive after ISO9660 is unmounted. Releasing the whole
+# hybrid disk is necessary before Linux will allow its appended state partition to be mounted.
+boot_media_released=false
+if umount /media/boot 2>/dev/null; then
+	boot_media_released=true
+	message "Boot filesystem released after the live root was attached."
+else
+	message "Boot filesystem remains busy; using a bounded partition mapping for USB state."
+fi
 
 mount -t tmpfs -o mode=0755 tmpfs /sysroot || rescue_shell "Could not mount live tmpfs root."
 mkdir -p /sysroot/.root-ro /sysroot/.root-rw /sysroot/.root-work
@@ -102,15 +130,85 @@ mount --move /media/root-ro /sysroot/.root-ro
 mount -t overlay -o lowerdir=/sysroot/.root-ro,upperdir=/sysroot/.root-rw,workdir=/sysroot/.root-work overlay /sysroot || \
 	rescue_shell "Could not create writable live overlay."
 
+# Hybrid live USBs carry a small ext4 partition immediately after the boot payload. Only inspect
+# partition 4 of the media that supplied this live root; never adopt a same-labeled state partition
+# from a customer's disk or an installed Lazarus appliance.
+case "$bootdev" in
+	/dev/nvme*n*|/dev/mmcblk*|/dev/loop*|/dev/nbd*) state_device="${bootdev}p4" ;;
+	/dev/sd*|/dev/vd*) state_device="${bootdev}4" ;;
+	*) state_device="" ;;
+esac
+if [ -n "$state_device" ]; then
+	for _ in $(seq 1 20); do
+		mdev -s 2>/dev/null || true
+		[ -b "$state_device" ] && break
+		sleep 0.1
+	done
+fi
+if [ -n "$state_device" ] && [ -b "$state_device" ] &&
+   blkid "$state_device" 2>/dev/null | grep -q 'LABEL="LAZARUS_STATE"'; then
+	mkdir -p /sysroot/var/lib/arcology-lazarus
+	state_source="$state_device"
+	state_mounted=false
+	if [ "$boot_media_released" = true ] &&
+	   mount -t ext4 -o rw,nosuid,nodev "$state_source" /sysroot/var/lib/arcology-lazarus; then
+		state_mounted=true
+	elif [ -r "/sys/class/block/${state_device##*/}/start" ]; then
+		# ISO9660 can retain an exclusive claim on the hybrid whole-disk node while its
+		# squashfs loop is active. Map only the trusted partition-4 byte range from that
+		# same boot device so the non-overlapping ext4 state filesystem remains writable.
+		state_offset_sectors="$(cat "/sys/class/block/${state_device##*/}/start")"
+		state_loop="$(losetup -f 2>/dev/null || true)"
+		if [ -n "$state_loop" ] &&
+		   losetup -o "$((state_offset_sectors * 512))" "$state_loop" "$bootdev" 2>/dev/null &&
+		   mount -t ext4 -o rw,nosuid,nodev "$state_loop" /sysroot/var/lib/arcology-lazarus; then
+			state_source="$state_loop"
+			state_mounted=true
+		else
+			[ -z "${state_loop:-}" ] || losetup -d "$state_loop" 2>/dev/null || true
+		fi
+	fi
+	if [ "$state_mounted" = true ]; then
+		state_probe=/sysroot/var/lib/arcology-lazarus/.lazarus-write-test
+		if touch "$state_probe" 2>/dev/null; then
+			rm -f "$state_probe"
+		else
+			umount /sysroot/var/lib/arcology-lazarus 2>/dev/null || true
+			[ -z "${state_loop:-}" ] || losetup -d "$state_loop" 2>/dev/null || true
+			state_mounted=false
+		fi
+	fi
+	if [ "$state_mounted" = true ]; then
+		state_root=/sysroot/var/lib/arcology-lazarus
+		mkdir -p "$state_root/config" /sysroot/etc/arcology-lazarus
+		for file in bench.profile network.conf; do
+			persistent="$state_root/config/$file"
+			active="/sysroot/etc/arcology-lazarus/$file"
+			if [ ! -f "$persistent" ]; then
+				cp "$active" "$persistent"
+			fi
+			mount --bind "$persistent" "$active"
+		done
+		chmod 0644 "$state_root/config/bench.profile" "$state_root/config/network.conf"
+		message "Writable live appliance state mounted from $state_device via $state_source."
+	else
+		message "Live state partition $state_device could not be mounted; continuing with volatile state."
+	fi
+else
+	message "No writable state partition was found on the boot media; continuing with volatile state."
+fi
+
 mkdir -p /sysroot/proc /sysroot/sys /sysroot/dev /sysroot/run /sysroot/media/boot
 mount --move /proc /sysroot/proc
 mount --move /sys /sysroot/sys
 mount --move /dev /sysroot/dev
 mount --move /run /sysroot/run
-mount --move /media/boot /sysroot/media/boot
+if [ "$boot_media_released" != true ]; then
+	mount --move /media/boot /sysroot/media/boot
+fi
 
 message "Switching to Arcology Lazarus OS."
-if [ -f /sysroot/media/boot/boot/lazarus-installer.flag ]; then
+if [ "$installer_media" = true ]; then
 	message "Installer media marker detected."
 	chvt 1 2>/dev/null || true
 	exec switch_root /sysroot /usr/local/sbin/lazarus-install-os

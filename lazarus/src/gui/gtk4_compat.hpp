@@ -64,7 +64,7 @@ inline void lazarus_box_pack_start(GtkBox* box, GtkWidget* child, gboolean, gboo
 
 inline void lazarus_box_pack_end(GtkBox* box, GtkWidget* child, gboolean, gboolean expand, guint) {
     gtk_widget_set_hexpand(child, expand);
-    gtk_box_prepend(box, child);
+    gtk_box_append(box, child);
 }
 
 inline GtkWidget* lazarus_scrolled_window_new() { return gtk_scrolled_window_new(); }

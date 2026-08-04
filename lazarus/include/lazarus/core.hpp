@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -108,6 +109,11 @@ struct BenchProfile {
     std::string image_storage_device;
     std::string image_storage_volume;
     std::vector<std::string> image_storage_port_paths;
+    std::string nas_storage_protocol;
+    std::string nas_storage_server;
+    std::string nas_storage_share;
+    std::string nas_storage_username;
+    std::string nas_storage_domain;
     BrandingTheme branding;
 };
 
@@ -154,6 +160,11 @@ struct ProgressEvent {
     std::uint64_t chunks_done = 0;
     std::uint64_t chunks_total = 0;
     bool indeterminate = false;
+    // Average throughput and estimated time remaining since this operation started, computed
+    // centrally so UI code never has to infer state (timing, smoothing) from raw byte counts.
+    // Both are 0 when not yet computable (too little elapsed time, or bytes_total unknown).
+    std::uint64_t bytes_per_second = 0;
+    std::uint64_t eta_seconds = 0;
 };
 
 using ProgressCallback = std::function<void(const ProgressEvent&)>;
@@ -229,6 +240,8 @@ struct PartitionInfo {
     std::uint64_t size_bytes = 0;
     FileSystemKind filesystem = FileSystemKind::Unknown;
     bool ntfs_detected = false;
+    bool logical = false;
+    bool extended_container = false;
 };
 
 struct DiskInspection {
@@ -268,7 +281,9 @@ struct ImageWriteResult {
     std::uint64_t bytes_read = 0;
     std::uint64_t bytes_written = 0;
     std::uint64_t bytes_stored = 0;
+    std::uint64_t zero_bytes_elided = 0;
     std::uint64_t chunks_written = 0;
+    std::uint64_t zero_chunks_elided = 0;
     std::uint64_t resumed_bytes = 0;
     std::uint64_t resumed_chunks = 0;
     bool incomplete_marker_created = false;
@@ -340,6 +355,28 @@ struct ImageBrowseCacheResult {
     bool prepared = false;
     std::vector<std::string> facts;
     std::vector<SafetyFinding> findings;
+};
+
+// Provides authenticated random access to a finalized Lazarus logical disk.
+// Opening validates the image envelope and chunk map only; individual chunks
+// are decompressed and SHA-256 checked when a caller actually reads them.
+class LogicalImageReader {
+public:
+    static std::unique_ptr<LogicalImageReader> open(const std::string& image_directory,
+                                                    std::string& error);
+    ~LogicalImageReader();
+
+    LogicalImageReader(const LogicalImageReader&) = delete;
+    LogicalImageReader& operator=(const LogicalImageReader&) = delete;
+
+    std::uint64_t size_bytes() const;
+    bool read_at(std::uint64_t offset, std::size_t byte_count,
+                 std::vector<std::byte>& output, std::string& error) const;
+
+private:
+    struct Impl;
+    explicit LogicalImageReader(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
 };
 
 struct SmartAttribute {
@@ -431,6 +468,26 @@ struct DriverMigrationPlan {
     std::vector<SafetyFinding> findings;
 };
 
+struct BootRepairFindingsOptions {
+    bool gpt_valid = false;
+    bool esp_present = false;
+    bool bootmgfw_present = false;
+    bool fallback_loader_present = false;
+    bool fallback_loader_matches_bootmgfw = false;
+    bool windows_partition_present = false;
+    bool winload_present = false;
+    bool bcd_present = false;
+    bool bcd_readable = false;
+};
+
+struct BootRepairPlan {
+    BootRepairFindingsOptions observed;
+    bool fallback_repair_needed = false;
+    bool ready_for_servicing = false;
+    std::vector<std::string> facts;
+    std::vector<SafetyFinding> findings;
+};
+
 std::string version();
 std::string to_string(DeviceRole role);
 std::string to_string(ImagingMode mode);
@@ -438,6 +495,7 @@ std::string to_string(CompressionMode mode);
 std::string to_string(Severity severity);
 std::string to_string(PartitionKind kind);
 std::string to_string(FileSystemKind kind);
+bool is_appliance_system_mountpoint(const std::string& path);
 
 bool is_complete(const JobInfo& job);
 std::vector<SafetyFinding> validate_job(const JobInfo& job);
@@ -465,6 +523,7 @@ DriverPackageInspection inspect_driver_package(const std::string& package_root);
 DriverMigrationPlan create_driver_migration_plan(
     const DriverMigrationPlanOptions& options,
     const std::vector<DriverPackageInspection>& packages);
+BootRepairPlan evaluate_boot_repair(const BootRepairFindingsOptions& observed);
 SupportBundleManifest create_support_bundle_manifest();
 std::vector<DeviceIdentity> discover_block_devices();
 

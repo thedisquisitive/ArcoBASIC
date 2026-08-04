@@ -5,6 +5,8 @@ service=$1
 root=$(mktemp -d)
 security="$root/admin.auth"
 backup="$root/persistent/admin.auth"
+technicians="$root/technicians.auth"
+technicians_backup="$root/persistent/technicians.auth"
 profile="$root/bench.profile"
 requests="$root/requests"
 responses="$root/responses"
@@ -18,7 +20,9 @@ trap cleanup EXIT INT TERM
 printf 'name=Security Test\nimage_storage=%s/images\n' "$root" > "$profile"
 mkdir -p "$root/images" "$(dirname "$backup")"
 mkfifo "$requests" "$responses"
-"$service" --config "$profile" --security "$security" --security-backup "$backup" --stdio <"$requests" >"$responses" 2>"$root/service.log" &
+"$service" --config "$profile" --security "$security" --security-backup "$backup" \
+    --technicians "$technicians" --technicians-backup "$technicians_backup" \
+    --stdio <"$requests" >"$responses" 2>"$root/service.log" &
 pid=$!
 exec 3>"$requests"
 exec 4<"$responses"
@@ -58,6 +62,17 @@ new_recovery=$(printf '%s\n' "$rotate" | sed -n 's/.*"recovery_key":"\([^"]*\)".
 cmp "$security" "$backup"
 call "{\"command\":\"admin_login\",\"recovery_key\":\"$recovery\"}" | grep -q '"ok":false'
 call "{\"command\":\"admin_login\",\"recovery_key\":\"$new_recovery\"}" | grep -q '"ok":true'
+call '{"command":"technician_add","name":"Bench Tech","pin":"2468"}' | grep -q '"ok":false'
+call "{\"command\":\"technician_add\",\"admin_token\":\"$token\",\"name\":\"Bench Tech\",\"pin\":\"24\"}" |
+    grep -q 'exactly 4 digits'
+call "{\"command\":\"technician_add\",\"admin_token\":\"$token\",\"name\":\"Bench Tech\",\"pin\":\"2468\"}" |
+    grep -q '"pin_assigned":true'
+call '{"command":"technician_verify","name":"Bench Tech","pin":"2468"}' | grep -q '"ok":true'
+call "{\"command\":\"technician_set_pin\",\"admin_token\":\"$token\",\"name\":\"Bench Tech\",\"pin\":\"1357\"}" |
+    grep -q '"pin_assigned":true'
+call '{"command":"technician_verify","name":"Bench Tech","pin":"2468"}' | grep -q '"ok":false'
+call '{"command":"technician_verify","name":"Bench Tech","pin":"1357"}' | grep -q '"ok":true'
+cmp "$technicians" "$technicians_backup"
 
 # Simulate the next live boot restoring the persistent credential mirror.
 exec 3>&-
@@ -65,10 +80,13 @@ exec 4<&-
 kill "$pid"
 wait "$pid" 2>/dev/null || true
 pid=
-rm -f "$requests" "$responses" "$security"
+rm -f "$requests" "$responses" "$security" "$technicians"
 cp "$backup" "$security"
+cp "$technicians_backup" "$technicians"
 mkfifo "$requests" "$responses"
-"$service" --config "$profile" --security "$security" --security-backup "$backup" --stdio <"$requests" >"$responses" 2>>"$root/service.log" &
+"$service" --config "$profile" --security "$security" --security-backup "$backup" \
+    --technicians "$technicians" --technicians-backup "$technicians_backup" \
+    --stdio <"$requests" >"$responses" 2>>"$root/service.log" &
 pid=$!
 exec 3>"$requests"
 exec 4<"$responses"
@@ -77,9 +95,16 @@ printf '%s\n' "$login" | grep -q '"ok":true'
 token=$(printf '%s\n' "$login" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 [ -n "$token" ]
 call "{\"command\":\"admin_login\",\"recovery_key\":\"$new_recovery\"}" | grep -q '"ok":true'
+call '{"command":"technician_verify","name":"Bench Tech","pin":"1357"}' | grep -q '"ok":true'
 call "{\"command\":\"configure_image_storage\",\"admin_token\":\"$token\",\"selector\":\"/dev/does-not-exist\",\"mode\":\"format\",\"confirmation\":\"NO\"}" |
     grep -q 'Type ERASE before formatting the entire storage disk'
 call "{\"command\":\"configure_image_storage\",\"admin_token\":\"$token\",\"selector\":\"/dev/does-not-exist\",\"mode\":\"format\",\"confirmation\":\"ERASE\"}" |
     grep -q 'selected storage disk is no longer connected'
 call "{\"command\":\"configure_image_storage\",\"admin_token\":\"$token\",\"selector\":\"/dev/does-not-exist\",\"mode\":\"erase\",\"confirmation\":\"ERASE\"}" |
     grep -q 'selected storage disk is no longer connected'
+call "{\"command\":\"configure_nas_storage\",\"admin_token\":\"$token\",\"protocol\":\"ftp\",\"server\":\"nas.example\",\"share\":\"Backups\",\"directory\":\"images\"}" |
+    grep -q 'Choose SMB or NFS'
+call "{\"command\":\"configure_nas_storage\",\"admin_token\":\"$token\",\"protocol\":\"smb\",\"server\":\"bad/server\",\"share\":\"Backups\",\"directory\":\"images\",\"username\":\"backup\",\"password\":\"secret\"}" |
+    grep -q 'hostname or IP address without slashes'
+call "{\"command\":\"configure_nas_storage\",\"admin_token\":\"$token\",\"protocol\":\"nfs\",\"server\":\"nas.example\",\"share\":\"relative/export\",\"directory\":\"images\"}" |
+    grep -q 'absolute path beginning with /'

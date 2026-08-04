@@ -252,6 +252,12 @@ void write_oversized_mbr_fixture(const std::filesystem::path& path) {
 }  // namespace
 
 int main() {
+    require(lazarus::is_appliance_system_mountpoint("/"), "root must identify its backing disk as system storage");
+    require(lazarus::is_appliance_system_mountpoint("/boot/efi"), "the EFI mount must identify its backing disk as system storage");
+    require(lazarus::is_appliance_system_mountpoint("/media/boot"), "live boot media must remain protected as system storage");
+    require(!lazarus::is_appliance_system_mountpoint("/mnt/lazarus-storage"), "mounted image storage must not become a system disk");
+    require(!lazarus::is_appliance_system_mountpoint("/mnt/lazarus-drives/storage"), "a Home-mounted data disk must remain configurable");
+
     require(!lazarus::is_complete({}), "empty job must not be complete");
     require(has_code(lazarus::validate_job({}), "job.ticket_missing"), "missing ticket must block");
 
@@ -274,6 +280,25 @@ int main() {
     };
     require(lazarus::validate_bench_profile(bench).empty(), "valid bench profile should have no findings");
 
+    const auto nas_profile_path = std::filesystem::temp_directory_path() / "lazarus-nas-profile-test.profile";
+    {
+        std::ofstream profile(nas_profile_path);
+        profile << "name=NAS Bench\n"
+                << "image_storage=/mnt/lazarus-storage/Lazarus Images\n"
+                << "nas_storage_protocol=smb\n"
+                << "nas_storage_server=nas.example.local\n"
+                << "nas_storage_share=Backups\n"
+                << "nas_storage_username=lazarus-backup\n"
+                << "nas_storage_domain=WORKGROUP\n";
+    }
+    const auto nas_bench = lazarus::load_bench_profile(nas_profile_path.string());
+    require(nas_bench.nas_storage_protocol == "smb", "bench profile should load the NAS protocol");
+    require(nas_bench.nas_storage_server == "nas.example.local", "bench profile should load the NAS server");
+    require(nas_bench.nas_storage_share == "Backups", "bench profile should load the NAS share");
+    require(nas_bench.nas_storage_username == "lazarus-backup", "bench profile should load the NAS username");
+    require(nas_bench.nas_storage_domain == "WORKGROUP", "bench profile should load the NAS domain");
+    std::filesystem::remove(nas_profile_path);
+
     const lazarus::DeviceIdentity good_source{
         "/dev/sdb",
         "/port/source-left",
@@ -294,10 +319,26 @@ int main() {
     require(lazarus::role_for_device(bench, good_source) == lazarus::DeviceRole::SourceOnly, "bench should assign source role by physical path");
     require(lazarus::validate_source_device(bench, good_source).empty(), "source-only drive should be accepted as source");
 
+    auto unassigned_source = good_source;
+    unassigned_source.physical_path = "/port/unassigned";
+    unassigned_source.by_path = "/dev/disk/by-path/pci-0000:00-usb-0:9:1.0-scsi-0:0:0:0";
+    unassigned_source.port_path = "/port/unassigned";
+    unassigned_source.bench_role = lazarus::DeviceRole::Unknown;
+    require(lazarus::role_for_device(bench, unassigned_source) == lazarus::DeviceRole::Unknown,
+            "an unassigned customer drive should remain explicitly unassigned");
+    require(lazarus::validate_source_device(bench, unassigned_source).empty(),
+            "an unassigned non-system drive should be accepted for read-only imaging");
+    require(lazarus::validate_destination_device(bench, unassigned_source).empty(),
+            "an unassigned non-system drive should be accepted as an explicitly confirmed restore destination");
+
     auto storage_bench = bench;
     storage_bench.image_storage_device = good_source.by_id_path;
     require(lazarus::role_for_device(storage_bench, good_source) == lazarus::DeviceRole::ImageStorage,
             "bench should assign image-storage role by stable device identity");
+    require(has_code(lazarus::validate_source_device(storage_bench, good_source), "source.image_storage"),
+            "image storage must never be accepted as an imaging source");
+    require(has_code(lazarus::validate_destination_device(storage_bench, good_source), "destination.image_storage"),
+            "image storage must never be accepted as a restore destination");
 
     auto removable_bench = bench;
     removable_bench.removable_media_paths.push_back("/port/recovery-media");
@@ -306,6 +347,10 @@ int main() {
     recovery_media.by_path.clear();
     require(lazarus::role_for_device(removable_bench, recovery_media) == lazarus::DeviceRole::RemovableMedia,
             "bench should assign removable-media role by physical path");
+    require(has_code(lazarus::validate_source_device(removable_bench, recovery_media), "source.removable_media"),
+            "removable-media export ports must not be accepted as imaging sources");
+    require(has_code(lazarus::validate_destination_device(removable_bench, recovery_media), "destination.removable_media"),
+            "removable-media export ports must not be accepted as restore destinations");
     removable_bench.destination_only_paths.push_back("/port/recovery-media");
     require(has_code(lazarus::validate_bench_profile(removable_bench), "bench.role_conflict"),
             "a physical port must not have removable-media and destination roles");
@@ -426,6 +471,18 @@ int main() {
         64 * 1024,
         0,
     };
+    const auto capacity_dir = std::filesystem::temp_directory_path() / "lazarus-capacity-preflight-smoke.laz";
+    std::filesystem::remove_all(capacity_dir);
+    auto capacity_options = image_options;
+    capacity_options.output_directory = capacity_dir.string();
+    const auto available = std::filesystem::space(std::filesystem::temp_directory_path()).available;
+    capacity_options.max_bytes = available == 0 ? 1 : available;
+    const auto capacity_result = lazarus::write_directory_image(job, gpt_open.handle, inspection, capacity_options);
+    require(!capacity_result.finalized && has_code(capacity_result.findings, "image.storage_capacity_insufficient"),
+            "image writer must reject a backup that cannot fit before writing source chunks");
+    require(capacity_result.chunks_written == 0,
+            "capacity preflight must stop before any source image chunk is written");
+    std::filesystem::remove_all(capacity_dir);
     int image_progress_events = 0;
     bool image_completed_event = false;
     image_options.progress = [&](const lazarus::ProgressEvent& event) {
@@ -442,6 +499,13 @@ int main() {
     require(image_result.chunks_written > 0, "image writer should record at least one chunk");
     require(std::filesystem::exists(image_dir / "FINALIZED"), "finalized image should have FINALIZED marker");
     require(!std::filesystem::exists(image_dir / "INCOMPLETE"), "finalized image should not keep INCOMPLETE marker");
+    const auto image_directory_permissions = std::filesystem::status(image_dir).permissions();
+    const auto metadata_permissions = std::filesystem::status(image_dir / "metadata.json").permissions();
+    require((image_directory_permissions & std::filesystem::perms::others_read) != std::filesystem::perms::none &&
+            (image_directory_permissions & std::filesystem::perms::others_exec) != std::filesystem::perms::none,
+            "finalized image directory should be readable and traversable on another Linux system");
+    require((metadata_permissions & std::filesystem::perms::others_read) != std::filesystem::perms::none,
+            "finalized image metadata should be readable on another Linux system");
     require(std::filesystem::exists(image_dir / "metadata.json"), "image writer should create metadata.json");
     require(std::filesystem::exists(image_dir / "job-journal.json"), "image writer should preserve a durable job journal for resume discovery");
     {
@@ -454,12 +518,58 @@ int main() {
     require(std::filesystem::exists(image_dir / "partition-table.bin"), "image writer should create partition-table.bin");
     require(std::filesystem::exists(image_dir / "disk.raw"), "image writer should create disk.raw");
     require(std::filesystem::exists(image_dir / "hashes.dat"), "image writer should create hashes.dat");
-    require(std::filesystem::file_size(image_dir / "disk.raw") == gpt_source.size_bytes, "disk.raw should match source size");
+    require(std::filesystem::file_size(image_dir / "disk.raw") == image_result.bytes_stored,
+            "disk.raw should match the reported physical stored size");
+    require(image_result.zero_chunks_elided > 0 && image_result.zero_bytes_elided > 0,
+            "image writer should elide zero-filled source chunks");
+    require(image_result.bytes_stored < gpt_source.size_bytes,
+            "zero-elided disk.raw should be smaller than the logical source");
     {
         std::ifstream hashes(image_dir / "hashes.dat");
         std::string first_line;
         std::getline(hashes, first_line);
         require(first_line == "algorithm=sha256", "hashes.dat should use SHA-256");
+        const std::string contents((std::istreambuf_iterator<char>(hashes)), std::istreambuf_iterator<char>());
+        require(contents.find(" zero\n") != std::string::npos,
+                "hashes.dat should identify zero-filled logical chunks without stored payload bytes");
+    }
+    {
+        std::ifstream hashes(image_dir / "hashes.dat");
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(hashes, line)) lines.push_back(line);
+        const auto original_lines = lines;
+        bool altered = false;
+        for (auto& candidate : lines) {
+            if (candidate.size() < 6 || candidate.rfind(" zero") != candidate.size() - 5) continue;
+            std::istringstream fields(candidate);
+            std::string index;
+            std::string source_offset;
+            std::string source_size;
+            std::string stored_offset;
+            std::string stored_size;
+            std::string source_hash;
+            std::string stored_hash;
+            std::string storage;
+            fields >> index >> source_offset >> source_size >> stored_offset >> stored_size >>
+                source_hash >> stored_hash >> storage;
+            require(!source_hash.empty(), "zero chunk test record should contain a source hash");
+            source_hash[0] = source_hash[0] == '0' ? '1' : '0';
+            candidate = index + " " + source_offset + " " + source_size + " " + stored_offset + " " +
+                        stored_size + " " + source_hash + " " + stored_hash + " " + storage;
+            altered = true;
+            break;
+        }
+        require(altered, "zero chunk integrity test should find a zero record");
+        {
+            std::ofstream hashes_out(image_dir / "hashes.dat");
+            for (const auto& candidate : lines) hashes_out << candidate << "\n";
+        }
+        const auto rejected_zero_hash = lazarus::verify_directory_image(image_dir.string());
+        require(!rejected_zero_hash.verified,
+                "verification must reject a zero-filled logical chunk with a forged source hash");
+        std::ofstream hashes_out(image_dir / "hashes.dat");
+        for (const auto& original : original_lines) hashes_out << original << "\n";
     }
     int verify_progress_events = 0;
     bool verify_completed_event = false;
@@ -628,6 +738,26 @@ int main() {
     require(compressed_verify.verified, "verifier should accept zstd image");
     require(compressed_verify.actual_bytes == gpt_source.size_bytes, "zstd verifier should report logical source size");
     require(compressed_verify.stored_bytes == compressed_result.bytes_stored, "zstd verifier should report stored size");
+    std::string logical_reader_error;
+    auto logical_reader = lazarus::LogicalImageReader::open(compressed_image_dir.string(), logical_reader_error);
+    require(logical_reader != nullptr && logical_reader_error.empty(),
+            "on-demand reader should open a finalized compressed image without full verification");
+    require(logical_reader->size_bytes() == gpt_source.size_bytes,
+            "on-demand reader should expose the logical source size");
+    std::vector<std::byte> demanded_bytes;
+    require(logical_reader->read_at(63 * 1024, 130 * 1024, demanded_bytes, logical_reader_error),
+            "on-demand reader should decode and verify a range crossing chunk boundaries");
+    std::vector<std::byte> fixture_bytes(demanded_bytes.size());
+    {
+        std::ifstream source_fixture(gpt_path, std::ios::binary);
+        source_fixture.seekg(63 * 1024);
+        source_fixture.read(reinterpret_cast<char*>(fixture_bytes.data()),
+                            static_cast<std::streamsize>(fixture_bytes.size()));
+    }
+    require(demanded_bytes == fixture_bytes, "on-demand bytes should exactly match the captured source");
+    require(!logical_reader->read_at(logical_reader->size_bytes() - 10, 20,
+                                     demanded_bytes, logical_reader_error),
+            "on-demand reader should reject a range beyond the logical disk");
     const auto compressed_restore_target = std::filesystem::temp_directory_path() / "lazarus-zstd-restore-target-smoke.bin";
     {
         std::ofstream target(compressed_restore_target, std::ios::binary);
@@ -674,14 +804,47 @@ int main() {
     std::filesystem::copy_file(gpt_path, corrupt_gpt_path, std::filesystem::copy_options::overwrite_existing);
     {
         std::fstream corrupt(corrupt_gpt_path, std::ios::binary | std::ios::in | std::ios::out);
-        corrupt.seekp(512 + 40);
-        corrupt.put(static_cast<char>(0x23));
+        corrupt.seekp(512 + 48);
+        const std::array<char, 8> invalid_last_usable{1, 0, 0, 0, 0, 0, 0, 0};
+        corrupt.write(invalid_last_usable.data(), static_cast<std::streamsize>(invalid_last_usable.size()));
     }
     auto corrupt_device = gpt_source;
     corrupt_device.linux_path = corrupt_gpt_path.string();
     auto corrupt_open = lazarus::open_source_read_only(bench, corrupt_device);
     const auto corrupt_inspection = lazarus::inspect_source_disk(corrupt_open.handle);
-    require(has_code(corrupt_inspection.findings, "gpt.header_crc_invalid"), "GPT inspection should reject a corrupt primary header CRC");
+    require(has_code(corrupt_inspection.findings, "gpt.bounds_invalid"), "GPT inspection should report an invalid usable LBA range");
+
+    const auto corrupt_image_dir = std::filesystem::temp_directory_path() / "lazarus-corrupt-gpt-image-smoke.laz";
+    std::filesystem::remove_all(corrupt_image_dir);
+    lazarus::ImageWriteOptions corrupt_image_options{corrupt_image_dir.string(), 64 * 1024, 0};
+    const auto corrupt_image_result = lazarus::write_directory_image(
+        job, corrupt_open.handle, corrupt_inspection, corrupt_image_options);
+    require(corrupt_image_result.finalized,
+            "raw image creation must not be blocked by an invalid GPT usable LBA range");
+    require(corrupt_image_result.completed_with_warnings && has_code(corrupt_image_result.findings, "gpt.bounds_invalid"),
+            "a corrupt source layout must complete with escalation warnings");
+    const auto corrupt_verify = lazarus::verify_directory_image(corrupt_image_dir.string());
+    require(corrupt_verify.verified,
+            "a byte-complete, hash-valid raw image must verify even when the captured GPT is corrupt");
+    require(!corrupt_verify.partition_table_valid && has_code(corrupt_verify.findings, "verify.source_layout_requires_escalation"),
+            "verification must distinguish capture integrity from damaged source layout health");
+
+    const auto corrupt_restore_target = std::filesystem::temp_directory_path() / "lazarus-corrupt-gpt-restore-smoke.bin";
+    {
+        std::ofstream target(corrupt_restore_target, std::ios::binary);
+        std::vector<char> zeros(static_cast<std::size_t>(gpt_source.size_bytes), 0);
+        target.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+    }
+    auto corrupt_restore_device = restore_device;
+    corrupt_restore_device.linux_path = corrupt_restore_target.string();
+    const auto corrupt_restore = lazarus::restore_directory_image(
+        bench, corrupt_restore_device, {corrupt_image_dir.string(), 64 * 1024, "ERASE"});
+    require(corrupt_restore.restored && corrupt_restore.readback_verified,
+            "raw restore must succeed when every restored byte matches a verified corrupt-source image");
+    require(!corrupt_restore.destination_layout_validated && has_code(corrupt_restore.findings, "restore.destination_layout_invalid"),
+            "raw restore must retain an escalation warning for the preserved corrupt layout");
+    std::filesystem::remove(corrupt_restore_target);
+    std::filesystem::remove_all(corrupt_image_dir);
     std::filesystem::remove(corrupt_gpt_path);
     gpt_open.handle.close();
     std::filesystem::remove_all(image_dir);

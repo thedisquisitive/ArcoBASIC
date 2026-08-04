@@ -164,7 +164,10 @@ lazarus
 lazarus-tui
 lazarus-gui
 lazarus-service
+lazarum
 ```
+
+`lazarum` is the read-only Lazarus Drive Viewer companion. It can mount a drive labeled `LAZARUS_STORAGE` read-only on Linux, inventory image jobs, read completion/escalation reports, and safely extract those reports. Its standalone cross-platform core, native GTK4 desktop application, current platform matrix, and image-data provider status are documented in `lazarum/README.md`.
 
 ## Arcology Lazarus OS
 

@@ -469,7 +469,7 @@ void install_theme(const std::string& accent, const std::string& background, con
         .workflow-title { color: {{TEXT}}; font-size: 26px; font-weight: 700; }
         .workflow-detail, .instruction, .choice-detail { color: #aebbc4; font-size: 14px; }
         .workflow-header { margin-bottom: 2px; }
-        .workflow-section, .operation-panel, .warning-panel {
+        .workflow-section, .operation-panel, .warning-panel, .analysis-panel {
             background: {{SURFACE}};
             border: 1px solid #34434e;
             border-radius: 8px;
@@ -478,6 +478,7 @@ void install_theme(const std::string& accent, const std::string& background, con
         .section-title { color: {{TEXT}}; font-size: 15px; font-weight: 700; }
         .section-detail { color: #91a0aa; font-size: 12px; }
         .form-label { color: #c9d2d8; font-size: 13px; font-weight: 600; }
+        .technical-details { color: #91a0aa; font-size: 12px; font-family: monospace; }
         .warning-panel { background: #2b2210; border-color: #a97c21; }
         .warning-text { color: #f0c86b; font-size: 13px; font-weight: 700; }
         .recovery-panel {
@@ -573,6 +574,14 @@ void install_theme(const std::string& accent, const std::string& background, con
         .heartbeat-title { color: #82919b; font-size: 10px; font-weight: 800; }
         .heartbeat-value { color: {{TEXT}}; font-size: 13px; font-weight: 700; }
         .bench-ribbon { color: #aebbc4; font-size: 12px; font-weight: 600; }
+        .storage-type-card { background: {{SURFACE}}; border: 2px solid #3b4b56; border-radius: 10px; padding: 20px; }
+        .storage-type-card-selected { border-color: {{ACCENT}}; }
+        .storage-type-icon-badge { background: #121a20; border: 1px solid #34434e; border-radius: 999px; min-width: 64px; min-height: 64px; }
+        .storage-type-radio { border: 2px solid #5b6b76; border-radius: 999px; min-width: 18px; min-height: 18px; background: transparent; }
+        .storage-type-radio-selected { border: 2px solid {{ACCENT}}; background: {{ACCENT}}; }
+        .step-badge { background: #3b7ddb; color: #ffffff; border-radius: 999px; min-width: 40px; min-height: 40px; font-size: 16px; font-weight: 700; }
+        .step-card { background: {{SURFACE}}; border: 1px solid #34434e; border-radius: 8px; padding: 14px; }
+        .alert-banner { background: #2b2210; border: 1px solid #a97c21; border-radius: 8px; padding: 14px 16px; }
     )CSS";
     replace_all("{{ACCENT}}", safe_accent);
     replace_all("{{BACKGROUND}}", safe_background);
@@ -582,9 +591,9 @@ void install_theme(const std::string& accent, const std::string& background, con
     if (is_light_color(safe_background)) {
         css += R"CSS(
         .workflow-detail, .instruction, .choice-detail, .section-detail,
-        .admin-task-detail { color: #526372; }
+        .admin-task-detail, .technical-details { color: #526372; }
         .form-label { color: #364957; }
-        .workflow-section, .operation-panel { background: {{SURFACE}}; border-color: #c8d5df; }
+        .workflow-section, .operation-panel, .analysis-panel { background: {{SURFACE}}; border-color: #c8d5df; }
         .recovery-panel { background: #edf8f0; border-color: #4e9a61; }
         .recovery-code { background: #ffffff; color: {{TEXT}}; border-color: {{ACCENT}}; }
         .operation-panel { background: #f7fafc; }
@@ -610,6 +619,10 @@ void install_theme(const std::string& accent, const std::string& background, con
         .heartbeat-title { color: #627584; }
         .heartbeat-value { color: {{TEXT}}; }
         .bench-ribbon { color: #526372; }
+        .storage-type-card { background: {{SURFACE}}; border-color: #c4d1db; }
+        .step-card { background: {{SURFACE}}; border-color: #c8d5df; }
+        .storage-type-icon-badge { background: #f1f5f8; border-color: #c8d5df; }
+        .alert-banner { background: #fdf3dc; border-color: #d9a53c; }
         )CSS";
         replace_all("{{ACCENT}}", safe_accent);
         replace_all("{{SURFACE}}", safe_surface);

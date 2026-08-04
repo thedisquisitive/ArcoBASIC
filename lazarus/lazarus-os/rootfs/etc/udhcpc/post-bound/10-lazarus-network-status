@@ -3,3 +3,6 @@
 message="Arcology Lazarus DHCP lease: $interface $ip/$mask"
 echo "$message" >> /var/log/arcology-lazarus/network.log
 echo "lazarus-network: $message" > /dev/ttyS0 2>/dev/null || true
+# A live or installed appliance may have started before its NAS was reachable.
+# Retry outside udhcpc so an offline server never delays lease processing.
+/usr/local/sbin/lazarus-mount-storage >>/var/log/arcology-lazarus/storage.log 2>&1 &

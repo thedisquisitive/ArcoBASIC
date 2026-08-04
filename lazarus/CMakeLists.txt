@@ -42,6 +42,8 @@ add_executable(lazarus_smoke_tests tests/lazarus_smoke.cpp)
 target_link_libraries(lazarus_smoke_tests PRIVATE lazarus_core)
 
 enable_testing()
+add_subdirectory(lazarum)
+
 add_test(NAME lazarus_smoke_tests COMMAND lazarus_smoke_tests)
 add_test(
     NAME lazarus_os_layout
@@ -58,6 +60,10 @@ add_test(
 add_test(
     NAME lazarus_service_profile
     COMMAND sh -c "printf '%s\\n' '{\"command\":\"profile\"}' | '$<TARGET_FILE:lazarus-service>' --stdio --config '${CMAKE_CURRENT_SOURCE_DIR}/examples/bench-alpha.profile' | grep -q '\"summary_text\"'"
+)
+add_test(
+    NAME lazarus_service_rejects_volatile_storage
+    COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/service_volatile_storage.sh" "$<TARGET_FILE:lazarus-service>"
 )
 add_test(
     NAME lazarus_service_backups
@@ -88,6 +94,10 @@ add_test(
     COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/service_branding_save.sh" "$<TARGET_FILE:lazarus-service>"
 )
 add_test(
+    NAME lazarus_service_nas_profile
+    COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/service_nas_profile.sh" "$<TARGET_FILE:lazarus-service>"
+)
+add_test(
     NAME lazarus_service_failure_detail
     COMMAND sh -c "printf '%s\\n' '{\"command\":\"verify_image\",\"image_directory\":\"/definitely/missing/lazarus-image\"}' | '$<TARGET_FILE:lazarus-service>' --stdio --config '${CMAKE_CURRENT_SOURCE_DIR}/examples/bench-alpha.profile' | grep -Eq '\"ok\":false.*\"error\":\"[^\"]+'"
 )
@@ -114,6 +124,10 @@ add_test(
 add_test(
     NAME lazarus_service_driver_plan
     COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/service_driver_plan.sh" "$<TARGET_FILE:lazarus-service>"
+)
+add_test(
+    NAME lazarus_service_boot_repair
+    COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/service_boot_repair.sh" "$<TARGET_FILE:lazarus-service>"
 )
 
 install(TARGETS lazarus lazarus-tui lazarus-gui RUNTIME DESTINATION bin)

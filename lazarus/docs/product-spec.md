@@ -83,6 +83,8 @@ Verify Backup
 
 Advanced terms such as raw copy, filesystem-aware copy, compression level, block size, and retry strategy stay hidden unless an administrator enables Expert Mode.
 
+Selecting a source in Create Backup automatically starts the same protected read-only drive analysis used by Diagnostics. The page shows a concise OS, confidence, boot-mode, encryption, layout, and SMART summary while the technician enters the ticket. The image action waits only until analysis releases the source. Damaged layouts, failed health, or an unavailable analysis select Rescue imaging and keep backup available; only loss or replacement of the selected physical source invalidates the selection. A successful result may be reused for five minutes while the connected-device generation is unchanged.
+
 ## Required Job Information
 
 No operation may begin without:
@@ -297,6 +299,8 @@ Application Data
 
 Lazarus should detect Windows version, build number, edition, architecture, hostname, user profiles, boot mode, partition style, EFI System Partition, BCD store, Windows Recovery Environment, BitLocker state, Fast Startup state where detectable, storage/chipset/network/display drivers, boot-critical services, and offline registry hives.
 
+The technician-facing Drive Analysis workflow currently reports Windows product name, display version, edition, and build when the offline SOFTWARE hive is readable. It confirms Linux distributions from `etc/os-release` or `usr/lib/os-release`, identifies Apple partition types as candidates, reports UEFI versus legacy layout, lists parsed partitions and filesystems, flags BitLocker signatures, and includes SMART facts. A filesystem-only or partition-layout match must be labeled as a candidate rather than a confirmed installation. Analysis mounts are read-only with journal replay disabled and are always released before the drive is shown as safe to disconnect. Failure to parse a layout or open a filesystem must not disable raw imaging.
+
 ## Hardware Migration
 
 Hardware migration is a first-class workflow:
@@ -458,6 +462,7 @@ Future recovery environment goals:
 * No package manager exposed to technicians
 * Bench profile loaded automatically
 * Central image storage mounted automatically
+* Administrator-configured SMB and NFS image repositories with read-write connection testing and root-only SMB credentials
 * Restricted network access
 * Persistent logs stored separately
 * Signed update process

@@ -15,9 +15,19 @@ branding_text=#edf1f3
 branding_icon=#f39a22
 branding_report_footer=Generated locally by Arcology Lazarus. SMART results describe reported device facts.
 
-# Local fallback storage. Use Administration > Image Storage to assign a
-# persistent storage device before customer imaging.
+# Installed appliances may use this path when /var/lib/arcology-lazarus is on
+# persistent storage. Live systems reject it when it resolves to RAM/overlay;
+# use Administration > Image Storage before customer imaging.
 image_storage=/var/lib/arcology-lazarus/images
+
+# NAS image storage is configured from Administration > Image Storage. SMB
+# passwords are kept separately in /var/lib/arcology-lazarus/nas-storage.auth
+# with mode 0600 and are never written to this profile.
+# nas_storage_protocol=smb
+# nas_storage_server=nas.example.local
+# nas_storage_share=Backups
+# nas_storage_username=lazarus-backup
+# nas_storage_domain=WORKGROUP
 
 # Port roles and labels use normalized port: topology identities. Lazarus creates
 # these from /dev/disk/by-path and keeps configured ports visible while empty.

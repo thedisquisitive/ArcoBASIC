@@ -27,6 +27,14 @@ else
 		> "$rootfs/etc/apk/repositories"
 fi
 
+# dislocker (BitLocker recovery-key unlock for Recover Files) is only packaged in Alpine's
+# testing repo. Pin it with a tagged repository line so "dislocker@testing" in packages/world
+# resolves without pulling the rest of the rootfs onto edge.
+if ! grep -q '^@testing ' "$rootfs/etc/apk/repositories" 2>/dev/null; then
+	testing_mirror="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
+	printf '%s\n' "@testing $testing_mirror/edge/testing" >> "$rootfs/etc/apk/repositories"
+fi
+
 echo "Preparing Alpine rootfs at: $rootfs"
 echo "This installs packages into the rootfs path only; it does not format or write a boot device."
 

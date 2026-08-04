@@ -32,6 +32,21 @@ std::string human_size(std::uint64_t bytes) {
     return out.str();
 }
 
+std::string human_duration(std::uint64_t total_seconds) {
+    const auto hours = total_seconds / 3600;
+    const auto minutes = (total_seconds % 3600) / 60;
+    const auto seconds = total_seconds % 60;
+    std::ostringstream out;
+    if (hours > 0) {
+        out << hours << "h" << std::setw(2) << std::setfill('0') << minutes << "m";
+    } else if (minutes > 0) {
+        out << minutes << "m" << std::setw(2) << std::setfill('0') << seconds << "s";
+    } else {
+        out << seconds << "s";
+    }
+    return out.str();
+}
+
 void clear_screen() {
     std::cout << "\033[2J\033[H";
 }
@@ -491,6 +506,13 @@ bool save_bench_profile(const lazarus::BenchProfile& bench, const std::string& p
     for (const auto& port : bench.image_storage_port_paths) {
         out << "image_storage_port=" << port << "\n";
     }
+    if (!bench.nas_storage_protocol.empty()) {
+        out << "nas_storage_protocol=" << bench.nas_storage_protocol << "\n";
+        out << "nas_storage_server=" << bench.nas_storage_server << "\n";
+        out << "nas_storage_share=" << bench.nas_storage_share << "\n";
+        if (!bench.nas_storage_username.empty()) out << "nas_storage_username=" << bench.nas_storage_username << "\n";
+        if (!bench.nas_storage_domain.empty()) out << "nas_storage_domain=" << bench.nas_storage_domain << "\n";
+    }
     for (const auto& removable : bench.removable_media_paths) {
         out << "removable_media=" << removable << "\n";
     }
@@ -746,7 +768,7 @@ void add_port_label(lazarus::BenchProfile& bench) {
 
 lazarus::ProgressCallback make_progress_printer() {
     return [](const lazarus::ProgressEvent& event) {
-        std::cout << "\r";
+        std::cout << "\r\033[K";
         std::cout << std::left << std::setw(12) << ("[" + event.operation + "]")
                   << std::setw(18) << event.phase;
         if (event.indeterminate || event.bytes_total == 0) {
@@ -757,6 +779,12 @@ lazarus::ProgressCallback make_progress_printer() {
         const auto percent = (static_cast<double>(event.bytes_done) / static_cast<double>(event.bytes_total)) * 100.0;
         std::cout << std::right << std::setw(6) << std::fixed << std::setprecision(1) << percent << "%  "
                   << human_size(event.bytes_done) << " / " << human_size(event.bytes_total);
+        if (event.bytes_per_second != 0) {
+            std::cout << "  " << human_size(event.bytes_per_second) << "/s";
+        }
+        if (event.eta_seconds != 0) {
+            std::cout << "  ETA " << human_duration(event.eta_seconds);
+        }
         if (event.chunks_total != 0) {
             std::cout << "  chunks " << event.chunks_done << "/" << event.chunks_total;
         }
@@ -911,7 +939,7 @@ void create_backup(const lazarus::BenchProfile& bench) {
 
     const auto inspection = lazarus::inspect_source_disk(open_result.handle);
     if (!has_imageable_layout(inspection) || has_blocker(inspection.findings)) {
-        std::cout << "\nThe selected source did not inspect as an imageable layout.\n";
+        std::cout << "\nThe source layout requires specialist escalation. Lazarus will preserve it as a raw image first.\n";
         if (!inspection.facts.empty()) {
             std::cout << "\nFacts:\n";
             for (const auto& fact : inspection.facts) {
@@ -919,8 +947,6 @@ void create_backup(const lazarus::BenchProfile& bench) {
             }
         }
         print_findings(inspection.findings);
-        pause();
-        return;
     }
 
     lazarus::ImageWriteOptions options;
@@ -932,6 +958,7 @@ void create_backup(const lazarus::BenchProfile& bench) {
     std::cout << "\n\nImage output: " << result.output_directory << "\n";
     std::cout << "Bytes written: " << result.bytes_written << "\n";
     std::cout << "Bytes stored: " << result.bytes_stored << "\n";
+    std::cout << "Zero-filled bytes skipped: " << result.zero_bytes_elided << "\n";
     std::cout << "Compression: " << lazarus::to_string(options.compression) << "\n";
     std::cout << "Chunks written: " << result.chunks_written << "\n";
     std::cout << "Finalized: " << (result.finalized ? "yes" : "no") << "\n";

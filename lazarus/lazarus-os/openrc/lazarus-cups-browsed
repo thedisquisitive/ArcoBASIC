@@ -16,3 +16,10 @@ depend() {
 start_pre() {
 	checkpath --directory --mode 0755 /var/cache/cups /var/log/cups
 }
+
+start_post() {
+	# OpenRC status output follows the physical console. Emit one explicit
+	# serial milestone so headless boot validation can still prove that printer
+	# discovery started successfully.
+	echo "lazarus-printers: driverless discovery ready" >/dev/ttyS0 2>/dev/null || true
+}

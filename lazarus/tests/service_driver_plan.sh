@@ -59,6 +59,6 @@ automatic_without_destination=$(printf '%s\n' \
     | "$service" --stdio --config "$root/bench.profile" | tail -n 1)
 printf '%s\n' "$automatic_without_destination" | grep -q '"ok":false'
 printf '%s\n' "$automatic_without_destination" | grep -q \
-    'Universal Restore requires a connected destination-only disk'
+    'Universal Restore requires a connected destination-only or unassigned replacement disk'
 
 echo "driver migration planning passed"

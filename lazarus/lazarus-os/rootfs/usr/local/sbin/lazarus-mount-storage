@@ -5,10 +5,120 @@ config=/etc/arcology-lazarus/bench.profile
 mount_target=/mnt/lazarus-storage
 security_file=/var/lib/arcology-lazarus/admin.auth
 network_file=/etc/arcology-lazarus/network.conf
+nas_credentials=/var/lib/arcology-lazarus/nas-storage.auth
+
+mkdir -p /run/arcology-lazarus
+exec 9>/run/arcology-lazarus/storage-mount.lock
+if ! flock -w 2 9; then
+	echo "Another Lazarus storage mount attempt is already running." >&2
+	exit 1
+fi
 
 device="$(awk -F= '$1 == "image_storage_device" {print substr($0, index($0, "=") + 1); exit}' "$config" 2>/dev/null || true)"
 volume="$(awk -F= '$1 == "image_storage_volume" {print substr($0, index($0, "=") + 1); exit}' "$config" 2>/dev/null || true)"
-[ -n "$device" ] || { echo "lazarus-storage: no image storage device configured" >/dev/ttyS0 2>/dev/null || true; exit 0; }
+image_directory="$(awk -F= '$1 == "image_storage" {print substr($0, index($0, "=") + 1); exit}' "$config" 2>/dev/null || true)"
+nas_protocol="$(awk -F= '$1 == "nas_storage_protocol" {print substr($0, index($0, "=") + 1); exit}' "$config" 2>/dev/null || true)"
+nas_server="$(awk -F= '$1 == "nas_storage_server" {print substr($0, index($0, "=") + 1); exit}' "$config" 2>/dev/null || true)"
+nas_share="$(awk -F= '$1 == "nas_storage_share" {print substr($0, index($0, "=") + 1); exit}' "$config" 2>/dev/null || true)"
+case "$image_directory" in
+	"$mount_target"/*) ;;
+	*) image_directory="$mount_target/images" ;;
+esac
+case "/${image_directory#"$mount_target"/}/" in
+	*/../*|*/./*) echo "Lazarus image-storage folder is unsafe: $image_directory" >&2; exit 1 ;;
+esac
+mkdir -p "$mount_target"
+
+make_local_storage_portable() {
+	mkdir -p "$image_directory"
+	resolved_image_directory="$(readlink -f "$image_directory")"
+	case "$resolved_image_directory" in
+		"$mount_target"/*) ;;
+		*) echo "Lazarus image-storage folder resolves outside the storage disk: $image_directory" >&2; return 1 ;;
+	esac
+	chgrp lazarus "$mount_target" "$image_directory"
+	# The repository is removable media, not appliance-private state. Keep it
+	# readable when another Linux installation has unrelated numeric group IDs.
+	# Appliance credentials live outside image_directory and remain mode 0600.
+	chmod 0755 "$mount_target"
+	chmod 0775 "$image_directory"
+	find "$image_directory" -xdev -type d -exec chmod a+rx,o-w {} +
+	find "$image_directory" -xdev -type f -exec chmod a+r,o-w {} +
+}
+
+nas_mount_matches_profile() {
+	mounted_source="$(findmnt -rn -M "$mount_target" -o SOURCE 2>/dev/null || true)"
+	mounted_type="$(findmnt -rn -M "$mount_target" -o FSTYPE 2>/dev/null || true)"
+	case "$nas_protocol" in
+		smb) [ "$mounted_type" = cifs ] && [ "$mounted_source" = "//$nas_server/$nas_share" ] ;;
+		nfs) case "$mounted_type" in nfs|nfs4) [ "$mounted_source" = "$nas_server:$nas_share" ] ;; *) return 1 ;; esac ;;
+		*) return 1 ;;
+	esac
+}
+
+nas_image_directory_is_confined() {
+	[ -d "$image_directory" ] || return 1
+	resolved_image_directory="$(readlink -f "$image_directory" 2>/dev/null || true)"
+	case "$resolved_image_directory" in
+		"$mount_target"/*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+if mountpoint -q "$mount_target"; then
+	if [ -n "$nas_protocol" ]; then
+		if ! nas_mount_matches_profile || ! nas_image_directory_is_confined; then
+			echo "The existing storage mount does not match the configured NAS or its image folder escapes the share." >&2
+			exit 1
+		fi
+	else
+		make_local_storage_portable
+	fi
+	echo "lazarus-storage: already mounted at $mount_target" >/dev/ttyS0 2>/dev/null || true
+	exit 0
+fi
+
+if [ -n "$nas_protocol" ]; then
+	[ -n "$nas_server" ] && [ -n "$nas_share" ] || {
+		echo "Lazarus NAS configuration is incomplete." >&2
+		exit 1
+	}
+	case "$nas_protocol" in
+		smb)
+			[ -f "$nas_credentials" ] || {
+				echo "Lazarus SMB credentials are unavailable: $nas_credentials" >&2
+				exit 1
+			}
+			chmod 0600 "$nas_credentials"
+			timeout -s KILL 10 mount -t cifs "//$nas_server/$nas_share" "$mount_target" \
+				-o "credentials=$nas_credentials,rw,nosuid,nodev,iocharset=utf8,file_mode=0660,dir_mode=0770"
+			;;
+		nfs)
+			timeout -s KILL 10 mount -t nfs "$nas_server:$nas_share" "$mount_target" \
+				-o rw,nosuid,nodev,retry=1,timeo=20,retrans=2
+			;;
+		*)
+			echo "Unsupported Lazarus NAS protocol: $nas_protocol" >&2
+			exit 1
+			;;
+	esac
+	if ! nas_mount_matches_profile; then
+		echo "The mounted filesystem does not match the configured NAS source and protocol." >&2
+		umount "$mount_target" 2>/dev/null || true
+		exit 1
+	fi
+	if ! mkdir -p "$image_directory" || ! nas_image_directory_is_confined || [ ! -w "$image_directory" ]; then
+		echo "The configured NAS image folder is not writable: $image_directory" >&2
+		umount "$mount_target" 2>/dev/null || true
+		exit 1
+	fi
+	echo "lazarus-storage: mounted NAS $nas_protocol storage at $mount_target" >/dev/ttyS0 2>/dev/null || true
+	# NAS configuration and appliance credentials live on the installed system disk.
+	# Never copy one appliance's administration state into a shared backup repository.
+	exit 0
+fi
+
+[ -n "$device" ] || { echo "lazarus-storage: no image storage configured" >/dev/ttyS0 2>/dev/null || true; exit 0; }
 
 for _ in $(seq 1 40); do
 	[ -b "$device" ] && break
@@ -48,13 +158,15 @@ if [ -z "$partition" ]; then
 	fi
 fi
 
-mkdir -p "$mount_target"
-if mountpoint -q "$mount_target"; then
-	echo "lazarus-storage: already mounted at $mount_target" >/dev/ttyS0 2>/dev/null || true
-	exit 0
-fi
+if ! modprobe ext4 2>/dev/null; then :; fi
+if ! modprobe vfat 2>/dev/null; then :; fi
+if ! modprobe exfat 2>/dev/null; then :; fi
+if ! modprobe ntfs3 2>/dev/null; then :; fi
 
-if ! blkid "$partition" >/dev/null 2>&1; then
+# -p forces a fresh low-level probe instead of trusting blkid's cache. Boot-time mounts of a
+# disk that was assigned and formatted earlier in a previous session must not depend on that
+# cache already agreeing with reality.
+if ! blkid -p "$partition" >/dev/null 2>&1; then
 	echo "Lazarus image-storage target has no filesystem: $partition" >&2
 	echo "Format it as ext4 from the administrator workflow before using it." >&2
 	echo "lazarus-storage: filesystem missing on $partition" >/dev/ttyS0 2>/dev/null || true
@@ -62,10 +174,10 @@ if ! blkid "$partition" >/dev/null 2>&1; then
 fi
 
 mount -o rw,nosuid,nodev "$partition" "$mount_target"
-mkdir -p "$mount_target/images"
-chgrp lazarus "$mount_target" "$mount_target/images"
-chmod 0750 "$mount_target"
-chmod 0770 "$mount_target/images"
+if ! make_local_storage_portable; then
+	umount "$mount_target" 2>/dev/null || true
+	exit 1
+fi
 echo "lazarus-storage: mounted $partition at $mount_target" >/dev/ttyS0 2>/dev/null || true
 
 # A live system keeps its root overlay in RAM. Mirror the profile beside the
@@ -88,6 +200,28 @@ if [ -f "$mount_target/admin.auth" ]; then
 elif [ -f "$security_file" ]; then
 	cp "$security_file" "$mount_target/admin.auth"
 	chmod 0600 "$mount_target/admin.auth"
+fi
+
+# Technician sign-in PINs follow the same persistence rule as the admin credential file.
+technicians_file=/var/lib/arcology-lazarus/technicians.auth
+if [ -f "$mount_target/technicians.auth" ]; then
+	cp "$mount_target/technicians.auth" "$technicians_file"
+	chmod 0600 "$technicians_file"
+	echo "lazarus-storage: restored technician list" >/dev/ttyS0 2>/dev/null || true
+elif [ -f "$technicians_file" ]; then
+	cp "$technicians_file" "$mount_target/technicians.auth"
+	chmod 0600 "$mount_target/technicians.auth"
+fi
+
+# The Home page recent-activity list follows the same persistence rule.
+activity_file=/var/lib/arcology-lazarus/activity.log
+if [ -f "$mount_target/activity.log" ]; then
+	cp "$mount_target/activity.log" "$activity_file"
+	chmod 0600 "$activity_file"
+	echo "lazarus-storage: restored activity log" >/dev/ttyS0 2>/dev/null || true
+elif [ -f "$activity_file" ]; then
+	cp "$activity_file" "$mount_target/activity.log"
+	chmod 0600 "$mount_target/activity.log"
 fi
 
 if [ -f "$mount_target/network.conf" ]; then

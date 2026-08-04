@@ -8,6 +8,7 @@ rootfs="${ROOTFS:-$base/build/rootfs}"
 iso_root="$base/build/live-iso-root"
 initramfs_work="$base/build/live-initramfs"
 live_initramfs="$base/build/initramfs-lazarus-live"
+state_image="$base/build/lazarus-live-state.img"
 
 run_root() {
 	if [ "$(id -u)" -eq 0 ]; then
@@ -22,7 +23,7 @@ run_root() {
 	fi
 }
 
-for tool in mksquashfs unsquashfs xorriso grub-mkrescue gzip cpio; do
+for tool in mksquashfs unsquashfs xorriso grub-mkrescue gzip cpio truncate; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
 		echo "$tool was not found." >&2
 		exit 1
@@ -35,6 +36,39 @@ if [ ! -d "$rootfs" ]; then
 	echo "  lazarus/lazarus-os/scripts/build-rootfs.sh $rootfs" >&2
 	exit 1
 fi
+
+state_tools=host
+if ! command -v mkfs.ext4 >/dev/null 2>&1 || ! command -v blkid >/dev/null 2>&1; then
+	state_tools=container
+	command -v systemd-nspawn >/dev/null 2>&1 || {
+		echo "mkfs.ext4/blkid are unavailable on the host and systemd-nspawn was not found." >&2
+		exit 1
+	}
+	[ -x "$rootfs/sbin/mkfs.ext4" ] && [ -x "$rootfs/sbin/blkid" ] || {
+		echo "The staged rootfs does not contain mkfs.ext4 and blkid." >&2
+		exit 1
+	}
+fi
+
+format_state_image() {
+	image=$1
+	if [ "$state_tools" = host ]; then
+		mkfs.ext4 -F -L LAZARUS_STATE "$image" >/dev/null
+	else
+		run_root systemd-nspawn -q --pipe -D "$rootfs" --bind="$image":/tmp/lazarus-state.img \
+			/sbin/mkfs.ext4 -F -L LAZARUS_STATE /tmp/lazarus-state.img >/dev/null
+	fi
+}
+
+state_image_label() {
+	image=$1
+	if [ "$state_tools" = host ]; then
+		blkid -p -s LABEL -o value "$image"
+	else
+		run_root systemd-nspawn -q --pipe -D "$rootfs" --bind-ro="$image":/tmp/lazarus-state-header.img \
+			/sbin/blkid -p -s LABEL -o value /tmp/lazarus-state-header.img
+	fi
+}
 
 run_root rm -rf "$iso_root"
 mkdir -p "$iso_root/boot/grub"
@@ -68,7 +102,7 @@ set timeout=0
 set default=0
 
 menuentry "Arcology Lazarus OS live" {
-    linux /boot/vmlinuz-lts console=tty0 console=ttyS0,115200
+    linux /boot/vmlinuz-lts console=ttyS0,115200 console=tty0
     initrd /boot/initramfs-lazarus-live
 }
 EOF
@@ -91,7 +125,12 @@ fi
 
 trap 'rm -f "$out_tmp"' EXIT HUP INT TERM
 rm -f "$out_tmp"
-grub-mkrescue -o "$out_tmp" "$iso_root"
+rm -f "$state_image"
+truncate -s "${LIVE_STATE_SIZE:-64M}" "$state_image"
+format_state_image "$state_image"
+# Partition 4 follows the ISO/HFS boot payload in grub-mkrescue's hybrid GPT. On a USB it is a
+# normal writable ext4 filesystem; on optical media the live system simply remains stateless.
+grub-mkrescue -o "$out_tmp" "$iso_root" -- -append_partition 4 0x83 "$state_image"
 
 # Do not replace a bootable ISO until its embedded rootfs can be read back.
 # QEMU otherwise can open the output while xorriso is still writing it.
@@ -102,6 +141,16 @@ xorriso -osirrox on -indev "$out_tmp" -extract /boot/rootfs.squashfs "$verify_di
 xorriso -osirrox on -indev "$out_tmp" -extract /boot/arcology-lazarus-live.marker "$verify_dir/arcology-lazarus-live.marker" >/dev/null
 unsquashfs -s "$verify_dir/rootfs.squashfs" >/dev/null
 [ "$(cat "$verify_dir/arcology-lazarus-live.marker")" = "Arcology Lazarus OS live media" ]
+state_start="$(xorriso -indev "$out_tmp" -report_system_area plain 2>/dev/null | awk '
+    /GPT partname local :   4  Appended4/ { found=1; next }
+    found && /GPT start and size :   4/ { print $7; exit }
+')"
+[ -n "$state_start" ] || { echo "Live state partition is missing from the hybrid image." >&2; exit 1; }
+dd if="$out_tmp" of="$verify_dir/state-header.img" bs=512 skip="$state_start" count=16 status=none
+[ "$(state_image_label "$verify_dir/state-header.img")" = "LAZARUS_STATE" ] || {
+	echo "Live state partition label could not be verified." >&2
+	exit 1
+}
 rm -rf "$verify_dir"
 mv -f "$out_tmp" "$out"
 trap - EXIT HUP INT TERM

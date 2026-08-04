@@ -35,11 +35,14 @@ smartmontools
 cups
 cups-client
 cups-filters
+cifs-utils
+nfs-utils
 avahi
 avahi-tools
 ntfs-3g
 ntfs-3g-progs
 hivex
+dislocker@testing
 dosfstools
 exfatprogs
 e2fsprogs

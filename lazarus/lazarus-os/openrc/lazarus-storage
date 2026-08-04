@@ -2,9 +2,32 @@
 
 name="Arcology Lazarus image storage"
 description="Mounts the administrator-selected persistent image storage device"
-command="/usr/local/sbin/lazarus-mount-storage"
+storage_pidfile="/run/arcology-lazarus/storage-mount.pid"
 
 depend() {
 	need localmount dev-settle
+	use lazarus-network
 	after udev-trigger hwdrivers
+}
+
+start_pre() {
+	checkpath -d -m 0755 /run/arcology-lazarus
+	checkpath -d -m 0750 -o root:lazarus /var/log/arcology-lazarus
+}
+
+start() {
+	protocol="$(awk -F= '$1 == "nas_storage_protocol" {print substr($0, index($0, "=") + 1); exit}' /etc/arcology-lazarus/bench.profile 2>/dev/null || true)"
+	if [ -n "$protocol" ]; then
+		ebegin "Scheduling bounded Arcology Lazarus NAS connection"
+		start-stop-daemon --start --background --make-pidfile \
+			--pidfile "$storage_pidfile" \
+			--exec /usr/local/sbin/lazarus-mount-storage \
+			--stdout /var/log/arcology-lazarus/storage.log \
+			--stderr /var/log/arcology-lazarus/storage.log
+		eend $?
+		return
+	fi
+	ebegin "Mounting Arcology Lazarus local image storage"
+	/usr/local/sbin/lazarus-mount-storage
+	eend $?
 }

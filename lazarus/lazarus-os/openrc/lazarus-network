@@ -7,8 +7,8 @@ bootstrap_pidfile="/run/arcology-lazarus/network-bootstrap.pid"
 
 depend() {
 	need localmount
-	use lazarus-storage
 	after udev
+	before lazarus-storage
 	before avahi-daemon cupsd
 	provide net
 }

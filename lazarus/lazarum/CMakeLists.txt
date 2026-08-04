@@ -1,0 +1,86 @@
+cmake_minimum_required(VERSION 3.20)
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(Lazarum VERSION 0.1.0 LANGUAGES CXX)
+    include(CTest)
+endif()
+
+add_library(lazarum_core
+    src/viewer.cpp
+    src/linux_image_provider.cpp
+)
+target_include_directories(lazarum_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(lazarum_core PUBLIC cxx_std_20)
+if(TARGET lazarus_core)
+    set(LAZARUM_IMAGE_CORE_TARGET lazarus_core)
+    target_link_libraries(lazarum_core PUBLIC lazarus_core)
+    target_compile_definitions(lazarum_core PRIVATE LAZARUM_WITH_LAZARUS_CORE=1)
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../src/core/core.cpp")
+    find_package(OpenSSL REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LAZARUM_ZSTD REQUIRED IMPORTED_TARGET libzstd)
+    add_library(lazarum_image_core STATIC ../src/core/core.cpp)
+    target_include_directories(lazarum_image_core PUBLIC ../include)
+    target_compile_features(lazarum_image_core PUBLIC cxx_std_20)
+    target_link_libraries(lazarum_image_core PUBLIC OpenSSL::Crypto PkgConfig::LAZARUM_ZSTD)
+    set(LAZARUM_IMAGE_CORE_TARGET lazarum_image_core)
+    target_link_libraries(lazarum_core PUBLIC lazarum_image_core)
+    target_compile_definitions(lazarum_core PRIVATE LAZARUM_WITH_LAZARUS_CORE=1)
+endif()
+
+add_executable(lazarum src/main.cpp)
+target_link_libraries(lazarum PRIVATE lazarum_core)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND LAZARUM_IMAGE_CORE_TARGET)
+    add_executable(lazarum-nbd src/nbd_helper.cpp)
+    target_link_libraries(lazarum-nbd PRIVATE ${LAZARUM_IMAGE_CORE_TARGET})
+    target_compile_features(lazarum-nbd PRIVATE cxx_std_20)
+endif()
+
+option(LAZARUM_BUILD_GTK_GUI "Build the Lazarum GTK4 desktop application" ON)
+if(LAZARUM_BUILD_GTK_GUI)
+    find_package(PkgConfig QUIET)
+    if(TARGET PkgConfig::GTK4 AND GTK4_VERSION VERSION_GREATER_EQUAL 4.12)
+        set(LAZARUM_GTK_TARGET PkgConfig::GTK4)
+    elseif(PkgConfig_FOUND)
+        pkg_check_modules(LAZARUM_GTK4 QUIET IMPORTED_TARGET gtk4>=4.12)
+        if(TARGET PkgConfig::LAZARUM_GTK4)
+            set(LAZARUM_GTK_TARGET PkgConfig::LAZARUM_GTK4)
+        endif()
+    endif()
+    if(LAZARUM_GTK_TARGET)
+        add_executable(lazarum-gui src/gtk_main.cpp)
+        target_link_libraries(lazarum-gui PRIVATE lazarum_core ${LAZARUM_GTK_TARGET})
+        target_compile_features(lazarum-gui PRIVATE cxx_std_20)
+        target_compile_definitions(lazarum-gui PRIVATE
+            LAZARUM_SOURCE_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../assets"
+            LAZARUM_SOURCE_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+    else()
+        message(STATUS "GTK 4.12 or newer not found; building Lazarum CLI and core only")
+    endif()
+endif()
+
+if(NOT DEFINED BUILD_TESTING OR BUILD_TESTING)
+    add_executable(lazarum_tests tests/viewer_tests.cpp)
+    target_link_libraries(lazarum_tests PRIVATE lazarum_core)
+    add_test(NAME lazarum_tests COMMAND lazarum_tests)
+    if(LAZARUM_IMAGE_CORE_TARGET)
+        add_executable(lazarum_provider_fixture tests/provider_fixture.cpp)
+        target_link_libraries(lazarum_provider_fixture PRIVATE ${LAZARUM_IMAGE_CORE_TARGET})
+        target_compile_features(lazarum_provider_fixture PRIVATE cxx_std_20)
+    endif()
+endif()
+
+install(TARGETS lazarum RUNTIME DESTINATION bin)
+if(TARGET lazarum-nbd)
+    install(TARGETS lazarum-nbd RUNTIME DESTINATION bin)
+endif()
+if(TARGET lazarum-gui)
+    install(TARGETS lazarum-gui RUNTIME DESTINATION bin)
+    install(FILES data/com.arcology.Lazarum.desktop DESTINATION share/applications)
+    install(FILES
+        ../assets/arcology-lazarus-logo.png
+        data/lazarum-phoenix-emblem.svg
+        data/lazarum-empty-drive.svg
+        DESTINATION share/lazarum)
+endif()

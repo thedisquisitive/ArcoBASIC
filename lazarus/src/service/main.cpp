@@ -24,6 +24,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <cstring>
 #include <filesystem>
@@ -49,8 +50,14 @@ struct ServiceConfig {
     std::string socket_path = "/run/arcology-lazarus/service.sock";
     std::string security_path = "/var/lib/arcology-lazarus/admin.auth";
     std::string security_backup_path = "/mnt/lazarus-storage/admin.auth";
+    std::string technicians_path = "/var/lib/arcology-lazarus/technicians.auth";
+    std::string technicians_backup_path = "/mnt/lazarus-storage/technicians.auth";
+    std::string activity_log_path = "/var/lib/arcology-lazarus/activity.log";
+    std::string activity_log_backup_path = "/mnt/lazarus-storage/activity.log";
     std::string network_path = "/etc/arcology-lazarus/network.conf";
     std::string network_helper = "/usr/local/sbin/lazarus-network-up";
+    std::string storage_helper = "/usr/local/sbin/lazarus-mount-storage";
+    std::string nas_credentials_path = "/var/lib/arcology-lazarus/nas-storage.auth";
     bool stdio = false;
 };
 
@@ -87,6 +94,22 @@ std::chrono::steady_clock::time_point admin_login_blocked_until{};
 std::recursive_mutex admin_mutex;
 std::mutex profile_save_mutex;
 
+// A technician PIN is a light accountability gate for job records (backup/restore/verify), so one
+// tech cannot casually log work under a coworker's name -- not a security boundary like the admin
+// password, so 4 digits is deliberately quick to enter on a shared bench keypad. It still gets the
+// same salted-hash storage as the admin credential rather than plaintext, and the same modest rate
+// limit shape.
+struct TechnicianRecord {
+    std::string name;
+    int iterations = kPasswordIterations;
+    std::string pin_salt;
+    std::string pin_hash;
+};
+
+std::mutex technician_mutex;
+unsigned int failed_technician_logins = 0;
+std::chrono::steady_clock::time_point technician_login_blocked_until{};
+
 struct DeviceActivity {
     lazarus::DeviceIdentity device;
     std::string operation;
@@ -103,6 +126,7 @@ struct BrowseVolume {
     std::string label;
     std::uint64_t size_bytes = 0;
     std::string mount_path;
+    std::string dislocker_mount_path;
 };
 
 struct BrowseSession {
@@ -191,6 +215,13 @@ std::string trim_copy(std::string value) {
     return value.substr(first, last - first + 1);
 }
 
+std::string lower_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
+}
+
 bool run_program(const std::vector<std::string>& arguments, std::string& output, std::string& error) {
     if (arguments.empty()) {
         error = "No command was provided.";
@@ -246,6 +277,30 @@ bool run_program(const std::vector<std::string>& arguments, std::string& output,
     return true;
 }
 
+bool path_uses_image_storage_mirror(const std::filesystem::path& path) {
+    const auto root = std::filesystem::path{"/mnt/lazarus-storage"};
+    const auto relative = path.lexically_normal().lexically_relative(root);
+    return !relative.empty() && *relative.begin() != "..";
+}
+
+// Appliance credentials and configuration may be mirrored beside images on a dedicated local
+// storage disk. A NAS is shared backup data, not per-appliance state, and must never receive it.
+// Explicit non-appliance paths remain available to the service test harness.
+bool appliance_state_mirror_allowed(const std::filesystem::path& path) {
+    if (!path_uses_image_storage_mirror(path)) return true;
+    std::string source;
+    std::string error;
+    if (!run_program({"findmnt", "-rn", "-M", "/mnt/lazarus-storage", "-o", "SOURCE"}, source, error)) {
+        return false;
+    }
+    source = trim_copy(source);
+    return source.rfind("/dev/", 0) == 0;
+}
+
+bool run_storage_helper(const ServiceConfig& config, std::string& output, std::string& error) {
+    return run_program({"timeout", "-s", "KILL", "12", config.storage_helper}, output, error);
+}
+
 bool valid_printer_name(const std::string& name) {
     return !name.empty() && name.size() <= 127 &&
            std::all_of(name.begin(), name.end(), [](unsigned char character) {
@@ -265,7 +320,8 @@ std::string printer_queue_name(const std::string& display_name) {
     std::string result;
     result.reserve(std::min<std::size_t>(display_name.size(), 127));
     bool separator = false;
-    for (const unsigned char character : display_name) {
+    for (const char raw_character : display_name) {
+        const auto character = static_cast<unsigned char>(raw_character);
         if (std::isalnum(character)) {
             result.push_back(static_cast<char>(character));
             separator = false;
@@ -469,7 +525,9 @@ bool load_printers(std::vector<PrinterInfo>& printers, std::string& default_prin
 bool persist_printer_state(std::string& error) {
     const std::filesystem::path source_root = "/etc/cups";
     const std::filesystem::path storage_root = "/mnt/lazarus-storage";
-    if (!std::filesystem::exists(source_root / "printers.conf") || !std::filesystem::is_directory(storage_root)) {
+    if (!std::filesystem::exists(source_root / "printers.conf") ||
+        !appliance_state_mirror_allowed(storage_root / "cups") ||
+        !std::filesystem::is_directory(storage_root)) {
         return true;
     }
 
@@ -514,62 +572,6 @@ std::string hex_encode(const unsigned char* data, std::size_t size) {
         result[index * 2 + 1] = digits[data[index] & 0x0f];
     }
     return result;
-}
-
-bool read_exact_at(int descriptor, void* buffer, std::size_t size, std::uint64_t offset) {
-    auto* output = static_cast<unsigned char*>(buffer);
-    std::size_t completed = 0;
-    while (completed < size) {
-        const auto count = ::pread(descriptor, output + completed, size - completed,
-                                   static_cast<off_t>(offset + completed));
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) return false;
-        completed += static_cast<std::size_t>(count);
-    }
-    return true;
-}
-
-std::string partition_table_identifier(const std::string& device_path) {
-    const int descriptor = ::open(device_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (descriptor < 0) return {};
-
-    std::array<unsigned char, 512> mbr{};
-    if (!read_exact_at(descriptor, mbr.data(), mbr.size(), 0) ||
-        mbr[510] != 0x55 || mbr[511] != 0xaa) {
-        ::close(descriptor);
-        return {};
-    }
-
-    unsigned int logical_sector_size = 512;
-    if (::ioctl(descriptor, BLKSSZGET, &logical_sector_size) != 0 || logical_sector_size < 512) {
-        logical_sector_size = 512;
-    }
-    std::vector<unsigned char> gpt_header(logical_sector_size);
-    const bool has_gpt = read_exact_at(descriptor, gpt_header.data(), gpt_header.size(), logical_sector_size) &&
-                         std::equal(gpt_header.begin(), gpt_header.begin() + 8,
-                                    std::array<unsigned char, 8>{'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T'}.begin());
-    if (has_gpt) {
-        const auto* guid = gpt_header.data() + 56;
-        if (std::any_of(guid, guid + 16, [](unsigned char byte) { return byte != 0; })) {
-            char formatted[37]{};
-            std::snprintf(formatted, sizeof(formatted),
-                          "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                          guid[3], guid[2], guid[1], guid[0], guid[5], guid[4], guid[7], guid[6],
-                          guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]);
-            ::close(descriptor);
-            return formatted;
-        }
-    }
-
-    ::close(descriptor);
-    const std::uint32_t mbr_identifier = static_cast<std::uint32_t>(mbr[440]) |
-                                         (static_cast<std::uint32_t>(mbr[441]) << 8U) |
-                                         (static_cast<std::uint32_t>(mbr[442]) << 16U) |
-                                         (static_cast<std::uint32_t>(mbr[443]) << 24U);
-    if (mbr_identifier == 0) return {};
-    char formatted[9]{};
-    std::snprintf(formatted, sizeof(formatted), "%08x", mbr_identifier);
-    return formatted;
 }
 
 std::vector<unsigned char> hex_decode(const std::string& value) {
@@ -719,7 +721,8 @@ bool save_admin_record(const ServiceConfig& config, const AdminRecord& record, s
     if (!write_admin_record_file(config.security_path, record, error)) return false;
     const std::filesystem::path backup(config.security_backup_path);
     std::error_code filesystem_error;
-    if (backup.has_parent_path() && std::filesystem::is_directory(backup.parent_path(), filesystem_error)) {
+    if (backup.has_parent_path() && appliance_state_mirror_allowed(backup) &&
+        std::filesystem::is_directory(backup.parent_path(), filesystem_error)) {
         std::string backup_error;
         if (!write_admin_record_file(backup, record, backup_error)) {
             error = "Credentials were saved locally but could not be mirrored to persistent storage: " + backup_error;
@@ -729,8 +732,138 @@ bool save_admin_record(const ServiceConfig& config, const AdminRecord& record, s
     return true;
 }
 
+std::string generate_pin() {
+    unsigned char random_byte[2]{};
+    if (RAND_bytes(random_byte, sizeof(random_byte)) != 1) return {};
+    const unsigned int value = (static_cast<unsigned int>(random_byte[0]) << 8 | random_byte[1]) % 10000;
+    char text[5]{};
+    std::snprintf(text, sizeof(text), "%04u", value);
+    return text;
+}
+
+std::vector<std::string> split_pipe_fields(const std::string& value) {
+    std::vector<std::string> fields;
+    std::size_t start = 0;
+    while (true) {
+        const auto separator = value.find('|', start);
+        fields.push_back(value.substr(start, separator == std::string::npos ? std::string::npos : separator - start));
+        if (separator == std::string::npos) break;
+        start = separator + 1;
+    }
+    return fields;
+}
+
+std::vector<TechnicianRecord> load_technicians(const ServiceConfig& config) {
+    std::vector<TechnicianRecord> technicians;
+    std::ifstream input(config.technicians_path);
+    if (!input) return technicians;
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto separator = line.find('=');
+        if (separator == std::string::npos) continue;
+        const auto key = line.substr(0, separator);
+        if (key != "technician") continue;
+        const auto fields = split_pipe_fields(line.substr(separator + 1));
+        if (fields.size() != 4) continue;
+        TechnicianRecord record;
+        record.name = trim_copy(fields[0]);
+        try { record.iterations = std::stoi(fields[1]); } catch (...) { continue; }
+        record.pin_salt = fields[2];
+        record.pin_hash = fields[3];
+        if (record.name.empty() || record.iterations < 100000 || record.pin_salt.empty() || record.pin_hash.empty()) continue;
+        technicians.push_back(std::move(record));
+    }
+    return technicians;
+}
+
+bool write_technicians_file(const std::filesystem::path& path, const std::vector<TechnicianRecord>& technicians,
+                            std::string& error) {
+    std::error_code filesystem_error;
+    if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), filesystem_error);
+    if (filesystem_error) { error = filesystem_error.message(); return false; }
+    const auto temporary = path.string() + ".tmp." + std::to_string(::getpid());
+    std::string contents = "version=1\n";
+    for (const auto& record : technicians) {
+        contents += "technician=" + record.name + "|" + std::to_string(record.iterations) + "|" +
+                    record.pin_salt + "|" + record.pin_hash + "\n";
+    }
+
+    const int descriptor = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor < 0) {
+        error = "Could not create technician credential file: " + std::string(std::strerror(errno));
+        return false;
+    }
+    std::size_t written = 0;
+    while (written < contents.size()) {
+        const ssize_t count = ::write(descriptor, contents.data() + written, contents.size() - written);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            error = "Could not write technician credential file: " + std::string(std::strerror(errno));
+            ::close(descriptor);
+            std::filesystem::remove(temporary);
+            return false;
+        }
+        written += static_cast<std::size_t>(count);
+    }
+    if (::fsync(descriptor) != 0) {
+        error = "Could not commit technician credential file: " + std::string(std::strerror(errno));
+        ::close(descriptor);
+        std::filesystem::remove(temporary);
+        return false;
+    }
+    if (::close(descriptor) != 0) {
+        error = "Could not close technician credential file: " + std::string(std::strerror(errno));
+        std::filesystem::remove(temporary);
+        return false;
+    }
+    if (::rename(temporary.c_str(), path.c_str()) != 0) {
+        error = "Could not replace technician credential file: " + std::string(std::strerror(errno));
+        std::filesystem::remove(temporary);
+        return false;
+    }
+    if (::chmod(path.c_str(), 0600) != 0) {
+        error = "Could not protect technician credential file: " + std::string(std::strerror(errno));
+        return false;
+    }
+    const auto parent = path.has_parent_path() ? path.parent_path() : std::filesystem::path{"."};
+    const int directory = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) {
+        error = "Could not open credential directory for synchronization: " + std::string(std::strerror(errno));
+        return false;
+    }
+    const bool synchronized = ::fsync(directory) == 0;
+    const int sync_error = errno;
+    ::close(directory);
+    if (!synchronized) {
+        error = "Could not commit credential directory: " + std::string(std::strerror(sync_error));
+        return false;
+    }
+    return true;
+}
+
+bool save_technicians(const ServiceConfig& config, const std::vector<TechnicianRecord>& technicians, std::string& error) {
+    if (!write_technicians_file(config.technicians_path, technicians, error)) return false;
+    const std::filesystem::path backup(config.technicians_backup_path);
+    std::error_code filesystem_error;
+    if (backup.has_parent_path() && appliance_state_mirror_allowed(backup) &&
+        std::filesystem::is_directory(backup.parent_path(), filesystem_error)) {
+        std::string backup_error;
+        if (!write_technicians_file(backup, technicians, backup_error)) {
+            error = "Technician list was saved locally but could not be mirrored to persistent storage: " + backup_error;
+            return false;
+        }
+    }
+    return true;
+}
+
 bool valid_new_password(const std::string& password) {
     return !password.empty() && password.size() <= 256;
+}
+
+bool valid_technician_pin(const std::string& pin) {
+    return pin.size() == 4 && std::all_of(pin.begin(), pin.end(), [](unsigned char character) {
+        return std::isdigit(character) != 0;
+    });
 }
 
 bool schedule_power_action(const std::string& executable, std::string& error) {
@@ -816,7 +949,8 @@ private:
 
 std::string json_escape(const std::string& value) {
     std::string out;
-    for (const unsigned char ch : value) {
+    for (const char raw_character : value) {
+        const auto ch = static_cast<unsigned char>(raw_character);
         switch (ch) {
             case '\\':
                 out += "\\\\";
@@ -912,6 +1046,68 @@ std::string extract_json_string(const std::string& text, const std::string& key)
     return out;
 }
 
+bool has_json_field(const std::string& text, const std::string& key) {
+    return text.find("\"" + key + "\"") != std::string::npos;
+}
+
+bool verify_technician_pin(const ServiceConfig& config, const std::string& name, const std::string& pin, std::string& error) {
+    std::lock_guard lock(technician_mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (now < technician_login_blocked_until) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(technician_login_blocked_until - now).count() + 1;
+        error = "Too many failed attempts. Try again in " + std::to_string(remaining) + " seconds.";
+        return false;
+    }
+    const auto technicians = load_technicians(config);
+    const auto found = std::find_if(technicians.begin(), technicians.end(), [&](const TechnicianRecord& technician) {
+        return technician.name == name;
+    });
+    const bool valid = found != technicians.end() &&
+        constant_time_equal(derive_secret(pin, found->pin_salt, found->iterations), found->pin_hash);
+    if (!valid) {
+        ++failed_technician_logins;
+        if (failed_technician_logins >= 3) {
+            const auto delay = std::min(30U, 1U << std::min(5U, failed_technician_logins - 2));
+            technician_login_blocked_until = now + std::chrono::seconds(delay);
+        }
+        error = "That name and PIN were not accepted.";
+        return false;
+    }
+    failed_technician_logins = 0;
+    technician_login_blocked_until = {};
+    return true;
+}
+
+// Every job that produces a customer-facing record (backup, restore, verify) must be attributed to
+// a real technician instead of a free-typed name, so one employee cannot log work under a
+// coworker's name to dodge accountability. Once at least one technician is on the roster, this is
+// mandatory; an empty roster (a fresh appliance before the admin has added anyone) falls back to a
+// free-typed name so day-one setup isn't blocked on configuring the roster first.
+bool resolve_job_technician(const ServiceConfig& config, const std::string& request, std::string& technician, std::string& error) {
+    std::vector<TechnicianRecord> technicians;
+    {
+        std::lock_guard lock(technician_mutex);
+        technicians = load_technicians(config);
+    }
+    if (technicians.empty()) {
+        technician = trim_copy(extract_json_string(request, "technician"));
+        if (technician.empty()) {
+            error = "technician is required.";
+            return false;
+        }
+        return true;
+    }
+    const auto name = trim_copy(extract_json_string(request, "technician_name"));
+    const auto pin = extract_json_string(request, "technician_pin");
+    if (name.empty() || pin.empty()) {
+        error = "Select your name and enter your PIN to continue.";
+        return false;
+    }
+    if (!verify_technician_pin(config, name, pin, error)) return false;
+    technician = name;
+    return true;
+}
+
 std::uint64_t extract_json_u64(const std::string& text, const std::string& key) {
     const auto key_pos = text.find("\"" + key + "\"");
     if (key_pos == std::string::npos) return 0;
@@ -925,6 +1121,15 @@ std::uint64_t extract_json_u64(const std::string& text, const std::string& key) 
     } catch (...) {
         return 0;
     }
+}
+
+bool extract_json_true(const std::string& text, const std::string& key) {
+    const auto key_pos = text.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) return false;
+    const auto colon = text.find(':', key_pos);
+    if (colon == std::string::npos) return false;
+    const auto value = text.find_first_not_of(" \t\r\n", colon + 1);
+    return value != std::string::npos && text.compare(value, 4, "true") == 0;
 }
 
 std::string trim(std::string value) {
@@ -1225,7 +1430,8 @@ bool save_network_settings(const ServiceConfig& config, const NetworkSettings& s
         return false;
     }
     const std::filesystem::path persistent_root("/mnt/lazarus-storage");
-    if (std::filesystem::is_directory(persistent_root)) {
+    if (appliance_state_mirror_allowed(persistent_root / "network.conf") &&
+        std::filesystem::is_directory(persistent_root)) {
         std::filesystem::copy_file(path, persistent_root / "network.conf",
                                    std::filesystem::copy_options::overwrite_existing, filesystem_error);
         if (filesystem_error) {
@@ -1238,20 +1444,49 @@ bool save_network_settings(const ServiceConfig& config, const NetworkSettings& s
 }
 
 bool image_storage_online(const lazarus::BenchProfile& bench) {
-    if (!bench.image_storage_device.empty()) {
+    if (!bench.image_storage_device.empty() || !bench.nas_storage_protocol.empty()) {
         std::string mounted;
         std::string error;
-        if (!run_program({"findmnt", "-rn", "-M", "/mnt/lazarus-storage", "-o", "TARGET"}, mounted, error) ||
-            trim_copy(mounted) != "/mnt/lazarus-storage") {
+        if (!run_program({"findmnt", "-rn", "-M", "/mnt/lazarus-storage", "-o", "TARGET,SOURCE,FSTYPE"}, mounted, error)) {
             return false;
+        }
+        std::istringstream details(trim_copy(mounted));
+        std::string target;
+        std::string source;
+        std::string filesystem;
+        details >> target >> source >> filesystem;
+        if (target != "/mnt/lazarus-storage") return false;
+        if (!bench.nas_storage_protocol.empty()) {
+            const bool protocol_matches = bench.nas_storage_protocol == "smb"
+                ? filesystem == "cifs"
+                : bench.nas_storage_protocol == "nfs" && (filesystem == "nfs" || filesystem == "nfs4");
+            const auto expected_source = bench.nas_storage_protocol == "smb"
+                ? "//" + bench.nas_storage_server + "/" + bench.nas_storage_share
+                : bench.nas_storage_server + ":" + bench.nas_storage_share;
+            if (!protocol_matches || source != expected_source) return false;
         }
     }
     for (const auto& path : bench.image_storage_paths) {
         if (!std::filesystem::is_directory(path)) continue;
+        std::error_code canonical_error;
+        const auto resolved = std::filesystem::canonical(path, canonical_error);
+        if (canonical_error) continue;
         std::string output;
         std::string error;
-        if (run_program({"findmnt", "-rn", "-T", path, "-o", "TARGET"}, output, error) &&
-            !trim_copy(output).empty()) return true;
+        if (!run_program({"findmnt", "-rn", "-T", resolved.string(), "-o", "TARGET,FSTYPE"}, output, error)) continue;
+        std::istringstream details(trim_copy(output));
+        std::string target;
+        std::string filesystem;
+        details >> target >> filesystem;
+        if (filesystem.empty()) continue;
+        if ((!bench.image_storage_device.empty() || !bench.nas_storage_protocol.empty()) &&
+            target != "/mnt/lazarus-storage") continue;
+        if (bench.image_storage_device.empty() &&
+            (filesystem == "overlay" || filesystem == "tmpfs" || filesystem == "ramfs" ||
+             filesystem == "squashfs" || filesystem == "aufs")) {
+            continue;
+        }
+        return true;
     }
     return false;
 }
@@ -1299,14 +1534,28 @@ std::optional<lazarus::DeviceIdentity> find_device(const lazarus::BenchProfile& 
     return std::nullopt;
 }
 
-bool ensure_image_storage_ready(const lazarus::BenchProfile& bench, std::string& error) {
+bool ensure_image_storage_ready(const ServiceConfig& config, const lazarus::BenchProfile& bench, std::string& error) {
     if (image_storage_online(bench)) {
         error.clear();
         return true;
     }
-    if (bench.image_storage_device.empty()) {
-        error = "Image storage is not configured. An administrator must assign and prepare an image-storage disk.";
+    if (bench.image_storage_device.empty() && bench.nas_storage_protocol.empty()) {
+        error = "Persistent image storage is not configured. An administrator must assign and prepare an image-storage disk; live-system RAM storage is not accepted for backups.";
         return false;
+    }
+    if (!bench.nas_storage_protocol.empty()) {
+        std::string output;
+        if (!run_storage_helper(config, output, error) || !image_storage_online(bench)) {
+            error = "The configured NAS could not be mounted. " + error +
+                    (output.empty() ? std::string{} : " " + trim_copy(output));
+            return false;
+        }
+        if (bench.image_storage_path.empty() || !std::filesystem::is_directory(bench.image_storage_path)) {
+            error = "The NAS mounted, but its configured Lazarus image folder is unavailable.";
+            return false;
+        }
+        error.clear();
+        return true;
     }
     const auto device = find_device(bench, bench.image_storage_device);
     if (!device) {
@@ -1323,14 +1572,13 @@ bool ensure_image_storage_ready(const lazarus::BenchProfile& bench, std::string&
         return false;
     }
     std::string output;
-    if (!run_program({"/usr/local/sbin/lazarus-mount-storage"}, output, error) ||
-        !path_is_mountpoint("/mnt/lazarus-storage")) {
+    if (!run_storage_helper(config, output, error) || !image_storage_online(bench)) {
         error = "The configured image-storage filesystem could not be mounted. " + error +
                 (output.empty() ? std::string{} : " " + trim_copy(output));
         return false;
     }
-    if (!std::filesystem::is_directory("/mnt/lazarus-storage/images")) {
-        error = "Image storage mounted, but its images directory is unavailable.";
+    if (bench.image_storage_path.empty() || !std::filesystem::is_directory(bench.image_storage_path)) {
+        error = "Image storage mounted, but its configured image folder is unavailable.";
         return false;
     }
     error.clear();
@@ -1401,6 +1649,23 @@ bool supported_browse_filesystem(const std::string& filesystem) {
     return supported.contains(filesystem);
 }
 
+bool is_bitlocker_filesystem(const std::string& filesystem) {
+    std::string lowered = filesystem;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+    return lowered == "bitlocker";
+}
+
+bool valid_bitlocker_recovery_key(const std::string& key) {
+    static const std::regex pattern(R"(^\d{6}(-\d{6}){7}$)");
+    return std::regex_match(key, pattern);
+}
+
+bool dislocker_available() {
+    return ::access("/usr/bin/dislocker", X_OK) == 0 || ::access("/usr/sbin/dislocker", X_OK) == 0;
+}
+
+
 std::string command_value(const std::vector<std::string>& arguments) {
     std::string output;
     std::string error;
@@ -1435,7 +1700,7 @@ std::string decode_blkid_value(const std::string& value) {
 std::string block_device_tag(const std::string& device_path, const std::string& tag) {
     std::string output;
     std::string error;
-    if (!run_program({"blkid", device_path}, output, error)) return {};
+    if (!run_program({"timeout", "-s", "KILL", "8", "blkid", device_path}, output, error)) return {};
     const auto marker = tag + "=\"";
     const auto start = output.find(marker);
     if (start == std::string::npos) return {};
@@ -1445,10 +1710,205 @@ std::string block_device_tag(const std::string& device_path, const std::string& 
     return decode_blkid_value(output.substr(value_start, end - value_start));
 }
 
-bool mount_browse_volume(BrowseVolume& volume, const std::string& session_id, std::string& error) {
+// Mounts any non-system disk's already-existing recognized filesystem for direct technician
+// access (Recover Files/browse handles reading inside a Lazarus image; this handles a live
+// physical disk). Never formats -- destructive preparation stays exclusively in
+// configure_image_storage's explicit ERASE flow. Idempotent: a partition already mounted
+// anywhere is reported as-is rather than mounted a second time.
+bool mount_generic_device(const lazarus::DeviceIdentity& device, std::string& mount_path,
+                          std::string& partition, bool& read_only, std::string& filesystem,
+                          std::string& error) {
+    std::vector<std::string> candidates = device.partitions;
+    if (candidates.empty()) candidates.push_back(device.linux_path);
+    for (const auto& candidate : candidates) {
+        const auto type = block_device_tag(candidate, "TYPE");
+        if (!supported_browse_filesystem(type)) continue;
+        partition = candidate;
+        filesystem = type;
+        break;
+    }
+    if (partition.empty()) {
+        error = "No recognized filesystem (NTFS, FAT32, exFAT, or ext2/3/4) was found on this disk. "
+                "Format it from Administration > Image Storage, or on another computer, then try again.";
+        return false;
+    }
+
+    std::string mounted_at;
+    std::string findmnt_error;
+    if (run_program({"findmnt", "-rn", "-S", partition, "-o", "TARGET"}, mounted_at, findmnt_error) &&
+        !trim_copy(mounted_at).empty()) {
+        mount_path = trim_copy(mounted_at);
+        return true;
+    }
+
+    read_only = device.bench_role == lazarus::DeviceRole::SourceOnly;
+    const auto token = sha256_text(identity_for_profile(device)).substr(0, 16);
+    const auto target = std::filesystem::path("/mnt/lazarus-drives") / token;
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(target, filesystem_error);
+    if (filesystem_error) {
+        error = "Could not create the mount point: " + filesystem_error.message();
+        return false;
+    }
+    // ext4/vfat/exfat/ntfs3 are loadable modules on this kernel, not built in, and nothing else
+    // in the boot path guarantees they are already loaded before the first real mount attempt.
+    // Preloading here is cheap and idempotent; skipping it risks a real-hardware-only failure
+    // that never shows up against pre-warmed QEMU test images.
+    std::string ignored_output;
+    std::string ignored_error;
+    for (const char* module : {"ext4", "vfat", "exfat", "ntfs3"}) {
+        run_program({"modprobe", module}, ignored_output, ignored_error);
+    }
+    std::string output;
+    const char* options = read_only ? "ro,nosuid,nodev,noexec" : "rw,nosuid,nodev,noexec";
+    if (!run_program({"mount", "-o", options, partition, target.string()}, output, error)) {
+        error = "Could not mount " + partition + ": " + error;
+        return false;
+    }
+    mount_path = target.string();
+    return true;
+}
+
+bool release_generic_mount_for_storage(const lazarus::DeviceIdentity& device, std::string& error) {
+    {
+        std::lock_guard lock(activity_mutex);
+        const auto active = active_devices.find(activity_key(device));
+        if (active != active_devices.end() && active->second.operation != "Mounted for direct access") {
+            error = "The selected disk is already in use by another Lazarus operation.";
+            return false;
+        }
+    }
+
+    std::vector<std::string> candidates = device.partitions;
+    if (candidates.empty()) candidates.push_back(device.linux_path);
+    for (const auto& candidate : candidates) {
+        std::string mounted_at;
+        std::string command_error;
+        if (!run_program({"findmnt", "-rn", "-S", candidate, "-o", "TARGET"}, mounted_at, command_error) ||
+            trim_copy(mounted_at).empty()) {
+            continue;
+        }
+        const auto target = trim_copy(mounted_at);
+        if (target == "/mnt/lazarus-storage") continue;
+        if (target.rfind("/mnt/lazarus-drives/", 0) != 0) {
+            error = "The selected filesystem is mounted outside Lazarus at " + target +
+                    ". Unmount it there before assigning it as image storage.";
+            return false;
+        }
+        std::string output;
+        run_program({"sync"}, output, command_error);
+        if (!run_program({"umount", target}, output, command_error)) {
+            error = "Could not release the Home-mounted filesystem before assigning image storage: " + command_error;
+            return false;
+        }
+        std::error_code filesystem_error;
+        std::filesystem::remove(target, filesystem_error);
+    }
+    std::lock_guard lock(activity_mutex);
+    active_devices.erase(activity_key(device));
+    return true;
+}
+
+// dislocker daemonizes (forks to background) once its FUSE mount succeeds; the surviving
+// background process retains any inherited stdout/stderr for the whole life of the mount. Using
+// run_program() here (which pipes and blocks reading until EOF) would hang the calling thread for
+// the entire browse session. Spawn it directly instead, redirecting stdout/stderr to /dev/null
+// (which also guarantees no dislocker output -- verbose, debug, or otherwise -- ever reaches a
+// JSON response or log), and detect success by polling for dislocker-file to appear.
+bool unlock_bitlocker_volume(BrowseVolume& volume, const std::string& session_id,
+                             const std::string& recovery_key, std::string& error) {
+    if (!dislocker_available()) {
+        error = "The BitLocker unlock tool is not installed on this appliance.";
+        return false;
+    }
+    std::string ignored_output, ignored_error;
+    run_program({"modprobe", "fuse"}, ignored_output, ignored_error);
+
+    const auto dislocker_dir = std::filesystem::path("/run/arcology-lazarus/browse") / session_id / (volume.token + "-bitlocker");
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(dislocker_dir, filesystem_error);
+    if (filesystem_error) {
+        error = "Could not create the protected BitLocker unlock mount point: " + filesystem_error.message();
+        return false;
+    }
+
+    const int devnull = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (devnull < 0) {
+        error = "Could not open /dev/null to launch the BitLocker unlock tool.";
+        return false;
+    }
+    const pid_t child = ::fork();
+    if (child < 0) {
+        ::close(devnull);
+        error = "Could not start the BitLocker unlock tool.";
+        return false;
+    }
+    if (child == 0) {
+        ::dup2(devnull, STDOUT_FILENO);
+        ::dup2(devnull, STDERR_FILENO);
+        ::close(devnull);
+        std::vector<std::string> arguments = {
+            "dislocker", "-r", "-V", volume.device_path, "-p" + recovery_key, "--", dislocker_dir.string(),
+        };
+        std::vector<char*> argv;
+        argv.reserve(arguments.size() + 1);
+        for (auto& argument : arguments) argv.push_back(argument.data());
+        argv.push_back(nullptr);
+        ::execvp(argv.front(), argv.data());
+        _exit(127);
+    }
+    ::close(devnull);
+    int status = 0;
+    ::waitpid(child, &status, 0);
+
+    const auto dislocker_file = dislocker_dir / "dislocker-file";
+    bool unlocked = false;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            std::error_code exists_error;
+            if (std::filesystem::exists(dislocker_file, exists_error) && !exists_error) {
+                unlocked = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+    if (!unlocked) {
+        std::string ignored;
+        run_program({"fusermount", "-u", dislocker_dir.string()}, ignored, ignored);
+        std::filesystem::remove(dislocker_dir, filesystem_error);
+        error = "Could not unlock the BitLocker volume. Verify the recovery key and try again.";
+        return false;
+    }
+    volume.dislocker_mount_path = dislocker_dir.string();
+    return true;
+}
+
+bool mount_browse_volume(BrowseVolume& volume, const std::string& session_id,
+                         const std::string& recovery_key, std::string& error) {
     if (!volume.mount_path.empty()) return true;
-    if (!supported_browse_filesystem(volume.filesystem)) {
-        error = "The " + (volume.filesystem.empty() ? std::string("unknown") : volume.filesystem) +
+
+    std::string source_path = volume.device_path;
+    std::string effective_filesystem = volume.filesystem;
+
+    if (is_bitlocker_filesystem(volume.filesystem)) {
+        if (volume.dislocker_mount_path.empty()) {
+            if (recovery_key.empty()) {
+                error = "This volume is protected by BitLocker. Enter the recovery key to unlock it.";
+                return false;
+            }
+            if (!valid_bitlocker_recovery_key(recovery_key)) {
+                error = "That doesn't look like a 48-digit BitLocker recovery key.";
+                return false;
+            }
+            if (!unlock_bitlocker_volume(volume, session_id, recovery_key, error)) return false;
+        }
+        source_path = volume.dislocker_mount_path + "/dislocker-file";
+        effective_filesystem = block_device_tag(source_path, "TYPE");
+    }
+
+    if (!supported_browse_filesystem(effective_filesystem)) {
+        error = "The " + (effective_filesystem.empty() ? std::string("unknown") : effective_filesystem) +
                 " filesystem is not supported by the read-only browser.";
         return false;
     }
@@ -1460,7 +1920,7 @@ bool mount_browse_volume(BrowseVolume& volume, const std::string& session_id, st
         return false;
     }
     std::string output;
-    if (!run_program({"mount", "-o", "ro,nosuid,nodev,noexec", volume.device_path, mount_path.string()}, output, error)) {
+    if (!run_program({"mount", "-o", "ro,nosuid,nodev,noexec", source_path, mount_path.string()}, output, error)) {
         error = "Could not mount the image volume read-only: " + error;
         return false;
     }
@@ -1471,19 +1931,34 @@ bool mount_browse_volume(BrowseVolume& volume, const std::string& session_id, st
 bool close_browse_session(BrowseSession& session, std::string* reported_error = nullptr) {
     bool closed = true;
     for (auto& volume : session.volumes) {
-        if (volume.mount_path.empty()) continue;
-        std::string output;
-        std::string error;
-        if (!run_program({"umount", volume.mount_path}, output, error)) {
-            closed = false;
-            if (reported_error != nullptr && reported_error->empty()) {
-                *reported_error = "Could not unmount a read-only image volume: " + error;
+        if (!volume.mount_path.empty()) {
+            std::string output;
+            std::string error;
+            if (!run_program({"umount", volume.mount_path}, output, error)) {
+                closed = false;
+                if (reported_error != nullptr && reported_error->empty()) {
+                    *reported_error = "Could not unmount a read-only image volume: " + error;
+                }
+            } else {
+                std::error_code filesystem_error;
+                std::filesystem::remove(volume.mount_path, filesystem_error);
+                volume.mount_path.clear();
             }
-            continue;
         }
-        std::error_code filesystem_error;
-        std::filesystem::remove(volume.mount_path, filesystem_error);
-        volume.mount_path.clear();
+        if (!volume.dislocker_mount_path.empty()) {
+            std::string output;
+            std::string error;
+            if (!run_program({"fusermount", "-u", volume.dislocker_mount_path}, output, error)) {
+                closed = false;
+                if (reported_error != nullptr && reported_error->empty()) {
+                    *reported_error = "Could not detach the BitLocker unlock mount: " + error;
+                }
+            } else {
+                std::error_code filesystem_error;
+                std::filesystem::remove_all(volume.dislocker_mount_path, filesystem_error);
+                volume.dislocker_mount_path.clear();
+            }
+        }
     }
     if (closed && !session.loop_device.empty()) {
         std::string output;
@@ -1703,42 +2178,14 @@ std::string driver_plan_rows(const lazarus::DriverMigrationPlan& plan) {
     return rows;
 }
 
-std::string sha256_file(const std::filesystem::path& path, std::string& error) {
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream) {
-        error = "Could not open staged file for hashing: " + path.string();
-        return {};
+std::string boot_repair_findings_text(const std::vector<lazarus::SafetyFinding>& findings) {
+    std::string rows;
+    for (const auto& item : findings) {
+        rows += lazarus::to_string(item.severity) + ": " + item.observed;
+        if (!item.action.empty()) rows += " Recommended: " + item.action;
+        rows += "\n";
     }
-    EVP_MD_CTX* context = EVP_MD_CTX_new();
-    if (context == nullptr || EVP_DigestInit_ex(context, EVP_sha256(), nullptr) != 1) {
-        if (context != nullptr) EVP_MD_CTX_free(context);
-        error = "Could not initialize SHA-256 for staged driver files.";
-        return {};
-    }
-    std::array<char, 64 * 1024> buffer{};
-    while (stream) {
-        stream.read(buffer.data(), buffer.size());
-        const auto count = stream.gcount();
-        if (count > 0 && EVP_DigestUpdate(context, buffer.data(), static_cast<std::size_t>(count)) != 1) {
-            EVP_MD_CTX_free(context);
-            error = "Could not hash staged driver file: " + path.string();
-            return {};
-        }
-    }
-    if (!stream.eof()) {
-        EVP_MD_CTX_free(context);
-        error = "Could not read the complete staged driver file: " + path.string();
-        return {};
-    }
-    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
-    unsigned int digest_size = 0;
-    if (EVP_DigestFinal_ex(context, digest.data(), &digest_size) != 1) {
-        EVP_MD_CTX_free(context);
-        error = "Could not finalize SHA-256 for staged driver file.";
-        return {};
-    }
-    EVP_MD_CTX_free(context);
-    return hex_encode(digest.data(), digest_size);
+    return rows;
 }
 
 bool copy_driver_package(const std::filesystem::path& source, const std::filesystem::path& destination,
@@ -1805,6 +2252,111 @@ std::string read_text_file(const std::filesystem::path& path) {
     std::string text;
     std::getline(in, text, '\0');
     return text;
+}
+
+// A small, append-only record of successful user-facing operations (backup/restore/verify) for the
+// Home page's recent-activity list, so a shop with several techs can see who did what without
+// digging through per-job reports. Admin-only actions (printers, network, branding, etc.) are
+// deliberately not tracked here.
+struct ActivityEntry {
+    std::string timestamp;
+    std::string technician;
+    std::string verb;
+    std::string ticket;
+    std::string customer;
+};
+
+std::mutex activity_log_mutex;
+
+std::string current_timestamp() {
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_r(&now, &local);
+    char buffer[32]{};
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M", &local);
+    return buffer;
+}
+
+std::string sanitize_log_field(std::string value) {
+    std::replace(value.begin(), value.end(), '|', ' ');
+    std::replace(value.begin(), value.end(), '\n', ' ');
+    std::replace(value.begin(), value.end(), '\r', ' ');
+    return trim_copy(value);
+}
+
+std::vector<ActivityEntry> load_activity_log(const std::filesystem::path& path) {
+    std::vector<ActivityEntry> entries;
+    std::istringstream stream(read_text_file(path));
+    std::string line;
+    while (std::getline(stream, line)) {
+        const auto fields = split_pipe_fields(line);
+        if (fields.size() != 5) continue;
+        entries.push_back({fields[0], fields[1], fields[2], fields[3], fields[4]});
+    }
+    return entries;
+}
+
+bool write_activity_log_file(const std::filesystem::path& path, const std::vector<ActivityEntry>& entries,
+                             std::string& error) {
+    std::error_code filesystem_error;
+    if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), filesystem_error);
+    if (filesystem_error) { error = filesystem_error.message(); return false; }
+    std::string contents;
+    for (const auto& entry : entries) {
+        contents += entry.timestamp + "|" + entry.technician + "|" + entry.verb + "|" +
+                    entry.ticket + "|" + entry.customer + "\n";
+    }
+    const auto temporary = path.string() + ".tmp." + std::to_string(::getpid());
+    {
+        std::ofstream out(temporary, std::ios::trunc);
+        if (!out) { error = "Could not write activity log."; return false; }
+        out << contents;
+        if (!out) { error = "Could not write activity log."; std::filesystem::remove(temporary); return false; }
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, path, rename_error);
+    if (rename_error) {
+        error = rename_error.message();
+        std::filesystem::remove(temporary);
+        return false;
+    }
+    return true;
+}
+
+// The Home page only ever shows the last 5 entries; cap the file so a 24/7 bench doesn't grow it
+// forever.
+constexpr std::size_t kActivityLogCapacity = 200;
+
+void record_activity(const ServiceConfig& config, const std::string& technician, const std::string& verb,
+                     const std::string& ticket, const std::string& customer) {
+    std::lock_guard lock(activity_log_mutex);
+    auto entries = load_activity_log(config.activity_log_path);
+    entries.push_back({current_timestamp(), sanitize_log_field(technician), verb,
+                       sanitize_log_field(ticket), sanitize_log_field(customer)});
+    if (entries.size() > kActivityLogCapacity) {
+        entries.erase(entries.begin(), entries.end() - kActivityLogCapacity);
+    }
+    std::string error;
+    if (!write_activity_log_file(config.activity_log_path, entries, error)) return;
+    const std::filesystem::path backup(config.activity_log_backup_path);
+    std::error_code filesystem_error;
+    if (backup.has_parent_path() && appliance_state_mirror_allowed(backup) &&
+        std::filesystem::is_directory(backup.parent_path(), filesystem_error)) {
+        std::string backup_error;
+        write_activity_log_file(backup, entries, backup_error);
+    }
+}
+
+std::string activity_rows_text(const ServiceConfig& config) {
+    auto entries = load_activity_log(config.activity_log_path);
+    std::string rows;
+    const std::size_t count = std::min<std::size_t>(5, entries.size());
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto& entry = entries[entries.size() - 1 - index];
+        rows += entry.timestamp + "\t" + entry.technician + "\t" + entry.verb + "\t" +
+                entry.ticket + "\t" + entry.customer + "\n";
+    }
+    return rows;
 }
 
 std::string sysfs_hex_component(const std::filesystem::path& path) {
@@ -1904,6 +2456,347 @@ std::filesystem::path case_insensitive_path(std::filesystem::path current,
     return current;
 }
 
+struct DriveOsAnalysis {
+    std::string family = "unknown";
+    std::string name = "No operating system confirmed";
+    std::string version;
+    std::string edition;
+    std::string build;
+    std::string architecture;
+    std::string confidence = "none";
+    std::string boot_mode = "Unknown";
+    std::string system_partition;
+    bool encrypted = false;
+    bool bitlocker_detected = false;
+    std::string encryption_type = "None detected";
+    std::vector<std::string> installations;
+    std::vector<std::string> facts;
+    std::vector<lazarus::SafetyFinding> findings;
+};
+
+lazarus::SafetyFinding analysis_finding(lazarus::Severity severity, std::string code,
+                                        std::string observed, std::string action) {
+    return lazarus::SafetyFinding{severity, std::move(code), std::move(observed), std::move(action)};
+}
+
+std::string offline_registry_string(const std::filesystem::path& hive_path,
+                                    const std::vector<std::string>& key_path,
+                                    const std::string& value_name) {
+    hive_h* hive = hivex_open(hive_path.c_str(), 0);
+    if (hive == nullptr) return {};
+    auto node = hivex_root(hive);
+    for (const auto& component : key_path) {
+        node = node == 0 ? 0 : hivex_node_get_child(hive, node, component.c_str());
+    }
+    const auto value = node == 0 ? 0 : hivex_node_get_value(hive, node, value_name.c_str());
+    char* text = value == 0 ? nullptr : hivex_value_string(hive, value);
+    std::string result = text == nullptr ? std::string{} : std::string{text};
+    std::free(text);
+    hivex_close(hive);
+    return trim_copy(result);
+}
+
+bool offline_hive_readable(const std::filesystem::path& hive_path) {
+    hive_h* hive = hivex_open(hive_path.c_str(), 0);
+    if (hive == nullptr) return false;
+    const bool readable = hivex_root(hive) != 0;
+    hivex_close(hive);
+    return readable;
+}
+
+std::map<std::string, std::string> parse_os_release(const std::filesystem::path& mount_root) {
+    std::filesystem::path path;
+    std::error_code filesystem_error;
+    for (const auto& relative : {std::filesystem::path{"etc/os-release"},
+                                 std::filesystem::path{"usr/lib/os-release"}}) {
+        std::filesystem::path resolved;
+        std::string resolve_error;
+        if (resolve_browse_path(mount_root, relative.string(), resolved, resolve_error) &&
+            std::filesystem::is_regular_file(resolved, filesystem_error) &&
+            !filesystem_error && std::filesystem::file_size(resolved, filesystem_error) <= 1024 * 1024 &&
+            !filesystem_error) {
+            path = resolved;
+            break;
+        }
+        filesystem_error.clear();
+    }
+    if (path.empty()) return {};
+    std::ifstream input(path);
+    std::map<std::string, std::string> values;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const auto separator = line.find('=');
+        if (separator == std::string::npos) continue;
+        auto key = trim_copy(line.substr(0, separator));
+        auto value = trim_copy(line.substr(separator + 1));
+        if (value.size() >= 2 && ((value.front() == '"' && value.back() == '"') ||
+                                  (value.front() == '\'' && value.back() == '\''))) {
+            value = value.substr(1, value.size() - 2);
+        }
+        if (!key.empty()) values[key] = value;
+    }
+    return values;
+}
+
+std::string detect_linux_architecture(const std::filesystem::path& mount_root) {
+    for (const auto& relative : {"bin/sh", "usr/bin/env", "bin/bash", "usr/bin/bash"}) {
+        std::filesystem::path executable;
+        std::string resolve_error;
+        if (!resolve_browse_path(mount_root, relative, executable, resolve_error)) continue;
+        std::ifstream input(executable, std::ios::binary);
+        std::array<unsigned char, 20> header{};
+        input.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+        if (input.gcount() != static_cast<std::streamsize>(header.size()) ||
+            header[0] != 0x7f || header[1] != 'E' || header[2] != 'L' || header[3] != 'F') continue;
+        const auto machine = header[5] == 2
+            ? static_cast<unsigned int>((header[18] << 8U) | header[19])
+            : static_cast<unsigned int>(header[18] | (header[19] << 8U));
+        if (machine == 62) return "x86-64";
+        if (machine == 3) return "x86 (32-bit)";
+        if (machine == 183) return "ARM64";
+        if (machine == 40) return "ARM (32-bit)";
+        if (machine == 243) return "RISC-V";
+        return "ELF machine " + std::to_string(machine);
+    }
+    return {};
+}
+
+std::string safe_analysis_mount_options(const std::string& filesystem) {
+    std::string options = "ro,nosuid,nodev,noexec";
+    if (filesystem == "ext2" || filesystem == "ext3" || filesystem == "ext4") options += ",noload";
+    else if (filesystem == "xfs") options += ",norecovery";
+    else if (filesystem == "btrfs") options += ",nologreplay";
+    else if (filesystem == "ntfs" || filesystem == "ntfs3") options += ",norecover";
+    return options;
+}
+
+DriveOsAnalysis analyze_drive_os(const lazarus::DeviceIdentity& device,
+                                 const lazarus::DiskInspection& inspection) {
+    DriveOsAnalysis analysis;
+    const bool has_efi = std::any_of(inspection.partitions.begin(), inspection.partitions.end(),
+        [](const lazarus::PartitionInfo& partition) {
+            return partition.kind == lazarus::PartitionKind::EfiSystem;
+        });
+    analysis.boot_mode = inspection.gpt_detected && has_efi ? "UEFI" :
+        (inspection.mbr_detected && !inspection.protective_mbr ? "Legacy BIOS/MBR" :
+         (inspection.gpt_detected ? "GPT (no EFI System Partition confirmed)" : "Unknown"));
+    analysis.bitlocker_detected = std::any_of(inspection.findings.begin(), inspection.findings.end(),
+        [](const lazarus::SafetyFinding& finding) { return finding.code == "windows.bitlocker_detected"; });
+    analysis.encrypted = analysis.bitlocker_detected;
+    if (analysis.bitlocker_detected) analysis.encryption_type = "BitLocker";
+
+    for (const auto& partition : inspection.partitions) {
+        if (partition.type_guid == "7c3457ef-0000-11aa-aa11-00306543ecac" ||
+            partition.type_guid == "48465300-0000-11aa-aa11-00306543ecac") {
+            analysis.family = "macos";
+            analysis.name = "macOS candidate";
+            analysis.confidence = "layout-only";
+            if (analysis.installations.empty()) {
+                analysis.installations.push_back("macOS candidate (layout-only)");
+                analysis.facts.push_back("An Apple APFS or HFS partition type was detected; the installed macOS version was not opened.");
+            }
+        }
+    }
+
+    std::vector<std::string> candidates = device.partitions;
+    if (candidates.empty()) candidates.push_back(device.linux_path);
+    const auto analysis_token = random_hex(12);
+    if (analysis_token.empty()) {
+        analysis.findings.push_back(analysis_finding(
+            lazarus::Severity::Warning, "analysis.mount_token_failed",
+            "Lazarus could not create a protected identity for read-only filesystem analysis.",
+            "Raw imaging remains available; retry drive analysis if OS confirmation is required."));
+        return analysis;
+    }
+    const auto analysis_base = std::filesystem::path("/run/arcology-lazarus/drive-analysis");
+    const auto analysis_root = analysis_base / analysis_token;
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(analysis_base, filesystem_error);
+    if (!filesystem_error) ::chmod(analysis_base.c_str(), 0700);
+    const bool root_created = !filesystem_error && std::filesystem::create_directory(analysis_root, filesystem_error);
+    if (!root_created || filesystem_error) {
+        analysis.findings.push_back(analysis_finding(
+            lazarus::Severity::Warning, "analysis.mount_root_failed",
+            "Lazarus could not create its protected read-only analysis directory.",
+            filesystem_error ? filesystem_error.message() : "Retry the analysis; no source data was modified."));
+        return analysis;
+    }
+    ::chmod(analysis_root.c_str(), 0700);
+
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        const auto& candidate = candidates[index];
+        auto filesystem = block_device_tag(candidate, "TYPE");
+        std::transform(filesystem.begin(), filesystem.end(), filesystem.begin(),
+                       [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+        if (filesystem == "bitlocker") {
+            analysis.encrypted = true;
+            analysis.bitlocker_detected = true;
+            analysis.encryption_type = "BitLocker";
+            continue;
+        }
+        if (filesystem == "crypto_luks" || filesystem == "luks") {
+            analysis.encrypted = true;
+            analysis.encryption_type = "Linux LUKS";
+            analysis.facts.push_back("A Linux LUKS encrypted-volume signature was found on " + candidate + ".");
+            continue;
+        }
+        static const std::set<std::string> supported{
+            "ntfs", "ntfs3", "vfat", "fat", "exfat", "ext2", "ext3", "ext4", "xfs", "btrfs"};
+        if (!supported.contains(filesystem)) continue;
+
+        std::string mounted_at;
+        std::string command_error;
+        if (run_program({"timeout", "-s", "KILL", "8", "findmnt", "-rn", "-S", candidate, "-o", "TARGET"}, mounted_at, command_error) &&
+            !trim_copy(mounted_at).empty()) {
+            analysis.findings.push_back(analysis_finding(
+                lazarus::Severity::Info, "analysis.partition_already_mounted",
+                candidate + " was already mounted, so Lazarus did not inspect it through an unmanaged path.",
+                "Unmount it safely and run drive analysis again if OS confirmation is required."));
+            continue;
+        }
+
+        const auto mount_root = analysis_root / std::to_string(index + 1);
+        filesystem_error.clear();
+        std::filesystem::create_directory(mount_root, filesystem_error);
+        if (filesystem_error) {
+            filesystem_error.clear();
+            continue;
+        }
+        std::string mount_output;
+        if (!run_program({"timeout", "-s", "KILL", "15", "mount", "-o", safe_analysis_mount_options(filesystem), candidate, mount_root.string()},
+                         mount_output, command_error)) {
+            analysis.findings.push_back(analysis_finding(
+                lazarus::Severity::Info, "analysis.partition_not_opened",
+                "Lazarus could not open " + candidate + " read-only for OS detection.",
+                "Imaging remains available; the filesystem may be encrypted, hibernated, damaged, or unsupported."));
+            std::filesystem::remove(mount_root, filesystem_error);
+            continue;
+        }
+
+        const auto efi = case_insensitive_child(mount_root, "EFI");
+        if (!efi.empty()) {
+            if (!case_insensitive_child(efi, "Microsoft").empty())
+                analysis.facts.push_back("Microsoft UEFI boot files were found on " + candidate + ".");
+            for (const auto* vendor : {"ubuntu", "debian", "fedora", "redhat", "opensuse"}) {
+                if (!case_insensitive_child(efi, vendor).empty())
+                    analysis.facts.push_back(std::string{"Linux UEFI boot files ("} + vendor + ") were found on " + candidate + ".");
+            }
+        }
+
+        const auto windows = case_insensitive_child(mount_root, "Windows");
+        const auto config = windows.empty() ? std::filesystem::path{} :
+            case_insensitive_path(windows, {"System32", "config"});
+        auto software = config.empty() ? std::filesystem::path{} : case_insensitive_child(config, "SOFTWARE");
+        auto system = config.empty() ? std::filesystem::path{} : case_insensitive_child(config, "SYSTEM");
+        if (!software.empty() && !path_is_beneath(software, mount_root)) software.clear();
+        if (!system.empty() && !path_is_beneath(system, mount_root)) system.clear();
+        if (!windows.empty() && (!software.empty() || !system.empty())) {
+            const bool software_readable = !software.empty() && offline_hive_readable(software);
+            const bool system_readable = !system.empty() && offline_hive_readable(system);
+            analysis.family = "windows";
+            analysis.name = "Microsoft Windows";
+            analysis.confidence = software_readable || system_readable ? "confirmed" : "filesystem-evidence";
+            analysis.system_partition = candidate;
+            if (software_readable) {
+                static const std::vector<std::string> current_version{"Microsoft", "Windows NT", "CurrentVersion"};
+                auto product_name = offline_registry_string(software, current_version, "ProductName");
+                analysis.version = offline_registry_string(software, current_version, "DisplayVersion");
+                if (analysis.version.empty()) analysis.version = offline_registry_string(software, current_version, "ReleaseId");
+                analysis.edition = offline_registry_string(software, current_version, "EditionID");
+                analysis.build = offline_registry_string(software, current_version, "CurrentBuildNumber");
+                if (analysis.build.empty()) analysis.build = offline_registry_string(software, current_version, "CurrentBuild");
+                const auto build_lab = lower_ascii(offline_registry_string(software, current_version, "BuildLabEx"));
+                if (build_lab.find("amd64") != std::string::npos) analysis.architecture = "x86-64";
+                else if (build_lab.find("arm64") != std::string::npos) analysis.architecture = "ARM64";
+                else if (build_lab.find("x86") != std::string::npos) analysis.architecture = "x86 (32-bit)";
+                if (!product_name.empty()) analysis.name = product_name;
+                try {
+                    if (!analysis.build.empty() && std::stoull(analysis.build) >= 22000 &&
+                        analysis.name.find("Windows 10") != std::string::npos) {
+                        analysis.name.replace(analysis.name.find("Windows 10"), std::strlen("Windows 10"), "Windows 11");
+                    }
+                } catch (...) {}
+            }
+            analysis.facts.push_back("Windows/System32/config was found on " + candidate + ".");
+            analysis.installations.push_back(
+                analysis.name + (analysis.version.empty() ? "" : " " + analysis.version) +
+                " on " + candidate + " (" + analysis.confidence + ")");
+            if (!software_readable && !system_readable) {
+                analysis.findings.push_back(analysis_finding(
+                    lazarus::Severity::Warning, "analysis.windows_hives_unreadable",
+                    "Windows installation files were found, but the offline registry hives could not be read.",
+                    "Capture the drive before repair. Treat the detected edition and version as unknown."));
+            }
+        } else {
+            const auto os_release = parse_os_release(mount_root);
+            if (!os_release.empty()) {
+                analysis.family = "linux";
+                const auto pretty = os_release.find("PRETTY_NAME");
+                const auto name = os_release.find("NAME");
+                analysis.name = pretty != os_release.end() ? pretty->second :
+                    (name != os_release.end() ? name->second : "Linux");
+                const auto version = os_release.find("VERSION_ID");
+                if (version != os_release.end()) analysis.version = version->second;
+                analysis.architecture = detect_linux_architecture(mount_root);
+                analysis.confidence = "confirmed";
+                analysis.system_partition = candidate;
+                analysis.installations.push_back(
+                    analysis.name + (analysis.version.empty() || analysis.name.find(analysis.version) != std::string::npos
+                        ? "" : " " + analysis.version) + " on " + candidate + " (confirmed)");
+                analysis.facts.push_back("A confined /etc/os-release record was found on " + candidate + ".");
+            }
+        }
+
+        std::string unmount_output;
+        std::string unmount_error;
+        if (!run_program({"timeout", "-s", "KILL", "15", "umount", mount_root.string()}, unmount_output, unmount_error)) {
+            std::string detach_output;
+            std::string detach_error;
+            if (run_program({"timeout", "-s", "KILL", "8", "umount", "-l", mount_root.string()},
+                            detach_output, detach_error)) {
+                analysis.findings.push_back(analysis_finding(
+                    lazarus::Severity::Warning, "analysis.mount_detached",
+                    "A read-only analysis mount required a lazy detach before the drive was released.",
+                    "The source was not written. Reboot the appliance before analyzing another unstable filesystem."));
+            } else {
+                analysis.findings.push_back(analysis_finding(
+                    lazarus::Severity::Blocker, "analysis.unmount_failed",
+                    "A read-only analysis mount could not be released: " + mount_root.string(),
+                    "Do not disconnect the drive. Shut down the appliance cleanly before removing it."));
+                break;
+            }
+        }
+        std::filesystem::remove(mount_root, filesystem_error);
+    }
+    std::filesystem::remove(analysis_root, filesystem_error);
+
+    if (analysis.installations.size() > 1) {
+        analysis.family = "multiple";
+        analysis.name = "Multiple operating systems detected";
+        analysis.version.clear();
+        analysis.edition.clear();
+        analysis.build.clear();
+        analysis.architecture.clear();
+        analysis.confidence = "multiple";
+        analysis.system_partition.clear();
+    } else if (analysis.family == "unknown") {
+        const bool windows_layout = std::any_of(inspection.partitions.begin(), inspection.partitions.end(),
+            [](const lazarus::PartitionInfo& partition) {
+                return partition.kind == lazarus::PartitionKind::WindowsBasicData &&
+                       (partition.filesystem == lazarus::FileSystemKind::Ntfs || partition.ntfs_detected);
+            });
+        if (windows_layout || analysis.bitlocker_detected) {
+            analysis.family = "windows";
+            analysis.name = analysis.bitlocker_detected ? "Windows/BitLocker candidate" : "Windows installation candidate";
+            analysis.confidence = "layout-only";
+            analysis.installations.push_back(analysis.name + " (layout-only)");
+            analysis.facts.push_back("The partition layout is consistent with Windows, but an installation was not opened and confirmed.");
+        }
+    }
+    return analysis;
+}
+
 class HiveHandle final {
 public:
     explicit HiveHandle(const std::filesystem::path& path) : handle_(hivex_open(path.c_str(), HIVEX_OPEN_WRITE)) {}
@@ -1936,7 +2829,8 @@ hive_node_h hive_path(hive_h* hive, hive_node_h parent,
 std::string utf16le(const std::string& value, bool double_terminator = false) {
     std::string encoded;
     encoded.reserve((value.size() + (double_terminator ? 2 : 1)) * 2);
-    for (const unsigned char character : value) {
+    for (const char raw_character : value) {
+        const auto character = static_cast<unsigned char>(raw_character);
         encoded.push_back(static_cast<char>(character));
         encoded.push_back('\0');
     }
@@ -2183,6 +3077,206 @@ bool apply_native_windows_bootstrap(const std::filesystem::path& windows_directo
     return true;
 }
 
+bool files_byte_identical(const std::filesystem::path& left, const std::filesystem::path& right) {
+    std::ifstream left_stream(left, std::ios::binary);
+    std::ifstream right_stream(right, std::ios::binary);
+    if (!left_stream || !right_stream) return false;
+    constexpr std::size_t buffer_size = 1 << 16;
+    std::vector<char> left_buffer(buffer_size);
+    std::vector<char> right_buffer(buffer_size);
+    while (true) {
+        left_stream.read(left_buffer.data(), static_cast<std::streamsize>(buffer_size));
+        right_stream.read(right_buffer.data(), static_cast<std::streamsize>(buffer_size));
+        const auto left_count = left_stream.gcount();
+        const auto right_count = right_stream.gcount();
+        if (left_count != right_count) return false;
+        if (left_count == 0) return true;
+        if (std::memcmp(left_buffer.data(), right_buffer.data(), static_cast<std::size_t>(left_count)) != 0) return false;
+    }
+}
+
+struct BootRepairMountResult {
+    std::filesystem::path esp_mount_root;
+    std::filesystem::path esp_partition;
+    std::filesystem::path windows_mount_root;
+    std::filesystem::path windows_directory;
+    std::filesystem::path windows_partition;
+};
+
+void release_boot_partitions(BootRepairMountResult& result) {
+    std::error_code filesystem_error;
+    if (!result.windows_mount_root.empty()) {
+        std::string output, unmount_error;
+        run_program({"umount", result.windows_mount_root.string()}, output, unmount_error);
+        std::filesystem::remove(result.windows_mount_root, filesystem_error);
+        result.windows_mount_root.clear();
+        result.windows_directory.clear();
+    }
+    if (!result.esp_mount_root.empty()) {
+        std::string output, unmount_error;
+        run_program({"umount", result.esp_mount_root.string()}, output, unmount_error);
+        std::filesystem::remove(result.esp_mount_root, filesystem_error);
+        result.esp_mount_root.clear();
+    }
+}
+
+// Mounts the destination disk's EFI System Partition and Windows partition (if present).
+// A missing ESP or Windows partition is reported through empty result fields, not treated as an
+// error here -- boot_repair_plan needs to observe and report that condition, not fail on it.
+// `error` is only set for genuine operational failures (e.g. cannot create a mount point).
+bool locate_boot_partitions(const lazarus::DeviceIdentity& destination, bool esp_read_write,
+                            BootRepairMountResult& result, std::string& error) {
+    std::vector<std::string> candidates = destination.partitions;
+    if (candidates.empty()) candidates.push_back(destination.linux_path);
+    std::error_code filesystem_error;
+
+    for (const auto& candidate : candidates) {
+        if (block_device_tag(candidate, "TYPE") != "vfat") continue;
+        std::string mounted_at, findmnt_error;
+        if (run_program({"findmnt", "-rn", "-S", candidate, "-o", "TARGET"}, mounted_at, findmnt_error) &&
+            !trim_copy(mounted_at).empty()) {
+            continue;
+        }
+        const auto mount_root = std::filesystem::path("/run/arcology-lazarus/boot-repair") / random_hex(12);
+        std::filesystem::create_directories(mount_root, filesystem_error);
+        if (filesystem_error) {
+            error = "Could not create a protected mount point for the EFI System Partition: " + filesystem_error.message();
+            return false;
+        }
+        std::string output, mount_error;
+        const char* options = esp_read_write ? "rw,nosuid,nodev,noexec" : "ro,nosuid,nodev,noexec";
+        if (!run_program({"mount", "-o", options, candidate, mount_root.string()}, output, mount_error)) {
+            std::filesystem::remove(mount_root, filesystem_error);
+            continue;
+        }
+        if (!case_insensitive_child(mount_root, "EFI").empty()) {
+            result.esp_mount_root = mount_root;
+            result.esp_partition = candidate;
+            break;
+        }
+        std::string unmount_output, unmount_error;
+        run_program({"umount", mount_root.string()}, unmount_output, unmount_error);
+        std::filesystem::remove(mount_root, filesystem_error);
+    }
+
+    for (const auto& candidate : candidates) {
+        if (block_device_tag(candidate, "TYPE") != "ntfs") continue;
+        std::string mounted_at, findmnt_error;
+        if (run_program({"findmnt", "-rn", "-S", candidate, "-o", "TARGET"}, mounted_at, findmnt_error) &&
+            !trim_copy(mounted_at).empty()) {
+            continue;
+        }
+        const auto mount_root = std::filesystem::path("/run/arcology-lazarus/boot-repair") / random_hex(12);
+        std::filesystem::create_directories(mount_root, filesystem_error);
+        if (filesystem_error) {
+            error = "Could not create a protected mount point for the Windows partition: " + filesystem_error.message();
+            release_boot_partitions(result);
+            return false;
+        }
+        std::string output, mount_error;
+        if (!run_program({"mount", "-o", "ro,nosuid,nodev,noexec", candidate, mount_root.string()}, output, mount_error)) {
+            std::filesystem::remove(mount_root, filesystem_error);
+            continue;
+        }
+        const auto candidate_windows = case_insensitive_child(mount_root, "Windows");
+        const auto candidate_hive = candidate_windows.empty() ? std::filesystem::path{} :
+            case_insensitive_path(candidate_windows, {"System32", "config", "SYSTEM"});
+        if (!candidate_windows.empty() && !candidate_hive.empty()) {
+            result.windows_mount_root = mount_root;
+            result.windows_directory = candidate_windows;
+            result.windows_partition = candidate;
+            break;
+        }
+        std::string unmount_output, unmount_error;
+        run_program({"umount", mount_root.string()}, unmount_output, unmount_error);
+        std::filesystem::remove(mount_root, filesystem_error);
+    }
+    return true;
+}
+
+bool detect_boot_repair_facts(const lazarus::DeviceIdentity& destination,
+                              BootRepairMountResult& mounts,
+                              lazarus::BootRepairFindingsOptions& observed,
+                              std::string& error) {
+    observed.gpt_valid = block_device_tag(destination.linux_path, "PTTYPE") == "gpt";
+    if (!locate_boot_partitions(destination, /*esp_read_write=*/false, mounts, error)) {
+        return false;
+    }
+    observed.esp_present = !mounts.esp_mount_root.empty();
+    observed.windows_partition_present = !mounts.windows_mount_root.empty();
+
+    if (observed.esp_present) {
+        const auto bootmgfw_path = case_insensitive_path(mounts.esp_mount_root, {"EFI", "Microsoft", "Boot", "bootmgfw.efi"});
+        observed.bootmgfw_present = !bootmgfw_path.empty();
+        const auto fallback_path = case_insensitive_path(mounts.esp_mount_root, {"EFI", "Boot", "BOOTX64.EFI"});
+        observed.fallback_loader_present = !fallback_path.empty();
+        if (observed.bootmgfw_present && observed.fallback_loader_present) {
+            observed.fallback_loader_matches_bootmgfw = files_byte_identical(bootmgfw_path, fallback_path);
+        }
+        const auto bcd_path = case_insensitive_path(mounts.esp_mount_root, {"EFI", "Microsoft", "Boot", "BCD"});
+        observed.bcd_present = !bcd_path.empty();
+        if (observed.bcd_present) {
+            hive_h* handle = hivex_open(bcd_path.c_str(), 0);
+            observed.bcd_readable = handle != nullptr;
+            if (handle != nullptr) hivex_close(handle);
+        }
+    }
+    if (observed.windows_partition_present) {
+        observed.winload_present = !case_insensitive_path(mounts.windows_directory, {"System32", "winload.efi"}).empty();
+    }
+    return true;
+}
+
+// Purely additive: copies the already-installed bootmgfw.efi to the UEFI firmware fallback path
+// EFI/Boot/BOOTX64.EFI. Never touches EFI/Microsoft/Boot or BCD.
+bool apply_boot_repair_fallback(const BootRepairMountResult& mounts, const std::string& job_id,
+                                std::vector<std::string>& facts, std::string& error) {
+    const auto bootmgfw_path = case_insensitive_path(mounts.esp_mount_root, {"EFI", "Microsoft", "Boot", "bootmgfw.efi"});
+    if (bootmgfw_path.empty()) {
+        error = "EFI/Microsoft/Boot/bootmgfw.efi was no longer present on the EFI System Partition.";
+        return false;
+    }
+    auto efi_directory = case_insensitive_child(mounts.esp_mount_root, "EFI");
+    if (efi_directory.empty()) {
+        error = "The EFI System Partition no longer contains an EFI directory.";
+        return false;
+    }
+    std::error_code filesystem_error;
+    auto boot_directory = case_insensitive_child(efi_directory, "Boot");
+    if (boot_directory.empty()) {
+        boot_directory = efi_directory / "Boot";
+        std::filesystem::create_directories(boot_directory, filesystem_error);
+        if (filesystem_error) {
+            error = "Could not create EFI/Boot on the EFI System Partition: " + filesystem_error.message();
+            return false;
+        }
+    }
+    const auto fallback_path = boot_directory / "BOOTX64.EFI";
+    const auto existing = case_insensitive_child(boot_directory, "BOOTX64.EFI");
+    if (!existing.empty()) {
+        const auto rollback_directory = boot_directory / "Lazarus-BootRepair" / job_id;
+        std::filesystem::create_directories(rollback_directory, filesystem_error);
+        if (filesystem_error) {
+            error = "Could not create the Lazarus boot-repair rollback directory: " + filesystem_error.message();
+            return false;
+        }
+        std::filesystem::copy_file(existing, rollback_directory / "BOOTX64.EFI.before",
+                                   std::filesystem::copy_options::overwrite_existing, filesystem_error);
+        if (filesystem_error) {
+            error = "Could not preserve the existing EFI/Boot/BOOTX64.EFI before replacement: " + filesystem_error.message();
+            return false;
+        }
+        facts.push_back("Preserved the previous EFI/Boot/BOOTX64.EFI at EFI/Boot/Lazarus-BootRepair/" + job_id + "/BOOTX64.EFI.before.");
+    }
+    std::filesystem::copy_file(bootmgfw_path, fallback_path, std::filesystem::copy_options::overwrite_existing, filesystem_error);
+    if (filesystem_error) {
+        error = "Could not copy bootmgfw.efi to EFI/Boot/BOOTX64.EFI: " + filesystem_error.message();
+        return false;
+    }
+    facts.push_back("Copied EFI/Microsoft/Boot/bootmgfw.efi to EFI/Boot/BOOTX64.EFI, the UEFI firmware fallback boot path.");
+    return true;
+}
+
 std::string date_component(const std::string& value) {
     for (std::size_t offset = 0; offset + 10 <= value.size(); ++offset) {
         const auto digit = [&value](std::size_t index) {
@@ -2253,7 +3347,10 @@ BackupSummary read_backup_summary(const std::filesystem::path& path) {
 }
 
 std::vector<BackupSummary> scan_backups(const lazarus::BenchProfile& bench) {
+    constexpr std::size_t kMaximumEntries = 100000;
+    constexpr int kMaximumDepth = 4;
     std::vector<BackupSummary> backups;
+    std::size_t entries_seen = 0;
     for (const auto& storage : bench.image_storage_paths) {
         std::error_code error;
         if (!std::filesystem::exists(storage, error)) {
@@ -2261,14 +3358,25 @@ std::vector<BackupSummary> scan_backups(const lazarus::BenchProfile& bench) {
         }
         std::filesystem::recursive_directory_iterator it(storage, std::filesystem::directory_options::skip_permission_denied, error);
         const std::filesystem::recursive_directory_iterator end;
-        while (!error && it != end) {
+        while (!error && it != end && entries_seen < kMaximumEntries) {
+            ++entries_seen;
             const auto path = it->path();
+            const auto status = it->symlink_status(error);
+            if (error) break;
+            if (std::filesystem::is_symlink(status)) {
+                it.disable_recursion_pending();
+                it.increment(error);
+                continue;
+            }
             if (looks_like_lazarus_image(path)) {
                 backups.push_back(read_backup_summary(path));
+                it.disable_recursion_pending();
+            } else if (std::filesystem::is_directory(status) && it.depth() >= kMaximumDepth) {
                 it.disable_recursion_pending();
             }
             it.increment(error);
         }
+        if (entries_seen >= kMaximumEntries) break;
     }
     std::sort(backups.begin(), backups.end(), [](const BackupSummary& left, const BackupSummary& right) {
         return left.image_directory < right.image_directory;
@@ -2277,7 +3385,7 @@ std::vector<BackupSummary> scan_backups(const lazarus::BenchProfile& bench) {
 }
 
 std::string backup_search_text(const BackupSummary& backup) {
-    return backup.image_directory + "\t" + backup.ticket_number + "\t" + backup.customer_name + "\t" + backup.technician + "\t" + backup.purpose;
+    return backup.image_directory + " " + backup.ticket_number + " " + backup.customer_name + " " + backup.technician + " " + backup.purpose;
 }
 
 std::string backup_title(const BackupSummary& backup) {
@@ -2320,11 +3428,11 @@ struct JobPreset {
 };
 
 constexpr JobPreset kJobPresets[] = {
-    {"backup-before-repair", "Backup Before Repair", "Backup Before Repair", lazarus::ImagingMode::Raw, lazarus::CompressionMode::Zstd, true},
+    {"backup-before-repair", "Backup Before Repair", "Backup Before Repair", lazarus::ImagingMode::Rescue, lazarus::CompressionMode::Zstd, true},
     {"ssd-upgrade", "SSD Upgrade", "SSD Upgrade", lazarus::ImagingMode::Raw, lazarus::CompressionMode::Zstd, true},
     {"data-recovery", "Data Recovery", "Data Recovery", lazarus::ImagingMode::Rescue, lazarus::CompressionMode::Zstd, true},
     {"hardware-migration", "Hardware Migration", "Hardware Migration", lazarus::ImagingMode::Raw, lazarus::CompressionMode::Zstd, true},
-    {"custom", "Custom", "", lazarus::ImagingMode::Raw, lazarus::CompressionMode::Zstd, false},
+    {"custom", "Custom", "", lazarus::ImagingMode::Raw, lazarus::CompressionMode::Zstd, true},
 };
 
 const JobPreset* find_job_preset(const std::string& id) {
@@ -2465,6 +3573,11 @@ bool write_completion_reports(const lazarus::BenchProfile& bench,
             error = "Could not write report: " + output.first.string();
             return false;
         }
+        // ext filesystems retain this portable mode. CIFS, NFS, NTFS, and
+        // exFAT may derive modes from mount options and legitimately reject
+        // chmod, which must not turn a successfully written report into a
+        // failed imaging job.
+        (void)::chmod(output.first.c_str(), 0644);
     }
     return true;
 }
@@ -2653,9 +3766,9 @@ std::string port_rows_text(const lazarus::BenchProfile& bench) {
     return rows;
 }
 
-std::string backup_rows_text(const lazarus::BenchProfile& bench) {
+std::string backup_rows_text(const std::vector<BackupSummary>& backups) {
     std::string rows;
-    for (const auto& backup : scan_backups(bench)) {
+    for (const auto& backup : backups) {
         const auto journal = read_text_file(std::filesystem::path(backup.image_directory) / "job-journal.json");
         auto source_selector = extract_json_string(journal, "by_id_path");
         if (source_selector.empty()) source_selector = extract_json_string(journal, "by_path");
@@ -2664,9 +3777,123 @@ std::string backup_rows_text(const lazarus::BenchProfile& bench) {
         rows += backup.image_directory + "\t" + backup_title(backup) + "\t" + backup_search_text(backup) + "\t" +
                 (backup.incomplete ? "interrupted" : (backup.finalized ? "finalized" : "unknown")) + "\t" +
                 source_selector + "\t" + extract_json_string(journal, "imaging_mode") + "\t" +
-                extract_json_string(journal, "compression") + "\n";
+                extract_json_string(journal, "compression") + "\t" + sanitize_log_field(backup.ticket_number) + "\t" +
+                sanitize_log_field(backup.customer_name) + "\t" + sanitize_log_field(backup.technician) + "\t" +
+                sanitize_log_field(backup.purpose) + "\t" + backup.created_date + "\n";
     }
     return rows;
+}
+
+std::string backup_rows_text(const lazarus::BenchProfile& bench) {
+    return backup_rows_text(scan_backups(bench));
+}
+
+std::string ticket_rows_text(const ServiceConfig& config, const std::vector<BackupSummary>& stored_backups) {
+    struct TicketRecord {
+        std::string ticket;
+        std::string customer;
+        std::string technician;
+        std::string purpose;
+        std::string created_date;
+        std::string image_directory;
+        std::string report_path;
+        std::string report_kind;
+        std::string report_sort_key;
+        std::string latest_timestamp;
+        std::string latest_technician;
+        std::string latest_activity;
+        std::size_t backup_count = 0;
+        bool finalized = false;
+        bool verified = false;
+        bool incomplete = false;
+        bool escalation = false;
+    };
+
+    std::map<std::string, TicketRecord> tickets;
+    for (const auto& activity : load_activity_log(config.activity_log_path)) {
+        if (activity.ticket.empty()) continue;
+        auto& ticket = tickets[activity.ticket];
+        ticket.ticket = activity.ticket;
+        if (!activity.customer.empty()) ticket.customer = activity.customer;
+        if (activity.timestamp >= ticket.latest_timestamp) {
+            ticket.latest_timestamp = activity.timestamp;
+            ticket.latest_technician = activity.technician;
+            ticket.latest_activity = activity.verb;
+        }
+    }
+
+    for (const auto& backup : stored_backups) {
+        const auto key = backup.ticket_number.empty() ? std::string{"No ticket"} : backup.ticket_number;
+        auto& ticket = tickets[key];
+        ticket.ticket = key;
+        ++ticket.backup_count;
+        ticket.finalized = ticket.finalized || backup.finalized;
+        ticket.incomplete = ticket.incomplete || backup.incomplete;
+        const auto image_path = std::filesystem::path(backup.image_directory);
+        const auto verification = read_text_file(image_path / "verification.json");
+        ticket.verified = ticket.verified || extract_json_true(verification, "verified");
+        const bool image_escalation = std::filesystem::exists(image_path / "escalation-report.html");
+        ticket.escalation = ticket.escalation || image_escalation;
+
+        const auto sort_key = backup.created_date + "\t" + backup.image_directory;
+        const auto current_key = ticket.created_date + "\t" + ticket.image_directory;
+        if (ticket.image_directory.empty() || sort_key >= current_key) {
+            ticket.customer = backup.customer_name;
+            ticket.technician = backup.technician;
+            ticket.purpose = backup.purpose;
+            ticket.created_date = backup.created_date;
+            ticket.image_directory = backup.image_directory;
+        }
+
+        const std::vector<std::pair<std::string, std::string>> reports{
+            {"Escalation report", "escalation-report.html"},
+            {"Restore report", "restore-report.html"},
+            {"Completion report", "completion-report.html"},
+            {"Image creation report", "image-creation-report.html"},
+        };
+        for (const auto& [kind, name] : reports) {
+            const auto candidate = image_path / name;
+            if (!std::filesystem::exists(candidate)) continue;
+            const bool candidate_is_escalation = kind == "Escalation report";
+            const bool current_is_escalation = ticket.report_kind == "Escalation report";
+            if (ticket.report_path.empty() ||
+                (candidate_is_escalation && !current_is_escalation) ||
+                (candidate_is_escalation == current_is_escalation && sort_key >= ticket.report_sort_key)) {
+                ticket.report_path = candidate.string();
+                ticket.report_kind = kind;
+                ticket.report_sort_key = sort_key;
+            }
+            break;
+        }
+    }
+
+    std::vector<TicketRecord> ordered;
+    for (auto& [key, ticket] : tickets) ordered.push_back(std::move(ticket));
+    std::sort(ordered.begin(), ordered.end(), [](const TicketRecord& left, const TicketRecord& right) {
+        const auto left_date = left.latest_timestamp.empty() ? left.created_date : left.latest_timestamp;
+        const auto right_date = right.latest_timestamp.empty() ? right.created_date : right.latest_timestamp;
+        if (left_date != right_date) return left_date > right_date;
+        return left.ticket > right.ticket;
+    });
+
+    std::string rows;
+    for (const auto& ticket : ordered) {
+        const auto status = ticket.incomplete ? "Interrupted" :
+            (ticket.escalation ? "Escalation required" :
+             (ticket.verified ? "Verified" : (ticket.finalized ? "Finalized" : "Activity only")));
+        rows += sanitize_log_field(ticket.ticket) + "\t" + sanitize_log_field(ticket.customer) + "\t" +
+                sanitize_log_field(ticket.technician) + "\t" + sanitize_log_field(ticket.purpose) + "\t" +
+                ticket.created_date + "\t" + status + "\t" + std::to_string(ticket.backup_count) + "\t" +
+                ticket.image_directory + "\t" + ticket.report_path + "\t" + ticket.report_kind + "\t" +
+                ticket.latest_timestamp + "\t" + sanitize_log_field(ticket.latest_technician) + "\t" +
+                sanitize_log_field(ticket.latest_activity) + "\n";
+    }
+    return rows;
+}
+
+std::string ticket_rows_text(const ServiceConfig& config, const lazarus::BenchProfile& bench,
+                             bool include_stored_backups = true) {
+    return ticket_rows_text(config, include_stored_backups ? scan_backups(bench) : std::vector<BackupSummary>{});
 }
 
 bool is_install_target(const lazarus::DeviceIdentity& device) {
@@ -2688,6 +3915,10 @@ std::string bench_summary_text(const ServiceConfig& config, const lazarus::Bench
     }
     if (!bench.image_storage_device.empty()) {
         text += "\nStorage device: " + bench.image_storage_device;
+    }
+    if (!bench.nas_storage_protocol.empty()) {
+        text += "\nNAS storage: " + bench.nas_storage_protocol + "://" +
+                bench.nas_storage_server + "/" + bench.nas_storage_share;
     }
     text += "\nPort labels:";
     if (bench.port_labels.empty()) {
@@ -2731,7 +3962,12 @@ bool validate_profile_text(const lazarus::BenchProfile& bench, std::string& erro
         !valid_profile_scalar(bench.branding.product_name, 80, "Branding product name", error, true) ||
         !valid_profile_scalar(bench.branding.subtitle, 180, "Branding subtitle", error) ||
         !valid_profile_scalar(bench.branding.logo_path, 4096, "Branding logo path", error) ||
-        !valid_profile_scalar(bench.branding.report_footer, 500, "Branding report footer", error)) {
+        !valid_profile_scalar(bench.branding.report_footer, 500, "Branding report footer", error) ||
+        !valid_profile_scalar(bench.nas_storage_protocol, 16, "NAS protocol", error) ||
+        !valid_profile_scalar(bench.nas_storage_server, 255, "NAS server", error) ||
+        !valid_profile_scalar(bench.nas_storage_share, 1024, "NAS share", error) ||
+        !valid_profile_scalar(bench.nas_storage_username, 255, "NAS username", error) ||
+        !valid_profile_scalar(bench.nas_storage_domain, 255, "NAS domain", error)) {
         return false;
     }
     for (const auto* color : {&bench.branding.accent, &bench.branding.background,
@@ -2810,6 +4046,13 @@ bool save_bench_profile(const lazarus::BenchProfile& bench, const std::string& p
     }
     for (const auto& port : bench.image_storage_port_paths) {
         out << "image_storage_port=" << port << "\n";
+    }
+    if (!bench.nas_storage_protocol.empty()) {
+        out << "nas_storage_protocol=" << bench.nas_storage_protocol << "\n";
+        out << "nas_storage_server=" << bench.nas_storage_server << "\n";
+        out << "nas_storage_share=" << bench.nas_storage_share << "\n";
+        if (!bench.nas_storage_username.empty()) out << "nas_storage_username=" << bench.nas_storage_username << "\n";
+        if (!bench.nas_storage_domain.empty()) out << "nas_storage_domain=" << bench.nas_storage_domain << "\n";
     }
     out << "\n";
     for (const auto& source : bench.source_only_paths) {
@@ -2910,6 +4153,7 @@ std::string supported_storage_volume(const lazarus::DeviceIdentity& device, std:
 
 bool configure_image_storage(const ServiceConfig& config, const lazarus::BenchProfile& current,
                              const lazarus::DeviceIdentity& device, bool erase,
+                             const std::string& requested_directory,
                              std::string& filesystem, std::string& error) {
     if (device.is_system_disk) {
         error = "The running Lazarus system disk cannot be reassigned as external image storage.";
@@ -2921,6 +4165,20 @@ bool configure_image_storage(const ServiceConfig& config, const lazarus::BenchPr
     }
     if (device.size_bytes == 0) {
         error = "The selected disk reports zero capacity and cannot be prepared as image storage.";
+        return false;
+    }
+
+    std::filesystem::path relative_directory;
+    if (requested_directory.find_first_of("\r\n=") != std::string::npos) {
+        error = "The selected image-storage folder contains unsupported characters.";
+        return false;
+    }
+    if (!safe_relative_path(requested_directory, relative_directory, error) || relative_directory.empty()) {
+        if (error.empty()) error = "Choose a folder on the storage disk for Lazarus images.";
+        return false;
+    }
+    if (relative_directory.string().size() > 1024) {
+        error = "The selected image-storage folder path is too long.";
         return false;
     }
 
@@ -2979,6 +4237,13 @@ bool configure_image_storage(const ServiceConfig& config, const lazarus::BenchPr
             error = "Could not format the Lazarus storage partition: " + command_error;
             return false;
         }
+        // mkfs writes the new superblock immediately, but udev's /dev/disk/by-uuid symlink
+        // (written into bench.profile just below) and blkid's device-change detection both
+        // depend on the kernel's change notification being processed first. Force that
+        // synchronously here instead of racing lazarus-mount-storage's own short retry loop
+        // against it on slower real drives.
+        run_program({"udevadm", "trigger", "--settle", "--action=change", partition}, output, command_error);
+        run_program({"udevadm", "settle", "--timeout=15"}, output, command_error);
         filesystem = "ext4";
         selected_volume = partition;
     } else {
@@ -2993,8 +4258,13 @@ bool configure_image_storage(const ServiceConfig& config, const lazarus::BenchPr
     const auto identity = identity_for_profile(device);
     const auto port_identity = port_identity_for_profile(device);
     staged.image_storage_device = identity;
+    staged.nas_storage_protocol.clear();
+    staged.nas_storage_server.clear();
+    staged.nas_storage_share.clear();
+    staged.nas_storage_username.clear();
+    staged.nas_storage_domain.clear();
     std::string volume_uuid;
-    if (run_program({"blkid", "-s", "UUID", "-o", "value", selected_volume}, volume_uuid, command_error) &&
+    if (run_program({"blkid", "-p", "-s", "UUID", "-o", "value", selected_volume}, volume_uuid, command_error) &&
         !trim_copy(volume_uuid).empty()) {
         staged.image_storage_volume = "/dev/disk/by-uuid/" + trim_copy(volume_uuid);
     } else {
@@ -3012,10 +4282,13 @@ bool configure_image_storage(const ServiceConfig& config, const lazarus::BenchPr
     remove_identity(staged.ignored_paths);
     if (!port_identity.empty()) staged.image_storage_port_paths = {port_identity};
 
+    staged.image_storage_path = (std::filesystem::path("/mnt/lazarus-storage") / relative_directory).string();
+    staged.image_storage_paths = {staged.image_storage_path};
+
     if (!save_bench_profile(staged, config.bench_path, error)) return false;
 
     std::string mount_output;
-    if (!run_program({"/usr/local/sbin/lazarus-mount-storage"}, mount_output, command_error)) {
+    if (!run_storage_helper(config, mount_output, command_error)) {
         std::string rollback_error;
         save_bench_profile(current, config.bench_path, rollback_error);
         error = "The storage filesystem was prepared but could not be mounted: " + command_error;
@@ -3023,9 +4296,178 @@ bool configure_image_storage(const ServiceConfig& config, const lazarus::BenchPr
         return false;
     }
 
-    staged.image_storage_paths = {"/mnt/lazarus-storage/images"};
-    staged.image_storage_path = staged.image_storage_paths.front();
     if (!save_bench_profile(staged, config.bench_path, error)) return false;
+    std::error_code credential_error;
+    std::filesystem::remove(config.nas_credentials_path, credential_error);
+    return true;
+}
+
+bool write_private_file(const std::filesystem::path& path, const std::string& contents, std::string& error) {
+    std::error_code filesystem_error;
+    if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), filesystem_error);
+    if (filesystem_error) {
+        error = "Could not create the credential directory: " + filesystem_error.message();
+        return false;
+    }
+    const auto temporary = path.string() + ".tmp." + std::to_string(::getpid());
+    const int descriptor = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor < 0) {
+        error = "Could not create the NAS credential file: " + std::string(std::strerror(errno));
+        return false;
+    }
+    std::size_t written = 0;
+    while (written < contents.size()) {
+        const auto count = ::write(descriptor, contents.data() + written, contents.size() - written);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            error = "Could not write the NAS credential file: " + std::string(std::strerror(errno));
+            ::close(descriptor);
+            std::filesystem::remove(temporary, filesystem_error);
+            return false;
+        }
+        written += static_cast<std::size_t>(count);
+    }
+    const bool file_synced = ::fsync(descriptor) == 0;
+    const bool file_closed = ::close(descriptor) == 0;
+    if (!file_synced || !file_closed || ::rename(temporary.c_str(), path.c_str()) != 0) {
+        error = "Could not commit the NAS credential file: " + std::string(std::strerror(errno));
+        std::filesystem::remove(temporary, filesystem_error);
+        return false;
+    }
+    if (::chmod(path.c_str(), 0600) != 0) {
+        error = "Could not protect the NAS credential file: " + std::string(std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+bool valid_nas_field(const std::string& value, std::size_t limit) {
+    return !value.empty() && value.size() <= limit && value.find_first_of("\r\n=") == std::string::npos;
+}
+
+bool configure_nas_storage(const ServiceConfig& config, const lazarus::BenchProfile& current,
+                           const std::string& protocol, const std::string& server,
+                           const std::string& share, const std::string& username,
+                           const std::string& password, const std::string& domain,
+                           const std::string& requested_directory, std::string& error) {
+    if (protocol != "smb" && protocol != "nfs") {
+        error = "Choose SMB or NFS as the NAS protocol.";
+        return false;
+    }
+    if (!valid_nas_field(server, 255) || server.find('/') != std::string::npos || server.find('\\') != std::string::npos) {
+        error = "Enter a NAS hostname or IP address without slashes.";
+        return false;
+    }
+    if (!std::all_of(server.begin(), server.end(), [](unsigned char character) {
+            return std::isalnum(character) || character == '.' || character == '-' || character == '_' ||
+                   character == ':' || character == '[' || character == ']';
+        })) {
+        error = "The NAS hostname or IP address contains unsupported characters.";
+        return false;
+    }
+    if (!valid_nas_field(share, 1024)) {
+        error = protocol == "smb" ? "Enter the SMB share name." : "Enter the exported NFS path.";
+        return false;
+    }
+    if (protocol == "smb" && (share.find('/') != std::string::npos || share.find('\\') != std::string::npos)) {
+        error = "Enter only the SMB share name; put subfolders in the Lazarus folder field.";
+        return false;
+    }
+    if (protocol == "nfs" && share.front() != '/') {
+        error = "An NFS export must be an absolute path beginning with /.";
+        return false;
+    }
+    if ((!username.empty() && !valid_nas_field(username, 255)) ||
+        (!domain.empty() && !valid_nas_field(domain, 255)) || password.find_first_of("\r\n") != std::string::npos) {
+        error = "NAS credentials contain unsupported characters.";
+        return false;
+    }
+    if (protocol == "smb" && (username.empty() || password.empty())) {
+        error = "SMB storage requires a username and password.";
+        return false;
+    }
+
+    std::filesystem::path relative_directory;
+    if (!safe_relative_path(requested_directory, relative_directory, error) || relative_directory.empty()) {
+        if (error.empty()) error = "Choose a folder inside the NAS share for Lazarus images.";
+        return false;
+    }
+    if (relative_directory.string().size() > 1024) {
+        error = "The selected NAS image folder path is too long.";
+        return false;
+    }
+
+    std::string previous_credentials = read_text_file(config.nas_credentials_path);
+    std::string credential_contents;
+    if (protocol == "smb") {
+        credential_contents = "username=" + username + "\npassword=" + password + "\n";
+        if (!domain.empty()) credential_contents += "domain=" + domain + "\n";
+    }
+
+    if (path_is_mountpoint("/mnt/lazarus-storage")) {
+        std::string output;
+        run_program({"sync"}, output, error);
+        if (!run_program({"umount", "/mnt/lazarus-storage"}, output, error)) {
+            error = "Image storage is busy and could not be unmounted: " + error;
+            return false;
+        }
+    }
+
+    if (protocol == "smb" && !write_private_file(config.nas_credentials_path, credential_contents, error)) {
+        std::string ignored;
+        std::string remount_output;
+        run_storage_helper(config, remount_output, ignored);
+        return false;
+    }
+
+    auto staged = current;
+    staged.image_storage_device.clear();
+    staged.image_storage_volume.clear();
+    staged.image_storage_port_paths.clear();
+    staged.nas_storage_protocol = protocol;
+    staged.nas_storage_server = server;
+    staged.nas_storage_share = share;
+    staged.nas_storage_username = protocol == "smb" ? username : "";
+    staged.nas_storage_domain = protocol == "smb" ? domain : "";
+    staged.image_storage_path = (std::filesystem::path("/mnt/lazarus-storage") / relative_directory).string();
+    staged.image_storage_paths = {staged.image_storage_path};
+
+    if (!save_bench_profile(staged, config.bench_path, error)) {
+        std::string ignored;
+        if (previous_credentials.empty()) {
+            std::error_code remove_error;
+            std::filesystem::remove(config.nas_credentials_path, remove_error);
+        } else {
+            write_private_file(config.nas_credentials_path, previous_credentials, ignored);
+        }
+        std::string remount_output;
+        run_storage_helper(config, remount_output, ignored);
+        return false;
+    }
+    std::string output;
+    std::string mount_error;
+    if (!run_storage_helper(config, output, mount_error) ||
+        !image_storage_online(staged) ||
+        !ensure_writable_directory(staged.image_storage_path, mount_error)) {
+        std::string ignored;
+        if (path_is_mountpoint("/mnt/lazarus-storage")) run_program({"umount", "/mnt/lazarus-storage"}, output, ignored);
+        save_bench_profile(current, config.bench_path, ignored);
+        if (previous_credentials.empty()) {
+            std::error_code remove_error;
+            std::filesystem::remove(config.nas_credentials_path, remove_error);
+        } else {
+            write_private_file(config.nas_credentials_path, previous_credentials, ignored);
+        }
+        std::string remount_output;
+        run_storage_helper(config, remount_output, ignored);
+        error = "The NAS settings were not saved because the share could not be mounted read-write. " + mount_error;
+        if (!output.empty()) error += " " + trim_copy(output);
+        return false;
+    }
+    if (protocol == "nfs") {
+        std::error_code remove_error;
+        std::filesystem::remove(config.nas_credentials_path, remove_error);
+    }
     return true;
 }
 
@@ -3076,6 +4518,91 @@ std::string smart_json(const lazarus::SmartDiagnosticResult& smart) {
            ",\"findings\":" + findings_json(smart.findings);
 }
 
+std::string drive_analysis_text(const lazarus::DeviceIdentity& device,
+                                const lazarus::DiskInspection& inspection,
+                                const DriveOsAnalysis& analysis,
+                                const lazarus::SmartDiagnosticResult* smart) {
+    const auto confidence = analysis.confidence == "confirmed" ? "Confirmed from installation data" :
+        (analysis.confidence == "filesystem-evidence" ? "Installation files found; version unconfirmed" :
+         (analysis.confidence == "layout-only" ? "Partition-layout candidate only" :
+          (analysis.confidence == "multiple" ? "Multiple installations or OS candidates found" : "Not detected")));
+    std::string partition_table = "Unknown or unreadable";
+    if (inspection.gpt_detected) {
+        partition_table = inspection.gpt_header_valid ? "GPT (valid primary header)" : "GPT metadata detected, but invalid";
+    } else if (inspection.mbr_detected) {
+        partition_table = "MBR";
+    }
+
+    std::ostringstream report;
+    report << "DRIVE ANALYSIS\n\n"
+           << "Drive: " << device.linux_path << " | " << device.model << " | " << human_capacity(device.size_bytes) << "\n"
+           << "Detected OS: " << analysis.name;
+    if (!analysis.version.empty() && analysis.name.find(analysis.version) == std::string::npos)
+        report << " " << analysis.version;
+    report << "\nConfidence: " << confidence
+           << "\nBoot layout: " << analysis.boot_mode
+           << "\nPartition table: " << partition_table
+           << "\nSystem partition: " << (analysis.system_partition.empty() ? "Not confirmed" : analysis.system_partition)
+           << "\nEncryption: " << analysis.encryption_type << "\n";
+    if (!analysis.edition.empty()) report << "Edition: " << analysis.edition << "\n";
+    if (!analysis.build.empty()) report << "OS build: " << analysis.build << "\n";
+    if (!analysis.architecture.empty()) report << "Architecture: " << analysis.architecture << "\n";
+    if (smart != nullptr) {
+        report << "SMART health: " << smart->health << "\n";
+        if (smart->temperature_celsius.present)
+            report << "Temperature: " << smart->temperature_celsius.value << " C\n";
+        if (smart->reallocated_sectors.present)
+            report << "Reallocated sectors: " << smart->reallocated_sectors.value << "\n";
+        if (smart->pending_sectors.present)
+            report << "Pending sectors: " << smart->pending_sectors.value << "\n";
+        if (smart->uncorrectable_errors.present)
+            report << "Uncorrectable errors: " << smart->uncorrectable_errors.value << "\n";
+    }
+
+    if (!analysis.installations.empty()) {
+        report << "\nINSTALLATIONS\n";
+        for (const auto& installation : analysis.installations) report << "- " << installation << "\n";
+    }
+
+    report << "\nPARTITIONS\n";
+    if (inspection.partitions.empty()) report << "No usable partition entries were parsed. Raw imaging remains available.\n";
+    for (std::size_t index = 0; index < inspection.partitions.size(); ++index) {
+        const auto& partition = inspection.partitions[index];
+        const auto path = index < device.partitions.size() ? device.partitions[index] :
+            partition_path_for_disk(device.linux_path, partition.number);
+        const auto label = block_device_tag(path, "LABEL");
+        report << "#" << partition.number << "  " << path << "  "
+               << lazarus::to_string(partition.kind) << "  "
+               << lazarus::to_string(partition.filesystem) << "  "
+               << human_capacity(partition.size_bytes);
+        if (!partition.name.empty()) report << "  " << partition.name;
+        if (!label.empty()) report << "  label=" << label;
+        report << "\n";
+    }
+
+    std::vector<std::string> facts = inspection.facts;
+    facts.insert(facts.end(), analysis.facts.begin(), analysis.facts.end());
+    if (smart != nullptr) facts.insert(facts.end(), smart->facts.begin(), smart->facts.end());
+    if (!facts.empty()) {
+        report << "\nEVIDENCE\n";
+        for (const auto& fact : facts) report << "- " << fact << "\n";
+    }
+
+    std::vector<lazarus::SafetyFinding> findings = inspection.findings;
+    findings.insert(findings.end(), analysis.findings.begin(), analysis.findings.end());
+    if (smart != nullptr) findings.insert(findings.end(), smart->findings.begin(), smart->findings.end());
+    if (!findings.empty()) {
+        report << "\nATTENTION\n";
+        for (const auto& finding : findings) {
+            report << "- " << lazarus::to_string(finding.severity) << ": " << finding.observed;
+            if (!finding.action.empty()) report << " Next: " << finding.action;
+            report << "\n";
+        }
+    }
+    report << "\nAnalysis was read-only. No repair was attempted. A damaged layout does not disable raw imaging.";
+    return report.str();
+}
+
 std::string progress_json(const lazarus::ProgressEvent& event) {
     return "{\"type\":\"progress\",\"operation\":" + quote(event.operation) +
            ",\"phase\":" + quote(event.phase) +
@@ -3084,7 +4611,9 @@ std::string progress_json(const lazarus::ProgressEvent& event) {
            ",\"bytes_total\":" + std::to_string(event.bytes_total) +
            ",\"chunks_done\":" + std::to_string(event.chunks_done) +
            ",\"chunks_total\":" + std::to_string(event.chunks_total) +
-           ",\"indeterminate\":" + std::string(event.indeterminate ? "true" : "false") + "}";
+           ",\"indeterminate\":" + std::string(event.indeterminate ? "true" : "false") +
+           ",\"bytes_per_second\":" + std::to_string(event.bytes_per_second) +
+           ",\"eta_seconds\":" + std::to_string(event.eta_seconds) + "}";
 }
 
 std::string final_json(bool ok, const std::string& command, const std::string& fields) {
@@ -3315,6 +4844,112 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         std::lock_guard admin_lock(admin_mutex);
         admin_sessions.erase(extract_json_string(request, "admin_token"));
         return final_json(true, command, "\"logged_out\":true");
+    }
+    if (command == "technicians_list") {
+        auto technicians = load_technicians(config);
+        std::sort(technicians.begin(), technicians.end(), [](const auto& left, const auto& right) {
+            return left.name < right.name;
+        });
+        std::string names_text;
+        for (const auto& technician : technicians) names_text += technician.name + "\n";
+        return final_json(true, command, "\"names_text\":" + quote(names_text));
+    }
+    if (command == "technician_verify") {
+        const auto name = trim_copy(extract_json_string(request, "name"));
+        const auto pin = extract_json_string(request, "pin");
+        std::string error;
+        if (!verify_technician_pin(config, name, pin, error)) return error_json(command, error);
+        return final_json(true, command, "\"name\":" + quote(name));
+    }
+    if (command == "technician_add") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        const auto name = trim_copy(extract_json_string(request, "name"));
+        if (name.empty() || name.find('|') != std::string::npos || name.find('\n') != std::string::npos) {
+            return error_json(command, "Enter a technician name without '|' or line breaks.");
+        }
+        std::lock_guard lock(technician_mutex);
+        auto technicians = load_technicians(config);
+        if (std::any_of(technicians.begin(), technicians.end(), [&](const auto& t) { return t.name == name; })) {
+            return error_json(command, "A technician named '" + name + "' already exists.");
+        }
+        auto pin = extract_json_string(request, "pin");
+        const bool assigned_pin = !pin.empty();
+        if (assigned_pin && !valid_technician_pin(pin)) {
+            return error_json(command, "Technician PINs must contain exactly 4 digits.");
+        }
+        if (!assigned_pin) pin = generate_pin();
+        TechnicianRecord record;
+        record.name = name;
+        record.pin_salt = random_hex(kSaltBytes);
+        record.pin_hash = derive_secret(pin, record.pin_salt, record.iterations);
+        if (pin.empty() || record.pin_salt.empty() || record.pin_hash.empty()) {
+            return error_json(command, "Secure PIN generation failed.");
+        }
+        technicians.push_back(record);
+        std::string error;
+        if (!save_technicians(config, technicians, error)) return error_json(command, error);
+        return final_json(true, command, "\"name\":" + quote(name) + ",\"pin\":" + quote(pin) +
+                          ",\"pin_assigned\":" + std::string(assigned_pin ? "true" : "false") +
+                          ",\"pin_shown_once\":true");
+    }
+    if (command == "technician_remove") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        const auto name = trim_copy(extract_json_string(request, "name"));
+        std::lock_guard lock(technician_mutex);
+        auto technicians = load_technicians(config);
+        const auto before = technicians.size();
+        std::erase_if(technicians, [&](const auto& t) { return t.name == name; });
+        if (technicians.size() == before) return error_json(command, "No technician named '" + name + "' was found.");
+        std::string error;
+        if (!save_technicians(config, technicians, error)) return error_json(command, error);
+        return final_json(true, command, "\"removed\":" + quote(name));
+    }
+    if (command == "technician_regenerate_pin") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        const auto name = trim_copy(extract_json_string(request, "name"));
+        std::lock_guard lock(technician_mutex);
+        auto technicians = load_technicians(config);
+        const auto found = std::find_if(technicians.begin(), technicians.end(), [&](auto& t) { return t.name == name; });
+        if (found == technicians.end()) return error_json(command, "No technician named '" + name + "' was found.");
+        const auto pin = generate_pin();
+        found->pin_salt = random_hex(kSaltBytes);
+        found->pin_hash = derive_secret(pin, found->pin_salt, found->iterations);
+        if (pin.empty() || found->pin_salt.empty() || found->pin_hash.empty()) {
+            return error_json(command, "Secure PIN generation failed.");
+        }
+        std::string error;
+        if (!save_technicians(config, technicians, error)) return error_json(command, error);
+        return final_json(true, command, "\"name\":" + quote(name) + ",\"pin\":" + quote(pin) + ",\"pin_shown_once\":true");
+    }
+    if (command == "technician_set_pin") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        const auto name = trim_copy(extract_json_string(request, "name"));
+        const auto pin = extract_json_string(request, "pin");
+        if (!valid_technician_pin(pin)) {
+            return error_json(command, "Technician PINs must contain exactly 4 digits.");
+        }
+        std::lock_guard lock(technician_mutex);
+        auto technicians = load_technicians(config);
+        const auto found = std::find_if(technicians.begin(), technicians.end(), [&](auto& technician) {
+            return technician.name == name;
+        });
+        if (found == technicians.end()) return error_json(command, "No technician named '" + name + "' was found.");
+        found->pin_salt = random_hex(kSaltBytes);
+        found->pin_hash = derive_secret(pin, found->pin_salt, found->iterations);
+        if (found->pin_salt.empty() || found->pin_hash.empty()) {
+            return error_json(command, "Could not protect the designated technician PIN.");
+        }
+        std::string error;
+        if (!save_technicians(config, technicians, error)) return error_json(command, error);
+        return final_json(true, command, "\"name\":" + quote(name) + ",\"pin_assigned\":true");
     }
     if (command == "system_power") {
         if (operation_in_progress()) {
@@ -3588,7 +5223,19 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
     }
     if (command == "profile") {
         std::string storage_error;
-        const bool storage_ready = ensure_image_storage_ready(bench, storage_error);
+        const bool storage_ready = image_storage_online(bench);
+        if (!storage_ready) {
+            if (!bench.nas_storage_protocol.empty()) {
+                storage_error = "The configured NAS is offline. Lazarus will retry it when a backup, restore, or explicit reconnect is requested.";
+            } else if (!bench.image_storage_device.empty()) {
+                storage_error = "The configured image-storage disk is offline. Connect it to its assigned storage port.";
+            } else {
+                storage_error = "Persistent image storage is not configured; live-system RAM storage is not accepted for backups.";
+            }
+        }
+        // One bounded repository walk supplies both backup and ticket rows. The previous profile
+        // path recursively enumerated the same repository twice on every refresh.
+        const auto stored_backups = storage_ready ? scan_backups(bench) : std::vector<BackupSummary>{};
         const auto network_address = network_ipv4_address();
         return final_json(true, command,
                           "\"name\":" + quote(bench.name) +
@@ -3608,6 +5255,11 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                               ",\"image_storage_volume\":" + quote(bench.image_storage_volume) +
                               ",\"image_storage_port_text\":" + quote(join_lines(bench.image_storage_port_paths)) +
                               ",\"image_storage_text\":" + quote(join_lines(bench.image_storage_paths)) +
+                              ",\"nas_storage_protocol\":" + quote(bench.nas_storage_protocol) +
+                              ",\"nas_storage_server\":" + quote(bench.nas_storage_server) +
+                              ",\"nas_storage_share\":" + quote(bench.nas_storage_share) +
+                              ",\"nas_storage_username\":" + quote(bench.nas_storage_username) +
+                              ",\"nas_storage_domain\":" + quote(bench.nas_storage_domain) +
                               ",\"source_text\":" + quote(join_lines(bench.source_only_paths)) +
                               ",\"destination_text\":" + quote(join_lines(bench.destination_only_paths)) +
                               ",\"removable_text\":" + quote(join_lines(bench.removable_media_paths)) +
@@ -3625,24 +5277,31 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                               ",\"device_generation\":" + quote(device_fingerprint(bench)) +
                               ",\"devices_rows\":" + quote(device_rows_text(bench)) +
                               ",\"ports_rows\":" + quote(port_rows_text(bench)) +
-                              ",\"backups_rows\":" + quote(backup_rows_text(bench)));
+                              ",\"backups_rows\":" + quote(backup_rows_text(stored_backups)) +
+                              ",\"tickets_rows\":" + quote(ticket_rows_text(config, stored_backups)) +
+                              ",\"activity_rows\":" + quote(activity_rows_text(config)));
     }
     if (command == "save_profile") {
         if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
             return error_json(command, "Admin authentication is required or has expired.");
         }
-        lazarus::BenchProfile edited;
-        edited.name = extract_json_string(request, "name");
-        edited.branding.name = extract_json_string(request, "branding_theme");
-        edited.branding.product_name = extract_json_string(request, "branding_product_name");
-        edited.branding.subtitle = extract_json_string(request, "branding_subtitle");
-        edited.branding.accent = extract_json_string(request, "branding_accent");
-        edited.branding.background = extract_json_string(request, "branding_background");
-        edited.branding.surface = extract_json_string(request, "branding_surface");
-        edited.branding.text = extract_json_string(request, "branding_text");
-        edited.branding.icon_color = extract_json_string(request, "branding_icon");
-        edited.branding.logo_path = extract_json_string(request, "branding_logo");
-        edited.branding.report_footer = extract_json_string(request, "branding_report_footer");
+        // save_profile edits bench presentation and port assignments. Storage is configured by
+        // the dedicated local/NAS workflows, so retain it even when an older client omits fields.
+        auto edited = bench;
+        const auto update_string = [&](const char* key, std::string& value) {
+            if (has_json_field(request, key)) value = extract_json_string(request, key);
+        };
+        update_string("name", edited.name);
+        update_string("branding_theme", edited.branding.name);
+        update_string("branding_product_name", edited.branding.product_name);
+        update_string("branding_subtitle", edited.branding.subtitle);
+        update_string("branding_accent", edited.branding.accent);
+        update_string("branding_background", edited.branding.background);
+        update_string("branding_surface", edited.branding.surface);
+        update_string("branding_text", edited.branding.text);
+        update_string("branding_icon", edited.branding.icon_color);
+        update_string("branding_logo", edited.branding.logo_path);
+        update_string("branding_report_footer", edited.branding.report_footer);
         if (edited.branding.name.empty()) edited.branding.name = "Lazarus Default Theme";
         if (edited.branding.product_name.empty()) edited.branding.product_name = "Arcology Lazarus";
         if (edited.branding.subtitle.empty()) edited.branding.subtitle = "Offline Imaging | Recovery | Hardware Migration";
@@ -3652,16 +5311,18 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         if (edited.branding.text.empty()) edited.branding.text = "#edf1f3";
         if (edited.branding.icon_color.empty()) edited.branding.icon_color = edited.branding.accent;
         if (edited.branding.report_footer.empty()) edited.branding.report_footer = "Generated locally by Arcology Lazarus. SMART results describe reported device facts.";
-        edited.image_storage_paths = split_lines(extract_json_string(request, "image_storage_text"));
-        edited.image_storage_path = edited.image_storage_paths.empty() ? "" : edited.image_storage_paths.front();
-        edited.image_storage_device = extract_json_string(request, "image_storage_device");
-        edited.image_storage_volume = extract_json_string(request, "image_storage_volume");
-        edited.image_storage_port_paths = split_lines(extract_json_string(request, "image_storage_port_text"));
-        edited.source_only_paths = split_lines(extract_json_string(request, "source_text"));
-        edited.destination_only_paths = split_lines(extract_json_string(request, "destination_text"));
-        edited.removable_media_paths = split_lines(extract_json_string(request, "removable_text"));
-        edited.ignored_paths = split_lines(extract_json_string(request, "ignored_text"));
-        edited.port_labels = labels_from_text(extract_json_string(request, "labels_text"));
+        if (has_json_field(request, "image_storage_port_text"))
+            edited.image_storage_port_paths = split_lines(extract_json_string(request, "image_storage_port_text"));
+        if (has_json_field(request, "source_text"))
+            edited.source_only_paths = split_lines(extract_json_string(request, "source_text"));
+        if (has_json_field(request, "destination_text"))
+            edited.destination_only_paths = split_lines(extract_json_string(request, "destination_text"));
+        if (has_json_field(request, "removable_text"))
+            edited.removable_media_paths = split_lines(extract_json_string(request, "removable_text"));
+        if (has_json_field(request, "ignored_text"))
+            edited.ignored_paths = split_lines(extract_json_string(request, "ignored_text"));
+        if (has_json_field(request, "labels_text"))
+            edited.port_labels = labels_from_text(extract_json_string(request, "labels_text"));
         std::string error;
         if (!save_bench_profile(edited, config.bench_path, error)) {
             return error_json(command, error);
@@ -3669,27 +5330,242 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         return final_json(true, command,
                           "\"summary_text\":" + quote(bench_summary_text(config, edited)) +
                               ",\"devices_rows\":" + quote(device_rows_text(edited)) +
-                              ",\"ports_rows\":" + quote(port_rows_text(edited)) +
-                              ",\"backups_rows\":" + quote(backup_rows_text(edited)));
+                              ",\"ports_rows\":" + quote(port_rows_text(edited)));
+    }
+    if (command == "mount_device") {
+        const auto selector = extract_json_string(request, "selector");
+        auto device = find_device(bench, selector);
+        if (!device) return error_json(command, "The selected disk is no longer connected.");
+        if (device->is_system_disk) return error_json(command, "The running Lazarus system disk cannot be mounted or unmounted.");
+        {
+            std::lock_guard lock(activity_mutex);
+            if (active_devices.contains(activity_key(*device))) {
+                return error_json(command, "This disk is already in use by another Lazarus operation.");
+            }
+        }
+        std::string mount_path;
+        std::string partition;
+        std::string filesystem;
+        std::string error;
+        bool read_only = false;
+        if (!mount_generic_device(*device, mount_path, partition, read_only, filesystem, error)) {
+            return error_json(command, error);
+        }
+        {
+            std::lock_guard lock(activity_mutex);
+            active_devices.insert_or_assign(activity_key(*device), DeviceActivity{*device, "Mounted for direct access", "mounted"});
+        }
+        return final_json(true, command,
+                          "\"mount_path\":" + quote(mount_path) +
+                              ",\"partition\":" + quote(partition) +
+                              ",\"filesystem\":" + quote(filesystem) +
+                              ",\"read_only\":" + std::string(read_only ? "true" : "false") +
+                              ",\"message\":" + quote(read_only
+                                  ? "Mounted read-only at " + mount_path + " (source-only port policy)."
+                              : "Mounted read-write at " + mount_path + "."));
+    }
+    if (command == "storage_folders") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        const auto selector = extract_json_string(request, "selector");
+        const auto relative_path = extract_json_string(request, "relative_path");
+        auto device = find_device(bench, selector);
+        if (!device) return error_json(command, "The selected storage disk is no longer connected.");
+        if (device->is_system_disk) {
+            return error_json(command, "The running Lazarus system disk cannot be used as image storage.");
+        }
+        if (device->bench_role == lazarus::DeviceRole::SourceOnly ||
+            device->bench_role == lazarus::DeviceRole::Ignored) {
+            return error_json(command, "The selected disk's physical-port policy does not allow image storage.");
+        }
+        {
+            std::lock_guard lock(activity_mutex);
+            const auto active = active_devices.find(activity_key(*device));
+            if (active != active_devices.end() && active->second.operation != "Mounted for direct access") {
+                return error_json(command, "This disk is already in use by another Lazarus operation.");
+            }
+        }
+        std::string mount_path;
+        std::string partition;
+        std::string filesystem;
+        std::string error;
+        bool read_only = false;
+        if (!mount_generic_device(*device, mount_path, partition, read_only, filesystem, error)) {
+            return error_json(command, error);
+        }
+        if (read_only) {
+            return error_json(command, "A source-only disk cannot be assigned as image storage.");
+        }
+        if (mount_path.rfind("/mnt/lazarus-drives/", 0) == 0) {
+            std::lock_guard lock(activity_mutex);
+            active_devices.insert_or_assign(activity_key(*device),
+                DeviceActivity{*device, "Mounted for direct access", "browsing folders"});
+        }
+
+        std::filesystem::path directory;
+        if (!resolve_browse_path(mount_path, relative_path, directory, error)) {
+            return error_json(command, error);
+        }
+        std::error_code filesystem_error;
+        if (!std::filesystem::is_directory(directory, filesystem_error) || filesystem_error) {
+            return error_json(command, "The selected folder is no longer available on this disk.");
+        }
+
+        std::filesystem::path clean_relative;
+        if (!safe_relative_path(relative_path, clean_relative, error)) return error_json(command, error);
+        std::vector<std::pair<std::string, std::string>> folders;
+        for (std::filesystem::directory_iterator iterator(
+                 directory, std::filesystem::directory_options::skip_permission_denied, filesystem_error), end;
+             !filesystem_error && iterator != end; iterator.increment(filesystem_error)) {
+            std::error_code entry_error;
+            const auto status = iterator->symlink_status(entry_error);
+            if (entry_error || std::filesystem::is_symlink(status) || !std::filesystem::is_directory(status)) continue;
+            const auto name = iterator->path().filename().string();
+            const auto child = (clean_relative / iterator->path().filename()).generic_string();
+            folders.emplace_back(name, child);
+        }
+        if (filesystem_error) {
+            return error_json(command, "The selected folder could not be read: " + filesystem_error.message());
+        }
+        std::sort(folders.begin(), folders.end(), [](const auto& left, const auto& right) {
+            return left.first < right.first;
+        });
+        std::string rows;
+        for (const auto& [name, child] : folders) {
+            rows += hex_encode_text(name) + "\t" + hex_encode_text(child) + "\n";
+        }
+        return final_json(true, command,
+                          "\"relative_path\":" + quote(clean_relative.generic_string()) +
+                              ",\"directories_rows\":" + quote(rows) +
+                              ",\"filesystem\":" + quote(filesystem));
+    }
+    if (command == "storage_create_folder") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        const auto selector = extract_json_string(request, "selector");
+        const auto relative_path = extract_json_string(request, "relative_path");
+        const auto requested_name = extract_json_string(request, "name");
+        auto device = find_device(bench, selector);
+        if (!device) return error_json(command, "The selected storage disk is no longer connected.");
+        if (device->is_system_disk) {
+            return error_json(command, "The running Lazarus system disk cannot be used as image storage.");
+        }
+        if (device->bench_role == lazarus::DeviceRole::SourceOnly ||
+            device->bench_role == lazarus::DeviceRole::Ignored) {
+            return error_json(command, "The selected disk's physical-port policy does not allow image storage.");
+        }
+
+        std::filesystem::path folder_name;
+        std::string error;
+        if (!safe_relative_path(requested_name, folder_name, error) || folder_name.empty() ||
+            std::distance(folder_name.begin(), folder_name.end()) != 1) {
+            return error_json(command, "Enter one folder name without slashes.");
+        }
+        {
+            std::lock_guard lock(activity_mutex);
+            const auto active = active_devices.find(activity_key(*device));
+            if (active != active_devices.end() && active->second.operation != "Mounted for direct access") {
+                return error_json(command, "This disk is already in use by another Lazarus operation.");
+            }
+        }
+        std::string mount_path;
+        std::string partition;
+        std::string filesystem;
+        bool read_only = false;
+        if (!mount_generic_device(*device, mount_path, partition, read_only, filesystem, error)) {
+            return error_json(command, error);
+        }
+        if (read_only) return error_json(command, "A source-only disk cannot be changed or assigned as image storage.");
+        if (mount_path.rfind("/mnt/lazarus-drives/", 0) == 0) {
+            std::lock_guard lock(activity_mutex);
+            active_devices.insert_or_assign(activity_key(*device),
+                DeviceActivity{*device, "Mounted for direct access", "creating storage folder"});
+        }
+
+        std::filesystem::path parent;
+        if (!resolve_browse_path(mount_path, relative_path, parent, error)) return error_json(command, error);
+        std::error_code filesystem_error;
+        if (!std::filesystem::is_directory(parent, filesystem_error) || filesystem_error) {
+            return error_json(command, "The current folder is no longer available on this disk.");
+        }
+        const auto created = parent / folder_name;
+        if (std::filesystem::exists(created, filesystem_error)) {
+            if (filesystem_error || !std::filesystem::is_directory(created, filesystem_error) || filesystem_error) {
+                return error_json(command, "An item with that name already exists and is not a folder.");
+            }
+        } else if (!std::filesystem::create_directory(created, filesystem_error) || filesystem_error) {
+            return error_json(command, "The folder could not be created: " + filesystem_error.message());
+        }
+        std::filesystem::path clean_parent;
+        if (!safe_relative_path(relative_path, clean_parent, error)) return error_json(command, error);
+        const auto created_relative = (clean_parent / folder_name).generic_string();
+        return final_json(true, command,
+                          "\"relative_path\":" + quote(created_relative) +
+                              ",\"message\":" + quote("Folder ready: /" + created_relative));
+    }
+    if (command == "unmount_device") {
+        const auto selector = extract_json_string(request, "selector");
+        auto device = find_device(bench, selector);
+        if (!device) return error_json(command, "The selected disk is no longer connected.");
+        if (device->is_system_disk) return error_json(command, "The running Lazarus system disk cannot be unmounted.");
+        if (const auto active = device_activity(*device);
+            active && active->operation != "Mounted for direct access") {
+            return error_json(command, "This disk is in use by '" + active->operation + "'. Wait for that operation to finish.");
+        }
+        std::vector<std::string> candidates = device->partitions;
+        if (candidates.empty()) candidates.push_back(device->linux_path);
+        bool unmounted_any = false;
+        std::string error;
+        for (const auto& candidate : candidates) {
+            std::string mounted_at;
+            std::string findmnt_error;
+            if (!run_program({"findmnt", "-rn", "-S", candidate, "-o", "TARGET"}, mounted_at, findmnt_error) ||
+                trim_copy(mounted_at).empty()) {
+                continue;
+            }
+            const auto target = trim_copy(mounted_at);
+            if (target == "/mnt/lazarus-storage") {
+                return error_json(command,
+                    "This is the assigned image-storage disk. Safely unmount it from Administration > Image Storage.");
+            }
+            std::string output;
+            run_program({"sync"}, output, error);
+            if (!run_program({"umount", target}, output, error)) {
+                return error_json(command, "Could not unmount " + candidate + ": " + error);
+            }
+            std::error_code filesystem_error;
+            std::filesystem::remove(target, filesystem_error);
+            unmounted_any = true;
+        }
+        {
+            std::lock_guard lock(activity_mutex);
+            active_devices.erase(activity_key(*device));
+        }
+        if (!unmounted_any) {
+            return final_json(true, command, "\"message\":\"This disk is already unmounted.\"");
+        }
+        return final_json(true, command, "\"message\":\"Disk was flushed and unmounted. It is safe to disconnect.\"");
     }
     if (command == "mount_image_storage") {
         if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
             return error_json(command, "Admin authentication is required or has expired.");
         }
-        if (bench.image_storage_device.empty()) {
-            return error_json(command, "No image-storage disk is assigned. Select a disk and configure it first.");
+        if (bench.image_storage_device.empty() && bench.nas_storage_protocol.empty()) {
+            return error_json(command, "No local disk or NAS is configured for image storage.");
         }
         if (image_storage_online(bench)) {
             return final_json(true, command,
                               std::string{"\"message\":\"Image storage is already mounted.\","} +
-                              "\"mount_path\":\"/mnt/lazarus-storage/images\"," +
+                              "\"mount_path\":" + quote(bench.image_storage_path) + "," +
                               "\"mount_source\":" + quote(image_storage_mount_source()));
         }
         std::string error;
-        if (!ensure_image_storage_ready(bench, error)) return error_json(command, error);
+        if (!ensure_image_storage_ready(config, bench, error)) return error_json(command, error);
         return final_json(true, command,
                           std::string{"\"message\":\"Image storage mounted read-write and is ready for backups.\","} +
-                          "\"mount_path\":\"/mnt/lazarus-storage/images\"," +
+                          "\"mount_path\":" + quote(bench.image_storage_path) + "," +
                           "\"mount_source\":" + quote(image_storage_mount_source()) +
                           ",\"storage_online\":true");
     }
@@ -3707,13 +5583,42 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         }
         std::string output;
         std::string error;
+        if (bench.nas_storage_protocol.empty() && !run_storage_helper(config, output, error)) {
+            return error_json(command,
+                "Image storage remains mounted because Lazarus could not apply portable read permissions: " + error);
+        }
         run_program({"sync"}, output, error);
         if (!run_program({"umount", "/mnt/lazarus-storage"}, output, error)) {
             return error_json(command, "Image storage could not be unmounted safely: " + error);
         }
         return final_json(true, command,
-                          std::string{"\"message\":\"Image storage was flushed and unmounted. The disk is safe to disconnect.\","} +
+                          "\"message\":" + quote(bench.nas_storage_protocol.empty()
+                              ? "Image storage was flushed and unmounted. The disk is safe to disconnect."
+                              : "NAS image storage was flushed and unmounted.") + "," +
                           "\"storage_online\":false");
+    }
+    if (command == "configure_nas_storage") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        auto directory = extract_json_string(request, "directory");
+        if (directory.empty()) directory = "images";
+        std::string error;
+        if (!configure_nas_storage(config, bench,
+                                   lower_ascii(extract_json_string(request, "protocol")),
+                                   trim_copy(extract_json_string(request, "server")),
+                                   trim_copy(extract_json_string(request, "share")),
+                                   extract_json_string(request, "username"),
+                                   extract_json_string(request, "password"),
+                                   extract_json_string(request, "domain"), directory, error)) {
+            return error_json(command, error);
+        }
+        const auto configured = lazarus::load_bench_profile(config.bench_path);
+        return final_json(true, command,
+                          std::string{"\"message\":\"NAS connection tested, mounted read-write, and assigned as image storage.\","} +
+                          "\"mount_path\":" + quote(configured.image_storage_path) + "," +
+                          "\"mount_source\":" + quote(image_storage_mount_source()) + "," +
+                          "\"storage_online\":true");
     }
     if (command == "configure_image_storage") {
         if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
@@ -3721,6 +5626,8 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         }
         const auto selector = extract_json_string(request, "selector");
         const auto mode = extract_json_string(request, "mode");
+        auto directory = extract_json_string(request, "directory");
+        if (directory.empty()) directory = "images";
         if (selector.empty()) return error_json(command, "Select a detected physical disk first.");
         const bool format = mode == "format" || mode == "erase";
         if (mode != "existing" && !format) {
@@ -3731,14 +5638,17 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         }
         const auto device = find_device(bench, selector);
         if (!device) return error_json(command, "The selected storage disk is no longer connected.");
+        std::string error;
+        if (!release_generic_mount_for_storage(*device, error)) {
+            return error_json(command, error);
+        }
         DeviceActivityGuard activity(*device, format ? "format image storage" : "mount image storage");
         if (!activity.acquired()) {
             return error_json(command, "The selected disk is already in use by another Lazarus operation.");
         }
         activity.phase(format ? "erase, partition, and format" : "inspect filesystem");
         std::string filesystem;
-        std::string error;
-        if (!configure_image_storage(config, bench, *device, format, filesystem, error)) {
+        if (!configure_image_storage(config, bench, *device, format, directory, filesystem, error)) {
             return error_json(command, error);
         }
         const auto configured = lazarus::load_bench_profile(config.bench_path);
@@ -3747,7 +5657,7 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                               ? "The selected disk was partitioned with GPT, formatted as ext4, mounted, and assigned as persistent image storage."
                               : "The existing filesystem was mounted and assigned as persistent image storage without formatting.") +
                               ",\"filesystem\":" + quote(filesystem) +
-                              ",\"mount_path\":" + quote("/mnt/lazarus-storage/images") +
+                              ",\"mount_path\":" + quote(configured.image_storage_path) +
                               ",\"devices_rows\":" + quote(device_rows_text(configured)) +
                               ",\"ports_rows\":" + quote(port_rows_text(configured)) +
                               ",\"storage_online\":true");
@@ -3769,7 +5679,16 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         return final_json(true, command, "\"device_generation\":" + quote(device_fingerprint(bench)));
     }
     if (command == "backups") {
+        std::string error;
+        if ((!bench.image_storage_device.empty() || !bench.nas_storage_protocol.empty()) &&
+            !ensure_image_storage_ready(config, bench, error)) return error_json(command, error);
         return final_json(true, command, "\"backups_rows\":" + quote(backup_rows_text(bench)));
+    }
+    if (command == "tickets") {
+        std::string error;
+        if ((!bench.image_storage_device.empty() || !bench.nas_storage_protocol.empty()) &&
+            !ensure_image_storage_ready(config, bench, error)) return error_json(command, error);
+        return final_json(true, command, "\"tickets_rows\":" + quote(ticket_rows_text(config, bench)));
     }
     if (command == "driver_plan" || command == "driver_apply_offline") {
         auto package_paths = split_lines(extract_json_string(request, "package_paths_text"));
@@ -3784,8 +5703,10 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         if (automatic) {
             const auto selector = extract_json_string(request, "destination_selector");
             const auto destination = find_device(bench, selector);
-            if (!destination || destination->is_system_disk || destination->bench_role != lazarus::DeviceRole::DestinationOnly) {
-                return error_json(command, "Universal Restore requires a connected destination-only disk.");
+            if (!destination || destination->is_system_disk ||
+                (destination->bench_role != lazarus::DeviceRole::DestinationOnly &&
+                 destination->bench_role != lazarus::DeviceRole::Unknown)) {
+                return error_json(command, "Universal Restore requires a connected destination-only or unassigned replacement disk.");
             }
             if (!plan_options.requested_removals.empty()) {
                 return error_json(command, "Universal Restore preserves existing storage drivers. Driver removal is available only in explicit expert servicing plans.");
@@ -3844,8 +5765,10 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
             }
             const auto destination_selector = extract_json_string(request, "destination_selector");
             auto destination = find_device(bench, destination_selector);
-            if (!destination || destination->is_system_disk || destination->bench_role != lazarus::DeviceRole::DestinationOnly) {
-                return error_json(command, "Offline Windows servicing requires a connected destination-only disk.");
+            if (!destination || destination->is_system_disk ||
+                (destination->bench_role != lazarus::DeviceRole::DestinationOnly &&
+                 destination->bench_role != lazarus::DeviceRole::Unknown)) {
+                return error_json(command, "Offline Windows servicing requires a connected destination-only or unassigned replacement disk.");
             }
             DeviceActivityGuard activity(*destination, "Apply Universal Restore boot drivers");
             if (!activity.acquired()) return error_json(command, "The replacement disk is already in use.");
@@ -3937,12 +5860,123 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                                   ",\"message\":" + quote("Universal Restore boot-driver servicing completed inside Lazarus OS."));
         }
     }
-    if (command == "inspect_source") {
+    if (command == "boot_repair_plan" || command == "boot_repair_apply") {
+        if (command == "boot_repair_apply" && extract_json_string(request, "confirmation") != "APPLY BOOT REPAIR") {
+            return error_json(command, "Type APPLY BOOT REPAIR to modify the EFI System Partition.");
+        }
+        const auto selector = extract_json_string(request, "destination_selector");
+        auto destination = find_device(bench, selector);
+        if (!destination || destination->is_system_disk ||
+            destination->bench_role == lazarus::DeviceRole::ImageStorage ||
+            destination->bench_role == lazarus::DeviceRole::RemovableMedia ||
+            destination->bench_role == lazarus::DeviceRole::Ignored) {
+            return error_json(command, "Boot repair requires a connected non-system disk.");
+        }
+        if (command == "boot_repair_apply" && !is_install_target(*destination)) {
+            return error_json(command,
+                "Boot repair can only write to a disk on a destination-only or unassigned port. Source drives are read-only.");
+        }
+        DeviceActivityGuard activity(*destination, "Boot repair");
+        if (!activity.acquired()) return error_json(command, "The selected disk is already in use.");
+
+        activity.phase("locate boot partitions");
+        send_line(out, progress_json(lazarus::ProgressEvent{
+            "boot-repair", "locate", "Locating the EFI System Partition and Windows installation."}));
+
+        lazarus::BootRepairFindingsOptions observed;
+        BootRepairMountResult mounts;
+        std::string detect_error;
+        const bool located = detect_boot_repair_facts(*destination, mounts, observed, detect_error);
+        release_boot_partitions(mounts);
+        if (!located) return error_json(command, detect_error);
+        const auto plan = lazarus::evaluate_boot_repair(observed);
+
+        if (command == "boot_repair_plan") {
+            return final_json(!has_blocker(plan.findings), command,
+                              failure_error_field(!has_blocker(plan.findings), plan.findings, "Boot repair found a blocking condition.") +
+                                  "\"destination_selector\":" + quote(selector) +
+                                  ",\"gpt_valid\":" + std::string(observed.gpt_valid ? "true" : "false") +
+                                  ",\"esp_present\":" + std::string(observed.esp_present ? "true" : "false") +
+                                  ",\"bootmgfw_present\":" + std::string(observed.bootmgfw_present ? "true" : "false") +
+                                  ",\"fallback_loader_present\":" + std::string(observed.fallback_loader_present ? "true" : "false") +
+                                  ",\"fallback_loader_matches_bootmgfw\":" + std::string(observed.fallback_loader_matches_bootmgfw ? "true" : "false") +
+                                  ",\"windows_partition_present\":" + std::string(observed.windows_partition_present ? "true" : "false") +
+                                  ",\"winload_present\":" + std::string(observed.winload_present ? "true" : "false") +
+                                  ",\"bcd_present\":" + std::string(observed.bcd_present ? "true" : "false") +
+                                  ",\"bcd_readable\":" + std::string(observed.bcd_readable ? "true" : "false") +
+                                  ",\"fallback_repair_needed\":" + std::string(plan.fallback_repair_needed ? "true" : "false") +
+                                  ",\"ready_for_servicing\":" + std::string(plan.ready_for_servicing ? "true" : "false") +
+                                  ",\"facts\":" + string_array_json(plan.facts) +
+                                  ",\"findings\":" + findings_json(plan.findings) +
+                                  ",\"findings_text\":" + quote(boot_repair_findings_text(plan.findings)));
+        }
+
+        // boot_repair_apply
+        if (!plan.ready_for_servicing) {
+            return final_json(false, command,
+                              failure_error_field(false, plan.findings, "Boot repair is not ready to apply.") +
+                                  "\"facts\":" + string_array_json(plan.facts) +
+                                  ",\"findings\":" + findings_json(plan.findings) +
+                                  ",\"findings_text\":" + quote(boot_repair_findings_text(plan.findings)));
+        }
+
+        activity.phase("rebuild fallback boot path");
+        send_line(out, progress_json(lazarus::ProgressEvent{
+            "boot-repair", "rebuild", "Rebuilding the EFI firmware fallback boot path."}));
+
+        BootRepairMountResult write_mounts;
+        std::string mount_error;
+        if (!locate_boot_partitions(*destination, /*esp_read_write=*/true, write_mounts, mount_error)) {
+            return error_json(command, mount_error);
+        }
+        if (write_mounts.esp_mount_root.empty()) {
+            release_boot_partitions(write_mounts);
+            return error_json(command, "The EFI System Partition could no longer be located for writing.");
+        }
+        const auto job_id = std::string("boot-repair-") + random_hex(8);
+        std::vector<std::string> facts;
+        std::string apply_error;
+        const bool applied = apply_boot_repair_fallback(write_mounts, job_id, facts, apply_error);
+
+        const int esp_descriptor = ::open(write_mounts.esp_mount_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (esp_descriptor < 0 || ::syncfs(esp_descriptor) != 0) {
+            if (apply_error.empty()) apply_error = "Could not flush the EFI System Partition: " + std::string(std::strerror(errno));
+        }
+        if (esp_descriptor >= 0) ::close(esp_descriptor);
+        const auto esp_partition = write_mounts.esp_partition;
+        release_boot_partitions(write_mounts);
+
+        if (!applied || !apply_error.empty()) {
+            return final_json(false, command,
+                              "\"error\":" + quote(apply_error.empty() ? "Boot repair did not complete." : apply_error) +
+                                  ",\"job_id\":" + quote(job_id) +
+                                  ",\"target_partition\":" + quote(esp_partition.string()) +
+                                  ",\"safe_to_disconnect\":true" +
+                                  ",\"facts\":" + string_array_json(facts));
+        }
+        return final_json(true, command,
+                          "\"job_id\":" + quote(job_id) +
+                              ",\"target_partition\":" + quote(esp_partition.string()) +
+                              ",\"safe_to_disconnect\":true" +
+                              ",\"facts\":" + string_array_json(facts) +
+                              ",\"message\":" + quote(
+                                  "EFI boot files were rebuilt at the firmware fallback path. "
+                                  "The BCD store was present and opened as a readable registry hive; its internal boot entries were not inspected or modified. "
+                                  "No known boot-blocking condition was detected."));
+    }
+    if (command == "inspect_source" || command == "drive_analysis") {
         const auto selector = extract_json_string(request, "selector");
         auto device = find_device(bench, selector);
         if (!device) {
             return error_json(command, "No discovered device matched selector.");
         }
+        DeviceActivityGuard activity(*device, "Read-only drive analysis");
+        if (!activity.acquired()) {
+            return error_json(command, "The selected drive is already in use by another Lazarus operation.");
+        }
+        activity.phase("inspect layout");
+        send_line(out, progress_json(lazarus::ProgressEvent{
+            "drive-analysis", "inspect-layout", "Reading partition and filesystem signatures without writing."}));
         auto open_result = lazarus::open_source_read_only(bench, *device);
         if (!open_result.handle.is_open()) {
             return final_json(false, command,
@@ -3950,30 +5984,87 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                                   "\"findings\":" + findings_json(open_result.findings));
         }
         const auto inspection = lazarus::inspect_source_disk(open_result.handle);
+        activity.phase("detect operating system");
+        send_line(out, progress_json(lazarus::ProgressEvent{
+            "drive-analysis", "detect-os", "Checking supported partitions through protected read-only mounts."}));
+        const auto os_analysis = analyze_drive_os(*device, inspection);
+
+        std::optional<lazarus::SmartDiagnosticResult> smart;
+        if (command == "drive_analysis") {
+            activity.phase("read drive health");
+            send_line(out, progress_json(lazarus::ProgressEvent{
+                "drive-analysis", "drive-health", "Reading drive-reported health data."}));
+            smart = lazarus::collect_smart_diagnostics(*device);
+        }
+
         std::string partitions = "[";
         for (std::size_t i = 0; i < inspection.partitions.size(); ++i) {
             const auto& partition = inspection.partitions[i];
+            const auto partition_path = i < device->partitions.size() ? device->partitions[i] :
+                partition_path_for_disk(device->linux_path, partition.number);
             if (i != 0) {
                 partitions += ",";
             }
             partitions += "{\"number\":" + std::to_string(partition.number) +
+                          ",\"path\":" + quote(partition_path) +
+                          ",\"name\":" + quote(partition.name) +
                           ",\"kind\":" + quote(lazarus::to_string(partition.kind)) +
+                          ",\"type_guid\":" + quote(partition.type_guid) +
                           ",\"filesystem\":" + quote(lazarus::to_string(partition.filesystem)) +
+                          ",\"label\":" + quote(block_device_tag(partition_path, "LABEL")) +
                           ",\"first_lba\":" + std::to_string(partition.first_lba) +
                           ",\"last_lba\":" + std::to_string(partition.last_lba) +
                           ",\"size_bytes\":" + std::to_string(partition.size_bytes) + "}";
         }
         partitions += "]";
-        const bool supported = has_imageable_layout(inspection) && !has_blocker(inspection.findings);
-        return final_json(supported, command,
-                          failure_error_field(supported, inspection.findings, "The selected source layout is not supported for imaging.") +
-                              "\"device\":" + device_json(bench, *device) +
-                              ",\"mbr_detected\":" + std::string(inspection.mbr_detected ? "true" : "false") +
-                              ",\"gpt_detected\":" + std::string(inspection.gpt_detected ? "true" : "false") +
-                              ",\"gpt_header_valid\":" + std::string(inspection.gpt_header_valid ? "true" : "false") +
-                              ",\"partitions\":" + partitions +
-                              ",\"facts\":" + string_array_json(inspection.facts) +
-                              ",\"findings\":" + findings_json(inspection.findings));
+        const bool layout_valid = has_imageable_layout(inspection) && !has_blocker(inspection.findings);
+
+        std::vector<std::string> facts = inspection.facts;
+        facts.insert(facts.end(), os_analysis.facts.begin(), os_analysis.facts.end());
+        std::vector<lazarus::SafetyFinding> findings = inspection.findings;
+        findings.insert(findings.end(), os_analysis.findings.begin(), os_analysis.findings.end());
+        if (smart) {
+            facts.insert(facts.end(), smart->facts.begin(), smart->facts.end());
+            findings.insert(findings.end(), smart->findings.begin(), smart->findings.end());
+        }
+
+        std::string fields =
+            "\"raw_capture_available\":true," +
+            std::string("\"layout_valid\":") + (layout_valid ? "true" : "false") + "," +
+            "\"device\":" + device_json(bench, *device) +
+            ",\"mbr_detected\":" + std::string(inspection.mbr_detected ? "true" : "false") +
+            ",\"gpt_detected\":" + std::string(inspection.gpt_detected ? "true" : "false") +
+            ",\"gpt_header_valid\":" + std::string(inspection.gpt_header_valid ? "true" : "false") +
+            ",\"detected_os_family\":" + quote(os_analysis.family) +
+            ",\"detected_os_name\":" + quote(os_analysis.name) +
+            ",\"detected_os_version\":" + quote(os_analysis.version) +
+            ",\"detected_os_edition\":" + quote(os_analysis.edition) +
+            ",\"detected_os_build\":" + quote(os_analysis.build) +
+            ",\"detected_os_architecture\":" + quote(os_analysis.architecture) +
+            ",\"os_detection_confidence\":" + quote(os_analysis.confidence) +
+            ",\"boot_mode\":" + quote(os_analysis.boot_mode) +
+            ",\"system_partition\":" + quote(os_analysis.system_partition) +
+            ",\"encryption_detected\":" + std::string(os_analysis.encrypted ? "true" : "false") +
+            ",\"encryption_type\":" + quote(os_analysis.encryption_type) +
+            ",\"detected_installations\":" + string_array_json(os_analysis.installations) +
+            ",\"partitions\":" + partitions +
+            ",\"facts\":" + string_array_json(facts) +
+            ",\"findings\":" + findings_json(findings) +
+            ",\"analysis_text\":" + quote(drive_analysis_text(
+                *device, inspection, os_analysis, smart ? &*smart : nullptr));
+        if (smart) {
+            fields += ",\"smartctl_available\":" + std::string(smart->smartctl_available ? "true" : "false") +
+                      ",\"command_completed\":" + std::string(smart->command_completed ? "true" : "false") +
+                      ",\"smart_exit_code\":" + std::to_string(smart->exit_code) +
+                      ",\"health\":" + quote(smart->health) +
+                      ",\"power_on_hours\":" + smart_attribute_json(smart->power_on_hours) +
+                      ",\"temperature_celsius\":" + smart_attribute_json(smart->temperature_celsius) +
+                      ",\"reallocated_sectors\":" + smart_attribute_json(smart->reallocated_sectors) +
+                      ",\"pending_sectors\":" + smart_attribute_json(smart->pending_sectors) +
+                      ",\"uncorrectable_errors\":" + smart_attribute_json(smart->uncorrectable_errors);
+        }
+        return final_json(true, command,
+                          fields);
     }
     if (command == "smart") {
         const auto selector = extract_json_string(request, "selector");
@@ -4075,7 +6166,7 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
             const auto display = volume.label.empty() ? "Partition " + std::to_string(index + 1) : volume.label;
             rows += volume.token + "\t" + hex_encode_text(display) + "\t" + volume.filesystem + "\t" +
                     std::to_string(volume.size_bytes) + "\t" +
-                    (supported_browse_filesystem(volume.filesystem) ? "1" : "0") + "\n";
+                    ((supported_browse_filesystem(volume.filesystem) || is_bitlocker_filesystem(volume.filesystem)) ? "1" : "0") + "\n";
         }
         const auto session_id = session.id;
         {
@@ -4099,7 +6190,9 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                                          [&](const BrowseVolume& volume) { return volume.token == volume_token; });
         if (volume_found == session_found->second.volumes.end()) return error_json(command, "The selected image volume was not found.");
         std::string mount_error;
-        if (!mount_browse_volume(*volume_found, session_id, mount_error)) return error_json(command, mount_error);
+        if (!mount_browse_volume(*volume_found, session_id, extract_json_string(request, "bitlocker_recovery_key"), mount_error)) {
+            return error_json(command, mount_error);
+        }
         std::filesystem::path directory;
         if (!resolve_browse_path(volume_found->mount_path, relative_path, directory, mount_error) ||
             !std::filesystem::is_directory(directory)) {
@@ -4160,7 +6253,9 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                                          [&](const BrowseVolume& volume) { return volume.token == volume_token; });
         if (volume_found == session_found->second.volumes.end()) return error_json(command, "The selected image volume was not found.");
         std::string error;
-        if (!mount_browse_volume(*volume_found, session_id, error)) return error_json(command, error);
+        if (!mount_browse_volume(*volume_found, session_id, extract_json_string(request, "bitlocker_recovery_key"), error)) {
+            return error_json(command, error);
+        }
 
         std::vector<std::filesystem::path> sources;
         for (const auto& encoded : encoded_sources) {
@@ -4289,10 +6384,15 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         if (image_dir.empty()) {
             return error_json(command, "image_directory is required.");
         }
+        std::string technician_error;
+        std::string performed_by;
+        if (!resolve_job_technician(config, request, performed_by, technician_error)) {
+            return error_json(command, technician_error);
+        }
         std::string path_error;
         if (!image_path_configured(bench, image_dir, path_error)) return error_json(command, path_error);
         std::string storage_error;
-        if (!ensure_image_storage_ready(bench, storage_error)) return error_json(command, storage_error);
+        if (!ensure_image_storage_ready(config, bench, storage_error)) return error_json(command, storage_error);
         if (!image_path_allowed(bench, image_dir, true, path_error)) {
             return error_json(command, path_error);
         }
@@ -4300,11 +6400,13 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
             send_line(out, progress_json(event));
         });
         const auto [report_job, report_device] = report_context_from_image(image_dir);
+        if (result.verified) record_activity(config, performed_by, "verified", report_job.ticket_number, report_job.customer_name);
         std::string report_error;
         const bool report_written = write_completion_reports(
             bench, image_dir, "completion-report", "Backup Verification",
             result.verified ? "Verified" : "Verification failed", report_job, report_device,
-            {{"Expected bytes", human_capacity(result.expected_bytes)},
+            {{"Verification performed by", performed_by},
+             {"Expected bytes", human_capacity(result.expected_bytes)},
              {"Verified bytes", human_capacity(result.actual_bytes)},
              {"Chunks verified", std::to_string(result.chunks_verified)},
              {"Partition table", result.partition_table_valid ? "Passed" : "Not validated"},
@@ -4333,14 +6435,19 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
     if (command == "image_source" || command == "resume_image") {
         std::string selector = extract_json_string(request, "selector");
         std::string output_dir = extract_json_string(request, "output_directory");
+        const bool resume_request = command == "resume_image";
         lazarus::JobInfo job;
         job.ticket_number = extract_json_string(request, "ticket_number");
         job.customer_name = extract_json_string(request, "customer_name");
-        job.technician = extract_json_string(request, "technician");
         job.purpose = extract_json_string(request, "purpose");
+        if (!resume_request) {
+            std::string technician_error;
+            if (!resolve_job_technician(config, request, job.technician, technician_error)) {
+                return error_json(command, technician_error);
+            }
+        }
         std::string requested_mode = extract_json_string(request, "imaging_mode");
         std::string requested_compression = extract_json_string(request, "compression");
-        const bool resume_request = command == "resume_image";
         if (resume_request) {
             output_dir = extract_json_string(request, "image_directory");
             const auto journal = read_text_file(std::filesystem::path(output_dir) / "job-journal.json");
@@ -4364,7 +6471,7 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         std::string path_error;
         if (!image_path_configured(bench, output_dir, path_error)) return error_json(command, path_error);
         std::string storage_error;
-        if (!ensure_image_storage_ready(bench, storage_error)) return error_json(command, storage_error);
+        if (!ensure_image_storage_ready(config, bench, storage_error)) return error_json(command, storage_error);
         if (!image_path_allowed(bench, output_dir, false, path_error)) {
             return error_json(command, path_error);
         }
@@ -4383,12 +6490,7 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                                   "\"findings\":" + findings_json(open_result.findings));
         }
         const auto inspection = lazarus::inspect_source_disk(open_result.handle);
-        if (!has_imageable_layout(inspection) || has_blocker(inspection.findings)) {
-            return final_json(false, command,
-                              failure_error_field(false, inspection.findings, "The selected source layout is not supported for imaging.") +
-                                  "\"facts\":" + string_array_json(inspection.facts) +
-                                           ",\"findings\":" + findings_json(inspection.findings));
-        }
+        const bool source_requires_escalation = !has_imageable_layout(inspection) || has_blocker(inspection.findings);
         lazarus::ImageWriteOptions options;
         options.output_directory = output_dir;
         const auto preset_id = extract_json_string(request, "preset");
@@ -4398,6 +6500,9 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
             : (requested_compression == "zstd" ? lazarus::CompressionMode::Zstd : lazarus::CompressionMode::None);
         options.mode = preset != nullptr ? preset->mode
             : (requested_mode == "rescue" ? lazarus::ImagingMode::Rescue : lazarus::ImagingMode::Raw);
+        if (!inspection.first_sector_read && options.mode != lazarus::ImagingMode::Rescue) {
+            options.mode = lazarus::ImagingMode::Rescue;
+        }
         const bool verify_after_imaging = resume_request || (preset != nullptr && preset->verify_after_imaging);
         options.progress = [&out, &activity](const lazarus::ProgressEvent& event) {
             activity.phase(event.phase);
@@ -4413,23 +6518,31 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
             });
         }
         const bool operation_succeeded = result.finalized && (!verify_after_imaging || (verification && verification->verified));
+        if (operation_succeeded) record_activity(config, job.technician, "imaged", job.ticket_number, job.customer_name);
         std::vector<std::string> report_facts = result.facts;
         std::vector<lazarus::SafetyFinding> report_findings = result.findings;
         if (verification) {
             report_facts.insert(report_facts.end(), verification->facts.begin(), verification->facts.end());
             report_findings.insert(report_findings.end(), verification->findings.begin(), verification->findings.end());
         }
+        const bool requires_escalation = source_requires_escalation || result.completed_with_warnings ||
+            (verification && (!verification->partition_table_valid || !verification->filesystem_readable));
+        const std::string report_basename = requires_escalation ? "escalation-report" :
+            (operation_succeeded ? "completion-report" : "image-creation-report");
         std::string report_error;
         const bool report_written = write_completion_reports(
-            bench, result.output_directory, operation_succeeded ? "completion-report" : "image-creation-report",
-            verify_after_imaging ? "Image Creation and Verification" : "Image Creation",
-            operation_succeeded ? (result.completed_with_warnings ? "Verified with recovery warnings" :
+            bench, result.output_directory, report_basename,
+            requires_escalation ? "Data Recovery Escalation - Raw Image Capture" :
+                (verify_after_imaging ? "Image Creation and Verification" : "Image Creation"),
+            operation_succeeded ? (requires_escalation ? "Raw backup preserved and verified - specialist escalation required" :
                                   (verify_after_imaging ? "Verified" : "Image creation completed"))
                                 : (result.finalized ? "Image finalized but verification failed" : "Image creation did not complete"),
             job, *device,
             {{"Source bytes read", human_capacity(result.bytes_read)},
              {"Stored bytes", human_capacity(result.bytes_stored)},
+             {"Zero-filled bytes skipped", human_capacity(result.zero_bytes_elided)},
              {"Chunks written", std::to_string(result.chunks_written)},
+             {"Zero-filled chunks skipped", std::to_string(result.zero_chunks_elided)},
              {"Imaging mode", lazarus::to_string(options.mode)},
              {"Compression", lazarus::to_string(options.compression)},
              {"Verification", verification ? (verification->verified ? "Passed" : "Failed") : "Not requested"},
@@ -4441,16 +6554,19 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                               "\"output_directory\":" + quote(result.output_directory) +
                               ",\"bytes_written\":" + std::to_string(result.bytes_written) +
                               ",\"bytes_stored\":" + std::to_string(result.bytes_stored) +
+                              ",\"zero_bytes_elided\":" + std::to_string(result.zero_bytes_elided) +
                               ",\"chunks_written\":" + std::to_string(result.chunks_written) +
+                              ",\"zero_chunks_elided\":" + std::to_string(result.zero_chunks_elided) +
                               ",\"completed_with_warnings\":" + std::string(result.completed_with_warnings ? "true" : "false") +
                               ",\"unreadable_ranges\":" + std::to_string(result.unreadable_ranges.size()) +
                               ",\"resumed\":" + std::string(result.resumed ? "true" : "false") +
                               ",\"resumed_bytes\":" + std::to_string(result.resumed_bytes) +
                               ",\"verified\":" + std::string(verification && verification->verified ? "true" : "false") +
+                              ",\"escalation_required\":" + std::string(requires_escalation ? "true" : "false") +
                               ",\"preset\":" + quote(preset == nullptr ? "custom" : preset->id) +
                               ",\"report_written\":" + std::string(report_written ? "true" : "false") +
                               ",\"report_path\":" + quote((std::filesystem::path(result.output_directory) /
-                                  (operation_succeeded ? "completion-report.html" : "image-creation-report.html")).string()) +
+                                  (report_basename + ".html")).string()) +
                               ",\"report_error\":" + quote(report_error) +
                               ",\"facts\":" + string_array_json(result.facts) +
                               ",\"findings\":" + findings_json(result.findings));
@@ -4462,10 +6578,15 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         if (image_dir.empty() || selector.empty()) {
             return error_json(command, "image_directory and selector are required.");
         }
+        std::string technician_error;
+        std::string performed_by;
+        if (!resolve_job_technician(config, request, performed_by, technician_error)) {
+            return error_json(command, technician_error);
+        }
         std::string path_error;
         if (!image_path_configured(bench, image_dir, path_error)) return error_json(command, path_error);
         std::string storage_error;
-        if (!ensure_image_storage_ready(bench, storage_error)) return error_json(command, storage_error);
+        if (!ensure_image_storage_ready(config, bench, storage_error)) return error_json(command, storage_error);
         if (!image_path_allowed(bench, image_dir, true, path_error)) {
             return error_json(command, path_error);
         }
@@ -4486,12 +6607,14 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         };
         const auto result = lazarus::restore_directory_image(bench, *device, options);
         const auto [report_job, source_device] = report_context_from_image(image_dir);
+        if (result.restored) record_activity(config, performed_by, "restored", report_job.ticket_number, report_job.customer_name);
         std::string report_error;
         const bool report_written = write_completion_reports(
             bench, image_dir, "restore-report", "Image Restore",
             result.restored ? "Restore completed and destination flushed" : "Restore did not complete",
             report_job, *device,
-            {{"Image source model", source_device.model},
+            {{"Restore performed by", performed_by},
+             {"Image source model", source_device.model},
              {"Bytes restored", human_capacity(result.bytes_written)},
              {"Bytes read back", human_capacity(result.bytes_verified)},
              {"Chunks restored", std::to_string(result.chunks_written)},
@@ -4577,15 +6700,32 @@ ServiceConfig parse_args(int argc, char** argv) {
             config.security_backup_path.clear();
         } else if (arg == "--security-backup" && i + 1 < argc) {
             config.security_backup_path = argv[++i];
+        } else if (arg == "--technicians" && i + 1 < argc) {
+            config.technicians_path = argv[++i];
+            config.technicians_backup_path.clear();
+        } else if (arg == "--technicians-backup" && i + 1 < argc) {
+            config.technicians_backup_path = argv[++i];
+        } else if (arg == "--activity-log" && i + 1 < argc) {
+            config.activity_log_path = argv[++i];
+            config.activity_log_backup_path.clear();
+        } else if (arg == "--activity-log-backup" && i + 1 < argc) {
+            config.activity_log_backup_path = argv[++i];
         } else if (arg == "--network-config" && i + 1 < argc) {
             config.network_path = argv[++i];
         } else if (arg == "--network-helper" && i + 1 < argc) {
             config.network_helper = argv[++i];
+        } else if (arg == "--storage-helper" && i + 1 < argc) {
+            config.storage_helper = argv[++i];
+        } else if (arg == "--nas-credentials" && i + 1 < argc) {
+            config.nas_credentials_path = argv[++i];
         } else if (arg == "--stdio") {
             config.stdio = true;
         } else if (arg == "-h" || arg == "--help") {
             std::cout << "Usage: lazarus-service [--config PATH] [--socket PATH] [--security PATH] "
-                         "[--security-backup PATH] [--network-config PATH] [--network-helper PATH] [--stdio]\n";
+                         "[--security-backup PATH] [--technicians PATH] [--technicians-backup PATH] "
+                         "[--activity-log PATH] [--activity-log-backup PATH] "
+                         "[--network-config PATH] [--network-helper PATH] "
+                         "[--storage-helper PATH] [--nas-credentials PATH] [--stdio]\n";
             std::exit(0);
         } else {
             std::cerr << "Unknown option: " << arg << "\n";

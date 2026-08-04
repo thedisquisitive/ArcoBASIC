@@ -97,6 +97,8 @@ Installed:
   ${prefix}/bin/lazarus
   ${prefix}/bin/lazarus-tui
   ${prefix}/bin/lazarus-gui
+  ${prefix}/bin/lazarum
+  ${prefix}/bin/lazarum-gui
   ${prefix}/sbin/lazarus-service
   ${bench_dir}/bench-alpha.profile
 

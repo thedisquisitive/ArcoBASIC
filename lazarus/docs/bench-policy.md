@@ -49,7 +49,11 @@ Role precedence:
 6. Removable media
 7. Unknown
 
-Normal source imaging only accepts `source-only`. System disks, destination ports, ignored ports, and unknown ports block the workflow.
+Normal source imaging accepts `source-only` and unassigned (`unknown`) connections. Unassigned disks are opened read-only for that imaging job so a portable or newly configured appliance supports plug-in-and-image without an administrative port setup step. System disks, destination ports, image storage, removable-media ports, and ignored ports remain blocked.
+
+Restore accepts `destination-only` and unassigned (`unknown`) non-system disks. Unassigned restore targets still require the exact destructive confirmation, image verification before writes, stable rediscovery by disk identity or `/dev/disk/by-path`, write-only open, full readback verification, and restored-layout inspection. Source-only, image-storage, removable-media, ignored, and system disks remain blocked.
+
+Image storage must resolve to a persistent filesystem. Live-system `overlay`, `tmpfs`, `ramfs`, `squashfs`, and `aufs` paths are reported offline even when their directories exist. Before source chunks are written, Lazarus checks worst-case image size, compression overhead, hash records, and a metadata reserve against currently available storage capacity.
 
 Labels do not grant permissions or change roles. They are display names for technician clarity, such as `Left USB3`, `Front SATA Dock`, or `Rear USB-C`.
 

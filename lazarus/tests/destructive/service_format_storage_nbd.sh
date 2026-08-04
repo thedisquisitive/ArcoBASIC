@@ -35,7 +35,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for tool in qemu-img qemu-nbd parted partprobe mkfs.vfat systemd-nspawn blkid; do
+for tool in qemu-img qemu-nbd parted partprobe mkfs.ext4 systemd-nspawn blkid; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "$tool is required for the destructive virtual-storage test." >&2
         exit 1
@@ -59,11 +59,11 @@ run_root qemu-nbd --connect="$nbd" --format=raw "$disk"
 run_root udevadm settle --timeout=10 || true
 sleep 1
 run_root parted -s "$nbd" mklabel msdos
-run_root parted -s "$nbd" mkpart primary fat32 1MiB 100%
+run_root parted -s "$nbd" mkpart primary ext4 1MiB 100%
 run_root partprobe "$nbd" || true
 sleep 1
 [ -b "$partition" ] || { echo "Disposable NBD partition did not appear: $partition" >&2; exit 1; }
-run_root mkfs.vfat -F 32 -n USED_DATA "$partition" >/dev/null
+run_root mkfs.ext4 -F -L USED_DATA "$partition" >/dev/null
 run_root mkdir -p /dev/disk/by-id
 run_root ln -s "../../${nbd#/dev/}" "$by_id"
 
@@ -85,6 +85,9 @@ requests=/tmp/lazarus-format-requests
 responses=/tmp/lazarus-format-responses
 security=/tmp/lazarus-format-admin.auth
 rm -f "\$requests" "\$responses" "\$security"
+mkdir -p /mnt/lazarus-drives/preconfigured
+mount '$partition' /mnt/lazarus-drives/preconfigured
+mkdir -p '/mnt/lazarus-drives/preconfigured/Existing/Lazarus Images'
 mkfifo "\$requests" "\$responses"
 /usr/sbin/lazarus-service --config '/work/${profile#"$repo"/}' --security "\$security" --stdio <"\$requests" >"\$responses" &
 pid=\$!
@@ -95,9 +98,33 @@ call() { printf '%s\\n' "\$1" >&3; IFS= read -r response <&4; printf '%s\\n' "\$
 setup=\$(call '{"command":"admin_setup","new_password":"test"}')
 token=\$(printf '%s\\n' "\$setup" | sed -n 's/.*\"token\":\"\\([^\"]*\\)\".*/\\1/p')
 [ -n "\$token" ]
-result=\$(call "\$(printf '{"command":"configure_image_storage","admin_token":"%s","selector":"$nbd","mode":"format","confirmation":"ERASE"}' "\$token")")
+root_folders=\$(call "\$(printf '{"command":"storage_folders","admin_token":"%s","selector":"$nbd","relative_path":""}' "\$token")")
+printf '%s\\n' "\$root_folders" | grep -q '"ok":true'
+printf '%s\\n' "\$root_folders" | grep -q '4578697374696e67'
+nested_folders=\$(call "\$(printf '{"command":"storage_folders","admin_token":"%s","selector":"$nbd","relative_path":"Existing"}' "\$token")")
+printf '%s\\n' "\$nested_folders" | grep -q '"ok":true'
+printf '%s\\n' "\$nested_folders" | grep -q '4c617a6172757320496d61676573'
+created_folder=\$(call "\$(printf '{"command":"storage_create_folder","admin_token":"%s","selector":"$nbd","relative_path":"Existing","name":"Created From Browser"}' "\$token")")
+printf '%s\\n' "\$created_folder" | grep -q '"ok":true'
+printf '%s\\n' "\$created_folder" | grep -q '"relative_path":"Existing/Created From Browser"'
+[ -d '/mnt/lazarus-drives/preconfigured/Existing/Created From Browser' ]
+invalid_folder=\$(call "\$(printf '{"command":"storage_create_folder","admin_token":"%s","selector":"$nbd","relative_path":"Existing","name":"../Escape"}' "\$token")")
+printf '%s\\n' "\$invalid_folder" | grep -q '"ok":false'
+escape_attempt=\$(call "\$(printf '{"command":"storage_folders","admin_token":"%s","selector":"$nbd","relative_path":"../"}' "\$token")")
+printf '%s\\n' "\$escape_attempt" | grep -q '"ok":false'
+existing=\$(call "\$(printf '{"command":"configure_image_storage","admin_token":"%s","selector":"$nbd","mode":"existing","directory":"Existing/Lazarus Images"}' "\$token")")
+printf '%s\\n' "\$existing" | grep -q '\"ok\":true'
+printf '%s\\n' "\$existing" | grep -q '\"mount_path\":\"/mnt/lazarus-storage/Existing/Lazarus Images\"'
+mountpoint -q /mnt/lazarus-storage
+[ -d '/mnt/lazarus-storage/Existing/Lazarus Images' ]
+! mountpoint -q /mnt/lazarus-drives/preconfigured
+unmounted=\$(call "\$(printf '{"command":"unmount_image_storage","admin_token":"%s"}' "\$token")")
+printf '%s\\n' "\$unmounted" | grep -q '\"ok\":true'
+result=\$(call "\$(printf '{"command":"configure_image_storage","admin_token":"%s","selector":"$nbd","mode":"format","directory":"Fresh/Lazarus Images","confirmation":"ERASE"}' "\$token")")
 printf '%s\\n' "\$result" | grep -q '\"ok\":true'
 printf '%s\\n' "\$result" | grep -q '\"filesystem\":\"ext4\"'
+printf '%s\\n' "\$result" | grep -q '\"mount_path\":\"/mnt/lazarus-storage/Fresh/Lazarus Images\"'
+[ -d '/mnt/lazarus-storage/Fresh/Lazarus Images' ]
 unmounted=\$(call "\$(printf '{"command":"unmount_image_storage","admin_token":"%s"}' "\$token")")
 printf '%s\\n' "\$unmounted" | grep -q '\"ok\":true'
 ! mountpoint -q /mnt/lazarus-storage
@@ -128,6 +155,6 @@ run_root parted -sm "$nbd" print | grep -q '^BYT;$'
 run_root parted -sm "$nbd" print | grep -q ':gpt:'
 grep -q '^image_storage_device=/dev/disk/by-id/lazarus-format-storage-test$' "$profile"
 grep -q '^image_storage_volume=' "$profile"
-grep -q '^image_storage=/mnt/lazarus-storage/images$' "$profile"
+grep -q '^image_storage=/mnt/lazarus-storage/Fresh/Lazarus Images$' "$profile"
 
-echo "Disposable used disk was reformatted and assigned as persistent Lazarus image storage."
+echo "The confined folder browser listed a Home-mounted disk, storage adopted its selected folder, and the disposable disk was reformatted with a custom persistent image folder."

@@ -51,8 +51,9 @@ Installed appliance:
 Live USB:
 
 - boots to RAM
-- stateless by default
-- optional persistence
+- keeps the operating-system overlay in RAM
+- persists appliance profile, network settings, credentials, and activity on the boot USB's dedicated `LAZARUS_STATE` partition
+- keeps customer backup images separate on administrator-selected local or NAS storage
 - portable recovery and hardware profiling
 
 ## Repository Layout

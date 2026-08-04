@@ -11,7 +11,7 @@ Installed appliance target:
 - EFI System Partition
 - A root partition
 - B root partition
-- persistent state partition mounted at `/var/lib/arcology-lazarus`
+- persistent state partition mounted at `/var/lib/arcology-lazarus`; live USB media uses the appended `LAZARUS_STATE` partition from its own boot device and bind-mounts the persistent bench and network profiles before OpenRC starts
 - optional central image storage mount under `/mnt/lazarus-storage`
 
 Live USB target:

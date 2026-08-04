@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Lazarum
+GenericName=Lazarus Drive Viewer
+Comment=Review and extract data from Lazarus backup images
+Exec=lazarum-gui
+Icon=drive-harddisk
+Terminal=false
+Categories=Utility;System;FileTools;
+Keywords=backup;recovery;disk;image;lazarus;
+StartupNotify=true

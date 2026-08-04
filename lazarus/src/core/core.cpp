@@ -11,6 +11,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
+#include <list>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <set>
@@ -299,6 +302,13 @@ bool is_partition_name_for_disk(const std::string& candidate, const std::string&
     return starts_with(candidate, disk) && candidate.size() > disk.size() && std::isdigit(static_cast<unsigned char>(candidate[disk.size()]));
 }
 
+bool is_system_mount_target(const std::string& target) {
+    return target == "/" || target == "/boot" || target == "/boot/efi" ||
+           target == "/var/lib/arcology-lazarus" || target == "/media/boot" ||
+           starts_with(target, "/boot/") || starts_with(target, "/var/lib/arcology-lazarus/") ||
+           starts_with(target, "/media/boot/");
+}
+
 std::set<std::string> mounted_major_minor_ids() {
     std::set<std::string> ids;
     std::ifstream file("/proc/self/mountinfo");
@@ -306,11 +316,9 @@ std::set<std::string> mounted_major_minor_ids() {
     while (std::getline(file, line)) {
         std::istringstream stream(line);
         std::string token;
-        for (int index = 0; index < 3 && stream >> token; ++index) {
-            if (index == 2) {
-                ids.insert(token);
-            }
-        }
+        std::vector<std::string> tokens;
+        while (stream >> token) tokens.push_back(token);
+        if (tokens.size() > 4 && is_system_mount_target(tokens[4])) ids.insert(tokens[2]);
     }
     return ids;
 }
@@ -326,6 +334,7 @@ std::set<std::string> mounted_device_basenames() {
         while (stream >> token) {
             tokens.push_back(token);
         }
+        if (tokens.size() <= 4 || !is_system_mount_target(tokens[4])) continue;
         auto separator = std::find(tokens.begin(), tokens.end(), "-");
         if (separator == tokens.end()) {
             continue;
@@ -463,11 +472,53 @@ bool has_imageable_layout(const DiskInspection& inspection) {
     return inspection.gpt_header_valid || inspection.mbr_detected || !inspection.partitions.empty();
 }
 
+SafetyFinding escalation_warning(const SafetyFinding& source) {
+    auto warning = source;
+    warning.severity = Severity::Warning;
+    warning.action = "Preserve the raw image and escalate the case to data recovery/forensics. Do not repair or write to the source drive.";
+    return warning;
+}
+
 std::uint64_t ceil_div(std::uint64_t value, std::uint64_t divisor) {
     if (divisor == 0) {
         return 0;
     }
-    return (value + divisor - 1) / divisor;
+    return value / divisor + (value % divisor == 0 ? 0 : 1);
+}
+
+std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) {
+    if (right > std::numeric_limits<std::uint64_t>::max() - left) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return left + right;
+}
+
+std::uint64_t saturating_multiply(std::uint64_t left, std::uint64_t right) {
+    if (left != 0 && right > std::numeric_limits<std::uint64_t>::max() / left) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return left * right;
+}
+
+std::uint64_t worst_case_image_storage_bytes(std::uint64_t logical_bytes, std::size_t chunk_size,
+                                             CompressionMode compression) {
+    if (chunk_size == 0) return std::numeric_limits<std::uint64_t>::max();
+    const auto chunk_bytes = static_cast<std::uint64_t>(chunk_size);
+    const auto full_chunks = logical_bytes / chunk_bytes;
+    const auto remainder = logical_bytes % chunk_bytes;
+    const auto stored_chunk_bound = compression == CompressionMode::Zstd
+        ? static_cast<std::uint64_t>(ZSTD_compressBound(chunk_size))
+        : chunk_bytes;
+    std::uint64_t required = saturating_multiply(full_chunks, stored_chunk_bound);
+    if (remainder != 0) {
+        const auto remainder_bound = compression == CompressionMode::Zstd
+            ? static_cast<std::uint64_t>(ZSTD_compressBound(static_cast<std::size_t>(remainder)))
+            : remainder;
+        required = saturating_add(required, remainder_bound);
+    }
+    const auto chunks = ceil_div(logical_bytes, chunk_bytes);
+    required = saturating_add(required, saturating_multiply(chunks, 256));
+    return saturating_add(required, 64ULL * 1024ULL * 1024ULL);
 }
 
 bool should_emit_progress(std::uint64_t chunks_done, std::uint64_t chunks_total) {
@@ -481,11 +532,38 @@ bool should_emit_progress(std::uint64_t chunks_done, std::uint64_t chunks_total)
     return chunks_done % interval == 0;
 }
 
-void emit_progress(const ProgressCallback& progress, ProgressEvent event) {
-    if (progress) {
-        progress(event);
+// Wraps a ProgressCallback for a single operation invocation, computing average throughput and
+// ETA from elapsed wall-clock time since construction before forwarding each event. Centralizing
+// this here (rather than in each of the CLI/TUI/GUI consumers) matches the existing progress-event
+// design: a ProgressEvent should be a complete, self-describing fact, not raw data a UI has to
+// derive additional state from.
+class ProgressEmitter {
+public:
+    explicit ProgressEmitter(ProgressCallback callback)
+        : callback_(std::move(callback)), start_(std::chrono::steady_clock::now()) {}
+
+    void operator()(ProgressEvent event) const {
+        if (!callback_) {
+            return;
+        }
+        if (!event.indeterminate && event.bytes_total > 0 && event.bytes_done > 0) {
+            const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+            if (elapsed > 0.05) {
+                const auto rate = static_cast<double>(event.bytes_done) / elapsed;
+                event.bytes_per_second = static_cast<std::uint64_t>(rate);
+                if (rate > 0.0 && event.bytes_done < event.bytes_total) {
+                    event.eta_seconds = static_cast<std::uint64_t>(
+                        static_cast<double>(event.bytes_total - event.bytes_done) / rate);
+                }
+            }
+        }
+        callback_(event);
     }
-}
+
+private:
+    ProgressCallback callback_;
+    std::chrono::steady_clock::time_point start_;
+};
 
 std::string strip_comment(std::string line) {
     // A '#' starts a comment only at the beginning of a line or after
@@ -818,11 +896,14 @@ std::string local_timestamp() {
 std::optional<std::uint64_t> extract_json_u64(const std::string& text, const std::string& key);
 std::optional<std::string> extract_json_string(const std::string& text, const std::string& key);
 
-std::string render_metadata_json(const JobInfo& job, const SourceReadHandle& source, const DiskInspection& inspection, const ImageWriteOptions& options, std::uint64_t bytes_written, std::uint64_t bytes_stored, std::uint64_t chunks_written) {
+std::string render_metadata_json(const JobInfo& job, const SourceReadHandle& source, const DiskInspection& inspection,
+                                 const ImageWriteOptions& options, std::uint64_t bytes_written,
+                                 std::uint64_t bytes_stored, std::uint64_t zero_bytes_elided,
+                                 std::uint64_t chunks_written, std::uint64_t zero_chunks_elided) {
     std::ostringstream out;
     out << "{\n";
     out << "  \"format\": \"laz-dir\",\n";
-    out << "  \"format_version\": 1,\n";
+    out << "  \"format_version\": 2,\n";
     out << "  \"image_state\": \"finalized\",\n";
     out << "  \"created_at\": \"" << local_timestamp() << "\",\n";
     out << "  \"job\": {\n";
@@ -847,7 +928,10 @@ std::string render_metadata_json(const JobInfo& job, const SourceReadHandle& sou
     out << "    \"chunk_size\": " << options.chunk_size << ",\n";
     out << "    \"bytes_written\": " << bytes_written << ",\n";
     out << "    \"bytes_stored\": " << bytes_stored << ",\n";
+    out << "    \"zero_bytes_elided\": " << zero_bytes_elided << ",\n";
     out << "    \"chunks_written\": " << chunks_written << ",\n";
+    out << "    \"zero_chunks_elided\": " << zero_chunks_elided << ",\n";
+    out << "    \"storage_layout\": \"zero-elided-v1\",\n";
     out << "    \"compression\": \"" << to_string(options.compression) << "\",\n";
     out << "    \"hash_algorithm\": \"sha256\"\n";
     out << "  },\n";
@@ -934,6 +1018,7 @@ struct ChunkHashRecord {
     std::uint64_t stored_size = 0;
     std::string source_hash;
     std::string stored_hash;
+    bool zero_filled = false;
 };
 
 std::string sha256_hex(const std::vector<std::byte>& data) {
@@ -946,6 +1031,19 @@ std::string sha256_hex(const std::vector<std::byte>& data) {
         out << std::setw(2) << static_cast<unsigned>(byte);
     }
     return out.str();
+}
+
+std::string zero_sha256_hex(std::size_t size) {
+    static std::mutex cache_mutex;
+    static std::unordered_map<std::size_t, std::string> cache;
+    {
+        const std::lock_guard lock(cache_mutex);
+        const auto found = cache.find(size);
+        if (found != cache.end()) return found->second;
+    }
+    const auto digest = sha256_hex(std::vector<std::byte>(size, std::byte{0}));
+    const std::lock_guard lock(cache_mutex);
+    return cache.emplace(size, digest).first->second;
 }
 
 std::optional<ChunkHashRecord> parse_hash_record_line(const std::string& line) {
@@ -970,7 +1068,7 @@ std::optional<ChunkHashRecord> parse_hash_record_line(const std::string& line) {
             record.stored_hash = record.source_hash;
             return record;
         }
-        if (fields.size() == 7) {
+        if (fields.size() == 7 || fields.size() == 8) {
             record.index = std::stoull(fields[0]);
             record.source_offset = std::stoull(fields[1]);
             record.source_size = std::stoull(fields[2]);
@@ -978,6 +1076,7 @@ std::optional<ChunkHashRecord> parse_hash_record_line(const std::string& line) {
             record.stored_size = std::stoull(fields[4]);
             record.source_hash = fields[5];
             record.stored_hash = fields[6];
+            record.zero_filled = fields.size() == 8 && fields[7] == "zero";
             return record;
         }
     } catch (...) {
@@ -1003,13 +1102,56 @@ void write_hash_header(std::ofstream& out, CompressionMode compression) {
     out << "algorithm=sha256\n";
     out << "stream=disk.raw\n";
     out << "compression=" << to_string(compression) << "\n";
-    out << "columns=index source_offset source_size stored_offset stored_size source_sha256 stored_sha256\n";
+    out << "columns=index source_offset source_size stored_offset stored_size source_sha256 stored_sha256 storage\n";
 }
 
 void write_hash_record(std::ofstream& out, const ChunkHashRecord& record) {
     out << record.index << " " << record.source_offset << " " << record.source_size << " "
         << record.stored_offset << " " << record.stored_size << " "
-        << record.source_hash << " " << record.stored_hash << "\n";
+        << record.source_hash << " " << record.stored_hash << " "
+        << (record.zero_filled ? "zero" : "data") << "\n";
+}
+
+bool chunk_is_all_zero(const std::vector<std::byte>& data) {
+    return std::all_of(data.begin(), data.end(), [](std::byte value) {
+        return value == std::byte{0};
+    });
+}
+
+bool zero_record_valid(const ChunkHashRecord& record) {
+    return record.zero_filled && record.stored_size == 0 &&
+           zero_sha256_hex(static_cast<std::size_t>(record.source_size)) == record.source_hash &&
+           zero_sha256_hex(0) == record.stored_hash;
+}
+
+std::vector<std::byte> logical_chunk(std::ifstream& disk, const ChunkHashRecord& record,
+                                     CompressionMode compression, std::string& error) {
+    if (record.zero_filled) {
+        if (!zero_record_valid(record)) {
+            error = "A zero-filled image chunk hash did not match.";
+            return {};
+        }
+        return std::vector<std::byte>(static_cast<std::size_t>(record.source_size), std::byte{0});
+    }
+    if (record.stored_size == 0) {
+        error = "A stored image chunk has zero length.";
+        return {};
+    }
+    std::vector<std::byte> stored(static_cast<std::size_t>(record.stored_size));
+    disk.clear();
+    disk.seekg(static_cast<std::streamoff>(record.stored_offset));
+    disk.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(stored.size()));
+    if (!disk || static_cast<std::uint64_t>(disk.gcount()) != record.stored_size ||
+        sha256_hex(stored) != record.stored_hash) {
+        error = "A stored image chunk failed its stored-byte hash check.";
+        return {};
+    }
+    auto source = decompress_chunk(stored, record.source_size, compression, error);
+    if (error.empty() && sha256_hex(source) != record.source_hash) {
+        error = "A logical image chunk hash did not match.";
+        return {};
+    }
+    return source;
 }
 
 std::optional<std::uint64_t> extract_json_u64(const std::string& text, const std::string& key) {
@@ -1186,10 +1328,15 @@ bool destructive_identity_matches(const DeviceIdentity& expected, const DeviceId
         reason = "The destination serial number changed after selection.";
         return false;
     }
-    if (expected.by_id_path.empty() && expected.serial.empty() &&
-        (expected.model != current.model || expected.serial_ending.empty() || expected.serial_ending != current.serial_ending)) {
-        reason = "The destination lacks a matching persistent device identity.";
-        return false;
+    if (expected.by_id_path.empty() && expected.serial.empty()) {
+        if (expected.by_path.empty()) {
+            reason = "The destination has no serial, persistent disk ID, or stable physical path.";
+            return false;
+        }
+        if (expected.model != current.model) {
+            reason = "The destination model changed after selection.";
+            return false;
+        }
     }
     return true;
 }
@@ -1199,7 +1346,8 @@ std::optional<DeviceIdentity> rediscover_destructive_destination(const BenchProf
         std::string mismatch;
         const bool same_stable_device = (!expected.by_id_path.empty() && current.by_id_path == expected.by_id_path) ||
                                         (!expected.serial.empty() && current.serial == expected.serial) ||
-                                        (expected.by_id_path.empty() && expected.serial.empty() && current.linux_path == expected.linux_path);
+                                        (expected.by_id_path.empty() && expected.serial.empty() &&
+                                         !expected.by_path.empty() && current.by_path == expected.by_path);
         if (!same_stable_device) {
             continue;
         }
@@ -1209,12 +1357,12 @@ std::optional<DeviceIdentity> rediscover_destructive_destination(const BenchProf
         }
         const auto findings = validate_destination_device(bench, current);
         if (has_blocker(findings)) {
-            reason = "The rediscovered destination no longer passes destination-only bench policy.";
+            reason = "The rediscovered destination no longer passes restore destination policy.";
             return std::nullopt;
         }
         return current;
     }
-    reason = "The selected destination could not be rediscovered by persistent identity.";
+    reason = "The selected destination could not be rediscovered by disk identity or stable physical path.";
     return std::nullopt;
 }
 
@@ -1312,18 +1460,8 @@ bool read_logical_image_range(std::ifstream& disk, const std::vector<ChunkHashRe
         const auto record_end = record.source_offset + record.source_size;
         if (record_end <= offset) continue;
         if (record.source_offset >= end) break;
-        std::vector<std::byte> stored(static_cast<std::size_t>(record.stored_size));
-        disk.clear();
-        disk.seekg(static_cast<std::streamoff>(record.stored_offset));
-        disk.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(stored.size()));
-        if (!disk || static_cast<std::uint64_t>(disk.gcount()) != record.stored_size || sha256_hex(stored) != record.stored_hash) {
-            error = "A stored image chunk failed while reading a logical range.";
-            return false;
-        }
-        std::string decompress_error;
-        const auto source_data = decompress_chunk(stored, record.source_size, compression, decompress_error);
-        if (!decompress_error.empty() || sha256_hex(source_data) != record.source_hash) {
-            error = decompress_error.empty() ? "A logical image chunk hash did not match." : decompress_error;
+        const auto source_data = logical_chunk(disk, record, compression, error);
+        if (!error.empty()) {
             return false;
         }
         const auto copy_start = std::max(offset, record.source_offset);
@@ -1381,7 +1519,7 @@ void validate_image_recoverability(const fs::path& disk_path, const std::vector<
         if (entry_count == 0 || entry_size < 128 || entries_length > 4ULL * 1024ULL * 1024ULL ||
             entries_lba > UINT64_MAX / logical_block_size || entries_lba * logical_block_size + entries_length > expected_bytes) {
             ::close(memory_fd);
-            result.findings.push_back(finding(Severity::Blocker, "verify.gpt_entries_invalid", "The image GPT entry-table location is invalid.", "Treat this image as corrupt."));
+            result.findings.push_back(finding(Severity::Warning, "verify.gpt_entries_invalid", "The captured source has an invalid GPT entry-table location.", "Preserve the verified raw image and escalate the case to data recovery/forensics."));
             return;
         }
         std::vector<std::byte> entries;
@@ -1389,7 +1527,7 @@ void validate_image_recoverability(const fs::path& disk_path, const std::vector<
                                       static_cast<std::size_t>(entries_length), entries, error) ||
             !write_exact_at(memory_fd, entries_lba * logical_block_size, entries)) {
             ::close(memory_fd);
-            result.findings.push_back(finding(Severity::Blocker, "verify.gpt_entries_read_failed", "The image GPT entries could not be reconstructed.", error));
+            result.findings.push_back(finding(Severity::Warning, "verify.gpt_entries_read_failed", "The captured source GPT entries could not be interpreted.", "Preserve the verified raw image and escalate the case to data recovery/forensics."));
             return;
         }
         for (std::uint32_t index = 0; index < entry_count; ++index) {
@@ -1404,7 +1542,7 @@ void validate_image_recoverability(const fs::path& disk_path, const std::vector<
                                       logical_block_size, backup, error) ||
             !write_exact_at(memory_fd, backup_lba * logical_block_size, backup)) {
             ::close(memory_fd);
-            result.findings.push_back(finding(Severity::Blocker, "verify.gpt_backup_read_failed", "The backup GPT header could not be reconstructed from the image.", error));
+            result.findings.push_back(finding(Severity::Warning, "verify.gpt_backup_read_failed", "The captured source points to an unreadable or invalid backup GPT header.", "Preserve the verified raw image and escalate the case to data recovery/forensics."));
             return;
         }
     } else if (prefix.size() >= 512 && prefix[510] == std::byte{0x55} && prefix[511] == std::byte{0xAA}) {
@@ -1421,7 +1559,7 @@ void validate_image_recoverability(const fs::path& disk_path, const std::vector<
         if (!read_logical_image_range(disk, records, compression, lba * logical_block_size, logical_block_size, boot, error) ||
             !write_exact_at(memory_fd, lba * logical_block_size, boot)) {
             ::close(memory_fd);
-            result.findings.push_back(finding(Severity::Blocker, "verify.partition_boot_read_failed", "A partition boot sector could not be reconstructed from the image.", error));
+            result.findings.push_back(finding(Severity::Warning, "verify.partition_boot_read_failed", "A captured partition boot sector could not be interpreted.", "Preserve the verified raw image and escalate the case to data recovery/forensics."));
             return;
         }
     }
@@ -1435,7 +1573,13 @@ void validate_image_recoverability(const fs::path& disk_path, const std::vector<
     const auto inspection = inspect_source_disk(image_source);
     result.partition_table_valid = has_imageable_layout(inspection) && !has_blocker(inspection.findings);
     if (!result.partition_table_valid) {
-        result.findings.insert(result.findings.end(), inspection.findings.begin(), inspection.findings.end());
+        for (const auto& inspect_finding : inspection.findings) {
+            result.findings.push_back(inspect_finding.severity == Severity::Blocker
+                ? escalation_warning(inspect_finding) : inspect_finding);
+        }
+        result.findings.push_back(finding(Severity::Warning, "verify.source_layout_requires_escalation",
+            "The raw image passed byte-integrity checks, but the captured source layout is damaged or unsupported.",
+            "Preserve the image and escalate the case to data recovery/forensics. Do not repair the source drive."));
         return;
     }
 
@@ -1448,7 +1592,7 @@ void validate_image_recoverability(const fs::path& disk_path, const std::vector<
                                       logical_block_size, boot, error)) continue;
         if (byte_string_equals_at(boot, 3, "-FVE-FS-")) {
             result.bitlocker_detected = true;
-            result.findings.push_back(finding(Severity::Blocker, "verify.bitlocker_locked", "A BitLocker-protected partition was detected, but Lazarus cannot yet unlock and browse it.", "Keep the raw image, obtain the recovery key, and verify it with a BitLocker-capable recovery workflow."));
+            result.findings.push_back(finding(Severity::Warning, "verify.bitlocker_locked", "A BitLocker-protected partition was detected. Chunk-hash verification does not unlock it.", "Preserve the verified image; use the recovery key or escalate if file recovery is required."));
             continue;
         }
         const auto filesystem = detect_filesystem_boot_sector(boot);
@@ -1481,9 +1625,9 @@ void validate_image_recoverability(const fs::path& disk_path, const std::vector<
     result.ntfs_mft_readable = found_ntfs && all_ntfs_mfts_readable;
     result.filesystem_readable = recognized_filesystem && (!found_ntfs || all_ntfs_mfts_readable) && !result.bitlocker_detected;
     if (found_ntfs && !all_ntfs_mfts_readable)
-        result.findings.push_back(finding(Severity::Blocker, "verify.ntfs_mft_unreadable", "An NTFS partition was detected but its first MFT record could not be read.", "Do not treat this image as recoverable."));
+        result.findings.push_back(finding(Severity::Warning, "verify.ntfs_mft_unreadable", "An NTFS partition was captured but its first MFT record could not be read.", "Preserve the verified raw image and escalate the case to data recovery/forensics."));
     if (!recognized_filesystem && !result.bitlocker_detected)
-        result.findings.push_back(finding(Severity::Blocker, "verify.filesystem_unrecognized", "No supported filesystem could be reopened from the image.", "Do not treat this image as recoverable."));
+        result.findings.push_back(finding(Severity::Warning, "verify.filesystem_unrecognized", "No supported filesystem could be reopened from the captured source.", "Preserve the verified raw image and escalate the case to data recovery/forensics."));
 }
 
 std::uint64_t safe_partition_size_bytes(std::uint64_t first_lba, std::uint64_t last_lba, std::uint32_t sector_size) {
@@ -1501,6 +1645,155 @@ std::uint64_t disk_lba_count(std::uint64_t size_bytes, std::uint32_t sector_size
 }
 
 }  // namespace
+
+struct LogicalImageReader::Impl {
+    std::uint64_t logical_bytes = 0;
+    CompressionMode compression = CompressionMode::None;
+    std::vector<ChunkHashRecord> records;
+    mutable std::ifstream disk;
+    mutable std::mutex mutex;
+    mutable std::unordered_map<std::size_t, std::pair<std::vector<std::byte>, std::uint64_t>> cache;
+    mutable std::uint64_t cache_clock = 0;
+};
+
+LogicalImageReader::LogicalImageReader(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+LogicalImageReader::~LogicalImageReader() = default;
+
+std::unique_ptr<LogicalImageReader> LogicalImageReader::open(const std::string& image_directory,
+                                                             std::string& error) {
+    error.clear();
+    const fs::path directory(image_directory);
+    const auto metadata_path = directory / "metadata.json";
+    const auto hashes_path = directory / "hashes.dat";
+    const auto disk_path = directory / "disk.raw";
+    if (!fs::is_directory(directory) || !safe_regular_file(metadata_path) ||
+        !safe_regular_file(hashes_path) || !safe_regular_file(disk_path) ||
+        !safe_regular_file(directory / "FINALIZED") || fs::exists(directory / "INCOMPLETE")) {
+        error = "The image is incomplete or its required files are missing or unsafe.";
+        return nullptr;
+    }
+    const auto metadata = read_text_file(metadata_path);
+    if (!metadata) {
+        error = "metadata.json could not be read.";
+        return nullptr;
+    }
+    auto impl = std::make_unique<Impl>();
+    impl->logical_bytes = extract_json_u64(*metadata, "bytes_written").value_or(0);
+    impl->compression = compression_from_string(
+        extract_json_string(*metadata, "compression").value_or("none"));
+    if (impl->logical_bytes == 0) {
+        error = "The image metadata reports a zero-length logical disk.";
+        return nullptr;
+    }
+    std::ifstream hashes(hashes_path);
+    bool sha256_declared = false;
+    std::string line;
+    while (std::getline(hashes, line)) {
+        if (trim(line) == "algorithm=sha256") sha256_declared = true;
+    }
+    if (hashes.bad() || !sha256_declared || read_hash_compression(hashes_path) != impl->compression) {
+        error = "The image hash header is unreadable, unsupported, or inconsistent with metadata.json.";
+        return nullptr;
+    }
+    impl->records = read_hash_records(hashes_path);
+    if (impl->records.empty()) {
+        error = "The image has no readable chunk map.";
+        return nullptr;
+    }
+    std::error_code file_error;
+    const auto stored_bytes = fs::file_size(disk_path, file_error);
+    if (file_error) {
+        error = "The stored image stream size could not be read: " + file_error.message();
+        return nullptr;
+    }
+    std::uint64_t source_offset = 0;
+    std::uint64_t stored_offset = 0;
+    for (std::size_t index = 0; index < impl->records.size(); ++index) {
+        const auto& record = impl->records[index];
+        if (record.index != index || record.source_offset != source_offset ||
+            record.stored_offset != stored_offset || record.source_size == 0 ||
+            (record.stored_size == 0 && !record.zero_filled) ||
+            source_offset > impl->logical_bytes || stored_offset > stored_bytes ||
+            record.source_size > impl->logical_bytes - source_offset ||
+            record.stored_size > stored_bytes - stored_offset) {
+            error = "The image chunk map is not a contiguous, bounded logical disk.";
+            return nullptr;
+        }
+        if (record.zero_filled && !zero_record_valid(record)) {
+            error = "A declared zero-filled image chunk has an invalid hash record.";
+            return nullptr;
+        }
+        source_offset += record.source_size;
+        stored_offset += record.stored_size;
+    }
+    if (source_offset != impl->logical_bytes || stored_offset != stored_bytes) {
+        error = "The image chunk map does not cover the complete logical and stored streams.";
+        return nullptr;
+    }
+    impl->disk.open(disk_path, std::ios::binary);
+    if (!impl->disk) {
+        error = "disk.raw could not be opened read-only.";
+        return nullptr;
+    }
+    return std::unique_ptr<LogicalImageReader>(new LogicalImageReader(std::move(impl)));
+}
+
+std::uint64_t LogicalImageReader::size_bytes() const {
+    return impl_->logical_bytes;
+}
+
+bool LogicalImageReader::read_at(std::uint64_t offset, std::size_t byte_count,
+                                 std::vector<std::byte>& output, std::string& error) const {
+    error.clear();
+    output.clear();
+    if (offset > impl_->logical_bytes || byte_count > impl_->logical_bytes - offset) {
+        error = "The requested range is outside the logical image.";
+        return false;
+    }
+    output.assign(byte_count, std::byte{0});
+    if (byte_count == 0) return true;
+
+    std::lock_guard lock(impl_->mutex);
+    auto record_it = std::lower_bound(
+        impl_->records.begin(), impl_->records.end(), offset,
+        [](const ChunkHashRecord& record, std::uint64_t value) {
+            return record.source_offset + record.source_size <= value;
+        });
+    const auto end = offset + byte_count;
+    while (record_it != impl_->records.end() && record_it->source_offset < end) {
+        const auto index = static_cast<std::size_t>(record_it - impl_->records.begin());
+        const std::vector<std::byte>* chunk = nullptr;
+        auto cached = impl_->cache.find(index);
+        if (cached == impl_->cache.end()) {
+            std::string chunk_error;
+            auto decoded = logical_chunk(impl_->disk, *record_it, impl_->compression, chunk_error);
+            if (!chunk_error.empty()) {
+                error = "Chunk " + std::to_string(index) + " failed on-demand verification: " + chunk_error;
+                output.clear();
+                return false;
+            }
+            constexpr std::size_t max_cached_chunks = 32;
+            if (impl_->cache.size() >= max_cached_chunks) {
+                const auto oldest = std::min_element(
+                    impl_->cache.begin(), impl_->cache.end(),
+                    [](const auto& left, const auto& right) { return left.second.second < right.second.second; });
+                impl_->cache.erase(oldest);
+            }
+            cached = impl_->cache.emplace(index,
+                std::make_pair(std::move(decoded), ++impl_->cache_clock)).first;
+        } else {
+            cached->second.second = ++impl_->cache_clock;
+        }
+        chunk = &cached->second.first;
+        const auto copy_start = std::max(offset, record_it->source_offset);
+        const auto copy_end = std::min(end, record_it->source_offset + record_it->source_size);
+        const auto count = static_cast<std::size_t>(copy_end - copy_start);
+        std::copy_n(chunk->begin() + static_cast<std::ptrdiff_t>(copy_start - record_it->source_offset), count,
+                    output.begin() + static_cast<std::ptrdiff_t>(copy_start - offset));
+        ++record_it;
+    }
+    return true;
+}
 
 SourceReadHandle::SourceReadHandle(int fd, DeviceIdentity device)
     : fd_(fd), device_(std::move(device)) {}
@@ -1634,6 +1927,10 @@ std::string version() {
     return "Arcology Lazarus 0.1.0-scaffold";
 }
 
+bool is_appliance_system_mountpoint(const std::string& path) {
+    return is_system_mount_target(path);
+}
+
 std::string to_string(DeviceRole role) {
     switch (role) {
         case DeviceRole::Unknown:
@@ -1752,10 +2049,10 @@ std::vector<SafetyFinding> validate_bench_profile(const BenchProfile& bench) {
         findings.push_back(finding(Severity::Blocker, "bench.storage_missing", "The bench profile has no image storage path.", "Set image storage before imaging."));
     }
     if (bench.source_only_paths.empty()) {
-        findings.push_back(finding(Severity::Blocker, "bench.sources_missing", "The bench profile has no source-only ports.", "Define at least one source-only port."));
+        findings.push_back(finding(Severity::Warning, "bench.sources_missing", "The bench profile has no source-only ports.", "Unassigned non-system disks remain available for read-only imaging; define source-only ports when fixed bench wiring is available."));
     }
     if (bench.destination_only_paths.empty()) {
-        findings.push_back(finding(Severity::Warning, "bench.destinations_missing", "The bench profile has no destination-only ports.", "Define destination-only ports before enabling restore or clone workflows."));
+        findings.push_back(finding(Severity::Warning, "bench.destinations_missing", "The bench profile has no destination-only ports.", "Unassigned non-system disks remain available after explicit destructive confirmation; define destination-only ports when fixed bench wiring is available."));
     }
 
     struct RolePaths {
@@ -1899,6 +2196,16 @@ BenchProfile load_bench_profile(const std::string& path) {
             bench.image_storage_volume = value;
         } else if (key == "image_storage_port") {
             bench.image_storage_port_paths.push_back(value);
+        } else if (key == "nas_storage_protocol") {
+            bench.nas_storage_protocol = value;
+        } else if (key == "nas_storage_server") {
+            bench.nas_storage_server = value;
+        } else if (key == "nas_storage_share") {
+            bench.nas_storage_share = value;
+        } else if (key == "nas_storage_username") {
+            bench.nas_storage_username = value;
+        } else if (key == "nas_storage_domain") {
+            bench.nas_storage_domain = value;
         } else if (key == "source") {
             bench.source_only_paths.push_back(value);
         } else if (key == "destination") {
@@ -1934,13 +2241,20 @@ std::vector<SafetyFinding> validate_source_device(const BenchProfile& bench, con
     if (assigned_role == DeviceRole::DestinationOnly) {
         findings.push_back(finding(Severity::Blocker, "source.destination_port", "The selected source is connected to a destination-only port.", "Move the customer drive to a source-only port."));
     }
+    if (assigned_role == DeviceRole::ImageStorage) {
+        findings.push_back(finding(Severity::Blocker, "source.image_storage", "The selected source is the configured image-storage disk.", "Select a different customer drive. Lazarus never images its backup destination as a source."));
+    }
+    if (assigned_role == DeviceRole::RemovableMedia) {
+        findings.push_back(finding(Severity::Blocker, "source.removable_media", "The selected source is connected to a removable-media export port.", "Select a customer drive on a source-only or unassigned connection."));
+    }
     if (assigned_role == DeviceRole::Ignored) {
         findings.push_back(finding(Severity::Blocker, "source.ignored_port", "The selected source is connected to an ignored port.", "Move the customer drive to a source-only port."));
     }
-    const bool marked_source = assigned_role == DeviceRole::SourceOnly;
-    if (!marked_source) {
-        findings.push_back(finding(Severity::Blocker, "source.not_source_port", "The selected drive is not on a source-only port.", "Connect the customer drive to a configured source-only port."));
-    }
+    // An explicit source-only port remains the strongest bench policy, but a fresh or portable
+    // appliance must still support the basic plug-in-and-image workflow. Unknown connections are
+    // accepted only as read-only sources; every role that can write, store images, export files,
+    // or identify the running system is rejected above. open_source_read_only() is still the only
+    // way this device is opened by the imaging path.
     if (blank(device.linux_path) || blank(device.physical_path)) {
         findings.push_back(finding(Severity::Blocker, "source.identity_incomplete", "The selected drive does not have enough persistent identity information.", "Rescan devices and require a persistent physical path before continuing."));
     }
@@ -1951,16 +2265,22 @@ std::vector<SafetyFinding> validate_destination_device(const BenchProfile& bench
     std::vector<SafetyFinding> findings;
     const auto assigned_role = role_for_device(bench, device);
     if (device.is_system_disk || assigned_role == DeviceRole::SystemDisk) {
-        findings.push_back(finding(Severity::Blocker, "destination.system_disk", "The selected destination appears to be the running system disk.", "Select an offline destination drive connected to a destination-only port."));
+        findings.push_back(finding(Severity::Blocker, "destination.system_disk", "The selected destination appears to be the running system disk.", "Select an offline destination-only or unassigned replacement disk."));
     }
     if (assigned_role == DeviceRole::SourceOnly) {
-        findings.push_back(finding(Severity::Blocker, "destination.source_port", "The selected destination is connected to a source-only port.", "Move the destination drive to a destination-only port."));
+        findings.push_back(finding(Severity::Blocker, "destination.source_port", "The selected destination is connected to a source-only port.", "Move the replacement disk to a destination-only or unassigned connection."));
     }
     if (assigned_role == DeviceRole::Ignored) {
-        findings.push_back(finding(Severity::Blocker, "destination.ignored_port", "The selected destination is connected to an ignored port.", "Move the destination drive to a destination-only port."));
+        findings.push_back(finding(Severity::Blocker, "destination.ignored_port", "The selected destination is connected to an ignored port.", "Move the replacement disk to a destination-only or unassigned connection."));
     }
-    if (assigned_role != DeviceRole::DestinationOnly) {
-        findings.push_back(finding(Severity::Blocker, "destination.not_destination_port", "The selected drive is not on a destination-only port.", "Connect the destination drive to a configured destination-only port."));
+    if (assigned_role == DeviceRole::ImageStorage) {
+        findings.push_back(finding(Severity::Blocker, "destination.image_storage", "The selected destination is the configured image-storage disk.", "Select a different replacement disk. Lazarus never overwrites image storage."));
+    }
+    if (assigned_role == DeviceRole::RemovableMedia) {
+        findings.push_back(finding(Severity::Blocker, "destination.removable_media", "The selected destination is connected to a removable-media export port.", "Select a destination-only or unassigned replacement disk."));
+    }
+    if (assigned_role != DeviceRole::DestinationOnly && assigned_role != DeviceRole::Unknown) {
+        findings.push_back(finding(Severity::Blocker, "destination.not_restore_target", "The selected drive is assigned to a role that cannot be erased by Restore.", "Select a destination-only or unassigned replacement disk."));
     }
     if (blank(device.linux_path) || blank(device.physical_path)) {
         findings.push_back(finding(Severity::Blocker, "destination.identity_incomplete", "The selected drive does not have enough persistent identity information.", "Rescan devices and require a persistent physical path before continuing."));
@@ -2122,6 +2442,28 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
         inspection.facts.push_back("GPT header was not detected; parsing primary MBR partition entries.");
         const auto disk_lbas = disk_lba_count(inspection.source.size_bytes, inspection.logical_block_size);
 
+        const auto probe_partition_filesystem = [&](PartitionInfo& partition) {
+            const auto boot_sector = source.read_at(partition.first_lba * static_cast<std::uint64_t>(inspection.logical_block_size), inspection.logical_block_size);
+            if (!boot_sector.error.empty()) {
+                inspection.findings.push_back(finding(Severity::Warning, "filesystem.boot_sector_read_failed", "Lazarus could not read a partition boot sector.", boot_sector.error));
+                return;
+            }
+            if (byte_string_equals_at(boot_sector.data, 3, "-FVE-FS-")) {
+                inspection.findings.push_back(finding(Severity::Warning, "windows.bitlocker_detected", "A BitLocker volume signature was detected.", "Raw imaging can continue. Unlock and browse it later from Recover Files with the BitLocker recovery key."));
+            }
+            partition.filesystem = detect_filesystem_boot_sector(boot_sector.data);
+            partition.ntfs_detected = partition.filesystem == FileSystemKind::Ntfs;
+            if (partition.filesystem != FileSystemKind::Unknown) {
+                partition.kind = PartitionKind::WindowsBasicData;
+                partition.name = filesystem_display_name(partition.filesystem);
+            }
+        };
+        const auto partition_bounds_valid = [&](const PartitionInfo& partition) {
+            return partition.first_lba != 0 && partition.last_lba >= partition.first_lba && partition.size_bytes != 0 &&
+                   (disk_lbas == 0 || partition.last_lba < disk_lbas);
+        };
+
+        std::uint32_t next_logical_number = 5;
         for (std::uint32_t index = 0; index < 4; ++index) {
             const auto entry = 446 + (index * 16);
             const auto type = std::to_integer<unsigned char>(first_sector.data[entry + 4]);
@@ -2131,11 +2473,8 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
                 continue;
             }
             if (type == 0xEE) {
-                inspection.findings.push_back(finding(Severity::Warning, "mbr.protective_without_gpt", "A protective MBR partition exists but no GPT header was detected.", "Treat this disk layout as suspicious until inspected with a dedicated partition tool."));
+                inspection.findings.push_back(finding(Severity::Warning, "mbr.protective_without_gpt", "A protective MBR partition exists but no GPT header was detected.", "Preserve a raw image, then escalate the case to data recovery/forensics."));
                 continue;
-            }
-            if (is_extended_mbr_type(type)) {
-                inspection.findings.push_back(finding(Severity::Warning, "mbr.extended_partition_unsupported", "An extended MBR partition was detected.", "Logical partitions are not parsed by the MVP inspector yet."));
             }
 
             PartitionInfo partition;
@@ -2147,26 +2486,74 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
             partition.last_lba = first_lba + sector_count - 1;
             partition.size_bytes = static_cast<std::uint64_t>(sector_count) * inspection.logical_block_size;
 
-            if (partition.first_lba == 0 || partition.last_lba < partition.first_lba || partition.size_bytes == 0 || (disk_lbas != 0 && partition.last_lba >= disk_lbas)) {
-                inspection.findings.push_back(finding(Severity::Blocker, "mbr.partition_bounds_invalid", "An MBR partition entry points outside the source disk.", "Stop before imaging this disk with the MVP path; the partition table may be stale or corrupt."));
+            if (!partition_bounds_valid(partition)) {
+                inspection.findings.push_back(finding(Severity::Blocker, "mbr.partition_bounds_invalid", "An MBR partition entry points outside the source disk.", "Preserve a raw image, then escalate the case to data recovery/forensics. Do not repair the source."));
                 continue;
             }
 
-            const auto boot_sector = source.read_at(partition.first_lba * static_cast<std::uint64_t>(inspection.logical_block_size), inspection.logical_block_size);
-            if (!boot_sector.error.empty()) {
-                inspection.findings.push_back(finding(Severity::Warning, "filesystem.boot_sector_read_failed", "Lazarus could not read a partition boot sector.", boot_sector.error));
-            } else {
-                if (byte_string_equals_at(boot_sector.data, 3, "-FVE-FS-")) {
-                    inspection.findings.push_back(finding(Severity::Warning, "windows.bitlocker_detected", "A BitLocker volume signature was detected.", "Raw imaging can continue, but filesystem recovery requires the BitLocker recovery key."));
+            if (is_extended_mbr_type(type)) {
+                partition.extended_container = true;
+                partition.name = "MBR extended partition container";
+                inspection.partitions.push_back(partition);
+
+                // Walk the extended boot record (EBR) chain: a standard, well-documented legacy
+                // layout. Each EBR's first partition-table entry describes the logical partition
+                // itself (first_lba relative to that EBR's own sector); its second entry, if
+                // present, links to the next EBR (first_lba relative to the start of the extended
+                // container, not the current EBR). A visited-sector set and hop cap guard against
+                // a corrupt or cyclic chain.
+                std::set<std::uint64_t> visited_ebrs;
+                auto ebr_lba = partition.first_lba;
+                for (int hop = 0; hop < 128; ++hop) {
+                    if (!visited_ebrs.insert(ebr_lba).second) {
+                        inspection.findings.push_back(finding(Severity::Warning, "mbr.logical_partition_loop", "The extended MBR partition chain revisited an already-seen sector.", "Stop parsing logical partitions; the extended partition table may be corrupt."));
+                        break;
+                    }
+                    const auto ebr_sector = source.read_at(ebr_lba * static_cast<std::uint64_t>(inspection.logical_block_size), inspection.logical_block_size);
+                    if (!ebr_sector.error.empty() || ebr_sector.data.size() < 512) {
+                        inspection.findings.push_back(finding(Severity::Warning, "mbr.logical_partition_read_failed", "Lazarus could not read an extended MBR (EBR) sector.", ebr_sector.error.empty() ? "The sector could not be read." : ebr_sector.error));
+                        break;
+                    }
+                    if (ebr_sector.data[510] != std::byte{0x55} || ebr_sector.data[511] != std::byte{0xAA}) {
+                        inspection.findings.push_back(finding(Severity::Warning, "mbr.logical_partition_signature_missing", "An extended MBR (EBR) sector did not have a valid boot signature.", "Stop parsing logical partitions; the extended partition table may be corrupt."));
+                        break;
+                    }
+
+                    const auto data_type = std::to_integer<unsigned char>(ebr_sector.data[446 + 4]);
+                    const auto data_first_lba_rel = static_cast<std::uint64_t>(le32(ebr_sector.data, 446 + 8));
+                    const auto data_sector_count = static_cast<std::uint64_t>(le32(ebr_sector.data, 446 + 12));
+                    const auto link_type = std::to_integer<unsigned char>(ebr_sector.data[462 + 4]);
+                    const auto link_first_lba_rel = static_cast<std::uint64_t>(le32(ebr_sector.data, 462 + 8));
+
+                    if (data_type != 0 && data_sector_count != 0) {
+                        PartitionInfo logical;
+                        logical.number = next_logical_number++;
+                        logical.kind = partition_kind_from_mbr_type(data_type);
+                        logical.type_guid = mbr_type_string(data_type);
+                        logical.name = logical.kind == PartitionKind::WindowsBasicData ? "MBR logical Windows/NTFS candidate" : "MBR logical partition";
+                        logical.logical = true;
+                        logical.first_lba = ebr_lba + data_first_lba_rel;
+                        logical.last_lba = logical.first_lba + data_sector_count - 1;
+                        logical.size_bytes = data_sector_count * static_cast<std::uint64_t>(inspection.logical_block_size);
+
+                        if (!partition_bounds_valid(logical)) {
+                            inspection.findings.push_back(finding(Severity::Blocker, "mbr.logical_partition_bounds_invalid", "A logical MBR partition entry points outside the source disk.", "Preserve a raw image, then escalate the case to data recovery/forensics. Do not repair the source."));
+                        } else {
+                            probe_partition_filesystem(logical);
+                            inspection.partitions.push_back(logical);
+                        }
+                    }
+
+                    if (link_type == 0) {
+                        break;
+                    }
+                    ebr_lba = partition.first_lba + link_first_lba_rel;
                 }
-                partition.filesystem = detect_filesystem_boot_sector(boot_sector.data);
-                partition.ntfs_detected = partition.filesystem == FileSystemKind::Ntfs;
-                if (partition.filesystem != FileSystemKind::Unknown) {
-                    partition.kind = PartitionKind::WindowsBasicData;
-                    partition.name = filesystem_display_name(partition.filesystem);
-                }
+                inspection.facts.push_back("Logical partitions inside the extended MBR partition were parsed.");
+                continue;
             }
 
+            probe_partition_filesystem(partition);
             inspection.partitions.push_back(partition);
         }
 
@@ -2202,7 +2589,7 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
     const auto disk_lbas = disk_lba_count(inspection.source.size_bytes, inspection.logical_block_size);
 
     if (header_size < 92 || header_size > inspection.logical_block_size) {
-        inspection.findings.push_back(finding(Severity::Blocker, "gpt.header_size_invalid", "The GPT header size is outside the supported range.", "Stop and inspect the disk layout with a dedicated partition tool."));
+        inspection.findings.push_back(finding(Severity::Blocker, "gpt.header_size_invalid", "The GPT header size is outside the supported range.", "Preserve a raw image, then escalate the case to data recovery/forensics. Do not repair the source."));
         return inspection;
     }
     if (current_lba != 1) {
@@ -2210,7 +2597,7 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
     }
     if (backup_lba == 0 || inspection.last_usable_lba < inspection.first_usable_lba ||
         (disk_lbas != 0 && (backup_lba >= disk_lbas || inspection.last_usable_lba >= disk_lbas))) {
-        inspection.findings.push_back(finding(Severity::Blocker, "gpt.bounds_invalid", "The GPT usable LBA range is invalid.", "Stop and inspect the disk layout with a dedicated partition tool."));
+        inspection.findings.push_back(finding(Severity::Blocker, "gpt.bounds_invalid", "The GPT usable LBA range is invalid.", "Preserve a raw image, then escalate the case to data recovery/forensics. Do not repair the source."));
         return inspection;
     }
 
@@ -2224,14 +2611,14 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
         return inspection;
     }
     if (entries_lba == 0 || entry_count == 0 || entry_size < 128 || entry_size > 4096) {
-        inspection.findings.push_back(finding(Severity::Blocker, "gpt.entries_invalid", "The GPT partition-entry table metadata is invalid.", "Stop and inspect the disk layout with a dedicated partition tool."));
+        inspection.findings.push_back(finding(Severity::Blocker, "gpt.entries_invalid", "The GPT partition-entry table metadata is invalid.", "Preserve a raw image, then escalate the case to data recovery/forensics. Do not repair the source."));
         return inspection;
     }
 
     const auto max_entries_to_read = std::min<std::uint32_t>(entry_count, 1024);
     const auto entries_bytes = static_cast<std::uint64_t>(entry_count) * entry_size;
     if (entries_bytes > 4ULL * 1024ULL * 1024ULL) {
-        inspection.findings.push_back(finding(Severity::Blocker, "gpt.entries_too_large", "The GPT partition-entry table is larger than the MVP inspection limit.", "Stop and inspect the disk layout with a dedicated partition tool."));
+        inspection.findings.push_back(finding(Severity::Blocker, "gpt.entries_too_large", "The GPT partition-entry table is larger than the inspection limit.", "Preserve a raw image, then escalate the case to data recovery/forensics."));
         return inspection;
     }
 
@@ -2247,7 +2634,7 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
 
     const auto backup = source.read_at(backup_lba * static_cast<std::uint64_t>(inspection.logical_block_size), inspection.logical_block_size);
     if (!backup.error.empty() || backup.data.size() < inspection.logical_block_size || !byte_string_equals(backup.data, 0, "EFI PART")) {
-        inspection.findings.push_back(finding(Severity::Blocker, "gpt.backup_header_missing", "The backup GPT header could not be read at the declared final LBA.", "Stop and repair the GPT before relying on this disk layout."));
+        inspection.findings.push_back(finding(Severity::Blocker, "gpt.backup_header_missing", "The backup GPT header could not be read at the declared final LBA.", "Preserve a raw image, then escalate the case to data recovery/forensics. Do not repair the source."));
         return inspection;
     }
     const auto backup_header_size = le32(backup.data, 12);
@@ -2260,7 +2647,7 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
     if (backup_header_size < 92 || backup_header_size > inspection.logical_block_size ||
         backup_expected_crc == 0 || crc32_bytes(backup_for_crc, backup_header_size) != backup_expected_crc ||
         le64(backup.data, 24) != backup_lba || le64(backup.data, 32) != 1) {
-        inspection.findings.push_back(finding(Severity::Blocker, "gpt.backup_header_invalid", "The backup GPT header failed CRC or cross-reference validation.", "Stop and repair the GPT before relying on this disk layout."));
+        inspection.findings.push_back(finding(Severity::Blocker, "gpt.backup_header_invalid", "The backup GPT header failed CRC or cross-reference validation.", "Preserve a raw image, then escalate the case to data recovery/forensics. Do not repair the source."));
         return inspection;
     }
     inspection.gpt_header_valid = true;
@@ -2286,7 +2673,7 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
         partition.name = utf16le_name_to_ascii(entries.data, offset + 56, std::min<std::uint32_t>(entry_size - 56, 72));
 
         if (partition.first_lba < inspection.first_usable_lba || partition.last_lba > inspection.last_usable_lba || partition.last_lba < partition.first_lba) {
-            inspection.findings.push_back(finding(Severity::Blocker, "gpt.partition_bounds_invalid", "A GPT partition entry has invalid boundaries.", "Stop before imaging this disk with the MVP path."));
+            inspection.findings.push_back(finding(Severity::Blocker, "gpt.partition_bounds_invalid", "A GPT partition entry has invalid boundaries.", "Preserve a raw image, then escalate the case to data recovery/forensics. Do not repair the source."));
         }
 
         const auto boot_sector = source.read_at(partition.first_lba * static_cast<std::uint64_t>(inspection.logical_block_size), inspection.logical_block_size);
@@ -2294,7 +2681,7 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
             inspection.findings.push_back(finding(Severity::Warning, "filesystem.boot_sector_read_failed", "Lazarus could not read a partition boot sector.", boot_sector.error));
         } else {
             if (byte_string_equals_at(boot_sector.data, 3, "-FVE-FS-")) {
-                inspection.findings.push_back(finding(Severity::Warning, "windows.bitlocker_detected", "A BitLocker volume signature was detected.", "Raw imaging can continue, but filesystem recovery requires the BitLocker recovery key."));
+                inspection.findings.push_back(finding(Severity::Warning, "windows.bitlocker_detected", "A BitLocker volume signature was detected.", "Raw imaging can continue. Unlock and browse it later from Recover Files with the BitLocker recovery key."));
             }
             partition.filesystem = detect_filesystem_boot_sector(boot_sector.data);
             partition.ntfs_detected = partition.filesystem == FileSystemKind::Ntfs;
@@ -2307,7 +2694,7 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
     }
 
     if (inspection.partitions.empty()) {
-        inspection.findings.push_back(finding(Severity::Blocker, "gpt.no_partitions", "GPT was detected but no partition entries were found.", "Stop and inspect the disk layout with a dedicated partition tool."));
+        inspection.findings.push_back(finding(Severity::Blocker, "gpt.no_partitions", "GPT was detected but no partition entries were found.", "Preserve a raw image, then escalate the case to data recovery/forensics. Do not repair the source."));
     } else {
         inspection.facts.push_back("GPT partition entries were parsed successfully.");
     }
@@ -2335,6 +2722,7 @@ DiskInspection inspect_source_disk(const SourceReadHandle& source) {
 }
 
 ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandle& source, const DiskInspection& inspection, const ImageWriteOptions& options) {
+    const ProgressEmitter emit(options.progress);
     ImageWriteResult result;
     result.output_directory = options.output_directory;
 
@@ -2349,13 +2737,19 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
     if (options.chunk_size == 0) {
         result.findings.push_back(finding(Severity::Blocker, "image.chunk_size_invalid", "The image chunk size is zero.", "Use a positive chunk size."));
     }
-    if (!has_imageable_layout(inspection)) {
-        result.findings.push_back(finding(Severity::Blocker, "image.inspect_not_valid", "The disk inspection did not validate an imageable disk layout or whole-device filesystem.", "Inspect and validate the source layout before imaging with the MVP path."));
-    }
     for (const auto& inspect_finding : inspection.findings) {
         if (inspect_finding.severity == Severity::Blocker) {
+            result.findings.push_back(escalation_warning(inspect_finding));
+            result.completed_with_warnings = true;
+        } else if (inspect_finding.severity == Severity::Warning) {
             result.findings.push_back(inspect_finding);
         }
+    }
+    if (!has_imageable_layout(inspection)) {
+        result.findings.push_back(finding(Severity::Warning, "image.source_layout_requires_escalation",
+            "The source layout is damaged or unsupported; Lazarus will preserve the device as a raw image.",
+            "Complete the backup, then escalate the image to data recovery/forensics. Do not repair the source drive."));
+        result.completed_with_warnings = true;
     }
     if (has_blocker(result.findings)) {
         return result;
@@ -2368,6 +2762,15 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
         result.findings.push_back(finding(Severity::Blocker, "image.output_create_failed", "Lazarus could not create the image output directory.", error.message()));
         return result;
     }
+    // Lazarus image storage is intentionally portable.  The appliance service
+    // runs as root, but a backup must remain inspectable when its ext4 disk is
+    // attached to an unrelated Linux workstation with different group IDs.
+    // Only add read/traverse access; owner write access is retained for imaging.
+    std::error_code permission_error;
+    fs::permissions(output_dir,
+                    fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
+                        fs::perms::others_read | fs::perms::others_exec,
+                    fs::perm_options::replace, permission_error);
 
     const auto incomplete_path = output_dir / "INCOMPLETE";
     const auto finalized_path = output_dir / "FINALIZED";
@@ -2427,7 +2830,7 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
 
     const auto source_size = options.max_bytes != 0 ? options.max_bytes : source.device().size_bytes;
     const auto total_chunks = source_size == 0 ? 0 : ceil_div(source_size, static_cast<std::uint64_t>(options.chunk_size));
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "image",
         "start",
         "Raw image write started.",
@@ -2449,24 +2852,21 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
         std::ifstream existing_disk(disk_path, std::ios::binary);
         const auto existing_records = read_hash_records(hashes_path);
         for (const auto& record : existing_records) {
-            if (record.index != verified_records.size() || record.source_offset != offset || record.stored_offset != stored_offset || record.source_size == 0 || record.stored_size == 0) {
+            if (record.index != verified_records.size() || record.source_offset != offset ||
+                record.stored_offset != stored_offset || record.source_size == 0 ||
+                (record.stored_size == 0 && !record.zero_filled)) {
                 break;
             }
             if (source_size != 0 && record.source_offset + record.source_size > source_size) {
                 break;
             }
-            std::vector<std::byte> stored_data(static_cast<std::size_t>(record.stored_size));
-            existing_disk.seekg(static_cast<std::streamoff>(record.stored_offset));
-            existing_disk.read(reinterpret_cast<char*>(stored_data.data()), static_cast<std::streamsize>(stored_data.size()));
-            if (!existing_disk || static_cast<std::uint64_t>(existing_disk.gcount()) != record.stored_size) {
-                break;
-            }
-            if (sha256_hex(stored_data) != record.stored_hash) {
-                break;
-            }
             std::string decompress_error;
-            const auto source_data = decompress_chunk(stored_data, record.source_size, options.compression, decompress_error);
-            if (!decompress_error.empty() || sha256_hex(source_data) != record.source_hash) {
+            if (record.zero_filled) {
+                if (!zero_record_valid(record)) decompress_error = "A zero-filled resume record is invalid.";
+            } else {
+                (void)logical_chunk(existing_disk, record, options.compression, decompress_error);
+            }
+            if (!decompress_error.empty()) {
                 break;
             }
             const auto current_source = source.read_at(record.source_offset, static_cast<std::size_t>(record.source_size));
@@ -2487,13 +2887,19 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
             result.bytes_written = offset;
             result.bytes_stored = stored_offset;
             result.chunks_written = verified_records.size();
+            for (const auto& record : verified_records) {
+                if (record.zero_filled) {
+                    result.zero_bytes_elided += record.source_size;
+                    ++result.zero_chunks_elided;
+                }
+            }
             fs::resize_file(disk_path, stored_offset, error);
             if (error) {
                 result.findings.push_back(finding(Severity::Blocker, "image.resume_truncate_failed", "Lazarus could not trim disk.raw to the verified resume point.", error.message()));
                 return result;
             }
             log << "Resuming from verified offset " << offset << " with " << verified_records.size() << " chunks.\n";
-            emit_progress(options.progress, ProgressEvent{
+            emit(ProgressEvent{
                 "image",
                 "resume",
                 "Existing image prefix verified; appending new chunks.",
@@ -2506,7 +2912,27 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
         }
     }
 
-    emit_progress(options.progress, ProgressEvent{
+    error.clear();
+    const auto storage_space = fs::space(output_dir, error);
+    if (error) {
+        result.findings.push_back(finding(
+            Severity::Blocker, "image.storage_capacity_unknown",
+            "Lazarus could not determine available image-storage capacity.",
+            "Check that image storage is mounted read-write before starting the backup: " + error.message()));
+        return result;
+    }
+    const auto logical_remaining = source_size > offset ? source_size - offset : 0;
+    const auto required_storage = worst_case_image_storage_bytes(logical_remaining, options.chunk_size, options.compression);
+    if (storage_space.available < required_storage) {
+        result.findings.push_back(finding(
+            Severity::Blocker, "image.storage_capacity_insufficient",
+            "Image storage has " + std::to_string(storage_space.available) + " available bytes, but this backup requires up to " +
+                std::to_string(required_storage) + " additional bytes.",
+            "Free image-storage space or select a larger storage disk before retrying. No source image chunks were written."));
+        return result;
+    }
+
+    emit(ProgressEvent{
         "image",
         "partition-table",
         "Reading partition-table snapshot.",
@@ -2517,15 +2943,19 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
         source_size == 0,
     });
     const auto partition_table_bytes = std::min<std::uint64_t>(source.device().size_bytes == 0 ? 1024ULL * 1024ULL : source.device().size_bytes, 1024ULL * 1024ULL);
-    const auto partition_table = source.read_at(0, static_cast<std::size_t>(partition_table_bytes));
-    if (!partition_table.error.empty() || partition_table.data.size() != partition_table_bytes) {
-        result.findings.push_back(finding(Severity::Blocker, "image.partition_table_read_failed", "Lazarus could not read the partition-table snapshot.", partition_table.error.empty() ? "The source returned fewer bytes than expected." : partition_table.error));
+    std::vector<std::byte> partition_table;
+    std::string partition_read_error;
+    if (!read_source_with_policy(source, 0, static_cast<std::size_t>(partition_table_bytes), options,
+                                 partition_table, result.unreadable_ranges, partition_read_error) ||
+        partition_table.size() != partition_table_bytes) {
+        result.findings.push_back(finding(Severity::Blocker, "image.partition_table_read_failed", "Lazarus could not capture the beginning of the source device.",
+            partition_read_error.empty() ? "Choose Rescue Mode so unreadable sectors can be recorded and zero-filled." : partition_read_error));
         log << "Partition-table snapshot failed.\n";
         return result;
     }
     {
         std::ofstream out(partition_table_path, std::ios::binary);
-        out.write(reinterpret_cast<const char*>(partition_table.data.data()), static_cast<std::streamsize>(partition_table.data.size()));
+        out.write(reinterpret_cast<const char*>(partition_table.data()), static_cast<std::streamsize>(partition_table.size()));
         if (!out) {
             result.findings.push_back(finding(Severity::Blocker, "image.partition_table_write_failed", "Lazarus could not write partition-table.bin.", "Check destination storage health and permissions."));
             return result;
@@ -2551,6 +2981,7 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
     for (const auto& record : verified_records) {
         write_hash_record(hashes_out, record);
     }
+    const auto empty_stored_hash = zero_sha256_hex(0);
 
     while (source_size == 0 || offset < source_size) {
         const auto remaining = source_size == 0 ? static_cast<std::uint64_t>(options.chunk_size) : std::min<std::uint64_t>(options.chunk_size, source_size - offset);
@@ -2561,7 +2992,21 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
         std::vector<std::byte> chunk_data;
         const auto unreadable_before = result.unreadable_ranges.size();
         std::string read_error;
-        if (!read_source_with_policy(source, offset, static_cast<std::size_t>(remaining), options, chunk_data, result.unreadable_ranges, read_error)) {
+        if (offset < partition_table.size()) {
+            const auto cached = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, partition_table.size() - offset));
+            chunk_data.insert(chunk_data.end(), partition_table.begin() + static_cast<std::ptrdiff_t>(offset),
+                              partition_table.begin() + static_cast<std::ptrdiff_t>(offset + cached));
+            if (cached < remaining) {
+                std::vector<std::byte> tail;
+                if (!read_source_with_policy(source, offset + cached, static_cast<std::size_t>(remaining - cached), options,
+                                             tail, result.unreadable_ranges, read_error)) {
+                    result.findings.push_back(finding(Severity::Blocker, "image.chunk_read_failed", "Lazarus could not read a source chunk.", read_error));
+                    log << "Read failed at offset " << offset + cached << ": " << read_error << "\n";
+                    return result;
+                }
+                chunk_data.insert(chunk_data.end(), tail.begin(), tail.end());
+            }
+        } else if (!read_source_with_policy(source, offset, static_cast<std::size_t>(remaining), options, chunk_data, result.unreadable_ranges, read_error)) {
             result.findings.push_back(finding(Severity::Blocker, "image.chunk_read_failed", "Lazarus could not read a source chunk.", read_error));
             log << "Read failed at offset " << offset << ": " << read_error << "\n";
             return result;
@@ -2584,28 +3029,40 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
             return result;
         }
 
+        const bool zero_filled = chunk_is_all_zero(chunk_data);
         std::string compression_error;
-        const auto stored_chunk = compress_chunk(chunk_data, options.compression, compression_error);
+        const auto stored_chunk = zero_filled
+            ? std::vector<std::byte>{}
+            : compress_chunk(chunk_data, options.compression, compression_error);
         if (!compression_error.empty()) {
             result.findings.push_back(finding(Severity::Blocker, "image.chunk_compress_failed", "Lazarus could not compress a source chunk.", compression_error));
             return result;
         }
 
-        disk_out.write(reinterpret_cast<const char*>(stored_chunk.data()), static_cast<std::streamsize>(stored_chunk.size()));
+        if (!stored_chunk.empty()) {
+            disk_out.write(reinterpret_cast<const char*>(stored_chunk.data()), static_cast<std::streamsize>(stored_chunk.size()));
+        }
         if (!disk_out) {
             result.findings.push_back(finding(Severity::Blocker, "image.chunk_write_failed", "Lazarus could not write a chunk to disk.raw.", "Check destination storage health and permissions."));
             log << "Write failed at offset " << offset << "\n";
             return result;
         }
 
+        std::string source_hash;
+        if (zero_filled) {
+            source_hash = zero_sha256_hex(chunk_data.size());
+        } else {
+            source_hash = sha256_hex(chunk_data);
+        }
         const ChunkHashRecord record{
             result.chunks_written,
             offset,
             static_cast<std::uint64_t>(chunk_data.size()),
             stored_offset,
             static_cast<std::uint64_t>(stored_chunk.size()),
-            sha256_hex(chunk_data),
-            sha256_hex(stored_chunk),
+            std::move(source_hash),
+            zero_filled ? empty_stored_hash : sha256_hex(stored_chunk),
+            zero_filled,
         };
         write_hash_record(hashes_out, record);
         if (!hashes_out) {
@@ -2618,12 +3075,16 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
         result.bytes_read += chunk_data.size();
         result.bytes_written += chunk_data.size();
         result.bytes_stored += stored_chunk.size();
+        if (zero_filled) {
+            result.zero_bytes_elided += chunk_data.size();
+            ++result.zero_chunks_elided;
+        }
         ++result.chunks_written;
         if (should_emit_progress(result.chunks_written, total_chunks)) {
-            emit_progress(options.progress, ProgressEvent{
+            emit(ProgressEvent{
                 "image",
                 "write",
-                "Writing raw image stream.",
+                zero_filled ? "Skipping a zero-filled source range." : "Writing compact image stream.",
                 result.bytes_written,
                 source_size,
                 result.chunks_written,
@@ -2633,7 +3094,7 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
         }
     }
 
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "image",
         "flush",
         "Flushing image streams.",
@@ -2650,7 +3111,7 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
         return result;
     }
 
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "image",
         "finalize",
         "Writing metadata and finalization marker.",
@@ -2660,7 +3121,9 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
         total_chunks,
         source_size == 0,
     });
-    if (!write_text_file(metadata_path, render_metadata_json(job, source, inspection, options, result.bytes_written, result.bytes_stored, result.chunks_written))) {
+    if (!write_text_file(metadata_path, render_metadata_json(
+            job, source, inspection, options, result.bytes_written, result.bytes_stored,
+            result.zero_bytes_elided, result.chunks_written, result.zero_chunks_elided))) {
         result.findings.push_back(finding(Severity::Blocker, "image.metadata_write_failed", "Lazarus could not write metadata.json.", "Treat this image as incomplete."));
         return result;
     }
@@ -2679,6 +3142,18 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
         result.findings.push_back(finding(Severity::Blocker, "image.finalized_marker_failed", "Lazarus could not create the finalized marker.", "Treat this image as incomplete."));
         return result;
     }
+    permission_error.clear();
+    for (fs::directory_iterator iterator(output_dir, fs::directory_options::skip_permission_denied,
+                                          permission_error), end;
+         !permission_error && iterator != end; iterator.increment(permission_error)) {
+        const auto status = iterator->symlink_status(permission_error);
+        if (permission_error) break;
+        if (fs::is_regular_file(status)) {
+            fs::permissions(iterator->path(), fs::perms::group_read | fs::perms::others_read,
+                            fs::perm_options::add, permission_error);
+            if (permission_error) break;
+        }
+    }
     fs::remove(incomplete_path, error);
     if (error) {
         result.findings.push_back(finding(Severity::Warning, "image.incomplete_marker_remove_failed", "The image completed but Lazarus could not remove the incomplete marker.", "Inspect the output directory before treating the image as finalized."));
@@ -2693,12 +3168,17 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
     log << "Image write completed.\n";
     log << "Bytes written: " << result.bytes_written << "\n";
     log << "Bytes stored: " << result.bytes_stored << "\n";
+    log << "Zero bytes elided: " << result.zero_bytes_elided << "\n";
     log << "Chunks written: " << result.chunks_written << "\n";
     result.facts.push_back("Source was read through the approved read-only source handle.");
     if (result.resumed) {
         result.facts.push_back("Existing image data was verified and resumed before appending new chunks.");
     }
-    result.facts.push_back("Image stream was written to disk.raw.");
+    result.facts.push_back("Image data chunks were written to disk.raw; verified zero-filled chunks were recorded as logical holes.");
+    if (result.zero_bytes_elided != 0) {
+        result.facts.push_back(std::to_string(result.zero_bytes_elided) +
+                               " zero-filled source bytes were omitted from physical image storage.");
+    }
     if (options.compression != CompressionMode::None) {
         result.facts.push_back("Image chunks were compressed before storage.");
     }
@@ -2707,7 +3187,7 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
     if (result.finalized) {
         result.facts.push_back("FINALIZED marker was created and INCOMPLETE marker was removed.");
     }
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "image",
         "complete",
         "Raw image write completed.",
@@ -2725,6 +3205,7 @@ ImageVerificationResult verify_directory_image(const std::string& image_director
 }
 
 ImageVerificationResult verify_directory_image(const std::string& image_directory, ProgressCallback progress) {
+    const ProgressEmitter emit(std::move(progress));
     ImageVerificationResult result;
     result.image_directory = image_directory;
     const fs::path image_dir(image_directory);
@@ -2742,7 +3223,7 @@ ImageVerificationResult verify_directory_image(const std::string& image_director
         result.findings.push_back(finding(Severity::Blocker, "verify.path_missing", "No image directory was provided.", "Select a Lazarus image directory to verify."));
         return result;
     }
-    emit_progress(progress, ProgressEvent{
+    emit(ProgressEvent{
         "verify",
         "start",
         "Image verification started.",
@@ -2835,7 +3316,7 @@ ImageVerificationResult verify_directory_image(const std::string& image_director
         result.findings.push_back(finding(Severity::Blocker, "verify.hash_records_missing", "No chunk hash records were found.", "The image cannot be chunk-verified."));
     }
 
-    emit_progress(progress, ProgressEvent{
+    emit(ProgressEvent{
         "verify",
         "hash",
         "Verifying image chunk hashes.",
@@ -2851,7 +3332,9 @@ ImageVerificationResult verify_directory_image(const std::string& image_director
     bool hashes_valid = !records.empty() && hash_algorithm_ok && disk_in.good();
     for (std::size_t i = 0; i < records.size() && hashes_valid; ++i) {
         const auto& record = records[i];
-        if (record.index != i || record.source_offset != source_offset || record.stored_offset != stored_offset || record.source_size == 0 || record.stored_size == 0) {
+        if (record.index != i || record.source_offset != source_offset ||
+            record.stored_offset != stored_offset || record.source_size == 0 ||
+            (record.stored_size == 0 && !record.zero_filled)) {
             result.findings.push_back(finding(Severity::Blocker, "verify.hash_map_not_contiguous", "hashes.dat does not describe a contiguous image stream.", "Treat this image as corrupt."));
             hashes_valid = false;
             break;
@@ -2867,28 +3350,15 @@ ImageVerificationResult verify_directory_image(const std::string& image_director
             break;
         }
 
-        std::vector<std::byte> stored_data(static_cast<std::size_t>(record.stored_size));
-        disk_in.seekg(static_cast<std::streamoff>(record.stored_offset));
-        disk_in.read(reinterpret_cast<char*>(stored_data.data()), static_cast<std::streamsize>(stored_data.size()));
-        if (!disk_in || static_cast<std::uint64_t>(disk_in.gcount()) != record.stored_size) {
-            result.findings.push_back(finding(Severity::Blocker, "verify.chunk_read_failed", "Lazarus could not read a chunk from disk.raw.", "Treat this image as corrupt."));
-            hashes_valid = false;
-            break;
+        std::string chunk_error;
+        if (record.zero_filled) {
+            if (!zero_record_valid(record)) chunk_error = "A zero-filled image chunk hash did not match.";
+        } else {
+            (void)logical_chunk(disk_in, record, compression, chunk_error);
         }
-        if (sha256_hex(stored_data) != record.stored_hash) {
-            result.findings.push_back(finding(Severity::Blocker, "verify.stored_chunk_hash_mismatch", "A stored disk.raw chunk did not match hashes.dat.", "Treat this image as corrupt."));
-            hashes_valid = false;
-            break;
-        }
-        std::string decompress_error;
-        const auto source_data = decompress_chunk(stored_data, record.source_size, compression, decompress_error);
-        if (!decompress_error.empty()) {
-            result.findings.push_back(finding(Severity::Blocker, "verify.chunk_decompress_failed", "Lazarus could not decompress a stored image chunk.", decompress_error));
-            hashes_valid = false;
-            break;
-        }
-        if (sha256_hex(source_data) != record.source_hash) {
-            result.findings.push_back(finding(Severity::Blocker, "verify.source_chunk_hash_mismatch", "A decompressed image chunk did not match hashes.dat.", "Treat this image as corrupt."));
+        if (!chunk_error.empty()) {
+            result.findings.push_back(finding(Severity::Blocker, "verify.chunk_invalid",
+                "An image chunk failed stored or logical verification.", chunk_error));
             hashes_valid = false;
             break;
         }
@@ -2896,7 +3366,7 @@ ImageVerificationResult verify_directory_image(const std::string& image_director
         stored_offset += record.stored_size;
         ++result.chunks_verified;
         if (should_emit_progress(result.chunks_verified, records.size())) {
-            emit_progress(progress, ProgressEvent{
+            emit(ProgressEvent{
                 "verify",
                 "hash",
                 "Verifying image chunk hashes.",
@@ -2935,8 +3405,10 @@ ImageVerificationResult verify_directory_image(const std::string& image_director
     }
 
     result.verified = result.finalized_marker_present && !result.incomplete_marker_present && result.metadata_read &&
-                      result.raw_stream_length_valid && result.hashes_valid && result.partition_table_valid &&
-                      result.filesystem_readable && !has_blocker(result.findings);
+                      result.raw_stream_length_valid && result.hashes_valid && !has_blocker(result.findings);
+    if (result.verified) {
+        result.facts.push_back("The complete raw capture passed stored-byte and logical-byte integrity verification.");
+    }
     std::ostringstream verification;
     verification << "{\n";
     verification << "  \"verified\": " << (result.verified ? "true" : "false") << ",\n";
@@ -2954,7 +3426,7 @@ ImageVerificationResult verify_directory_image(const std::string& image_director
     verification << "}\n";
     write_text_file(verification_path, verification.str());
 
-    emit_progress(progress, ProgressEvent{
+    emit(ProgressEvent{
         "verify",
         result.verified ? "complete" : "failed",
         result.verified ? "Image verification completed." : "Image verification failed.",
@@ -2968,6 +3440,7 @@ ImageVerificationResult verify_directory_image(const std::string& image_director
 }
 
 ImageBrowseCacheResult prepare_image_browse_cache(const ImageBrowseCacheOptions& options) {
+    const ProgressEmitter emit(options.progress);
     ImageBrowseCacheResult result;
     result.image_directory = options.image_directory;
     result.output_path = options.output_path;
@@ -2978,7 +3451,7 @@ ImageBrowseCacheResult prepare_image_browse_cache(const ImageBrowseCacheOptions&
         return result;
     }
 
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "browse", "verify", "Verifying the image before read-only browsing.", 0, 0, 0, 0, true,
     });
     const auto verification = verify_directory_image(options.image_directory, options.progress);
@@ -3017,7 +3490,7 @@ ImageBrowseCacheResult prepare_image_browse_cache(const ImageBrowseCacheOptions&
         result.reused_existing_cache = true;
         result.prepared = true;
         result.facts.push_back("The existing read-only browse cache matches the verified image fingerprint.");
-        emit_progress(options.progress, ProgressEvent{
+        emit(ProgressEvent{
             "browse", "complete", "Read-only browse cache is ready.",
             result.logical_bytes, result.logical_bytes, 0, 0, false,
         });
@@ -3070,31 +3543,35 @@ ImageBrowseCacheResult prepare_image_browse_cache(const ImageBrowseCacheOptions&
                    "Keep the image unchanged and run verification again.");
         return result;
     }
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "browse", "reconstruct", "Preparing a sparse read-only browse cache.",
         0, result.logical_bytes, 0, records.size(), false,
     });
     for (const auto& record : records) {
-        std::vector<std::byte> stored(static_cast<std::size_t>(record.stored_size));
-        disk.clear();
-        disk.seekg(static_cast<std::streamoff>(record.stored_offset));
-        disk.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(stored.size()));
-        if (!disk || static_cast<std::uint64_t>(disk.gcount()) != record.stored_size ||
-            sha256_hex(stored) != record.stored_hash) {
-            fail_cache("browse.stored_chunk_invalid", "A stored image chunk failed verification during browse preparation.",
-                       "Do not browse this image; preserve it for investigation.");
-            return result;
+        if (record.zero_filled) {
+            if (!zero_record_valid(record)) {
+                fail_cache("browse.zero_chunk_invalid", "A zero-filled image chunk failed verification during browse preparation.",
+                           "Do not browse this image; preserve it for investigation.");
+                return result;
+            }
+            ++result.chunks_reconstructed;
+            if (should_emit_progress(result.chunks_reconstructed, records.size())) {
+                emit(ProgressEvent{
+                    "browse", "reconstruct", "Skipping a zero-filled image range.",
+                    record.source_offset + record.source_size, result.logical_bytes,
+                    result.chunks_reconstructed, records.size(), false,
+                });
+            }
+            continue;
         }
-        std::string decompress_error;
-        const auto source = decompress_chunk(stored, record.source_size, compression, decompress_error);
-        if (!decompress_error.empty() || sha256_hex(source) != record.source_hash) {
+        std::string chunk_error;
+        const auto source = logical_chunk(disk, record, compression, chunk_error);
+        if (!chunk_error.empty()) {
             fail_cache("browse.source_chunk_invalid", "A reconstructed source chunk failed verification during browse preparation.",
-                       decompress_error.empty() ? "Do not browse this image." : decompress_error);
+                       chunk_error);
             return result;
         }
-        const bool all_zero = std::all_of(source.begin(), source.end(), [](std::byte value) {
-            return value == std::byte{0};
-        });
+        const bool all_zero = record.zero_filled || chunk_is_all_zero(source);
         if (!all_zero) {
             if (!write_exact_at(output_fd, record.source_offset, source)) {
                 fail_cache("browse.cache_write_failed", "Lazarus could not write the next browse-cache chunk.", std::strerror(errno));
@@ -3104,7 +3581,7 @@ ImageBrowseCacheResult prepare_image_browse_cache(const ImageBrowseCacheOptions&
         }
         ++result.chunks_reconstructed;
         if (should_emit_progress(result.chunks_reconstructed, records.size())) {
-            emit_progress(options.progress, ProgressEvent{
+            emit(ProgressEvent{
                 "browse", "reconstruct", "Preparing a sparse read-only browse cache.",
                 record.source_offset + record.source_size, result.logical_bytes,
                 result.chunks_reconstructed, records.size(), false,
@@ -3133,7 +3610,7 @@ ImageBrowseCacheResult prepare_image_browse_cache(const ImageBrowseCacheOptions&
     result.prepared = true;
     result.facts.push_back("Every reconstructed browse-cache chunk matched the image SHA-256 records.");
     result.facts.push_back("Zero-filled source chunks were retained as sparse cache ranges.");
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "browse", "complete", "Read-only browse cache is ready.",
         result.logical_bytes, result.logical_bytes, result.chunks_reconstructed, records.size(), false,
     });
@@ -3141,6 +3618,7 @@ ImageBrowseCacheResult prepare_image_browse_cache(const ImageBrowseCacheOptions&
 }
 
 ImageRestoreResult restore_directory_image(const BenchProfile& bench, DeviceIdentity destination, const ImageRestoreOptions& options) {
+    const ProgressEmitter emit(options.progress);
     ImageRestoreResult result;
     result.image_directory = options.image_directory;
     result.destination = apply_bench_policy(bench, std::move(destination));
@@ -3154,7 +3632,7 @@ ImageRestoreResult restore_directory_image(const BenchProfile& bench, DeviceIden
         return result;
     }
 
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "restore",
         "verify",
         "Verifying image before restore.",
@@ -3188,7 +3666,7 @@ ImageRestoreResult restore_directory_image(const BenchProfile& bench, DeviceIden
     }
 
     const auto total_chunks = records.size();
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "restore",
         "open-destination",
         "Opening destination write-only.",
@@ -3221,7 +3699,7 @@ ImageRestoreResult restore_directory_image(const BenchProfile& bench, DeviceIden
         return result;
     }
 
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "restore",
         "write",
         "Writing disk.raw to destination.",
@@ -3232,25 +3710,11 @@ ImageRestoreResult restore_directory_image(const BenchProfile& bench, DeviceIden
         false,
     });
     for (const auto& record : records) {
-        std::vector<std::byte> stored_chunk(static_cast<std::size_t>(record.stored_size));
-        disk_in.seekg(static_cast<std::streamoff>(record.stored_offset));
-        disk_in.read(reinterpret_cast<char*>(stored_chunk.data()), static_cast<std::streamsize>(stored_chunk.size()));
-        if (!disk_in || static_cast<std::uint64_t>(disk_in.gcount()) != record.stored_size) {
-            result.findings.push_back(finding(Severity::Blocker, "restore.disk_stream_read_failed", "Lazarus could not read the next restore chunk from disk.raw.", "Destination restore stopped; the destination contents are incomplete."));
-            return result;
-        }
-        if (sha256_hex(stored_chunk) != record.stored_hash) {
-            result.findings.push_back(finding(Severity::Blocker, "restore.stored_chunk_hash_mismatch", "A stored disk.raw chunk did not match hashes.dat during restore.", "Destination restore stopped; the destination contents are incomplete."));
-            return result;
-        }
-        std::string decompress_error;
-        const auto chunk = decompress_chunk(stored_chunk, record.source_size, compression, decompress_error);
-        if (!decompress_error.empty()) {
-            result.findings.push_back(finding(Severity::Blocker, "restore.chunk_decompress_failed", "Lazarus could not decompress a stored image chunk during restore.", decompress_error));
-            return result;
-        }
-        if (sha256_hex(chunk) != record.source_hash) {
-            result.findings.push_back(finding(Severity::Blocker, "restore.source_chunk_hash_mismatch", "A decompressed image chunk did not match hashes.dat during restore.", "Destination restore stopped; the destination contents are incomplete."));
+        std::string chunk_error;
+        const auto chunk = logical_chunk(disk_in, record, compression, chunk_error);
+        if (!chunk_error.empty()) {
+            result.findings.push_back(finding(Severity::Blocker, "restore.image_chunk_invalid",
+                "An image chunk failed verification during restore.", chunk_error));
             return result;
         }
 
@@ -3263,7 +3727,7 @@ ImageRestoreResult restore_directory_image(const BenchProfile& bench, DeviceIden
         result.bytes_written += chunk.size();
         ++result.chunks_written;
         if (should_emit_progress(result.chunks_written, total_chunks)) {
-            emit_progress(options.progress, ProgressEvent{
+            emit(ProgressEvent{
                 "restore",
                 "write",
                 "Writing disk.raw to destination.",
@@ -3276,7 +3740,7 @@ ImageRestoreResult restore_directory_image(const BenchProfile& bench, DeviceIden
         }
     }
 
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "restore",
         "flush",
         "Flushing destination writes.",
@@ -3295,7 +3759,7 @@ ImageRestoreResult restore_directory_image(const BenchProfile& bench, DeviceIden
     const auto destination_path = result.destination.linux_path;
     open_result.handle.close();
 
-    emit_progress(options.progress, ProgressEvent{
+    emit(ProgressEvent{
         "restore",
         "readback",
         "Reading the restored destination back and comparing every chunk.",
@@ -3322,7 +3786,7 @@ ImageRestoreResult restore_directory_image(const BenchProfile& bench, DeviceIden
         result.bytes_verified += record.source_size;
         ++readback_chunks;
         if (should_emit_progress(readback_chunks, total_chunks)) {
-            emit_progress(options.progress, ProgressEvent{
+            emit(ProgressEvent{
                 "restore",
                 "readback",
                 "Reading the restored destination back and comparing every chunk.",
@@ -3340,9 +3804,11 @@ ImageRestoreResult restore_directory_image(const BenchProfile& bench, DeviceIden
     const auto restored_inspection = inspect_source_disk(restored_source);
     result.destination_layout_validated = has_imageable_layout(restored_inspection) && !has_blocker(restored_inspection.findings);
     if (!result.destination_layout_validated) {
-        result.findings.push_back(finding(Severity::Blocker, "restore.destination_layout_invalid", "The restored destination bytes matched, but its partition layout did not pass inspection.", "Do not boot or deliver this destination until the partition findings are reviewed."));
-        result.findings.insert(result.findings.end(), restored_inspection.findings.begin(), restored_inspection.findings.end());
-        return result;
+        result.findings.push_back(finding(Severity::Warning, "restore.destination_layout_invalid", "The restored destination matches the image byte-for-byte, including its damaged or unsupported source layout.", "Do not boot or deliver this destination; escalate the preserved image to data recovery/forensics."));
+        for (const auto& inspect_finding : restored_inspection.findings) {
+            result.findings.push_back(inspect_finding.severity == Severity::Blocker
+                ? escalation_warning(inspect_finding) : inspect_finding);
+        }
     }
     result.restored = true;
     result.facts.push_back("The image was verified before restore began.");
@@ -3350,8 +3816,10 @@ ImageRestoreResult restore_directory_image(const BenchProfile& bench, DeviceIden
     result.facts.push_back("disk.raw was written to the destination from offset zero.");
     result.facts.push_back("Restore writes were flushed to the destination.");
     result.facts.push_back("Every restored destination chunk was read back and matched its source SHA-256 hash.");
-    result.facts.push_back("The restored destination partition layout was reopened and inspected.");
-    emit_progress(options.progress, ProgressEvent{
+    result.facts.push_back(result.destination_layout_validated
+        ? "The restored destination partition layout was reopened and validated."
+        : "The restored destination was reopened; its bytes match the image, but its source layout still requires escalation.");
+    emit(ProgressEvent{
         "restore",
         "complete",
         "Restore completed.",
@@ -3447,7 +3915,10 @@ SmartDiagnosticResult collect_smart_diagnostics(DeviceIdentity device) {
         return result;
     }
 
-    const std::string command = shell_quote(*smartctl) + " -a -j " + shell_quote(device.linux_path) + " 2>&1";
+    // Some USB-SATA/USB-NVMe bridges do not pass SMART commands through cleanly and never
+    // respond at all, rather than returning an error. Without a bound here, one flaky bench
+    // adapter would hang this call forever with no way for the technician to cancel it.
+    const std::string command = "timeout -s KILL 30 " + shell_quote(*smartctl) + " -a -j " + shell_quote(device.linux_path) + " 2>&1";
     FILE* pipe = ::popen(command.c_str(), "r");
     if (pipe == nullptr) {
         result.findings.push_back(finding(Severity::Warning, "smart.smartctl_unavailable", "Lazarus found smartctl but could not start it.", "Check Lazarus service permissions and the recovery environment PATH."));
@@ -3891,6 +4362,71 @@ DriverMigrationPlan create_driver_migration_plan(
     plan.facts.push_back("Driver additions are ordered before any requested removals.");
     plan.facts.push_back("Lazarus OS will install the boot-critical driver directly into the restored offline Windows installation.");
     plan.ready_for_servicing = plan.matching_storage_driver_found && !has_blocker(plan.findings);
+    return plan;
+}
+
+BootRepairPlan evaluate_boot_repair(const BootRepairFindingsOptions& observed) {
+    BootRepairPlan plan;
+    plan.observed = observed;
+
+    if (!observed.gpt_valid) {
+        plan.findings.push_back(finding(
+            Severity::Warning, "boot_repair.gpt_not_detected",
+            "The destination disk does not report a valid GPT partition table.",
+            "Legacy MBR systems are supported for raw imaging, but Lazarus boot repair currently targets UEFI/GPT boot files only."));
+    }
+    if (!observed.esp_present) {
+        plan.findings.push_back(finding(
+            Severity::Blocker, "boot_repair.esp_missing",
+            "No EFI System Partition was found on the destination disk.",
+            "Boot repair requires a FAT-formatted EFI System Partition. Verify the restore completed and the correct disk was selected."));
+    }
+    if (!observed.windows_partition_present) {
+        plan.findings.push_back(finding(
+            Severity::Blocker, "boot_repair.windows_missing",
+            "No NTFS partition containing a Windows installation was found on the destination disk.",
+            "Verify the restore completed and the correct disk was selected."));
+    }
+    if (observed.esp_present && !observed.bootmgfw_present) {
+        plan.findings.push_back(finding(
+            Severity::Blocker, "boot_repair.bootmgfw_missing",
+            "The EFI System Partition does not contain EFI/Microsoft/Boot/bootmgfw.efi.",
+            "Windows itself did not install its UEFI boot manager on this partition. This is outside Lazarus boot repair's scope."));
+    }
+    if (observed.bcd_present && !observed.bcd_readable) {
+        plan.findings.push_back(finding(
+            Severity::Blocker, "boot_repair.bcd_unreadable",
+            "EFI/Microsoft/Boot/BCD exists but could not be opened as a valid registry hive.",
+            "The BCD store may be corrupt. Lazarus boot repair does not reconstruct BCD contents; restore from a known-good image."));
+    } else if (observed.esp_present && !observed.bcd_present) {
+        plan.findings.push_back(finding(
+            Severity::Blocker, "boot_repair.bcd_missing",
+            "The EFI System Partition does not contain EFI/Microsoft/Boot/BCD.",
+            "Full BCD reconstruction is not implemented. Lazarus boot repair cannot recover this installation's boot configuration."));
+    }
+
+    const bool blocked = has_blocker(plan.findings);
+    if (!blocked) {
+        if (!observed.fallback_loader_present || !observed.fallback_loader_matches_bootmgfw) {
+            plan.fallback_repair_needed = true;
+            plan.findings.push_back(finding(
+                Severity::Info, "boot_repair.fallback_loader_stale",
+                observed.fallback_loader_present
+                    ? "EFI/Boot/BOOTX64.EFI exists but does not match EFI/Microsoft/Boot/bootmgfw.efi."
+                    : "EFI/Boot/BOOTX64.EFI, the UEFI firmware fallback boot path, is missing.",
+                "Lazarus can copy bootmgfw.efi to EFI/Boot/BOOTX64.EFI so firmware without a matching NVRAM boot entry can still find Windows."));
+        } else {
+            plan.facts.push_back("EFI/Boot/BOOTX64.EFI is already present and matches EFI/Microsoft/Boot/bootmgfw.efi.");
+        }
+    }
+    if (observed.windows_partition_present && !observed.winload_present) {
+        plan.findings.push_back(finding(
+            Severity::Warning, "boot_repair.winload_missing",
+            "Windows/System32/winload.efi was not found on the Windows partition.",
+            "The Windows installation may be incomplete or damaged beyond boot-file repair."));
+    }
+
+    plan.ready_for_servicing = plan.fallback_repair_needed && !has_blocker(plan.findings);
     return plan;
 }
 

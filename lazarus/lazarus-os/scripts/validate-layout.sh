@@ -51,6 +51,30 @@ for path in $required; do
 	fi
 done
 
+for storage_package in cifs-utils nfs-utils; do
+	grep -qx "$storage_package" "$base/packages/world" || {
+		echo "Missing NAS storage package: $storage_package" >&2
+		exit 1
+	}
+done
+
+grep -q 'mount -t cifs' "$base/rootfs/usr/local/sbin/lazarus-mount-storage" || {
+	echo "Image storage helper must support SMB NAS mounts." >&2
+	exit 1
+}
+grep -q 'mount -t nfs' "$base/rootfs/usr/local/sbin/lazarus-mount-storage" || {
+	echo "Image storage helper must support NFS NAS mounts." >&2
+	exit 1
+}
+grep -q 'chmod 0755 "$mount_target"' "$base/rootfs/usr/local/sbin/lazarus-mount-storage" || {
+	echo "Portable image storage must be traversable on another Linux system." >&2
+	exit 1
+}
+grep -q 'find "$image_directory" -xdev -type f -exec chmod a+r,o-w' "$base/rootfs/usr/local/sbin/lazarus-mount-storage" || {
+	echo "Existing Lazarus image files must be readable on another Linux system." >&2
+	exit 1
+}
+
 for driver_package in \
 	xf86-video-amdgpu \
 	xf86-video-ati \
@@ -64,12 +88,17 @@ for driver_package in \
 	}
 done
 
-for service in lazarus-service lazarus-session lazarus-network; do
+for service in lazarus-service lazarus-session; do
 	grep -q 'use lazarus-storage' "$base/openrc/$service" || {
 		echo "$service must treat image storage as optional during boot." >&2
 		exit 1
 	}
 done
+
+grep -q 'before lazarus-storage' "$base/openrc/lazarus-network" || {
+	echo "Networking must start independently before an asynchronous NAS connection is attempted." >&2
+	exit 1
+}
 
 grep -q 'use lazarus-storage lazarus-service' "$base/openrc/lazarus-session" || {
 	echo "The kiosk must still start when the privileged service is unavailable." >&2
@@ -80,6 +109,46 @@ if grep -q '^tty1::respawn:' "$base/rootfs/etc/inittab"; then
 	echo "tty1 must be reserved for kiosk startup diagnostics." >&2
 	exit 1
 fi
+
+for path in \
+	qemu/build-live-iso.sh \
+	qemu/install-system-disk.sh \
+	rootfs/usr/local/sbin/lazarus-install-os
+do
+	grep -q 'console=ttyS0,115200 console=tty0' "$base/$path" || {
+		echo "$path must leave the physical display as the primary userspace console." >&2
+		exit 1
+	}
+done
+
+grep -q 'Entered initramfs /init' "$base/boot/live-init" || {
+	echo "Live init must identify entry into early userspace on the physical console." >&2
+	exit 1
+}
+grep -q '/dev/ttyS0' "$base/boot/live-init" || {
+	echo "Live init milestones must remain available to serial diagnostics." >&2
+	exit 1
+}
+grep -q 'lazarus-printers: driverless discovery ready' "$base/openrc/lazarus-cups-browsed" || {
+	echo "Printer discovery must expose a serial-ready milestone." >&2
+	exit 1
+}
+grep -q 'supervisor="supervise-daemon"' "$base/openrc/lazarus-service" || {
+	echo "The privileged Lazarus service must be supervised and restarted after failure." >&2
+	exit 1
+}
+grep -q 'lazarus-service: socket ready' "$base/openrc/lazarus-service" || {
+	echo "The privileged Lazarus service must expose a socket-ready milestone." >&2
+	exit 1
+}
+if sed -n '/^start_pre()/,/^}/p' "$base/openrc/lazarus-service" | grep -q '/usr/bin/lazarus devices'; then
+	echo "Hardware inventory must not run synchronously before the service socket is ready." >&2
+	exit 1
+fi
+grep -q 'timeout 15 /bin/sh' "$base/openrc/lazarus-service" || {
+	echo "Serial hardware inventory must have a hard runtime deadline." >&2
+	exit 1
+}
 
 for display_path in auto modesetting fbdev vesa; do
 	grep -q "auto modesetting fbdev vesa" "$base/rootfs/usr/local/bin/lazarus-kiosk" || {
@@ -94,6 +163,7 @@ grep -q 'all Xorg display paths failed; retrying' "$base/rootfs/usr/local/bin/la
 }
 
 for path in \
+	boot/live-init \
 	openrc/lazarus-service \
 	openrc/lazarus-storage \
 	openrc/lazarus-session \
@@ -129,6 +199,15 @@ for service in udev-trigger hwdrivers udev-settle; do
 		exit 1
 	}
 done
+
+grep -q 'openrc/\*' "$base/scripts/stage-current-lazarus.sh" || {
+	echo "Incremental rootfs staging must refresh active OpenRC service files." >&2
+	exit 1
+}
+grep -q '90-arcology-lazarus.rules' "$base/scripts/stage-current-lazarus.sh" || {
+	echo "Incremental rootfs staging must refresh the active udev rules." >&2
+	exit 1
+}
 
 if ! grep -q '^CreateIPPPrinterQueues Driverless$' "$base/rootfs/etc/cups/cups-browsed.conf"; then
 	echo "cups-browsed must create driverless IPP queues" >&2

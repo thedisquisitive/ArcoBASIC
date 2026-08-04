@@ -40,6 +40,21 @@ std::string human_size(std::uint64_t bytes) {
     return out.str();
 }
 
+std::string human_duration(std::uint64_t total_seconds) {
+    const auto hours = total_seconds / 3600;
+    const auto minutes = (total_seconds % 3600) / 60;
+    const auto seconds = total_seconds % 60;
+    std::ostringstream out;
+    if (hours > 0) {
+        out << hours << "h" << std::setw(2) << std::setfill('0') << minutes << "m";
+    } else if (minutes > 0) {
+        out << minutes << "m" << std::setw(2) << std::setfill('0') << seconds << "s";
+    } else {
+        out << seconds << "s";
+    }
+    return out.str();
+}
+
 lazarus::ProgressCallback make_progress_printer() {
     return [](const lazarus::ProgressEvent& event) {
         std::cerr << "[" << event.operation << "] " << event.phase;
@@ -54,6 +69,12 @@ lazarus::ProgressCallback make_progress_printer() {
             const auto percent = (static_cast<double>(event.bytes_done) / static_cast<double>(event.bytes_total)) * 100.0;
             std::cerr << " " << human_size(event.bytes_done) << " / " << human_size(event.bytes_total)
                       << " (" << std::fixed << std::setprecision(1) << percent << "%)";
+            if (event.bytes_per_second != 0) {
+                std::cerr << " " << human_size(event.bytes_per_second) << "/s";
+            }
+            if (event.eta_seconds != 0) {
+                std::cerr << " ETA " << human_duration(event.eta_seconds);
+            }
         }
         if (event.chunks_total != 0) {
             std::cerr << " chunks " << event.chunks_done << "/" << event.chunks_total;
@@ -332,10 +353,6 @@ int image_source(int argc, char** argv) {
         std::cout << "Inspection findings:\n";
         print_findings(inspection.findings);
     }
-    if (!has_imageable_layout(inspection)) {
-        return 3;
-    }
-
     lazarus::ImageWriteOptions options{
         output_dir,
         4 * 1024 * 1024,
@@ -347,6 +364,7 @@ int image_source(int argc, char** argv) {
     std::cout << "Image output: " << result.output_directory << "\n";
     std::cout << "Bytes written: " << result.bytes_written << "\n";
     std::cout << "Bytes stored: " << result.bytes_stored << "\n";
+    std::cout << "Zero-filled bytes skipped: " << result.zero_bytes_elided << "\n";
     std::cout << "Compression: " << lazarus::to_string(options.compression) << "\n";
     std::cout << "Chunks written: " << result.chunks_written << "\n";
     std::cout << "Finalized: " << (result.finalized ? "yes" : "no") << "\n";

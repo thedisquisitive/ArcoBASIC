@@ -41,9 +41,10 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 for _ in $(seq 1 120); do
-	if grep -q 'lazarus-xinitrc: exec Lazarus client' "$serial_log" 2>/dev/null; then
+	if grep -q 'lazarus-xinitrc: exec Lazarus client' "$serial_log" 2>/dev/null &&
+	   grep -q 'lazarus-service: socket ready' "$serial_log" 2>/dev/null; then
 		sleep 7
-		if grep -Eq 'general protection fault.*lazarus-gui|Lazarus GTK application exited' "$serial_log"; then
+		if grep -Eq 'general protection fault.*lazarus-gui|Lazarus GTK application exited|Gtk-(WARNING|CRITICAL)|GLib-GObject-(WARNING|CRITICAL)|invalid cast' "$serial_log"; then
 			echo "Offline live-boot smoke test failed: Lazarus GUI exited after launch." >&2
 			tail -n 100 "$serial_log" >&2
 			exit 1

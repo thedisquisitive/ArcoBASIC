@@ -4,6 +4,11 @@ set -eu
 source=/mnt/lazarus-storage/cups
 destination=/etc/cups
 
+[ "$(findmnt -rn -M /mnt/lazarus-storage -o SOURCE 2>/dev/null || true)" != "" ] || exit 0
+case "$(findmnt -rn -M /mnt/lazarus-storage -o SOURCE 2>/dev/null || true)" in
+	/dev/*) ;;
+	*) exit 0 ;;
+esac
 [ -d "$source" ] || exit 0
 mkdir -p "$destination/ppd"
 for name in printers.conf printers.conf.O classes.conf classes.conf.O; do
