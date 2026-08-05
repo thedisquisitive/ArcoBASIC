@@ -1,0 +1,5 @@
+ARCOLOGY HARDWARE TEST
+
+Hello from ArcoBASIC
+
+System halted intentionally.

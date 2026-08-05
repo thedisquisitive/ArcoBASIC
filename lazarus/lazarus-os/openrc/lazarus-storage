@@ -15,6 +15,51 @@ start_pre() {
 	checkpath -d -m 0750 -o root:lazarus /var/log/arcology-lazarus
 }
 
+# Additional ("extra") storage locations never carry appliance-state persistence duty, so
+# unlike the primary above they are always mounted in the background: a slow/offline NAS extra
+# must never delay boot, and any number of them can be brought up concurrently.
+mount_extra_storage_locations() {
+	config=/etc/arcology-lazarus/bench.profile
+	field() {
+		awk -F= -v k="$1" '$1 == k {print substr($0, index($0, "=") + 1); exit}' "$config" 2>/dev/null || true
+	}
+	count="$(field storage.count)"
+	case "$count" in ''|*[!0-9]*) return 0 ;; esac
+	i=0
+	while [ "$i" -lt "$count" ]; do
+		id="$(field "storage.$i.id")"
+		type="$(field "storage.$i.type")"
+		folder="$(field "storage.$i.folder")"
+		if [ -z "$id" ] || [ -z "$type" ]; then
+			i=$((i + 1))
+			continue
+		fi
+		target="/mnt/lazarus-storage-extra/$id"
+		if [ "$type" = local ]; then
+			device="$(field "storage.$i.device")"
+			volume="$(field "storage.$i.volume")"
+			set -- --id "$id" --target "$target" --folder "${folder:-images}" --type local --device "$device"
+			[ -n "$volume" ] && set -- "$@" --volume "$volume"
+		else
+			nas_protocol="$(field "storage.$i.nas_protocol")"
+			nas_server="$(field "storage.$i.nas_server")"
+			nas_share="$(field "storage.$i.nas_share")"
+			set -- --id "$id" --target "$target" --folder "${folder:-images}" --type nas \
+				--protocol "$nas_protocol" --server "$nas_server" --share "$nas_share"
+			[ "$nas_protocol" = smb ] && set -- "$@" --credentials "/var/lib/arcology-lazarus/nas-storage.$id.auth"
+		fi
+		ebegin "Scheduling Arcology Lazarus additional storage: $id"
+		start-stop-daemon --start --background --make-pidfile \
+			--pidfile "/run/arcology-lazarus/storage-mount-extra-$id.pid" \
+			--exec /usr/local/sbin/lazarus-mount-extra-storage \
+			--stdout /var/log/arcology-lazarus/storage.log \
+			--stderr /var/log/arcology-lazarus/storage.log \
+			-- "$@"
+		eend $?
+		i=$((i + 1))
+	done
+}
+
 start() {
 	protocol="$(awk -F= '$1 == "nas_storage_protocol" {print substr($0, index($0, "=") + 1); exit}' /etc/arcology-lazarus/bench.profile 2>/dev/null || true)"
 	if [ -n "$protocol" ]; then
@@ -25,9 +70,10 @@ start() {
 			--stdout /var/log/arcology-lazarus/storage.log \
 			--stderr /var/log/arcology-lazarus/storage.log
 		eend $?
-		return
+	else
+		ebegin "Mounting Arcology Lazarus local image storage"
+		/usr/local/sbin/lazarus-mount-storage
+		eend $?
 	fi
-	ebegin "Mounting Arcology Lazarus local image storage"
-	/usr/local/sbin/lazarus-mount-storage
-	eend $?
+	mount_extra_storage_locations
 }

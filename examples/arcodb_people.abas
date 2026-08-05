@@ -17,7 +17,7 @@ PRINT restored.email
 byEmail = ArcoDB.RecallBy(db, customerSchema, "email", "wanda@email.com")
 PRINT byEmail.name
 
-restored.email = "wanda.goodburger@arcology.example"
+restored.email = "wanda.goodburger@example.test"
 PRINT ArcoDB.Replace(db, customerSchema, id, restored)
 PRINT ArcoDB.Write(db)
 
@@ -25,7 +25,7 @@ reopened = ArcoDB.Open(path)
 schema = ArcoDB.SchemaFor(reopened, "Customer")
 loaded = ArcoDB.Recall(reopened, schema, id)
 PRINT loaded.email
-loadedByEmail = ArcoDB.RecallBy(reopened, schema, "email", "wanda.goodburger@arcology.example")
+loadedByEmail = ArcoDB.RecallBy(reopened, schema, "email", "wanda.goodburger@example.test")
 PRINT loadedByEmail.name
 
 PRINT ArcoDB.Count(reopened)

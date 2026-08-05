@@ -41,14 +41,29 @@ service_socket="${LAZARUS_SERVICE_SOCKET:-/run/arcology-lazarus/service.sock}"
 cursor_theme="${XCURSOR_THEME:-Adwaita}"
 cursor_size="${XCURSOR_SIZE:-32}"
 cursor_path="${XCURSOR_PATH:-/usr/share/icons}"
-scale_environment=""
-if command -v xrandr >/dev/null 2>&1 && DISPLAY="$display" xrandr --query 2>/dev/null | grep -q '^Virtual-1 connected'; then
+scale_environment="GDK_SCALE=1 GDK_DPI_SCALE=1"
+if command -v xrandr >/dev/null 2>&1 && DISPLAY="$display" xrandr --query >/tmp/lazarus-xrandr.txt 2>/dev/null; then
+	physical_output="$(awk '$2 == "connected" && $1 != "Virtual-1" { print $1; exit }' /tmp/lazarus-xrandr.txt)"
+	if grep -q '^Virtual-1 connected' /tmp/lazarus-xrandr.txt; then
 	# Set the X framebuffer and output mode together. Changing only the output
 	# mode leaves QEMU's backing surface at its old dimensions when zoom-to-fit
 	# is active, which confines the kiosk to one corner of the display.
-	DISPLAY="$display" xrandr --fb 1920x1080 --output Virtual-1 --mode 1920x1080 >/dev/null 2>&1 || true
-	scale_environment="GDK_SCALE=1 GDK_DPI_SCALE=1"
-	printf 'lazarus-xinitrc: QEMU framebuffer and output set to 1920x1080 at GTK scale 1\n' >>/dev/ttyS0 2>/dev/null || true
+		DISPLAY="$display" xrandr --fb 1920x1080 --output Virtual-1 --mode 1920x1080 >/dev/null 2>&1 || true
+		printf 'lazarus-xinitrc: QEMU framebuffer and output set to 1920x1080 at GTK scale 1\n' >>/dev/ttyS0 2>/dev/null || true
+	elif [ -n "$physical_output" ] &&
+	     sed -n "/^$physical_output connected/,/^[^[:space:]]/p" /tmp/lazarus-xrandr.txt |
+	         grep -q '^[[:space:]]*1920x1080[[:space:]]'; then
+		# Use a predictable 1080p kiosk canvas on physical displays that advertise it. Lower-resolution
+		# panels retain their native mode; the GTK shell remains scroll-safe down to 1024x768.
+		DISPLAY="$display" xrandr --output "$physical_output" --mode 1920x1080 >/dev/null 2>&1 || true
+		printf 'lazarus-xinitrc: physical output %s requested at 1920x1080 and GTK scale 1\n' \
+			"$physical_output" >>/dev/ttyS0 2>/dev/null || true
+	fi
+	current_modes="$(DISPLAY="$display" xrandr --current 2>/dev/null | awk '
+		$2 == "connected" { output=$1 }
+		/^[[:space:]]+[0-9]+x[0-9]+.*\*/ { print output "=" $1 }
+	')"
+	printf 'lazarus-xinitrc: active display modes: %s\n' "${current_modes:-unknown}" >>/dev/ttyS0 2>/dev/null || true
 fi
 printf 'lazarus-xinitrc: exec Lazarus client\n' >>/dev/ttyS0 2>/dev/null || true
 exec su -s /bin/sh lazarus -c "exec dbus-run-session -- env \

@@ -57,6 +57,7 @@ struct ServiceConfig {
     std::string network_path = "/etc/arcology-lazarus/network.conf";
     std::string network_helper = "/usr/local/sbin/lazarus-network-up";
     std::string storage_helper = "/usr/local/sbin/lazarus-mount-storage";
+    std::string extra_storage_helper = "/usr/local/sbin/lazarus-mount-extra-storage";
     std::string nas_credentials_path = "/var/lib/arcology-lazarus/nas-storage.auth";
     bool stdio = false;
 };
@@ -93,6 +94,11 @@ unsigned int failed_admin_logins = 0;
 std::chrono::steady_clock::time_point admin_login_blocked_until{};
 std::recursive_mutex admin_mutex;
 std::mutex profile_save_mutex;
+// Guards the load-mutate-save sequence of every extra-storage-location command below. Unlike
+// profile_save_mutex (which only serializes the write itself), this prevents two concurrent
+// storage-list mutations (e.g. two quick "Add Location" clicks) from each loading the same
+// starting profile and one silently clobbering the other's change on save.
+std::mutex storage_locations_mutex;
 
 // A technician PIN is a light accountability gate for job records (backup/restore/verify), so one
 // tech cannot casually log work under a coworker's name -- not a security boundary like the admin
@@ -299,6 +305,13 @@ bool appliance_state_mirror_allowed(const std::filesystem::path& path) {
 
 bool run_storage_helper(const ServiceConfig& config, std::string& output, std::string& error) {
     return run_program({"timeout", "-s", "KILL", "12", config.storage_helper}, output, error);
+}
+
+bool run_extra_storage_helper(const ServiceConfig& config, const std::vector<std::string>& args,
+                               std::string& output, std::string& error) {
+    std::vector<std::string> command = {"timeout", "-s", "KILL", "12", config.extra_storage_helper};
+    command.insert(command.end(), args.begin(), args.end());
+    return run_program(command, output, error);
 }
 
 bool valid_printer_name(const std::string& name) {
@@ -1505,6 +1518,41 @@ bool path_is_mountpoint(const std::filesystem::path& path) {
            trim_copy(output) == path.string();
 }
 
+// Extra storage locations never share the primary's fixed mountpoint (which also carries
+// appliance-state persistence duty -- see lazarus-mount-storage). Each gets its own subdirectory
+// so any number of them can be mounted at once alongside the primary.
+std::string extra_storage_mount_target(const std::string& id) {
+    return "/mnt/lazarus-storage-extra/" + id;
+}
+
+std::string extra_storage_image_path(const lazarus::StorageLocation& location) {
+    return (std::filesystem::path(extra_storage_mount_target(location.id)) / location.folder).string();
+}
+
+// The single source of truth for bench.image_storage_paths: the primary location's path (if
+// configured) followed by every extra location's path, in configuration order. Callers that
+// replace the primary (configure_image_storage/configure_nas_storage) must call this instead of
+// hand-assigning a single-element vector, or a primary reconfiguration would silently drop every
+// already-configured extra location from path validation and backup scanning.
+void recompute_image_storage_paths(lazarus::BenchProfile& bench) {
+    bench.image_storage_paths.clear();
+    if ((!bench.image_storage_device.empty() || !bench.nas_storage_protocol.empty()) &&
+        !bench.image_storage_path.empty()) {
+        bench.image_storage_paths.push_back(bench.image_storage_path);
+    }
+    for (const auto& location : bench.extra_storage_locations) {
+        bench.image_storage_paths.push_back(extra_storage_image_path(location));
+    }
+    if (bench.image_storage_paths.empty()) {
+        // validate_bench_profile treats an empty image_storage_paths list as a blocking safety
+        // finding, so save_bench_profile would refuse to persist removing the very last location
+        // (primary or extra). Fall back to the same non-persistent placeholder the shipped
+        // default profile ships with before anything real is configured (see
+        // lazarus-os/profiles/bench.profile) rather than leaving the list empty.
+        bench.image_storage_paths.push_back("/var/lib/arcology-lazarus/images");
+    }
+}
+
 bool matches_device_selector(const lazarus::DeviceIdentity& device, const std::string& selector) {
     return device.linux_path == selector || device.physical_path == selector || device.by_id_path == selector || device.by_path == selector;
 }
@@ -2400,36 +2448,107 @@ std::vector<std::string> destination_storage_hardware_ids(const std::string& dev
     return {};
 }
 
-std::vector<std::string> automatic_driver_package_paths(const lazarus::BenchProfile& bench) {
+// Scans one vault directory tree for .inf files and returns the set of their parent directories
+// (each a driver "package" root). Shared by automatic_driver_package_paths (global DriverVault,
+// used to seed a backup's AUR/ on first use) and backup_driver_package_paths (per-backup AUR,
+// the effective source once it exists).
+std::vector<std::string> driver_package_paths_in(const std::filesystem::path& vault) {
     std::set<std::string> package_roots;
     std::size_t entries_seen = 0;
+    std::error_code filesystem_error;
+    if (!std::filesystem::is_directory(vault, filesystem_error)) return {};
+    std::filesystem::recursive_directory_iterator iterator(
+        vault, std::filesystem::directory_options::skip_permission_denied, filesystem_error);
+    const std::filesystem::recursive_directory_iterator end;
+    for (; !filesystem_error && iterator != end && entries_seen < 50000 && package_roots.size() < 512;
+         iterator.increment(filesystem_error), ++entries_seen) {
+        const auto status = iterator->symlink_status(filesystem_error);
+        if (filesystem_error) break;
+        if (std::filesystem::is_symlink(status)) {
+            if (std::filesystem::is_directory(status)) iterator.disable_recursion_pending();
+            continue;
+        }
+        if (!std::filesystem::is_regular_file(status)) continue;
+        auto extension = iterator->path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+        if (extension != ".inf") continue;
+        const auto parent = std::filesystem::weakly_canonical(iterator->path().parent_path(), filesystem_error);
+        if (!filesystem_error) package_roots.insert(parent.string());
+    }
+    return {package_roots.begin(), package_roots.end()};
+}
+
+std::vector<std::string> automatic_driver_package_paths(const lazarus::BenchProfile& bench) {
+    std::set<std::string> package_roots;
     auto storage_roots = bench.image_storage_paths;
     if (storage_roots.empty() && !bench.image_storage_path.empty()) storage_roots.push_back(bench.image_storage_path);
     for (const auto& storage_root : storage_roots) {
-        const auto vault = std::filesystem::path(storage_root) / "DriverVault";
-        std::error_code filesystem_error;
-        if (!std::filesystem::is_directory(vault, filesystem_error)) continue;
-        std::filesystem::recursive_directory_iterator iterator(
-            vault, std::filesystem::directory_options::skip_permission_denied, filesystem_error);
-        const std::filesystem::recursive_directory_iterator end;
-        for (; !filesystem_error && iterator != end && entries_seen < 50000 && package_roots.size() < 512;
-             iterator.increment(filesystem_error), ++entries_seen) {
-            const auto status = iterator->symlink_status(filesystem_error);
-            if (filesystem_error) break;
-            if (std::filesystem::is_symlink(status)) {
-                if (std::filesystem::is_directory(status)) iterator.disable_recursion_pending();
-                continue;
-            }
-            if (!std::filesystem::is_regular_file(status)) continue;
-            auto extension = iterator->path().extension().string();
-            std::transform(extension.begin(), extension.end(), extension.begin(),
-                           [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
-            if (extension != ".inf") continue;
-            const auto parent = std::filesystem::weakly_canonical(iterator->path().parent_path(), filesystem_error);
-            if (!filesystem_error) package_roots.insert(parent.string());
+        for (auto& path : driver_package_paths_in(std::filesystem::path(storage_root) / "DriverVault")) {
+            package_roots.insert(std::move(path));
         }
     }
     return {package_roots.begin(), package_roots.end()};
+}
+
+// The per-backup driver vault: <image_directory>/AUR. Created lazily by
+// ensure_backup_driver_vault (seeded once from the union of all configured storage locations'
+// DriverVault/ trees, then reused as-is on later Universal Restore runs against the same backup)
+// so each backup keeps a stable, reproducible driver set independent of later global-vault edits.
+std::filesystem::path backup_driver_vault_path(const std::string& image_directory) {
+    return std::filesystem::path(image_directory) / "AUR";
+}
+
+bool ensure_backup_driver_vault(const lazarus::BenchProfile& bench, const std::string& image_directory,
+                                 std::string& error) {
+    const auto vault = backup_driver_vault_path(image_directory);
+    std::error_code exists_error;
+    if (std::filesystem::exists(vault, exists_error)) return true;
+
+    auto storage_roots = bench.image_storage_paths;
+    if (storage_roots.empty() && !bench.image_storage_path.empty()) storage_roots.push_back(bench.image_storage_path);
+    bool found_any_source = false;
+    for (const auto& storage_root : storage_roots) {
+        std::error_code is_dir_error;
+        if (std::filesystem::is_directory(std::filesystem::path(storage_root) / "DriverVault", is_dir_error)) {
+            found_any_source = true;
+            break;
+        }
+    }
+    if (!found_any_source) return true;
+
+    std::error_code create_error;
+    std::filesystem::create_directory(vault, create_error);
+    if (create_error) {
+        error = "Could not create the backup's driver folder: " + create_error.message();
+        return false;
+    }
+    for (const auto& storage_root : storage_roots) {
+        const auto source = std::filesystem::path(storage_root) / "DriverVault";
+        std::error_code is_dir_error;
+        if (!std::filesystem::is_directory(source, is_dir_error)) continue;
+        std::error_code iterate_error;
+        for (const auto& entry : std::filesystem::directory_iterator(source, iterate_error)) {
+            if (iterate_error) {
+                error = "Could not read the configured driver vault: " + iterate_error.message();
+                return false;
+            }
+            std::uint64_t files = 0;
+            std::uint64_t directories = 0;
+            std::uint64_t bytes = 0;
+            const auto destination = vault / entry.path().filename();
+            std::error_code target_exists_error;
+            if (std::filesystem::exists(destination, target_exists_error)) continue;
+            if (!copy_recovered_tree(entry.path(), destination, files, directories, bytes, 0, error)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::vector<std::string> backup_driver_package_paths(const std::string& image_directory) {
+    return driver_package_paths_in(backup_driver_vault_path(image_directory));
 }
 
 std::filesystem::path case_insensitive_child(const std::filesystem::path& parent, const std::string& wanted) {
@@ -3639,6 +3758,9 @@ std::string device_rows_text(const lazarus::BenchProfile& bench) {
         if (!device.serial_ending.empty()) {
             detail += " | serial ending " + device.serial_ending;
         }
+        if (device.link_speed_mbps != 0) {
+            detail += " | USB link " + std::to_string(device.link_speed_mbps) + " Mb/s";
+        }
         detail += " | " + device.physical_path;
         std::string filesystems;
         std::string mountpoints;
@@ -3661,7 +3783,7 @@ std::string device_rows_text(const lazarus::BenchProfile& bench) {
                 std::to_string(device.size_bytes) + "\t" + lazarus::to_string(device.bench_role) + "\t" +
                 device.transport + "\t" + device.serial_ending + "\t" + safety.first + "\t" + safety.second +
                 "\t" + device.physical_path + "\t" + port_identity_for_profile(device) + "\t" +
-                filesystem + "\t" + mountpoint + "\n";
+                filesystem + "\t" + mountpoint + "\t" + std::to_string(device.link_speed_mbps) + "\n";
     }
     return rows;
 }
@@ -4054,6 +4176,32 @@ bool save_bench_profile(const lazarus::BenchProfile& bench, const std::string& p
         if (!bench.nas_storage_username.empty()) out << "nas_storage_username=" << bench.nas_storage_username << "\n";
         if (!bench.nas_storage_domain.empty()) out << "nas_storage_domain=" << bench.nas_storage_domain << "\n";
     }
+    if (!bench.default_storage_location_id.empty()) {
+        out << "default_storage_location_id=" << bench.default_storage_location_id << "\n";
+    }
+    out << "storage.count=" << bench.extra_storage_locations.size() << "\n";
+    for (std::size_t index = 0; index < bench.extra_storage_locations.size(); ++index) {
+        const auto& location = bench.extra_storage_locations[index];
+        const auto prefix = "storage." + std::to_string(index) + ".";
+        out << prefix << "id=" << location.id << "\n";
+        out << prefix << "name=" << location.name << "\n";
+        out << prefix << "default=" << (location.is_default ? "1" : "0") << "\n";
+        out << prefix << "type=" << location.type << "\n";
+        out << prefix << "folder=" << location.folder << "\n";
+        if (location.type == "nas") {
+            out << prefix << "nas_protocol=" << location.nas_protocol << "\n";
+            out << prefix << "nas_server=" << location.nas_server << "\n";
+            out << prefix << "nas_share=" << location.nas_share << "\n";
+            if (!location.nas_username.empty()) out << prefix << "nas_username=" << location.nas_username << "\n";
+            if (!location.nas_domain.empty()) out << prefix << "nas_domain=" << location.nas_domain << "\n";
+        } else {
+            if (!location.device.empty()) out << prefix << "device=" << location.device << "\n";
+            if (!location.volume.empty()) out << prefix << "volume=" << location.volume << "\n";
+            for (const auto& port : location.port_paths) {
+                out << prefix << "port_path=" << port << "\n";
+            }
+        }
+    }
     out << "\n";
     for (const auto& source : bench.source_only_paths) {
         out << "source=" << source << "\n";
@@ -4151,6 +4299,79 @@ std::string supported_storage_volume(const lazarus::DeviceIdentity& device, std:
     return "";
 }
 
+// Shared by configure_image_storage (primary) and add_local_storage_location (extras): validates
+// the disk is writable, then either formats a fresh LAZARUS_STORAGE partition (erase) or detects
+// an existing supported filesystem to use as-is. Pure extraction from what was configure_image_storage's
+// inline logic -- behavior is unchanged for the primary path.
+bool prepare_local_storage_volume(const lazarus::DeviceIdentity& device, bool erase,
+                                   std::string& filesystem, std::string& selected_volume, std::string& error) {
+    std::string read_only;
+    std::string read_only_error;
+    if (!run_program({"blockdev", "--getro", device.linux_path}, read_only, read_only_error)) {
+        error = "Could not determine whether the selected storage disk is writable: " + read_only_error;
+        return false;
+    }
+    if (trim_copy(read_only) != "0") {
+        error = "The selected disk is read-only. Lazarus did not alter its partition table or filesystems.";
+        return false;
+    }
+    std::string command_error;
+    if (erase) {
+        std::string mounts;
+        if (!run_program({"lsblk", "-nr", "-o", "MOUNTPOINTS", device.linux_path}, mounts, command_error)) {
+            error = "Could not check whether the selected storage disk is mounted: " + command_error;
+            return false;
+        }
+        if (!trim_copy(mounts).empty()) {
+            error = "The selected storage disk or one of its partitions is mounted. Lazarus refused to erase it.";
+            return false;
+        }
+        std::string output;
+        if (!run_program({"wipefs", "-a", device.linux_path}, output, command_error) ||
+            !run_program({"parted", "-s", "-a", "optimal", device.linux_path, "mklabel", "gpt"}, output, command_error) ||
+            !run_program({"parted", "-s", "-a", "optimal", device.linux_path, "mkpart", "LAZARUS_STORAGE", "ext4", "1MiB", "100%"}, output, command_error)) {
+            error = "Could not create the Lazarus storage partition: " + command_error;
+            return false;
+        }
+        run_program({"partprobe", device.linux_path}, output, command_error);
+        run_program({"udevadm", "settle", "--timeout=15"}, output, command_error);
+        const auto partition = partition_path_for_disk(device.linux_path, 1);
+        for (int attempt = 0; attempt < 30 && !std::filesystem::exists(partition); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!std::filesystem::exists(partition) ||
+            !run_program({"mkfs.ext4", "-F", "-L", "LAZARUS_STORAGE", partition}, output, command_error)) {
+            error = "Could not format the Lazarus storage partition: " + command_error;
+            return false;
+        }
+        // mkfs writes the new superblock immediately, but udev's /dev/disk/by-uuid symlink and
+        // blkid's device-change detection both depend on the kernel's change notification being
+        // processed first. Force that synchronously here instead of racing the mount helper's own
+        // short retry loop against it on slower real drives.
+        run_program({"udevadm", "trigger", "--settle", "--action=change", partition}, output, command_error);
+        run_program({"udevadm", "settle", "--timeout=15"}, output, command_error);
+        filesystem = "ext4";
+        selected_volume = partition;
+    } else {
+        selected_volume = supported_storage_volume(device, filesystem);
+        if (selected_volume.empty()) {
+            error = "No supported filesystem was found. Use 'Erase and Prepare' to create dedicated ext4 image storage.";
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string resolve_volume_uuid_path(const std::string& selected_volume) {
+    std::string volume_uuid;
+    std::string command_error;
+    if (run_program({"blkid", "-p", "-s", "UUID", "-o", "value", selected_volume}, volume_uuid, command_error) &&
+        !trim_copy(volume_uuid).empty()) {
+        return "/dev/disk/by-uuid/" + trim_copy(volume_uuid);
+    }
+    return selected_volume;
+}
+
 bool configure_image_storage(const ServiceConfig& config, const lazarus::BenchProfile& current,
                              const lazarus::DeviceIdentity& device, bool erase,
                              const std::string& requested_directory,
@@ -4166,6 +4387,19 @@ bool configure_image_storage(const ServiceConfig& config, const lazarus::BenchPr
     if (device.size_bytes == 0) {
         error = "The selected disk reports zero capacity and cannot be prepared as image storage.";
         return false;
+    }
+    {
+        const auto claim_identity = identity_for_profile(device);
+        const auto claim_port = port_identity_for_profile(device);
+        for (const auto& location : current.extra_storage_locations) {
+            const bool port_matches = !claim_port.empty() &&
+                std::find(location.port_paths.begin(), location.port_paths.end(), claim_port) != location.port_paths.end();
+            if (location.device == claim_identity || port_matches) {
+                error = "This disk is already configured as an additional storage location ('" +
+                        (location.name.empty() ? location.id : location.name) + "'). Remove it there first.";
+                return false;
+            }
+        }
     }
 
     std::filesystem::path relative_directory;
@@ -4209,49 +4443,8 @@ bool configure_image_storage(const ServiceConfig& config, const lazarus::BenchPr
     }
 
     std::string selected_volume;
-    if (erase) {
-        std::string mounts;
-        if (!run_program({"lsblk", "-nr", "-o", "MOUNTPOINTS", device.linux_path}, mounts, command_error)) {
-            error = "Could not check whether the selected storage disk is mounted: " + command_error;
-            return false;
-        }
-        if (!trim_copy(mounts).empty()) {
-            error = "The selected storage disk or one of its partitions is mounted. Lazarus refused to erase it.";
-            return false;
-        }
-        std::string output;
-        if (!run_program({"wipefs", "-a", device.linux_path}, output, command_error) ||
-            !run_program({"parted", "-s", "-a", "optimal", device.linux_path, "mklabel", "gpt"}, output, command_error) ||
-            !run_program({"parted", "-s", "-a", "optimal", device.linux_path, "mkpart", "LAZARUS_STORAGE", "ext4", "1MiB", "100%"}, output, command_error)) {
-            error = "Could not create the Lazarus storage partition: " + command_error;
-            return false;
-        }
-        run_program({"partprobe", device.linux_path}, output, command_error);
-        run_program({"udevadm", "settle", "--timeout=15"}, output, command_error);
-        const auto partition = partition_path_for_disk(device.linux_path, 1);
-        for (int attempt = 0; attempt < 30 && !std::filesystem::exists(partition); ++attempt) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        if (!std::filesystem::exists(partition) ||
-            !run_program({"mkfs.ext4", "-F", "-L", "LAZARUS_STORAGE", partition}, output, command_error)) {
-            error = "Could not format the Lazarus storage partition: " + command_error;
-            return false;
-        }
-        // mkfs writes the new superblock immediately, but udev's /dev/disk/by-uuid symlink
-        // (written into bench.profile just below) and blkid's device-change detection both
-        // depend on the kernel's change notification being processed first. Force that
-        // synchronously here instead of racing lazarus-mount-storage's own short retry loop
-        // against it on slower real drives.
-        run_program({"udevadm", "trigger", "--settle", "--action=change", partition}, output, command_error);
-        run_program({"udevadm", "settle", "--timeout=15"}, output, command_error);
-        filesystem = "ext4";
-        selected_volume = partition;
-    } else {
-        selected_volume = supported_storage_volume(device, filesystem);
-        if (selected_volume.empty()) {
-            error = "No supported filesystem was found. Use 'Erase and Prepare' to create dedicated ext4 image storage.";
-            return false;
-        }
+    if (!prepare_local_storage_volume(device, erase, filesystem, selected_volume, error)) {
+        return false;
     }
 
     auto staged = current;
@@ -4263,13 +4456,7 @@ bool configure_image_storage(const ServiceConfig& config, const lazarus::BenchPr
     staged.nas_storage_share.clear();
     staged.nas_storage_username.clear();
     staged.nas_storage_domain.clear();
-    std::string volume_uuid;
-    if (run_program({"blkid", "-p", "-s", "UUID", "-o", "value", selected_volume}, volume_uuid, command_error) &&
-        !trim_copy(volume_uuid).empty()) {
-        staged.image_storage_volume = "/dev/disk/by-uuid/" + trim_copy(volume_uuid);
-    } else {
-        staged.image_storage_volume = selected_volume;
-    }
+    staged.image_storage_volume = resolve_volume_uuid_path(selected_volume);
     auto remove_identity = [&](std::vector<std::string>& entries) {
         std::erase_if(entries, [&](const std::string& value) {
             return value == identity || value == port_identity || matches_device_selector(device, value) ||
@@ -4283,7 +4470,7 @@ bool configure_image_storage(const ServiceConfig& config, const lazarus::BenchPr
     if (!port_identity.empty()) staged.image_storage_port_paths = {port_identity};
 
     staged.image_storage_path = (std::filesystem::path("/mnt/lazarus-storage") / relative_directory).string();
-    staged.image_storage_paths = {staged.image_storage_path};
+    recompute_image_storage_paths(staged);
 
     if (!save_bench_profile(staged, config.bench_path, error)) return false;
 
@@ -4345,11 +4532,11 @@ bool valid_nas_field(const std::string& value, std::size_t limit) {
     return !value.empty() && value.size() <= limit && value.find_first_of("\r\n=") == std::string::npos;
 }
 
-bool configure_nas_storage(const ServiceConfig& config, const lazarus::BenchProfile& current,
-                           const std::string& protocol, const std::string& server,
-                           const std::string& share, const std::string& username,
-                           const std::string& password, const std::string& domain,
-                           const std::string& requested_directory, std::string& error) {
+// Shared by configure_nas_storage (primary) and add_nas_storage_location (extras). Pure
+// extraction of what was configure_nas_storage's inline field validation -- behavior unchanged.
+bool validate_nas_fields(const std::string& protocol, const std::string& server, const std::string& share,
+                          const std::string& username, const std::string& password, const std::string& domain,
+                          std::string& error) {
     if (protocol != "smb" && protocol != "nfs") {
         error = "Choose SMB or NFS as the NAS protocol.";
         return false;
@@ -4386,6 +4573,17 @@ bool configure_nas_storage(const ServiceConfig& config, const lazarus::BenchProf
         error = "SMB storage requires a username and password.";
         return false;
     }
+    return true;
+}
+
+bool configure_nas_storage(const ServiceConfig& config, const lazarus::BenchProfile& current,
+                           const std::string& protocol, const std::string& server,
+                           const std::string& share, const std::string& username,
+                           const std::string& password, const std::string& domain,
+                           const std::string& requested_directory, std::string& error) {
+    if (!validate_nas_fields(protocol, server, share, username, password, domain, error)) {
+        return false;
+    }
 
     std::filesystem::path relative_directory;
     if (!safe_relative_path(requested_directory, relative_directory, error) || relative_directory.empty()) {
@@ -4395,6 +4593,14 @@ bool configure_nas_storage(const ServiceConfig& config, const lazarus::BenchProf
     if (relative_directory.string().size() > 1024) {
         error = "The selected NAS image folder path is too long.";
         return false;
+    }
+    for (const auto& location : current.extra_storage_locations) {
+        if (location.type == "nas" && location.nas_protocol == protocol &&
+            location.nas_server == server && location.nas_share == share) {
+            error = "This NAS share is already configured as an additional storage location ('" +
+                    (location.name.empty() ? location.id : location.name) + "'). Remove it there first.";
+            return false;
+        }
     }
 
     std::string previous_credentials = read_text_file(config.nas_credentials_path);
@@ -4430,7 +4636,7 @@ bool configure_nas_storage(const ServiceConfig& config, const lazarus::BenchProf
     staged.nas_storage_username = protocol == "smb" ? username : "";
     staged.nas_storage_domain = protocol == "smb" ? domain : "";
     staged.image_storage_path = (std::filesystem::path("/mnt/lazarus-storage") / relative_directory).string();
-    staged.image_storage_paths = {staged.image_storage_path};
+    recompute_image_storage_paths(staged);
 
     if (!save_bench_profile(staged, config.bench_path, error)) {
         std::string ignored;
@@ -4471,6 +4677,338 @@ bool configure_nas_storage(const ServiceConfig& config, const lazarus::BenchProf
     return true;
 }
 
+// --- Extra (additional) image storage locations ---------------------------------------------
+//
+// Unlike the primary location above, extras never touch /mnt/lazarus-storage or its
+// appliance-state mirroring; each gets its own mountpoint under /mnt/lazarus-storage-extra/<id>
+// and is mounted via the separate, argv-based lazarus-mount-extra-storage helper so any number
+// of them can be online simultaneously alongside the primary.
+
+std::string extra_nas_credentials_path(const ServiceConfig& config, const std::string& id) {
+    return (std::filesystem::path(config.nas_credentials_path).parent_path() /
+            ("nas-storage." + id + ".auth")).string();
+}
+
+bool add_local_storage_location(const ServiceConfig& config, const lazarus::BenchProfile& current,
+                                 const lazarus::DeviceIdentity& device, bool erase,
+                                 const std::string& requested_directory, const std::string& requested_name,
+                                 bool set_default, std::string& error) {
+    if (device.is_system_disk) {
+        error = "The running Lazarus system disk cannot be used as image storage.";
+        return false;
+    }
+    if (device.bench_role == lazarus::DeviceRole::SourceOnly) {
+        error = "A source-only customer drive cannot be used as image storage.";
+        return false;
+    }
+    if (device.size_bytes == 0) {
+        error = "The selected disk reports zero capacity and cannot be prepared as image storage.";
+        return false;
+    }
+    const auto identity = identity_for_profile(device);
+    const auto port_identity = port_identity_for_profile(device);
+    const bool claims_primary = current.image_storage_device == identity ||
+        (!port_identity.empty() &&
+         std::find(current.image_storage_port_paths.begin(), current.image_storage_port_paths.end(), port_identity) !=
+             current.image_storage_port_paths.end());
+    if (claims_primary) {
+        error = "This disk is already configured as the primary image storage location.";
+        return false;
+    }
+    for (const auto& location : current.extra_storage_locations) {
+        const bool port_matches = !port_identity.empty() &&
+            std::find(location.port_paths.begin(), location.port_paths.end(), port_identity) != location.port_paths.end();
+        if (location.device == identity || port_matches) {
+            error = "This disk is already configured as an additional storage location ('" +
+                    (location.name.empty() ? location.id : location.name) + "').";
+            return false;
+        }
+    }
+
+    if (requested_directory.find_first_of("\r\n=") != std::string::npos) {
+        error = "The selected image-storage folder contains unsupported characters.";
+        return false;
+    }
+    std::filesystem::path relative_directory;
+    if (!safe_relative_path(requested_directory, relative_directory, error) || relative_directory.empty()) {
+        if (error.empty()) error = "Choose a folder on the storage disk for Lazarus images.";
+        return false;
+    }
+    if (relative_directory.string().size() > 1024) {
+        error = "The selected image-storage folder path is too long.";
+        return false;
+    }
+    if (requested_name.find_first_of("\r\n=") != std::string::npos || requested_name.size() > 255) {
+        error = "The storage location name contains unsupported characters.";
+        return false;
+    }
+
+    std::string filesystem;
+    std::string selected_volume;
+    if (!prepare_local_storage_volume(device, erase, filesystem, selected_volume, error)) {
+        return false;
+    }
+
+    lazarus::StorageLocation location;
+    location.id = "extra-" + random_hex(8);
+    location.name = requested_name.empty() ? ("Local Drive (" + device.model + ")") : requested_name;
+    location.type = "local";
+    location.device = identity;
+    location.volume = resolve_volume_uuid_path(selected_volume);
+    if (!port_identity.empty()) location.port_paths = {port_identity};
+    location.folder = relative_directory.string();
+    location.is_default = set_default;
+
+    auto staged = current;
+    if (set_default) {
+        for (auto& other : staged.extra_storage_locations) other.is_default = false;
+        staged.default_storage_location_id = location.id;
+    }
+    staged.extra_storage_locations.push_back(location);
+    recompute_image_storage_paths(staged);
+
+    if (!save_bench_profile(staged, config.bench_path, error)) return false;
+
+    const auto mount_target = extra_storage_mount_target(location.id);
+    std::string mount_output;
+    std::string mount_error;
+    if (!run_extra_storage_helper(config,
+            {"--id", location.id, "--target", mount_target, "--folder", location.folder,
+             "--type", "local", "--device", location.device, "--volume", location.volume},
+            mount_output, mount_error) ||
+        !path_is_mountpoint(mount_target)) {
+        std::string ignored;
+        save_bench_profile(current, config.bench_path, ignored);
+        error = "The storage filesystem was prepared but could not be mounted: " + mount_error;
+        if (!mount_output.empty()) error += " " + trim_copy(mount_output);
+        return false;
+    }
+    return true;
+}
+
+bool add_nas_storage_location(const ServiceConfig& config, const lazarus::BenchProfile& current,
+                               const std::string& protocol, const std::string& server, const std::string& share,
+                               const std::string& username, const std::string& password, const std::string& domain,
+                               const std::string& requested_directory, const std::string& requested_name,
+                               bool set_default, std::string& error) {
+    if (!validate_nas_fields(protocol, server, share, username, password, domain, error)) {
+        return false;
+    }
+    std::filesystem::path relative_directory;
+    if (!safe_relative_path(requested_directory, relative_directory, error) || relative_directory.empty()) {
+        if (error.empty()) error = "Choose a folder inside the NAS share for Lazarus images.";
+        return false;
+    }
+    if (relative_directory.string().size() > 1024) {
+        error = "The selected NAS image folder path is too long.";
+        return false;
+    }
+    if (requested_name.find_first_of("\r\n=") != std::string::npos || requested_name.size() > 255) {
+        error = "The storage location name contains unsupported characters.";
+        return false;
+    }
+    const bool claims_primary = !current.nas_storage_protocol.empty() && current.nas_storage_protocol == protocol &&
+        current.nas_storage_server == server && current.nas_storage_share == share;
+    if (claims_primary) {
+        error = "This NAS share is already configured as the primary image storage location.";
+        return false;
+    }
+    for (const auto& location : current.extra_storage_locations) {
+        if (location.type == "nas" && location.nas_protocol == protocol &&
+            location.nas_server == server && location.nas_share == share) {
+            error = "This NAS share is already configured as an additional storage location ('" +
+                    (location.name.empty() ? location.id : location.name) + "').";
+            return false;
+        }
+    }
+
+    lazarus::StorageLocation location;
+    location.id = "extra-" + random_hex(8);
+    location.name = requested_name.empty() ? ("Network Storage (" + server + ")") : requested_name;
+    location.type = "nas";
+    location.nas_protocol = protocol;
+    location.nas_server = server;
+    location.nas_share = share;
+    location.nas_username = protocol == "smb" ? username : "";
+    location.nas_domain = protocol == "smb" ? domain : "";
+    location.folder = relative_directory.string();
+    location.is_default = set_default;
+
+    const auto credential_path = extra_nas_credentials_path(config, location.id);
+    if (protocol == "smb") {
+        std::string credential_contents = "username=" + username + "\npassword=" + password + "\n";
+        if (!domain.empty()) credential_contents += "domain=" + domain + "\n";
+        if (!write_private_file(credential_path, credential_contents, error)) {
+            return false;
+        }
+    }
+
+    auto staged = current;
+    if (set_default) {
+        for (auto& other : staged.extra_storage_locations) other.is_default = false;
+        staged.default_storage_location_id = location.id;
+    }
+    staged.extra_storage_locations.push_back(location);
+    recompute_image_storage_paths(staged);
+
+    if (!save_bench_profile(staged, config.bench_path, error)) {
+        if (protocol == "smb") {
+            std::error_code remove_error;
+            std::filesystem::remove(credential_path, remove_error);
+        }
+        return false;
+    }
+
+    const auto mount_target = extra_storage_mount_target(location.id);
+    std::vector<std::string> args = {"--id", location.id, "--target", mount_target, "--folder", location.folder,
+                                      "--type", "nas", "--protocol", protocol, "--server", server, "--share", share};
+    if (protocol == "smb") {
+        args.push_back("--credentials");
+        args.push_back(credential_path);
+    }
+    std::string mount_output;
+    std::string mount_error;
+    if (!run_extra_storage_helper(config, args, mount_output, mount_error) || !path_is_mountpoint(mount_target)) {
+        std::string ignored;
+        save_bench_profile(current, config.bench_path, ignored);
+        if (protocol == "smb") {
+            std::error_code remove_error;
+            std::filesystem::remove(credential_path, remove_error);
+        }
+        error = "The NAS settings were not saved because the share could not be mounted read-write. " + mount_error;
+        if (!mount_output.empty()) error += " " + trim_copy(mount_output);
+        return false;
+    }
+    return true;
+}
+
+bool remove_storage_location(const ServiceConfig& config, const lazarus::BenchProfile& current,
+                              const std::string& id, std::string& error) {
+    auto staged = current;
+    const auto found = std::find_if(staged.extra_storage_locations.begin(), staged.extra_storage_locations.end(),
+                                     [&](const lazarus::StorageLocation& location) { return location.id == id; });
+    if (found == staged.extra_storage_locations.end()) {
+        error = "That storage location was not found.";
+        return false;
+    }
+    const auto mount_target = extra_storage_mount_target(id);
+    if (path_is_mountpoint(mount_target)) {
+        std::string output;
+        std::string unmount_error;
+        run_program({"sync"}, output, unmount_error);
+        run_program({"umount", mount_target}, output, unmount_error);
+    }
+    if (found->type == "nas" && found->nas_protocol == "smb") {
+        std::error_code remove_error;
+        std::filesystem::remove(extra_nas_credentials_path(config, id), remove_error);
+    }
+    const bool was_default = staged.default_storage_location_id == id;
+    staged.extra_storage_locations.erase(found);
+    if (was_default) staged.default_storage_location_id.clear();
+    recompute_image_storage_paths(staged);
+    return save_bench_profile(staged, config.bench_path, error);
+}
+
+bool mount_storage_location(const ServiceConfig& config, const lazarus::BenchProfile& current,
+                             const std::string& id, std::string& error) {
+    const auto found = std::find_if(current.extra_storage_locations.begin(), current.extra_storage_locations.end(),
+                                     [&](const lazarus::StorageLocation& location) { return location.id == id; });
+    if (found == current.extra_storage_locations.end()) {
+        error = "That storage location was not found.";
+        return false;
+    }
+    const auto mount_target = extra_storage_mount_target(id);
+    if (path_is_mountpoint(mount_target)) return true;
+    std::vector<std::string> args = {"--id", found->id, "--target", mount_target,
+                                      "--folder", found->folder, "--type", found->type};
+    if (found->type == "nas") {
+        args.insert(args.end(), {"--protocol", found->nas_protocol, "--server", found->nas_server, "--share", found->nas_share});
+        if (found->nas_protocol == "smb") {
+            args.push_back("--credentials");
+            args.push_back(extra_nas_credentials_path(config, id));
+        }
+    } else {
+        args.insert(args.end(), {"--device", found->device, "--volume", found->volume});
+    }
+    std::string output;
+    if (!run_extra_storage_helper(config, args, output, error) || !path_is_mountpoint(mount_target)) {
+        if (error.empty()) error = "Could not mount the storage location.";
+        if (!output.empty()) error += " " + trim_copy(output);
+        return false;
+    }
+    return true;
+}
+
+bool unmount_storage_location(const std::string& id, std::string& error) {
+    const auto mount_target = extra_storage_mount_target(id);
+    if (!path_is_mountpoint(mount_target)) return true;
+    std::string output;
+    run_program({"sync"}, output, error);
+    if (!run_program({"umount", mount_target}, output, error)) {
+        error = "Storage location is busy and could not be unmounted: " + error;
+        return false;
+    }
+    return true;
+}
+
+bool set_default_storage_location(const ServiceConfig& config, const lazarus::BenchProfile& current,
+                                   const std::string& id, std::string& error) {
+    auto staged = current;
+    if (!id.empty()) {
+        const auto found = std::find_if(staged.extra_storage_locations.begin(), staged.extra_storage_locations.end(),
+                                         [&](const lazarus::StorageLocation& location) { return location.id == id; });
+        if (found == staged.extra_storage_locations.end()) {
+            error = "That storage location was not found.";
+            return false;
+        }
+    }
+    for (auto& location : staged.extra_storage_locations) location.is_default = (location.id == id);
+    staged.default_storage_location_id = id;
+    return save_bench_profile(staged, config.bench_path, error);
+}
+
+std::string local_storage_detail(const lazarus::BenchProfile& bench, const std::string& selector) {
+    std::string detail = selector;
+    if (const auto device = find_device(bench, selector); device && device->link_speed_mbps != 0) {
+        detail += " | USB link " + std::to_string(device->link_speed_mbps) + " Mb/s";
+        if (device->link_speed_mbps <= 480) {
+            detail += " | USB 2.0-speed link; try another port or cable";
+        }
+    }
+    return detail;
+}
+
+std::string storage_location_type_detail(const lazarus::BenchProfile& bench,
+                                         const lazarus::StorageLocation& location) {
+    if (location.type == "nas") {
+        return location.nas_protocol + "://" + location.nas_server + "/" + location.nas_share;
+    }
+    return local_storage_detail(bench, location.device);
+}
+
+// Tab/newline "rows text" JSON string, matching the convention already used for
+// devices_rows/ports_rows/backups_rows: id, name, type, is_default, online, path, detail.
+std::string storage_locations_rows_text(const lazarus::BenchProfile& bench) {
+    std::string rows;
+    if (!bench.image_storage_device.empty() || !bench.nas_storage_protocol.empty()) {
+        const auto detail = !bench.nas_storage_protocol.empty()
+            ? bench.nas_storage_protocol + "://" + bench.nas_storage_server + "/" + bench.nas_storage_share
+            : local_storage_detail(bench, bench.image_storage_device);
+        const bool is_default = bench.default_storage_location_id.empty();
+        rows += "primary\tPrimary Storage\t" + std::string(!bench.nas_storage_protocol.empty() ? "nas" : "local") +
+                "\t" + (is_default ? "1" : "0") + "\t" + (image_storage_online(bench) ? "1" : "0") +
+                "\t" + bench.image_storage_path + "\t" + detail + "\n";
+    }
+    for (const auto& location : bench.extra_storage_locations) {
+        const bool is_default = bench.default_storage_location_id == location.id;
+        const bool online = path_is_mountpoint(extra_storage_mount_target(location.id));
+        rows += location.id + "\t" + (location.name.empty() ? location.id : location.name) + "\t" + location.type +
+                "\t" + (is_default ? "1" : "0") + "\t" + (online ? "1" : "0") +
+                "\t" + extra_storage_image_path(location) + "\t" + storage_location_type_detail(bench, location) + "\n";
+    }
+    return rows;
+}
+
 std::string device_json(const lazarus::BenchProfile& bench, const lazarus::DeviceIdentity& device) {
     const auto safety = disconnect_state(bench, device);
     return "{\"linux_path\":" + quote(device.linux_path) +
@@ -4483,6 +5021,7 @@ std::string device_json(const lazarus::BenchProfile& bench, const lazarus::Devic
            ",\"serial\":" + quote(device.serial) +
            ",\"serial_ending\":" + quote(device.serial_ending) +
            ",\"transport\":" + quote(device.transport) +
+           ",\"link_speed_mbps\":" + std::to_string(device.link_speed_mbps) +
            ",\"size_bytes\":" + std::to_string(device.size_bytes) +
            ",\"logical_block_size\":" + std::to_string(device.logical_block_size) +
            ",\"role\":" + quote(lazarus::to_string(device.bench_role)) +
@@ -5279,7 +5818,8 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                               ",\"ports_rows\":" + quote(port_rows_text(bench)) +
                               ",\"backups_rows\":" + quote(backup_rows_text(stored_backups)) +
                               ",\"tickets_rows\":" + quote(ticket_rows_text(config, stored_backups)) +
-                              ",\"activity_rows\":" + quote(activity_rows_text(config)));
+                              ",\"activity_rows\":" + quote(activity_rows_text(config)) +
+                              ",\"storage_locations_rows\":" + quote(storage_locations_rows_text(bench)));
     }
     if (command == "save_profile") {
         if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
@@ -5662,6 +6202,131 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                               ",\"ports_rows\":" + quote(port_rows_text(configured)) +
                               ",\"storage_online\":true");
     }
+    if (command == "add_local_storage_location") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        const auto selector = extract_json_string(request, "selector");
+        const auto mode = extract_json_string(request, "mode");
+        auto directory = extract_json_string(request, "directory");
+        if (directory.empty()) directory = "images";
+        const auto name = trim_copy(extract_json_string(request, "name"));
+        const bool set_default = extract_json_string(request, "set_default") == "1";
+        if (selector.empty()) return error_json(command, "Select a detected physical disk first.");
+        const bool format = mode == "format" || mode == "erase";
+        if (mode != "existing" && !format) {
+            return error_json(command, "Storage mode must be existing or format.");
+        }
+        if (format && extract_json_string(request, "confirmation") != "ERASE") {
+            return error_json(command, "Type ERASE before formatting the entire storage disk.");
+        }
+        const auto device = find_device(bench, selector);
+        if (!device) return error_json(command, "The selected storage disk is no longer connected.");
+        std::string error;
+        if (!release_generic_mount_for_storage(*device, error)) {
+            return error_json(command, error);
+        }
+        DeviceActivityGuard activity(*device, format ? "format additional storage" : "mount additional storage");
+        if (!activity.acquired()) {
+            return error_json(command, "The selected disk is already in use by another Lazarus operation.");
+        }
+        activity.phase(format ? "erase, partition, and format" : "inspect filesystem");
+        std::lock_guard storage_lock(storage_locations_mutex);
+        const auto fresh = lazarus::load_bench_profile(config.bench_path);
+        if (!add_local_storage_location(config, fresh, *device, format, directory, name, set_default, error)) {
+            return error_json(command, error);
+        }
+        const auto configured = lazarus::load_bench_profile(config.bench_path);
+        return final_json(true, command,
+                          "\"message\":\"The additional storage location was prepared and mounted.\"," +
+                          std::string("\"storage_locations_rows\":") + quote(storage_locations_rows_text(configured)));
+    }
+    if (command == "add_nas_storage_location") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        auto directory = extract_json_string(request, "directory");
+        if (directory.empty()) directory = "images";
+        const auto name = trim_copy(extract_json_string(request, "name"));
+        const bool set_default = extract_json_string(request, "set_default") == "1";
+        std::string error;
+        std::lock_guard storage_lock(storage_locations_mutex);
+        const auto fresh = lazarus::load_bench_profile(config.bench_path);
+        if (!add_nas_storage_location(config, fresh,
+                                      lower_ascii(extract_json_string(request, "protocol")),
+                                      trim_copy(extract_json_string(request, "server")),
+                                      trim_copy(extract_json_string(request, "share")),
+                                      extract_json_string(request, "username"),
+                                      extract_json_string(request, "password"),
+                                      extract_json_string(request, "domain"), directory, name, set_default, error)) {
+            return error_json(command, error);
+        }
+        const auto configured = lazarus::load_bench_profile(config.bench_path);
+        return final_json(true, command,
+                          "\"message\":\"The additional NAS location was tested and mounted read-write.\"," +
+                          std::string("\"storage_locations_rows\":") + quote(storage_locations_rows_text(configured)));
+    }
+    if (command == "remove_storage_location") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        const auto id = extract_json_string(request, "id");
+        if (id.empty()) return error_json(command, "Select a storage location to remove.");
+        std::string error;
+        std::lock_guard storage_lock(storage_locations_mutex);
+        const auto fresh = lazarus::load_bench_profile(config.bench_path);
+        if (!remove_storage_location(config, fresh, id, error)) {
+            return error_json(command, error);
+        }
+        const auto configured = lazarus::load_bench_profile(config.bench_path);
+        return final_json(true, command,
+                          "\"message\":\"The storage location was removed.\"," +
+                          std::string("\"storage_locations_rows\":") + quote(storage_locations_rows_text(configured)));
+    }
+    if (command == "mount_storage_location") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        const auto id = extract_json_string(request, "id");
+        if (id.empty()) return error_json(command, "Select a storage location to mount.");
+        std::string error;
+        if (!mount_storage_location(config, bench, id, error)) {
+            return error_json(command, error);
+        }
+        return final_json(true, command,
+                          "\"message\":\"The storage location is mounted and ready.\"," +
+                          std::string("\"storage_locations_rows\":") + quote(storage_locations_rows_text(bench)));
+    }
+    if (command == "unmount_storage_location") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        const auto id = extract_json_string(request, "id");
+        if (id.empty()) return error_json(command, "Select a storage location to unmount.");
+        std::string error;
+        if (!unmount_storage_location(id, error)) {
+            return error_json(command, error);
+        }
+        return final_json(true, command,
+                          "\"message\":\"The storage location was flushed and unmounted.\"," +
+                          std::string("\"storage_locations_rows\":") + quote(storage_locations_rows_text(bench)));
+    }
+    if (command == "set_default_storage_location") {
+        if (!validate_admin_session(extract_json_string(request, "admin_token"))) {
+            return error_json(command, "Admin authentication is required or has expired.");
+        }
+        const auto id = extract_json_string(request, "id");
+        std::string error;
+        std::lock_guard storage_lock(storage_locations_mutex);
+        const auto fresh = lazarus::load_bench_profile(config.bench_path);
+        if (!set_default_storage_location(config, fresh, id, error)) {
+            return error_json(command, error);
+        }
+        const auto configured = lazarus::load_bench_profile(config.bench_path);
+        return final_json(true, command,
+                          "\"message\":\"The default storage location was updated.\"," +
+                          std::string("\"storage_locations_rows\":") + quote(storage_locations_rows_text(configured)));
+    }
     if (command == "devices") {
         const auto devices = lazarus::apply_bench_policy(bench, lazarus::discover_block_devices());
         std::string device_list = "[";
@@ -5691,6 +6356,7 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
         return final_json(true, command, "\"tickets_rows\":" + quote(ticket_rows_text(config, bench)));
     }
     if (command == "driver_plan" || command == "driver_apply_offline") {
+        const auto image_directory = extract_json_string(request, "image_directory");
         auto package_paths = split_lines(extract_json_string(request, "package_paths_text"));
         lazarus::DriverMigrationPlanOptions plan_options;
         plan_options.target_hardware_ids = split_lines(extract_json_string(request, "hardware_ids_text"));
@@ -5717,7 +6383,18 @@ std::string handle_request(const ServiceConfig& config, const std::string& reque
                     "Lazarus could not identify the PCI storage controller that owns the destination disk. "
                     "Install the destination internally in the replacement computer, or load a replacement-hardware profile.");
             }
-            package_paths = automatic_driver_package_paths(bench);
+            // Each backup keeps its own driver set under <image_directory>/AUR, seeded once from
+            // the configured DriverVault(s) and reused on later Universal Restore runs against
+            // the same backup so it stays reproducible even if the global vault changes later.
+            if (!image_directory.empty()) {
+                std::string vault_error;
+                if (!ensure_backup_driver_vault(bench, image_directory, vault_error)) {
+                    return error_json(command, "Could not prepare the backup's driver folder: " + vault_error);
+                }
+                package_paths = backup_driver_package_paths(image_directory);
+            } else {
+                package_paths = automatic_driver_package_paths(bench);
+            }
             if (package_paths.empty()) {
                 return error_json(command,
                     "No extracted INF packages were found beneath DriverVault in configured image storage. "

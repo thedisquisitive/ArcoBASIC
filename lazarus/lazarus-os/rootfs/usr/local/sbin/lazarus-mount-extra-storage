@@ -1,0 +1,182 @@
+#!/bin/sh
+set -eu
+
+# Mounts a single additional ("extra") image storage location at its own mountpoint under
+# /mnt/lazarus-storage-extra/<id>. Unlike lazarus-mount-storage (the primary location, which also
+# mirrors appliance state such as bench.profile/admin.auth across live-boot reboots), this script
+# is purely argv-driven and never touches appliance state -- it exists so any number of extra
+# locations can be mounted simultaneously alongside the primary without interfering with it.
+
+id=""
+mount_target=""
+folder="images"
+type=""
+device=""
+volume=""
+protocol=""
+server=""
+share=""
+credentials=""
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--id) id="$2"; shift 2 ;;
+		--target) mount_target="$2"; shift 2 ;;
+		--folder) folder="$2"; shift 2 ;;
+		--type) type="$2"; shift 2 ;;
+		--device) device="$2"; shift 2 ;;
+		--volume) volume="$2"; shift 2 ;;
+		--protocol) protocol="$2"; shift 2 ;;
+		--server) server="$2"; shift 2 ;;
+		--share) share="$2"; shift 2 ;;
+		--credentials) credentials="$2"; shift 2 ;;
+		*) echo "Unknown argument: $1" >&2; exit 1 ;;
+	esac
+done
+
+if [ -z "$id" ] || [ -z "$mount_target" ] || [ -z "$type" ]; then
+	echo "usage: lazarus-mount-extra-storage --id ID --target PATH --folder FOLDER --type local|nas ..." >&2
+	exit 1
+fi
+
+case "$mount_target" in
+	/mnt/lazarus-storage-extra/*) ;;
+	*) echo "Refusing to mount an extra storage location outside /mnt/lazarus-storage-extra: $mount_target" >&2; exit 1 ;;
+esac
+
+mkdir -p /run/arcology-lazarus
+lockfile="/run/arcology-lazarus/storage-mount-extra-$id.lock"
+exec 9>"$lockfile"
+if ! flock -w 2 9; then
+	echo "Another mount attempt for this storage location is already running." >&2
+	exit 1
+fi
+
+case "/${folder}/" in
+	*/../*|*/./*) echo "Lazarus image-storage folder is unsafe: $folder" >&2; exit 1 ;;
+esac
+image_directory="$mount_target/$folder"
+mkdir -p "$mount_target"
+
+make_extra_storage_portable() {
+	mkdir -p "$image_directory"
+	resolved_image_directory="$(readlink -f "$image_directory")"
+	case "$resolved_image_directory" in
+		"$mount_target"/*) ;;
+		*) echo "Lazarus image-storage folder resolves outside the storage disk: $image_directory" >&2; return 1 ;;
+	esac
+	chgrp lazarus "$mount_target" "$image_directory"
+	chmod 0755 "$mount_target"
+	chmod 0775 "$image_directory"
+	find "$image_directory" -xdev -type d -exec chmod a+rx,o-w {} +
+	find "$image_directory" -xdev -type f -exec chmod a+r,o-w {} +
+}
+
+if mountpoint -q "$mount_target"; then
+	if [ "$type" = local ]; then
+		make_extra_storage_portable
+	fi
+	echo "lazarus-storage-extra: already mounted at $mount_target" >/dev/ttyS0 2>/dev/null || true
+	exit 0
+fi
+
+if [ "$type" = nas ]; then
+	if [ -z "$server" ] || [ -z "$share" ]; then
+		echo "Lazarus additional NAS storage configuration is incomplete." >&2
+		exit 1
+	fi
+	case "$protocol" in
+		smb)
+			if [ -z "$credentials" ] || [ ! -f "$credentials" ]; then
+				echo "Lazarus SMB credentials are unavailable: $credentials" >&2
+				exit 1
+			fi
+			chmod 0600 "$credentials"
+			timeout -s KILL 10 mount -t cifs "//$server/$share" "$mount_target" \
+				-o "credentials=$credentials,rw,nosuid,nodev,iocharset=utf8,file_mode=0660,dir_mode=0770"
+			;;
+		nfs)
+			timeout -s KILL 10 mount -t nfs "$server:$share" "$mount_target" \
+				-o rw,nosuid,nodev,retry=1,timeo=20,retrans=2
+			;;
+		*)
+			echo "Unsupported Lazarus NAS protocol: $protocol" >&2
+			exit 1
+			;;
+	esac
+	if ! mkdir -p "$image_directory" || [ ! -w "$image_directory" ]; then
+		echo "The configured NAS image folder is not writable: $image_directory" >&2
+		umount "$mount_target" 2>/dev/null || true
+		exit 1
+	fi
+	echo "lazarus-storage-extra: mounted NAS $protocol storage at $mount_target" >/dev/ttyS0 2>/dev/null || true
+	exit 0
+fi
+
+if [ "$type" != local ]; then
+	echo "Unsupported Lazarus additional storage type: $type" >&2
+	exit 1
+fi
+
+if [ -z "$device" ]; then
+	echo "lazarus-storage-extra: no device configured for $id" >/dev/ttyS0 2>/dev/null || true
+	exit 1
+fi
+
+for _ in $(seq 1 40); do
+	[ -b "$device" ] && break
+	sleep 0.25
+done
+
+if [ ! -b "$device" ]; then
+	echo "Lazarus additional storage device is not currently connected: $device" >&2
+	echo "lazarus-storage-extra: device missing: $device" >/dev/ttyS0 2>/dev/null || true
+	exit 1
+fi
+
+resolved_device="$(readlink -f "$device")"
+if [ ! -b "$resolved_device" ]; then
+	echo "Lazarus additional storage identity did not resolve to a block device: $device" >&2
+	exit 1
+fi
+
+partition=""
+if [ -n "$volume" ]; then
+	for _ in $(seq 1 20); do
+		[ -b "$volume" ] && break
+		sleep 0.1
+	done
+	[ -b "$volume" ] && partition="$(readlink -f "$volume")"
+fi
+if [ -z "$partition" ]; then
+	partition="$resolved_device"
+	case "$resolved_device" in
+		/dev/nvme*n*|/dev/mmcblk*|/dev/loop*|/dev/nbd*) candidate="${resolved_device}p1" ;;
+		*) candidate="${resolved_device}1" ;;
+	esac
+	if [ -b "$candidate" ]; then
+		partition="$candidate"
+	fi
+fi
+
+if ! modprobe ext4 2>/dev/null; then :; fi
+if ! modprobe vfat 2>/dev/null; then :; fi
+if ! modprobe exfat 2>/dev/null; then :; fi
+if ! modprobe ntfs3 2>/dev/null; then :; fi
+
+# -p forces a fresh low-level probe instead of trusting blkid's cache, matching
+# lazarus-mount-storage's rationale: a disk assigned and formatted earlier in a previous session
+# must not depend on that cache already agreeing with reality.
+if ! blkid -p "$partition" >/dev/null 2>&1; then
+	echo "Lazarus additional storage target has no filesystem: $partition" >&2
+	echo "Format it as ext4 from the administrator workflow before using it." >&2
+	echo "lazarus-storage-extra: filesystem missing on $partition" >/dev/ttyS0 2>/dev/null || true
+	exit 1
+fi
+
+mount -o rw,nosuid,nodev "$partition" "$mount_target"
+if ! make_extra_storage_portable; then
+	umount "$mount_target" 2>/dev/null || true
+	exit 1
+fi
+echo "lazarus-storage-extra: mounted $partition at $mount_target" >/dev/ttyS0 2>/dev/null || true

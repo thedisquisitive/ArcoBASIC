@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <list>
@@ -445,6 +446,31 @@ std::string detect_transport(const fs::path& disk_path) {
         return "sata";
     }
     return "";
+}
+
+std::uint64_t detect_usb_link_speed_mbps(const fs::path& disk_path) {
+    std::error_code error;
+    auto current = fs::canonical(disk_path, error);
+    if (error) {
+        return 0;
+    }
+
+    // A block device normally resolves below a USB interface directory such as
+    // 2-1:1.0.  The negotiated speed belongs to its parent USB device (2-1).
+    // Walking upward also handles hubs without relying on a particular SCSI
+    // host/target directory layout.
+    while (!current.empty() && current != current.root_path()) {
+        const auto speed = read_u64_file(current / "speed");
+        if (speed != 0) {
+            return speed;
+        }
+        const auto parent = current.parent_path();
+        if (parent == current) {
+            break;
+        }
+        current = parent;
+    }
+    return 0;
 }
 
 std::vector<std::string> list_partitions(const fs::path& disk_path, const std::string& disk) {
@@ -1796,7 +1822,11 @@ bool LogicalImageReader::read_at(std::uint64_t offset, std::size_t byte_count,
 }
 
 SourceReadHandle::SourceReadHandle(int fd, DeviceIdentity device)
-    : fd_(fd), device_(std::move(device)) {}
+    : fd_(fd), device_(std::move(device)) {
+    if (fd_ >= 0) {
+        (void)::posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+    }
+}
 
 SourceReadHandle::~SourceReadHandle() {
     close();
@@ -1834,13 +1864,24 @@ SourceRead SourceReadHandle::read_at(std::uint64_t offset, std::size_t byte_coun
     }
 
     result.data.resize(byte_count);
-    const auto bytes_read = ::pread(fd_, result.data.data(), result.data.size(), static_cast<off_t>(offset));
-    if (bytes_read < 0) {
-        result.data.clear();
-        result.error = std::strerror(errno);
-        return result;
+    std::size_t completed = 0;
+    while (completed < byte_count) {
+        const auto bytes_read = ::pread(fd_, result.data.data() + completed, byte_count - completed,
+                                        static_cast<off_t>(offset + completed));
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            result.data.clear();
+            result.error = std::strerror(errno);
+            return result;
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+        completed += static_cast<std::size_t>(bytes_read);
     }
-    result.data.resize(static_cast<std::size_t>(bytes_read));
+    result.data.resize(completed);
     return result;
 }
 
@@ -2206,6 +2247,46 @@ BenchProfile load_bench_profile(const std::string& path) {
             bench.nas_storage_username = value;
         } else if (key == "nas_storage_domain") {
             bench.nas_storage_domain = value;
+        } else if (key == "default_storage_location_id") {
+            bench.default_storage_location_id = value;
+        } else if (key == "storage.count") {
+            std::size_t count = 0;
+            try { count = static_cast<std::size_t>(std::stoul(value)); } catch (...) {}
+            if (bench.extra_storage_locations.size() < count) {
+                bench.extra_storage_locations.resize(count);
+            }
+        } else if (key.rfind("storage.", 0) == 0) {
+            const auto rest = key.substr(8);
+            const auto dot = rest.find('.');
+            if (dot != std::string::npos) {
+                std::size_t index = 0;
+                bool valid_index = true;
+                try {
+                    index = static_cast<std::size_t>(std::stoul(rest.substr(0, dot)));
+                } catch (...) {
+                    valid_index = false;
+                }
+                if (valid_index) {
+                    const auto field = rest.substr(dot + 1);
+                    if (bench.extra_storage_locations.size() <= index) {
+                        bench.extra_storage_locations.resize(index + 1);
+                    }
+                    auto& location = bench.extra_storage_locations[index];
+                    if (field == "id") location.id = value;
+                    else if (field == "name") location.name = value;
+                    else if (field == "default") location.is_default = (value == "1");
+                    else if (field == "type") location.type = value;
+                    else if (field == "device") location.device = value;
+                    else if (field == "volume") location.volume = value;
+                    else if (field == "port_path") location.port_paths.push_back(value);
+                    else if (field == "nas_protocol") location.nas_protocol = value;
+                    else if (field == "nas_server") location.nas_server = value;
+                    else if (field == "nas_share") location.nas_share = value;
+                    else if (field == "nas_username") location.nas_username = value;
+                    else if (field == "nas_domain") location.nas_domain = value;
+                    else if (field == "folder") location.folder = value;
+                }
+            }
         } else if (key == "source") {
             bench.source_only_paths.push_back(value);
         } else if (key == "destination") {
@@ -2983,35 +3064,70 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
     }
     const auto empty_stored_hash = zero_sha256_hex(0);
 
-    while (source_size == 0 || offset < source_size) {
-        const auto remaining = source_size == 0 ? static_cast<std::uint64_t>(options.chunk_size) : std::min<std::uint64_t>(options.chunk_size, source_size - offset);
-        if (remaining == 0) {
-            break;
-        }
-
-        std::vector<std::byte> chunk_data;
-        const auto unreadable_before = result.unreadable_ranges.size();
-        std::string read_error;
-        if (offset < partition_table.size()) {
-            const auto cached = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, partition_table.size() - offset));
-            chunk_data.insert(chunk_data.end(), partition_table.begin() + static_cast<std::ptrdiff_t>(offset),
-                              partition_table.begin() + static_cast<std::ptrdiff_t>(offset + cached));
-            if (cached < remaining) {
+    struct PendingChunkRead {
+        std::uint64_t offset = 0;
+        std::uint64_t expected_size = 0;
+        std::vector<std::byte> data;
+        std::vector<UnreadableRange> unreadable_ranges;
+        std::string error;
+        bool succeeded = false;
+    };
+    const auto read_chunk = [&](std::uint64_t read_offset, std::uint64_t read_size) {
+        PendingChunkRead pending;
+        pending.offset = read_offset;
+        pending.expected_size = read_size;
+        if (read_offset < partition_table.size()) {
+            const auto cached = static_cast<std::size_t>(
+                std::min<std::uint64_t>(read_size, partition_table.size() - read_offset));
+            pending.data.insert(pending.data.end(),
+                                partition_table.begin() + static_cast<std::ptrdiff_t>(read_offset),
+                                partition_table.begin() + static_cast<std::ptrdiff_t>(read_offset + cached));
+            if (cached < read_size) {
                 std::vector<std::byte> tail;
-                if (!read_source_with_policy(source, offset + cached, static_cast<std::size_t>(remaining - cached), options,
-                                             tail, result.unreadable_ranges, read_error)) {
-                    result.findings.push_back(finding(Severity::Blocker, "image.chunk_read_failed", "Lazarus could not read a source chunk.", read_error));
-                    log << "Read failed at offset " << offset + cached << ": " << read_error << "\n";
-                    return result;
+                pending.succeeded = read_source_with_policy(
+                    source, read_offset + cached, static_cast<std::size_t>(read_size - cached), options,
+                    tail, pending.unreadable_ranges, pending.error);
+                if (pending.succeeded) {
+                    pending.data.insert(pending.data.end(), tail.begin(), tail.end());
                 }
-                chunk_data.insert(chunk_data.end(), tail.begin(), tail.end());
+            } else {
+                pending.succeeded = true;
             }
-        } else if (!read_source_with_policy(source, offset, static_cast<std::size_t>(remaining), options, chunk_data, result.unreadable_ranges, read_error)) {
-            result.findings.push_back(finding(Severity::Blocker, "image.chunk_read_failed", "Lazarus could not read a source chunk.", read_error));
-            log << "Read failed at offset " << offset << ": " << read_error << "\n";
+        } else {
+            pending.succeeded = read_source_with_policy(
+                source, read_offset, static_cast<std::size_t>(read_size), options,
+                pending.data, pending.unreadable_ranges, pending.error);
+        }
+        return pending;
+    };
+    const auto chunk_length_at = [&](std::uint64_t read_offset) {
+        return source_size == 0
+            ? static_cast<std::uint64_t>(options.chunk_size)
+            : std::min<std::uint64_t>(options.chunk_size, source_size - read_offset);
+    };
+    const auto launch_read = [&](std::uint64_t read_offset, std::uint64_t read_size) {
+        return std::async(std::launch::async, read_chunk, read_offset, read_size);
+    };
+
+    std::optional<std::future<PendingChunkRead>> pending_read;
+    if (source_size == 0 || offset < source_size) {
+        pending_read.emplace(launch_read(offset, chunk_length_at(offset)));
+    }
+    while (pending_read) {
+        auto completed_read = pending_read->get();
+        pending_read.reset();
+        const auto remaining = completed_read.expected_size;
+        auto chunk_data = std::move(completed_read.data);
+        for (const auto& range : completed_read.unreadable_ranges) {
+            add_unreadable_range(result.unreadable_ranges, range.offset, range.length);
+        }
+        if (!completed_read.succeeded) {
+            result.findings.push_back(finding(Severity::Blocker, "image.chunk_read_failed", "Lazarus could not read a source chunk.", completed_read.error));
+            log << "Read failed at offset " << completed_read.offset << ": " << completed_read.error << "\n";
             return result;
         }
-        if (result.unreadable_ranges.size() != unreadable_before && !write_text_file(bad_sector_map_path, render_bad_sector_map(result.unreadable_ranges))) {
+        if (!completed_read.unreadable_ranges.empty() &&
+            !write_text_file(bad_sector_map_path, render_bad_sector_map(result.unreadable_ranges))) {
             result.findings.push_back(finding(Severity::Blocker, "image.bad_sector_map_write_failed", "Lazarus could not durably record an unreadable source range.", "Imaging stopped; preserve the incomplete image and inspect storage health."));
             return result;
         }
@@ -3027,6 +3143,14 @@ ImageWriteResult write_directory_image(const JobInfo& job, const SourceReadHandl
             result.findings.push_back(finding(Severity::Blocker, "image.chunk_short_read", "The source returned fewer bytes than expected.", "Treat this image as incomplete."));
             log << "Short read at offset " << offset << "\n";
             return result;
+        }
+
+        // Keep one bounded chunk in flight so source reads overlap compression,
+        // hashing, and destination writes.  Chunk ordering and all journal/hash
+        // durability semantics remain unchanged in the main thread.
+        const auto next_offset = offset + chunk_data.size();
+        if (source_size == 0 || next_offset < source_size) {
+            pending_read.emplace(launch_read(next_offset, chunk_length_at(next_offset)));
         }
 
         const bool zero_filled = chunk_is_all_zero(chunk_data);
@@ -4487,6 +4611,9 @@ std::vector<DeviceIdentity> discover_block_devices() {
         device.serial = serial;
         device.serial_ending = serial_ending_from(serial);
         device.transport = detect_transport(entry.path());
+        if (device.transport == "usb") {
+            device.link_speed_mbps = detect_usb_link_speed_mbps(entry.path());
+        }
         device.logical_block_size = read_u32_file(entry.path() / "queue/logical_block_size", 512);
         device.removable = read_u64_file(entry.path() / "removable") != 0;
         if (sectors == 0 && !device.removable) {
