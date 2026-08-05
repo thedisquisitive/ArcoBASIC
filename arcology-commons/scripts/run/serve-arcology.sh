@@ -14,11 +14,11 @@ BUILD_IF_MISSING=1
 
 usage() {
     cat <<USAGE
-Usage: arcology-os/scripts/run/serve-arcology.sh [options]
+Usage: arcology-commons/scripts/run/serve-arcology.sh [options]
 
 Options:
-  --db PATH             Arcology database path (default: ./arcology-os/var/local/arcology-v01a.arcodb)
-  --out DIR             Static export directory (default: ./arcology-os/dist/commons)
+  --db PATH             Arcology database path (default: ./arcology-commons/var/local/arcology-v01a.arcodb)
+  --out DIR             Static export directory (default: ./arcology-commons/dist/commons)
   --host HOST           Host/interface to bind (default: 127.0.0.1)
   --port PORT           TCP port to bind (default: 8080)
   --max-requests N      Stop after N requests; 0 means run until Ctrl-C
@@ -26,9 +26,9 @@ Options:
   -h, --help            Show this help
 
 Examples:
-  arcology-os/scripts/run/serve-arcology.sh
-  arcology-os/scripts/run/serve-arcology.sh --port 8088
-  arcology-os/scripts/run/serve-arcology.sh --host 0.0.0.0 --port 8080
+  arcology-commons/scripts/run/serve-arcology.sh
+  arcology-commons/scripts/run/serve-arcology.sh --port 8088
+  arcology-commons/scripts/run/serve-arcology.sh --host 0.0.0.0 --port 8080
 USAGE
 }
 

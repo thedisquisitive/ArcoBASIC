@@ -1,5 +1,5 @@
 add_executable(arcology_os_tests arcology-os/tests/unit/arcology_os_tests.cpp)
-target_link_libraries(arcology_os_tests PRIVATE arco)
+target_link_libraries(arcology_os_tests PRIVATE arcology_os)
 add_test(NAME arcology_os_unit_tests COMMAND arcology_os_tests)
 
 arco_add_script_test(

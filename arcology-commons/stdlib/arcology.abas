@@ -1,4 +1,4 @@
-' Arcology v0.1a: domain helpers for community software.
+' Arcology Commons v0.1a: domain helpers for the standalone social network.
 '
 ' This module builds on Commons and ArcoDB. It intentionally avoids web-server
 ' concerns for now; request routing, identity, and service hosting can attach to
@@ -325,7 +325,7 @@ FUNCTION Arcology.RenderHome(app)
     manifest = Arcology.Manifest()
     info = Arcology.Inspect(app)
     body = "    <section class=\"hero\">\n"
-    body = body + "      <p class=\"eyebrow\">Arcology v0.1a static commons</p>\n"
+    body = body + "      <p class=\"eyebrow\">Arcology Commons v0.1a static site</p>\n"
     body = body + "      <h1>" + Arcology.HtmlEscape(manifest.Name) + "</h1>\n"
     body = body + "      <p>" + Arcology.HtmlEscape(manifest.Motto) + "</p>\n"
     body = body + "    </section>\n"

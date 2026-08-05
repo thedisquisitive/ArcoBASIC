@@ -1,7 +1,7 @@
 #DESCRIPTION "Arcology Commons v0.1a seed demo"
 #IMPORT "arcology"
 
-path = "arcology-os/var/local/arcology-v01a.arcodb"
+path = "arcology-commons/var/local/arcology-v01a.arcodb"
 IF LEN(Args) > 0 THEN path = Args[0]
 
 app = Arcology.Open(path)

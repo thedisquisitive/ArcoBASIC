@@ -26,3 +26,4 @@ arco_add_script_test(
 )
 
 include(arcology-os/cmake/Testing.cmake)
+include(arcology-commons/cmake/Testing.cmake)

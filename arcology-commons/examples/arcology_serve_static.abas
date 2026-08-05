@@ -1,13 +1,19 @@
-#DESCRIPTION "Export Arcology v0.1a as a static HTML site"
+#DESCRIPTION "Export and serve Arcology Commons v0.1a static HTML over HTTP"
 #IMPORT "arcology"
 
-dbPath = "arcology-os/var/local/arcology-v01a.arcodb"
-outDir = "arcology-os/dist/commons"
+dbPath = "arcology-commons/var/local/arcology-v01a.arcodb"
+outDir = "arcology-commons/dist/commons"
+port = 8080
+host = "127.0.0.1"
+maxRequests = 0
+
 IF LEN(Args) > 0 THEN dbPath = Args[0]
 IF LEN(Args) > 1 THEN outDir = Args[1]
+IF LEN(Args) > 2 THEN port = NUMBER(Args[2])
+IF LEN(Args) > 3 THEN host = Args[3]
+IF LEN(Args) > 4 THEN maxRequests = NUMBER(Args[4])
 
 app = Arcology.Open(dbPath)
-
 info = Arcology.Inspect(app)
 IF info.Communities == 0 THEN
     ignored = Arcology.CreateUser(app, "ada", "Ada Lovelace", "Community steward", "moderator")
@@ -22,12 +28,17 @@ IF info.Communities == 0 THEN
     ignored = Arcology.Save(app)
 END IF
 
-result = Arcology.ExportSite(app, outDir)
-IF result.Ok THEN
-    PRINT "Exported: " + result.Path
-    PRINT "Files: " + STRING(result.Files)
-    PRINT "Open: " + Arcology.SitePath(result.Path, "index.html")
-ELSE
+exported = Arcology.ExportSite(app, outDir)
+IF exported.Ok == FALSE THEN
     PRINT "Export failed"
+    ExitTheProgram(1)
+END IF
+
+PRINT "Serving " + exported.Path
+PRINT "Open http://" + host + ":" + STRING(port) + "/"
+IF maxRequests == 0 THEN PRINT "Press Ctrl-C to stop." ELSE PRINT "Stopping after " + STRING(maxRequests) + " request(s)."
+result = Web.ServeStatic(exported.Path, port, host, maxRequests)
+IF result.Ok == FALSE THEN
+    PRINT "Server error: " + result.Error
     ExitTheProgram(1)
 END IF

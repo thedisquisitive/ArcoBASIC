@@ -5,9 +5,9 @@
 Version: Draft 0.1
 
 This repository is the umbrella workspace for the full Arcology project. It contains the
-ArcoBASIC language and tools, the `arcology-os/` systems layer, and the `lazarus/` recovery
-appliance. Each component keeps a clear build boundary, but all three are first-class parts of
-Arcology.
+ArcoBASIC language and tools, the `arcology-os/` systems layer, the standalone
+`arcology-commons/` social network, and the `lazarus/` recovery appliance. Each component keeps a
+clear boundary, but all four are first-class parts of Arcology.
 
 ---
 
@@ -230,7 +230,8 @@ examples/             Runnable example programs
 tutorials/            Guided ArcoSH programs
 scripts/              Generic build, install, run, and ArcoSH tools
 docs/                 Generic ArcoBASIC user and developer documentation
-arcology-os/          Arcology OS library, modules, examples, tests, tooling, RFCs, and docs
+arcology-os/          Arcology OS systems library, UEFI examples, tests, tooling, RFCs, and docs
+arcology-commons/     Standalone Arcology Commons social network written in ArcoBASIC
 lazarus/              Arcology Lazarus recovery appliance and live environment
 ```
 
@@ -905,20 +906,20 @@ match = Commons.MatchRoute(router, "GET", "/communities/photo")
 PRINT match.Params.id
 ```
 
-See [docs/commons.md](docs/commons.md) and
-`arcology-os/examples/commons_arcology_seed.abas`.
+See [arcology-commons/docs/framework.md](arcology-commons/docs/framework.md) and
+`arcology-commons/examples/commons_arcology_seed.abas`.
 
 ---
 
-# Arcology v0.1a
+# Arcology Commons v0.1a
 
-`#IMPORT "arcology"` starts the Arcology Commons domain layer on top of
-`commons` and `arcodb`.
+`#IMPORT "arcology"` starts the standalone Arcology Commons social network's domain layer on top
+of `commons` and `arcodb`. Arcology Commons is written in ArcoBASIC and is not part of Arcology OS.
 
 ```basic
 #IMPORT "arcology"
 
-app = Arcology.Open("arcology-os/var/local/arcology-v01a.arcodb")
+app = Arcology.Open("arcology-commons/var/local/arcology-v01a.arcodb")
 ignored = Arcology.CreateUser(app, "ada", "Ada Lovelace")
 ignored = Arcology.CreateCommunity(app, "photography", "Photography")
 ignored = Arcology.JoinCommunity(app, "ada", "photography")
@@ -930,26 +931,29 @@ FOR item IN feed.Items
 NEXT
 ```
 
-See [arcology-os/docs/commons.md](arcology-os/docs/commons.md) and `arcology-os/examples/arcology_v01a.abas`.
+See [arcology-commons/docs/README.md](arcology-commons/docs/README.md) and
+`arcology-commons/examples/arcology_v01a.abas`.
 
 Static HTML export is available before the live web server exists:
 
 ```sh
-arcosh arcology-os/examples/arcology_export_site.abas \
-  arcology-os/var/local/arcology-v01a.arcodb arcology-os/dist/commons
+ARCOBASIC_STDLIB=arcology-commons/stdlib \
+  arcosh arcology-commons/examples/arcology_export_site.abas \
+  arcology-commons/var/local/arcology-v01a.arcodb arcology-commons/dist/commons
 ```
 
 Serve that static UI from ArcoBASIC:
 
 ```sh
-arcology-os/scripts/run/serve-arcology.sh
+arcology-commons/scripts/run/serve-arcology.sh
 ```
 
 Or choose paths and a port explicitly:
 
 ```sh
-arcosh arcology-os/examples/arcology_serve_static.abas \
-  arcology-os/var/local/arcology-v01a.arcodb arcology-os/dist/commons 8080
+ARCOBASIC_STDLIB=arcology-commons/stdlib \
+  arcosh arcology-commons/examples/arcology_serve_static.abas \
+  arcology-commons/var/local/arcology-v01a.arcodb arcology-commons/dist/commons 8080
 ```
 
 ---

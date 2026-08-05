@@ -2547,7 +2547,7 @@ const std::map<std::string, std::string>& help_catalog() {
             "Standard library modules\n"
             "\n"
             "Import modules with #IMPORT. ArcoBASIC searches the current directory,\n"
-            "stdlib/, arcology-os/stdlib/, their parent equivalents, and ARCOBASIC_STDLIB. Extensionless names try\n"
+            "stdlib/, its parent equivalent, and ARCOBASIC_STDLIB. Extensionless names try\n"
             ".abas, .arc, and .bas automatically.\n"
             "\n"
             "Modules:\n"
@@ -2580,7 +2580,8 @@ const std::map<std::string, std::string>& help_catalog() {
             "  ArcoDB.Catalog(db, schema, \"name\")\n"
             "  id = ArcoDB.Keep(db, schema, {\"id\": 1042, \"name\": \"Wanda\"})\n"
             "\n"
-            "The modules are regular viewable .abas files under stdlib/ and arcology-os/stdlib/.\n"},
+            "Core modules are under stdlib/. Standalone projects can expose their own module\n"
+            "directory through ARCOBASIC_STDLIB.\n"},
         {"doctor",
             "ArcoSH doctor\n"
             "\n"

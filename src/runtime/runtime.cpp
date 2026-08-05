@@ -903,8 +903,6 @@ std::vector<std::filesystem::path> import_candidates(const std::string& import_n
         std::filesystem::current_path(),
         std::filesystem::current_path() / "stdlib",
         std::filesystem::current_path() / "../stdlib",
-        std::filesystem::current_path() / "arcology-os/stdlib",
-        std::filesystem::current_path() / "../arcology-os/stdlib",
         std::filesystem::path("/usr/local/share/arcobasic/stdlib"),
         std::filesystem::path("/usr/share/arcobasic/stdlib")
     };

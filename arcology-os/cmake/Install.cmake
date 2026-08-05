@@ -8,11 +8,6 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/arcology-os/include/arco/
     FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
 )
 
-install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/arcology-os/stdlib/
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/arcobasic/stdlib
-    FILES_MATCHING PATTERN "*.abas" PATTERN "*.arc" PATTERN "*.bas"
-)
-
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/arcology-os/examples/
     DESTINATION ${CMAKE_INSTALL_DATADIR}/arcobasic/examples/arcology-os
     FILES_MATCHING PATTERN "*.abas" PATTERN "*.arc" PATTERN "*.bas" PATTERN "*.arcsh"

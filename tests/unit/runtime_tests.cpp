@@ -671,32 +671,6 @@ int main() {
     require(run_capture("#IMPORT \"text\"\nPRINT Text.IsBlank(\"   \")\nPRINT text.join([\"a\", \"b\"], \":\")\n") == "TRUE\na:b\n", "imports stdlib modules by name and calls functions case-insensitively");
     require(run_capture("#IMPORT \"text\" AS Txt\nPRINT Txt.IsBlank(\"   \")\nPRINT txt.join([\"a\", \"b\"], \":\")\n") == "TRUE\na:b\n", "imports stdlib modules through alias namespaces");
     require(run_capture(
-        "#IMPORT \"commons\"\n"
-        "router = Commons.Router()\n"
-        "router = Commons.AddRoute(router, \"GET\", \"/communities/:id\", \"ShowCommunity\", \"Community page\")\n"
-        "match = Commons.MatchRoute(router, \"get\", \"/communities/photo\")\n"
-        "PRINT match.Ok\n"
-        "PRINT match.Handler\n"
-        "PRINT match.Params.id\n"
-        "response = Commons.Text(200, \"ok\")\n"
-        "PRINT Object.Get(response.Headers, \"Content-Type\")\n"
-        "validation = Commons.Validation()\n"
-        "validation = Commons.RequireField(validation, \"\", \"title\")\n"
-        "validation = Commons.MaxLength(validation, \"abcdef\", \"body\", 3)\n"
-        "PRINT validation.Ok\n"
-        "PRINT LEN(validation.Errors)\n"
-        "feed = Commons.Feed([Commons.FeedItem(\"post\", \"p1\", \"Hello\", \"From a community you joined\")], \"Local\", \"Chronological\")\n"
-        "PRINT feed.CaughtUp\n"
-        "PRINT Object.Get(feed.Items[0], \"Reason\")\n"
-        "caught = Commons.CaughtUp()\n"
-        "PRINT caught.Message\n"
-        "report = Commons.Report(\"post:p1\", \"user:ada\", \"Spam\")\n"
-        "action = Commons.ModerationAction(report, \"spam\", \"remove_content\", \"Matched spam rule\", \"mod:grace\")\n"
-        "PRINT action.RuleId\n"
-        "PRINT action.AppealAvailable\n"
-        "audit = Commons.AuditEntry(\"mod:grace\", \"remove\", \"post:p1\", \"spam\")\n"
-        "PRINT audit.Verb\n") == "TRUE\nShowCommunity\nphoto\ntext/plain; charset=utf-8\nFALSE\n2\nFALSE\nFrom a community you joined\nYou're caught up.\nspam\nTRUE\nremove\n", "imports commons framework helpers for routes, feeds, and moderation records");
-    require(run_capture(
         "#IMPORT \"compy\"\n"
         "data = {\"Name\": \"Ada\", \"Items\": [1, \"two\", TRUE, NULL], \"Flags\": {\"Ready\": TRUE}}\n"
         "packed = ArcoCompy.Pack(data)\n"

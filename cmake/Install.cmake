@@ -82,3 +82,4 @@ install(DIRECTORY docs/
 install(FILES README.md DESTINATION share/doc/arcobasic)
 
 include(arcology-os/cmake/Install.cmake)
+include(arcology-commons/cmake/Install.cmake)

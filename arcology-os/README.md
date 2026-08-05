@@ -1,13 +1,14 @@
 # Arcology OS
 
-This subtree owns the Arcology-specific layer built on top of ArcoBASIC. Its source, public systems
-headers, standard-library module, examples, RFCs, agent packets, tests, hardware tooling, and
-developer documentation live together here.
+This subtree owns Arcology OS: the operating-system and freestanding systems layer built on
+ArcoBASIC. Its source, public systems headers, RFCs, agent packets, tests, hardware tooling, and
+developer documentation live together here. The separate Arcology Commons social network is under
+`arcology-commons/`; it is an ArcoBASIC application, not part of Arcology OS.
 
 ## Layout
 
 - `src/` and `include/` — the Arcology UEFI/PE backend and systems interfaces.
-- `stdlib/` and `examples/` — the Arcology Commons module and runnable applications.
+- `examples/` — runnable Arcology OS and UEFI programs.
 - `scripts/` — hardware-image builders plus QEMU/OVMF and development launchers.
 - `tests/` — systems integration tests and boot fixtures.
 - `docs/` — implementation, architecture, roadmap, and bring-up documentation.
