@@ -1,6 +1,7 @@
 build/
 build-*/
 dist/
+/var/
 CMakeFiles/
 CMakeCache.txt
 
@@ -13,7 +14,7 @@ CMakeCache.txt
 
 .DS_Store
 
-# Generated/runtime artifacts, not source
+# Legacy root-level generated/runtime artifacts (new output belongs under dist/ or var/)
 arcoalpha/
 arcoalpha.zip
 arco-file-log-example.txt

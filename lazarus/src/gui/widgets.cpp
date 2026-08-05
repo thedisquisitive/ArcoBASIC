@@ -520,6 +520,11 @@ void install_theme(const std::string& accent, const std::string& background, con
         .choice-row:disabled { opacity: 0.45; }
         .empty-state { background: #1a242b; color: #c7d1d7; border: 1px solid #3e515d; border-radius: 8px; padding: 18px; }
         .bottom-bar { background: #11191f; color: #b8c4cc; border-top: 1px solid #31404a; padding: 12px 18px; }
+        .workflow-action-bar {
+            background: #11191f;
+            border-top: 1px solid #31404a;
+            padding: 10px 48px 12px 48px;
+        }
         .operation-panel textview, .operation-panel textview text { padding: 8px; }
         dropdown > button {
             background: #12191f;
@@ -616,6 +621,7 @@ void install_theme(const std::string& accent, const std::string& background, con
         .port-label-row { background: #ffffff; border-color: #d5dee6; }
         .home-utility { background: {{SURFACE}}; border-color: #c8d5df; }
         .heartbeat-strip { background: #f1f5f8; border-color: #c8d5df; }
+        .workflow-action-bar { background: #f1f5f8; border-color: #c8d5df; }
         .heartbeat-title { color: #627584; }
         .heartbeat-value { color: {{TEXT}}; }
         .bench-ribbon { color: #526372; }

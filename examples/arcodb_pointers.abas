@@ -52,7 +52,7 @@ order = orderPtr.Resolve(db)
 PRINT order.Label(db)
 
 customer = ArcoDB.Resolve(db, customerPtr)
-customer.Email = "wanda.goodburger@arcology.example"
+customer.Email = "wanda.goodburger@example.test"
 PRINT ArcoDB.Replace(db, customerSchema, customerPtr.Id, customer)
 
 updatedOrder = orderPtr.Resolve(db)

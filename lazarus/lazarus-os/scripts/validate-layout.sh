@@ -19,6 +19,7 @@ rootfs/etc/cups/cups-browsed.conf
 rootfs/usr/local/bin/lazarus-kiosk
 rootfs/usr/local/sbin/lazarus-install-os
 rootfs/usr/local/sbin/lazarus-network-up
+rootfs/usr/local/sbin/lazarus-mount-extra-storage
 	rootfs/etc/arcology-lazarus/network.conf
 	rootfs/etc/inittab
 	rootfs/etc/udhcpc/post-bound/10-lazarus-network-status
@@ -72,6 +73,14 @@ grep -q 'chmod 0755 "$mount_target"' "$base/rootfs/usr/local/sbin/lazarus-mount-
 }
 grep -q 'find "$image_directory" -xdev -type f -exec chmod a+r,o-w' "$base/rootfs/usr/local/sbin/lazarus-mount-storage" || {
 	echo "Existing Lazarus image files must be readable on another Linux system." >&2
+	exit 1
+}
+grep -q 'mount -t cifs' "$base/rootfs/usr/local/sbin/lazarus-mount-extra-storage" || {
+	echo "Additional storage helper must support SMB NAS mounts." >&2
+	exit 1
+}
+grep -q 'mount -t nfs' "$base/rootfs/usr/local/sbin/lazarus-mount-extra-storage" || {
+	echo "Additional storage helper must support NFS NAS mounts." >&2
 	exit 1
 }
 

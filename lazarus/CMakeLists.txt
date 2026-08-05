@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
@@ -22,7 +23,7 @@ target_include_directories(lazarus_core
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-target_link_libraries(lazarus_core PUBLIC OpenSSL::Crypto PkgConfig::ZSTD)
+target_link_libraries(lazarus_core PUBLIC OpenSSL::Crypto PkgConfig::ZSTD Threads::Threads)
 
 add_executable(lazarus src/cli/main.cpp)
 target_link_libraries(lazarus PRIVATE lazarus_core)

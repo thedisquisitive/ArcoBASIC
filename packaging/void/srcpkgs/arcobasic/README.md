@@ -5,12 +5,12 @@ This directory is a Void Linux `xbps-src` package definition for ArcoBASIC.
 For normal alpha release builds, use the project helper:
 
 ```sh
-scripts/build-void-native-package.sh --void-packages /path/to/void-packages --out arcoalpha
+scripts/build/build-void-native-package.sh --void-packages /path/to/void-packages --out dist/void
 ```
 
 The helper creates a local source tarball, copies it into the `void-packages`
 source cache, writes the matching checksum into the template, builds with
-`xbps-src`, and copies the `.xbps` plus repository metadata into `arcoalpha/`.
+`xbps-src`, and copies the `.xbps` plus repository metadata into `dist/void/`.
 
 Manual use from a `void-packages` checkout is still possible:
 
@@ -24,7 +24,7 @@ cd /path/to/void-packages
 The generated archive from:
 
 ```sh
-scripts/build-linux-packages.sh --xbps-src
+scripts/build/build-linux-packages.sh --xbps-src
 ```
 
 contains this same `srcpkgs/arcobasic` structure for easier copying.

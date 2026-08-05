@@ -353,11 +353,8 @@ int image_source(int argc, char** argv) {
         std::cout << "Inspection findings:\n";
         print_findings(inspection.findings);
     }
-    lazarus::ImageWriteOptions options{
-        output_dir,
-        4 * 1024 * 1024,
-        0,
-    };
+    lazarus::ImageWriteOptions options;
+    options.output_directory = output_dir;
     options.compression = compression_from_environment();
     options.progress = make_progress_printer();
     const auto result = lazarus::write_directory_image(job, open_result.handle, inspection, options);

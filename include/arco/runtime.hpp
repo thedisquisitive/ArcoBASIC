@@ -42,7 +42,7 @@ struct CompileMetadata {
     bool strict = false;
     bool experimental = false;
     bool deprecated = false;
-    // Systems-target directives (docs/systems/uefi-target.md section 2).
+    // Systems-target directives (arcology-os/docs/systems/uefi-target.md section 2).
     std::string profile;        // #PROFILE value, e.g. "UEFI"; empty = no systems profile
     std::string runtime_mode;   // #RUNTIME value, e.g. "NONE"; empty = hosted runtime
     std::string arch;           // architecture selected via #TARGET under a systems profile

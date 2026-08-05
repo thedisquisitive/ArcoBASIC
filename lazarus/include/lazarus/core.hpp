@@ -77,6 +77,7 @@ struct DeviceIdentity {
     bool rotational = false;
     std::vector<std::string> partitions;
     std::string port_path;
+    std::uint64_t link_speed_mbps = 0;
 };
 
 struct PortLabel {
@@ -97,6 +98,26 @@ struct BrandingTheme {
     std::string report_footer = "Generated locally by Arcology Lazarus. SMART results describe reported device facts.";
 };
 
+// An additional image storage location beyond the primary bench assignment
+// (see BenchProfile::extra_storage_locations). Unlike the primary location,
+// extras carry no appliance-state persistence duty and are mounted at
+// /mnt/lazarus-storage-extra/<id> rather than the fixed primary mountpoint.
+struct StorageLocation {
+    std::string id;
+    std::string name;
+    bool is_default = false;
+    std::string type;
+    std::string device;
+    std::string volume;
+    std::vector<std::string> port_paths;
+    std::string nas_protocol;
+    std::string nas_server;
+    std::string nas_share;
+    std::string nas_username;
+    std::string nas_domain;
+    std::string folder;
+};
+
 struct BenchProfile {
     std::string name;
     std::string image_storage_path;
@@ -114,6 +135,8 @@ struct BenchProfile {
     std::string nas_storage_share;
     std::string nas_storage_username;
     std::string nas_storage_domain;
+    std::vector<StorageLocation> extra_storage_locations;
+    std::string default_storage_location_id;
     BrandingTheme branding;
 };
 
@@ -262,7 +285,7 @@ struct DiskInspection {
 
 struct ImageWriteOptions {
     std::string output_directory;
-    std::size_t chunk_size = 4 * 1024 * 1024;
+    std::size_t chunk_size = 16 * 1024 * 1024;
     std::uint64_t max_bytes = 0;
     CompressionMode compression = CompressionMode::None;
     ImagingMode mode = ImagingMode::Raw;

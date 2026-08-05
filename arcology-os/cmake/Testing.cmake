@@ -1,0 +1,73 @@
+add_executable(arcology_os_tests arcology-os/tests/unit/arcology_os_tests.cpp)
+target_link_libraries(arcology_os_tests PRIVATE arco)
+add_test(NAME arcology_os_unit_tests COMMAND arcology_os_tests)
+
+arco_add_script_test(
+    systems_fixed_width_types_smoke
+    arcology-os/tests/systems/systems_fixed_width_types_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+)
+arco_add_script_test(
+    systems_freestanding_profile_smoke
+    arcology-os/tests/systems/systems_freestanding_profile_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+)
+arco_add_script_test(
+    systems_amir_primitives_smoke
+    arcology-os/tests/systems/systems_amir_primitives_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_frontend_amir_contract_smoke
+    arcology-os/tests/systems/systems_frontend_amir_contract_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_hardware_semantics_smoke
+    arcology-os/tests/systems/systems_hardware_semantics_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+)
+arco_add_script_test(
+    systems_calling_convention_smoke
+    arcology-os/tests/systems/systems_calling_convention_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_uefi_bindings_smoke
+    arcology-os/tests/systems/systems_uefi_bindings_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_utf16_encoding_smoke
+    arcology-os/tests/systems/systems_utf16_encoding_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_x86_64_codegen_smoke
+    arcology-os/tests/systems/systems_x86_64_codegen_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_pe_image_smoke
+    arcology-os/tests/systems/systems_pe_image_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_qemu_ovmf_harness_smoke
+    arcology-os/tests/systems/systems_qemu_ovmf_harness_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_arcology_hardware_artifact_smoke
+    arcology-os/tests/systems/systems_arcology_hardware_artifact_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)

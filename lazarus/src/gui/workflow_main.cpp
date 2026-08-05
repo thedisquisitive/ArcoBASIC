@@ -44,6 +44,7 @@ struct Device {
     std::string role;
     std::uint64_t size_bytes = 0;
     std::string transport;
+    std::uint64_t link_speed_mbps = 0;
     std::string serial_ending;
     std::string disconnect_state;
     std::string disconnect_message;
@@ -104,6 +105,17 @@ struct ActivityRecord {
     std::string customer;
 };
 
+// One row per image storage location (the primary, id "primary", plus each configured extra).
+struct StorageLocationRow {
+    std::string id;
+    std::string name;
+    std::string type;
+    bool is_default = false;
+    bool online = false;
+    std::string path;
+    std::string detail;
+};
+
 struct App {
     GtkWidget* window = nullptr;
     GtkWidget* stack = nullptr;
@@ -114,6 +126,10 @@ struct App {
     std::vector<Device> devices;
     std::vector<Port> ports;
     std::vector<Backup> backups;
+    std::vector<StorageLocationRow> storage_locations;
+    // Set just before navigating to the local/network storage sub-pages to switch them from
+    // "replace the primary location" (default) into "add another location" mode.
+    bool adding_extra_storage_location = false;
     std::vector<TicketRecord> tickets;
     std::vector<ActivityRecord> recent_activity;
     std::unordered_map<std::string, std::pair<std::chrono::steady_clock::time_point, std::string>> drive_analysis_cache;
@@ -565,6 +581,9 @@ OperationUi* add_operation_ui(App* app, GtkWidget* page, const char* button_text
     gtk_widget_set_visible(ui->print, produces_printable_report);
     GtkWidget* actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
     gtk_widget_set_halign(actions, GTK_ALIGN_END);
+    // add_page() lifts direct workflow actions out of the scrolling document and into a fixed
+    // footer. Critical Start/Confirm controls must remain reachable on 768-line bench displays.
+    g_object_set_data(G_OBJECT(actions), "lazarus-persistent-action", GINT_TO_POINTER(1));
     gtk_box_append(GTK_BOX(actions), ui->print);
     gtk_box_append(GTK_BOX(actions), ui->button);
     gtk_box_append(GTK_BOX(page), actions);
@@ -860,6 +879,9 @@ void load_data(App* app) {
         if (fields.size() > 14) device.port_identity = fields[14];
         if (fields.size() > 15) device.filesystem = fields[15];
         if (fields.size() > 16) device.mountpoint = fields[16];
+        if (fields.size() > 17) {
+            try { device.link_speed_mbps = std::stoull(fields[17]); } catch (...) { device.link_speed_mbps = 0; }
+        }
         try { device.size_bytes = std::stoull(fields[7]); } catch (...) { device.size_bytes = 0; }
         app->devices.push_back(std::move(device));
     }
@@ -914,6 +936,16 @@ void load_data(App* app) {
         const auto fields = split(row, '\t');
         if (fields.size() < 5) continue;
         app->recent_activity.push_back({fields[0], fields[1], fields[2], fields[3], fields[4]});
+    }
+    app->storage_locations.clear();
+    for (const auto& row : split(json_string(response, "storage_locations_rows"), '\n')) {
+        const auto fields = split(row, '\t');
+        if (fields.size() < 7) continue;
+        StorageLocationRow location;
+        location.id = fields[0]; location.name = fields[1]; location.type = fields[2];
+        location.is_default = fields[3] == "1"; location.online = fields[4] == "1";
+        location.path = fields[5]; location.detail = fields[6];
+        app->storage_locations.push_back(std::move(location));
     }
     app->bench_name = json_string(response, "name");
     app->source_text = json_string(response, "source_text");
@@ -1071,7 +1103,11 @@ GtkWidget* device_choice(App* app, const Device& device, const char* required_ro
     std::string detail = device.model;
     if (device.size_bytes != 0) detail += " | " + human_bytes(device.size_bytes);
     if (!device.transport.empty()) detail += " | " + device.transport;
+    if (device.link_speed_mbps != 0) detail += " " + std::to_string(device.link_speed_mbps) + " Mb/s";
     if (!device.serial_ending.empty()) detail += " | serial ending " + device.serial_ending;
+    if (device.transport == "usb" && device.link_speed_mbps != 0 && device.link_speed_mbps <= 480) {
+        detail += "\nPerformance warning: this drive negotiated a USB 2.0-speed link. Try another port or cable.";
+    }
     if (!device.label.empty()) detail += "\nConnected to: " + device.label;
     else if (!device.physical_path.empty()) detail += "\nPhysical connection: " + device.physical_path;
     detail += "\n" + (device.disconnect_message.empty()
@@ -1338,54 +1374,58 @@ GtkWidget* make_tickets_page(App* app) {
 
 // Every job-record-producing page (Backup, Restore, Verify) signs the operator in against the
 // admin-configured technician roster instead of taking a free-typed name, so one employee cannot
-// log work under a coworker's name. If no roster has been configured yet (a fresh appliance before
-// the admin has added anyone), this falls back to a plain name field so day-one setup isn't blocked.
+// log work under a coworker's name. An empty or unavailable roster blocks the workflow until an
+// administrator configures it; silently falling back to a typed name would bypass accountability.
 struct TechnicianField {
-    GtkWidget* free_entry = nullptr;
     GtkWidget* roster_dropdown = nullptr;
     GtkWidget* roster_pin = nullptr;
 };
 
 TechnicianField build_technician_field(GtkWidget* section) {
     std::string response;
-    request("{\"command\":\"technicians_list\"}", response);
+    const bool roster_loaded = request("{\"command\":\"technicians_list\"}", response) &&
+        response.find("\"ok\":true") != std::string::npos;
     auto names = split(json_string(response, "names_text"), '\n');
     names.erase(std::remove_if(names.begin(), names.end(), [](const std::string& name) { return name.empty(); }), names.end());
     TechnicianField field;
-    if (names.empty()) {
-        gtk_box_append(GTK_BOX(section), label("Technician", "form-label"));
-        GtkWidget* entry = gtk_entry_new();
-        gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "Technician name");
-        gtk_box_append(GTK_BOX(section), entry);
-        field.free_entry = entry;
-        return field;
-    }
     gtk_box_append(GTK_BOX(section), label("Technician", "form-label"));
     GtkStringList* model = gtk_string_list_new(nullptr);
     for (const auto& name : names) gtk_string_list_append(model, name.c_str());
     GtkWidget* dropdown = gtk_drop_down_new(G_LIST_MODEL(model), nullptr);
+    gtk_widget_set_hexpand(dropdown, TRUE);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(dropdown), GTK_INVALID_LIST_POSITION);
     gtk_box_append(GTK_BOX(section), dropdown);
     gtk_box_append(GTK_BOX(section), label("Technician PIN", "form-label"));
     GtkWidget* pin = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(pin), "4-digit PIN");
     gtk_entry_set_visibility(GTK_ENTRY(pin), FALSE);
-    gtk_entry_set_input_purpose(GTK_ENTRY(pin), GTK_INPUT_PURPOSE_PASSWORD);
+    gtk_entry_set_input_purpose(GTK_ENTRY(pin), GTK_INPUT_PURPOSE_DIGITS);
+    gtk_entry_set_max_length(GTK_ENTRY(pin), 4);
     gtk_box_append(GTK_BOX(section), pin);
+    if (names.empty()) {
+        gtk_widget_set_sensitive(dropdown, FALSE);
+        gtk_widget_set_sensitive(pin, FALSE);
+        const auto message = roster_loaded
+            ? "No technicians are configured. An administrator must add a technician and PIN before starting a job."
+            : "The technician roster could not be loaded. Return Home and retry before starting a job.";
+        GtkWidget* warning = label(message, "warning-text");
+        gtk_label_set_wrap(GTK_LABEL(warning), TRUE);
+        gtk_box_append(GTK_BOX(section), warning);
+    }
     field.roster_dropdown = dropdown;
     field.roster_pin = pin;
     return field;
 }
 
 bool technician_field_complete(const TechnicianField& field) {
-    if (field.free_entry != nullptr) return *gtk_editable_get_text(GTK_EDITABLE(field.free_entry)) != '\0';
+    const std::string pin = gtk_editable_get_text(GTK_EDITABLE(field.roster_pin));
     return gtk_drop_down_get_selected(GTK_DROP_DOWN(field.roster_dropdown)) != GTK_INVALID_LIST_POSITION &&
-           *gtk_editable_get_text(GTK_EDITABLE(field.roster_pin)) != '\0';
+           pin.size() == 4 && std::all_of(pin.begin(), pin.end(), [](unsigned char character) {
+               return std::isdigit(character) != 0;
+           });
 }
 
 std::string technician_field_json(const TechnicianField& field) {
-    if (field.free_entry != nullptr) {
-        return ",\"technician\":" + quote_json(std::string(gtk_editable_get_text(GTK_EDITABLE(field.free_entry))));
-    }
     const guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(field.roster_dropdown));
     auto* model = GTK_STRING_LIST(gtk_drop_down_get_model(GTK_DROP_DOWN(field.roster_dropdown)));
     const std::string name = selected == GTK_INVALID_LIST_POSITION ? "" : gtk_string_list_get_string(model, selected);
@@ -1395,12 +1435,6 @@ std::string technician_field_json(const TechnicianField& field) {
 
 template <typename Binding, void (*Update)(Binding*)>
 void connect_technician_field(const TechnicianField& field, Binding* binding) {
-    if (field.free_entry != nullptr) {
-        g_signal_connect(field.free_entry, "changed", G_CALLBACK(+[](GtkEditable*, gpointer data) {
-            Update(static_cast<Binding*>(data));
-        }), binding);
-        return;
-    }
     g_signal_connect(field.roster_dropdown, "notify::selected", G_CALLBACK(+[](GObject*, GParamSpec*, gpointer data) {
         Update(static_cast<Binding*>(data));
     }), binding);
@@ -1784,6 +1818,31 @@ GtkWidget* make_backup_page(App* app) {
     // gtk_drop_down_new() consumes the caller's model reference.
     GtkWidget* storage = gtk_drop_down_new(G_LIST_MODEL(storage_model), nullptr);
     gtk_widget_set_hexpand(storage, TRUE);
+    // The model's own strings stay the literal storage paths (that is what gets submitted below
+    // unchanged); this factory only changes how each row is *displayed*, looking up a friendly
+    // name/default badge from app->storage_locations by matching path.
+    GtkListItemFactory* storage_factory = gtk_signal_list_item_factory_new();
+    g_signal_connect(storage_factory, "setup", G_CALLBACK(+[](GtkListItemFactory*, GtkListItem* item) {
+        GtkWidget* item_label = gtk_label_new(nullptr);
+        gtk_label_set_xalign(GTK_LABEL(item_label), 0);
+        gtk_list_item_set_child(item, item_label);
+    }), nullptr);
+    g_signal_connect(storage_factory, "bind", G_CALLBACK(+[](GtkListItemFactory*, GtkListItem* item, gpointer data) {
+        auto* state = static_cast<App*>(data);
+        auto* string_object = GTK_STRING_OBJECT(gtk_list_item_get_item(item));
+        const std::string path = gtk_string_object_get_string(string_object);
+        std::string display = path;
+        for (const auto& location : state->storage_locations) {
+            if (location.path != path) continue;
+            display = location.name.empty() ? path : location.name;
+            if (location.is_default) display += " (Default)";
+            if (!location.detail.empty()) display += "\n" + location.detail;
+            break;
+        }
+        gtk_label_set_text(GTK_LABEL(gtk_list_item_get_child(item)), display.c_str());
+    }), app);
+    gtk_drop_down_set_factory(GTK_DROP_DOWN(storage), storage_factory);
+    g_object_unref(storage_factory);
     gtk_grid_attach(GTK_GRID(form), label("Image storage", "form-label"), 0, 4, 1, 1);
     gtk_grid_attach(GTK_GRID(form), storage, 1, 4, 1, 1);
     const char* imaging_modes[] = {"Standard raw imaging", "Rescue imaging for unstable drives", nullptr};
@@ -1845,7 +1904,18 @@ GtkWidget* make_backup_page(App* app) {
         gtk_widget_set_sensitive(values->imaging_mode, selected == 4 && !values->analysis_recommends_rescue);
         update_backup_button(values);
     })), binding);
-    if (g_list_model_get_n_items(G_LIST_MODEL(storage_model)) > 0) gtk_drop_down_set_selected(GTK_DROP_DOWN(storage), 0);
+    {
+        const guint storage_count = g_list_model_get_n_items(G_LIST_MODEL(storage_model));
+        guint default_index = GTK_INVALID_LIST_POSITION;
+        for (guint i = 0; i < storage_count; ++i) {
+            const std::string path = gtk_string_list_get_string(storage_model, i);
+            const bool is_default = std::any_of(app->storage_locations.begin(), app->storage_locations.end(),
+                [&](const StorageLocationRow& location) { return location.path == path && location.is_default; });
+            if (is_default) { default_index = i; break; }
+        }
+        if (default_index == GTK_INVALID_LIST_POSITION && storage_count > 0) default_index = 0;
+        if (default_index != GTK_INVALID_LIST_POSITION) gtk_drop_down_set_selected(GTK_DROP_DOWN(storage), default_index);
+    }
     if (sources == 1 && sole_source != nullptr) gtk_list_box_select_row(GTK_LIST_BOX(choices), sole_source);
     gtk_widget_set_sensitive(imaging_mode, FALSE);
     g_signal_connect(operation->button, "clicked", G_CALLBACK((+[](GtkButton*, gpointer data) {
@@ -2185,8 +2255,8 @@ GtkWidget* make_driver_migration_page(App* app) {
         const auto backup = values->backup;
         const auto destination = values->destination;
         const auto technician_json = technician_field_json(values->technician);
-        const auto plan = "{\"command\":\"driver_plan\",\"automatic\":true,\"destination_selector\":" +
-            quote_json(destination) + "}";
+        const auto plan = "{\"command\":\"driver_plan\",\"automatic\":true,\"image_directory\":" +
+            quote_json(backup) + ",\"destination_selector\":" + quote_json(destination) + "}";
         begin_service_job(operation, plan, "Replacement storage driver matched.", {},
             [operation, backup, destination, technician_json](bool plan_ok, const std::string&) {
                 if (!plan_ok) return;
@@ -2195,10 +2265,11 @@ GtkWidget* make_driver_migration_page(App* app) {
                     ",\"confirmation\":\"ERASE\"" + technician_json + "}";
                 begin_service_job(operation, restore,
                     "Windows image restored and verified. Preparing replacement-hardware servicing.", "restore",
-                    [operation, destination](bool restore_ok, const std::string&) {
+                    [operation, backup, destination](bool restore_ok, const std::string&) {
                         if (!restore_ok) return;
                         const auto servicing = "{\"command\":\"driver_apply_offline\",\"automatic\":true,"
-                            "\"destination_selector\":" + quote_json(destination) +
+                            "\"image_directory\":" + quote_json(backup) +
+                            ",\"destination_selector\":" + quote_json(destination) +
                             ",\"confirmation\":\"APPLY UNIVERSAL RESTORE\"}";
                         begin_service_job(operation, servicing,
                             "Universal Restore installed the replacement boot-storage driver inside offline Windows.", "driver-job",
@@ -2768,6 +2839,11 @@ struct StorageBinding {
     GtkWidget* create_folder = nullptr;
     std::string selector;
     std::string browser_relative;
+    // Non-null only when this page was reached via "Add Another Location" rather than the
+    // primary type-card flow -- see App::adding_extra_storage_location.
+    GtkWidget* location_name = nullptr;
+    GtkWidget* set_default = nullptr;
+    bool adding_extra = false;
 };
 
 struct StorageMountBinding {
@@ -2786,6 +2862,11 @@ struct NasStorageBinding {
     GtkWidget* username = nullptr;
     GtkWidget* password = nullptr;
     GtkWidget* domain = nullptr;
+    // Non-null only when this page was reached via "Add Another Location" rather than the
+    // primary type-card flow -- see App::adding_extra_storage_location.
+    GtkWidget* location_name = nullptr;
+    GtkWidget* set_default = nullptr;
+    bool adding_extra = false;
 };
 
 void update_nas_storage_action(NasStorageBinding* binding) {
@@ -2831,6 +2912,32 @@ void refresh_storage_mount_controls(StorageMountBinding* binding) {
     gtk_widget_set_sensitive(binding->operation->button,
                              binding->app->storage_online || !binding->app->image_storage_device.empty() ||
                              !binding->app->nas_storage_protocol.empty());
+}
+
+void add_storage_mount_status(App* app, GtkWidget* page) {
+    GtkWidget* status_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    lazarus::gui::add_class(status_panel, "workflow-section");
+    gtk_box_append(GTK_BOX(status_panel), label("Current Status", "section-title"));
+    GtkWidget* status_state = label("Reading image-storage mount state...", "instruction");
+    gtk_label_set_selectable(GTK_LABEL(status_state), TRUE);
+    gtk_box_append(GTK_BOX(status_panel), status_state);
+    auto* mount_operation = add_operation_ui(app, status_panel, "Mount Assigned Image Storage");
+    auto* mount_binding = new StorageMountBinding{app, mount_operation, status_state};
+    refresh_storage_mount_controls(mount_binding);
+    g_signal_connect(mount_operation->button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer data) {
+        auto* values = static_cast<StorageMountBinding*>(data);
+        const bool unmount = values->app->storage_online;
+        begin_service_job(values->operation,
+                          "{\"command\":\"" + std::string(unmount ? "unmount_image_storage" : "mount_image_storage") +
+                              "\",\"admin_token\":" + quote_json(values->app->admin_token) + "}",
+                          unmount ? "Image storage was safely unmounted." : "Image storage is mounted and ready.", {},
+                          [values](bool, const std::string&) {
+                              load_data(values->app);
+                              refresh_storage_mount_controls(values);
+                              refresh_operational_pages(values->app);
+                          });
+    }), mount_binding);
+    gtk_box_append(GTK_BOX(page), status_panel);
 }
 
 void update_storage_action(StorageBinding* binding) {
@@ -2935,23 +3042,94 @@ GtkWidget* build_storage_type_card(App* app, const char* icon, const char* title
 
     GtkWidget* button = gtk_button_new_with_label(button_label);
     lazarus::gui::add_class(button, selected ? "primary-command" : "secondary-command");
-    gtk_widget_set_valign(button, GTK_ALIGN_END);
-    gtk_widget_set_vexpand(button, TRUE);
     g_object_set_data_full(G_OBJECT(button), "target-page", g_strdup(target_page), g_free);
     g_signal_connect(button, "clicked", G_CALLBACK(+[](GtkButton* self, gpointer data) {
         const auto* target = static_cast<const char*>(g_object_get_data(G_OBJECT(self), "target-page"));
-        show_page(static_cast<App*>(data), target);
+        auto* state = static_cast<App*>(data);
+        state->adding_extra_storage_location = false;
+        show_page(state, target);
     }), app);
     gtk_box_append(GTK_BOX(card), button);
     return card;
 }
 
+GtkWidget* build_storage_location_row(App* app, const StorageLocationRow& location) {
+    GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    lazarus::gui::add_class(row, "workflow-section");
+    gtk_box_append(GTK_BOX(row), lazarus::gui::make_icon(location.type == "nas" ? "network-storage" : "hdd", 24));
+
+    GtkWidget* text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_hexpand(text, TRUE);
+    GtkWidget* title_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_append(GTK_BOX(title_row), label(location.name, "choice-title"));
+    if (location.is_default) gtk_box_append(GTK_BOX(title_row), label("Default", "port-role"));
+    GtkWidget* dot = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    lazarus::gui::add_class(dot, location.online ? "heartbeat-ok" : "heartbeat-warning");
+    gtk_widget_set_valign(dot, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(title_row), dot);
+    gtk_box_append(GTK_BOX(title_row), label(location.online ? "Mounted" : "Not mounted", "choice-detail"));
+    gtk_box_append(GTK_BOX(text), title_row);
+    gtk_box_append(GTK_BOX(text), label(location.detail, "choice-detail"));
+    gtk_box_append(GTK_BOX(row), text);
+
+    GtkWidget* actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    const auto set_location_id = [](GtkWidget* button, const std::string& id) {
+        g_object_set_data_full(G_OBJECT(button), "location-id", g_strdup(id.c_str()), g_free);
+    };
+    if (location.id != "primary") {
+        GtkWidget* toggle = gtk_button_new_with_label(location.online ? "Unmount" : "Mount");
+        lazarus::gui::add_class(toggle, "secondary-command");
+        set_location_id(toggle, location.id);
+        g_object_set_data(G_OBJECT(toggle), "location-unmount", GINT_TO_POINTER(location.online ? 1 : 0));
+        g_signal_connect(toggle, "clicked", G_CALLBACK(+[](GtkButton* self, gpointer data) {
+            auto* state = static_cast<App*>(data);
+            const auto* id = static_cast<const char*>(g_object_get_data(G_OBJECT(self), "location-id"));
+            const bool unmount = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(self), "location-unmount")) != 0;
+            std::string response;
+            request("{\"command\":\"" + std::string(unmount ? "unmount_storage_location" : "mount_storage_location") +
+                     "\",\"admin_token\":" + quote_json(state->admin_token) + ",\"id\":" + quote_json(id) + "}", response);
+            load_data(state);
+            refresh_operational_pages(state);
+        }), app);
+        gtk_box_append(GTK_BOX(actions), toggle);
+    }
+    if (!location.is_default) {
+        GtkWidget* set_default = gtk_button_new_with_label("Set Default");
+        lazarus::gui::add_class(set_default, "secondary-command");
+        set_location_id(set_default, location.id == "primary" ? "" : location.id);
+        g_signal_connect(set_default, "clicked", G_CALLBACK(+[](GtkButton* self, gpointer data) {
+            auto* state = static_cast<App*>(data);
+            const auto* id = static_cast<const char*>(g_object_get_data(G_OBJECT(self), "location-id"));
+            std::string response;
+            request("{\"command\":\"set_default_storage_location\",\"admin_token\":" + quote_json(state->admin_token) +
+                     ",\"id\":" + quote_json(id) + "}", response);
+            load_data(state);
+            refresh_operational_pages(state);
+        }), app);
+        gtk_box_append(GTK_BOX(actions), set_default);
+    }
+    if (location.id != "primary") {
+        GtkWidget* remove = gtk_button_new_with_label("Remove");
+        lazarus::gui::add_class(remove, "danger-command");
+        set_location_id(remove, location.id);
+        g_signal_connect(remove, "clicked", G_CALLBACK(+[](GtkButton* self, gpointer data) {
+            auto* state = static_cast<App*>(data);
+            const auto* id = static_cast<const char*>(g_object_get_data(G_OBJECT(self), "location-id"));
+            std::string response;
+            request("{\"command\":\"remove_storage_location\",\"admin_token\":" + quote_json(state->admin_token) +
+                     ",\"id\":" + quote_json(id) + "}", response);
+            load_data(state);
+            refresh_operational_pages(state);
+        }), app);
+        gtk_box_append(GTK_BOX(actions), remove);
+    }
+    gtk_box_append(GTK_BOX(row), actions);
+    return row;
+}
+
 GtkWidget* make_storage_page(App* app) {
     GtkWidget* page = page_shell(app, "BENCH STORAGE", "Configure Image Storage",
                                  "Choose where Lazarus should store image backups.", "admin");
-    gtk_box_append(GTK_BOX(page), label(
-        "Lazarus mounts supported storage without erasing it, or prepares dedicated ext4 storage after explicit confirmation.",
-        "section-detail"));
 
     const bool network_selected = !app->nas_storage_protocol.empty();
     const bool local_selected = !network_selected && !app->image_storage_device.empty();
@@ -2970,7 +3148,6 @@ GtkWidget* make_storage_page(App* app) {
         gtk_box_append(GTK_BOX(page), banner);
     }
 
-    gtk_box_append(GTK_BOX(page), label("1. Choose Storage Type", "section-title"));
     gtk_box_append(GTK_BOX(page), label(
         "Select how and where you want to store Lazarus image backups.", "section-detail"));
     GtkWidget* cards = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
@@ -2985,122 +3162,60 @@ GtkWidget* make_storage_page(App* app) {
         "Configure Network Storage", "admin-storage-network", network_selected));
     gtk_box_append(GTK_BOX(page), cards);
 
-    gtk_box_append(GTK_BOX(page), label("2. Current Storage Status", "section-title"));
-    GtkWidget* status_info_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
-    gtk_box_set_homogeneous(GTK_BOX(status_info_row), TRUE);
-
-    GtkWidget* status_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    lazarus::gui::add_class(status_panel, "workflow-section");
-    GtkWidget* status_icon_wrap = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_set_halign(status_icon_wrap, GTK_ALIGN_CENTER);
-    gtk_box_append(GTK_BOX(status_icon_wrap), lazarus::gui::make_icon("hdd", 40));
-    gtk_box_append(GTK_BOX(status_panel), status_icon_wrap);
-    GtkWidget* status_state = label("Reading image-storage mount state...", "instruction");
-    gtk_label_set_selectable(GTK_LABEL(status_state), TRUE);
-    gtk_widget_set_halign(status_state, GTK_ALIGN_CENTER);
-    gtk_label_set_justify(GTK_LABEL(status_state), GTK_JUSTIFY_CENTER);
-    gtk_box_append(GTK_BOX(status_panel), status_state);
-    auto* mount_operation = add_operation_ui(app, status_panel, "Mount Assigned Image Storage");
-    auto* mount_binding = new StorageMountBinding{app, mount_operation, status_state};
-    refresh_storage_mount_controls(mount_binding);
-    g_signal_connect(mount_operation->button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer data) {
-        auto* values = static_cast<StorageMountBinding*>(data);
-        const bool unmount = values->app->storage_online;
-        begin_service_job(values->operation,
-                          "{\"command\":\"" + std::string(unmount ? "unmount_image_storage" : "mount_image_storage") +
-                              "\",\"admin_token\":" + quote_json(values->app->admin_token) + "}",
-                          unmount ? "Image storage was safely unmounted." : "Image storage is mounted and ready.", {},
-                          [values](bool, const std::string&) {
-                              load_data(values->app);
-                              refresh_storage_mount_controls(values);
-                              refresh_operational_pages(values->app);
-                          });
-    }), mount_binding);
-    gtk_box_append(GTK_BOX(status_info_row), status_panel);
-
-    GtkWidget* info_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    lazarus::gui::add_class(info_panel, "workflow-section");
-    GtkWidget* info_header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(info_header), lazarus::gui::make_icon("info", 20));
-    gtk_box_append(GTK_BOX(info_header), label("About Image Storage", "section-title"));
-    gtk_box_append(GTK_BOX(info_panel), info_header);
-    gtk_box_append(GTK_BOX(info_panel), label(
-        "Lazarus stores image files in the configured location. The storage must be formatted with ext4 or an existing ext4 filesystem.",
-        "choice-detail"));
-    gtk_box_append(GTK_BOX(info_panel), label("Requirements:", "form-label"));
-    for (const char* req : {"ext4 filesystem (recommended)", "Sufficient free space", "Read/write access", "Stable connection"}) {
-        GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-        gtk_box_append(GTK_BOX(row), lazarus::gui::make_icon("check", 14));
-        gtk_box_append(GTK_BOX(row), label(req, "choice-detail"));
-        gtk_box_append(GTK_BOX(info_panel), row);
-    }
-    gtk_box_append(GTK_BOX(status_info_row), info_panel);
-    gtk_box_append(GTK_BOX(page), status_info_row);
-
-    gtk_box_append(GTK_BOX(page), label("3. Next Steps", "section-title"));
-    GtkWidget* steps_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-    struct NextStep { const char* number; const char* title; const char* detail; };
-    const NextStep steps[] = {
-        {"1", "Configure Storage", "Choose a local drive or connect to network storage."},
-        {"2", "Test Connection", "Lazarus will verify that the storage is accessible and writable."},
-        {"3", "Ready to Use", "Start creating and restoring images with confidence."},
-    };
-    for (std::size_t i = 0; i < 3; ++i) {
-        GtkWidget* step_card = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-        lazarus::gui::add_class(step_card, "step-card");
-        gtk_widget_set_hexpand(step_card, TRUE);
-        GtkWidget* badge = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-        lazarus::gui::add_class(badge, "step-badge");
-        gtk_widget_set_halign(badge, GTK_ALIGN_CENTER);
-        gtk_widget_set_valign(badge, GTK_ALIGN_CENTER);
-        gtk_box_append(GTK_BOX(badge), label(steps[i].number));
-        gtk_box_append(GTK_BOX(step_card), badge);
-        GtkWidget* step_text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
-        gtk_box_append(GTK_BOX(step_text), label(steps[i].title, "section-title"));
-        gtk_box_append(GTK_BOX(step_text), label(steps[i].detail, "choice-detail"));
-        gtk_box_append(GTK_BOX(step_card), step_text);
-        gtk_box_append(GTK_BOX(steps_row), step_card);
-        if (i < 2) {
-            GtkWidget* arrow = lazarus::gui::make_icon("arrow-right", 20);
-            gtk_widget_set_valign(arrow, GTK_ALIGN_CENTER);
-            gtk_box_append(GTK_BOX(steps_row), arrow);
+    gtk_box_append(GTK_BOX(page), label("Additional Storage Locations", "section-title"));
+    gtk_box_append(GTK_BOX(page), label(
+        "Configure more than one location so a technician can choose where to write each backup. "
+        "All configured locations are mounted at once.", "section-detail"));
+    if (app->storage_locations.empty()) {
+        gtk_box_append(GTK_BOX(page), label(
+            "No storage locations are configured yet.", "empty-state"));
+    } else {
+        for (const auto& location : app->storage_locations) {
+            gtk_box_append(GTK_BOX(page), build_storage_location_row(app, location));
         }
     }
-    gtk_box_append(GTK_BOX(page), steps_row);
-
-    GtkWidget* footer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-    lazarus::gui::add_class(footer, "bottom-bar");
-    GtkWidget* tip = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_set_hexpand(tip, TRUE);
-    gtk_box_append(GTK_BOX(tip), lazarus::gui::make_icon("lightbulb", 18));
-    gtk_box_append(GTK_BOX(tip), label(
-        "Tip: You can change the storage location at any time. Existing images will remain safe."));
-    gtk_box_append(GTK_BOX(footer), tip);
-    GtkWidget* footer_status = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-    gtk_box_append(GTK_BOX(footer_status), label(
-        "Bench: " + (app->bench_name.empty() ? std::string{"Unnamed Bench"} : app->bench_name)));
-    GtkWidget* dot = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    lazarus::gui::add_class(dot, app->storage_online ? "heartbeat-ok" : "heartbeat-warning");
-    gtk_widget_set_valign(dot, GTK_ALIGN_CENTER);
-    gtk_box_append(GTK_BOX(footer_status), dot);
-    gtk_box_append(GTK_BOX(footer_status), label(app->storage_online ? "Storage mounted" : "Storage not mounted"));
-    gtk_box_append(GTK_BOX(footer_status), lazarus::gui::make_icon("shield", 16));
-    gtk_box_append(GTK_BOX(footer_status), label(
-        app->admin_token.empty() ? "Administration locked" : "Administration unlocked"));
-    gtk_box_append(GTK_BOX(footer), footer_status);
-    gtk_box_append(GTK_BOX(page), footer);
+    GtkWidget* add_extra_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget* add_local = gtk_button_new_with_label("Add Local Drive");
+    lazarus::gui::add_class(add_local, "secondary-command");
+    g_object_set_data_full(G_OBJECT(add_local), "target-page", g_strdup("admin-storage-local"), g_free);
+    GtkWidget* add_network = gtk_button_new_with_label("Add Network Storage");
+    lazarus::gui::add_class(add_network, "secondary-command");
+    g_object_set_data_full(G_OBJECT(add_network), "target-page", g_strdup("admin-storage-network"), g_free);
+    for (GtkWidget* button : {add_local, add_network}) {
+        g_signal_connect(button, "clicked", G_CALLBACK(+[](GtkButton* self, gpointer data) {
+            auto* state = static_cast<App*>(data);
+            const auto* target = static_cast<const char*>(g_object_get_data(G_OBJECT(self), "target-page"));
+            state->adding_extra_storage_location = true;
+            show_page(state, target);
+        }), app);
+        gtk_box_append(GTK_BOX(add_extra_row), button);
+    }
+    gtk_box_append(GTK_BOX(page), add_extra_row);
 
     return page;
 }
 
 GtkWidget* make_storage_network_page(App* app) {
+    const bool adding_extra = app->adding_extra_storage_location;
     GtkWidget* page = page_shell(app, "BENCH STORAGE", "Network Storage",
                                  "Connect an SMB share or NFS export. Lazarus tests the repository read-write before saving it and keeps SMB credentials in a root-only file.",
                                  "admin-storage");
+    GtkWidget* location_name = nullptr;
+    GtkWidget* set_default = nullptr;
+    if (adding_extra) {
+        gtk_box_append(GTK_BOX(page), label("Additional location details", "section-title"));
+        gtk_box_append(GTK_BOX(page), label("Location name", "form-label"));
+        location_name = gtk_entry_new();
+        gtk_entry_set_placeholder_text(GTK_ENTRY(location_name), "e.g. Office NAS");
+        gtk_box_append(GTK_BOX(page), location_name);
+        set_default = gtk_check_button_new_with_label("Set as the default location for new backups");
+        gtk_box_append(GTK_BOX(page), set_default);
+    } else {
+        add_storage_mount_status(app, page);
+    }
     GtkWidget* nas = page;
     const char* protocols[] = {"SMB / Windows Share", "NFS Export", nullptr};
     GtkWidget* nas_protocol = gtk_drop_down_new_from_strings(protocols);
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(nas_protocol), app->nas_storage_protocol == "nfs" ? 1 : 0);
     GtkWidget* nas_server = gtk_entry_new();
     GtkWidget* nas_share = gtk_entry_new();
     GtkWidget* nas_folder = gtk_entry_new();
@@ -3111,20 +3226,26 @@ GtkWidget* make_storage_network_page(App* app) {
     gtk_entry_set_placeholder_text(GTK_ENTRY(nas_server), "nas.example.local or 192.168.1.20");
     gtk_entry_set_placeholder_text(GTK_ENTRY(nas_folder), "Lazarus Images");
     gtk_entry_set_placeholder_text(GTK_ENTRY(nas_username), "Backup service account");
-    g_object_set(nas_password, "placeholder-text", app->nas_storage_protocol == "smb"
-        ? "Re-enter password to test or change settings" : "SMB password", nullptr);
     gtk_entry_set_placeholder_text(GTK_ENTRY(nas_domain), "Optional SMB domain or workgroup");
-    gtk_editable_set_text(GTK_EDITABLE(nas_server), app->nas_storage_server.c_str());
-    gtk_editable_set_text(GTK_EDITABLE(nas_share), app->nas_storage_share.c_str());
-    gtk_editable_set_text(GTK_EDITABLE(nas_username), app->nas_storage_username.c_str());
-    gtk_editable_set_text(GTK_EDITABLE(nas_domain), app->nas_storage_domain.c_str());
-    auto nas_relative = std::string{"images"};
-    const auto nas_prefix = std::string{"/mnt/lazarus-storage/"};
-    if (!app->nas_storage_protocol.empty() && app->storage_text.rfind(nas_prefix, 0) == 0) {
-        nas_relative = app->storage_text.substr(nas_prefix.size());
-        if (const auto newline = nas_relative.find('\n'); newline != std::string::npos) nas_relative.resize(newline);
+    gtk_editable_set_text(GTK_EDITABLE(nas_folder), "images");
+    if (!adding_extra) {
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(nas_protocol), app->nas_storage_protocol == "nfs" ? 1 : 0);
+        g_object_set(nas_password, "placeholder-text", app->nas_storage_protocol == "smb"
+            ? "Re-enter password to test or change settings" : "SMB password", nullptr);
+        gtk_editable_set_text(GTK_EDITABLE(nas_server), app->nas_storage_server.c_str());
+        gtk_editable_set_text(GTK_EDITABLE(nas_share), app->nas_storage_share.c_str());
+        gtk_editable_set_text(GTK_EDITABLE(nas_username), app->nas_storage_username.c_str());
+        gtk_editable_set_text(GTK_EDITABLE(nas_domain), app->nas_storage_domain.c_str());
+        auto nas_relative = std::string{"images"};
+        const auto nas_prefix = std::string{"/mnt/lazarus-storage/"};
+        if (!app->nas_storage_protocol.empty() && app->storage_text.rfind(nas_prefix, 0) == 0) {
+            nas_relative = app->storage_text.substr(nas_prefix.size());
+            if (const auto newline = nas_relative.find('\n'); newline != std::string::npos) nas_relative.resize(newline);
+        }
+        gtk_editable_set_text(GTK_EDITABLE(nas_folder), nas_relative.c_str());
+    } else {
+        gtk_entry_set_placeholder_text(GTK_ENTRY(nas_password), "SMB password");
     }
-    gtk_editable_set_text(GTK_EDITABLE(nas_folder), nas_relative.c_str());
     for (const auto& field : std::vector<std::pair<const char*, GtkWidget*>>{
              {"Protocol", nas_protocol}, {"NAS hostname or IP", nas_server},
              {"Share name / export path", nas_share}, {"Lazarus image folder inside the share", nas_folder},
@@ -3132,10 +3253,10 @@ GtkWidget* make_storage_network_page(App* app) {
         gtk_box_append(GTK_BOX(nas), label(field.first, "form-label"));
         gtk_box_append(GTK_BOX(nas), field.second);
     }
-    auto* nas_operation = add_operation_ui(app, nas, "Test and Use NAS Storage");
+    auto* nas_operation = add_operation_ui(app, nas, adding_extra ? "Add NAS Storage Location" : "Test and Use NAS Storage");
     auto* nas_binding = new NasStorageBinding{
         app, nas_operation, nas_protocol, nas_server, nas_share, nas_folder,
-        nas_username, nas_password, nas_domain};
+        nas_username, nas_password, nas_domain, location_name, set_default, adding_extra};
     for (auto* entry : {nas_server, nas_share, nas_folder, nas_username, nas_password, nas_domain}) {
         g_signal_connect(entry, "changed", G_CALLBACK(+[](GtkEditable*, gpointer data) {
             update_nas_storage_action(static_cast<NasStorageBinding*>(data));
@@ -3147,20 +3268,30 @@ GtkWidget* make_storage_network_page(App* app) {
     g_signal_connect(nas_operation->button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer data) {
         auto* values = static_cast<NasStorageBinding*>(data);
         const bool smb = gtk_drop_down_get_selected(GTK_DROP_DOWN(values->protocol)) == 0;
-        const auto request_json = "{\"command\":\"configure_nas_storage\",\"admin_token\":" +
-            quote_json(values->app->admin_token) + ",\"protocol\":" + quote_json(smb ? "smb" : "nfs") +
+        auto request_json = "{\"command\":\"" + std::string(values->adding_extra ? "add_nas_storage_location" : "configure_nas_storage") +
+            "\",\"admin_token\":" + quote_json(values->app->admin_token) + ",\"protocol\":" + quote_json(smb ? "smb" : "nfs") +
             ",\"server\":" + quote_json(gtk_editable_get_text(GTK_EDITABLE(values->server))) +
             ",\"share\":" + quote_json(gtk_editable_get_text(GTK_EDITABLE(values->share))) +
             ",\"directory\":" + quote_json(gtk_editable_get_text(GTK_EDITABLE(values->folder))) +
             ",\"username\":" + quote_json(gtk_editable_get_text(GTK_EDITABLE(values->username))) +
             ",\"password\":" + quote_json(gtk_editable_get_text(GTK_EDITABLE(values->password))) +
-            ",\"domain\":" + quote_json(gtk_editable_get_text(GTK_EDITABLE(values->domain))) + "}";
+            ",\"domain\":" + quote_json(gtk_editable_get_text(GTK_EDITABLE(values->domain)));
+        if (values->adding_extra) {
+            request_json += ",\"name\":" + quote_json(gtk_editable_get_text(GTK_EDITABLE(values->location_name))) +
+                ",\"set_default\":" + quote_json(gtk_check_button_get_active(GTK_CHECK_BUTTON(values->set_default)) ? "1" : "0");
+        }
+        request_json += "}";
         begin_service_job(values->operation, request_json,
-                          "NAS storage is mounted read-write and ready for backups.", {},
+                          values->adding_extra ? "The additional NAS location was tested and mounted read-write."
+                                                : "NAS storage is mounted read-write and ready for backups.", {},
                           [values](bool ok, const std::string&) {
                               if (!ok) return;
                               gtk_editable_set_text(GTK_EDITABLE(values->password), "");
                               load_data(values->app);
+                              if (values->adding_extra) {
+                                  values->app->adding_extra_storage_location = false;
+                                  show_page(values->app, "admin-storage");
+                              }
                               refresh_operational_pages(values->app);
                           });
     }), nas_binding);
@@ -3169,9 +3300,23 @@ GtkWidget* make_storage_network_page(App* app) {
 }
 
 GtkWidget* make_storage_local_page(App* app) {
+    const bool adding_extra = app->adding_extra_storage_location;
     GtkWidget* page = page_shell(app, "BENCH STORAGE", "Local Drive Storage",
                                  "Select a physical disk. Lazarus mounts supported existing storage without erasing it, or prepares dedicated ext4 storage after explicit confirmation.",
                                  "admin-storage");
+    GtkWidget* location_name = nullptr;
+    GtkWidget* set_default = nullptr;
+    if (adding_extra) {
+        gtk_box_append(GTK_BOX(page), label("Additional location details", "section-title"));
+        gtk_box_append(GTK_BOX(page), label("Location name", "form-label"));
+        location_name = gtk_entry_new();
+        gtk_entry_set_placeholder_text(GTK_ENTRY(location_name), "e.g. Portable SSD");
+        gtk_box_append(GTK_BOX(page), location_name);
+        set_default = gtk_check_button_new_with_label("Set as the default location for new backups");
+        gtk_box_append(GTK_BOX(page), set_default);
+    } else {
+        add_storage_mount_status(app, page);
+    }
     gtk_box_append(GTK_BOX(page), label("1. Select the physical storage disk", "section-title"));
     gtk_box_append(GTK_BOX(page), label(
         "The Lazarus system disk and source-only customer drives are never eligible.", "section-detail"));
@@ -3284,7 +3429,7 @@ GtkWidget* make_storage_local_page(App* app) {
     gtk_widget_set_visible(confirmation, FALSE);
     gtk_box_append(GTK_BOX(page), confirmation);
 
-    auto* operation = add_operation_ui(app, page, "Configure Image Storage");
+    auto* operation = add_operation_ui(app, page, adding_extra ? "Add Storage Location" : "Configure Image Storage");
     gtk_widget_set_sensitive(operation->button, FALSE);
     auto* binding = new StorageBinding;
     binding->app = app;
@@ -3303,6 +3448,9 @@ GtkWidget* make_storage_local_page(App* app) {
     binding->browser_use = browser_use;
     binding->new_folder = new_folder;
     binding->create_folder = create_folder;
+    binding->location_name = location_name;
+    binding->set_default = set_default;
+    binding->adding_extra = adding_extra;
     g_signal_connect(choices, "row-selected", G_CALLBACK(+[](GtkListBox*, GtkListBoxRow* row, gpointer data) {
         auto* values = static_cast<StorageBinding*>(data);
         const char* selector = row == nullptr ? nullptr : static_cast<const char*>(g_object_get_data(G_OBJECT(row), "selector"));
@@ -3387,16 +3535,26 @@ GtkWidget* make_storage_local_page(App* app) {
         auto* values = static_cast<StorageBinding*>(data);
         const bool erase = gtk_drop_down_get_selected(GTK_DROP_DOWN(values->mode)) == 1;
         const std::string directory = gtk_editable_get_text(GTK_EDITABLE(values->folder));
-        const auto request_json = "{\"command\":\"configure_image_storage\",\"admin_token\":" +
-            quote_json(values->app->admin_token) + ",\"selector\":" + quote_json(values->selector) +
+        auto request_json = "{\"command\":\"" + std::string(values->adding_extra ? "add_local_storage_location" : "configure_image_storage") +
+            "\",\"admin_token\":" + quote_json(values->app->admin_token) + ",\"selector\":" + quote_json(values->selector) +
             ",\"mode\":" + quote_json(erase ? "format" : "existing") +
             ",\"directory\":" + quote_json(directory) +
-            ",\"confirmation\":" + quote_json(erase ? "ERASE" : "") + "}";
+            ",\"confirmation\":" + quote_json(erase ? "ERASE" : "");
+        if (values->adding_extra) {
+            request_json += ",\"name\":" + quote_json(gtk_editable_get_text(GTK_EDITABLE(values->location_name))) +
+                ",\"set_default\":" + quote_json(gtk_check_button_get_active(GTK_CHECK_BUTTON(values->set_default)) ? "1" : "0");
+        }
+        request_json += "}";
         begin_service_job(values->operation, request_json,
-                          "Image storage is mounted and persistent.", {},
+                          values->adding_extra ? "The additional storage location was prepared and mounted."
+                                                : "Image storage is mounted and persistent.", {},
                           [values](bool ok, const std::string&) {
                               if (!ok) return;
                               load_data(values->app);
+                              if (values->adding_extra) {
+                                  values->app->adding_extra_storage_location = false;
+                                  show_page(values->app, "admin-storage");
+                              }
                               refresh_operational_pages(values->app);
                           });
     }), binding);
@@ -4391,6 +4549,7 @@ GtkWidget* make_technicians_page(App* app) {
         gtk_editable_set_text(GTK_EDITABLE(pin_confirmation), "");
         gtk_widget_set_visible(pin_label, FALSE);
         refresh_technicians(values);
+        refresh_operational_pages(values->app);
         gtk_label_set_text(GTK_LABEL(values->status), "Technician added with the designated PIN.");
     }), binding);
     g_object_set_data(G_OBJECT(add), "pin-entry", add_pin_entry);
@@ -4466,6 +4625,7 @@ GtkWidget* make_technicians_page(App* app) {
             return;
         }
         refresh_technicians(values);
+        refresh_operational_pages(values->app);
         gtk_label_set_text(GTK_LABEL(values->status), "Technician removed.");
     }), binding);
 
@@ -5120,11 +5280,46 @@ GtkWidget* make_admin_page(App* app) {
 }
 
 void add_page(App* app, GtkWidget* page, const char* name, const char* title) {
-    GtkWidget* child = page;
-    if (std::strcmp(name, "home") != 0) {
-        child = gtk_scrolled_window_new();
-        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(child), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(child), page);
+    GtkWidget* action_bar = nullptr;
+    for (GtkWidget* item = gtk_widget_get_first_child(page); item != nullptr;) {
+        GtkWidget* next = gtk_widget_get_next_sibling(item);
+        if (g_object_get_data(G_OBJECT(item), "lazarus-persistent-action") != nullptr) {
+            if (action_bar == nullptr) {
+                action_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+                gtk_widget_set_halign(action_bar, GTK_ALIGN_FILL);
+                gtk_widget_set_hexpand(action_bar, TRUE);
+                lazarus::gui::add_class(action_bar, "workflow-action-bar");
+                GtkWidget* spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+                gtk_widget_set_hexpand(spacer, TRUE);
+                gtk_box_append(GTK_BOX(action_bar), spacer);
+            }
+            g_object_ref(item);
+            gtk_box_remove(GTK_BOX(page), item);
+            gtk_box_append(GTK_BOX(action_bar), item);
+            g_object_unref(item);
+        }
+        item = next;
+    }
+
+    // Every page, including Home, is constrained to the physical viewport. Without this wrapper,
+    // Home's natural height can enlarge the homogeneous GtkStack beyond a 1366x768 framebuffer and
+    // clip the bottom of every workflow in an unmanaged kiosk session.
+    GtkWidget* scroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_propagate_natural_width(GTK_SCROLLED_WINDOW(scroll), FALSE);
+    gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll), FALSE);
+    gtk_widget_set_hexpand(scroll, TRUE);
+    gtk_widget_set_vexpand(scroll, TRUE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), page);
+
+    GtkWidget* child = scroll;
+    if (action_bar != nullptr) {
+        GtkWidget* shell = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+        gtk_widget_set_hexpand(shell, TRUE);
+        gtk_widget_set_vexpand(shell, TRUE);
+        gtk_box_append(GTK_BOX(shell), scroll);
+        gtk_box_append(GTK_BOX(shell), action_bar);
+        child = shell;
     }
     gtk_stack_add_titled(GTK_STACK(app->stack), child, name, title);
 }
@@ -5498,7 +5693,7 @@ void activate(GtkApplication* application, gpointer data) {
         }
     }
     GtkWidget* root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0); gtk_window_set_child(GTK_WINDOW(app->window), root);
-    app->stack = gtk_stack_new(); gtk_stack_set_transition_type(GTK_STACK(app->stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE); gtk_widget_set_vexpand(app->stack, TRUE); gtk_box_append(GTK_BOX(root), app->stack);
+    app->stack = gtk_stack_new(); gtk_stack_set_transition_type(GTK_STACK(app->stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE); gtk_stack_set_hhomogeneous(GTK_STACK(app->stack), FALSE); gtk_stack_set_vhomogeneous(GTK_STACK(app->stack), FALSE); gtk_widget_set_hexpand(app->stack, TRUE); gtk_widget_set_vexpand(app->stack, TRUE); gtk_box_append(GTK_BOX(root), app->stack);
     app->status = gtk_label_new("Loading Lazarus service..."); gtk_label_set_xalign(GTK_LABEL(app->status), 0); lazarus::gui::add_class(app->status, "bottom-bar"); gtk_box_append(GTK_BOX(root), app->status);
     gui_trace("activate: root widgets created");
     load_data(app);
@@ -5558,8 +5753,19 @@ void activate(GtkApplication* application, gpointer data) {
     // to offset the unmanaged surface and clip its top edge.
     if (std::getenv("LAZARUS_KIOSK_FULLSCREEN") != nullptr) {
         gtk_window_set_decorated(GTK_WINDOW(app->window), FALSE);
+        gtk_window_set_resizable(GTK_WINDOW(app->window), FALSE);
     }
     gtk_window_present(GTK_WINDOW(app->window));
+    g_idle_add(+[](gpointer data) -> gboolean {
+        auto* state = static_cast<App*>(data);
+        char geometry[96]{};
+        std::snprintf(geometry, sizeof(geometry), "activate: allocated window %dx%d",
+                      gtk_widget_get_width(state->window), gtk_widget_get_height(state->window));
+        gui_trace(geometry);
+        std::fprintf(stderr, "lazarus-gui: allocated window %dx%d\n",
+                     gtk_widget_get_width(state->window), gtk_widget_get_height(state->window));
+        return G_SOURCE_REMOVE;
+    }, app);
     gui_trace("activate: window presented");
     g_timeout_add(1250, +[](gpointer data) -> gboolean {
         auto* state = static_cast<App*>(data);

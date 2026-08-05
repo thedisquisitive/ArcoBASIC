@@ -53,7 +53,7 @@ Continue()
 Section("7. Inspect files")
 PRINT "File.Exists and File.Find are available to ArcoBASIC scripts."
 PRINT "Type this command:"
-ok = Tutorial.Step("PRINT File.Exists(\"readme.md\")", "arco")
+ok = Tutorial.Step("PRINT File.Exists(\"README.md\")", "arco")
 Demo("Find markdown files:", "FOR file IN File.Find(\"*.md\")\nPRINT file\nNEXT", "arco")
 Continue()
 

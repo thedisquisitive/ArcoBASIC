@@ -4,8 +4,8 @@ PRINT "ArcoSH on " + Host.OSName()
 PRINT "Host " + Host.Hostname()
 PRINT Color.Cyan("colored output ready")
 
-IF File.Exists("readme.md") THEN
-    PRINT "readme.md found"
+IF File.Exists("README.md") THEN
+    PRINT "README.md found"
 END IF
 
 result = RUN("printf shell-test")
@@ -17,7 +17,7 @@ FOR proc IN Host.Processes()
 NEXT proc
 
 FOR file IN File.Find("*.md")
-    IF file CONTAINS "readme" THEN
+    IF file CONTAINS "README" THEN
         PRINT "Doc " + file
     END IF
 NEXT file

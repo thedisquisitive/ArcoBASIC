@@ -1,0 +1,33 @@
+#DESCRIPTION "Export Arcology v0.1a as a static HTML site"
+#IMPORT "arcology"
+
+dbPath = "arcology-os/var/local/arcology-v01a.arcodb"
+outDir = "arcology-os/dist/commons"
+IF LEN(Args) > 0 THEN dbPath = Args[0]
+IF LEN(Args) > 1 THEN outDir = Args[1]
+
+app = Arcology.Open(dbPath)
+
+info = Arcology.Inspect(app)
+IF info.Communities == 0 THEN
+    ignored = Arcology.CreateUser(app, "ada", "Ada Lovelace", "Community steward", "moderator")
+    ignored = Arcology.CreateUser(app, "grace", "Grace Hopper", "Systems neighbor")
+    ignored = Arcology.CreateCommunity(app, "photography", "Photography", "Local photos, walks, and image craft.")
+    ignored = Arcology.CreateCommunity(app, "makers", "Makers", "Repairs, workshops, projects, and practical help.")
+    ignored = Arcology.JoinCommunity(app, "ada", "photography", "moderator")
+    ignored = Arcology.JoinCommunity(app, "grace", "photography")
+    ignored = Arcology.JoinCommunity(app, "grace", "makers")
+    ignored = Arcology.Post(app, "photography", "grace", "Sunset walk", "Meet at the library steps at 7.", ["local", "photo"])
+    ignored = Arcology.Event(app, "makers", "Repair night", "2026-08-12 18:00", "Community center", "Bring broken lamps, radios, and bikes.")
+    ignored = Arcology.Save(app)
+END IF
+
+result = Arcology.ExportSite(app, outDir)
+IF result.Ok THEN
+    PRINT "Exported: " + result.Path
+    PRINT "Files: " + STRING(result.Files)
+    PRINT "Open: " + Arcology.SitePath(result.Path, "index.html")
+ELSE
+    PRINT "Export failed"
+    ExitTheProgram(1)
+END IF

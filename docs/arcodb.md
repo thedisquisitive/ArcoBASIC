@@ -27,7 +27,7 @@ id = ArcoDB.Keep(db, schema, customer)
 restored = ArcoDB.Recall(db, schema, id)
 byEmail = ArcoDB.RecallBy(db, schema, "email", "wanda@email.com")
 
-restored.email = "wanda.goodburger@arcology.example"
+restored.email = "wanda.goodburger@example.test"
 ArcoDB.Replace(db, schema, id, restored)
 
 ArcoDB.Write(db)
