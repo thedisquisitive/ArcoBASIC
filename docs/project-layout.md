@@ -62,6 +62,7 @@ CTest registration lives in `cmake/Testing.cmake` rather than the top-level buil
 - `arcology-os/scripts/` — Arcology OS hardware builders, QEMU launchers, and entry points into the
   independent Lazarus subproject.
 - `arcology-commons/scripts/` — Arcology Commons development and service launchers.
+- `books/` — long-form technical references for Arcology components, organized by component.
 
 Generated builds belong in `build/` or `build-*`; generic distributable output belongs in `dist/`.
 Arcology OS artifacts belong in `arcology-os/dist/`. Arcology Commons generated sites and runtime

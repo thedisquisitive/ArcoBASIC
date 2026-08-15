@@ -1,0 +1,12 @@
+LET screen AS SURFACE = GRAPHICS.PrimarySurface()
+GRAPHICS.Bind(screen)
+GRAPHICS.Clear(COLOR.Black())
+GRAPHICS.FillRect(20, 20, 120, 40, COLOR.Magenta())
+GRAPHICS.DrawText(28, 34, "ARCOLOGY OS", COLOR.White())
+PRINT RESOURCE.Describe()
+LET destroyed AS BOOL = GRAPHICS.DestroySurface(screen)
+IF destroyed THEN
+    PRINT "FAIL: primary surface was destroyed"
+    STOP
+END IF
+PRINT "PRIMARY SURFACE ABI ONLINE"

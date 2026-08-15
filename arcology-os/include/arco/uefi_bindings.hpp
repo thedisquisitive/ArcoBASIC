@@ -62,6 +62,61 @@ inline std::optional<UefiType> lookup_uefi_type(const std::string& name) {
                 // EFI_SET_WATCHDOG_TIMER is a service-table function, not a protocol method:
                 // its four explicit parameters begin in RCX and there is no implicit This.
                 UefiField{"SetWatchdogTimer", "SetWatchdogTimer", 0x100, "", true, false, "U64"},
+                // EFI_BOOT_SERVICES.GetMemoryMap (table index 6, offset 0x38). The raw ABI
+                // exposes buffer size, buffer, map key, descriptor size, and version pointers.
+                UefiField{"GetMemoryMap", "GetMemoryMap", 0x38, "", true, false, "U64"},
+                // EFI_BOOT_SERVICES.AllocatePages (table index 5, offset 0x28). The raw
+                // bootstrap binding keeps the physical output pointer explicit.
+                UefiField{"AllocatePages", "AllocatePages", 0x28, "", true, false, "U64"},
+                // EFI_BOOT_SERVICES.AllocatePool / FreePool (offsets 0x40 / 0x48). These are
+                // recorded for the bootstrap allocator layer; typed buffer wrappers remain next.
+                UefiField{"AllocatePool", "AllocatePool", 0x40, "", true, false, "U64"},
+                UefiField{"FreePool", "FreePool", 0x48, "", true, false, "U64"},
+                // EFI_BOOT_SERVICES.LocateProtocol (table index 37, offset 0x140).
+                // The raw ABI takes a protocol GUID pointer, an optional registration key,
+                // and an output interface pointer. A typed convenience wrapper remains a
+                // follow-up; this binding records the verified firmware entry point.
+                UefiField{"LocateProtocol", "LocateProtocol", 0x140, "", true, false, "U64"},
+                // EFI_BOOT_SERVICES.ExitBootServices (table index 29, offset 0xE8). The
+                // image handle and memory-map key are explicit UINTN arguments; the service
+                // table pointer is not an implicit C++/protocol `This` parameter.
+                UefiField{"ExitBootServices", "ExitBootServices", 0xE8, "", true, false, "U64"},
+            },
+        };
+    }
+    if (name == "UEFI.GraphicsOutputProtocol") {
+        return UefiType{
+            "UEFI.GraphicsOutputProtocol",
+            32,
+            {
+                UefiField{"Mode", "Mode", 0x18, "UEFI.GraphicsOutputMode", false, false, ""},
+            },
+        };
+    }
+    if (name == "UEFI.GraphicsOutputMode") {
+        return UefiType{
+            "UEFI.GraphicsOutputMode",
+            40,
+            {
+                UefiField{"MaxMode", "MaxMode", 0x00, "U32", false, false, ""},
+                UefiField{"Mode", "Mode", 0x04, "U32", false, false, ""},
+                UefiField{"Info", "Info", 0x08, "UEFI.GraphicsOutputModeInformation", false, false, ""},
+                UefiField{"SizeOfInfo", "SizeOfInfo", 0x10, "U64", false, false, ""},
+                UefiField{"FrameBufferBase", "FrameBufferBase", 0x18, "PHYSICALPTR", false, false, ""},
+                UefiField{"FrameBufferSize", "FrameBufferSize", 0x20, "U64", false, false, ""},
+            },
+        };
+    }
+    if (name == "UEFI.GraphicsOutputModeInformation") {
+        return UefiType{
+            "UEFI.GraphicsOutputModeInformation",
+            36,
+            {
+                UefiField{"Version", "Version", 0x00, "U32", false, false, ""},
+                UefiField{"HorizontalResolution", "HorizontalResolution", 0x04, "U32", false, false, ""},
+                UefiField{"VerticalResolution", "VerticalResolution", 0x08, "U32", false, false, ""},
+                UefiField{"PixelFormat", "PixelFormat", 0x0C, "U32", false, false, ""},
+                UefiField{"PixelsPerScanLine", "PixelsPerScanLine", 0x20, "U32", false, false, ""},
             },
         };
     }

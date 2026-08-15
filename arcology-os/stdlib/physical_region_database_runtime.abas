@@ -1,0 +1,264 @@
+' Persistent PRD record layout, implemented in ArcoBASIC over a caller-owned MMIO/mapped buffer.
+' Header: U32 region count at byte 0. Records begin at byte 8 and occupy 64 bytes:
+' base(0), pages(8), state(16), owner(24), provider(32), reason(40), flags(48).
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION PRDRuntimeRegionEnd(base AS U64, pages AS U64) AS U64
+    IF pages = 0 THEN RETURN 0
+    IF pages > 4503599627370495 THEN RETURN 0
+    LET bytes AS U64 = pages * 4096
+    IF base > 18446744073709551615 - bytes THEN RETURN 0
+    RETURN base + bytes
+END FUNCTION
+
+FUNCTION PRDRuntimeValidateRegion(base AS U64, pages AS U64) AS BOOL
+    IF (base AND 4095) <> 0 THEN RETURN 0
+    IF PRDRuntimeRegionEnd(base, pages) = 0 THEN RETURN 0
+    RETURN 1
+END FUNCTION
+
+FUNCTION PRDRuntimeRegionsOverlap(firstBase AS U64, firstPages AS U64, secondBase AS U64, secondPages AS U64) AS BOOL
+    LET firstEnd AS U64 = PRDRuntimeRegionEnd(firstBase, firstPages)
+    LET secondEnd AS U64 = PRDRuntimeRegionEnd(secondBase, secondPages)
+    IF firstEnd = 0 OR secondEnd = 0 THEN RETURN 0
+    IF firstBase >= secondEnd OR secondBase >= firstEnd THEN RETURN 0
+    RETURN 1
+END FUNCTION
+
+FUNCTION PRDInitialize(database AS MMIOPTR, capacity AS U32) AS BOOL
+    IF capacity = 0 THEN
+        RETURN 0
+    END IF
+    LET countAddress AS MMIOPTR = ADDRESS.Offset(database, 0)
+    MEMORY.Write32(countAddress, 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION PRDRegionCount(database AS MMIOPTR) AS U32
+    LET countAddress AS MMIOPTR = ADDRESS.Offset(database, 0)
+    RETURN MEMORY.Read32(countAddress)
+END FUNCTION
+
+FUNCTION PRDAddRegion(database AS MMIOPTR, capacity AS U32, pbase AS U64, ppages AS U64, pstate AS U32, powner AS U32, pprovider AS U32, preason AS U32, pflags AS U32) AS BOOL
+    IF PRDRuntimeValidateRegion(pbase, ppages) = 0 THEN
+        RETURN 0
+    END IF
+    LET count AS U32 = PRDRegionCount(database)
+    LET existing AS U32 = 0
+    WHILE existing < count
+        LET existingOffset AS U32 = 8 + (existing * 64)
+        LET existingRecord AS MMIOPTR = ADDRESS.Offset(database, existingOffset)
+        IF PRDRuntimeRegionsOverlap(pbase, ppages, MEMORY.Read64(existingRecord), MEMORY.Read64(ADDRESS.Offset(existingRecord, 8))) <> 0 THEN
+            RETURN 0
+        END IF
+        existing = existing + 1
+    WEND
+    IF count >= capacity THEN
+        RETURN 0
+    END IF
+    LET recordOffset AS U32 = 8 + (count * 64)
+    LET record AS MMIOPTR = ADDRESS.Offset(database, recordOffset)
+    MEMORY.Write64(record, pbase)
+    MEMORY.Write64(ADDRESS.Offset(record, 8), ppages)
+    MEMORY.Write32(ADDRESS.Offset(record, 16), pstate)
+    MEMORY.Write32(ADDRESS.Offset(record, 24), powner)
+    MEMORY.Write32(ADDRESS.Offset(record, 32), pprovider)
+    MEMORY.Write32(ADDRESS.Offset(record, 40), preason)
+    MEMORY.Write32(ADDRESS.Offset(record, 48), pflags)
+    LET nextCount AS U32 = count + 1
+    MEMORY.Write32(ADDRESS.Offset(database, 0), nextCount)
+    RETURN 1
+END FUNCTION
+
+FUNCTION PRDRegionState(database AS MMIOPTR, index AS U32) AS U32
+    LET recordOffset AS U32 = 8 + (index * 64)
+    LET record AS MMIOPTR = ADDRESS.Offset(database, recordOffset)
+    RETURN MEMORY.Read32(ADDRESS.Offset(record, 16))
+END FUNCTION
+
+FUNCTION PRDReserveRegion(database AS MMIOPTR, index AS U32) AS BOOL
+    LET recordOffset AS U32 = 8 + (index * 64)
+    LET record AS MMIOPTR = ADDRESS.Offset(database, recordOffset)
+    IF MEMORY.Read32(ADDRESS.Offset(record, 16)) <> 0 THEN
+        RETURN 0
+    END IF
+    MEMORY.Write32(ADDRESS.Offset(record, 16), 1)
+    RETURN 1
+END FUNCTION
+
+' Reserve a page range only when it exactly matches a translated PRD record.
+' Refusing partial ranges is deliberate: callers must use a future splitting
+' transaction rather than silently leaving an overlapping free record.
+FUNCTION PRDReserveExactRange(database AS MMIOPTR, base AS U64, pages AS U64, owner AS U32, purpose AS U32) AS BOOL
+    IF PRDRuntimeValidateRegion(base, pages) = 0 THEN RETURN 0
+    LET count AS U32 = PRDRegionCount(database)
+    LET index AS U32 = 0
+    WHILE index < count
+        LET record AS MMIOPTR = ADDRESS.Offset(database, 8 + (index * 64))
+        IF MEMORY.Read64(record) = base AND MEMORY.Read64(ADDRESS.Offset(record, 8)) = pages THEN
+            IF MEMORY.Read32(ADDRESS.Offset(record, 16)) <> 0 THEN RETURN 0
+            MEMORY.Write32(ADDRESS.Offset(record, 16), 1)
+            MEMORY.Write32(ADDRESS.Offset(record, 24), owner)
+            MEMORY.Write32(ADDRESS.Offset(record, 40), purpose)
+            RETURN 1
+        END IF
+        index = index + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION PRDWriteRecord(record AS MMIOPTR, recordBaseValue AS U64, pages AS U64, state AS U32, owner AS U32) AS U64
+    MEMORY.Write64(record, recordBaseValue)
+    MEMORY.Write64(ADDRESS.Offset(record, 8), pages)
+    MEMORY.Write32(ADDRESS.Offset(record, 16), state)
+    MEMORY.Write32(ADDRESS.Offset(record, 24), owner)
+    RETURN 0
+END FUNCTION
+
+' Split one free descriptor and reserve a sub-range. The operation either
+' commits all record changes or returns failure before modifying the database.
+FUNCTION PRDReserveRange(database AS MMIOPTR, capacity AS U32, base AS U64, pages AS U64, owner AS U32, purpose AS U32) AS BOOL
+    IF PRDRuntimeValidateRegion(base, pages) = 0 THEN RETURN 0
+    LET requestedEnd AS U64 = PRDRuntimeRegionEnd(base, pages)
+    LET count AS U32 = PRDRegionCount(database)
+    LET index AS U32 = 0
+    WHILE index < count
+        LET record AS MMIOPTR = ADDRESS.Offset(database, 8 + (index * 64))
+        LET state AS U32 = MEMORY.Read32(ADDRESS.Offset(record, 16))
+        LET recordBase AS U64 = MEMORY.Read64(record)
+        LET recordPages AS U64 = MEMORY.Read64(ADDRESS.Offset(record, 8))
+        LET recordEnd AS U64 = PRDRuntimeRegionEnd(recordBase, recordPages)
+        IF state = 0 AND recordEnd <> 0 AND base >= recordBase AND requestedEnd <= recordEnd THEN
+            LET prefixPages AS U64 = (base - recordBase) SHR 12
+            LET suffixPages AS U64 = (recordEnd - requestedEnd) SHR 12
+            LET extra AS U32 = 0
+            IF prefixPages > 0 THEN extra = extra + 1
+            IF suffixPages > 0 THEN extra = extra + 1
+            IF count + extra > capacity THEN RETURN 0
+            LET oldProvider AS U32 = MEMORY.Read32(ADDRESS.Offset(record, 32))
+            LET oldReason AS U32 = MEMORY.Read32(ADDRESS.Offset(record, 40))
+            LET oldFlags AS U32 = MEMORY.Read32(ADDRESS.Offset(record, 48))
+            LET nextIndex AS U32 = count
+            IF prefixPages > 0 THEN
+                PRDWriteRecord(record, recordBase, prefixPages, 0, 0)
+                MEMORY.Write32(ADDRESS.Offset(record, 32), oldProvider)
+                MEMORY.Write32(ADDRESS.Offset(record, 40), oldReason)
+                MEMORY.Write32(ADDRESS.Offset(record, 48), oldFlags)
+                LET reservedRecord AS MMIOPTR = ADDRESS.Offset(database, 8 + (nextIndex * 64))
+                PRDWriteRecord(reservedRecord, base, pages, 1, owner)
+                MEMORY.Write32(ADDRESS.Offset(reservedRecord, 40), purpose)
+                nextIndex = nextIndex + 1
+            ELSE
+                PRDWriteRecord(record, base, pages, 1, owner)
+                MEMORY.Write32(ADDRESS.Offset(record, 40), purpose)
+            END IF
+            IF suffixPages > 0 THEN
+                LET suffixRecord AS MMIOPTR = ADDRESS.Offset(database, 8 + (nextIndex * 64))
+                PRDWriteRecord(suffixRecord, requestedEnd, suffixPages, 0, 0)
+                MEMORY.Write32(ADDRESS.Offset(suffixRecord, 32), oldProvider)
+                MEMORY.Write32(ADDRESS.Offset(suffixRecord, 40), oldReason)
+                MEMORY.Write32(ADDRESS.Offset(suffixRecord, 48), oldFlags)
+                nextIndex = nextIndex + 1
+            END IF
+            MEMORY.Write32(database, nextIndex)
+            RETURN 1
+        END IF
+        index = index + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION PRDAllocateFirstFreeForOwner(database AS MMIOPTR, capacity AS U32, requestedPages AS U64, owner AS U32, purpose AS U32) AS U64
+    IF requestedPages = 0 THEN
+        RETURN 0
+    END IF
+    LET count AS U32 = PRDRegionCount(database)
+    LET index AS U32 = 0
+    WHILE index < count
+        LET recordOffset AS U32 = 8 + (index * 64)
+        LET record AS MMIOPTR = ADDRESS.Offset(database, recordOffset)
+        LET state AS U32 = MEMORY.Read32(ADDRESS.Offset(record, 16))
+        LET pages AS U64 = MEMORY.Read64(ADDRESS.Offset(record, 8))
+        IF state = 0 THEN
+            IF pages >= requestedPages THEN
+                LET base AS U64 = MEMORY.Read64(record)
+                IF pages = requestedPages THEN
+                    MEMORY.Write32(ADDRESS.Offset(record, 16), 2)
+                    MEMORY.Write32(ADDRESS.Offset(record, 24), owner)
+                    MEMORY.Write32(ADDRESS.Offset(record, 40), purpose)
+                    RETURN base
+                END IF
+                IF count >= capacity THEN
+                    RETURN 0
+                END IF
+                LET allocatedOffset AS U32 = 8 + (count * 64)
+                LET allocated AS MMIOPTR = ADDRESS.Offset(database, allocatedOffset)
+                MEMORY.Write64(allocated, base)
+                MEMORY.Write64(ADDRESS.Offset(allocated, 8), requestedPages)
+                MEMORY.Write32(ADDRESS.Offset(allocated, 16), 2)
+                MEMORY.Write32(ADDRESS.Offset(allocated, 24), owner)
+                MEMORY.Write32(ADDRESS.Offset(allocated, 32), 0)
+                MEMORY.Write32(ADDRESS.Offset(allocated, 40), purpose)
+                MEMORY.Write32(ADDRESS.Offset(allocated, 48), 0)
+                MEMORY.Write64(record, base + (requestedPages * 4096))
+                MEMORY.Write64(ADDRESS.Offset(record, 8), pages - requestedPages)
+                MEMORY.Write32(ADDRESS.Offset(database, 0), count + 1)
+                RETURN base
+            END IF
+        END IF
+        index = index + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION PRDReleaseRegionOwned(database AS MMIOPTR, index AS U32, owner AS U32) AS BOOL
+    LET count AS U32 = PRDRegionCount(database)
+    IF index >= count THEN RETURN 0
+    LET record AS MMIOPTR = ADDRESS.Offset(database, 8 + (index * 64))
+    IF MEMORY.Read32(ADDRESS.Offset(record, 16)) <> 2 THEN RETURN 0
+    IF MEMORY.Read32(ADDRESS.Offset(record, 24)) <> owner THEN RETURN 0
+    MEMORY.Write32(ADDRESS.Offset(record, 16), 0)
+    MEMORY.Write32(ADDRESS.Offset(record, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(record, 40), 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION PRDAllocateFirstFree(database AS MMIOPTR, capacity AS U32, requestedPages AS U64) AS U64
+    RETURN PRDAllocateFirstFreeForOwner(database, capacity, requestedPages, 0, 0)
+END FUNCTION
+
+FUNCTION PRDReleaseRegion(database AS MMIOPTR, index AS U32) AS BOOL
+    LET recordOffset AS U32 = 8 + (index * 64)
+    LET record AS MMIOPTR = ADDRESS.Offset(database, recordOffset)
+    IF MEMORY.Read32(ADDRESS.Offset(record, 16)) <> 2 THEN
+        RETURN 0
+    END IF
+    MEMORY.Write32(ADDRESS.Offset(record, 16), 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION PRDCoalescePair(database AS MMIOPTR, firstIndex AS U32, secondIndex AS U32) AS BOOL
+    LET firstOffset AS U32 = 8 + (firstIndex * 64)
+    LET secondOffset AS U32 = 8 + (secondIndex * 64)
+    LET first AS MMIOPTR = ADDRESS.Offset(database, firstOffset)
+    LET second AS MMIOPTR = ADDRESS.Offset(database, secondOffset)
+    IF MEMORY.Read32(ADDRESS.Offset(first, 16)) <> 0 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(ADDRESS.Offset(second, 16)) <> 0 THEN
+        RETURN 0
+    END IF
+    LET firstBase AS U64 = MEMORY.Read64(first)
+    LET firstPages AS U64 = MEMORY.Read64(ADDRESS.Offset(first, 8))
+    LET secondBase AS U64 = MEMORY.Read64(second)
+    LET secondPages AS U64 = MEMORY.Read64(ADDRESS.Offset(second, 8))
+    IF firstBase + (firstPages * 4096) <> secondBase THEN
+        RETURN 0
+    END IF
+    MEMORY.Write64(ADDRESS.Offset(first, 8), firstPages + secondPages)
+    MEMORY.Write32(ADDRESS.Offset(second, 16), 4)
+    RETURN 1
+END FUNCTION

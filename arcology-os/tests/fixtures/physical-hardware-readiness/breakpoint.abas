@@ -1,0 +1,8 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION TriggerBreakpoint() AS U64
+    CPU.Breakpoint
+    RETURN 0
+END FUNCTION

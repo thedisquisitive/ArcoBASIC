@@ -1,0 +1,10 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION Main(database AS MMIOPTR) AS U64
+    IF VMAPInitialize(database) = 0 THEN RETURN 1
+    IF VMAPAddValidated(database, 8, 536870912, 4096, 1048576, 3, 1) = 0 THEN RETURN 2
+    IF VMAPAddValidated(database, 8, 536875008, 4096, 1052672, 3, 1) <> 0 THEN RETURN 3
+    RETURN MEMORY.Read32(database)
+END FUNCTION

@@ -1,0 +1,86 @@
+' Generation-1 x86-64 paging geometry and address validation policy.
+' The compiler supplies only the privileged instructions; these decisions stay in ArcoBASIC.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION PageSize() AS U64
+    RETURN 4096
+END FUNCTION
+
+FUNCTION PageTableEntries() AS U64
+    RETURN 512
+END FUNCTION
+
+FUNCTION PageOffset(address AS U64) AS U64
+    RETURN address AND 4095
+END FUNCTION
+
+FUNCTION PageAlignDown(address AS U64) AS U64
+    RETURN address AND 18446744073709547520
+END FUNCTION
+
+FUNCTION PageAlignUp(address AS U64) AS U64
+    IF address > 18446744073709547520 THEN
+        RETURN 0
+    END IF
+    IF (address AND 4095) = 0 THEN
+        RETURN address
+    END IF
+    RETURN (address + 4095) AND 18446744073709547520
+END FUNCTION
+
+FUNCTION IsCanonicalAddress(address AS U64) AS BOOL
+    IF address <= 140737488355327 THEN
+        RETURN 1
+    END IF
+    IF address >= 18446462598732840960 THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION IsCanonicalRange(base AS U64, length AS U64) AS BOOL
+    IF length = 0 THEN
+        RETURN 0
+    END IF
+    IF base > 18446744073709551615 - length THEN
+        RETURN 0
+    END IF
+    IF IsCanonicalAddress(base) = 0 THEN
+        RETURN 0
+    END IF
+    LET last AS U64 = base + length - 1
+    IF last <= 140737488355327 THEN
+        RETURN 1
+    END IF
+    IF last >= 18446462598732840960 THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION IsPageAligned(address AS U64) AS BOOL
+    RETURN (address AND 4095) = 0
+END FUNCTION
+
+FUNCTION IsPhysicalAddressValid(address AS U64) AS BOOL
+    RETURN (address AND 18446462598732840960) = 0
+END FUNCTION
+
+FUNCTION PML4Index(address AS U64) AS U64
+    RETURN (address >> 39) AND 511
+END FUNCTION
+
+FUNCTION PDPTIndex(address AS U64) AS U64
+    RETURN (address >> 30) AND 511
+END FUNCTION
+
+FUNCTION PDIndex(address AS U64) AS U64
+    RETURN (address >> 21) AND 511
+END FUNCTION
+
+FUNCTION PTIndex(address AS U64) AS U64
+    RETURN (address >> 12) AND 511
+END FUNCTION

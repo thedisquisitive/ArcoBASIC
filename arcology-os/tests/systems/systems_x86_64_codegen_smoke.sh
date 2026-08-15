@@ -28,7 +28,7 @@ grep -q "^RDATA 42 bytes$" "$TMP_ROOT/hello.x86_64"
 # Full instruction sequence, byte for byte (prologue; spill imageHandle/systemTable; LEA the UTF-16
 # string with its still-unpatched relocation placeholder; dereference ConsoleOut/OutputString;
 # indirect call with the implicit This argument; materialize and return 0; epilogue).
-grep -qF "0000: 48 83 ec 48 48 89 4c 24" "$TMP_ROOT/hello.x86_64"
+grep -qF "0000: 48 83 ec 68 48 89 4c 24" "$TMP_ROOT/hello.x86_64"
 grep -qF "0008: 20 48 89 54 24 28 48 8d" "$TMP_ROOT/hello.x86_64"
 grep -qF "0010: 05 00 00 00 00 48 89 44" "$TMP_ROOT/hello.x86_64"
 grep -qF "0018: 24 30 48 8b 44 24 28 48" "$TMP_ROOT/hello.x86_64"
@@ -37,7 +37,7 @@ grep -qF "0028: 54 24 30 ff 50 08 48 89" "$TMP_ROOT/hello.x86_64"
 grep -qF "0030: 44 24 38 48 b8 00 00 00" "$TMP_ROOT/hello.x86_64"
 grep -qF "0038: 00 00 00 00 00 48 89 44" "$TMP_ROOT/hello.x86_64"
 grep -qF "0040: 24 40 48 8b 44 24 40 48" "$TMP_ROOT/hello.x86_64"
-grep -qF "0048: 83 c4 48 c3" "$TMP_ROOT/hello.x86_64"
+grep -qF "0048: 83 c4 68 c3" "$TMP_ROOT/hello.x86_64"
 
 # The UTF-16 encoding of "Hello from ArcoBASIC" plus its null terminator (Packet WP-007), placed
 # verbatim in the data section.
@@ -53,8 +53,7 @@ grep -qF "0028: 00 00" "$TMP_ROOT/hello.x86_64"
 grep -qF "RELOCATIONS 1" "$TMP_ROOT/hello.x86_64"
 grep -qF "TEXT+11 RIP_REL32_TO RDATA+0 (instruction ends at TEXT+15)" "$TMP_ROOT/hello.x86_64"
 
-# A function with control flow beyond a single straight-line block is rejected with a clear error
-# rather than silently mis-encoded (Packet WP-008 non-goal: general-purpose instruction selection).
+# A function with a conditional return is emitted as multiple blocks with patched near branches.
 cat > "$TMP_ROOT/branchy.abas" <<'SCRIPT'
 FUNCTION Branchy(flag AS BOOL) AS U64
     IF flag THEN
@@ -63,11 +62,9 @@ FUNCTION Branchy(flag AS BOOL) AS U64
     RETURN 0
 END FUNCTION
 SCRIPT
-if "$ARCOFISSION" reveal "$TMP_ROOT/branchy.abas" at X86_64 --entry Branchy > "$TMP_ROOT/branchy.out" 2>&1; then
-    echo "FAIL: expected a function with control flow to be rejected by the code generator" >&2
-    cat "$TMP_ROOT/branchy.out" >&2
-    exit 1
-fi
-grep -qF "control flow beyond a single straight-line block" "$TMP_ROOT/branchy.out"
+"$ARCOFISSION" reveal "$TMP_ROOT/branchy.abas" at X86_64 --entry Branchy > "$TMP_ROOT/branchy.out"
+grep -qF "X86_64 GENERATED" "$TMP_ROOT/branchy.out"
+grep -qF "0f 85" "$TMP_ROOT/branchy.out"
+grep -qF "e9" "$TMP_ROOT/branchy.out"
 
 echo "PASS: x86-64 code generation smoke test"

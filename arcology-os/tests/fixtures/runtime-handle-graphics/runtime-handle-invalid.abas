@@ -1,0 +1,3 @@
+LET surface AS SURFACE = GRAPHICS.CreateSurface(8, 8)
+GRAPHICS.DestroySurface(surface)
+GRAPHICS.DestroySurface(surface)

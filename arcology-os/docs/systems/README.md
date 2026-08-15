@@ -17,6 +17,8 @@ arcology-os/docs/systems/pe32-image.md           The PE32+ writer, including the
 arcology-os/docs/systems/qemu-ovmf-harness.md    The reusable QEMU/OVMF boot-and-verify harness
 arcology-os/docs/systems/frontend-amir-contract.md  Authoritative AST -> A-MIR compiler contract
 arcology-os/docs/systems/hardware-semantics.md   CPU.Halt and CPU.HaltForever semantics/lowering
+arcology-os/docs/systems/port-io-semantics.md    Typed x86 port I/O and COM1 milestone
+arcology-os/docs/systems/graphics-foundation.md  Surface renderer, clipped primitives, text, UI, and backbuffer contract
 arcology-os/docs/systems/arcology-hardware-bringup.md  Reproducible USB image and hardware checklist
 ```
 
@@ -80,7 +82,8 @@ Runs every test, including the systems-specific ones added by this mission
 `systems_amir_primitives_smoke`, `systems_calling_convention_smoke`, `systems_uefi_bindings_smoke`,
 `systems_utf16_encoding_smoke`, `systems_x86_64_codegen_smoke`, `systems_pe_image_smoke`,
 `systems_qemu_ovmf_harness_smoke`, `systems_frontend_amir_contract_smoke`,
-`systems_hardware_semantics_smoke`, and `systems_arcology_hardware_artifact_smoke`). Firmware tests
+`systems_hardware_semantics_smoke`, `systems_arcology_hardware_artifact_smoke`, and
+`systems_port_io_smoke`). Firmware tests
 skip gracefully (not a failure) if QEMU/OVMF are not installed. To run only the systems tests:
 
 ```sh
@@ -150,12 +153,18 @@ END FUNCTION
   `0x08`), verified against the TianoCore EDK2 reference headers (`arcology-os/docs/systems/uefi-bindings.md`).
 - `UEFI.SystemTable.BootServices.SetWatchdogTimer` at offsets `0x60` then `0x100`, used narrowly to
   disable the firmware watchdog before the intentional hardware-test halt.
+- `UEFI.SystemTable.BootServices.ExitBootServices` at offset `0xE8`, exposed for lifecycle
+  handoff validation; acquiring a valid memory-map key remains future bootstrap work.
+- Raw `GetMemoryMap`, `AllocatePool`, and `FreePool` service entries are registered at `0x38`,
+  `0x40`, and `0x48` for the forthcoming typed bootstrap wrapper.
 - Architecture-independent `CPU.Halt` and terminal `CPU.HaltForever` A-MIR operations, lowered by
   the x86-64 backend to `HLT` and `CLI; HLT; JMP -3` respectively.
+- Typed `IOPORT`, `PORT.Address`, `PORT.Offset`, 8/16/32-bit `PORT.Read*`/`Write*` operations,
+  intent aliases, and `CPU.Pause`, lowered directly to x86 `IN`, `OUT`, and `PAUSE` instructions.
 - UTF-16 string constant encoding with correct surrogate-pair handling
   (`arcology-os/docs/systems/utf16-encoding.md`).
-- A single-function x86-64 code generator (prologue/epilogue, uniform spill-based value handling,
-  UEFI field dereferencing, indirect calls) producing machine code independently verified against
+- A spill-based multi-block x86-64 code generator (prologue/epilogue, uniform value handling,
+  UEFI field dereferencing, indirect calls, deterministic rel32 branches) producing machine code independently verified against
   `nasm` and `objdump` (`arcology-os/docs/systems/x86-64-codegen.md`).
 - A self-contained PE32+ writer producing images that boot under real QEMU/OVMF
   (`arcology-os/docs/systems/pe32-image.md`).
@@ -164,18 +173,20 @@ END FUNCTION
 
 ## Unsupported Features (Non-Goals, Not Gaps to Silently Assume Away)
 
-- **Control flow**: the code generator supports exactly one straight-line A-MIR block. `IF`,
-  `WHILE`, `FOR`, `TRY`, and any other multi-block construct produce a clear compile-time error
-  under `--target uefi-x86_64`, not incorrect code (`arcology-os/docs/systems/x86-64-codegen.md`).
+- **Control flow**: `IF ... END IF` (including `ELSE`) and `WHILE ... WEND` are supported with
+  explicit A-MIR blocks and rel32 branch fixups. `ELSEIF` is not currently represented by the
+  shared parser; `FOR`, `TRY`, and other multi-block constructs remain unsupported.
 - **Classes, arrays, objects** under `#RUNTIME NONE`: not rejected at parse time today (a
   documented, narrower-than-planned scope decision -- see `.agents/reports/
   WP-003-freestanding-profile.md` DEVIATIONS), but not lowered by the code generator either, so a
   program using them under `--target uefi-x86_64` fails at the X86_64 codegen stage.
-- **UEFI binding surface**: only `ConsoleOut`/`Write` and the narrow
+- **UEFI binding surface**: only `ConsoleOut`/`Write`, `ExitBootServices`, and the narrow
   `BootServices`/`SetWatchdogTimer` chain are bound. Every other `EFI_SYSTEM_TABLE`
   field (`ConIn`, `RuntimeServices`, ...) and every other
   `EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL` method (`Reset`, `ClearScreen`, ...) is rejected with a
   diagnostic naming what is bound instead (`arcology-os/docs/systems/uefi-bindings.md`).
+- **Port I/O**: direct x86 port access is limited to 8-, 16-, and 32-bit transfers through
+  `IOPORT`; no 64-bit forms, bulk string I/O, MMIO, or other device APIs are defined.
 - **Floating point, SIMD, interrupts, MMIO, page tables, DMA, PCI, USB, networking, multicore,
   ARM64, legacy BIOS**: out of scope for this milestone by design (Packet section 4).
 - **5th+ function parameters** (stack-passed, beyond the four register-passed arguments): rejected
@@ -193,7 +204,6 @@ END FUNCTION
 | `... is not available under #RUNTIME NONE` | A hosted-runtime construct (`PRINT`, `File.*`, etc.) was used in a freestanding program | `arcology-os/docs/systems/uefi-target.md` section 7 |
 | `UEFI.SystemTable has no bound field or method "X" ... Bound fields: ConsoleOut, BootServices.` | Only the listed UEFI surface is bound; `X` is real UEFI but not implemented here, or not real at all | `arcology-os/docs/systems/uefi-bindings.md` |
 | `string argument cannot be encoded as UTF-16: ...` | A string literal passed to a UEFI call had an embedded NUL byte or malformed UTF-8 | `arcology-os/docs/systems/utf16-encoding.md` |
-| `function "X" has control flow beyond a single straight-line block, which this milestone's code generator does not support` | The program uses `IF`/`WHILE`/`FOR`/etc.; the code generator only handles one block | `arcology-os/docs/systems/x86-64-codegen.md` |
 | `ERROR: qemu-system-x86_64 was not found` / `no OVMF UEFI firmware image was found` | Install guidance is printed directly to stderr; nothing is downloaded automatically | `arcology-os/docs/systems/qemu-ovmf-harness.md` |
 | `arco_runtime_tests` crashes only with an explicit `-DCMAKE_BUILD_TYPE=Release`/`RelWithDebInfo` build | A **pre-existing, unrelated** bug in `src/shell/arcosh.cpp`'s `Process.Exists`, confirmed present before this mission started; does not occur with the project's standard build configuration | `.agents/reports/WP-000-repository-audit.md` section 7b |
 | `undefined bytecode local: X` when running a typed-parameter function through `compile-run`/`run` | A **pre-existing, unrelated** bytecode-VM parameter-binding bug; irrelevant to the `--target uefi-x86_64` path, which does not use the bytecode VM | `.agents/reports/WP-000-repository-audit.md` section 7a |

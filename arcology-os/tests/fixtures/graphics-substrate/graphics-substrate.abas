@@ -1,0 +1,36 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' ArcoBASIC-only substrate proof. C++ contributes only compiler/backend primitives.
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
+    IF gop = 0 THEN
+        CPU.HaltForever
+    END IF
+    LET mode AS UEFI.GraphicsOutputMode = UEFI.GOP.Mode(gop)
+    IF mode = 0 THEN
+        CPU.HaltForever
+    END IF
+    LET framebuffer AS PHYSICALPTR = UEFI.GOP.FrameBufferBase(gop)
+    LET framebufferSize AS U64 = UEFI.GOP.FrameBufferSize(gop)
+    LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
+    LET mapped AS MMIOPTR = MEMORY.MapDevice(framebuffer, framebufferSize)
+
+    ' Draw a visible 160x100 diagnostic panel through ArcoBASIC loops and MMIO semantics.
+    LET y AS U32 = 0
+    WHILE y < 100
+        LET x AS U32 = 0
+        WHILE x < 160
+            LET pixelOffset AS U32 = (y * stride + x) * 4
+            LET pixel AS MMIOPTR = ADDRESS.Offset(mapped, pixelOffset)
+            MEMORY.Write32(pixel, 16711935)
+            x = x + 1
+        WEND
+        y = y + 1
+    WEND
+    CPU.MemoryBarrier
+    CPU.HaltForever
+END FUNCTION

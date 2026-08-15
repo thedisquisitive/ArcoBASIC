@@ -7,22 +7,31 @@ Implemented:
 * C++ runtime object with sandbox-style instruction limits
 * Lexer and recursive descent parser
 * Interpreter for modern BASIC syntax
-* Values: null, boolean, number, string
+* Values: null, boolean, number, string, immutable tuples, first-class `CALLABLE` references, and immutable packed `BITVECTOR`
 * Composite values: arrays and objects
 * Statements: `PRINT`, assignment, `LET`, `IF ... THEN ... ELSE ... END IF`, `SELECT CASE ... CASE ... CASE start TO finish ... CASE ELSE ... END SELECT`, `WHILE ... WEND`, `DO WHILE` / `DO UNTIL` / `LOOP WHILE` / `LOOP UNTIL`, `FOR ... TO ... STEP ... NEXT`, `EXIT FOR`, `CONTINUE FOR`, `EXIT WHILE`, `CONTINUE WHILE`, `EXIT DO`, and `CONTINUE DO`
 * Collection iteration: `FOR item IN array ... NEXT`
 * Expressions: arithmetic including BASIC `MOD` and symbolic `%` modulo, comparison, equality, grouping, unary minus, symbolic boolean `!`, and short-circuit boolean `ANDALSO` / `ORELSE` / `&&` / `||`
 * `CONTAINS` for string and array membership checks
 * Literals: arrays (`[1, 2]`) and objects (`{"Name": "Ada"}`), including multiline delimited arrays/objects/call argument lists with trailing commas
+* Bit-vector literals (`BITS "0001_1011"`), indexing, slicing, concatenation, exact-length serialization, and the core immutable `Bits.*` transformation API across interpreter and hosted bytecode paths
+* Collection slices for arrays, strings, tuples, and bit vectors with omitted bounds, negative bounds, positive/negative steps, Unicode code-point string slicing, and mutable array slice replacement for step-1 slices
+* Explicit `COPY` shallow copying for arrays and objects while preserving scalar, immutable, handle, and class-instance identity rules
+* Tuple literals `()`, `(value,)`, and `(a, b)`, `AS TUPLE`, tuple indexing, equality, iteration, slicing, function returns, and flat exact-arity destructuring assignment
+* First-class `CALLABLE` values from `ADDRESSOF`, indirect callable invocation with ordinary call syntax, `AS CALLABLE`, bound instance-method callables, and stable keyed ordering helpers `Array.SortBy`, `Array.MinBy`, and `Array.MaxBy`
+* Lazy immutable `RANGE` values from `Range(stop)`, `Range(start, stop)`, and `Range(start, stop, step)`, with `LEN`, indexing, `FOR IN`, membership checks, and deterministic display
+* Single-clause array comprehensions such as `[i * i FOR i IN Range(5)]` and `[i FOR i IN Range(9) IF board[i] == " "]`, with one evaluated iterable, optional filter, scoped binding, and interpreter/hosted-bytecode/native parity
+* Hosted `#INSTRUCTION_LIMIT` metadata with embedding authorization policy, first-party tool overrides, A-MIR/serialized-bytecode preservation, and native-capsule embedding
 * Object property reads such as `person.Name`
 * Host function calls from expressions
 * Core helpers: `LEN`, `Upper`, `Lower`
 * Math helpers for interpreter and ArcoFission-hosted code: `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `ATAN2`, `SQRT`, `FLOOR`, `CEIL`, `ROUND`, `ABS`, `MIN`, `MAX`, `CLAMP`, `LERP`, `POW`, `EXP`, `LOG`, `LOG10`, `PI`, `TAU`, plus `Math.*` aliases and `Math.Constants()`
+* Deterministic hosted pseudorandom generation through `Random.Create`, `Random.Clone`, `Random.Destroy`, `Random.Reseed`, `Random.Float`, `Random.Integer`, `Random.Choice`, `Random.Sample`, and `Random.Shuffle`, with opaque `RANDOM` handles, independent state clones, PCG32 seeded-stream compatibility across interpreter and hosted capsules, and `Math.Random()` backed by each runtime's default generator
 * Core file/text/document helpers available to interpreter and ArcoFission-hosted code: `File.Exists`, `File.ReadText`, `File.WriteText`, `File.AppendText`, `File.ReadBytes`, `File.WriteBytes`, `Bytes.New`, `Bytes.Length`, `Bytes.GetU8`, `Bytes.SetU8`, `Bytes.FromText`, `Bytes.ToText`, `String.Insert`, `String.Delete`, `String.Join`, `Document.New`, `Document.InsertText`, `Document.DeleteRange`, `Document.ReplaceRange`, `Document.LineColumnAt`, `Document.OffsetAtLineColumn`, `Document.ApplyFormat`, `Document.Runs`, `Document.PlainText`, `Document.Serialize`, `Document.Parse`, `Document.Save`, `Document.Load`, `Document.Text`, and `Document.LineAt`; document edits now preserve and normalize formatting runs across insert/delete/replace and `.arwrite` roundtrips
 * Public C++ header
 * Public C API matching the draft embedding shape
 * CLI runner
-* Initial `ArcoFission` native compiler prototype command with `reveal FILE at AST` parsed tree output, `reveal FILE at A-MIR` source validation plus structured A-MIR model/rendering for hosted expressions, calls, arrays, objects, indexing, indexed stores, compound assignment, expression-call statements, line labels, `GOTO`, `IF`, `SELECT CASE`, `WHILE`, `DO`, `FOR`, `FOR IN`, loop control, user functions, `TRY` / `CATCH`, class/interface declarations, compiled class method bodies, `STOP`, and `RETURN`; A-MIR reveal also reports unsupported lowering, unresolved branch/jump targets, and unterminated blocks as diagnostics; `reveal FILE at BYTECODE`, `bytecode FILE -o OUT.arcof`, and `build FILE -o OUT.arcof` emit the initial `.arcof-text` bytecode-prep format with stable opcodes, constants, locals, explicit blocks, and terminators; `compile-run FILE` and `run FILE.arcof` execute the first hosted bytecode VM subset, including straight-line code, arrays/objects/indexed stores, user function calls, GUI/window host API calls, low-level GUI pixel/fill/column drawing, key-state polling, pointer position reads, `IF`, `SELECT CASE`, `WHILE`, `DO`, `FOR`, `FOR IN`, loop control, `TRY` / `CATCH`, compiled class-method calls by full name, and numbered `GOTO`; by default, `build FILE -o OUT` and `native FILE -o OUT` build a Linux ELF64 runtime capsule that embeds the prepared bytecode and links it against the ArcoFission VM from the active CMake build tree
+* Initial `ArcoFission` native compiler prototype command with `reveal FILE at AST` parsed tree output, `reveal FILE at A-MIR` source validation plus structured A-MIR model/rendering for hosted expressions, calls, arrays, objects, indexing, indexed stores, slices, explicit copies, tuples, destructuring, callable references, range-backed comprehensions, compound assignment, expression-call statements, line labels, `GOTO`, `IF`, `SELECT CASE`, `WHILE`, `DO`, `FOR`, `FOR IN`, loop control, user functions, `TRY` / `CATCH`, class/interface declarations, compiled class method bodies, `STOP`, and `RETURN`; A-MIR reveal also reports unsupported lowering, unresolved branch/jump targets, and unterminated blocks as diagnostics; `reveal FILE at BYTECODE`, `bytecode FILE -o OUT.arcof`, and `build FILE -o OUT.arcof` emit the initial `.arcof-text` bytecode-prep format with stable opcodes, constants, locals, explicit blocks, and terminators; `compile-run FILE` and `run FILE.arcof` execute the first hosted bytecode VM subset, including straight-line code, arrays/objects/indexed stores, slices, explicit copies, tuples, destructuring, first-class callables, keyed array ordering, ranges, array comprehensions, user function calls, GUI/window host API calls, low-level GUI pixel/fill/column drawing, key-state polling, pointer position reads, `IF`, `SELECT CASE`, `WHILE`, `DO`, `FOR`, `FOR IN`, loop control, `TRY` / `CATCH`, compiled class-method calls by full name, and numbered `GOTO`; by default, `build FILE -o OUT` and `native FILE -o OUT` build a Linux ELF64 runtime capsule that embeds the prepared bytecode and links it against the ArcoFission VM from the active CMake build tree
 * ArcoSH script runner and REPL
 * Executable `.abas` / `.arcsh` scripts with `#!/usr/bin/env arcosh` shebang support
 * Initial ArcoSH host built-ins: `ENV`, `RUN`, `Host.OSName`, `Host.Hostname`, `Host.IsWindows`, `Host.Processes`, `Host.Printers`, `File.Exists`, `File.ReadText`, `File.Find`
@@ -67,7 +76,7 @@ Implemented:
 * External command color preservation for common tools (`ls`, `grep`, `rg`, `git`, `diff`) when ArcoSH color mode is enabled
 * REPL `oops <correct-command>` retry after unknown system commands
 * Classic line-numbered ArcoBASIC scripts and ArcoSH REPL program buffer with `LIST`, `RUN`, and `NEW`
-* Expanded in-shell syntax help topics such as `HELP if`, `HELP select`, `HELP for`, `HELP arrays`, and `HELP lines`
+* Expanded in-shell syntax help topics such as `HELP if`, `HELP select`, `HELP for`, `HELP arrays`, `HELP random`, and `HELP lines`
 * Single-line `IF condition THEN statement`, `==` equality, and ArcoSH `Exit()`/`ExitTheProgram()` helpers
 * Compound assignment (`+=`, `-=`, `*=`, `/=`, bitwise variants) and bitwise operations via symbols, word operators, and `Bit.*` helpers
 * Human-friendly bitwise layer: binary/hex literals, `SHIFT`, `BIT`, bit mutation helpers, bit/hex conversion helpers, `HAS`/`ADD`/`REMOVE`/`TOGGLE`, and `FLAGS` blocks
@@ -90,7 +99,7 @@ Implemented:
 * Array indexing and assignment plus object property assignment
 * Type/conversion helpers: `TYPEOF`, `ISNULL`, `NUMBER`, `STRING`
 * Safe runtime references through `REF(value)` and typed `REF(value, "TypeName")`, with `.Value`, `.Set(value)`, `.Exists()`, and `.Clear()`; no raw memory pointer access
-* `TRY` / `CATCH err` / `END TRY` runtime error handling
+* `TRY` / `CATCH err` / `END TRY` runtime error handling plus RFC-0022 `THROW` source-defined errors, normalized `Message` / `Type` catch objects, and interpreter/hosted-bytecode/native-capsule parity
 * ArcoSH unnumbered multiline REPL blocks for `IF`, `WHILE`, `FOR`, `FUNCTION`, `TRY`, and `FLAGS`
 * Core `Array.*` and `String.*` helper functions
 * Classic `GOTO lineNumber` support for line-numbered programs

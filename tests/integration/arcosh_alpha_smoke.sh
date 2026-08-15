@@ -257,7 +257,8 @@ SCRIPT
 (cd "$TMP_ROOT" && ARCOSH_HOME="$INSTALLED_HOME" "$PREFIX/bin/arcosh" --safe "$TMP_ROOT/import-smoke.abas") > "$TMP_ROOT/installed-import.txt"
 grep -q "TRUE" "$TMP_ROOT/installed-import.txt"
 
-printf 'VERSION\nHELP shell\nHELP doctor\nEXIT\n' | run_arcosh --safe > "$TMP_ROOT/help.txt"
+printf 'VERSION\nHELP shell\nHELP doctor\nHELP random\nEXIT\n' | run_arcosh --safe > "$TMP_ROOT/help.txt"
 grep -q "alpha 0.1" "$TMP_ROOT/help.txt"
 grep -q "ArcoSH usage" "$TMP_ROOT/help.txt"
 grep -q "ArcoSH doctor" "$TMP_ROOT/help.txt"
+grep -q "Pseudorandom numbers" "$TMP_ROOT/help.txt"

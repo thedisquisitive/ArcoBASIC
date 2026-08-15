@@ -1,6 +1,8 @@
 #include "arco/calling_convention.hpp"
+#include "arco/graphics.hpp"
 #include "arco/pe_image.hpp"
 #include "arco/utf16.hpp"
+#include "arco/uefi_bindings.hpp"
 #include "arco/x86_64_encoder.hpp"
 
 #include <cstdint>
@@ -22,6 +24,77 @@ void require(bool condition, const std::string& message) {
 } // namespace
 
 int main() {
+    using namespace arco::graphics;
+    {
+        const auto surface_result = CreateSurface(16, 12, PixelFormat::RedGreenBlueReserved8);
+        require(static_cast<bool>(surface_result), "graphics surface allocation succeeds");
+        auto surface = surface_result.surface;
+        require(PackColor(Color::RGB(0x12, 0x34, 0x56), PixelFormat::RedGreenBlueReserved8).value() == 0x00563412,
+                "RGB GOP packing is little-endian BGR byte order");
+        require(PackColor(Color::RGB(0x12, 0x34, 0x56), PixelFormat::BlueGreenRedReserved8).value() == 0x00123456,
+                "BGR GOP packing reverses red and blue channels");
+        require(PutPixel(surface, 2, 3, Color::Magenta()), "in-bounds pixel write succeeds");
+        require(!PutPixel(surface, -1, 0, Color::White()), "out-of-bounds pixel write is clipped");
+        FillRect(surface, -4, -3, 10, 10, Color::White());
+        require(surface.Pixels[0] == 255 && surface.Pixels[1] == 255 && surface.Pixels[2] == 255,
+                "partially offscreen rectangle clips to the surface");
+        DrawLine(surface, -5, 0, 20, 11, Color::RGB(1, 2, 3));
+        DrawCircle(surface, 8, 6, 4, Color::RGB(4, 5, 6));
+        FillCircle(surface, 8, 6, 2, Color::RGB(7, 8, 9));
+        const auto metrics = MeasureText("ARCOLOGY\nOS");
+        require(metrics.width == 48 && metrics.height == 16, "bitmap text metrics are deterministic");
+        DrawText(surface, -3, -2, "ARCOLOGY", Color::White());
+        auto other_result = CreateSurface(16, 12);
+        require(static_cast<bool>(other_result), "second graphics surface allocation succeeds");
+        auto other = other_result.surface;
+        FillRect(other, 0, 0, 16, 12, Color::Black());
+        require(Blit(surface, other, -2, -2), "clipped blit succeeds");
+        require(Present(surface, other), "same-sized surfaces can be presented");
+        require(Centered({0, 0, 100, 80}, 40, 20).x == 30, "centered layout is resolution-independent");
+        require(Align({0, 0, 100, 80}, 20, 10, HorizontalAlign::Right, VerticalAlign::Bottom).x == 80,
+                "edge alignment uses parent-relative bounds");
+        Panel panel{{1, 1, 10, 8}}; Render(other, panel);
+        Button button{{2, 2, 8, 6}, "OK"}; Render(other, button);
+        ProgressBar progress{{0, 0, 10, 2}, 50}; Render(other, progress);
+        Label label{{0, 0, 10, 8}, "UI"}; Render(other, label);
+        Unbind();
+        require(Bind(surface) && CurrentSurface() == &surface, "binding selects the active surface");
+        FillRect(0, 0, 2, 2, Color::Magenta());
+        require(PushSurface(other) && CurrentSurface() == &other, "nested binding redirects rendering");
+        FillRect(0, 0, 2, 2, Color::White());
+        require(PopSurface() && CurrentSurface() == &surface, "pop restores the previous surface");
+        require(PopSurface() && CurrentSurface() == nullptr, "final pop clears the active binding");
+    }
+    {
+        require(CreateSurface(0, 4).error == SurfaceError::InvalidDimensions, "zero-sized surface is rejected");
+        require(CreateSurface(4, 4, static_cast<PixelFormat>(99)).error == SurfaceError::UnsupportedPixelFormat,
+                "unsupported pixel format is rejected");
+        require(FromFramebuffer(nullptr, 4, 4, 4, PixelFormat::RedGreenBlueReserved8).error == SurfaceError::NullPixels,
+                "null framebuffer is rejected");
+        std::uint8_t pixels[16]{};
+        require(FromFramebuffer(pixels, 4, 4, 2, PixelFormat::RedGreenBlueReserved8).error == SurfaceError::InvalidStride,
+                "invalid framebuffer stride is rejected");
+    }
+    {
+        const auto gop = arco::systems::lookup_uefi_type("UEFI.GraphicsOutputMode");
+        require(gop.has_value(), "minimal GOP mode binding is registered");
+        const auto* base = gop->find_field("FrameBufferBase");
+        require(base != nullptr && base->result_type == "PHYSICALPTR" && base->offset_bytes == 0x18,
+                "GOP framebuffer base is a PHYSICALPTR at the verified mode offset");
+        const auto boot = arco::systems::lookup_uefi_type("UEFI.BootServices");
+        const auto* locate = boot->find_field("LocateProtocol");
+        require(locate != nullptr && locate->is_method && locate->offset_bytes == 0x140,
+                "BootServices.LocateProtocol is bound at the verified table offset");
+        const auto* exit_boot = boot->find_field("ExitBootServices");
+        require(exit_boot != nullptr && exit_boot->is_method && exit_boot->offset_bytes == 0xE8,
+                "BootServices.ExitBootServices is bound at the verified table offset");
+        const auto* memory_map = boot->find_field("GetMemoryMap");
+        require(memory_map != nullptr && memory_map->is_method && memory_map->offset_bytes == 0x38,
+                "BootServices.GetMemoryMap is bound at the verified table offset");
+        const auto* allocate_pool = boot->find_field("AllocatePool");
+        require(allocate_pool != nullptr && allocate_pool->is_method && allocate_pool->offset_bytes == 0x40,
+                "BootServices.AllocatePool is bound at the verified table offset");
+    }
     // Microsoft x64 calling convention (Packet WP-005, arcology-os/docs/systems/calling-conventions.md).
     require(arco::systems::assign_argument_locations(0).empty(), "zero arguments assigns no locations");
     {
@@ -162,6 +235,50 @@ int main() {
         }
         {
             Assembler asm_;
+            asm_.mov_load32_disp8(Reg::RAX, Reg::RAX, 0x20);
+            require(bytes_equal(asm_.bytes(), {0x8B, 0x40, 0x20}),
+                    "mov eax, [rax+disp8] performs an exact-width U32 load and zero-extends");
+        }
+        {
+            Assembler asm_;
+            asm_.mov_reg32_reg32(Reg::RAX, Reg::RAX);
+            require(bytes_equal(asm_.bytes(), {0x89, 0xC0}),
+                    "mov eax, eax zero-extends U32 values without the imm32 sign-extension trap");
+        }
+        {
+            Assembler asm_;
+            asm_.mov_rax_cr3();
+            require(bytes_equal(asm_.bytes(), {0x0F, 0x20, 0xD8}), "mov rax, cr3 matches x86-64 encoding");
+            Assembler write;
+            write.mov_cr3_rax();
+            require(bytes_equal(write.bytes(), {0x0F, 0x22, 0xD8}), "mov cr3, rax matches x86-64 encoding");
+            Assembler invalidate;
+            invalidate.invlpg_rax();
+            require(bytes_equal(invalidate.bytes(), {0x0F, 0x01, 0x38}), "invlpg [rax] matches x86-64 encoding");
+        }
+        {
+            Assembler asm_;
+            asm_.mov_rax_cr2();
+            require(bytes_equal(asm_.bytes(), {0x0F, 0x20, 0xD0}), "mov rax, cr2 matches x86-64 encoding");
+        }
+        {
+            Assembler lgdt;
+            lgdt.lgdt_rax();
+            require(bytes_equal(lgdt.bytes(), {0x0F, 0x01, 0x10}), "lgdt [rax] matches x86-64 encoding");
+            Assembler lidt;
+            lidt.lidt_rax();
+            require(bytes_equal(lidt.bytes(), {0x0F, 0x01, 0x18}), "lidt [rax] matches x86-64 encoding");
+            Assembler ltr;
+            ltr.ltr_rax();
+            require(bytes_equal(ltr.bytes(), {0x66, 0x0F, 0x00, 0xD8}), "ltr ax matches x86-64 encoding");
+        }
+        {
+            Assembler asm_;
+            asm_.int3();
+            require(bytes_equal(asm_.bytes(), {0xCC}), "INT3 breakpoint matches x86-64 encoding");
+        }
+        {
+            Assembler asm_;
             asm_.mov_reg_reg(Reg::RCX, Reg::RAX);
             require(bytes_equal(asm_.bytes(), {0x48, 0x89, 0xC1}), "mov rcx, rax matches nasm");
         }
@@ -187,8 +304,22 @@ int main() {
         }
         {
             Assembler asm_;
+            const std::size_t disp_offset = asm_.call_rel32_placeholder();
+            require(disp_offset == 1 && bytes_equal(asm_.bytes(), {0xE8, 0x00, 0x00, 0x00, 0x00}),
+                    "call rel32 emits a patchable near-call placeholder");
+            asm_.patch_i32(disp_offset, 1);
+            require(bytes_equal(asm_.bytes(), {0xE8, 0x01, 0x00, 0x00, 0x00}),
+                    "call rel32 displacement is patched little-endian");
+        }
+        {
+            Assembler asm_;
             asm_.hlt();
             require(bytes_equal(asm_.bytes(), {0xF4}), "hlt matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.cmp_rax_imm8(0);
+            require(bytes_equal(asm_.bytes(), {0x48, 0x83, 0xF8, 0x00}), "cmp rax, 0 matches nasm");
         }
         {
             Assembler asm_;
@@ -197,6 +328,41 @@ int main() {
             asm_.jmp_rel8(-3);
             require(bytes_equal(asm_.bytes(), {0xFA, 0xF4, 0xEB, 0xFD}),
                     "CPU.HaltForever sequence matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.in_al_dx();
+            asm_.in_ax_dx();
+            asm_.in_eax_dx();
+            asm_.out_dx_al();
+            asm_.out_dx_ax();
+            asm_.out_dx_eax();
+            asm_.pause();
+            require(bytes_equal(asm_.bytes(), {0xEC, 0x66, 0xED, 0xED, 0xEE, 0x66, 0xEF, 0xEF, 0xF3, 0x90}),
+                    "IN/OUT DX forms and PAUSE match x86-64 encodings");
+        }
+        {
+            Assembler asm_;
+            asm_.lfence();
+            asm_.sfence();
+            asm_.mfence();
+            require(bytes_equal(asm_.bytes(), {0x0F, 0xAE, 0xE8, 0x0F, 0xAE, 0xF8, 0x0F, 0xAE, 0xF0}),
+                    "LFENCE/SFENCE/MFENCE match x86-64 encodings");
+        }
+        {
+            Assembler asm_;
+            asm_.mov_load8_rax();
+            asm_.mov_load16_rax();
+            asm_.mov_load32_rax();
+            asm_.mov_load64_rax();
+            asm_.mov_store8_rax_from_cl();
+            asm_.mov_store16_rax_from_cx();
+            asm_.mov_store32_rax_from_ecx();
+            asm_.mov_store64_rax_from_rcx();
+            require(bytes_equal(asm_.bytes(), {0x0F, 0xB6, 0x00, 0x66, 0x0F, 0xB7, 0x00, 0x8B, 0x00,
+                                                0x48, 0x8B, 0x00, 0x88, 0x08, 0x66, 0x89, 0x08, 0x89, 0x08,
+                                                0x48, 0x89, 0x08}),
+                    "volatile memory load/store forms match x86-64 encodings");
         }
         {
             Assembler asm_;

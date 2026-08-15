@@ -179,3 +179,57 @@ types), so it cannot produce false positives outside the systems surface it is s
 - Does not validate field chains through variables that are not themselves a function parameter
   (e.g. a local variable reassigned from a parameter) -- only direct parameter-rooted chains are
   checked, matching WP-004's `CallExternal` classification scope.
+
+The binding registry also contains minimal GOP mode metadata for the framebuffer phase:
+`UEFI.GraphicsOutputProtocol.Mode`, `UEFI.GraphicsOutputMode.FrameBufferBase` (`PHYSICALPTR`),
+`FrameBufferSize`, and the resolution, stride, and pixel-format fields of
+`UEFI.GraphicsOutputModeInformation`. Protocol discovery and a complete GOP wrapper remain deferred.
+`UEFI.BootServices.LocateProtocol` is now recorded at offset `0x140` (the verified table index for
+`EFI_BOOT_SERVICES.LocateProtocol`). Its raw GUID/output-pointer ABI is intentionally not wrapped by
+the source language directly. `UEFI.GOP.Discover(systemTable)` is the narrow typed compiler intrinsic:
+it materializes the standard GOP GUID and an internal output-pointer temporary, invokes
+`LocateProtocol`, checks its `EFI_STATUS`, and returns a null `UEFI.GraphicsOutputProtocol` value on
+failure. General pointer-to-pointer syntax is not exposed.
+The same narrow namespace exposes `FrameBufferBase`, `FrameBufferSize`, `Width`, `Height`,
+`PixelsPerScanLine`, and `PixelFormat` accessors on a discovered GOP value; these lower to the
+verified mode-structure offsets and preserve the address-domain types.
+
+`UEFI.BootServices.ExitBootServices(imageHandle, mapKey)` is also bound at table offset `0xE8`.
+This is currently a binding/lowering surface only: a correct handoff still requires a valid memory
+map key, which will be supplied by the future `GetMemoryMap` bootstrap layer.
+
+The first source-level wrapper now lives in `stdlib/uefi_bootstrap.abas` as
+`AcquireMemoryMap(systemTable)`. It probes the map, allocates boot-services data with headroom, and
+returns the acquired key. It is a bootstrap primitive and does not yet perform the final handoff.
+The same module now exposes `ExitBootServicesSafe(imageHandle, systemTable)`, which performs the
+acquisition and immediate handoff sequence. It must only be used when a post-handoff runtime is
+ready to take ownership; the checked-in fixture is a PE32+ proof and is not an unattended boot test.
+The acquisition path retries failed final map reads up to three times with additional buffer
+headroom and refuses the handoff when retries are exhausted.
+It also validates the returned descriptor size/map extent and frees the allocated buffer on every
+pre-handoff failure path.
+`stdlib/uefi_memory_manager.abas` provides the first post-handoff map walker, counting conventional
+memory pages from the retained descriptor buffer using typed `VIRTUALPTR` reads.
+It now also finds a conventional region and performs checked 4 KiB page-region allocation in
+ArcoBASIC, forming the initial post-handoff allocator policy.
+The same source module exposes checked allocation-index advancement and page-range validation for
+future free/coalescing management.
+RFC-0018 now formalizes the transition contract, and `stdlib/physical_region_database.abas` adds
+source-level region-end overflow checks, page alignment validation, and overlap rejection before
+firmware descriptors become allocator input.
+RFC-0019 extends this with reservation eligibility, split validity, and adjacent-free coalescing
+predicates in `stdlib/physical_region_allocator.abas`; persistent region records remain the next
+language-storage phase.
+That storage phase has begun in `stdlib/physical_region_database_runtime.abas`: a caller-owned
+64-byte record buffer now persists base/pages/state/owner/provider/reason/flags and exposes count,
+insert, and state queries without consulting firmware descriptors.
+The buffer now also drives ArcoBASIC reservation, first-fit split allocation, release, and adjacent
+free-region coalescing operations.
+RFC-0020/FMAP-0001 now establish the virtual-memory layer; `stdlib/virtual_region_manager.abas`
+provides the first persistent virtual-region record and map/protect/unmap policy. Physical PRD state
+remains authoritative for backing allocation.
+
+The prerequisite raw service entries are now recorded as well: `GetMemoryMap` at `0x38`,
+`AllocatePool` at `0x40`, and `FreePool` at `0x48`. These accept the firmware ABI's pointer-shaped
+arguments, but a typed ArcoBASIC memory-map wrapper has not yet been claimed; callers must not pass
+placeholder zeros on real hardware.

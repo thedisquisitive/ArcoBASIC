@@ -1,0 +1,40 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+FUNCTION FillMappedSurface(framebuffer AS MMIOPTR, width AS U32, height AS U32, stride AS U32, color AS U32) AS U64
+    LET y AS U32 = 0
+    WHILE y < height
+        LET x AS U32 = 0
+        WHILE x < width
+            LET pixelOffset AS U32 = (y * stride + x) * 4
+            LET pixel AS MMIOPTR = ADDRESS.Offset(framebuffer, pixelOffset)
+            MEMORY.Write32(pixel, color)
+            x = x + 1
+        WEND
+        y = y + 1
+    WEND
+    CPU.MemoryBarrier
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
+    IF gop = 0 THEN
+        CPU.HaltForever
+    END IF
+    LET mode AS UEFI.GraphicsOutputMode = UEFI.GOP.Mode(gop)
+    IF mode = 0 THEN
+        CPU.HaltForever
+    END IF
+    LET framebuffer AS PHYSICALPTR = UEFI.GOP.FrameBufferBase(gop)
+    LET framebufferSize AS U64 = UEFI.GOP.FrameBufferSize(gop)
+    LET width AS U32 = UEFI.GOP.Width(gop)
+    LET height AS U32 = UEFI.GOP.Height(gop)
+    LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
+    LET mapped AS MMIOPTR = MEMORY.MapDevice(framebuffer, framebufferSize)
+    LET status AS U64 = FillMappedSurface(mapped, 160, 100, stride, 16711935)
+    CPU.HaltForever
+END FUNCTION

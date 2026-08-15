@@ -1,0 +1,93 @@
+' RFC-0020 virtual-region policy over a persistent caller-owned database.
+' Record layout: virtual base(0), length bytes(8), physical base(16), protection(24), state(28).
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION VMRegionEnd(base AS U64, length AS U64) AS U64
+    IF length = 0 THEN
+        RETURN 0
+    END IF
+    IF base > 18446744073709551615 - length THEN
+        RETURN 0
+    END IF
+    RETURN base + length
+END FUNCTION
+
+FUNCTION VMRegionsOverlap(firstBase AS U64, firstLength AS U64, secondBase AS U64, secondLength AS U64) AS BOOL
+    LET firstEnd AS U64 = VMRegionEnd(firstBase, firstLength)
+    LET secondEnd AS U64 = VMRegionEnd(secondBase, secondLength)
+    IF firstEnd = 0 THEN
+        RETURN 0
+    END IF
+    IF secondEnd = 0 THEN
+        RETURN 0
+    END IF
+    IF firstBase >= secondEnd THEN
+        RETURN 0
+    END IF
+    IF secondBase >= firstEnd THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION VMCanonicalAddress(address AS U64) AS BOOL
+    IF address <= 140737488355327 THEN RETURN 1
+    IF address >= 18446462598732840960 THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+FUNCTION VMAPAddValidated(database AS MMIOPTR, capacity AS U32, virtualBase AS U64, length AS U64, physicalBase AS U64, protection AS U32, state AS U32) AS BOOL
+    IF length = 0 THEN RETURN 0
+    IF (virtualBase AND 4095) <> 0 THEN RETURN 0
+    IF (physicalBase AND 4095) <> 0 THEN RETURN 0
+    IF (length AND 4095) <> 0 THEN RETURN 0
+    IF VMRegionEnd(virtualBase, length) = 0 THEN RETURN 0
+    IF VMCanonicalAddress(virtualBase) = 0 THEN RETURN 0
+    IF VMCanonicalAddress(VMRegionEnd(virtualBase, length) - 1) = 0 THEN RETURN 0
+    LET count AS U32 = MEMORY.Read32(database)
+    LET index AS U32 = 0
+    WHILE index < count
+        LET record AS MMIOPTR = ADDRESS.Offset(database, 8 + (index * 40))
+        IF MEMORY.Read32(ADDRESS.Offset(record, 28)) <> 4 THEN
+            IF VMRegionsOverlap(virtualBase, length, MEMORY.Read64(record), MEMORY.Read64(ADDRESS.Offset(record, 8))) <> 0 THEN RETURN 0
+        END IF
+        index = index + 1
+    WEND
+    RETURN VMAPAdd(database, capacity, virtualBase, length, physicalBase, protection, state)
+END FUNCTION
+
+FUNCTION VMAPInitialize(database AS MMIOPTR) AS BOOL
+    MEMORY.Write32(database, 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION VMAPAdd(database AS MMIOPTR, capacity AS U32, virtualBase AS U64, length AS U64, physicalBase AS U64, protection AS U32, state AS U32) AS BOOL
+    LET count AS U32 = MEMORY.Read32(database)
+    IF count >= capacity THEN
+        RETURN 0
+    END IF
+    LET offset AS U32 = 8 + (count * 40)
+    LET record AS MMIOPTR = ADDRESS.Offset(database, offset)
+    MEMORY.Write64(record, virtualBase)
+    MEMORY.Write64(ADDRESS.Offset(record, 8), length)
+    MEMORY.Write64(ADDRESS.Offset(record, 16), physicalBase)
+    MEMORY.Write32(ADDRESS.Offset(record, 24), protection)
+    MEMORY.Write32(ADDRESS.Offset(record, 28), state)
+    MEMORY.Write32(database, count + 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION VMAPProtect(database AS MMIOPTR, index AS U32, protection AS U32) AS BOOL
+    LET record AS MMIOPTR = ADDRESS.Offset(database, 8 + (index * 40))
+    MEMORY.Write32(ADDRESS.Offset(record, 24), protection)
+    RETURN 1
+END FUNCTION
+
+FUNCTION VMAPUnmap(database AS MMIOPTR, index AS U32) AS BOOL
+    LET record AS MMIOPTR = ADDRESS.Offset(database, 8 + (index * 40))
+    MEMORY.Write32(ADDRESS.Offset(record, 28), 4)
+    RETURN 1
+END FUNCTION

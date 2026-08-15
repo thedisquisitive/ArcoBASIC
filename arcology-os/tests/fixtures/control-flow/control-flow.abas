@@ -1,0 +1,17 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+#EXPORT "efi_main"
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET count AS U8 = 0
+    WHILE count < 3
+        IF count = 1 THEN
+            systemTable.ConsoleOut.Write("middle\r\n")
+        END IF
+        count = count + 1
+    WEND
+    systemTable.ConsoleOut.Write("done\r\n")
+    RETURN count
+END FUNCTION

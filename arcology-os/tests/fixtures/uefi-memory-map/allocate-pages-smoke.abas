@@ -1,0 +1,18 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("PAGES PRE")
+    LET physical AS U64 = 0
+    LET physicalAddress AS PTR = ADDRESS.Local(physical)
+    LET status AS U64 = systemTable.BootServices.AllocatePages(0, 2, 1, physicalAddress)
+    IF status <> 0 THEN
+        systemTable.ConsoleOut.Write("PAGES FAIL")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("PAGES OK")
+    CPU.HaltForever
+END FUNCTION

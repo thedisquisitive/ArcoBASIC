@@ -99,6 +99,14 @@ expect_reject "system_under_freestanding" '#RUNTIME NONE
 LET x = System.Capabilities()' \
     "System.* calls is not available under #RUNTIME NONE"
 
+expect_reject "random_under_freestanding" '#RUNTIME NONE
+LET x = Random.Float()' \
+    "Random.* calls is not available under #RUNTIME NONE"
+
+expect_reject "math_random_under_freestanding" '#RUNTIME NONE
+LET x = Math.Random()' \
+    "Math.Random call is not available under #RUNTIME NONE"
+
 # Directive validation: only the documented values are accepted.
 expect_reject "unknown_profile" '#PROFILE FOO
 PRINT "hi"' \

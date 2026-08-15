@@ -1,0 +1,10 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION LoadDescriptorTables(pointer AS U64) AS U64
+    CPU.LoadGDT(pointer)
+    CPU.LoadIDT(pointer)
+    CPU.LoadTaskRegister(pointer)
+    RETURN 0
+END FUNCTION

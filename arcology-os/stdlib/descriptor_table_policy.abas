@@ -1,0 +1,84 @@
+' APS-owned x86-64 descriptor-table policy.
+' The compiler supplies LGDT/LIDT/LTR; this file owns table contents and policy.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION DescriptorWrite64(table AS MMIOPTR, offset AS U32, value AS U64) AS U64
+    MEMORY.Write64(ADDRESS.Offset(table, offset), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION BuildTSS(tss AS MMIOPTR, ringZeroStack AS U64, doubleFaultStack AS U64) AS BOOL
+    LET offset AS U32 = 0
+    WHILE offset < 104
+        MEMORY.Write8(ADDRESS.Offset(tss, offset), 0)
+        offset = offset + 1
+    WEND
+    MEMORY.Write64(ADDRESS.Offset(tss, 4), ringZeroStack)
+    MEMORY.Write64(ADDRESS.Offset(tss, 36), doubleFaultStack)
+    MEMORY.Write16(ADDRESS.Offset(tss, 102), 104)
+    RETURN 1
+END FUNCTION
+
+FUNCTION BuildTSSDescriptor(table AS MMIOPTR, offset AS U32, tssBase AS U64) AS BOOL
+    LET low AS U64 = 103
+    low = low OR ((tssBase AND 65535) SHL 16)
+    low = low OR (((tssBase SHR 16) AND 255) SHL 32)
+    low = low OR (137 SHL 40)
+    low = low OR (((tssBase SHR 24) AND 255) SHL 56)
+    MEMORY.Write64(ADDRESS.Offset(table, offset), low)
+    MEMORY.Write64(ADDRESS.Offset(table, offset + 8), (tssBase SHR 32) AND 4294967295)
+    RETURN 1
+END FUNCTION
+
+FUNCTION BuildMinimalGDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, tssBase AS U64) AS BOOL
+    ' Null, 64-bit code, long-mode data, and one available 64-bit TSS.
+    DescriptorWrite64(table, 0, 0)
+    DescriptorWrite64(table, 8, 49427445715107839)
+    DescriptorWrite64(table, 16, 58425848876826623)
+    BuildTSSDescriptor(table, 24, tssBase)
+    MEMORY.Write16(ADDRESS.Offset(pseudoDescriptor, 0), 39)
+    MEMORY.Write64(ADDRESS.Offset(pseudoDescriptor, 2), ADDRESS.Value(table))
+    RETURN 1
+END FUNCTION
+
+FUNCTION IDTWriteInterruptGate(table AS MMIOPTR, index AS U32, handler AS U64, ist AS U8) AS BOOL
+    LET gate AS MMIOPTR = ADDRESS.Offset(table, index * 16)
+    MEMORY.Write16(gate, handler AND 65535)
+    MEMORY.Write16(ADDRESS.Offset(gate, 2), 8)
+    MEMORY.Write8(ADDRESS.Offset(gate, 4), ist AND 7)
+    MEMORY.Write8(ADDRESS.Offset(gate, 5), 142)
+    MEMORY.Write16(ADDRESS.Offset(gate, 6), (handler SHR 16) AND 65535)
+    MEMORY.Write32(ADDRESS.Offset(gate, 8), (handler SHR 32) AND 4294967295)
+    MEMORY.Write32(ADDRESS.Offset(gate, 12), 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION BuildMinimalIDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, handler AS U64) AS BOOL
+    LET index AS U32 = 0
+    WHILE index < 256
+        LET gate AS MMIOPTR = ADDRESS.Offset(table, index * 16)
+        MEMORY.Write64(gate, 0)
+        MEMORY.Write64(ADDRESS.Offset(gate, 8), 0)
+        index = index + 1
+    WEND
+    LET vector AS U32 = 0
+    WHILE vector < 32
+        LET ist AS U8 = 0
+        IF vector = 8 THEN ist = 1
+        IDTWriteInterruptGate(table, vector, handler, ist)
+        vector = vector + 1
+    WEND
+    MEMORY.Write16(ADDRESS.Offset(pseudoDescriptor, 0), 4095)
+    MEMORY.Write64(ADDRESS.Offset(pseudoDescriptor, 2), ADDRESS.Value(table))
+    RETURN 1
+END FUNCTION
+
+FUNCTION ActivateDescriptorTables(gdtPseudo AS U64, idtPseudo AS U64, tssSelector AS U64) AS U64
+    CPU.LoadGDT(gdtPseudo)
+    CPU.LoadTaskRegister(tssSelector)
+    CPU.LoadIDT(idtPseudo)
+    RETURN 0
+END FUNCTION

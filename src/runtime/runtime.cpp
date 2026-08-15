@@ -1,4 +1,7 @@
 #include "arco/runtime.hpp"
+#include "arco/runtime_handles.hpp"
+#include "arco/random.hpp"
+#include "arco/graphics.hpp"
 #include "arco/gui.hpp"
 
 #include "frontend/lexer.hpp"
@@ -6,6 +9,7 @@
 
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <fstream>
 #include <filesystem>
 #include <stdexcept>
@@ -1136,6 +1140,30 @@ long long value_to_int(const Value& value) {
     return static_cast<long long>(value.as_number());
 }
 
+const BitVector& require_bit_vector(const Value& value, const std::string& operation) {
+    if (!value.is_bit_vector()) throw std::runtime_error(operation + " expects a BITVECTOR");
+    return value.as_bit_vector();
+}
+
+std::size_t require_bit_index(const Value& value, std::size_t length, const std::string& operation,
+                              bool allow_end = false) {
+    const double number = value.as_number();
+    const double maximum = static_cast<double>(length + (allow_end ? 1 : 0));
+    if (!std::isfinite(number) || std::floor(number) != number || number < 0 || number >= maximum) {
+        throw std::runtime_error(operation + " index " + value.to_string() +
+                                 " is out of range for bit length " + std::to_string(length));
+    }
+    return static_cast<std::size_t>(number);
+}
+
+bool require_bit_value(const Value& value, const std::string& operation) {
+    const double number = value.as_number();
+    if (!std::isfinite(number) || std::floor(number) != number || (number != 0 && number != 1)) {
+        throw std::runtime_error(operation + " bit value must be integral 0 or 1; received " + value.to_string());
+    }
+    return number == 1;
+}
+
 Value bit_binary(const std::vector<Value>& args, const std::string& name, char op) {
     if (args.size() != 2) {
         throw std::runtime_error(name + " expects 2 arguments");
@@ -1216,6 +1244,18 @@ Value math_constants_function(const std::vector<Value>& args) {
     constexpr double pi = 3.14159265358979323846264338327950288;
     constexpr double e = 2.71828182845904523536028747135266250;
     return Value::Object{{"PI", pi}, {"Pi", pi}, {"TAU", pi * 2.0}, {"Tau", pi * 2.0}, {"E", e}, {"DegToRad", pi / 180.0}, {"RadToDeg", 180.0 / pi}};
+}
+
+std::uint64_t random_safe_integer(const Value& value, const std::string& label) {
+    constexpr double maximum_safe_integer = 9007199254740991.0;
+    if (!value.is_number()) {
+        throw std::runtime_error(label + " must be a non-negative safe integer");
+    }
+    const double number = value.as_number();
+    if (!std::isfinite(number) || number < 0 || number > maximum_safe_integer || std::floor(number) != number) {
+        throw std::runtime_error(label + " must be a non-negative safe integer");
+    }
+    return static_cast<std::uint64_t>(number);
 }
 
 std::string bits_to_string(unsigned long long value, int width) {
@@ -2167,6 +2207,17 @@ Value sleep_function(const std::vector<Value>& args) {
     return {};
 }
 
+arco::graphics::Color runtime_color(const Value& value) {
+    if (!value.is_object()) throw std::runtime_error("GRAPHICS color expects COLOR.RGB/RGBA");
+    const auto component = [&value](const char* name) {
+        const auto field = value.get_property(name);
+        const auto number = field.as_number();
+        if (number < 0 || number > 255) throw std::runtime_error(std::string("color component out of range: ") + name);
+        return static_cast<std::uint8_t>(number);
+    };
+    return arco::graphics::Color::RGBA(component("R"), component("G"), component("B"), component("A"));
+}
+
 } // namespace
 
 ExitSignal::ExitSignal(int code) : code_(code) {}
@@ -2203,7 +2254,24 @@ const char* StopSignal::what() const noexcept {
     return "program stopped";
 }
 
-Runtime::Runtime() : output_(&std::cout) {
+UserError::UserError(std::string message, int source_line, int source_column)
+    : message_(std::move(message)), source_line_(source_line), source_column_(source_column) {}
+
+const char* UserError::what() const noexcept {
+    return message_.c_str();
+}
+
+int UserError::source_line() const noexcept {
+    return source_line_;
+}
+
+int UserError::source_column() const noexcept {
+    return source_column_;
+}
+
+Runtime::Runtime()
+    : output_(&std::cout),
+      default_random_(std::make_shared<Pcg32>(automatic_random_seed(), Pcg32::default_sequence)) {
     register_class("REF");
     register_class_field("REF", "Value", 0, "");
     register_class_field("REF", "Valid", 0, "Boolean");
@@ -2228,10 +2296,125 @@ Runtime::Runtime() : output_(&std::cout) {
         if (args[0].is_array()) {
             return static_cast<double>(args[0].as_array().size());
         }
+        if (args[0].is_tuple()) {
+            return static_cast<double>(args[0].as_tuple().size());
+        }
         if (args[0].is_object()) {
             return static_cast<double>(args[0].as_object().size());
         }
+        if (args[0].is_bit_vector()) {
+            return static_cast<double>(args[0].as_bit_vector().length);
+        }
+        if (args[0].is_range()) {
+            return static_cast<double>(args[0].as_range().length);
+        }
+        if (args[0].is_string()) {
+            return static_cast<double>(utf8_codepoints(args[0].to_string()).size());
+        }
         return static_cast<double>(args[0].to_string().size());
+    });
+    register_function("Range", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Range", 1, 3);
+        long long start = 0;
+        long long stop = 0;
+        long long step = 1;
+        if (args.size() == 1) {
+            stop = exact_slice_integer(args[0].as_number(), "stop");
+        } else {
+            start = exact_slice_integer(args[0].as_number(), "start");
+            stop = exact_slice_integer(args[1].as_number(), "stop");
+            if (args.size() == 3) step = exact_slice_integer(args[2].as_number(), "step");
+        }
+        return Value(RangeValue{start, stop, step, range_length(start, stop, step)});
+    });
+    register_function("Bits.FromString", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Bits.FromString", 1, 1);
+        if (!args[0].is_string()) throw std::runtime_error("Bits.FromString expects a string");
+        return Value(BitVector::from_string(args[0].to_string()));
+    });
+    register_function("Bits.ToString", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Bits.ToString", 1, 1);
+        return require_bit_vector(args[0], "Bits.ToString").string();
+    });
+    register_function("Bits.FromArray", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Bits.FromArray", 1, 1);
+        if (!args[0].is_array()) throw std::runtime_error("Bits.FromArray expects an array");
+        std::string text;
+        text.reserve(args[0].as_array().size());
+        for (const auto& value : args[0].as_array()) text.push_back(require_bit_value(value, "Bits.FromArray") ? '1' : '0');
+        return Value(BitVector::from_string(text));
+    });
+    register_function("Bits.ToArray", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Bits.ToArray", 1, 1);
+        const auto& bits = require_bit_vector(args[0], "Bits.ToArray");
+        Value::Array values;
+        values.reserve(bits.length);
+        for (std::size_t i = 0; i < bits.length; ++i) values.emplace_back(bits.get(i) ? 1.0 : 0.0);
+        return values;
+    });
+    register_function("Bits.Get", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Bits.Get", 2, 2);
+        const auto& bits = require_bit_vector(args[0], "Bits.Get");
+        return bits.get(require_bit_index(args[1], bits.length, "Bits.Get")) ? 1.0 : 0.0;
+    });
+    register_function("Bits.Set", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Bits.Set", 3, 3);
+        const auto& bits = require_bit_vector(args[0], "Bits.Set");
+        const auto index = require_bit_index(args[1], bits.length, "Bits.Set");
+        std::string text = bits.string();
+        text[index] = require_bit_value(args[2], "Bits.Set") ? '1' : '0';
+        return Value(BitVector::from_string(text));
+    });
+    register_function("Bits.Flip", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Bits.Flip", 2, 2);
+        const auto& bits = require_bit_vector(args[0], "Bits.Flip");
+        const auto index = require_bit_index(args[1], bits.length, "Bits.Flip");
+        std::string text = bits.string();
+        text[index] = text[index] == '0' ? '1' : '0';
+        return Value(BitVector::from_string(text));
+    });
+    register_function("Bits.Count", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Bits.Count", 1, 2);
+        const auto& bits = require_bit_vector(args[0], "Bits.Count");
+        const bool wanted = args.size() == 1 || require_bit_value(args[1], "Bits.Count");
+        std::size_t count = 0;
+        for (std::size_t i = 0; i < bits.length; ++i) if (bits.get(i) == wanted) ++count;
+        return static_cast<double>(count);
+    });
+    register_function("Bits.Slice", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Bits.Slice", 2, 3);
+        const auto& bits = require_bit_vector(args[0], "Bits.Slice");
+        const auto start = require_bit_index(args[1], bits.length, "Bits.Slice", true);
+        std::size_t length = bits.length - start;
+        if (args.size() == 3) {
+            const double requested = args[2].as_number();
+            if (!std::isfinite(requested) || std::floor(requested) != requested || requested < 0 ||
+                requested > static_cast<double>(bits.length - start)) {
+                throw std::runtime_error("Bits.Slice length is out of range");
+            }
+            length = static_cast<std::size_t>(requested);
+        }
+        return Value(BitVector::from_string(bits.string().substr(start, length)));
+    });
+    register_function("Bits.Replace", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Bits.Replace", 4, 4);
+        const auto& bits = require_bit_vector(args[0], "Bits.Replace");
+        const auto start = require_bit_index(args[1], bits.length, "Bits.Replace", true);
+        const double requested = args[2].as_number();
+        if (!std::isfinite(requested) || std::floor(requested) != requested || requested < 0 ||
+            requested > static_cast<double>(bits.length - start)) {
+            throw std::runtime_error("Bits.Replace length is out of range");
+        }
+        std::string text = bits.string();
+        text.replace(start, static_cast<std::size_t>(requested),
+                     require_bit_vector(args[3], "Bits.Replace").string());
+        return Value(BitVector::from_string(text));
+    });
+    register_function("Bits.Reverse", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Bits.Reverse", 1, 1);
+        std::string text = require_bit_vector(args[0], "Bits.Reverse").string();
+        std::reverse(text.begin(), text.end());
+        return Value(BitVector::from_string(text));
     });
     register_function("Upper", [](const std::vector<Value>& args) -> Value {
         if (args.size() != 1) {
@@ -2268,6 +2451,10 @@ Runtime::Runtime() : output_(&std::cout) {
         if (args[0].is_array()) {
             return "Array";
         }
+        if (args[0].is_tuple()) return "Tuple";
+        if (args[0].is_bit_vector()) return "BitVector";
+        if (args[0].is_range()) return "Range";
+        if (is_callable(args[0])) return "Callable";
         if (is_reference(args[0])) {
             return "Reference";
         }
@@ -2383,6 +2570,54 @@ Runtime::Runtime() : output_(&std::cout) {
     register_function("Array.Join", array_join_function);
     register_function("Array.Contains", array_contains_function);
     register_function("Array.Sort", array_sort_function);
+    register_function("Array.SortBy", [this](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Array.SortBy", 2, 3);
+        if (!args[0].is_array()) throw std::runtime_error("Array.SortBy expects an array");
+        if (!is_callable(args[1])) throw std::runtime_error("Array.SortBy expects a CALLABLE key");
+        struct Decorated { Value key; std::size_t index; Value value; };
+        std::vector<Decorated> decorated;
+        decorated.reserve(args[0].as_array().size());
+        for (std::size_t i = 0; i < args[0].as_array().size(); ++i) {
+            Value key = call_callable(args[1], {args[0].as_array()[i]});
+            if (!key.is_number() && !key.is_string()) throw std::runtime_error("Array.SortBy keys must be numbers or strings");
+            if (!decorated.empty() && decorated.front().key.is_number() != key.is_number()) {
+                throw std::runtime_error("Array.SortBy keys must all have the same orderable type");
+            }
+            decorated.push_back({std::move(key), i, args[0].as_array()[i]});
+        }
+        const bool descending = args.size() == 3 && args[2].truthy();
+        std::stable_sort(decorated.begin(), decorated.end(), [descending](const Decorated& a, const Decorated& b) {
+            const bool less = a.key.is_number() ? a.key.as_number() < b.key.as_number() : a.key.to_string() < b.key.to_string();
+            const bool greater = a.key.is_number() ? a.key.as_number() > b.key.as_number() : a.key.to_string() > b.key.to_string();
+            return descending ? greater : less;
+        });
+        Value::Array result;
+        for (const auto& item : decorated) result.push_back(item.value);
+        return result;
+    });
+    const auto extrema_by = [this](const std::vector<Value>& args, bool maximum) -> Value {
+        expect_arg_count(args, maximum ? "Array.MaxBy" : "Array.MinBy", 2, 2);
+        if (!args[0].is_array() || args[0].as_array().empty()) {
+            throw std::runtime_error(std::string(maximum ? "Array.MaxBy" : "Array.MinBy") + " expects a non-empty array");
+        }
+        if (!is_callable(args[1])) throw std::runtime_error("key argument must be a CALLABLE");
+        std::size_t best = 0;
+        Value best_key = call_callable(args[1], {args[0].as_array()[0]});
+        if (!best_key.is_number() && !best_key.is_string()) throw std::runtime_error("key must be a number or string");
+        for (std::size_t i = 1; i < args[0].as_array().size(); ++i) {
+            Value key = call_callable(args[1], {args[0].as_array()[i]});
+            if (key.is_number() != best_key.is_number() || (!key.is_number() && !key.is_string())) {
+                throw std::runtime_error("keys must all have the same orderable type");
+            }
+            const bool better = best_key.is_number()
+                ? (maximum ? key.as_number() > best_key.as_number() : key.as_number() < best_key.as_number())
+                : (maximum ? key.to_string() > best_key.to_string() : key.to_string() < best_key.to_string());
+            if (better) { best = i; best_key = std::move(key); }
+        }
+        return args[0].as_array()[best];
+    };
+    register_function("Array.MinBy", [extrema_by](const std::vector<Value>& args) { return extrema_by(args, false); });
+    register_function("Array.MaxBy", [extrema_by](const std::vector<Value>& args) { return extrema_by(args, true); });
     register_function("Object.Keys", object_keys_function);
     register_function("Object.Has", object_has_function);
     register_function("Object.Get", object_get_function);
@@ -2650,6 +2885,143 @@ Runtime::Runtime() : output_(&std::cout) {
         expect_arg_count(args, "TAU", 0, 0);
         return 6.28318530717958647692528676655900576;
     });
+    const auto random_from_value = [this](const Value* value, const std::string& function) -> std::shared_ptr<Pcg32> {
+        if (value == nullptr || value->is_null()) {
+            return default_random_;
+        }
+        if (!value->is_handle() || !object_handles_.valid(value->as_handle(), "RANDOM")) {
+            throw std::runtime_error(function + " received an invalid or destroyed RANDOM handle");
+        }
+        return std::static_pointer_cast<Pcg32>(object_handles_.object(value->as_handle(), "RANDOM"));
+    };
+    register_function("Random.Create", [this](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Random.Create", 0, 2);
+        const std::uint64_t seed = args.empty() || args[0].is_null()
+            ? automatic_random_seed()
+            : random_safe_integer(args[0], "Random.Create seed");
+        const std::uint64_t sequence = args.size() < 2
+            ? Pcg32::default_sequence
+            : random_safe_integer(args[1], "Random.Create sequence");
+        auto generator = std::make_shared<Pcg32>(seed, sequence);
+        const auto handle = object_handles_.create("RANDOM", generator);
+        if (!resources_.register_resource(ResourceRecord{handle, "RANDOM", "Execution Context", "Hosted PCG32 Provider",
+                                                          ResourceLifetime::Explicit, ResourceLifecycle::Ready, {"Hosted Runtime"}})) {
+            (void)object_handles_.destroy(handle);
+            throw std::runtime_error("Random.Create resource registration failed");
+        }
+        return Value(handle);
+    });
+    register_function("Random.Clone", [this, random_from_value](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Random.Clone", 1, 1);
+        if (args[0].is_null()) {
+            throw std::runtime_error("Random.Clone requires an explicit RANDOM handle");
+        }
+        auto generator = random_from_value(&args[0], "Random.Clone");
+        auto clone = std::make_shared<Pcg32>(*generator);
+        const auto handle = object_handles_.create("RANDOM", clone);
+        if (!resources_.register_resource(ResourceRecord{handle, "RANDOM", "Execution Context", "Hosted PCG32 Provider",
+                                                          ResourceLifetime::Explicit, ResourceLifecycle::Ready, {"Hosted Runtime"}})) {
+            (void)object_handles_.destroy(handle);
+            throw std::runtime_error("Random.Clone resource registration failed");
+        }
+        return Value(handle);
+    });
+    register_function("Random.Destroy", [this](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Random.Destroy", 1, 1);
+        if (!args[0].is_handle() || !object_handles_.valid(args[0].as_handle(), "RANDOM")) {
+            throw std::runtime_error("Random.Destroy received an invalid or destroyed RANDOM handle");
+        }
+        const RuntimeHandle handle = args[0].as_handle();
+        if (!object_handles_.destroy(handle)) {
+            throw std::runtime_error("Random.Destroy received an invalid or destroyed RANDOM handle");
+        }
+        (void)resources_.unregister_resource(handle);
+        return true;
+    });
+    register_function("Random.Reseed", [random_from_value](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Random.Reseed", 2, 3);
+        if (args[0].is_null()) {
+            throw std::runtime_error("Random.Reseed requires an explicit RANDOM handle");
+        }
+        auto generator = random_from_value(&args[0], "Random.Reseed");
+        const std::uint64_t seed = random_safe_integer(args[1], "Random.Reseed seed");
+        const std::uint64_t sequence = args.size() < 3
+            ? Pcg32::default_sequence
+            : random_safe_integer(args[2], "Random.Reseed sequence");
+        generator->reseed(seed, sequence);
+        return true;
+    });
+    register_function("Random.Float", [random_from_value](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Random.Float", 0, 1);
+        return random_from_value(args.empty() ? nullptr : &args[0], "Random.Float")->unit_interval();
+    });
+    register_function("Math.Random", [random_from_value](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Math.Random", 0, 0);
+        return random_from_value(nullptr, "Math.Random")->unit_interval();
+    });
+    register_function("Random.Integer", [random_from_value](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Random.Integer", 2, 3);
+        const std::uint64_t minimum = random_safe_integer(args[0], "Random.Integer minimum");
+        const std::uint64_t maximum = random_safe_integer(args[1], "Random.Integer maximum");
+        if (minimum > maximum) {
+            throw std::runtime_error("Random.Integer requires minimum <= maximum");
+        }
+        const std::uint64_t width = maximum - minimum + 1U;
+        if (width > (UINT64_C(1) << 32U)) {
+            throw std::runtime_error("Random.Integer range size must not exceed 2^32");
+        }
+        auto generator = random_from_value(args.size() < 3 ? nullptr : &args[2], "Random.Integer");
+        return static_cast<double>(minimum + generator->bounded(width));
+    });
+    register_function("Random.Choice", [random_from_value](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Random.Choice", 1, 2);
+        if (!args[0].is_array() || args[0].as_array().empty()) {
+            throw std::runtime_error("Random.Choice requires a non-empty array");
+        }
+        const auto& values = args[0].as_array();
+        if (values.size() > (UINT64_C(1) << 32U)) {
+            throw std::runtime_error("Random.Choice source length must not exceed 2^32");
+        }
+        auto generator = random_from_value(args.size() < 2 ? nullptr : &args[1], "Random.Choice");
+        return values[generator->bounded(values.size())];
+    });
+    register_function("Random.Sample", [random_from_value](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Random.Sample", 2, 3);
+        if (!args[0].is_array()) {
+            throw std::runtime_error("Random.Sample source must be an array");
+        }
+        Value::Array values = args[0].as_array();
+        if (values.size() > (UINT64_C(1) << 32U)) {
+            throw std::runtime_error("Random.Sample source length must not exceed 2^32");
+        }
+        const std::uint64_t count = random_safe_integer(args[1], "Random.Sample count");
+        if (count > values.size()) {
+            throw std::runtime_error("Random.Sample count must be between 0 and the source length");
+        }
+        auto generator = random_from_value(args.size() < 3 ? nullptr : &args[2], "Random.Sample");
+        for (std::size_t index = 0; index < static_cast<std::size_t>(count); ++index) {
+            const std::size_t selected = index + generator->bounded(values.size() - index);
+            std::swap(values[index], values[selected]);
+        }
+        values.resize(static_cast<std::size_t>(count));
+        return values;
+    });
+    register_function("Random.Shuffle", [random_from_value](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Random.Shuffle", 1, 2);
+        if (!args[0].is_array()) {
+            throw std::runtime_error("Random.Shuffle source must be an array");
+        }
+        Value::Array values = args[0].as_array();
+        if (values.size() > (UINT64_C(1) << 32U)) {
+            throw std::runtime_error("Random.Shuffle source length must not exceed 2^32");
+        }
+        auto generator = random_from_value(args.size() < 2 ? nullptr : &args[1], "Random.Shuffle");
+        for (std::size_t remaining = values.size(); remaining > 1; --remaining) {
+            const std::size_t selected = generator->bounded(remaining);
+            std::swap(values[remaining - 1], values[selected]);
+        }
+        return values;
+    });
     register_function("Document.New", document_new_function);
     register_function("Document.InsertText", document_insert_function);
     register_function("Document.DeleteRange", document_delete_function);
@@ -2721,6 +3093,121 @@ Runtime::Runtime() : output_(&std::cout) {
     register_function("DATE", time_now_function);
     register_function("Date", time_now_function);
     register_function("Sleep", sleep_function);
+    register_function("COLOR.RGB", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 3) throw std::runtime_error("COLOR.RGB expects red, green, and blue");
+        return Value::Object{{"__color", true}, {"R", args[0]}, {"G", args[1]}, {"B", args[2]}, {"A", 255}};
+    });
+    register_function("COLOR.RGBA", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 4) throw std::runtime_error("COLOR.RGBA expects red, green, blue, and alpha");
+        return Value::Object{{"__color", true}, {"R", args[0]}, {"G", args[1]}, {"B", args[2]}, {"A", args[3]}};
+    });
+    register_function("COLOR.Black", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("COLOR.Black expects no arguments");
+        return Value::Object{{"__color", true}, {"R", 0}, {"G", 0}, {"B", 0}, {"A", 255}};
+    });
+    register_function("COLOR.White", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("COLOR.White expects no arguments");
+        return Value::Object{{"__color", true}, {"R", 255}, {"G", 255}, {"B", 255}, {"A", 255}};
+    });
+    register_function("COLOR.Magenta", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("COLOR.Magenta expects no arguments");
+        return Value::Object{{"__color", true}, {"R", 255}, {"G", 0}, {"B", 255}, {"A", 255}};
+    });
+    const auto surface_from_handle = [this](const Value& value) -> std::shared_ptr<graphics::Surface> {
+        if (!value.is_handle() || !object_handles_.valid(value.as_handle(), "SURFACE")) {
+            throw std::runtime_error("invalid SURFACE handle");
+        }
+        return std::static_pointer_cast<graphics::Surface>(object_handles_.object(value.as_handle(), "SURFACE"));
+    };
+    register_function("GRAPHICS.CreateSurface", [this](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2 || args.size() > 3) throw std::runtime_error("GRAPHICS.CreateSurface expects width, height, and optional pixel format");
+        const auto width = static_cast<std::uint32_t>(args[0].as_number());
+        const auto height = static_cast<std::uint32_t>(args[1].as_number());
+        const auto format = static_cast<graphics::PixelFormat>(args.size() == 3 ? static_cast<std::uint32_t>(args[2].as_number()) : 0);
+        auto created = graphics::CreateSurface(width, height, format);
+        if (!created) throw std::runtime_error("GRAPHICS.CreateSurface failed");
+        auto surface = std::make_shared<graphics::Surface>(std::move(created.surface));
+        const auto handle = object_handles_.create("SURFACE", surface);
+        if (!resources_.register_resource(ResourceRecord{handle, "SURFACE", "Execution Context", "Software Graphics Provider",
+                                                          ResourceLifetime::Explicit, ResourceLifecycle::Ready, {"Graphics Provider"}})) {
+            (void)object_handles_.destroy(handle);
+            throw std::runtime_error("GRAPHICS.CreateSurface resource registration failed");
+        }
+        return Value(handle);
+    });
+    register_function("GRAPHICS.PrimarySurface", [this](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("GRAPHICS.PrimarySurface expects no arguments");
+        if (!primary_surface_handle_) {
+            // Hosted bootstrap backend: the physical display adapter supplies this surface on
+            // UEFI. Keeping it in the runtime table makes ownership and binding semantics equal.
+            auto created = graphics::CreateSurface(800, 600, graphics::PixelFormat::RedGreenBlueReserved8);
+            if (!created) throw std::runtime_error("GRAPHICS.PrimarySurface unavailable");
+            auto surface = std::make_shared<graphics::Surface>(std::move(created.surface));
+            primary_surface_handle_ = object_handles_.create("SURFACE", surface, false);
+            if (!resources_.register_resource(ResourceRecord{*primary_surface_handle_, "SURFACE", "Graphics Runtime", "Software Graphics Provider",
+                                                              ResourceLifetime::RuntimeOwned, ResourceLifecycle::Ready, {"Graphics Provider", "Primary Display Backend"}})) {
+                primary_surface_handle_.reset();
+                throw std::runtime_error("GRAPHICS.PrimarySurface resource registration failed");
+            }
+        }
+        return Value(*primary_surface_handle_);
+    });
+    register_function("GRAPHICS.DestroySurface", [this, surface_from_handle](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) throw std::runtime_error("GRAPHICS.DestroySurface expects a SURFACE");
+        if (args[0].is_null()) return {};
+        (void)surface_from_handle(args[0]);
+        if (!object_handles_.valid(args[0].as_handle(), "SURFACE")) throw std::runtime_error("invalid SURFACE handle");
+        if (!object_handles_.destroy(args[0].as_handle())) {
+            if (!object_handles_.destroyable(args[0].as_handle())) return false;
+            throw std::runtime_error("invalid SURFACE handle");
+        }
+        (void)resources_.unregister_resource(args[0].as_handle());
+        return true;
+    });
+    register_function("GRAPHICS.Bind", [surface_from_handle](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) throw std::runtime_error("GRAPHICS.Bind expects a SURFACE");
+        if (args[0].is_null()) { graphics::Unbind(); return {}; }
+        if (!graphics::Bind(*surface_from_handle(args[0]))) throw std::runtime_error("cannot bind invalid SURFACE");
+        return {};
+    });
+    register_function("GRAPHICS.PushSurface", [surface_from_handle](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) throw std::runtime_error("GRAPHICS.PushSurface expects a SURFACE");
+        if (!graphics::PushSurface(*surface_from_handle(args[0]))) throw std::runtime_error("cannot push invalid SURFACE");
+        return {};
+    });
+    register_function("GRAPHICS.PopSurface", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("GRAPHICS.PopSurface expects no arguments");
+        if (!graphics::PopSurface()) throw std::runtime_error("GRAPHICS surface binding stack is empty");
+        return {};
+    });
+    register_function("GRAPHICS.Clear", [](const std::vector<Value>& args) -> Value {
+        if (args.size() > 1) throw std::runtime_error("GRAPHICS.Clear expects an optional color");
+        const auto color = args.empty() ? graphics::Color::Black() : runtime_color(args[0]);
+        auto* surface = graphics::CurrentSurface();
+        if (surface == nullptr) throw std::runtime_error("GRAPHICS.Clear has no bound SURFACE");
+        graphics::FillRect(*surface, 0, 0, static_cast<std::int32_t>(surface->Width), static_cast<std::int32_t>(surface->Height), color);
+        return {};
+    });
+    register_function("GRAPHICS.FillRect", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 5) throw std::runtime_error("GRAPHICS.FillRect expects x, y, width, height, and color");
+        auto* surface = graphics::CurrentSurface();
+        if (surface == nullptr) throw std::runtime_error("GRAPHICS.FillRect has no bound SURFACE");
+        graphics::FillRect(*surface, static_cast<std::int32_t>(args[0].as_number()), static_cast<std::int32_t>(args[1].as_number()),
+                           static_cast<std::int32_t>(args[2].as_number()), static_cast<std::int32_t>(args[3].as_number()), runtime_color(args[4]));
+        return {};
+    });
+    register_function("GRAPHICS.DrawText", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 4) throw std::runtime_error("GRAPHICS.DrawText expects x, y, text, and color");
+        auto* surface = graphics::CurrentSurface();
+        if (surface == nullptr) throw std::runtime_error("GRAPHICS.DrawText has no bound SURFACE");
+        graphics::DrawText(*surface, static_cast<std::int32_t>(args[0].as_number()), static_cast<std::int32_t>(args[1].as_number()),
+                           args[2].to_string(), runtime_color(args[3]));
+        return {};
+    });
+    register_function("RESOURCE.Describe", [this](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("RESOURCE.Describe expects no arguments");
+        return resources_.describe();
+    });
     register_function("GUI.Available", [](const std::vector<Value>& args) -> Value {
         if (!args.empty()) throw std::runtime_error("GUI.Available expects no arguments");
         return gui_session_available() && gui::available();
@@ -2909,8 +3396,10 @@ std::string Runtime::preprocess_source(const std::string& code, bool reset_metad
     std::ostringstream output;
     std::istringstream input(code);
     std::string line;
+    std::size_t source_line = 0;
 
     while (std::getline(input, line)) {
+        ++source_line;
         const std::string trimmed = trim_copy(line);
         if (trimmed.rfind("#!", 0) == 0) {
             output << '\n';
@@ -3039,6 +3528,33 @@ std::string Runtime::preprocess_source(const std::string& code, bool reset_metad
                     "Unknown #RUNTIME value: " + args + ". NONE is the only accepted value in this milestone.");
             }
             metadata_.runtime_mode = mode;
+        } else if (directive == "INSTRUCTION_LIMIT") {
+            constexpr std::uint64_t maximum_safe_integer = 9007199254740991ULL;
+            if (metadata_.instruction_limit.has_value()) {
+                throw std::runtime_error("duplicate #INSTRUCTION_LIMIT directive at line " +
+                                         std::to_string(source_line));
+            }
+            if (args.empty() || !std::all_of(args.begin(), args.end(), [](unsigned char c) {
+                    return std::isdigit(c) != 0;
+                })) {
+                throw std::runtime_error(
+                    "#INSTRUCTION_LIMIT expects a decimal integer from 1 through 9007199254740991 at line " +
+                    std::to_string(source_line));
+            }
+            std::uint64_t requested = 0;
+            try {
+                requested = std::stoull(args);
+            } catch (const std::exception&) {
+                throw std::runtime_error(
+                    "#INSTRUCTION_LIMIT expects a decimal integer from 1 through 9007199254740991 at line " +
+                    std::to_string(source_line));
+            }
+            if (requested == 0 || requested > maximum_safe_integer) {
+                throw std::runtime_error(
+                    "#INSTRUCTION_LIMIT expects a decimal integer from 1 through 9007199254740991 at line " +
+                    std::to_string(source_line));
+            }
+            metadata_.instruction_limit = requested;
         } else if (directive == "CALLCONV") {
             const std::string convention = upper_copy(args);
             if (convention != "UEFI") {
@@ -3097,6 +3613,9 @@ std::string Runtime::preprocess_source(const std::string& code, bool reset_metad
     if (!conditionals.empty()) {
         throw std::runtime_error("unterminated conditional directive");
     }
+    if (metadata_.runtime_mode == "NONE" && metadata_.instruction_limit.has_value()) {
+        throw std::runtime_error("#INSTRUCTION_LIMIT is available only for hosted execution");
+    }
 
     return output.str();
 }
@@ -3106,6 +3625,7 @@ RunResult Runtime::run_string(const std::string& code) {
     try {
         reset_instruction_count();
         processed = preprocess_source(code);
+        prepare_execution(metadata_.instruction_limit);
         Lexer lexer(processed);
         Parser parser(lexer.scan_tokens(), metadata_.runtime_mode == "NONE");
         auto statements = parser.parse();
@@ -3130,7 +3650,10 @@ RunResult Runtime::run_string(const std::string& code) {
             } catch (const ExitSignal&) {
                 throw;
             } catch (const std::exception& error) {
-                throw std::runtime_error(format_runtime_diagnostic(error.what(), processed, statements[pc]->source_line, statements[pc]->source_column));
+                const auto* user_error = dynamic_cast<const UserError*>(&error);
+                const int line = user_error && user_error->source_line() > 0 ? user_error->source_line() : statements[pc]->source_line;
+                const int column = user_error && user_error->source_column() > 0 ? user_error->source_column() : statements[pc]->source_column;
+                throw std::runtime_error(format_runtime_diagnostic(error.what(), processed, line, column));
             }
         }
         return {};
@@ -3265,11 +3788,27 @@ bool Runtime::value_matches_type(const Value& value, const std::string& type_nam
     if (type == "array" || type == "list") {
         return value.is_array();
     }
+    if (type == "bitvector") {
+        return value.is_bit_vector();
+    }
+    if (type == "tuple") {
+        return value.is_tuple();
+    }
+    if (type == "range") {
+        return value.is_range();
+    }
     if (type == "object") {
         return value.is_object();
     }
     if (type == "ref" || type == "reference") {
         return is_reference(value);
+    }
+    // Runtime Object Handles are opaque, identity-bearing values. NULL is the invalid value for
+    // every handle type and is accepted by typed APIs; non-null values must carry the exact type.
+    if (type == "surface" || type == "window" || type == "image" || type == "font" ||
+        type == "file" || type == "directory" || type == "timer" || type == "thread" ||
+        type == "mutex" || type == "socket" || type == "random" || type == "callable") {
+        return value.is_null() || (value.is_handle() && function_key(value.as_handle().type) == type);
     }
     if (classes_.find(type) != classes_.end()) {
         return is_instance_of(value, type_name);
@@ -3651,15 +4190,52 @@ std::ostream& Runtime::output() {
 
 void Runtime::set_limits(RuntimeLimits limits) {
     limits_ = limits;
+    effective_limits_ = limits;
 }
 
 const RuntimeLimits& Runtime::limits() const {
     return limits_;
 }
 
+void Runtime::set_instruction_limit_policy(bool allow_source_requests,
+                                           std::optional<std::size_t> hard_maximum) {
+    allow_source_instruction_limits_ = allow_source_requests;
+    instruction_limit_hard_maximum_ = hard_maximum;
+}
+
+void Runtime::set_instruction_limit_override(std::optional<std::size_t> limit) {
+    instruction_limit_override_ = limit;
+}
+
+void Runtime::prepare_execution(std::optional<std::uint64_t> source_request) {
+    if (source_request.has_value() && !allow_source_instruction_limits_) {
+        throw std::runtime_error("source #INSTRUCTION_LIMIT requests are not authorized by this host");
+    }
+
+    std::size_t selected = limits_.instruction_limit;
+    if (source_request.has_value()) {
+        if (*source_request > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+            throw std::runtime_error("requested instruction limit is not representable by this host");
+        }
+        selected = static_cast<std::size_t>(*source_request);
+    }
+    if (instruction_limit_override_.has_value()) {
+        selected = *instruction_limit_override_;
+    }
+
+    if (instruction_limit_hard_maximum_.has_value() &&
+        (selected == 0 || selected > *instruction_limit_hard_maximum_)) {
+        throw std::runtime_error(
+            "requested instruction limit " + (selected == 0 ? std::string("unlimited") : std::to_string(selected)) +
+            " exceeds host maximum " + std::to_string(*instruction_limit_hard_maximum_));
+    }
+    effective_limits_.instruction_limit = selected;
+    reset_instruction_count();
+}
+
 void Runtime::tick() {
     instruction_count_++;
-    if (limits_.instruction_limit > 0 && instruction_count_ > limits_.instruction_limit) {
+    if (effective_limits_.instruction_limit > 0 && instruction_count_ > effective_limits_.instruction_limit) {
         throw std::runtime_error("instruction limit exceeded");
     }
 }
@@ -3683,6 +4259,58 @@ Value Runtime::call_host_function(const std::string& name, const std::vector<Val
         throw std::runtime_error("unknown host function: " + name);
     }
     return found->second(args);
+}
+
+Value Runtime::make_callable(const std::string& name, std::optional<Value> receiver, bool require_registered) {
+    if (receiver.has_value()) {
+        if (!receiver->is_object()) throw std::runtime_error("ADDRESSOF bound receiver must be a class instance");
+        if (require_registered) {
+            const auto dot = name.rfind('.');
+            const std::string method = dot == std::string::npos ? name : name.substr(dot + 1);
+            std::string class_name = receiver->get_property("__class").to_string();
+            bool resolved = false;
+            while (!class_name.empty()) {
+                if (has_function(class_name + "." + method)) {
+                    ensure_member_access(class_name, method, true);
+                    resolved = true;
+                    break;
+                }
+                const auto found = classes_.find(function_key(class_name));
+                if (found == classes_.end()) break;
+                class_name = found->second.parent;
+            }
+            if (!resolved) throw std::runtime_error("ADDRESSOF cannot resolve callable: " + name);
+        }
+    } else if (require_registered && !has_function(name)) {
+        throw std::runtime_error("ADDRESSOF cannot resolve callable: " + name);
+    }
+    auto descriptor = std::make_shared<CallableDescriptor>();
+    descriptor->name = name;
+    descriptor->receiver = std::move(receiver);
+    return Value(object_handles_.create("CALLABLE", std::move(descriptor), false));
+}
+
+bool Runtime::is_callable(const Value& value) const {
+    return value.is_handle() && value.as_handle().type == "CALLABLE" &&
+           object_handles_.valid(value.as_handle(), "CALLABLE");
+}
+
+CallableDescriptor Runtime::callable_descriptor(const Value& value) const {
+    if (!is_callable(value)) throw std::runtime_error("value is not a live CALLABLE");
+    const auto descriptor = std::static_pointer_cast<CallableDescriptor>(
+        object_handles_.object(value.as_handle(), "CALLABLE"));
+    if (!descriptor) throw std::runtime_error("value is not a live CALLABLE");
+    return *descriptor;
+}
+
+Value Runtime::call_callable(const Value& callable, const std::vector<Value>& args) {
+    const CallableDescriptor descriptor = callable_descriptor(callable);
+    if (descriptor.receiver.has_value()) {
+        const auto dot = descriptor.name.rfind('.');
+        const std::string method = dot == std::string::npos ? descriptor.name : descriptor.name.substr(dot + 1);
+        return call_method(*descriptor.receiver, method, args);
+    }
+    return call_host_function(descriptor.name, args);
 }
 
 Value Runtime::call_method(Value receiver, const std::string& method, const std::vector<Value>& args) {

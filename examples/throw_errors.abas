@@ -1,0 +1,12 @@
+FUNCTION RequireProbability(value)
+    IF value < 0 ORELSE value > 1 THEN
+        THROW "Probability must be between 0 and 1"
+    END IF
+    RETURN value
+END FUNCTION
+
+TRY
+    PRINT RequireProbability(2)
+CATCH err
+    PRINT err.Type + ": " + err.Message
+END TRY

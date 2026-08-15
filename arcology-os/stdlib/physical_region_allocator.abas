@@ -1,0 +1,81 @@
+' RFC-0019 region-state operations. Records are represented as explicit scalar fields until the
+' persistent PRD record/array ABI is introduced; these functions define the invariant policy.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+' Region states: 0 Free, 1 Reserved, 2 Allocated, 3 Runtime, 4 Unavailable.
+FUNCTION RegionEnd(base AS U64, pages AS U64) AS U64
+    IF pages = 0 THEN
+        RETURN 0
+    END IF
+    IF pages > 4503599627370495 THEN
+        RETURN 0
+    END IF
+    LET bytes AS U64 = pages * 4096
+    IF base > 18446744073709551615 - bytes THEN
+        RETURN 0
+    END IF
+    RETURN base + bytes
+END FUNCTION
+
+FUNCTION RegionsOverlap(firstBase AS U64, firstPages AS U64, secondBase AS U64, secondPages AS U64) AS BOOL
+    LET firstEnd AS U64 = RegionEnd(firstBase, firstPages)
+    LET secondEnd AS U64 = RegionEnd(secondBase, secondPages)
+    IF firstEnd = 0 THEN
+        RETURN 0
+    END IF
+    IF secondEnd = 0 THEN
+        RETURN 0
+    END IF
+    IF firstBase >= secondEnd THEN
+        RETURN 0
+    END IF
+    IF secondBase >= firstEnd THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION CanReserveRegion(state AS U32, regionBase AS U64, regionPages AS U64, reserveBase AS U64, reservePages AS U64) AS BOOL
+    IF state <> 0 THEN
+        RETURN 0
+    END IF
+    IF RegionsOverlap(regionBase, regionPages, reserveBase, reservePages) = 1 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION CanSplitRegion(state AS U32, regionPages AS U64, allocationPages AS U64) AS BOOL
+    IF state <> 0 THEN
+        RETURN 0
+    END IF
+    IF allocationPages = 0 THEN
+        RETURN 0
+    END IF
+    IF allocationPages >= regionPages THEN
+        RETURN allocationPages = regionPages
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION CanCoalesce(firstState AS U32, firstBase AS U64, firstPages AS U64, secondState AS U32, secondBase AS U64, secondPages AS U64) AS BOOL
+    IF firstState <> 0 THEN
+        RETURN 0
+    END IF
+    IF secondState <> 0 THEN
+        RETURN 0
+    END IF
+    IF RegionEnd(firstBase, firstPages) = 0 THEN
+        RETURN 0
+    END IF
+    IF RegionEnd(firstBase, firstPages) <> secondBase THEN
+        RETURN 0
+    END IF
+    IF RegionEnd(secondBase, secondPages) = 0 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION

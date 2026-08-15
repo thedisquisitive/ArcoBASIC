@@ -1,0 +1,9 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET screen AS SURFACE = GRAPHICS.PrimarySurface()
+    GRAPHICS.Bind(screen)
+    CPU.HaltForever
+END FUNCTION

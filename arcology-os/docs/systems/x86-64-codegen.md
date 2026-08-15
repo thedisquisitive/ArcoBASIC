@@ -5,8 +5,8 @@ Depends on: `arcology-os/docs/systems/calling-conventions.md`, `arcology-os/docs
 `arcology-os/docs/systems/utf16-encoding.md`
 
 `include/arco/x86_64_encoder.hpp` provides a small instruction encoder; `src/compiler/fission.cpp`'s
-`generate_x86_64_function` (exposed as `ArcoFission reveal FILE at X86_64`) walks a single A-MIR
-function and lowers it to real x86-64 machine code using that encoder. This is the first work
+`generate_x86_64_function` (exposed as `ArcoFission reveal FILE at X86_64`) walks an ordered A-MIR
+block graph and lowers it to real x86-64 machine code using that encoder. This is the first work
 package in the mission to produce actual machine code rather than an intermediate representation.
 
 ## Scope
@@ -15,18 +15,21 @@ Per Packet WP-008's non-goals ("optimization," "register allocator sophisticatio
 correctness," "general-purpose instruction selection"), this is deliberately not a general
 compiler backend. It supports exactly the A-MIR shapes the hello-world program produces:
 
-- A single straight-line block (no branches; `IF`/`WHILE`/`FOR`/etc. produce multiple A-MIR blocks
-  and are rejected with a clear error rather than silently mishandled).
+- Multiple reachable A-MIR blocks with deterministic near `JMP`/`Jcc` rel32 fixups. `IF`/`ELSE`
+  and `WHILE` are supported; `ELSEIF` is unavailable because the shared parser does not yet
+  represent it, and `FOR`/`TRY` remain unsupported by this systems backend.
 - `CONST` for string literals (UTF-16 encoded per WP-007, placed in a data section, referenced by
   a RIP-relative `LEA`) and exact integer literals (loaded via a 64-bit immediate `MOV`).
 - `LOAD` of a named value.
 - `CALL_EXTERNAL` through a UEFI-bound field chain (WP-006), including injecting the implicit
   `This` argument real UEFI protocol methods require (see "Implicit This Argument" below --
   this closes the gap `arcology-os/docs/systems/uefi-bindings.md` flagged as deferred).
+- `CALL` to a declared ArcoBASIC function. Helpers are emitted into the same PE32+ text image and
+  linked with deterministic near `CALL rel32` fixups after function bases are known.
 - `RETURN` of a value or of nothing.
-- Function parameters passed in registers (the first four, per
-  `arcology-os/docs/systems/calling-conventions.md`); a 5th+ stack-passed parameter is rejected with a clear
-  error rather than silently mishandled, since no hello-world-shaped function needs one.
+- Function parameters passed in registers or in the Microsoft x64 incoming stack area. A 5th+
+  parameter is loaded from its entry-stack location and homed into the function spill frame before
+  ordinary lowering.
 
 Any other A-MIR instruction kind, or any of the above cases outside what is listed, produces a
 clear `ok = false` error naming what is unsupported, per Packet section 13's diagnostic quality

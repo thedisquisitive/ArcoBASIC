@@ -1,0 +1,28 @@
+' Freestanding Arcology graphics substrate.
+' This module is intentionally ArcoBASIC: C++ supplies only the compiler, ABI, and primitive
+' memory operations. Applications consume the public GRAPHICS surface API instead of calling
+' this implementation directly.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+' Fill a mapped GOP framebuffer with the canonical magenta diagnostic pixel. The caller supplies
+' validated GOP metadata; validation and mapping belong to the substrate bootstrap, not app code.
+' Stack-passed parameters are homed by the freestanding Microsoft x64 lowering, so color remains
+' explicit ArcoBASIC data rather than a compiler-selected constant.
+FUNCTION FillMappedSurface(framebuffer AS MMIOPTR, width AS U32, height AS U32, stride AS U32, color AS U32) AS U64
+    LET y AS U32 = 0
+    WHILE y < height
+        LET x AS U32 = 0
+        WHILE x < width
+            LET pixelOffset AS U32 = (y * stride + x) * 4
+            LET pixel AS MMIOPTR = ADDRESS.Offset(framebuffer, pixelOffset)
+            MEMORY.Write32(pixel, color)
+            x = x + 1
+        WEND
+        y = y + 1
+    WEND
+    CPU.MemoryBarrier
+    RETURN 0
+END FUNCTION

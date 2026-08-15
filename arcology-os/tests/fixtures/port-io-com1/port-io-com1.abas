@@ -1,0 +1,61 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+#EXPORT "efi_main"
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+
+    LET com1 AS IOPORT = PORT.Address(0x3F8)
+    LET interruptEnable AS IOPORT = PORT.Offset(com1, 1)
+    LET lineControl AS IOPORT = PORT.Offset(com1, 3)
+    LET fifoControl AS IOPORT = PORT.Offset(com1, 2)
+    LET modemControl AS IOPORT = PORT.Offset(com1, 4)
+    LET lineStatus AS IOPORT = PORT.Offset(com1, 5)
+
+    PORT.WriteByte(interruptEnable, 0)
+    PORT.WriteByte(lineControl, 0x80)
+    PORT.WriteByte(com1, 1)
+    PORT.WriteByte(interruptEnable, 0)
+    PORT.WriteByte(lineControl, 3)
+    PORT.WriteByte(fifoControl, 0xC7)
+    PORT.WriteByte(modemControl, 0x0B)
+
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(lineStatus) AND 0x20) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 1000 THEN
+            CPU.HaltForever
+        END IF
+    WEND
+
+    PORT.WriteByte(com1, 65)
+    PORT.WriteByte(com1, 82)
+    PORT.WriteByte(com1, 67)
+    PORT.WriteByte(com1, 79)
+    PORT.WriteByte(com1, 76)
+    PORT.WriteByte(com1, 79)
+    PORT.WriteByte(com1, 71)
+    PORT.WriteByte(com1, 89)
+    PORT.WriteByte(com1, 32)
+    PORT.WriteByte(com1, 80)
+    PORT.WriteByte(com1, 79)
+    PORT.WriteByte(com1, 82)
+    PORT.WriteByte(com1, 84)
+    PORT.WriteByte(com1, 32)
+    PORT.WriteByte(com1, 73)
+    PORT.WriteByte(com1, 47)
+    PORT.WriteByte(com1, 79)
+    PORT.WriteByte(com1, 32)
+    PORT.WriteByte(com1, 79)
+    PORT.WriteByte(com1, 78)
+    PORT.WriteByte(com1, 76)
+    PORT.WriteByte(com1, 73)
+    PORT.WriteByte(com1, 78)
+    PORT.WriteByte(com1, 69)
+    PORT.WriteByte(com1, 13)
+    PORT.WriteByte(com1, 10)
+    CPU.HaltForever
+END FUNCTION

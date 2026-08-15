@@ -1,0 +1,11 @@
+LET surface AS SURFACE = GRAPHICS.CreateSurface(32, 24)
+IF surface = NULL THEN
+    PRINT "FAIL: constructor returned null"
+    STOP
+END IF
+GRAPHICS.Bind(surface)
+GRAPHICS.Clear(COLOR.Magenta())
+GRAPHICS.PushSurface(surface)
+GRAPHICS.PopSurface()
+GRAPHICS.DestroySurface(surface)
+PRINT "RUNTIME HANDLE ABI ONLINE"

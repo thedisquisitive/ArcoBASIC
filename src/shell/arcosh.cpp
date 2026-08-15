@@ -988,7 +988,7 @@ std::vector<std::string> shell_builtin_commands() {
         "alias", "bg", "cd", "cls", "color", "complete", "disown", "env", "exit", "export", "fg", "help", "history",
         "install-login", "jobs", "kill", "list", "load", "new", "oops", "pwd", "run", "source", "tutorial", "unalias",
         "unset", "version",
-        "PRINT", "LET", "IF", "WHILE", "FOR", "FUNCTION", "TRY", "FLAGS", "STOP", "GOTO"
+        "PRINT", "LET", "IF", "WHILE", "FOR", "FUNCTION", "TRY", "THROW", "FLAGS", "STOP", "GOTO"
     };
 }
 
@@ -1963,6 +1963,7 @@ const std::map<std::string, std::string>& help_catalog() {
             "  print       PRINT expression\n"
             "  let         Assignment with name = value or LET name = value\n"
             "  arrays      Array literals and FOR IN\n"
+            "  random      Seeded generators, integers, choice, sample, and shuffle\n"
             "  strings     String.Trim, String.Split, String.Replace, String.Contains\n"
             "  objects     Object literals and property reads\n"
             "  contains    CONTAINS and IN membership checks\n"
@@ -2285,6 +2286,27 @@ const std::map<std::string, std::string>& help_catalog() {
             "  FOR value IN values\n"
             "      PRINT value\n"
             "  NEXT\n"},
+        {"random",
+            "Pseudorandom numbers\n"
+            "\n"
+            "Convenient default generator:\n"
+            "  PRINT Math.Random()\n"
+            "  PRINT Random.Integer(1, 6)\n"
+            "  PRINT Random.Choice([\"north\", \"south\"])\n"
+            "\n"
+            "Reproducible generator:\n"
+            "  rng = Random.Create(42)\n"
+            "  copy = Random.Clone(rng)\n"
+            "  PRINT Random.Float(rng)\n"
+            "  PRINT Random.Integer(0, 100, rng)\n"
+            "  PRINT Random.Sample([1, 2, 3, 4], 2, rng)\n"
+            "  PRINT Random.Shuffle([1, 2, 3, 4], rng)\n"
+            "  Random.Reseed(rng, 42)\n"
+            "  Random.Destroy(copy)\n"
+            "  Random.Destroy(rng)\n"
+            "\n"
+            "Random.* is deterministic when explicitly seeded. It is not\n"
+            "cryptographically secure and must not create keys, tokens, salts, or nonces.\n"},
         {"strings",
             "String helpers\n"
             "\n"
@@ -2412,6 +2434,7 @@ const std::map<std::string, std::string>& help_catalog() {
             "  TRY\n"
             "      risky statements\n"
             "  CATCH err\n"
+            "      PRINT err.Type\n"
             "      PRINT err.Message\n"
             "  END TRY\n"
             "\n"
@@ -2422,7 +2445,39 @@ const std::map<std::string, std::string>& help_catalog() {
             "      PRINT err.Message\n"
             "  END TRY\n"
             "\n"
+            "Use THROW \"message\" to originate a UserError from source.\n"
+            "Caught user errors have Type UserError; ordinary failures have Type RuntimeError.\n"
+            "\n"
             "Exit() and RETURN are control flow and are not swallowed by CATCH.\n"},
+        {"throw",
+            "THROW\n"
+            "\n"
+            "Syntax:\n"
+            "  THROW stringExpression\n"
+            "\n"
+            "THROW stops the current path and transfers to the nearest active CATCH.\n"
+            "The expression is evaluated once and must produce a String.\n"
+            "THROW is hosted-only and is rejected under #RUNTIME NONE.\n"},
+        {"instruction-limit",
+            "Hosted instruction limits\n"
+            "\n"
+            "  #INSTRUCTION_LIMIT 10000000\n"
+            "  arcosh --instruction-limit 50000000 script.abas\n"
+            "  arcosh --instruction-limit unlimited script.abas\n"
+            "\n"
+            "The default is 100000 instructions. Source requests are subject to host\n"
+            "policy; an operator option supersedes source metadata. 'unlimited' disables\n"
+            "instruction-count termination and may consume CPU indefinitely.\n"},
+        {"bits",
+            "Immutable bit vectors\n"
+            "\n"
+            "  genome = BITS \"0001_1011\"\n"
+            "  PRINT genome[3]\n"
+            "  PRINT Bits.ToString(Bits.Flip(genome, 0))\n"
+            "\n"
+            "Helpers: Bits.FromString, Bits.ToString, Bits.FromArray, Bits.ToArray,\n"
+            "Bits.Get, Bits.Set, Bits.Flip, Bits.Count, Bits.Slice, Bits.Replace,\n"
+            "and Bits.Reverse. Operations return new values; the original is immutable.\n"},
         {"bitwise",
             "Bitwise operations\n"
             "\n"

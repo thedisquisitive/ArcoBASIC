@@ -1,7 +1,11 @@
 #include "arco/fission.hpp"
 
 #include <fstream>
+#include <cctype>
 #include <iostream>
+#include <limits>
+#include <optional>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -23,6 +27,8 @@ void print_usage(std::ostream& output) {
         << "  ArcoFission native FILE -o OUT\n"
         << "  ArcoFission run FILE.arcof\n"
         << "  ArcoFission compile-run FILE\n"
+        << "  Hosted run/build commands accept --instruction-limit COUNT|unlimited\n"
+        << "  Hosted ArcoFission execution defaults to unlimited instruction count.\n"
         << "\n"
         << "This first slice validates ArcoBASIC source with the existing parser\n"
         << "and emits the parsed AST, structured A-MIR, or the initial serialized\n"
@@ -41,6 +47,37 @@ std::string lowercase(std::string text) {
 
 bool ends_with(const std::string& text, const std::string& suffix) {
     return text.size() >= suffix.size() && text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::size_t parse_instruction_limit(const std::string& value) {
+    const std::string normalized = lowercase(value);
+    if (normalized == "unlimited") return 0;
+    if (value.empty() || value == "0" || value.find_first_not_of("0123456789") != std::string::npos) {
+        throw std::runtime_error("instruction limit must be 1..9007199254740991 or unlimited");
+    }
+    const auto parsed = std::stoull(value);
+    if (parsed == 0 || parsed > 9007199254740991ULL || parsed > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error("instruction limit must be 1..9007199254740991 or unlimited");
+    }
+    return static_cast<std::size_t>(parsed);
+}
+
+std::optional<std::size_t> trailing_instruction_limit(int argc, char** argv, int first_optional) {
+    if (argc == first_optional) return std::nullopt;
+    if (argc != first_optional + 2 || std::string(argv[first_optional]) != "--instruction-limit") {
+        throw std::runtime_error("expected --instruction-limit COUNT|unlimited");
+    }
+    return parse_instruction_limit(argv[first_optional + 1]);
+}
+
+std::optional<std::size_t> default_unlimited_instruction_limit() {
+    return std::optional<std::size_t>(0);
+}
+
+std::optional<std::size_t> hosted_instruction_limit_or_unlimited(int argc, char** argv, int first_optional) {
+    const auto requested = trailing_instruction_limit(argc, argv, first_optional);
+    if (requested.has_value()) return requested;
+    return default_unlimited_instruction_limit();
 }
 
 int write_bytecode_file(const std::string& source_path, const std::string& output_path) {
@@ -62,8 +99,9 @@ int write_bytecode_file(const std::string& source_path, const std::string& outpu
     return 0;
 }
 
-int write_native_file(const std::string& source_path, const std::string& output_path) {
-    const auto result = arco::fission::build_native_file(source_path, output_path);
+int write_native_file(const std::string& source_path, const std::string& output_path,
+                      std::optional<std::size_t> instruction_limit = default_unlimited_instruction_limit()) {
+    const auto result = arco::fission::build_native_file(source_path, output_path, instruction_limit);
     if (!result.ok) {
         std::cerr << "NATIVE BUILD FAILED\n\n" << result.error << '\n';
         return 1;
@@ -145,11 +183,19 @@ int main(int argc, char** argv) {
         const std::string output_path = argv[4];
         std::string target;
         std::string entry_function = "Main";
+        std::optional<std::size_t> instruction_limit = default_unlimited_instruction_limit();
         for (int i = 5; i + 1 < argc; i += 2) {
             if (lowercase(argv[i]) == "--target") {
                 target = lowercase(argv[i + 1]);
             } else if (lowercase(argv[i]) == "--entry") {
                 entry_function = argv[i + 1];
+            } else if (lowercase(argv[i]) == "--instruction-limit") {
+                try {
+                    instruction_limit = parse_instruction_limit(argv[i + 1]);
+                } catch (const std::exception& error) {
+                    std::cerr << "ArcoFission: " << error.what() << '\n';
+                    return 2;
+                }
             }
         }
         if (target == "uefi-x86_64" || target == "uefi-x86-64") {
@@ -164,19 +210,27 @@ int main(int argc, char** argv) {
         if (ends_with(lowercase(output_path), ".arcof")) {
             return write_bytecode_file(argv[2], output_path);
         }
-        return write_native_file(argv[2], output_path);
+        return write_native_file(argv[2], output_path, instruction_limit);
     }
 
     if (argc == 5 && lowercase(argv[1]) == "bytecode" && std::string(argv[3]) == "-o") {
         return write_bytecode_file(argv[2], argv[4]);
     }
 
-    if (argc == 5 && lowercase(argv[1]) == "native" && std::string(argv[3]) == "-o") {
-        return write_native_file(argv[2], argv[4]);
+    if ((argc == 5 || argc == 7) && lowercase(argv[1]) == "native" && std::string(argv[3]) == "-o") {
+        try {
+            return write_native_file(argv[2], argv[4], hosted_instruction_limit_or_unlimited(argc, argv, 5));
+        } catch (const std::exception& error) {
+            std::cerr << "ArcoFission: " << error.what() << '\n';
+            return 2;
+        }
     }
 
-    if (argc == 3 && lowercase(argv[1]) == "run") {
-        const auto result = arco::fission::run_bytecode_file(argv[2]);
+    if ((argc == 3 || argc == 5) && lowercase(argv[1]) == "run") {
+        std::optional<std::size_t> instruction_limit;
+        try { instruction_limit = hosted_instruction_limit_or_unlimited(argc, argv, 3); }
+        catch (const std::exception& error) { std::cerr << "ArcoFission: " << error.what() << '\n'; return 2; }
+        const auto result = arco::fission::run_bytecode_file(argv[2], instruction_limit);
         if (!result.ok) {
             std::cerr << "BYTECODE RUN FAILED\n\n" << result.error << '\n';
             return 1;
@@ -185,8 +239,11 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (argc == 3 && lowercase(argv[1]) == "compile-run") {
-        const auto result = arco::fission::compile_run_file(argv[2]);
+    if ((argc == 3 || argc == 5) && lowercase(argv[1]) == "compile-run") {
+        std::optional<std::size_t> instruction_limit;
+        try { instruction_limit = hosted_instruction_limit_or_unlimited(argc, argv, 3); }
+        catch (const std::exception& error) { std::cerr << "ArcoFission: " << error.what() << '\n'; return 2; }
+        const auto result = arco::fission::compile_run_file(argv[2], instruction_limit);
         if (!result.ok) {
             std::cerr << "BYTECODE RUN FAILED\n\n" << result.error << '\n';
             return 1;

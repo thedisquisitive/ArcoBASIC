@@ -12,13 +12,16 @@
 
 #include <filesystem>
 #include <fstream>
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -154,16 +157,27 @@ struct AmirInstruction {
         CallExternal,
         CpuHalt,
         CpuHaltForever,
+        CpuPause,
+        Port,
+        Memory,
+        Barrier,
         Array,
+        Tuple,
         Object,
         Index,
+        Slice,
+        Copy,
+        AddressOf,
         Store,
         StoreIndex,
+        StoreSlice,
+        Destructure,
         Call,
         Jump,
         Branch,
         TryBegin,
         TryEnd,
+        Throw,
         DeclareFunction,
         DeclareClass,
         DeclareInterface,
@@ -173,8 +187,12 @@ struct AmirInstruction {
 
     Kind kind;
     std::string result;
+    std::string result_type;
     std::string target;
+    // Runtime-library ABI ownership metadata. Empty means ordinary value/call semantics.
+    std::string ownership;
     std::vector<std::string> operands;
+    std::vector<std::string> operand_types;
     int source_line = 0;
 };
 
@@ -193,6 +211,7 @@ struct AmirFunction {
 struct AmirModule {
     std::string source_name;
     int version = 0;
+    std::optional<std::uint64_t> instruction_limit;
     std::vector<AmirFunction> functions;
     std::vector<std::string> diagnostics;
 };
@@ -262,6 +281,13 @@ AmirInstruction amir_array(std::string result, std::vector<std::string> operands
     return instruction;
 }
 
+AmirInstruction amir_tuple(std::string result, std::vector<std::string> operands) {
+    AmirInstruction instruction{AmirInstruction::Kind::Tuple};
+    instruction.result = std::move(result);
+    instruction.operands = std::move(operands);
+    return instruction;
+}
+
 AmirInstruction amir_object(std::string result, std::vector<std::string> fields) {
     AmirInstruction instruction{AmirInstruction::Kind::Object};
     instruction.result = std::move(result);
@@ -277,6 +303,29 @@ AmirInstruction amir_index(std::string result, std::string target, std::string i
     return instruction;
 }
 
+AmirInstruction amir_slice(std::string result, std::string target, std::string start, std::string end,
+                           std::string step) {
+    AmirInstruction instruction{AmirInstruction::Kind::Slice};
+    instruction.result = std::move(result);
+    instruction.target = std::move(target);
+    instruction.operands = {std::move(start), std::move(end), std::move(step)};
+    return instruction;
+}
+
+AmirInstruction amir_copy(std::string result, std::string value) {
+    AmirInstruction instruction{AmirInstruction::Kind::Copy};
+    instruction.result = std::move(result);
+    instruction.operands.push_back(std::move(value));
+    return instruction;
+}
+
+AmirInstruction amir_address_of(std::string result, std::string name) {
+    AmirInstruction instruction{AmirInstruction::Kind::AddressOf};
+    instruction.result = std::move(result);
+    instruction.target = std::move(name);
+    return instruction;
+}
+
 AmirInstruction amir_store(std::string target, std::string value) {
     AmirInstruction instruction{AmirInstruction::Kind::Store};
     instruction.target = std::move(target);
@@ -288,6 +337,20 @@ AmirInstruction amir_store_index(std::string target, std::vector<std::string> op
     AmirInstruction instruction{AmirInstruction::Kind::StoreIndex};
     instruction.target = std::move(target);
     instruction.operands = std::move(operands);
+    return instruction;
+}
+
+AmirInstruction amir_store_slice(std::string target, std::string start, std::string end, std::string replacement) {
+    AmirInstruction instruction{AmirInstruction::Kind::StoreSlice};
+    instruction.target = std::move(target);
+    instruction.operands = {std::move(start), std::move(end), std::move(replacement)};
+    return instruction;
+}
+
+AmirInstruction amir_destructure(std::vector<std::string> targets, std::string source) {
+    AmirInstruction instruction{AmirInstruction::Kind::Destructure};
+    instruction.target = std::move(source);
+    instruction.operands = std::move(targets);
     return instruction;
 }
 
@@ -321,6 +384,12 @@ AmirInstruction amir_try_begin(std::string catch_target, std::string error_name)
 
 AmirInstruction amir_try_end() {
     return AmirInstruction{AmirInstruction::Kind::TryEnd};
+}
+
+AmirInstruction amir_throw(std::string value) {
+    AmirInstruction instruction{AmirInstruction::Kind::Throw};
+    instruction.operands.push_back(std::move(value));
+    return instruction;
 }
 
 AmirInstruction amir_declare_class(std::string name, std::vector<std::string> metadata) {
@@ -365,9 +434,42 @@ AmirInstruction amir_cpu_halt_forever() {
     return AmirInstruction{AmirInstruction::Kind::CpuHaltForever};
 }
 
+AmirInstruction amir_cpu_pause() {
+    return AmirInstruction{AmirInstruction::Kind::CpuPause};
+}
+
+AmirInstruction amir_port(std::string operation, std::string result, std::vector<std::string> operands,
+                          std::string result_type, std::vector<std::string> operand_types) {
+    AmirInstruction instruction{AmirInstruction::Kind::Port};
+    instruction.target = std::move(operation);
+    instruction.result = std::move(result);
+    instruction.operands = std::move(operands);
+    instruction.result_type = std::move(result_type);
+    instruction.operand_types = std::move(operand_types);
+    return instruction;
+}
+
+AmirInstruction amir_memory(std::string operation, std::string result, std::vector<std::string> operands,
+                             std::string result_type, std::vector<std::string> operand_types) {
+    AmirInstruction instruction{AmirInstruction::Kind::Memory};
+    instruction.target = std::move(operation);
+    instruction.result = std::move(result);
+    instruction.operands = std::move(operands);
+    instruction.result_type = std::move(result_type);
+    instruction.operand_types = std::move(operand_types);
+    return instruction;
+}
+
+AmirInstruction amir_barrier(std::string operation) {
+    AmirInstruction instruction{AmirInstruction::Kind::Barrier};
+    instruction.target = std::move(operation);
+    return instruction;
+}
+
 bool is_terminal_instruction(const AmirInstruction& instruction) {
     return instruction.kind == AmirInstruction::Kind::Return || instruction.kind == AmirInstruction::Kind::Jump ||
-           instruction.kind == AmirInstruction::Kind::Branch || instruction.kind == AmirInstruction::Kind::CpuHaltForever;
+           instruction.kind == AmirInstruction::Kind::Branch || instruction.kind == AmirInstruction::Kind::Throw ||
+           instruction.kind == AmirInstruction::Kind::CpuHaltForever;
 }
 
 std::string upper_ascii(std::string text) {
@@ -389,12 +491,41 @@ const std::vector<CanonicalAstNodePtr>& ast_group(const CanonicalAstNode& node, 
     return empty;
 }
 
+CanonicalAstNodePtr replace_variable_name(const CanonicalAstNodePtr& node, const std::string& from, const std::string& to) {
+    if (!node) return nullptr;
+    auto copy = std::make_shared<CanonicalAstNode>(*node);
+    if (copy->kind == AstKind::Variable && copy->name == from) copy->name = to;
+    copy->children.clear();
+    for (const auto& child : node->children) copy->children.push_back(replace_variable_name(child, from, to));
+    copy->named_children.clear();
+    for (const auto& [name, child] : node->named_children) {
+        copy->named_children.push_back({name, replace_variable_name(child, from, to)});
+    }
+    copy->groups.clear();
+    for (const auto& group : node->groups) {
+        CanonicalAstGroup copied_group;
+        copied_group.role = group.role;
+        for (const auto& child : group.nodes) copied_group.nodes.push_back(replace_variable_name(child, from, to));
+        copy->groups.push_back(std::move(copied_group));
+    }
+    copy->parameters.clear();
+    for (const auto& parameter : node->parameters) {
+        copy->parameters.push_back(CanonicalAstParameter{
+            parameter.name,
+            parameter.type_name,
+            replace_variable_name(parameter.default_value, from, to),
+        });
+    }
+    return copy;
+}
+
 std::string ast_operator(TokenType op) {
     switch (op) {
         case TokenType::Plus: return "+";
         case TokenType::Minus: return "-";
         case TokenType::Star: return "*";
         case TokenType::Slash: return "/";
+        case TokenType::Backslash: return "\\";
         case TokenType::Mod: return "MOD";
         case TokenType::Ampersand:
         case TokenType::BitAnd: return "&";
@@ -419,6 +550,7 @@ std::string ast_operator(TokenType op) {
         case TokenType::ShiftLeftWord: return "<<";
         case TokenType::ShiftRight:
         case TokenType::ShiftRightWord: return ">>";
+        case TokenType::ShiftArithmeticRightWord: return "SAR";
         case TokenType::Contains: return "CONTAINS";
         case TokenType::In: return "IN";
         default: return "?";
@@ -468,6 +600,45 @@ std::string render_ast_expression(const CanonicalAstNode& node) {
                 return render_ast_expression(*node.children[0]) + "[" + render_ast_expression(*node.children[1]) + "]";
             }
             return "nothing";
+        case AstKind::Slice:
+            if (node.children.size() == 4) {
+                return render_ast_expression(*node.children[0]) + "[" +
+                    (node.children[1] ? render_ast_expression(*node.children[1]) : "") + ":" +
+                    (node.children[2] ? render_ast_expression(*node.children[2]) : "") +
+                    (node.children[3] ? ":" + render_ast_expression(*node.children[3]) : "") + "]";
+            }
+            return "nothing";
+        case AstKind::Copy:
+            return node.children.empty() ? "COPY nothing" : "COPY " + render_ast_expression(*node.children[0]);
+        case AstKind::AddressOf:
+            return "ADDRESSOF " + node.name;
+        case AstKind::Tuple: {
+            std::string result = "(";
+            for (std::size_t i = 0; i < node.children.size(); ++i) {
+                if (i) result += ", ";
+                result += render_ast_expression(*node.children[i]);
+            }
+            if (node.children.size() == 1) result += ',';
+            return result + ")";
+        }
+        case AstKind::Array: {
+            std::string result = "[";
+            for (std::size_t i = 0; i < node.children.size(); ++i) {
+                if (i) result += ", ";
+                result += render_ast_expression(*node.children[i]);
+            }
+            return result + "]";
+        }
+        case AstKind::ArrayComprehension:
+            if (node.children.size() >= 2) {
+                std::string result = "[" + render_ast_expression(*node.children[0]) + " FOR " + node.name +
+                    " IN " + render_ast_expression(*node.children[1]);
+                if (node.children.size() > 2 && node.children[2]) {
+                    result += " IF " + render_ast_expression(*node.children[2]);
+                }
+                return result + "]";
+            }
+            return "[]";
         default:
             return node.text.empty() ? "nothing" : node.text;
     }
@@ -537,12 +708,99 @@ private:
         return false;
     }
 
-    std::string lower_expression(AmirFunction& function, const CanonicalAstNode& node) {
+    bool is_fixed_integer_type(const std::string& type) const {
+        return type == "U8" || type == "U16" || type == "U32" || type == "U64" ||
+               type == "I8" || type == "I16" || type == "I32" || type == "I64" || type == "BOOL";
+    }
+
+    bool is_port_type(const std::string& type) const { return type == "IOPORT"; }
+
+    std::string type_of_expression(const CanonicalAstNode& node, const std::string& expected = "") const {
+        if (node.kind == AstKind::Literal) {
+            if (node.text == "true" || node.text == "false") return "BOOL";
+            if (node.text.rfind("BITS \"", 0) == 0) return "BITVECTOR";
+            return expected;
+        }
+        if (node.kind == AstKind::Tuple) return "TUPLE";
+        if (node.kind == AstKind::ArrayComprehension) return "ARRAY";
+        if (node.kind == AstKind::AddressOf) return "CALLABLE";
+        if (node.kind == AstKind::Variable) {
+            const auto found = types_.find(node.name);
+            return found == types_.end() ? expected : found->second;
+        }
+        if (node.kind == AstKind::Unary) {
+            if (node.op == TokenType::Bang) return "BOOL";
+            return node.children.empty() ? expected : type_of_expression(*node.children.front(), expected);
+        }
+        if (node.kind == AstKind::Binary || node.kind == AstKind::Logical) {
+            switch (node.op) {
+                case TokenType::Equal: case TokenType::NotEqual: case TokenType::Less:
+                case TokenType::LessEqual: case TokenType::Greater: case TokenType::GreaterEqual:
+                case TokenType::LogicalAnd: case TokenType::LogicalOr: case TokenType::AndAlso: case TokenType::OrElse:
+                    return "BOOL";
+                default:
+                    return node.children.empty() ? expected : type_of_expression(*node.children.front(), expected);
+            }
+        }
+        if (node.kind == AstKind::Call || node.kind == AstKind::MethodCall || node.kind == AstKind::SuperCall) {
+            const std::string name = upper_ascii(node.name);
+            if (name == "CPU.READCR3") return "U64";
+            if (name == "CPU.READCR2") return "U64";
+            if (name == "CPU.READRSP") return "U64";
+            if (name == "GRAPHICS.CREATESURFACE" || name == "GRAPHICS.PRIMARYSURFACE") return "SURFACE";
+            if (name == "GRAPHICS.CREATEWINDOW") return "WINDOW";
+            if (name == "GRAPHICS.CREATEIMAGE") return "IMAGE";
+            if (name == "FILES.OPEN") return "FILE";
+            if (name == "NETWORK.CONNECT") return "SOCKET";
+        }
+        if (node.kind == AstKind::PortOperation) {
+            const std::string name = upper_ascii(node.name);
+            if (name == "PORT.ADDRESS" || name == "PORT.OFFSET") return "IOPORT";
+            if (name == "PORT.READ8" || name == "PORT.READBYTE") return "U8";
+            if (name == "PORT.READ16" || name == "PORT.READWORD") return "U16";
+            if (name == "PORT.READ32" || name == "PORT.READDWORD") return "U32";
+            return "";
+        }
+        if (node.kind == AstKind::MemoryOperation) {
+            const std::string name = upper_ascii(node.name);
+            if (name == "CPU.READCR3") return "U64";
+            if (name == "CPU.READCR2") return "U64";
+            if (name == "UEFI.GOP.DISCOVER") return "UEFI.GraphicsOutputProtocol";
+            if (name == "UEFI.GOP.MODE") return "UEFI.GraphicsOutputMode";
+            if (name == "UEFI.GOP.FRAMEBUFFERBASE") return "PHYSICALPTR";
+            if (name == "UEFI.GOP.FRAMEBUFFERSIZE") return "U64";
+            if (name == "UEFI.GOP.WIDTH" || name == "UEFI.GOP.HEIGHT" || name == "UEFI.GOP.PIXELSPERSCANLINE" || name == "UEFI.GOP.PIXELFORMAT") return "U32";
+            if (name == "ADDRESS.PHYSICAL") return "PHYSICALPTR";
+            if (name == "ADDRESS.VIRTUAL") return "VIRTUALPTR";
+            if (name == "ADDRESS.MMIO") return "MMIOPTR";
+            if (name == "ADDRESS.VALUE") return "U64";
+            if (name == "ADDRESS.LOCAL") return "PTR";
+            if (name == "MEMORY.MAP") return "VIRTUALPTR";
+            if (name == "MEMORY.MAPDEVICE") return "MMIOPTR";
+            if (name == "GRAPHICS.PRIMARYSURFACE") return "SURFACE";
+            if (name == "GRAPHICS.DESTROYSURFACE") return "BOOL";
+            if (name == "MEMORY.READ8") return "U8";
+            if (name == "MEMORY.READ16") return "U16";
+            if (name == "MEMORY.READ32") return "U32";
+            if (name == "MEMORY.READ64") return "U64";
+            if (name == "MEMORY.ISALIGNED") return "BOOL";
+            return "";
+        }
+        return expected;
+    }
+
+    void report_integer_error(const std::string& message) {
+        module_.diagnostics.push_back(message);
+    }
+
+    std::string lower_expression(AmirFunction& function, const CanonicalAstNode& node, const std::string& expected_type = "") {
         AmirBlock& out = current_block(function);
         switch (node.kind) {
             case AstKind::Literal: {
                 const std::string result = temp();
-                out.instructions.push_back(amir_const(result, node.text));
+                auto instruction = amir_const(result, node.text);
+                instruction.result_type = type_of_expression(node, expected_type);
+                out.instructions.push_back(std::move(instruction));
                 return result;
             }
             case AstKind::InterpolatedString: {
@@ -553,24 +811,268 @@ private:
             case AstKind::Variable:
                 return lower_variable(out, node.name);
             case AstKind::Unary: {
-                const std::string value = node.children.empty() ? lower_fallback(out, node) : lower_expression(function, *node.children[0]);
+                const std::string result_type = type_of_expression(node, expected_type);
+                const std::string value = node.children.empty() ? lower_fallback(out, node) : lower_expression(function, *node.children[0], result_type);
                 const std::string result = temp();
-                out.instructions.push_back(amir_unary(result, ast_operator(node.op), value));
+                auto instruction = amir_unary(result, ast_operator(node.op), value);
+                instruction.result_type = result_type;
+                const std::string unary_type = type_of_expression(*node.children.front(), result_type);
+                if (!unary_type.empty() || !result_type.empty()) instruction.operand_types = {unary_type};
+                out.instructions.push_back(std::move(instruction));
                 return result;
             }
             case AstKind::Binary:
             case AstKind::Logical: {
                 if (node.children.size() != 2) return lower_fallback(out, node);
-                const std::string left = lower_expression(function, *node.children[0]);
-                const std::string right = lower_expression(function, *node.children[1]);
+                const std::string result_type = type_of_expression(node, expected_type);
+                const std::string inferred_left_type = type_of_expression(*node.children[0]);
+                const std::string inferred_right_type = type_of_expression(*node.children[1]);
+                const std::string left_type = inferred_left_type.empty() ? expected_type : inferred_left_type;
+                const std::string right_type = inferred_right_type.empty() ? (left_type.empty() ? expected_type : left_type) : inferred_right_type;
+                const bool comparison = result_type == "BOOL";
+                if (!comparison && is_fixed_integer_type(left_type) && is_fixed_integer_type(right_type) && left_type != right_type) {
+                    report_integer_error("operator " + ast_operator(node.op) + " requires matching fixed-width integer operands; received " + left_type + " and " + right_type + ".");
+                }
+                const auto is_address_domain = [](const std::string& type) {
+                    return type == "PTR" || type == "VIRTUALPTR" || type == "PHYSICALPTR" || type == "MMIOPTR" || type == "IOPORT";
+                };
+                const auto is_runtime_handle = [](const std::string& type) {
+                    return type == "SURFACE" || type == "WINDOW" || type == "IMAGE" || type == "FONT" ||
+                           type == "FILE" || type == "DIRECTORY" || type == "TIMER" || type == "THREAD" ||
+                           type == "MUTEX" || type == "SOCKET";
+                };
+                if (!comparison && (is_address_domain(left_type) || is_address_domain(right_type))) {
+                    report_integer_error("address-domain values do not support ordinary arithmetic; use ADDRESS.Offset/AlignUp/AlignDown or PORT.Offset.");
+                }
+                if (!comparison && (is_port_type(left_type) || is_port_type(right_type))) {
+                    report_integer_error("IOPORT values do not support ordinary arithmetic; use PORT.Offset for related ports.");
+                }
+                if (!comparison && (is_runtime_handle(left_type) || is_runtime_handle(right_type))) {
+                    report_integer_error("runtime object handles do not support arithmetic or bitwise operations; use the owning library API.");
+                }
+                if (!comparison && (left_type == "BOOL" || right_type == "BOOL") &&
+                    (node.op == TokenType::Plus || node.op == TokenType::Minus || node.op == TokenType::Star ||
+                     node.op == TokenType::Backslash || node.op == TokenType::Mod)) {
+                    report_integer_error("Boolean values do not support arithmetic in the UEFI systems profile.");
+                }
+                if ((node.op == TokenType::Backslash || node.op == TokenType::Mod) && node.children[1]->kind == AstKind::Literal &&
+                    (node.children[1]->text == "0" || node.children[1]->text == "0x0" || node.children[1]->text == "0X0" ||
+                     node.children[1]->text == "0b0" || node.children[1]->text == "0B0")) {
+                    report_integer_error("integer division by a compile-time zero divisor is not allowed");
+                }
+                const std::string operand_expected = comparison ? left_type : result_type;
+                const std::string left = lower_expression(function, *node.children[0], operand_expected);
+                const std::string right = lower_expression(function, *node.children[1], operand_expected);
                 const std::string result = temp();
-                out.instructions.push_back(amir_binary(result, ast_operator(node.op), left, right));
+                auto instruction = amir_binary(result, ast_operator(node.op), left, right);
+                instruction.result_type = result_type;
+                if (!left_type.empty() || !right_type.empty() || !result_type.empty()) instruction.operand_types = {left_type, right_type};
+                out.instructions.push_back(std::move(instruction));
                 return result;
             }
             case AstKind::Call:
             case AstKind::MethodCall:
             case AstKind::SuperCall:
                 return lower_call(function, node);
+            case AstKind::PortOperation: {
+                const std::string full_name = upper_ascii(node.name);
+                const std::string operation = full_name.rfind("PORT.", 0) == 0 ? full_name.substr(5) : full_name;
+                const auto canonical = [&](const std::string& name) {
+                    if (name == "READBYTE") return std::string("READ8");
+                    if (name == "READWORD") return std::string("READ16");
+                    if (name == "READDWORD") return std::string("READ32");
+                    if (name == "WRITEBYTE") return std::string("WRITE8");
+                    if (name == "WRITEWORD") return std::string("WRITE16");
+                    if (name == "WRITEDWORD") return std::string("WRITE32");
+                    return name;
+                };
+                const std::string op = canonical(operation);
+                std::vector<std::string> args;
+                for (const auto& child : node.children) args.push_back(lower_expression(function, *child));
+                if (op == "ADDRESS") {
+                    if (args.size() != 1) { report_integer_error("PORT.Address expects one U16 argument"); return lower_fallback(out, node); }
+                    const std::string input_type = type_of_expression(*node.children[0], "U16");
+                    if (input_type != "U16") report_integer_error("PORT.Address expects U16; received " + (input_type.empty() ? "unknown" : input_type));
+                    if (node.children[0]->kind == AstKind::Literal) {
+                        try {
+                            std::string text = node.children[0]->text;
+                            int base = 10;
+                            if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) { base = 16; text = text.substr(2); }
+                            else if (text.size() > 2 && text[0] == '0' && (text[1] == 'b' || text[1] == 'B')) { base = 2; text = text.substr(2); }
+                            if (std::stoull(text, nullptr, base) > 65535ULL) report_integer_error("PORT.Address literal is out of range 0..65535");
+                        } catch (...) {
+                            report_integer_error("PORT.Address requires an exact integer literal or U16 value");
+                        }
+                    }
+                    const std::string result = temp();
+                    out.instructions.push_back(amir_port("ADDRESS", result, std::move(args), "IOPORT", {input_type}));
+                    return result;
+                }
+                if (op == "OFFSET") {
+                    if (args.size() != 2) { report_integer_error("PORT.Offset expects IOPORT and I16 arguments"); return lower_fallback(out, node); }
+                    if (node.children[1]->kind != AstKind::Literal) {
+                        report_integer_error("PORT.Offset requires a statically known displacement in the initial x86-64 systems target");
+                    } else {
+                        try {
+                            const long long displacement = std::stoll(node.children[1]->text, nullptr, 0);
+                            if (displacement < -65535LL || displacement > 65535LL) report_integer_error("PORT.Offset displacement is outside the supported I16 range");
+                        } catch (...) {
+                            report_integer_error("PORT.Offset displacement must be an exact integer literal");
+                        }
+                    }
+                    const std::string result = temp();
+                    out.instructions.push_back(amir_port("OFFSET", result, std::move(args), "IOPORT", {"IOPORT", "I16"}));
+                    return result;
+                }
+                const bool read = op == "READ8" || op == "READ16" || op == "READ32";
+                const bool write = op == "WRITE8" || op == "WRITE16" || op == "WRITE32";
+                if (!read && !write) {
+                    report_integer_error("unknown port intrinsic " + node.name);
+                    return lower_fallback(out, node);
+                }
+                const std::string width = op.substr(read ? 4 : 5);
+                const std::string value_type = "U" + width;
+                if (args.empty() || args.size() > (write ? 2U : 1U)) {
+                    report_integer_error("PORT." + op + " has the wrong argument count");
+                    return lower_fallback(out, node);
+                }
+                const std::string port_type = type_of_expression(*node.children[0]);
+                if (port_type != "IOPORT") report_integer_error("PORT." + op + " expects IOPORT; received " + (port_type.empty() ? "unknown" : port_type));
+                if (write) {
+                    const std::string supplied = type_of_expression(*node.children[1], value_type);
+                    if (supplied != value_type) report_integer_error("PORT." + op + " expects " + value_type + "; received " + (supplied.empty() ? "unknown" : supplied));
+                }
+                const std::string result = temp();
+                out.instructions.push_back(amir_port(op, result, std::move(args), read ? value_type : "", write ? std::vector<std::string>{"IOPORT", value_type} : std::vector<std::string>{"IOPORT"}));
+                return result;
+            }
+            case AstKind::MemoryOperation: {
+                const std::string name = upper_ascii(node.name);
+                if (name == "ADDRESS.LOCAL") {
+                    if (node.children.size() != 1 || node.children.front()->kind != AstKind::Variable) {
+                        report_integer_error("ADDRESS.Local expects one local variable");
+                        return lower_fallback(out, node);
+                    }
+                    const std::string result = temp();
+                    out.instructions.push_back(amir_memory("LOCAL", result, {node.children.front()->name}, "PTR", {"PTR"}));
+                    return result;
+                }
+                std::vector<std::string> args;
+                for (const auto& child : node.children) args.push_back(lower_expression(function, *child));
+                const auto barrier = [&](const std::string& n) {
+                    return n == "CPU.READBARRIER" || n == "CPU.WRITEBARRIER" || n == "CPU.MEMORYBARRIER";
+                };
+                if (barrier(name)) {
+                    out.instructions.push_back(amir_barrier(name.substr(4)));
+                    return temp();
+                }
+                if (name == "CPU.READCR2" || name == "CPU.READCR3" || name == "CPU.WRITECR3" || name == "CPU.INVALIDATEPAGE" || name == "CPU.LOADGDT" || name == "CPU.LOADIDT" || name == "CPU.LOADTASKREGISTER") {
+                    const std::string op = name == "CPU.READCR2" ? "READCR2" : (name == "CPU.READCR3" ? "READCR3" : (name == "CPU.WRITECR3" ? "WRITECR3" : "INVLPG"));
+                    const std::string descriptor_op = name == "CPU.LOADGDT" ? "LGDT" : (name == "CPU.LOADIDT" ? "LIDT" : (name == "CPU.LOADTASKREGISTER" ? "LTR" : op));
+                    const std::string result = temp();
+                    const bool read = name == "CPU.READCR2" || name == "CPU.READCR3";
+                    out.instructions.push_back(amir_memory(descriptor_op, read ? result : "", std::move(args), read ? "U64" : "", {"U64"}));
+                    return result;
+                }
+                if (name == "CPU.READRSP") {
+                    const std::string result = temp();
+                    out.instructions.push_back(amir_memory("READRSP", result, {}, "U64", {}));
+                    return result;
+                }
+                std::string op = name;
+                if (name.rfind("UEFI.GOP.", 0) == 0) {
+                    const std::string gop_op = name.substr(9);
+                    const bool discover = gop_op == "DISCOVER";
+                    const bool field = gop_op == "MODE" || gop_op == "FRAMEBUFFERBASE" || gop_op == "FRAMEBUFFERSIZE" || gop_op == "WIDTH" || gop_op == "HEIGHT" || gop_op == "PIXELSPERSCANLINE" || gop_op == "PIXELFORMAT";
+                    if (node.children.size() != 1 || (discover && type_of_expression(*node.children.front()) != "UEFI.SystemTable") || (field && type_of_expression(*node.children.front()) != "UEFI.GraphicsOutputProtocol")) {
+                        report_integer_error("UEFI.GOP." + gop_op + " received an invalid operand");
+                    }
+                    const std::string result = temp();
+                    std::string target = discover ? "GOPDISCOVER" : "GOP" + gop_op;
+                    out.instructions.push_back(amir_memory(target, result, std::move(args), type_of_expression(node), {discover ? "UEFI.SystemTable" : "UEFI.GraphicsOutputProtocol"}));
+                    return result;
+                }
+                if (name == "GRAPHICS.PRIMARYSURFACE") {
+                    // Freestanding bootstrap representation: the opaque SURFACE handle is the
+                    // discovered GOP protocol pointer. No application-visible GOP type or
+                    // framebuffer address is exposed; later backend work will replace this with
+                    // a runtime-owned surface record without changing source.
+                    const std::string system_table = lower_variable(current_block(function), "systemTable");
+                    const std::string result = temp();
+                    out.instructions.push_back(amir_memory("GOPDISCOVER", result, {system_table}, "SURFACE", {"UEFI.SystemTable"}));
+                    return result;
+                }
+                if (name == "GRAPHICS.BIND") {
+                    if (node.children.size() != 1 || type_of_expression(*node.children.front()) != "SURFACE") {
+                        report_integer_error("GRAPHICS.Bind expects one SURFACE handle");
+                    }
+                    const std::string result = temp();
+                    out.instructions.push_back(amir_memory("GRAPHICSBIND", result, std::move(args), "", {"SURFACE"}));
+                    return result;
+                }
+                if (name.rfind("GRAPHICS.", 0) == 0) {
+                    const std::string result = temp();
+                    auto call = amir_call_value(result, name, std::move(args));
+                    call.result_type = type_of_expression(node, expected_type);
+                    if (name == "GRAPHICS.DESTROYSURFACE") call.ownership = "Consumed";
+                    else call.ownership = "Borrowed";
+                    out.instructions.push_back(std::move(call));
+                    return result;
+                }
+                if (op.rfind("ADDRESS.", 0) == 0) op = op.substr(8);
+                else if (op.rfind("MEMORY.", 0) == 0) op = op.substr(7);
+                const bool physical_write = op == "PHYSICALWRITE64";
+                const bool read = op == "READ8" || op == "READ16" || op == "READ32" || op == "READ64";
+                const bool write = op == "WRITE8" || op == "WRITE16" || op == "WRITE32" || op == "WRITE64" || physical_write;
+                const std::string result_type = type_of_expression(node, expected_type);
+                const bool constructor = op == "PHYSICAL" || op == "VIRTUAL" || op == "MMIO" || op == "VALUE" || op == "MAP" || op == "MAPDEVICE";
+                if (name == "ADDRESS.PHYSICAL" || name == "ADDRESS.VIRTUAL") {
+                    if (node.children.size() != 1 || type_of_expression(*node.children.front(), "U64") != "U64") report_integer_error(name + " expects one U64 argument");
+                } else if (name == "ADDRESS.MMIO") {
+                    if (node.children.size() != 1 || type_of_expression(*node.children.front()) != "VIRTUALPTR") report_integer_error("ADDRESS.MMIO expects one VIRTUALPTR argument");
+                } else if (name == "ADDRESS.VALUE") {
+                    if (node.children.size() != 1) report_integer_error("ADDRESS.VALUE expects one address argument");
+                } else if (name == "ADDRESS.OFFSET") {
+                    if (node.children.size() != 2) report_integer_error("ADDRESS.OFFSET expects an address and a displacement");
+                } else if (name == "ADDRESS.ALIGNUP" || name == "ADDRESS.ALIGNDOWN" || name == "ADDRESS.ISALIGNED") {
+                    if (node.children.size() != 2) report_integer_error(name + " expects an address and an alignment");
+                    else if (node.children[1]->kind == AstKind::Literal) {
+                        try {
+                            const auto alignment = std::stoull(node.children[1]->text, nullptr, 0);
+                            if (alignment == 0 || (alignment & (alignment - 1)) != 0) report_integer_error(name + " alignment must be a nonzero power of two");
+                        } catch (...) {
+                            report_integer_error(name + " alignment must be an exact integer literal or validated integer");
+                        }
+                    }
+                } else if (name == "MEMORY.MAP") {
+                    if (node.children.size() != 3 || type_of_expression(*node.children.front()) != "PHYSICALPTR") report_integer_error("MEMORY.MAP expects PHYSICALPTR, U64 length, and MEMORYMAPFLAGS");
+                } else if (name == "MEMORY.MAPDEVICE") {
+                    if (node.children.size() != 2 || type_of_expression(*node.children.front()) != "PHYSICALPTR") report_integer_error("MEMORY.MAPDEVICE expects PHYSICALPTR and U64 length");
+                }
+                if ((read || write) && !physical_write && !node.children.empty() && type_of_expression(*node.children[0]) == "PHYSICALPTR") {
+                    report_integer_error("MEMORY access cannot dereference PHYSICALPTR; map it to VIRTUALPTR or MMIOPTR first");
+                }
+                if (physical_write && (node.children.size() != 2 || type_of_expression(*node.children[0]) != "PHYSICALPTR" || type_of_expression(*node.children[1], "U64") != "U64")) {
+                    report_integer_error("MEMORY.PhysicalWrite64 expects PHYSICALPTR and U64");
+                }
+                if (name == "ADDRESS.ALIGNUP" || name == "ADDRESS.ALIGNDOWN" || name == "ADDRESS.OFFSET") {
+                    const std::string result = temp();
+                    out.instructions.push_back(amir_memory(op, result, std::move(args), result_type, {}));
+                    return result;
+                }
+                if (name == "ADDRESS.ISALIGNED") {
+                    const std::string result = temp();
+                    out.instructions.push_back(amir_memory(op, result, std::move(args), "BOOL", {}));
+                    return result;
+                }
+                if (read || write || name == "ADDRESS.PHYSICAL" || name == "ADDRESS.VIRTUAL" || name == "ADDRESS.VALUE" || name == "ADDRESS.MMIO" || name == "MEMORY.MAP" || name == "MEMORY.MAPDEVICE") {
+                    const std::string result = temp();
+                    out.instructions.push_back(amir_memory(op, result, std::move(args), write ? "" : result_type, {}));
+                    return result;
+                }
+                if (!constructor && name != "ADDRESS.OFFSET" && name != "ADDRESS.ALIGNUP" && name != "ADDRESS.ALIGNDOWN" && name != "ADDRESS.ISALIGNED") report_integer_error("unknown memory/address intrinsic " + node.name);
+                return lower_fallback(out, node);
+            }
             case AstKind::Index: {
                 if (node.children.size() != 2) return lower_fallback(out, node);
                 const std::string target = lower_expression(function, *node.children[0]);
@@ -579,11 +1081,118 @@ private:
                 out.instructions.push_back(amir_index(result, target, index));
                 return result;
             }
+            case AstKind::Slice: {
+                if (node.children.size() != 4) return lower_fallback(out, node);
+                const std::string target = lower_expression(function, *node.children[0]);
+                auto lower_optional = [&](const CanonicalAstNodePtr& child) {
+                    if (child) return lower_expression(function, *child);
+                    const std::string omitted = temp();
+                    out.instructions.push_back(amir_const(omitted, "nothing"));
+                    return omitted;
+                };
+                const std::string start = lower_optional(node.children[1]);
+                const std::string end = lower_optional(node.children[2]);
+                const std::string step = lower_optional(node.children[3]);
+                const std::string result = temp();
+                out.instructions.push_back(amir_slice(result, target, start, end, step));
+                return result;
+            }
+            case AstKind::Copy: {
+                if (node.children.empty()) return lower_fallback(out, node);
+                const std::string value = lower_expression(function, *node.children[0]);
+                const std::string result = temp();
+                out.instructions.push_back(amir_copy(result, value));
+                return result;
+            }
+            case AstKind::AddressOf: {
+                const std::string result = temp();
+                out.instructions.push_back(amir_address_of(result, node.name));
+                return result;
+            }
             case AstKind::Array: {
                 std::vector<std::string> items;
                 for (const auto& child : node.children) items.push_back(lower_expression(function, *child));
                 const std::string result = temp();
                 out.instructions.push_back(amir_array(result, std::move(items)));
+                return result;
+            }
+            case AstKind::ArrayComprehension: {
+                if (node.children.size() < 2) return lower_fallback(current_block(function), node);
+                const std::string result_name = hidden_name("comp_result");
+                const std::string items_name = hidden_name("comp_items");
+                const std::string index_name = hidden_name("comp_index");
+                const std::string binding_name = hidden_name("comp_item");
+                const CanonicalAstNodePtr result_expr = replace_variable_name(node.children[0], node.name, binding_name);
+                const CanonicalAstNodePtr filter_expr = node.children.size() > 2
+                    ? replace_variable_name(node.children[2], node.name, binding_name)
+                    : nullptr;
+                const std::string empty = temp();
+                current_block(function).instructions.push_back(amir_array(empty, {}));
+                current_block(function).instructions.push_back(amir_store(result_name, empty));
+                current_block(function).instructions.push_back(amir_store(items_name, lower_expression(function, *node.children[1])));
+                const std::string zero = temp();
+                current_block(function).instructions.push_back(amir_const(zero, "0"));
+                current_block(function).instructions.push_back(amir_store(index_name, zero));
+
+                const std::size_t cond_block = add_block(function, "ComprehensionCond");
+                const std::size_t body_block = add_block(function, "ComprehensionBody");
+                const std::size_t append_block = add_block(function, "ComprehensionAppend");
+                const std::size_t inc_block = add_block(function, "ComprehensionInc");
+                const std::size_t end_block = add_block(function, "ComprehensionEnd");
+                current_block(function).instructions.push_back(amir_jump(block_name(function, cond_block)));
+
+                current_block_ = cond_block;
+                const std::string index = temp();
+                const std::string items = temp();
+                const std::string length = temp();
+                const std::string condition = temp();
+                current_block(function).instructions.push_back(amir_load(index, index_name));
+                current_block(function).instructions.push_back(amir_load(items, items_name));
+                current_block(function).instructions.push_back(amir_call_value(length, "LEN", {items}));
+                current_block(function).instructions.push_back(amir_binary(condition, "<", index, length));
+                current_block(function).instructions.push_back(
+                    amir_branch(condition, block_name(function, body_block), block_name(function, end_block)));
+
+                current_block_ = body_block;
+                const std::string item = temp();
+                current_block(function).instructions.push_back(amir_index(item, items, index));
+                current_block(function).instructions.push_back(amir_store(binding_name, item));
+                if (filter_expr) {
+                    const std::string filter = lower_expression(function, *filter_expr);
+                    current_block(function).instructions.push_back(
+                        amir_branch(filter, block_name(function, append_block), block_name(function, inc_block)));
+                } else {
+                    current_block(function).instructions.push_back(amir_jump(block_name(function, append_block)));
+                }
+
+                current_block_ = append_block;
+                const std::string result_array = temp();
+                current_block(function).instructions.push_back(amir_load(result_array, result_name));
+                const std::string value = lower_expression(function, *result_expr);
+                const std::string ignored = temp();
+                current_block(function).instructions.push_back(amir_call_value(ignored, "Array.Add", {result_array, value}));
+                current_block(function).instructions.push_back(amir_jump(block_name(function, inc_block)));
+
+                current_block_ = inc_block;
+                const std::string old_index = temp();
+                const std::string one = temp();
+                const std::string next_index = temp();
+                current_block(function).instructions.push_back(amir_load(old_index, index_name));
+                current_block(function).instructions.push_back(amir_const(one, "1"));
+                current_block(function).instructions.push_back(amir_binary(next_index, "+", old_index, one));
+                current_block(function).instructions.push_back(amir_store(index_name, next_index));
+                current_block(function).instructions.push_back(amir_jump(block_name(function, cond_block)));
+
+                current_block_ = end_block;
+                const std::string result = temp();
+                current_block(function).instructions.push_back(amir_load(result, result_name));
+                return result;
+            }
+            case AstKind::Tuple: {
+                std::vector<std::string> items;
+                for (const auto& child : node.children) items.push_back(lower_expression(function, *child));
+                const std::string result = temp();
+                out.instructions.push_back(amir_tuple(result, std::move(items)));
                 return result;
             }
             case AstKind::Object: {
@@ -610,16 +1219,22 @@ private:
         const auto parts = split_identifier_path(name);
         if (parts.size() <= 1) {
             const std::string result = temp();
-            out.instructions.push_back(amir_load(result, name));
+            auto instruction = amir_load(result, name);
+            instruction.result_type = types_.count(name) ? types_.at(name) : "U64";
+            out.instructions.push_back(std::move(instruction));
             return result;
         }
         std::string target = temp();
-        out.instructions.push_back(amir_load(target, parts.front()));
+        auto load = amir_load(target, parts.front());
+        load.result_type = types_.count(parts.front()) ? types_.at(parts.front()) : "U64";
+        out.instructions.push_back(std::move(load));
         for (std::size_t i = 1; i < parts.size(); ++i) {
             const std::string property = temp();
             out.instructions.push_back(amir_const(property, "\"" + escaped(parts[i]) + "\""));
             const std::string indexed = temp();
-            out.instructions.push_back(amir_index(indexed, target, property));
+            auto index_instruction = amir_index(indexed, target, property);
+            index_instruction.result_type = "U64";
+            out.instructions.push_back(std::move(index_instruction));
             target = indexed;
         }
         return target;
@@ -634,9 +1249,35 @@ private:
         }
         for (const auto& child : node.children) args.push_back(lower_expression(function, *child));
         const std::string result = temp();
+        const std::string upper_target = upper_ascii(target);
+        if (upper_target == "CPU.READCR2" || upper_target == "CPU.READCR3") {
+            auto instruction = amir_memory(upper_target == "CPU.READCR2" ? "READCR2" : "READCR3", result, {}, "U64", {});
+            current_block(function).instructions.push_back(std::move(instruction));
+            return result;
+        }
+        if (upper_target == "CPU.WRITECR3" || upper_target == "CPU.INVALIDATEPAGE" || upper_target == "CPU.LOADGDT" || upper_target == "CPU.LOADIDT" || upper_target == "CPU.LOADTASKREGISTER") {
+            const std::string op = upper_target == "CPU.WRITECR3" ? "WRITECR3" : (upper_target == "CPU.INVALIDATEPAGE" ? "INVLPG" : (upper_target == "CPU.LOADGDT" ? "LGDT" : (upper_target == "CPU.LOADIDT" ? "LIDT" : "LTR")));
+            current_block(function).instructions.push_back(amir_memory(op, "", std::move(args), "", {"U64"}));
+            return result;
+        }
         AmirInstruction instruction = amir_call_value(result, target, std::move(args));
-        if (node.kind == AstKind::MethodCall && has_parameter(function, node.secondary_name)) {
+        if (upper_target == "GRAPHICS.CREATESURFACE" || upper_target == "GRAPHICS.PRIMARYSURFACE" || upper_target == "GRAPHICS.CREATEWINDOW" ||
+            upper_target == "GRAPHICS.CREATEIMAGE" || upper_target == "FILES.OPEN" || upper_target == "NETWORK.CONNECT") {
+            instruction.result_type = type_of_expression(node);
+            instruction.ownership = upper_target == "GRAPHICS.PRIMARYSURFACE" ? "Borrowed" : "Returned";
+        } else if (upper_target == "GRAPHICS.BIND" || upper_target == "GRAPHICS.PUSHSURFACE" ||
+                   upper_target == "GRAPHICS.CLEAR" || upper_target == "GRAPHICS.FILLRECT" ||
+                   upper_target == "GRAPHICS.DRAWTEXT" || upper_target == "GRAPHICS.POPSURFACE") {
+            instruction.ownership = "Borrowed";
+        } else if (upper_target == "GRAPHICS.DESTROYSURFACE") {
+            instruction.ownership = "Consumed";
+        }
+        const auto receiver_dot = target.find('.');
+        const std::string receiver_name = receiver_dot == std::string::npos ? "" : target.substr(0, receiver_dot);
+        if (node.kind == AstKind::MethodCall && (has_parameter(function, node.secondary_name) ||
+            (types_.count(receiver_name) != 0 && types_.at(receiver_name).rfind("UEFI.", 0) == 0))) {
             instruction.kind = AmirInstruction::Kind::CallExternal;
+            if (!receiver_name.empty() && types_.count(receiver_name) != 0) instruction.operand_types = {types_.at(receiver_name)};
         }
         current_block(function).instructions.push_back(std::move(instruction));
         return result;
@@ -646,7 +1287,8 @@ private:
         for (const auto& statement : statements) {
             lower_statement(function, *statement);
             const auto& instructions = current_block(function).instructions;
-            if (!instructions.empty() && instructions.back().kind == AmirInstruction::Kind::CpuHaltForever) {
+            if (!instructions.empty() && (instructions.back().kind == AmirInstruction::Kind::CpuHaltForever ||
+                                          instructions.back().kind == AmirInstruction::Kind::Throw)) {
                 break;
             }
         }
@@ -665,6 +1307,15 @@ private:
             case AstKind::Assign:
                 lower_assignment(function, node);
                 break;
+            case AstKind::SliceAssign:
+                lower_slice_assignment(function, node);
+                break;
+            case AstKind::Destructure:
+                if (!node.children.empty()) {
+                    current_block(function).instructions.push_back(
+                        amir_destructure(node.names, lower_expression(function, *node.children[0])));
+                }
+                break;
             case AstKind::CompoundAssign:
                 lower_compound(function, node);
                 break;
@@ -675,8 +1326,15 @@ private:
                 lower_flags(function, node);
                 break;
             case AstKind::HardwareSemantic:
-                current_block(function).instructions.push_back(
-                    node.name == "CPU.HaltForever" ? amir_cpu_halt_forever() : amir_cpu_halt());
+                if (node.name == "CPU.HaltForever") current_block(function).instructions.push_back(amir_cpu_halt_forever());
+                else if (node.name == "CPU.Pause") current_block(function).instructions.push_back(amir_cpu_pause());
+                else if (node.name == "CPU.ReadBarrier") current_block(function).instructions.push_back(amir_barrier("READBARRIER"));
+                else if (node.name == "CPU.WriteBarrier") current_block(function).instructions.push_back(amir_barrier("WRITEBARRIER"));
+                else if (node.name == "CPU.MemoryBarrier") current_block(function).instructions.push_back(amir_barrier("MEMORYBARRIER"));
+                else if (node.name == "CPU.DisableInterrupts") current_block(function).instructions.push_back(amir_barrier("DISABLEINTERRUPTS"));
+                else if (node.name == "CPU.EnableInterrupts") current_block(function).instructions.push_back(amir_barrier("ENABLEINTERRUPTS"));
+                else if (node.name == "CPU.Breakpoint") current_block(function).instructions.push_back(amir_barrier("BREAKPOINT"));
+                else current_block(function).instructions.push_back(amir_cpu_halt());
                 break;
             case AstKind::ExpressionStatement:
                 lower_expression_statement(function, node);
@@ -721,6 +1379,13 @@ private:
             case AstKind::Try:
                 lower_try(function, node);
                 break;
+            case AstKind::Throw:
+                if (node.children.empty()) {
+                    current_block(function).instructions.push_back(amir_unsupported("THROW without message"));
+                } else {
+                    current_block(function).instructions.push_back(amir_throw(lower_expression(function, *node.children[0])));
+                }
+                break;
             case AstKind::Function:
                 lower_function(function, node);
                 break;
@@ -753,6 +1418,10 @@ private:
 
     void lower_assignment(AmirFunction& function, const CanonicalAstNode& node) {
         if (node.children.empty()) return;
+        const std::string declared_type = node.type_name.empty()
+            ? (types_.count(node.name) ? types_.at(node.name) : type_of_expression(*node.children.back()))
+            : node.type_name;
+        if (!declared_type.empty()) types_[node.name] = declared_type;
         const auto parts = split_identifier_path(node.name);
         std::vector<std::string> indexes;
         for (std::size_t i = 1; i < parts.size(); ++i) {
@@ -764,7 +1433,7 @@ private:
         for (std::size_t i = 0; i < explicit_indexes && i < node.children.size() - 1; ++i) {
             indexes.push_back(lower_expression(function, *node.children[i]));
         }
-        const std::string value = lower_expression(function, *node.children.back());
+        const std::string value = lower_expression(function, *node.children.back(), declared_type);
         if (indexes.empty()) {
             current_block(function).instructions.push_back(amir_store(node.name, value));
         } else {
@@ -773,13 +1442,33 @@ private:
         }
     }
 
+    void lower_slice_assignment(AmirFunction& function, const CanonicalAstNode& node) {
+        if (node.children.size() != 3 || !node.children[2]) return;
+        auto lower_optional = [&](const CanonicalAstNodePtr& child) {
+            if (child) return lower_expression(function, *child);
+            const std::string omitted = temp();
+            current_block(function).instructions.push_back(amir_const(omitted, "nothing"));
+            return omitted;
+        };
+        const std::string start = lower_optional(node.children[0]);
+        const std::string end = lower_optional(node.children[1]);
+        const std::string replacement = lower_expression(function, *node.children[2]);
+        current_block(function).instructions.push_back(amir_store_slice(node.name, start, end, replacement));
+    }
+
     void lower_compound(AmirFunction& function, const CanonicalAstNode& node) {
         if (node.children.empty()) return;
         const std::string current = temp();
-        current_block(function).instructions.push_back(amir_load(current, node.name));
-        const std::string value = lower_expression(function, *node.children[0]);
+        const std::string current_type = types_.count(node.name) ? types_.at(node.name) : "";
+        auto load = amir_load(current, node.name);
+        load.result_type = current_type;
+        current_block(function).instructions.push_back(std::move(load));
+        const std::string value = lower_expression(function, *node.children[0], current_type);
         const std::string result = temp();
-        current_block(function).instructions.push_back(amir_binary(result, ast_operator(node.op), current, value));
+        auto instruction = amir_binary(result, ast_operator(node.op), current, value);
+        instruction.result_type = current_type;
+        if (!current_type.empty()) instruction.operand_types = {current_type, current_type};
+        current_block(function).instructions.push_back(std::move(instruction));
         current_block(function).instructions.push_back(amir_store(node.name, result));
     }
 
@@ -815,7 +1504,7 @@ private:
             return;
         }
         const AstKind kind = node.children[0]->kind;
-        if (kind == AstKind::Call || kind == AstKind::MethodCall || kind == AstKind::SuperCall) {
+        if (kind == AstKind::Call || kind == AstKind::MethodCall || kind == AstKind::SuperCall || kind == AstKind::PortOperation || kind == AstKind::MemoryOperation) {
             (void)lower_expression(function, *node.children[0]);
         } else {
             current_block(function).instructions.push_back(amir_unsupported(render_ast_expression(*node.children[0])));
@@ -835,6 +1524,11 @@ private:
 
     void lower_if(AmirFunction& function, const CanonicalAstNode& node) {
         if (node.children.empty()) return;
+        std::string condition_type = type_of_expression(*node.children[0]);
+        if (condition_type.empty() && node.children[0]->kind == AstKind::Literal) condition_type = "U64";
+        if (condition_type != "BOOL") {
+            report_integer_error("IF condition must be BOOL under #RUNTIME NONE; received " + (condition_type.empty() ? "unknown" : condition_type) + ". Compare the value explicitly.");
+        }
         const std::size_t then_block = add_block(function, "IfThen");
         const std::size_t else_block = add_block(function, "IfElse");
         const std::size_t end_block = add_block(function, "IfEnd");
@@ -856,6 +1550,11 @@ private:
 
     void lower_while(AmirFunction& function, const CanonicalAstNode& node) {
         if (node.children.empty()) return;
+        std::string condition_type = type_of_expression(*node.children[0]);
+        if (condition_type.empty() && node.children[0]->kind == AstKind::Literal) condition_type = "U64";
+        if (condition_type != "BOOL") {
+            report_integer_error("WHILE condition must be BOOL under #RUNTIME NONE; received " + (condition_type.empty() ? "unknown" : condition_type) + ". Compare the value explicitly.");
+        }
         const std::size_t cond_block = add_block(function, "WhileCond");
         const std::size_t body_block = add_block(function, "WhileBody");
         const std::size_t end_block = add_block(function, "WhileEnd");
@@ -1155,12 +1854,18 @@ private:
 
         const std::size_t saved_block = current_block_;
         const auto saved_loops = loop_stack_;
+        const auto saved_types = types_;
         current_block_ = 0;
         loop_stack_.clear();
+        types_.clear();
+        for (const auto& param : node.parameters) {
+            if (!param.type_name.empty()) types_[param.name] = param.type_name;
+        }
         lower_statements(function, ast_group(node, "body"));
         ensure_terminated(function, current_block_, "VALUE", "nothing");
         current_block_ = saved_block;
         loop_stack_ = saved_loops;
+        types_ = saved_types;
         module_.functions.push_back(std::move(function));
     }
 
@@ -1198,7 +1903,11 @@ private:
     void validate_module() {
         for (const auto& function : module_.functions) {
             std::vector<std::string> targets;
+            std::unordered_set<std::string> seen_blocks;
             for (const auto& current : function.blocks) {
+                if (!seen_blocks.insert(current.name).second) {
+                    module_.diagnostics.push_back("duplicate A-MIR block " + function.name + "." + current.name);
+                }
                 targets.push_back(current.name);
                 for (const auto& instruction : current.instructions) {
                     if (instruction.kind == AmirInstruction::Kind::Label) targets.push_back(instruction.target);
@@ -1212,7 +1921,14 @@ private:
                 if (!is_terminal_instruction(current.instructions.back())) {
                     module_.diagnostics.push_back("unterminated block " + function.name + "." + current.name);
                 }
-                for (const auto& instruction : current.instructions) {
+                for (std::size_t instruction_index = 0; instruction_index < current.instructions.size(); ++instruction_index) {
+                    const auto& instruction = current.instructions[instruction_index];
+                    const bool source_label_split = instruction.kind == AmirInstruction::Kind::Jump &&
+                        instruction_index + 1 < current.instructions.size() &&
+                        current.instructions[instruction_index + 1].kind == AmirInstruction::Kind::Label;
+                    if (instruction_index + 1 < current.instructions.size() && is_terminal_instruction(instruction) && !source_label_split) {
+                        module_.diagnostics.push_back("instruction after terminal operation in " + function.name + "." + current.name);
+                    }
                     if (instruction.kind == AmirInstruction::Kind::Unsupported && !instruction.operands.empty()) {
                         module_.diagnostics.push_back("unsupported lowering in " + function.name + "." + current.name + ": " +
                                                       instruction.operands.front());
@@ -1221,6 +1937,8 @@ private:
                     } else if (instruction.kind == AmirInstruction::Kind::Branch && instruction.operands.size() >= 3) {
                         validate_target(function.name, current.name, instruction.operands[1], targets);
                         validate_target(function.name, current.name, instruction.operands[2], targets);
+                    } else if (instruction.kind == AmirInstruction::Kind::Branch) {
+                        module_.diagnostics.push_back("malformed BRANCH in " + function.name + "." + current.name);
                     } else if (instruction.kind == AmirInstruction::Kind::TryBegin) {
                         validate_target(function.name, current.name, instruction.target, targets);
                     }
@@ -1245,6 +1963,7 @@ private:
 
     AmirModule module_;
     std::vector<CanonicalAstNodePtr> roots_;
+    std::unordered_map<std::string, std::string> types_;
     std::vector<LoopTarget> loop_stack_;
     int temporary_ = 0;
     int hidden_counter_ = 0;
@@ -1252,8 +1971,11 @@ private:
     std::size_t current_block_ = 0;
 };
 
-AmirModule build_amir(const std::vector<std::unique_ptr<Stmt>>& statements, const std::string& source_name) {
-    return AstAmirBuilder(statements, source_name).build();
+AmirModule build_amir(const std::vector<std::unique_ptr<Stmt>>& statements, const std::string& source_name,
+                      std::optional<std::uint64_t> instruction_limit = std::nullopt) {
+    AmirModule module = AstAmirBuilder(statements, source_name).build();
+    module.instruction_limit = instruction_limit;
+    return module;
 }
 
 void render_instruction(std::ostream& out, const AmirInstruction& instruction, const std::string& source_name) {
@@ -1274,17 +1996,53 @@ void render_instruction(std::ostream& out, const AmirInstruction& instruction, c
             out << "    " << instruction.result << " := LOAD " << instruction.target << "\n";
             break;
         case AmirInstruction::Kind::Unary:
-            out << "    " << instruction.result << " := " << instruction.target << ' ' << instruction.operands.front() << "\n";
+            out << "    " << instruction.result;
+            if (!instruction.result_type.empty()) out << " :" << instruction.result_type;
+            out << " := " << (instruction.target == "~" ? "INT.NOT" : instruction.target == "-" ? "INT.NEG" : instruction.target)
+                << ' ' << instruction.operands.front() << "\n";
             break;
         case AmirInstruction::Kind::Binary:
-            out << "    " << instruction.result << " := " << instruction.target << ' ' << instruction.operands[0] << ", " << instruction.operands[1]
-                << "\n";
+            {
+            std::string operation = instruction.target;
+            const std::string type = instruction.operand_types.empty() ? instruction.result_type : instruction.operand_types.front();
+            const bool signed_value = type == "I8" || type == "I16" || type == "I32" || type == "I64";
+            const bool typed = !instruction.result_type.empty() || !instruction.operand_types.empty();
+            const std::string source_operation = operation;
+            if (operation == "+") operation = "INT.ADD";
+            else if (operation == "-") operation = "INT.SUB";
+            else if (operation == "*") operation = "INT.MUL";
+            else if (operation == "\\") operation = signed_value ? "INT.DIV_SIGNED" : "INT.DIV_UNSIGNED";
+            else if (operation == "MOD") operation = signed_value ? "INT.MOD_SIGNED" : "INT.MOD_UNSIGNED";
+            else if (operation == "&") operation = "INT.AND";
+            else if (operation == "|") operation = "INT.OR";
+            else if (operation == "^") operation = "INT.XOR";
+            else if (operation == "<<") operation = "INT.SHL";
+            else if (operation == ">>") operation = "INT.SHR";
+            else if (operation == "SAR") operation = "INT.SAR";
+            else if (operation == "==") operation = "INT.CMP_EQ";
+            else if (operation == "!=") operation = "INT.CMP_NE";
+            else if (operation == "<") operation = signed_value ? "INT.CMP_LT_SIGNED" : "INT.CMP_LT_UNSIGNED";
+            else if (operation == "<=") operation = signed_value ? "INT.CMP_LE_SIGNED" : "INT.CMP_LE_UNSIGNED";
+            else if (operation == ">") operation = signed_value ? "INT.CMP_GT_SIGNED" : "INT.CMP_GT_UNSIGNED";
+            else if (operation == ">=") operation = signed_value ? "INT.CMP_GE_SIGNED" : "INT.CMP_GE_UNSIGNED";
+            out << "    " << instruction.result;
+            if (typed && !instruction.result_type.empty()) out << " :" << instruction.result_type;
+            out << " := " << (typed ? operation : source_operation) << ' ' << instruction.operands[0] << ", " << instruction.operands[1];
+            if (typed) {
+                out << " [" << (instruction.operand_types.empty() ? "VALUE" : instruction.operand_types[0]) << ","
+                    << (instruction.operand_types.size() < 2 ? "VALUE" : instruction.operand_types[1]) << "]";
+            }
+            out << "\n";
+            }
             break;
         case AmirInstruction::Kind::CallValue:
-            out << "    " << instruction.result << " := CALL " << instruction.target;
+            out << "    " << instruction.result;
+            if (!instruction.result_type.empty()) out << " :" << instruction.result_type;
+            out << " := CALL " << instruction.target;
             for (const auto& operand : instruction.operands) {
                 out << ' ' << operand;
             }
+            if (!instruction.ownership.empty()) out << " {" << instruction.ownership << "}";
             out << "\n";
             break;
         case AmirInstruction::Kind::CallExternal:
@@ -1300,11 +2058,59 @@ void render_instruction(std::ostream& out, const AmirInstruction& instruction, c
         case AmirInstruction::Kind::CpuHaltForever:
             out << "    CPU.HALT_FOREVER\n";
             break;
+        case AmirInstruction::Kind::CpuPause:
+            out << "    CPU.PAUSE\n";
+            break;
+        case AmirInstruction::Kind::Port:
+            out << "    ";
+            if (!instruction.result.empty()) {
+                out << instruction.result;
+                if (!instruction.result_type.empty()) out << " :" << instruction.result_type;
+                out << " = ";
+            }
+            out << "PORT." << instruction.target;
+            if (!instruction.operands.empty()) {
+                out << ' ' << instruction.operands[0];
+                for (std::size_t i = 1; i < instruction.operands.size(); ++i) out << ", " << instruction.operands[i];
+            }
+            if (!instruction.operand_types.empty()) {
+                out << " [";
+                for (std::size_t i = 0; i < instruction.operand_types.size(); ++i) {
+                    if (i) out << ',';
+                    out << instruction.operand_types[i];
+                }
+                out << ']';
+            }
+            out << "\n";
+            break;
+        case AmirInstruction::Kind::Memory: {
+            out << "    ";
+            if (!instruction.result.empty()) {
+                out << instruction.result;
+                if (!instruction.result_type.empty()) out << " :" << instruction.result_type;
+                out << " = ";
+            }
+            const bool address_op = instruction.target == "PHYSICAL" || instruction.target == "VIRTUAL" || instruction.target == "MMIO" ||
+                instruction.target == "VALUE" || instruction.target == "OFFSET" || instruction.target == "ALIGNUP" || instruction.target == "ALIGNDOWN" || instruction.target == "ISALIGNED";
+            if (instruction.target == "GOPDISCOVER") out << "UEFI.GOP.DISCOVER";
+            else out << (address_op ? "ADDRESS." : "MEMORY.") << instruction.target;
+            for (const auto& operand : instruction.operands) out << ' ' << operand;
+            out << "\n";
+            break;
+        }
+        case AmirInstruction::Kind::Barrier:
+            out << "    CPU." << instruction.target << "\n";
+            break;
         case AmirInstruction::Kind::Array:
             out << "    " << instruction.result << " := ARRAY";
             for (const auto& operand : instruction.operands) {
                 out << ' ' << operand;
             }
+            out << "\n";
+            break;
+        case AmirInstruction::Kind::Tuple:
+            out << "    " << instruction.result << " := TUPLE";
+            for (const auto& operand : instruction.operands) out << ' ' << operand;
             out << "\n";
             break;
         case AmirInstruction::Kind::Object:
@@ -1317,6 +2123,16 @@ void render_instruction(std::ostream& out, const AmirInstruction& instruction, c
         case AmirInstruction::Kind::Index:
             out << "    " << instruction.result << " := INDEX " << instruction.target << ", " << instruction.operands.front() << "\n";
             break;
+        case AmirInstruction::Kind::Slice:
+            out << "    " << instruction.result << " := SLICE " << instruction.target << ", "
+                << instruction.operands[0] << ", " << instruction.operands[1] << ", " << instruction.operands[2] << "\n";
+            break;
+        case AmirInstruction::Kind::Copy:
+            out << "    " << instruction.result << " := COPY " << instruction.operands.front() << "\n";
+            break;
+        case AmirInstruction::Kind::AddressOf:
+            out << "    " << instruction.result << " := ADDRESSOF " << instruction.target << "\n";
+            break;
         case AmirInstruction::Kind::Store:
             out << "    STORE " << instruction.target << ", " << instruction.operands.front() << "\n";
             break;
@@ -1325,6 +2141,15 @@ void render_instruction(std::ostream& out, const AmirInstruction& instruction, c
             for (const auto& operand : instruction.operands) {
                 out << ' ' << operand;
             }
+            out << "\n";
+            break;
+        case AmirInstruction::Kind::StoreSlice:
+            out << "    STORE_SLICE " << instruction.target << ' ' << instruction.operands[0] << ' '
+                << instruction.operands[1] << ' ' << instruction.operands[2] << "\n";
+            break;
+        case AmirInstruction::Kind::Destructure:
+            out << "    DESTRUCTURE " << instruction.target;
+            for (const auto& operand : instruction.operands) out << ' ' << operand;
             out << "\n";
             break;
         case AmirInstruction::Kind::Call:
@@ -1349,6 +2174,9 @@ void render_instruction(std::ostream& out, const AmirInstruction& instruction, c
             break;
         case AmirInstruction::Kind::TryEnd:
             out << "    TRY_END\n";
+            break;
+        case AmirInstruction::Kind::Throw:
+            out << "    THROW " << instruction.operands.front() << "\n";
             break;
         case AmirInstruction::Kind::DeclareFunction:
             out << "    DECLARE_FUNCTION " << instruction.target;
@@ -1384,6 +2212,9 @@ std::string render_amir(const AmirModule& module) {
     std::ostringstream out;
     out << "A-MIR MODULE \"" << escaped(module.source_name) << "\"\n";
     out << "VERSION " << module.version << "\n\n";
+    if (module.instruction_limit.has_value()) {
+        out << "METADATA INSTRUCTION_LIMIT " << *module.instruction_limit << "\n\n";
+    }
     if (!module.diagnostics.empty()) {
         out << "DIAGNOSTICS " << module.diagnostics.size() << "\n";
         for (const auto& diagnostic : module.diagnostics) {
@@ -1501,6 +2332,13 @@ enum class BytecodeOp {
     Return = 20,
     CallExternal = 21,
     Unsupported = 22,
+    Throw = 23,
+    Slice = 24,
+    Copy = 25,
+    StoreSlice = 26,
+    Tuple = 27,
+    Destructure = 28,
+    AddressOf = 29,
 };
 
 struct BytecodeInstruction {
@@ -1524,6 +2362,7 @@ struct BytecodeFunction {
 struct BytecodeModule {
     std::string source_name;
     int version = 0;
+    std::optional<std::uint64_t> instruction_limit;
     std::vector<std::string> constants;
     std::vector<BytecodeFunction> functions;
     std::vector<std::string> diagnostics;
@@ -1577,6 +2416,20 @@ std::string bytecode_op_name(BytecodeOp op) {
             return "CALL_EXTERNAL";
         case BytecodeOp::Unsupported:
             return "UNSUPPORTED";
+        case BytecodeOp::Throw:
+            return "THROW";
+        case BytecodeOp::Slice:
+            return "SLICE";
+        case BytecodeOp::Copy:
+            return "COPY";
+        case BytecodeOp::StoreSlice:
+            return "STORE_SLICE";
+        case BytecodeOp::Tuple:
+            return "TUPLE";
+        case BytecodeOp::Destructure:
+            return "DESTRUCTURE";
+        case BytecodeOp::AddressOf:
+            return "ADDRESSOF";
     }
     return "UNSUPPORTED";
 }
@@ -1585,7 +2438,7 @@ bool is_symbol_name(const std::string& text) {
     if (text.empty() || text[0] == '%' || text[0] == '"' || (text[0] >= '0' && text[0] <= '9')) {
         return false;
     }
-    if (text == "true" || text == "false" || text == "nothing") {
+    if (text == "true" || text == "false" || text == "nothing" || text == "null") {
         return false;
     }
     for (char c : text) {
@@ -1611,8 +2464,36 @@ std::string constant_ref(BytecodeModule& module, const std::string& value) {
     return "K" + std::to_string(intern(module.constants, value));
 }
 
+std::string local_base_name(const std::string& name) {
+    const auto space = name.find(' ');
+    const auto equals = name.find('=');
+    std::size_t end = std::min(space == std::string::npos ? name.size() : space,
+                               equals == std::string::npos ? name.size() : equals);
+    while (end > 0 && (name[end - 1] == ' ' || name[end - 1] == '\t')) --end;
+    return name.substr(0, end);
+}
+
+// A parameter descriptor is rendered as "name[ AS Type][ = defaultExpr]" (see parameter_text).
+// Returns the trimmed default-value text, or an empty string when the parameter has no default.
+std::string param_default_text(const std::string& descriptor) {
+    const auto equals = descriptor.find('=');
+    if (equals == std::string::npos) return std::string();
+    std::string text = descriptor.substr(equals + 1);
+    const auto begin = text.find_first_not_of(" \t");
+    if (begin == std::string::npos) return std::string();
+    const auto end = text.find_last_not_of(" \t");
+    return text.substr(begin, end - begin + 1);
+}
+
 std::string local_ref(BytecodeFunction& function, const std::string& value) {
-    return "L" + std::to_string(intern(function.locals, value));
+    const std::string base = local_base_name(value);
+    for (std::size_t i = 0; i < function.locals.size(); ++i) {
+        if (local_base_name(function.locals[i]) == base) {
+            return "L" + std::to_string(i);
+        }
+    }
+    function.locals.push_back(value);
+    return "L" + std::to_string(function.locals.size() - 1);
 }
 
 BytecodeInstruction bytecode_instruction(BytecodeOp op, std::vector<std::string> operands) {
@@ -1626,6 +2507,7 @@ BytecodeModule build_bytecode(const AmirModule& amir) {
     BytecodeModule module;
     module.source_name = amir.source_name;
     module.version = 0;
+    module.instruction_limit = amir.instruction_limit;
     module.diagnostics = amir.diagnostics;
 
     for (const auto& amir_function : amir.functions) {
@@ -1688,10 +2570,32 @@ BytecodeModule build_bytecode(const AmirModule& amir) {
                         module.diagnostics.push_back("hardware semantic CPU.HaltForever is unsupported by hosted bytecode backend");
                         block.instructions.push_back(bytecode_instruction(BytecodeOp::Unsupported, {"CPU.HaltForever"}));
                         break;
+                    case AmirInstruction::Kind::CpuPause:
+                        module.diagnostics.push_back("hardware semantic CPU.Pause is unsupported by hosted bytecode backend");
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::Unsupported, {"CPU.Pause"}));
+                        break;
+                    case AmirInstruction::Kind::Port:
+                        module.diagnostics.push_back("PORT." + instruction.target + " is available only on a freestanding target with port-I/O support");
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::Unsupported, {"PORT." + instruction.target}));
+                        break;
+                    case AmirInstruction::Kind::Memory:
+                        module.diagnostics.push_back("MEMORY/ADDRESS operation is available only on a freestanding target with memory support");
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::Unsupported, {"MEMORY." + instruction.target}));
+                        break;
+                    case AmirInstruction::Kind::Barrier:
+                        module.diagnostics.push_back("CPU." + instruction.target + " is available only on a freestanding target with memory-ordering support");
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::Unsupported, {"CPU." + instruction.target}));
+                        break;
                     case AmirInstruction::Kind::Array: {
                         std::vector<std::string> operands{instruction.result};
                         operands.insert(operands.end(), instruction.operands.begin(), instruction.operands.end());
                         block.instructions.push_back(bytecode_instruction(BytecodeOp::Array, std::move(operands)));
+                        break;
+                    }
+                    case AmirInstruction::Kind::Tuple: {
+                        std::vector<std::string> operands{instruction.result};
+                        operands.insert(operands.end(), instruction.operands.begin(), instruction.operands.end());
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::Tuple, std::move(operands)));
                         break;
                     }
                     case AmirInstruction::Kind::Object: {
@@ -1703,6 +2607,18 @@ BytecodeModule build_bytecode(const AmirModule& amir) {
                     case AmirInstruction::Kind::Index:
                         block.instructions.push_back(bytecode_instruction(BytecodeOp::Index, {instruction.result, instruction.target, instruction.operands.front()}));
                         break;
+                    case AmirInstruction::Kind::Slice:
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::Slice,
+                            {instruction.result, instruction.target, instruction.operands[0], instruction.operands[1], instruction.operands[2]}));
+                        break;
+                    case AmirInstruction::Kind::Copy:
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::Copy,
+                            {instruction.result, instruction.operands.front()}));
+                        break;
+                    case AmirInstruction::Kind::AddressOf:
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::AddressOf,
+                            {instruction.result, instruction.target}));
+                        break;
                     case AmirInstruction::Kind::Store:
                         block.instructions.push_back(bytecode_instruction(BytecodeOp::Store, {local_ref(function, instruction.target), instruction.operands.front()}));
                         break;
@@ -1710,6 +2626,16 @@ BytecodeModule build_bytecode(const AmirModule& amir) {
                         std::vector<std::string> operands{local_ref(function, instruction.target)};
                         operands.insert(operands.end(), instruction.operands.begin(), instruction.operands.end());
                         block.instructions.push_back(bytecode_instruction(BytecodeOp::StoreIndex, std::move(operands)));
+                        break;
+                    }
+                    case AmirInstruction::Kind::StoreSlice:
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::StoreSlice,
+                            {local_ref(function, instruction.target), instruction.operands[0], instruction.operands[1], instruction.operands[2]}));
+                        break;
+                    case AmirInstruction::Kind::Destructure: {
+                        std::vector<std::string> operands{instruction.target};
+                        for (const auto& name : instruction.operands) operands.push_back(local_ref(function, name));
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::Destructure, std::move(operands)));
                         break;
                     }
                     case AmirInstruction::Kind::Call: {
@@ -1729,6 +2655,9 @@ BytecodeModule build_bytecode(const AmirModule& amir) {
                         break;
                     case AmirInstruction::Kind::TryEnd:
                         block.instructions.push_back(bytecode_instruction(BytecodeOp::TryEnd, {}));
+                        break;
+                    case AmirInstruction::Kind::Throw:
+                        block.instructions.push_back(bytecode_instruction(BytecodeOp::Throw, instruction.operands));
                         break;
                     case AmirInstruction::Kind::DeclareFunction: {
                         std::vector<std::string> operands{instruction.target};
@@ -1770,9 +2699,12 @@ std::string render_bytecode(const BytecodeModule& module) {
     out << "FORMAT .arcof-text\n";
     out << "VERSION " << module.version << "\n";
     out << "SOURCE \"" << escaped(module.source_name) << "\"\n\n";
+    if (module.instruction_limit.has_value()) {
+        out << "METADATA INSTRUCTION_LIMIT " << *module.instruction_limit << "\n\n";
+    }
 
     out << "OPCODES\n";
-    for (int id = static_cast<int>(BytecodeOp::Label); id <= static_cast<int>(BytecodeOp::Unsupported); ++id) {
+    for (int id = static_cast<int>(BytecodeOp::Label); id <= static_cast<int>(BytecodeOp::AddressOf); ++id) {
         const auto op = static_cast<BytecodeOp>(id);
         out << "    " << id << " " << bytecode_op_name(op) << "\n";
     }
@@ -1839,7 +2771,7 @@ std::vector<std::string> split_words(const std::string& line) {
 }
 
 BytecodeOp bytecode_op_from_name(const std::string& name) {
-    for (int id = static_cast<int>(BytecodeOp::Label); id <= static_cast<int>(BytecodeOp::Unsupported); ++id) {
+    for (int id = static_cast<int>(BytecodeOp::Label); id <= static_cast<int>(BytecodeOp::AddressOf); ++id) {
         const auto op = static_cast<BytecodeOp>(id);
         if (bytecode_op_name(op) == name) {
             return op;
@@ -1866,6 +2798,8 @@ BytecodeModule parse_bytecode(const std::string& text) {
             module.version = std::stoi(line.substr(8));
         } else if (line.rfind("SOURCE ", 0) == 0) {
             module.source_name = line.substr(7);
+        } else if (line.rfind("METADATA INSTRUCTION_LIMIT ", 0) == 0) {
+            module.instruction_limit = std::stoull(line.substr(27));
         } else if (line.rfind("DIAGNOSTICS ", 0) == 0) {
             continue;
         } else if (line.rfind("CONSTANTS ", 0) == 0) {
@@ -1965,20 +2899,26 @@ struct X86_64CodegenResult {
         std::size_t rdata_offset;
     };
     std::vector<DataRelocation> relocations;
+    struct InternalCallFixup {
+        std::size_t disp_field_offset;
+        std::string target;
+    };
+    std::vector<InternalCallFixup> internal_calls;
     std::string entry_symbol;
 };
 
-// Generates x86-64 machine code for a single named function within `module` (Packet WP-008,
-// arcology-os/docs/systems/x86-64-codegen.md). Deliberately narrow: supports exactly the A-MIR instruction
-// kinds the milestone's hello-world program uses (CONST, LOAD, CALL_EXTERNAL, RETURN, plus the
-// non-semantic SOURCE/LABEL markers, skipped) with a uniform spill-everything strategy (Packet
-// non-goal: "register allocator sophistication beyond correctness" -- every named value gets its
-// own stack slot, always reloaded before use, never kept live in a register across instructions).
+// Generates x86-64 machine code for a single named function within `module` (Packet WP-008/WP-006,
+// arcology-os/docs/systems/x86-64-codegen.md). Deliberately narrow: supports the A-MIR instruction
+// kinds required by the systems fixtures, including explicit multi-block branches, with a uniform
+// spill-everything strategy (Packet non-goal: "register allocator sophistication beyond correctness"
+// -- every named value gets its own stack slot, always reloaded before use, never kept live in a
+// register across instructions).
 // Any other instruction kind, or any construct this milestone's UEFI bindings/calling convention
 // do not cover, produces a clear error rather than an incorrect or silently wrong encoding.
 X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std::string& function_name) {
     X86_64CodegenResult result;
     result.entry_symbol = function_name;
+    using Reg = systems::x86_64::Reg;
 
     const AmirFunction* target = nullptr;
     for (const auto& function : module.functions) {
@@ -1994,13 +2934,6 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
         result.error = "no function named \"" + function_name + "\" was found";
         return result;
     }
-    if (target->blocks.size() != 1) {
-        result.ok = false;
-        result.error = "function \"" + function_name + "\" has control flow beyond a single "
-            "straight-line block, which this milestone's code generator does not support";
-        return result;
-    }
-
     std::vector<std::string> slot_names;
     std::unordered_map<std::string, int> slot_offsets;
     const auto add_slot = [&](const std::string& name) {
@@ -2013,30 +2946,114 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
     for (const auto& declared_parameter : target->params) {
         add_slot(bare_parameter_name(declared_parameter));
     }
-    for (const auto& instruction : target->blocks.front().instructions) {
-        add_slot(instruction.result);
+    for (const auto& block : target->blocks) {
+        for (const auto& instruction : block.instructions) {
+            add_slot(instruction.result);
+            if (instruction.kind == AmirInstruction::Kind::Store || instruction.kind == AmirInstruction::Kind::Load) {
+                add_slot(instruction.target);
+            }
+        }
     }
 
     const int shadow = systems::kShadowSpaceBytes;
-    int frame_size = shadow + 8 * static_cast<int>(slot_names.size());
+    int max_outgoing_stack_args = 0;
+    for (const auto& block : target->blocks) {
+        for (const auto& instruction : block.instructions) {
+            if (instruction.kind != AmirInstruction::Kind::CallExternal && instruction.kind != AmirInstruction::Kind::CallValue) continue;
+            // Reserve conservatively for the implicit UEFI `This` argument. This may reserve one
+            // extra slot, but keeps the frame layout deterministic without backend-specific type
+            // lookup during frame construction.
+            const int total_args = static_cast<int>(instruction.operands.size()) + 1;
+            max_outgoing_stack_args = std::max(max_outgoing_stack_args, std::max(0, total_args - 4));
+        }
+    }
+    const int outgoing_base = shadow;
+    const int slot_base = outgoing_base + 8 * max_outgoing_stack_args;
+    const int scratch_base = slot_base + 8 * static_cast<int>(slot_names.size());
+    int frame_size = scratch_base + 32;
     // RSP is kEntryRspMod16 (8) mod 16 at function entry; after `sub rsp, frame_size`, RSP must
     // be 0 mod 16 immediately before any CALL this function makes, which requires
     // frame_size % 16 == kEntryRspMod16.
     while (frame_size % 16 != systems::kEntryRspMod16) {
         ++frame_size;
     }
-    if (frame_size > 255) {
+    if (frame_size > 4095) {
         result.ok = false;
-        result.error = "function \"" + function_name + "\" needs a stack frame larger than this "
-            "milestone's 8-bit immediate prologue/epilogue encoding supports";
+        result.error = "function \"" + function_name + "\" needs a stack frame larger than the "
+            "systems backend's supported stack layout";
         return result;
     }
     for (std::size_t i = 0; i < slot_names.size(); ++i) {
-        slot_offsets[slot_names[i]] = shadow + 8 * static_cast<int>(i);
+        slot_offsets[slot_names[i]] = slot_base + 8 * static_cast<int>(i);
     }
     const auto slot_of = [&](const std::string& name) -> int {
         const auto found = slot_offsets.find(name);
         return found == slot_offsets.end() ? -1 : found->second;
+    };
+
+    const auto width_bits = [](const std::string& type) -> int {
+        if (type == "U8" || type == "I8" || type == "BOOL") return 8;
+        if (type == "IOPORT") return 16;
+        if (type == "U16" || type == "I16") return 16;
+        if (type == "U32" || type == "I32") return 32;
+        return 64;
+    };
+    const auto signed_type = [](const std::string& type) {
+        return type == "I8" || type == "I16" || type == "I32" || type == "I64";
+    };
+    const auto normalize = [&](Reg reg, const std::string& type) {
+        const int bits = width_bits(type);
+        if (bits < 64) {
+            // REX.W AND r64, imm32 sign-extends the immediate. For 0xFFFFFFFF that means
+            // "AND with all ones", so it does not truncate U32 at all. A 32-bit MOV writes
+            // the low dword and architecturally clears the upper 32 bits.
+            if (bits == 32) result.text.mov_reg32_reg32(reg, reg);
+            else result.text.and_reg_imm32(reg, (1U << bits) - 1U);
+            if (signed_type(type)) {
+                result.text.shl_reg_imm8(reg, static_cast<std::uint8_t>(64 - bits));
+                result.text.sar_reg_imm8(reg, static_cast<std::uint8_t>(64 - bits));
+            }
+        }
+    };
+    const auto store_result = [&](const std::string& name, const std::string& type, Reg reg = Reg::RAX) -> bool {
+        const int offset = slot_of(name);
+        if (offset < 0) {
+            result.ok = false;
+            result.error = "value \"" + name + "\" has no assigned stack slot";
+            return false;
+        }
+        normalize(reg, type);
+        if (offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(offset), reg);
+        else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(offset), reg);
+        return true;
+    };
+    const auto load_value = [&](const std::string& name, const std::string& type, Reg reg) -> bool {
+        const int offset = slot_of(name);
+        if (offset < 0) {
+            result.ok = false;
+            result.error = "value \"" + name + "\" has no assigned stack slot";
+            return false;
+        }
+        if (offset <= 127) result.text.mov_load_disp8(reg, Reg::RSP, static_cast<std::uint8_t>(offset));
+        else result.text.mov_load_disp32(reg, Reg::RSP, static_cast<std::uint32_t>(offset));
+        normalize(reg, type);
+        return true;
+    };
+    const auto parse_integer = [](const std::string& text, std::uint64_t& value) -> bool {
+        try {
+            std::size_t consumed = 0;
+            int base = 10;
+            std::string digits = text;
+            if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+                base = 16; digits = digits.substr(2);
+            } else if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'b' || digits[1] == 'B')) {
+                base = 2; digits = digits.substr(2);
+            }
+            value = std::stoull(digits, &consumed, base);
+            return consumed == digits.size();
+        } catch (...) {
+            return false;
+        }
     };
 
     static const std::unordered_map<std::string, systems::x86_64::Reg> kRegisterByName = {
@@ -2044,33 +3061,97 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
         {"R8", systems::x86_64::Reg::R8}, {"R9", systems::x86_64::Reg::R9},
     };
 
-    using Reg = systems::x86_64::Reg;
-    result.text.sub_rsp_imm8(static_cast<std::uint8_t>(frame_size));
+    struct BranchFixup {
+        std::size_t displacement_offset = 0;
+        std::string target;
+    };
+    std::vector<BranchFixup> branch_fixups;
+    std::unordered_map<std::string, std::size_t> block_offsets;
 
-    // Spill incoming register arguments (Packet WP-008 non-goal: general-purpose instruction
-    // selection -- only register-passed parameters are handled; a 5th+ stack-passed parameter is
-    // outside this milestone's hello-world shape and produces a clear error rather than silently
-    // mishandled code).
+    std::unordered_map<std::string, std::size_t> block_indices;
+    for (std::size_t i = 0; i < target->blocks.size(); ++i) block_indices[target->blocks[i].name] = i;
+    std::unordered_set<std::string> reachable_blocks;
+    std::vector<std::string> pending_blocks;
+    if (!target->blocks.empty()) pending_blocks.push_back(target->blocks.front().name);
+    while (!pending_blocks.empty()) {
+        const std::string name = pending_blocks.back();
+        pending_blocks.pop_back();
+        if (!reachable_blocks.insert(name).second) continue;
+        const auto found = block_indices.find(name);
+        if (found == block_indices.end()) continue;
+        const auto& instructions = target->blocks[found->second].instructions;
+        if (instructions.empty()) continue;
+        const auto& terminator = instructions.back();
+        if (terminator.kind == AmirInstruction::Kind::Jump && !terminator.target.empty()) {
+            pending_blocks.push_back(terminator.target);
+        } else if (terminator.kind == AmirInstruction::Kind::Branch && terminator.operands.size() >= 3) {
+            pending_blocks.push_back(terminator.operands[1]);
+            pending_blocks.push_back(terminator.operands[2]);
+        }
+    }
+
+    if (frame_size <= 255) result.text.sub_rsp_imm8(static_cast<std::uint8_t>(frame_size));
+    else result.text.sub_rsp_imm32(static_cast<std::uint32_t>(frame_size));
+
+    // Spill incoming arguments. Register arguments arrive in the four Microsoft x64 integer
+    // registers; later arguments are homed by the caller at entry-RSP+40, +48, ... (32 bytes of
+    // shadow space plus the return address). After our prologue, entry-RSP is frame_size bytes
+    // above the current RSP, so stack parameters are loaded from frame_size+stack_offset.
     {
         const auto locations = systems::assign_argument_locations(static_cast<int>(target->params.size()));
         for (std::size_t i = 0; i < target->params.size(); ++i) {
             const std::string name = bare_parameter_name(target->params[i]);
-            if (!locations[i].in_register) {
-                result.ok = false;
-                result.error = "function \"" + function_name + "\" parameter \"" + name +
-                    "\" is passed on the stack, which this milestone's code generator does not support";
-                return result;
+            const int parameter_slot = slot_of(name);
+            if (locations[i].in_register) {
+                if (parameter_slot <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(parameter_slot),
+                                             kRegisterByName.at(locations[i].register_name));
+                else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(parameter_slot),
+                                             kRegisterByName.at(locations[i].register_name));
+            } else {
+                const std::uint32_t incoming_offset = static_cast<std::uint32_t>(frame_size + locations[i].stack_offset_bytes);
+                if (incoming_offset <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(incoming_offset));
+                else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, incoming_offset);
+                if (parameter_slot <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(parameter_slot), Reg::RAX);
+                else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(parameter_slot), Reg::RAX);
             }
-            result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(slot_of(name)),
-                                         kRegisterByName.at(locations[i].register_name));
         }
     }
 
-    for (const auto& instruction : target->blocks.front().instructions) {
+    for (const auto& current_block : target->blocks) {
+        if (reachable_blocks.count(current_block.name) == 0) continue;
+        block_offsets[current_block.name] = result.text.size();
+        for (const auto& instruction : current_block.instructions) {
         switch (instruction.kind) {
             case AmirInstruction::Kind::Source:
             case AmirInstruction::Kind::Label:
                 break;
+
+            case AmirInstruction::Kind::Jump: {
+                const std::size_t displacement = result.text.jmp_rel32_placeholder();
+                branch_fixups.push_back({displacement, instruction.target});
+                break;
+            }
+
+            case AmirInstruction::Kind::Branch: {
+                if (instruction.operands.size() < 3) {
+                    result.ok = false;
+                    result.error = "malformed BRANCH instruction";
+                    return result;
+                }
+                const std::string condition_type = instruction.result_type.empty() ? "BOOL" : instruction.result_type;
+                if (condition_type != "BOOL") {
+                    result.ok = false;
+                    result.error = "BRANCH condition must be BOOL; received " + condition_type;
+                    return result;
+                }
+                if (!load_value(instruction.operands[0], condition_type, Reg::RAX)) return result;
+                result.text.cmp_reg_imm32(Reg::RAX, 0);
+                const std::size_t true_displacement = result.text.jcc_rel32_placeholder(0x5); // JNE
+                branch_fixups.push_back({true_displacement, instruction.operands[1]});
+                const std::size_t false_displacement = result.text.jmp_rel32_placeholder();
+                branch_fixups.push_back({false_displacement, instruction.operands[2]});
+                break;
+            }
 
             case AmirInstruction::Kind::Const: {
                 const std::string& text_operand = instruction.operands.front();
@@ -2090,24 +3171,17 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     }
                     const std::size_t disp_offset = result.text.lea_rip_relative(Reg::RAX);
                     result.relocations.push_back({disp_offset, result.text.size(), data_offset});
-                    result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(slot_of(instruction.result)), Reg::RAX);
+                    if (!store_result(instruction.result, instruction.result_type.empty() ? "U64" : instruction.result_type)) return result;
                 } else {
                     std::uint64_t value = 0;
-                    try {
-                        std::size_t consumed = 0;
-                        const long long parsed = std::stoll(text_operand, &consumed, 10);
-                        if (consumed != text_operand.size()) {
-                            throw std::invalid_argument("trailing characters");
-                        }
-                        value = static_cast<std::uint64_t>(parsed);
-                    } catch (const std::exception&) {
+                    if (!parse_integer(text_operand, value)) {
                         result.ok = false;
                         result.error = "numeric constant \"" + text_operand + "\" is not an exact "
                             "integer literal, which is all this milestone's code generator supports";
                         return result;
                     }
                     result.text.mov_reg_imm64(Reg::RAX, value);
-                    result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(slot_of(instruction.result)), Reg::RAX);
+                    if (!store_result(instruction.result, instruction.result_type.empty() ? "U64" : instruction.result_type)) return result;
                 }
                 break;
             }
@@ -2119,8 +3193,111 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     result.error = "LOAD of \"" + instruction.target + "\" has no assigned stack slot";
                     return result;
                 }
-                result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(source_slot));
-                result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(slot_of(instruction.result)), Reg::RAX);
+                if (source_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(source_slot));
+                else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(source_slot));
+                normalize(Reg::RAX, instruction.result_type.empty() ? "U64" : instruction.result_type);
+                if (!store_result(instruction.result, instruction.result_type.empty() ? "U64" : instruction.result_type)) return result;
+                break;
+            }
+
+            case AmirInstruction::Kind::Unary: {
+                const std::string type = instruction.result_type.empty() ? "U64" : instruction.result_type;
+                const std::string operand_type = instruction.operand_types.empty() ? type : instruction.operand_types.front();
+                if (!load_value(instruction.operands.front(), operand_type, Reg::RAX)) return result;
+                if (instruction.target == "-") result.text.neg_reg(Reg::RAX);
+                else if (instruction.target == "~") result.text.not_reg(Reg::RAX);
+                else if (instruction.target == "!") {
+                    result.text.cmp_reg_imm32(Reg::RAX, 0);
+                    result.text.setcc_al(0x4);
+                    result.text.movzx_eax_al();
+                } else {
+                    result.ok = false;
+                    result.error = "unsupported systems unary operation " + instruction.target;
+                    return result;
+                }
+                if (!store_result(instruction.result, type)) return result;
+                break;
+            }
+
+            case AmirInstruction::Kind::Binary: {
+                if (instruction.operands.size() < 2) {
+                    result.ok = false; result.error = "malformed integer operation"; return result;
+                }
+                const std::string type = instruction.result_type.empty() ? "U64" : instruction.result_type;
+                const std::string left_type = instruction.operand_types.size() > 0 ? instruction.operand_types[0] : type;
+                const std::string right_type = instruction.operand_types.size() > 1 ? instruction.operand_types[1] : type;
+                if (!load_value(instruction.operands[0], left_type, Reg::RAX) ||
+                    !load_value(instruction.operands[1], right_type, Reg::RCX)) return result;
+                const std::string op = instruction.target;
+                if (op == "+") result.text.add_reg_reg(Reg::RAX, Reg::RCX);
+                else if (op == "-") result.text.sub_reg_reg(Reg::RAX, Reg::RCX);
+                else if (op == "*") result.text.imul_reg_reg(Reg::RAX, Reg::RCX);
+                else if (op == "&") result.text.and_reg_reg(Reg::RAX, Reg::RCX);
+                else if (op == "|") result.text.or_reg_reg(Reg::RAX, Reg::RCX);
+                else if (op == "^") result.text.xor_reg_reg(Reg::RAX, Reg::RCX);
+                else if (op == "\\" || op == "MOD") {
+                    if (signed_type(left_type)) result.text.cqo(); else result.text.xor_rdx_rdx();
+                    if (signed_type(left_type)) result.text.idiv_reg(Reg::RCX); else result.text.div_reg(Reg::RCX);
+                    if (op == "MOD") result.text.mov_reg_reg(Reg::RAX, Reg::RDX);
+                } else if (op == "<<" || op == ">>") {
+                    result.text.mov_reg_reg(Reg::R8, Reg::RAX);
+                    result.text.mov_reg_reg(Reg::RCX, Reg::RCX);
+                    if (op == "<<") result.text.shl_reg_cl(Reg::RAX);
+                    else result.text.shr_reg_cl(Reg::RAX);
+                    result.text.cmp_reg_imm32(Reg::RCX, static_cast<std::uint32_t>(width_bits(left_type)));
+                    result.text.setcc_al(0x2);
+                    result.text.movzx_eax_al();
+                    result.text.neg_reg(Reg::RAX);
+                    result.text.and_reg_reg(Reg::R8, Reg::RAX);
+                    result.text.mov_reg_reg(Reg::RAX, Reg::R8);
+                } else if (op == "SAR") {
+                    result.text.mov_reg_reg(Reg::R8, Reg::RAX);
+                    result.text.mov_reg_reg(Reg::R9, Reg::RAX);
+                    result.text.sar_reg_imm8(Reg::R9, 63);
+                    result.text.sar_reg_cl(Reg::R8);
+                    result.text.cmp_reg_imm32(Reg::RCX, static_cast<std::uint32_t>(width_bits(left_type)));
+                    result.text.setcc_al(0x2);
+                    result.text.movzx_eax_al();
+                    result.text.neg_reg(Reg::RAX);
+                    result.text.and_reg_reg(Reg::R8, Reg::RAX);
+                    result.text.not_reg(Reg::RAX);
+                    result.text.and_reg_reg(Reg::R9, Reg::RAX);
+                    result.text.or_reg_reg(Reg::R8, Reg::R9);
+                    result.text.mov_reg_reg(Reg::RAX, Reg::R8);
+                } else if (op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") {
+                    result.text.cmp_reg_reg(Reg::RAX, Reg::RCX);
+                    std::uint8_t condition = 0x4;
+                    if (op == "!=") condition = 0x5;
+                    else if (op == "<") condition = signed_type(left_type) ? 0xC : 0x2;
+                    else if (op == "<=") condition = signed_type(left_type) ? 0xE : 0x6;
+                    else if (op == ">") condition = signed_type(left_type) ? 0xF : 0x7;
+                    else if (op == ">=") condition = signed_type(left_type) ? 0xD : 0x3;
+                    result.text.setcc_al(condition);
+                    result.text.movzx_eax_al();
+                } else {
+                    result.ok = false;
+                    result.error = "unsupported systems integer operation " + op;
+                    return result;
+                }
+                if (!store_result(instruction.result, type)) return result;
+                break;
+            }
+
+            case AmirInstruction::Kind::Store: {
+                if (instruction.operands.empty()) {
+                    result.ok = false; result.error = "malformed STORE"; return result;
+                }
+                const int target_slot = slot_of(instruction.target);
+                const int value_slot = slot_of(instruction.operands.front());
+                if (target_slot < 0 || value_slot < 0) {
+                    result.ok = false;
+                    result.error = "STORE references an unknown value";
+                    return result;
+                }
+                if (value_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(value_slot));
+                else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(value_slot));
+                if (target_slot <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(target_slot), Reg::RAX);
+                else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(target_slot), Reg::RAX);
                 break;
             }
 
@@ -2136,6 +3313,273 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 result.text.jmp_rel8(-3);
                 break;
 
+            case AmirInstruction::Kind::CpuPause:
+                result.text.pause();
+                break;
+
+            case AmirInstruction::Kind::Port: {
+                if (instruction.operands.empty()) {
+                    result.ok = false;
+                    result.error = "malformed PORT." + instruction.target;
+                    return result;
+                }
+                const std::string port_type = instruction.operand_types.empty() ? "IOPORT" : instruction.operand_types.front();
+                if (!load_value(instruction.operands[0], port_type, Reg::RAX)) return result;
+                result.text.mov_reg_reg(Reg::RDX, Reg::RAX);
+                if (instruction.target == "ADDRESS") {
+                    if (!store_result(instruction.result, "IOPORT")) return result;
+                } else if (instruction.target == "OFFSET") {
+                    if (instruction.operands.size() != 2 || !load_value(instruction.operands[1], "I16", Reg::RCX)) return result;
+                    result.text.add_reg_reg(Reg::RDX, Reg::RCX);
+                    result.text.and_reg_imm32(Reg::RDX, 0xFFFF);
+                    result.text.mov_reg_reg(Reg::RAX, Reg::RDX);
+                    if (!store_result(instruction.result, "IOPORT")) return result;
+                } else {
+                    const bool read = instruction.target == "READ8" || instruction.target == "READ16" || instruction.target == "READ32";
+                    const bool write = instruction.target == "WRITE8" || instruction.target == "WRITE16" || instruction.target == "WRITE32";
+                    if (!read && !write) {
+                        result.ok = false;
+                        result.error = "unsupported systems port operation " + instruction.target;
+                        return result;
+                    }
+                    const std::string width = instruction.target.substr(read ? 4 : 5);
+                    const std::string value_type = "U" + width;
+                    if (write) {
+                        if (instruction.operands.size() != 2 || !load_value(instruction.operands[1], value_type, Reg::RCX)) return result;
+                        result.text.mov_reg_reg(Reg::RAX, Reg::RCX);
+                        if (width == "8") result.text.out_dx_al();
+                        else if (width == "16") result.text.out_dx_ax();
+                        else result.text.out_dx_eax();
+                    } else {
+                        if (width == "8") result.text.in_al_dx();
+                        else if (width == "16") result.text.in_ax_dx();
+                        else result.text.in_eax_dx();
+                        if (!store_result(instruction.result, value_type)) return result;
+                    }
+                }
+                break;
+            }
+
+            case AmirInstruction::Kind::Barrier:
+                if (instruction.target == "READBARRIER") result.text.lfence();
+                else if (instruction.target == "WRITEBARRIER") result.text.sfence();
+                else if (instruction.target == "MEMORYBARRIER") result.text.mfence();
+                else if (instruction.target == "DISABLEINTERRUPTS") result.text.cli();
+                else if (instruction.target == "ENABLEINTERRUPTS") result.text.sti();
+                else if (instruction.target == "BREAKPOINT") result.text.int3();
+                else { result.ok = false; result.error = "unsupported memory barrier " + instruction.target; return result; }
+                break;
+
+            case AmirInstruction::Kind::Memory: {
+                const std::string op = instruction.target;
+                if (op == "READRSP") {
+                    result.text.mov_rax_rsp();
+                    if (!store_result(instruction.result, "U64")) return result;
+                    break;
+                }
+                if (op == "READCR3") {
+                    result.text.mov_rax_cr3();
+                    if (!store_result(instruction.result, "U64")) return result;
+                    break;
+                }
+                if (op == "READCR2") {
+                    result.text.mov_rax_cr2();
+                    if (!store_result(instruction.result, "U64")) return result;
+                    break;
+                }
+                if (op == "WRITECR3" || op == "INVLPG") {
+                    if (instruction.operands.size() != 1 || !load_value(instruction.operands[0], "U64", Reg::RAX)) return result;
+                    if (op == "WRITECR3") result.text.mov_cr3_rax();
+                    else result.text.invlpg_rax();
+                    break;
+                }
+                if (op == "LGDT" || op == "LIDT" || op == "LTR") {
+                    if (instruction.operands.size() != 1 || !load_value(instruction.operands[0], "U64", Reg::RAX)) { result.ok = false; result.error = "malformed descriptor-table operation"; return result; }
+                    if (op == "LGDT") result.text.lgdt_rax();
+                    else if (op == "LIDT") result.text.lidt_rax();
+                    else result.text.ltr_rax();
+                    break;
+                }
+                if (instruction.operands.empty()) { result.ok = false; result.error = "malformed memory operation"; return result; }
+                if (op == "GRAPHICSBIND") {
+                    if (instruction.operands.size() != 1 || !load_value(instruction.operands[0], "SURFACE", Reg::RAX)) return result;
+                    const int surface_offset = scratch_base + 24;
+                    if (surface_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(surface_offset), Reg::RAX);
+                    else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(surface_offset), Reg::RAX);
+                    break;
+                }
+                if (op == "LOCAL") {
+                    if (instruction.operands.size() != 1) { result.ok = false; result.error = "ADDRESS.LOCAL requires one local variable"; return result; }
+                    const int local_offset = slot_of(instruction.operands[0]);
+                    if (local_offset < 0) { result.ok = false; result.error = "ADDRESS.LOCAL references an unknown local"; return result; }
+                    if (local_offset <= 127) result.text.lea_rsp_disp8(Reg::RAX, static_cast<std::uint8_t>(local_offset));
+                    else result.text.lea_rsp_disp32(Reg::RAX, static_cast<std::uint32_t>(local_offset));
+                    if (!store_result(instruction.result, "PTR")) return result;
+                    break;
+                }
+                if (op == "GOPDISCOVER") {
+                    if (!load_value(instruction.operands[0], "UEFI.SystemTable", Reg::RAX)) return result;
+                    result.text.mov_load_disp8(Reg::R11, Reg::RAX, 0x60); // SystemTable.BootServices
+                    const int guid_offset = scratch_base;
+                    const int output_offset = scratch_base + 16;
+                    result.text.mov_reg_imm64(Reg::RDX, 0x4A3823DC9042A9DEULL);
+                    if (guid_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(guid_offset), Reg::RDX);
+                    else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(guid_offset), Reg::RDX);
+                    result.text.mov_reg_imm64(Reg::RDX, 0x6A5180D0DE7AFB96ULL);
+                    if (guid_offset + 8 <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(guid_offset + 8), Reg::RDX);
+                    else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(guid_offset + 8), Reg::RDX);
+                    if (guid_offset <= 127) result.text.lea_rsp_disp8(Reg::RCX, static_cast<std::uint8_t>(guid_offset));
+                    else result.text.lea_rsp_disp32(Reg::RCX, static_cast<std::uint32_t>(guid_offset));
+                    result.text.xor_rdx_rdx();
+                    if (output_offset <= 127) result.text.lea_rsp_disp8(Reg::R8, static_cast<std::uint8_t>(output_offset));
+                    else result.text.lea_rsp_disp32(Reg::R8, static_cast<std::uint32_t>(output_offset));
+                    result.text.mov_reg_imm64(Reg::RAX, 0);
+                    if (output_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(output_offset), Reg::RAX);
+                    else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(output_offset), Reg::RAX);
+                    result.text.call_indirect_disp32(Reg::R11, 0x140);
+                    // LocateProtocol returns EFI_STATUS in RAX. Do not consume the output
+                    // pointer unless the status is EFI_SUCCESS (zero). A failed discovery is
+                    // represented as a null typed GOP value for source-level guards.
+                    result.text.cmp_rax_imm8(0);
+                    const std::size_t failed_displacement = result.text.jcc_rel32_placeholder(0x5); // JNE
+                    if (output_offset <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(output_offset));
+                    else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(output_offset));
+                    const std::size_t success_jump = result.text.jmp_rel32_placeholder();
+                    const std::size_t failure_target = result.text.size();
+                    result.text.mov_reg_imm64(Reg::RAX, 0);
+                    const std::size_t done_target = result.text.size();
+                    result.text.patch_i32(failed_displacement, static_cast<std::int32_t>(failure_target) -
+                        static_cast<std::int32_t>(failed_displacement + 4));
+                    result.text.patch_i32(success_jump, static_cast<std::int32_t>(done_target) -
+                        static_cast<std::int32_t>(success_jump + 4));
+                    if (!store_result(instruction.result, "UEFI.GraphicsOutputProtocol")) return result;
+                    break;
+                }
+                if (op.rfind("GOP", 0) == 0 && op != "GOPDISCOVER") {
+                    if (!load_value(instruction.operands[0], "UEFI.GraphicsOutputProtocol", Reg::RAX)) return result;
+                    result.text.mov_load_disp8(Reg::RAX, Reg::RAX, 0x18); // GOP.Mode
+                    if (op == "GOPMODE") {
+                        if (!store_result(instruction.result, "UEFI.GraphicsOutputMode")) return result;
+                        break;
+                    }
+                    const bool info_field = op == "GOPWIDTH" || op == "GOPHEIGHT" || op == "GOPPIXELSPERSCANLINE" || op == "GOPPIXELFORMAT";
+                    if (info_field) result.text.mov_load_disp8(Reg::RAX, Reg::RAX, 0x08); // Mode.Info
+                    int offset = 0x18;
+                    if (op == "GOPFRAMEBUFFERSIZE") offset = 0x20;
+                    else if (op == "GOPWIDTH") offset = 0x04;
+                    else if (op == "GOPHEIGHT") offset = 0x08;
+                    else if (op == "GOPPIXELSPERSCANLINE") offset = 0x20;
+                    else if (op == "GOPPIXELFORMAT") offset = 0x0C;
+                    if (info_field) {
+                        if (offset <= 127) result.text.mov_load32_disp8(Reg::RAX, Reg::RAX, static_cast<std::uint8_t>(offset));
+                        else result.text.mov_load32_disp32(Reg::RAX, Reg::RAX, static_cast<std::uint32_t>(offset));
+                    } else {
+                        if (offset <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RAX, static_cast<std::uint8_t>(offset));
+                        else result.text.mov_load_disp32(Reg::RAX, Reg::RAX, static_cast<std::uint32_t>(offset));
+                    }
+                    if (!store_result(instruction.result, instruction.result_type)) return result;
+                    break;
+                }
+                const bool physical_write = op == "PHYSICALWRITE64";
+                if (op == "OFFSET") {
+                    if (instruction.operands.size() != 2) { result.ok = false; result.error = "ADDRESS.OFFSET requires two operands"; return result; }
+                    if (!load_value(instruction.operands[0], instruction.operand_types.empty() ? "VIRTUALPTR" : instruction.operand_types.front(), Reg::RAX)) return result;
+                    if (!load_value(instruction.operands[1], instruction.operand_types.size() > 1 ? instruction.operand_types[1] : "I64", Reg::RCX)) return result;
+                    result.text.add_reg_reg(Reg::RAX, Reg::RCX);
+                    if (!store_result(instruction.result, instruction.result_type.empty() ? "VIRTUALPTR" : instruction.result_type)) return result;
+                    break;
+                }
+                if (op == "ALIGNDOWN" || op == "ALIGNUP" || op == "ISALIGNED") {
+                    if (instruction.operands.size() != 2) { result.ok = false; result.error = "address alignment operation requires two operands"; return result; }
+                    if (!load_value(instruction.operands[0], instruction.operand_types.empty() ? "VIRTUALPTR" : instruction.operand_types.front(), Reg::RAX) ||
+                        !load_value(instruction.operands[1], instruction.operand_types.size() > 1 ? instruction.operand_types[1] : "U64", Reg::RCX)) return result;
+                    if (op == "ISALIGNED") {
+                        result.text.mov_reg_reg(Reg::RDX, Reg::RCX);
+                        result.text.mov_reg_imm64(Reg::RCX, 1);
+                        result.text.sub_reg_reg(Reg::RDX, Reg::RCX);
+                        result.text.and_reg_reg(Reg::RAX, Reg::RDX);
+                        result.text.cmp_reg_imm32(Reg::RAX, 0);
+                        result.text.setcc_al(0x04);
+                        result.text.movzx_eax_al();
+                        if (!store_result(instruction.result, "BOOL")) return result;
+                    } else {
+                        result.text.mov_reg_imm64(Reg::RDX, 1);
+                        if (op == "ALIGNUP") { result.text.sub_reg_reg(Reg::RCX, Reg::RDX); result.text.add_reg_reg(Reg::RAX, Reg::RCX); }
+                        result.text.not_reg(Reg::RCX);
+                        result.text.and_reg_reg(Reg::RAX, Reg::RCX);
+                        if (!store_result(instruction.result, instruction.result_type.empty() ? "VIRTUALPTR" : instruction.result_type)) return result;
+                    }
+                    break;
+                }
+                if (op == "PHYSICAL" || op == "VIRTUAL" || op == "MMIO" || op == "VALUE" || op == "MAP" || op == "MAPDEVICE") {
+                    if (!load_value(instruction.operands[0], instruction.operand_types.empty() ? "U64" : instruction.operand_types.front(), Reg::RAX)) return result;
+                    if (!store_result(instruction.result, instruction.result_type.empty() ? "U64" : instruction.result_type)) return result;
+                    break;
+                }
+                const bool read = op == "READ8" || op == "READ16" || op == "READ32" || op == "READ64";
+                const bool write = op == "WRITE8" || op == "WRITE16" || op == "WRITE32" || op == "WRITE64" || physical_write;
+                if (!read && !write) { result.ok = false; result.error = "unsupported memory operation " + op; return result; }
+                if (!load_value(instruction.operands[0], instruction.operand_types.empty() ? (physical_write ? "PHYSICALPTR" : "VIRTUALPTR") : instruction.operand_types.front(), Reg::RAX)) return result;
+                if (read) {
+                    if (op == "READ8") result.text.mov_load8_rax();
+                    else if (op == "READ16") result.text.mov_load16_rax();
+                    else if (op == "READ32") result.text.mov_load32_rax();
+                    else result.text.mov_load64_rax();
+                    if (!store_result(instruction.result, instruction.result_type)) return result;
+                } else {
+                    if (instruction.operands.size() < 2 || !load_value(instruction.operands[1], instruction.operand_types.size() > 1 ? instruction.operand_types[1] : "U64", Reg::RCX)) return result;
+                    if (physical_write) result.text.mov_store64_rax_from_rcx();
+                    else if (op == "WRITE8") result.text.mov_store8_rax_from_cl();
+                    else if (op == "WRITE16") result.text.mov_store16_rax_from_cx();
+                    else if (op == "WRITE32") result.text.mov_store32_rax_from_ecx();
+                    else result.text.mov_store64_rax_from_rcx();
+                }
+                break;
+            }
+
+            case AmirInstruction::Kind::CallValue: {
+                const AmirFunction* callee = nullptr;
+                for (const auto& candidate : module.functions) {
+                    if (candidate.name == instruction.target) { callee = &candidate; break; }
+                }
+                if (!callee) {
+                    result.ok = false;
+                    result.error = "freestanding call target \"" + instruction.target + "\" is not a declared function";
+                    return result;
+                }
+                if (instruction.operands.size() != callee->params.size()) {
+                    result.ok = false;
+                    result.error = "call to \"" + instruction.target + "\" expects " +
+                        std::to_string(callee->params.size()) + " arguments, got " + std::to_string(instruction.operands.size());
+                    return result;
+                }
+                const auto call_locations = systems::assign_argument_locations(static_cast<int>(instruction.operands.size()));
+                for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
+                    const int argument_slot = slot_of(instruction.operands[i]);
+                    if (argument_slot < 0) {
+                        result.ok = false;
+                        result.error = "internal call argument \"" + instruction.operands[i] + "\" has no assigned stack slot";
+                        return result;
+                    }
+                    if (call_locations[i].in_register) {
+                        if (argument_slot <= 127) result.text.mov_load_disp8(kRegisterByName.at(call_locations[i].register_name), Reg::RSP,
+                            static_cast<std::uint8_t>(argument_slot));
+                        else result.text.mov_load_disp32(kRegisterByName.at(call_locations[i].register_name), Reg::RSP,
+                            static_cast<std::uint32_t>(argument_slot));
+                    } else {
+                        if (argument_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(argument_slot));
+                        else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(argument_slot));
+                        const std::uint32_t outgoing_offset = static_cast<std::uint32_t>(outgoing_base + 8 * (static_cast<int>(i) - 4));
+                        if (outgoing_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(outgoing_offset), Reg::RAX);
+                        else result.text.mov_store_disp32(Reg::RSP, outgoing_offset, Reg::RAX);
+                    }
+                }
+                const auto call_disp = result.text.call_rel32_placeholder();
+                result.internal_calls.push_back({call_disp, instruction.target});
+                if (!store_result(instruction.result, instruction.result_type.empty() ? callee->return_type : instruction.result_type)) return result;
+                break;
+            }
+
             case AmirInstruction::Kind::CallExternal: {
                 const auto dot = instruction.target.find('.');
                 if (dot == std::string::npos) {
@@ -2144,12 +3588,14 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     return result;
                 }
                 const std::string receiver = instruction.target.substr(0, dot);
-                std::string receiver_type;
+                std::string receiver_type = instruction.operand_types.empty() ? "" : instruction.operand_types.front();
+                if (receiver_type.empty()) {
                 for (const auto& declared_parameter : target->params) {
                     if (bare_parameter_name(declared_parameter) == receiver) {
                         receiver_type = declared_parameter_type(declared_parameter);
                         break;
                     }
+                }
                 }
                 auto current_type = systems::lookup_uefi_type(receiver_type);
                 if (!current_type) {
@@ -2164,7 +3610,8 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     result.error = "external call receiver \"" + receiver + "\" has no assigned stack slot";
                     return result;
                 }
-                result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(receiver_slot));
+                if (receiver_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(receiver_slot));
+                else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(receiver_slot));
 
                 std::string remaining = instruction.target.substr(dot + 1);
                 const systems::UefiField* final_field = nullptr;
@@ -2181,7 +3628,8 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                         final_field = field;
                         break;
                     }
-                    result.text.mov_load_disp8(Reg::RAX, Reg::RAX, static_cast<std::uint8_t>(field->offset_bytes));
+                    if (field->offset_bytes <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RAX, static_cast<std::uint8_t>(field->offset_bytes));
+                    else result.text.mov_load_disp32(Reg::RAX, Reg::RAX, static_cast<std::uint32_t>(field->offset_bytes));
                     const std::string next_type_name = field->result_type;
                     current_type = systems::lookup_uefi_type(next_type_name);
                     if (!current_type) {
@@ -2202,18 +3650,26 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 const int explicit_arg_count = static_cast<int>(instruction.operands.size());
                 const auto locations = systems::assign_argument_locations(
                     explicit_arg_count + (final_field->implicit_this_argument ? 1 : 0));
+                const bool has_stack_arguments = std::any_of(locations.begin(), locations.end(),
+                    [](const systems::ArgumentLocation& location) { return !location.in_register; });
+                if (has_stack_arguments) {
+                    // RAX currently holds the resolved protocol method table. Preserve it while
+                    // loading values for outgoing stack arguments; R11 is caller-saved under the
+                    // Microsoft x64 ABI and is safe until the indirect call.
+                    result.text.mov_reg_reg(Reg::R11, Reg::RAX);
+                }
                 std::size_t location_index = 0;
                 if (final_field->implicit_this_argument) {
-                    result.text.mov_reg_reg(kRegisterByName.at(locations[location_index].register_name), Reg::RAX);
+                    if (locations[location_index].in_register) {
+                        result.text.mov_reg_reg(kRegisterByName.at(locations[location_index].register_name), Reg::RAX);
+                    } else {
+                        result.ok = false;
+                        result.error = "external call \"" + instruction.target + "\" cannot pass implicit This on the stack";
+                        return result;
+                    }
                     ++location_index;
                 }
                 for (int i = 0; i < explicit_arg_count; ++i, ++location_index) {
-                    if (!locations[location_index].in_register) {
-                        result.ok = false;
-                        result.error = "external call \"" + instruction.target + "\" has more arguments than "
-                            "this milestone's code generator supports in registers";
-                        return result;
-                    }
                     const int argument_slot = slot_of(instruction.operands[static_cast<std::size_t>(i)]);
                     if (argument_slot < 0) {
                         result.ok = false;
@@ -2221,16 +3677,34 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                             "\" has no assigned stack slot";
                         return result;
                     }
-                    result.text.mov_load_disp8(kRegisterByName.at(locations[location_index].register_name), Reg::RSP,
-                                                static_cast<std::uint8_t>(argument_slot));
+                    if (locations[location_index].in_register) {
+                        if (argument_slot <= 127) result.text.mov_load_disp8(kRegisterByName.at(locations[location_index].register_name), Reg::RSP,
+                                                    static_cast<std::uint8_t>(argument_slot));
+                        else result.text.mov_load_disp32(kRegisterByName.at(locations[location_index].register_name), Reg::RSP,
+                                                    static_cast<std::uint32_t>(argument_slot));
+                    } else {
+                        if (argument_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(argument_slot));
+                        else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(argument_slot));
+                        const std::uint32_t outgoing_offset = static_cast<std::uint32_t>(outgoing_base +
+                            8 * (static_cast<int>(location_index) - 4));
+                        if (outgoing_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(outgoing_offset), Reg::RAX);
+                        else result.text.mov_store_disp32(Reg::RSP, outgoing_offset, Reg::RAX);
+                    }
                 }
 
                 if (final_field->offset_bytes <= 0x7F) {
-                    result.text.call_indirect_disp8(Reg::RAX, static_cast<std::uint8_t>(final_field->offset_bytes));
+                    result.text.call_indirect_disp8(has_stack_arguments ? Reg::R11 : Reg::RAX, static_cast<std::uint8_t>(final_field->offset_bytes));
                 } else {
-                    result.text.call_indirect_disp32(Reg::RAX, static_cast<std::uint32_t>(final_field->offset_bytes));
+                    result.text.call_indirect_disp32(has_stack_arguments ? Reg::R11 : Reg::RAX, static_cast<std::uint32_t>(final_field->offset_bytes));
                 }
-                result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(slot_of(instruction.result)), Reg::RAX);
+                const int result_slot = slot_of(instruction.result);
+                if (result_slot < 0) {
+                    result.ok = false;
+                    result.error = "external call result has no assigned stack slot";
+                    return result;
+                }
+                if (result_slot <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(result_slot), Reg::RAX);
+                else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(result_slot), Reg::RAX);
                 break;
             }
 
@@ -2243,9 +3717,11 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                         result.error = "RETURN of \"" + value_ref + "\" has no assigned stack slot";
                         return result;
                     }
-                    result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(value_slot));
+                    if (value_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(value_slot));
+                    else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(value_slot));
                 }
-                result.text.add_rsp_imm8(static_cast<std::uint8_t>(frame_size));
+                if (frame_size <= 255) result.text.add_rsp_imm8(static_cast<std::uint8_t>(frame_size));
+                else result.text.add_rsp_imm32(static_cast<std::uint32_t>(frame_size));
                 result.text.ret();
                 break;
             }
@@ -2255,9 +3731,107 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 result.error = "this milestone's code generator does not support this A-MIR instruction kind";
                 return result;
         }
+        }
+    }
+
+    for (const auto& fixup : branch_fixups) {
+        const auto target_offset = block_offsets.find(fixup.target);
+        if (target_offset == block_offsets.end()) {
+            result.ok = false;
+            result.error = "unresolved x86-64 branch target \"" + fixup.target + "\"";
+            return result;
+        }
+        const std::int64_t next_instruction = static_cast<std::int64_t>(fixup.displacement_offset + 4);
+        const std::int64_t displacement = static_cast<std::int64_t>(target_offset->second) - next_instruction;
+        if (displacement < std::numeric_limits<std::int32_t>::min() || displacement > std::numeric_limits<std::int32_t>::max()) {
+            result.ok = false;
+            result.error = "x86-64 branch displacement overflow for target \"" + fixup.target + "\"";
+            return result;
+        }
+        result.text.patch_i32(fixup.displacement_offset, static_cast<std::int32_t>(displacement));
     }
 
     return result;
+}
+
+// Emit the entry function followed by every declared helper. Calls use rel32 displacements and
+// are patched only after all function bases are known. The synthetic top-level wrapper is omitted
+// when a real function with the same name is selected, preserving the existing last-declaration
+// entry rule.
+X86_64CodegenResult generate_x86_64_program(const AmirModule& module, const std::string& entry_function) {
+    X86_64CodegenResult combined;
+    combined.entry_symbol = entry_function;
+    std::vector<std::pair<std::string, X86_64CodegenResult>> fragments;
+    std::unordered_set<std::string> emitted;
+    auto add_fragment = [&](const std::string& name) -> bool {
+        if (!emitted.insert(name).second) return true;
+        auto fragment = generate_x86_64_function(module, name);
+        if (!fragment.ok) { combined.ok = false; combined.error = fragment.error; return false; }
+        fragments.emplace_back(name, std::move(fragment));
+        return true;
+    };
+    if (!add_fragment(entry_function)) return combined;
+    for (const auto& function : module.functions) {
+        if (function.name == entry_function) continue;
+        bool declaration_wrapper = false;
+        if (function.name == "Main") {
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    if (instruction.kind == AmirInstruction::Kind::DeclareFunction) {
+                        declaration_wrapper = true;
+                        break;
+                    }
+                }
+                if (declaration_wrapper) break;
+            }
+        }
+        if (declaration_wrapper) continue;
+        bool has_body = false;
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (instruction.kind != AmirInstruction::Kind::DeclareFunction) {
+                    has_body = true;
+                    break;
+                }
+            }
+            if (has_body) break;
+        }
+        if (!has_body) continue; // synthetic declaration-only wrapper
+        if (!add_fragment(function.name)) return combined;
+    }
+
+    std::unordered_map<std::string, std::size_t> function_offsets;
+    for (const auto& fragment : fragments) {
+        function_offsets[fragment.first] = combined.text.size();
+        const auto text_base = combined.text.size();
+        const auto rdata_base = combined.rdata.size();
+        combined.text.append_bytes(fragment.second.text.bytes());
+        combined.rdata.insert(combined.rdata.end(), fragment.second.rdata.begin(), fragment.second.rdata.end());
+        for (const auto& relocation : fragment.second.relocations) {
+            combined.relocations.push_back({text_base + relocation.disp_field_offset,
+                text_base + relocation.instruction_end_offset, rdata_base + relocation.rdata_offset});
+        }
+        for (const auto& call : fragment.second.internal_calls) {
+            combined.internal_calls.push_back({text_base + call.disp_field_offset, call.target});
+        }
+    }
+    for (const auto& call : combined.internal_calls) {
+        const auto target = function_offsets.find(call.target);
+        if (target == function_offsets.end()) {
+            combined.ok = false;
+            combined.error = "unresolved internal function target \"" + call.target + "\"";
+            return combined;
+        }
+        const std::int64_t next_instruction = static_cast<std::int64_t>(call.disp_field_offset + 4);
+        const std::int64_t displacement = static_cast<std::int64_t>(target->second) - next_instruction;
+        if (displacement < std::numeric_limits<std::int32_t>::min() || displacement > std::numeric_limits<std::int32_t>::max()) {
+            combined.ok = false;
+            combined.error = "internal call displacement overflow for target \"" + call.target + "\"";
+            return combined;
+        }
+        combined.text.patch_i32(call.disp_field_offset, static_cast<std::int32_t>(displacement));
+    }
+    return combined;
 }
 
 std::string render_x86_64(const X86_64CodegenResult& codegen) {
@@ -2289,11 +3863,15 @@ std::string render_x86_64(const X86_64CodegenResult& codegen) {
             << relocation.rdata_offset << " (instruction ends at TEXT+" << relocation.instruction_end_offset
             << ")" << std::dec << "\n";
     }
+    out << "\nINTERNAL_CALLS " << codegen.internal_calls.size() << "\n";
+    for (const auto& call : codegen.internal_calls) {
+        out << "    TEXT+" << std::hex << call.disp_field_offset << " REL32_TO " << call.target << std::dec << "\n";
+    }
     return out.str();
 }
 
 Value parse_constant_value(const std::string& text) {
-    if (text == "nothing") {
+    if (text == "nothing" || text == "null") {
         return Value();
     }
     if (text == "true") {
@@ -2302,8 +3880,14 @@ Value parse_constant_value(const std::string& text) {
     if (text == "false") {
         return false;
     }
+    if (text == "[]") {
+        return Value(Value::Array{});
+    }
     if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
         return unquote_constant(text);
+    }
+    if (text.rfind("BITS \"", 0) == 0 && text.size() >= 7 && text.back() == '"') {
+        return Value(BitVector::from_string(text.substr(6, text.size() - 7)));
     }
     return std::stod(text);
 }
@@ -2327,6 +3911,12 @@ Value eval_unary(const std::string& op, const Value& value) {
 
 Value eval_binary(const std::string& op, const Value& left, const Value& right) {
     if (op == "+") {
+        if (left.is_bit_vector() || right.is_bit_vector()) {
+            if (!left.is_bit_vector() || !right.is_bit_vector()) {
+                throw std::runtime_error("bit vector concatenation requires two BITVECTOR values");
+            }
+            return Value(BitVector::from_string(left.as_bit_vector().string() + right.as_bit_vector().string()));
+        }
         if (left.is_string() || right.is_string()) {
             return left.to_string() + right.to_string();
         }
@@ -2396,7 +3986,26 @@ Value eval_binary(const std::string& op, const Value& left, const Value& right) 
             }
             return false;
         }
+        if (left.is_range()) {
+            const double value = right.as_number();
+            if (!std::isfinite(value) || std::floor(value) != value) return false;
+            return left.as_range().contains(static_cast<long long>(value));
+        }
         return left.to_string().find(right.to_string()) != std::string::npos;
+    }
+    if (op == "IN") {
+        if (right.is_array()) {
+            for (const auto& item : right.as_array()) {
+                if (values_equal(left, item)) return true;
+            }
+            return false;
+        }
+        if (right.is_range()) {
+            const double value = left.as_number();
+            if (!std::isfinite(value) || std::floor(value) != value) return false;
+            return right.as_range().contains(static_cast<long long>(value));
+        }
+        return right.to_string().find(left.to_string()) != std::string::npos;
     }
     throw std::runtime_error("unsupported bytecode binary operator: " + op);
 }
@@ -2469,11 +4078,35 @@ Value index_value(const Value& target, const Value& index_value) {
     }
     if (target.is_string()) {
         const int index = static_cast<int>(index_value.as_number());
-        const std::string text = target.to_string();
-        if (index < 0 || static_cast<std::size_t>(index) >= text.size()) {
+        const auto points = utf8_codepoints(target.to_string());
+        if (index < 0 || static_cast<std::size_t>(index) >= points.size()) {
             throw std::runtime_error("string index out of range");
         }
-        return std::string(1, text[static_cast<std::size_t>(index)]);
+        return points[static_cast<std::size_t>(index)];
+    }
+    if (target.is_bit_vector()) {
+        const double numeric_index = index_value.as_number();
+        if (!std::isfinite(numeric_index) || std::floor(numeric_index) != numeric_index || numeric_index < 0 ||
+            numeric_index >= static_cast<double>(target.as_bit_vector().length)) {
+            throw std::runtime_error("bit vector index out of range");
+        }
+        return target.as_bit_vector().get(static_cast<std::size_t>(numeric_index)) ? 1.0 : 0.0;
+    }
+    if (target.is_tuple()) {
+        const double numeric_index = index_value.as_number();
+        if (!std::isfinite(numeric_index) || std::floor(numeric_index) != numeric_index || numeric_index < 0 ||
+            numeric_index >= static_cast<double>(target.as_tuple().size())) {
+            throw std::runtime_error("tuple index out of range");
+        }
+        return target.as_tuple()[static_cast<std::size_t>(numeric_index)];
+    }
+    if (target.is_range()) {
+        const double numeric_index = index_value.as_number();
+        if (!std::isfinite(numeric_index) || std::floor(numeric_index) != numeric_index || numeric_index < 0 ||
+            numeric_index >= static_cast<double>(target.as_range().length)) {
+            throw std::runtime_error("range index out of range");
+        }
+        return static_cast<double>(target.as_range().at(static_cast<std::size_t>(numeric_index)));
     }
     if (target.is_object()) {
         return target.get_property(index_value.to_string());
@@ -2539,12 +4172,20 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
 
     BytecodeFrame frame;
     for (std::size_t i = 0; i < function.params.size(); ++i) {
-        if (i >= args.size()) {
-            break;
-        }
         for (std::size_t local_index = 0; local_index < function.locals.size(); ++local_index) {
-            if (function.locals[local_index] == function.params[i]) {
-                frame.locals["L" + std::to_string(local_index)] = args[i];
+            if (local_base_name(function.locals[local_index]) == local_base_name(function.params[i])) {
+                if (i < args.size()) {
+                    frame.locals["L" + std::to_string(local_index)] = args[i];
+                } else {
+                    // Caller omitted this argument. Fall back to the parameter's own default
+                    // expression (rendered into the params descriptor by parameter_text) instead
+                    // of leaving the local unbound, which previously surfaced as an opaque
+                    // "undefined bytecode local" failure the first time the body read it.
+                    const std::string default_text = param_default_text(function.params[i]);
+                    if (!default_text.empty()) {
+                        frame.locals["L" + std::to_string(local_index)] = parse_constant_value(default_text);
+                    }
+                }
                 break;
             }
         }
@@ -2552,6 +4193,7 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
 
     Cursor cursor{0, 0};
     std::vector<TryHandler> try_stack;
+    int current_source_line = 0;
     while (cursor.block < function.blocks.size()) {
         const BytecodeBlock& block = function.blocks[cursor.block];
         if (cursor.instruction >= block.instructions.size()) {
@@ -2562,7 +4204,9 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
         try {
             switch (instruction.op) {
             case BytecodeOp::Label:
+                break;
             case BytecodeOp::Source:
+                if (!instruction.operands.empty()) current_source_line = std::stoi(instruction.operands.front());
                 break;
             case BytecodeOp::Const:
                 frame.temps[instruction.operands[0]] = operand_value(module, function, frame, instruction.operands[1]);
@@ -2591,6 +4235,21 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 runtime.set_global(local_name(function, instruction.operands[0]), target);
                 break;
             }
+            case BytecodeOp::StoreSlice: {
+                if (instruction.operands.size() != 4) throw std::runtime_error("STORE_SLICE expects four operands");
+                Value target = operand_value(module, function, frame, instruction.operands[0]);
+                const Value first = operand_value(module, function, frame, instruction.operands[1]);
+                const Value last = operand_value(module, function, frame, instruction.operands[2]);
+                const Value replacement = operand_value(module, function, frame, instruction.operands[3]);
+                const auto start = first.is_null() ? std::nullopt
+                    : std::optional<long long>(exact_slice_integer(first.as_number(), "start"));
+                const auto end = last.is_null() ? std::nullopt
+                    : std::optional<long long>(exact_slice_integer(last.as_number(), "end"));
+                target = replace_array_slice(target, start, end, replacement);
+                frame.locals[instruction.operands[0]] = target;
+                runtime.set_global(local_name(function, instruction.operands[0]), target);
+                break;
+            }
             case BytecodeOp::Unary:
                 frame.temps[instruction.operands[0]] = eval_unary(instruction.operands[1], operand_value(module, function, frame, instruction.operands[2]));
                 break;
@@ -2603,7 +4262,37 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 for (std::size_t i = 2; i < instruction.operands.size(); ++i) {
                     args.push_back(operand_value(module, function, frame, instruction.operands[i]));
                 }
-                if (const BytecodeFunction* user_function = find_function(module, instruction.operands[1])) {
+                std::optional<Value> callable_target;
+                for (std::size_t local_index = 0; local_index < function.locals.size(); ++local_index) {
+                    if (local_base_name(function.locals[local_index]) == instruction.operands[1]) {
+                        const std::string ref = "L" + std::to_string(local_index);
+                        const auto found = frame.locals.find(ref);
+                        if (found != frame.locals.end() && runtime.is_callable(found->second)) {
+                            callable_target = found->second;
+                        }
+                        break;
+                    }
+                }
+                if (!callable_target.has_value() && runtime.has_global(instruction.operands[1]) &&
+                    runtime.is_callable(runtime.get_global(instruction.operands[1]))) {
+                    callable_target = runtime.get_global(instruction.operands[1]);
+                }
+                if (callable_target.has_value()) {
+                    const Value callable = *callable_target;
+                    const CallableDescriptor descriptor = runtime.callable_descriptor(callable);
+                    std::string resolved_name = descriptor.name;
+                    if (descriptor.receiver.has_value()) {
+                        const std::string method = resolved_name.substr(resolved_name.rfind('.') + 1);
+                        resolved_name = descriptor.receiver->get_property("__class").to_string() + "." + method;
+                        args.insert(args.begin(), *descriptor.receiver);
+                    }
+                    if (const BytecodeFunction* user_function = find_function(module, resolved_name)) {
+                        frame.temps[instruction.operands[0]] = execute_function(module, *user_function, runtime, args);
+                    } else {
+                        frame.temps[instruction.operands[0]] = runtime.call_callable(callable,
+                            descriptor.receiver.has_value() ? std::vector<Value>(args.begin() + 1, args.end()) : args);
+                    }
+                } else if (const BytecodeFunction* user_function = find_function(module, instruction.operands[1])) {
                     frame.temps[instruction.operands[0]] = execute_function(module, *user_function, runtime, args);
                 } else {
                     frame.temps[instruction.operands[0]] = runtime.call_host_function(instruction.operands[1], args);
@@ -2633,6 +4322,14 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 frame.temps[instruction.operands[0]] = Value(std::move(values));
                 break;
             }
+            case BytecodeOp::Tuple: {
+                Value::Array values;
+                for (std::size_t i = 1; i < instruction.operands.size(); ++i) {
+                    values.push_back(operand_value(module, function, frame, instruction.operands[i]));
+                }
+                frame.temps[instruction.operands[0]] = Value::tuple(std::move(values));
+                break;
+            }
             case BytecodeOp::Object: {
                 Value::Object values;
                 for (std::size_t i = 1; i < instruction.operands.size(); ++i) {
@@ -2653,6 +4350,59 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 frame.temps[instruction.operands[0]] =
                     index_value(operand_value(module, function, frame, instruction.operands[1]), operand_value(module, function, frame, instruction.operands[2]));
                 break;
+            case BytecodeOp::Slice: {
+                if (instruction.operands.size() != 5) throw std::runtime_error("SLICE expects five operands");
+                const Value first = operand_value(module, function, frame, instruction.operands[2]);
+                const Value last = operand_value(module, function, frame, instruction.operands[3]);
+                const Value stride = operand_value(module, function, frame, instruction.operands[4]);
+                const auto start = first.is_null() ? std::nullopt
+                    : std::optional<long long>(exact_slice_integer(first.as_number(), "start"));
+                const auto end = last.is_null() ? std::nullopt
+                    : std::optional<long long>(exact_slice_integer(last.as_number(), "end"));
+                const long long step = stride.is_null() ? 1 : exact_slice_integer(stride.as_number(), "step");
+                frame.temps[instruction.operands[0]] = slice_value(
+                    operand_value(module, function, frame, instruction.operands[1]), start, end, step);
+                break;
+            }
+            case BytecodeOp::Copy:
+                if (instruction.operands.size() != 2) throw std::runtime_error("COPY expects two operands");
+                frame.temps[instruction.operands[0]] = shallow_copy_value(
+                    operand_value(module, function, frame, instruction.operands[1]));
+                break;
+            case BytecodeOp::Destructure: {
+                if (instruction.operands.size() < 2) throw std::runtime_error("DESTRUCTURE expects a source and targets");
+                const Value source = operand_value(module, function, frame, instruction.operands[0]);
+                if (!source.is_array() && !source.is_tuple()) {
+                    throw std::runtime_error("destructuring expects an array or tuple with arity " +
+                                             std::to_string(instruction.operands.size() - 1));
+                }
+                const auto& elements = source.is_tuple() ? source.as_tuple() : source.as_array();
+                if (elements.size() != instruction.operands.size() - 1) {
+                    throw std::runtime_error("destructuring arity mismatch: expected " +
+                        std::to_string(instruction.operands.size() - 1) + ", received " + std::to_string(elements.size()));
+                }
+                const Value::Array captured(elements.begin(), elements.end());
+                for (std::size_t i = 1; i < instruction.operands.size(); ++i) {
+                    frame.locals[instruction.operands[i]] = captured[i - 1];
+                    runtime.set_global(local_name(function, instruction.operands[i]), captured[i - 1]);
+                }
+                break;
+            }
+            case BytecodeOp::AddressOf: {
+                if (instruction.operands.size() != 2) throw std::runtime_error("ADDRESSOF expects a result and name");
+                const std::string name = instruction.operands[1];
+                const auto dot = name.find('.');
+                if (dot != std::string::npos && runtime.has_global(name.substr(0, dot))) {
+                    frame.temps[instruction.operands[0]] = runtime.make_callable(
+                        name, runtime.get_global(name.substr(0, dot)), false);
+                } else {
+                    if (!find_function(module, name) && !runtime.has_function(name)) {
+                        throw std::runtime_error("ADDRESSOF cannot resolve callable: " + name);
+                    }
+                    frame.temps[instruction.operands[0]] = runtime.make_callable(name, std::nullopt, false);
+                }
+                break;
+            }
             case BytecodeOp::Jump:
                 cursor = jump_to(instruction.operands.front());
                 break;
@@ -2668,6 +4418,20 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                     try_stack.pop_back();
                 }
                 break;
+            case BytecodeOp::Throw: {
+                if (instruction.operands.size() != 1) throw std::runtime_error("THROW expects one value");
+                const Value message = operand_value(module, function, frame, instruction.operands.front());
+                if (!message.is_string()) {
+                    std::string type = "Object";
+                    if (message.is_null()) type = "Null";
+                    else if (message.is_bool()) type = "Boolean";
+                    else if (message.is_number()) type = "Number";
+                    else if (message.is_array()) type = "Array";
+                    else if (message.is_handle()) type = message.as_handle().type;
+                    throw std::runtime_error("THROW message must be String; received " + type);
+                }
+                throw UserError(message.to_string(), current_source_line, 1);
+            }
             case BytecodeOp::DeclareFunction:
             case BytecodeOp::DeclareClass:
             case BytecodeOp::DeclareInterface:
@@ -2675,7 +4439,16 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
             case BytecodeOp::Return:
                 return instruction.operands.size() > 1 ? operand_value(module, function, frame, instruction.operands[1]) : Value();
             case BytecodeOp::Unsupported:
-                throw std::runtime_error("cannot execute unsupported bytecode instruction");
+                if (!instruction.operands.empty() &&
+                    (instruction.operands.back().rfind("PORT.", 0) == 0 || instruction.operands.back() == "CPU.Pause")) {
+                    throw std::runtime_error(instruction.operands.back() + " is available only on a freestanding target with port-I/O support");
+                }
+                if (!instruction.operands.empty() &&
+                    (instruction.operands.back().rfind("MEMORY.", 0) == 0 || instruction.operands.back().rfind("ADDRESS.", 0) == 0 || instruction.operands.back().rfind("CPU.", 0) == 0)) {
+                    throw std::runtime_error(instruction.operands.back() + " is available only on a freestanding target with memory support");
+                }
+                throw std::runtime_error("cannot execute unsupported bytecode instruction" +
+                                         (instruction.operands.empty() ? std::string() : ": " + instruction.operands.back()));
             default:
                 throw std::runtime_error("bytecode VM does not implement opcode yet: " + bytecode_op_name(instruction.op));
             }
@@ -2688,7 +4461,7 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
             if (!handler.error_name.empty()) {
                 Value::Object object;
                 object["Message"] = error.what();
-                object["Type"] = "RuntimeError";
+                object["Type"] = dynamic_cast<const UserError*>(&error) ? "UserError" : "RuntimeError";
                 const Value error_value(std::move(object));
                 bool stored_local = false;
                 for (std::size_t local_index = 0; local_index < function.locals.size(); ++local_index) {
@@ -2716,6 +4489,14 @@ Value execute_bytecode(const BytecodeModule& module, Runtime& runtime) {
     if (!main) {
         throw std::runtime_error("bytecode module has no Main function");
     }
+    for (const auto& function : module.functions) {
+        if (function.name == "Main") continue;
+        const BytecodeFunction* callable_function = &function;
+        runtime.register_function(function.name, [&module, &runtime, callable_function](const std::vector<Value>& args) {
+            return execute_function(module, *callable_function, runtime, args);
+        });
+    }
+    runtime.prepare_execution(module.instruction_limit);
     return execute_function(module, *main, runtime, {});
 }
 
@@ -2831,7 +4612,8 @@ bool is_elf64_file(const std::filesystem::path& path) {
 }
 #endif
 
-Result build_native_bytecode(const std::string& bytecode, const std::string& output_path) {
+Result build_native_bytecode(const std::string& bytecode, const std::string& output_path,
+                             std::optional<std::size_t> instruction_limit_override = std::nullopt) {
 #if defined(__linux__)
     try {
         const std::filesystem::path source_root = source_root_path();
@@ -2855,7 +4637,13 @@ Result build_native_bytecode(const std::string& bytecode, const std::string& out
                 << "\n"
                 << "int main() {\n"
                 << "    const std::string bytecode = " << cpp_string_literal(bytecode) << ";\n"
-                << "    const auto result = arco::fission::run_bytecode(bytecode);\n"
+                << "    const auto result = arco::fission::run_bytecode(bytecode, ";
+            if (instruction_limit_override.has_value()) {
+                out << "std::optional<std::size_t>(" << *instruction_limit_override << ")";
+            } else {
+                out << "std::nullopt";
+            }
+            out << ");\n"
                 << "    if (!result.ok) {\n"
                 << "        std::cerr << result.error << '\\n';\n"
                 << "        return 1;\n"
@@ -2955,7 +4743,7 @@ Result reveal_amir(const std::string& source, const std::string& source_name) {
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
         auto statements = parser.parse();
 
-        return {true, render_amir(build_amir(statements, source_name)), ""};
+        return {true, render_amir(build_amir(statements, source_name, runtime.compile_metadata().instruction_limit)), ""};
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }
@@ -2979,7 +4767,7 @@ Result reveal_callconv(const std::string& source, const std::string& source_name
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
         auto statements = parser.parse();
 
-        return {true, render_calling_convention(build_amir(statements, source_name)), ""};
+        return {true, render_calling_convention(build_amir(statements, source_name, runtime.compile_metadata().instruction_limit)), ""};
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }
@@ -3003,7 +4791,9 @@ Result reveal_x86_64(const std::string& source, const std::string& source_name, 
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
         auto statements = parser.parse();
 
-        const auto codegen = generate_x86_64_function(build_amir(statements, source_name), entry_function);
+        const AmirModule amir = build_amir(statements, source_name, runtime.compile_metadata().instruction_limit);
+        if (!amir.diagnostics.empty()) return {false, "", amir.diagnostics.front()};
+        const auto codegen = generate_x86_64_program(amir, entry_function);
         if (!codegen.ok) {
             return {false, "", codegen.error};
         }
@@ -3032,7 +4822,9 @@ Result build_efi_image(const std::string& source, const std::string& source_name
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
         auto statements = parser.parse();
 
-        const auto codegen = generate_x86_64_function(build_amir(statements, source_name), entry_function);
+        const AmirModule amir = build_amir(statements, source_name, runtime.compile_metadata().instruction_limit);
+        if (!amir.diagnostics.empty()) return {false, "", amir.diagnostics.front()};
+        const auto codegen = generate_x86_64_program(amir, entry_function);
         if (!codegen.ok) {
             return {false, "", codegen.error};
         }
@@ -3084,7 +4876,7 @@ Result reveal_bytecode(const std::string& source, const std::string& source_name
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
         auto statements = parser.parse();
 
-        const AmirModule amir = build_amir(statements, source_name);
+        const AmirModule amir = build_amir(statements, source_name, runtime.compile_metadata().instruction_limit);
         return {true, render_bytecode(build_bytecode(amir)), ""};
     } catch (const std::exception& error) {
         return {false, "", error.what()};
@@ -3099,9 +4891,11 @@ Result reveal_bytecode_file(const std::string& path) {
     }
 }
 
-Result run_bytecode(const std::string& bytecode) {
+Result run_bytecode(const std::string& bytecode, std::optional<std::size_t> instruction_limit_override) {
     try {
         Runtime runtime;
+        runtime.set_instruction_limit_policy(true);
+        runtime.set_instruction_limit_override(instruction_limit_override);
         std::ostringstream output;
         runtime.set_output(output);
         (void)execute_bytecode(parse_bytecode(bytecode), runtime);
@@ -3111,15 +4905,16 @@ Result run_bytecode(const std::string& bytecode) {
     }
 }
 
-Result run_bytecode_file(const std::string& path) {
+Result run_bytecode_file(const std::string& path, std::optional<std::size_t> instruction_limit_override) {
     try {
-        return run_bytecode(read_file(path));
+        return run_bytecode(read_file(path), instruction_limit_override);
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }
 }
 
-Result compile_run(const std::string& source, const std::string& source_name) {
+Result compile_run(const std::string& source, const std::string& source_name,
+                   std::optional<std::size_t> instruction_limit_override) {
     try {
         Runtime preprocess_runtime;
         const std::string processed = preprocess_runtime.preprocess_source(source);
@@ -3130,24 +4925,28 @@ Result compile_run(const std::string& source, const std::string& source_name) {
         auto statements = parser.parse();
 
         Runtime runtime;
+        runtime.set_instruction_limit_policy(true);
+        runtime.set_instruction_limit_override(instruction_limit_override);
         std::ostringstream output;
         runtime.set_output(output);
-        (void)execute_bytecode(build_bytecode(build_amir(statements, source_name)), runtime);
+        (void)execute_bytecode(build_bytecode(build_amir(
+            statements, source_name, preprocess_runtime.compile_metadata().instruction_limit)), runtime);
         return {true, output.str(), ""};
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }
 }
 
-Result compile_run_file(const std::string& path) {
+Result compile_run_file(const std::string& path, std::optional<std::size_t> instruction_limit_override) {
     try {
-        return compile_run(read_file(path), path);
+        return compile_run(read_file(path), path, instruction_limit_override);
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }
 }
 
-Result build_native_file(const std::string& path, const std::string& output_path) {
+Result build_native_file(const std::string& path, const std::string& output_path,
+                         std::optional<std::size_t> instruction_limit_override) {
     try {
         Runtime runtime;
         const std::string processed = runtime.preprocess_source(read_file(path));
@@ -3157,9 +4956,9 @@ Result build_native_file(const std::string& path, const std::string& output_path
         Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
         auto statements = parser.parse();
 
-        const AmirModule amir = build_amir(statements, path);
+        const AmirModule amir = build_amir(statements, path, runtime.compile_metadata().instruction_limit);
         const std::string bytecode = render_bytecode(build_bytecode(amir));
-        return build_native_bytecode(bytecode, output_path);
+        return build_native_bytecode(bytecode, output_path, instruction_limit_override);
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }

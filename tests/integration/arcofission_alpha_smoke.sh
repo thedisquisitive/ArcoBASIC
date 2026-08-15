@@ -121,6 +121,7 @@ grep -q "BYTECODE WRITTEN" "$TMP_ROOT/bytecode-build.txt"
 grep -q "ARCOFISSION BYTECODE" "$TMP_ROOT/structured-explicit.arcof"
 
 cat > "$TMP_ROOT/vm.abas" <<'SCRIPT'
+#INSTRUCTION_LIMIT 1000
 PRINT "vm hello"
 LET x = 2 + 3 * 4
 PRINT x
@@ -228,6 +229,249 @@ grep -q "^18$" "$TMP_ROOT/functions-compile-run.txt"
 "$ARCOFISSION" build "$TMP_ROOT/functions-vm.abas" -o "$TMP_ROOT/functions-vm.arcof" > /dev/null
 "$ARCOFISSION" run "$TMP_ROOT/functions-vm.arcof" > "$TMP_ROOT/functions-run.txt"
 diff -u "$TMP_ROOT/functions-compile-run.txt" "$TMP_ROOT/functions-run.txt"
+
+cat > "$TMP_ROOT/instruction-limit.abas" <<'SCRIPT'
+#INSTRUCTION_LIMIT 1000
+LET total = 0
+FOR i = 1 TO 20
+total += i
+NEXT
+PRINT total
+STOP
+SCRIPT
+
+"$ARCOFISSION" reveal "$TMP_ROOT/instruction-limit.abas" at A-MIR > "$TMP_ROOT/instruction-limit-amir.txt"
+grep -q "METADATA INSTRUCTION_LIMIT 1000" "$TMP_ROOT/instruction-limit-amir.txt"
+"$ARCOFISSION" reveal "$TMP_ROOT/instruction-limit.abas" at BYTECODE > "$TMP_ROOT/instruction-limit-bytecode.txt"
+grep -q "METADATA INSTRUCTION_LIMIT 1000" "$TMP_ROOT/instruction-limit-bytecode.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/instruction-limit.abas" > "$TMP_ROOT/instruction-limit-run.txt"
+grep -q "^210$" "$TMP_ROOT/instruction-limit-run.txt"
+if "$ARCOFISSION" compile-run "$TMP_ROOT/instruction-limit.abas" --instruction-limit 1 > /dev/null 2>&1; then
+    echo "ArcoFission ignored the operator instruction-limit override" >&2
+    exit 1
+fi
+"$ARCOFISSION" build "$TMP_ROOT/instruction-limit.abas" -o "$TMP_ROOT/instruction-limit.arcof" > /dev/null
+grep -q "METADATA INSTRUCTION_LIMIT 1000" "$TMP_ROOT/instruction-limit.arcof"
+"$ARCOFISSION" run "$TMP_ROOT/instruction-limit.arcof" > "$TMP_ROOT/instruction-limit-bytecode-run.txt"
+diff -u "$TMP_ROOT/instruction-limit-run.txt" "$TMP_ROOT/instruction-limit-bytecode-run.txt"
+
+cat > "$TMP_ROOT/slices-vm.abas" <<'SCRIPT'
+values = [0, 1, 2, 3, 4]
+PRINT values[1:4]
+PRINT values[::-1]
+PRINT "Aé猫Z"[1:3]
+copied = COPY values
+copied[0] = 9
+PRINT values[0]
+PRINT copied[0]
+values[1:4] = [8, 9]
+PRINT values
+STOP
+SCRIPT
+
+"$ARCOFISSION" reveal "$TMP_ROOT/slices-vm.abas" at A-MIR > "$TMP_ROOT/slices-amir.txt"
+grep -q " := SLICE " "$TMP_ROOT/slices-amir.txt"
+grep -q " := COPY " "$TMP_ROOT/slices-amir.txt"
+grep -q "STORE_SLICE values" "$TMP_ROOT/slices-amir.txt"
+"$ARCOFISSION" reveal "$TMP_ROOT/slices-vm.abas" at BYTECODE > "$TMP_ROOT/slices-bytecode.txt"
+grep -q "24 SLICE" "$TMP_ROOT/slices-bytecode.txt"
+grep -q "25 COPY" "$TMP_ROOT/slices-bytecode.txt"
+grep -q "26 STORE_SLICE" "$TMP_ROOT/slices-bytecode.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/slices-vm.abas" > "$TMP_ROOT/slices-compile-run.txt"
+grep -q '^\[1, 2, 3\]$' "$TMP_ROOT/slices-compile-run.txt"
+grep -q '^\[4, 3, 2, 1, 0\]$' "$TMP_ROOT/slices-compile-run.txt"
+grep -q '^é猫$' "$TMP_ROOT/slices-compile-run.txt"
+grep -q '^\[0, 8, 9, 4\]$' "$TMP_ROOT/slices-compile-run.txt"
+"$ARCOFISSION" build "$TMP_ROOT/slices-vm.abas" -o "$TMP_ROOT/slices-vm.arcof" > /dev/null
+"$ARCOFISSION" run "$TMP_ROOT/slices-vm.arcof" > "$TMP_ROOT/slices-bytecode-run.txt"
+diff -u "$TMP_ROOT/slices-compile-run.txt" "$TMP_ROOT/slices-bytecode-run.txt"
+"$ARCOFISSION" native "$TMP_ROOT/slices-vm.abas" -o "$TMP_ROOT/slices-native" > /dev/null
+"$TMP_ROOT/slices-native" > "$TMP_ROOT/slices-native-run.txt"
+diff -u "$TMP_ROOT/slices-compile-run.txt" "$TMP_ROOT/slices-native-run.txt"
+
+cat > "$TMP_ROOT/tuples-vm.abas" <<'SCRIPT'
+FUNCTION Pair(a, b) AS TUPLE
+RETURN (a, b)
+END FUNCTION
+LET (left, right) = Pair(3, 4)
+PRINT (left, right)
+(left, right) = (right, left)
+PRINT left
+PRINT right
+PRINT Pair(1, 2)[::-1]
+STOP
+SCRIPT
+
+"$ARCOFISSION" reveal "$TMP_ROOT/tuples-vm.abas" at A-MIR > "$TMP_ROOT/tuples-amir.txt"
+grep -q " := TUPLE" "$TMP_ROOT/tuples-amir.txt"
+grep -q "DESTRUCTURE" "$TMP_ROOT/tuples-amir.txt"
+"$ARCOFISSION" reveal "$TMP_ROOT/tuples-vm.abas" at BYTECODE > "$TMP_ROOT/tuples-bytecode.txt"
+grep -q "27 TUPLE" "$TMP_ROOT/tuples-bytecode.txt"
+grep -q "28 DESTRUCTURE" "$TMP_ROOT/tuples-bytecode.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/tuples-vm.abas" > "$TMP_ROOT/tuples-compile-run.txt"
+grep -q '^(3, 4)$' "$TMP_ROOT/tuples-compile-run.txt"
+grep -q '^(2, 1)$' "$TMP_ROOT/tuples-compile-run.txt"
+"$ARCOFISSION" build "$TMP_ROOT/tuples-vm.abas" -o "$TMP_ROOT/tuples-vm.arcof" > /dev/null
+"$ARCOFISSION" run "$TMP_ROOT/tuples-vm.arcof" > "$TMP_ROOT/tuples-bytecode-run.txt"
+diff -u "$TMP_ROOT/tuples-compile-run.txt" "$TMP_ROOT/tuples-bytecode-run.txt"
+"$ARCOFISSION" native "$TMP_ROOT/tuples-vm.abas" -o "$TMP_ROOT/tuples-native" > /dev/null
+"$TMP_ROOT/tuples-native" > "$TMP_ROOT/tuples-native-run.txt"
+diff -u "$TMP_ROOT/tuples-compile-run.txt" "$TMP_ROOT/tuples-native-run.txt"
+
+cat > "$TMP_ROOT/callables-vm.abas" <<'SCRIPT'
+FUNCTION Score(item)
+RETURN item.Score
+END FUNCTION
+FUNCTION Invoke(fn AS CALLABLE, value)
+RETURN fn(value)
+END FUNCTION
+FUNCTION Track(value)
+RETURN value
+END FUNCTION
+items = [{Name: "b", Score: 2}, {Name: "a", Score: 1}, {Name: "c", Score: 2}]
+key = ADDRESSOF Score
+PRINT TYPEOF(key)
+PRINT key({Score: 5})
+PRINT Invoke(key, {Score: 7})
+ranked = Array.SortBy(items, key)
+first = ranked[0]
+second = ranked[1]
+third = ranked[2]
+PRINT first.Name
+PRINT second.Name
+PRINT third.Name
+descending = Array.SortBy(items, key, TRUE)
+descFirst = descending[0]
+PRINT descFirst.Name
+minItem = Array.MinBy(items, key)
+maxItem = Array.MaxBy(items, key)
+PRINT minItem.Name
+PRINT maxItem.Name
+Array.SortBy([3, 1, 2], ADDRESSOF Track)
+STOP
+SCRIPT
+
+"$ARCOFISSION" reveal "$TMP_ROOT/callables-vm.abas" at A-MIR > "$TMP_ROOT/callables-amir.txt"
+grep -q " := ADDRESSOF Score" "$TMP_ROOT/callables-amir.txt"
+grep -q " := ADDRESSOF Track" "$TMP_ROOT/callables-amir.txt"
+"$ARCOFISSION" reveal "$TMP_ROOT/callables-vm.abas" at BYTECODE > "$TMP_ROOT/callables-bytecode.txt"
+grep -q "29 ADDRESSOF" "$TMP_ROOT/callables-bytecode.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/callables-vm.abas" > "$TMP_ROOT/callables-compile-run.txt"
+grep -q '^Callable$' "$TMP_ROOT/callables-compile-run.txt"
+grep -q '^5$' "$TMP_ROOT/callables-compile-run.txt"
+grep -q '^7$' "$TMP_ROOT/callables-compile-run.txt"
+grep -q '^a$' "$TMP_ROOT/callables-compile-run.txt"
+grep -q '^b$' "$TMP_ROOT/callables-compile-run.txt"
+"$ARCOFISSION" build "$TMP_ROOT/callables-vm.abas" -o "$TMP_ROOT/callables-vm.arcof" > /dev/null
+"$ARCOFISSION" run "$TMP_ROOT/callables-vm.arcof" > "$TMP_ROOT/callables-bytecode-run.txt"
+diff -u "$TMP_ROOT/callables-compile-run.txt" "$TMP_ROOT/callables-bytecode-run.txt"
+"$ARCOFISSION" native "$TMP_ROOT/callables-vm.abas" -o "$TMP_ROOT/callables-native" > /dev/null
+"$TMP_ROOT/callables-native" > "$TMP_ROOT/callables-native-run.txt"
+diff -u "$TMP_ROOT/callables-compile-run.txt" "$TMP_ROOT/callables-native-run.txt"
+
+cat > "$TMP_ROOT/ranges-vm.abas" <<'SCRIPT'
+squares = [i * i FOR i IN Range(1, 5)]
+PRINT squares
+evens = [j FOR j IN Range(7) IF j % 2 == 0]
+PRINT evens
+TRY
+PRINT j
+CATCH err
+PRINT err.Type
+END TRY
+total = 0
+FOR i IN Range(5)
+total += i
+NEXT
+PRINT total
+PRINT TYPEOF(Range(3))
+PRINT LEN(Range(5, 0, -2))
+PRINT Range(5, 0, -2)[1]
+STOP
+SCRIPT
+
+"$ARCOFISSION" reveal "$TMP_ROOT/ranges-vm.abas" at AST > "$TMP_ROOT/ranges-ast.txt"
+grep -q "ArrayComprehension i" "$TMP_ROOT/ranges-ast.txt"
+"$ARCOFISSION" reveal "$TMP_ROOT/ranges-vm.abas" at A-MIR > "$TMP_ROOT/ranges-amir.txt"
+grep -q "BLOCK ComprehensionCond" "$TMP_ROOT/ranges-amir.txt"
+grep -q "CALL Array.Add" "$TMP_ROOT/ranges-amir.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/ranges-vm.abas" > "$TMP_ROOT/ranges-compile-run.txt"
+grep -q '^\[1, 4, 9, 16\]$' "$TMP_ROOT/ranges-compile-run.txt"
+grep -q '^\[0, 2, 4, 6\]$' "$TMP_ROOT/ranges-compile-run.txt"
+grep -q '^10$' "$TMP_ROOT/ranges-compile-run.txt"
+grep -q '^Range$' "$TMP_ROOT/ranges-compile-run.txt"
+grep -q '^RuntimeError$' "$TMP_ROOT/ranges-compile-run.txt"
+"$ARCOFISSION" build "$TMP_ROOT/ranges-vm.abas" -o "$TMP_ROOT/ranges-vm.arcof" > /dev/null
+"$ARCOFISSION" run "$TMP_ROOT/ranges-vm.arcof" > "$TMP_ROOT/ranges-bytecode-run.txt"
+diff -u "$TMP_ROOT/ranges-compile-run.txt" "$TMP_ROOT/ranges-bytecode-run.txt"
+"$ARCOFISSION" native "$TMP_ROOT/ranges-vm.abas" -o "$TMP_ROOT/ranges-native" > /dev/null
+"$TMP_ROOT/ranges-native" > "$TMP_ROOT/ranges-native-run.txt"
+diff -u "$TMP_ROOT/ranges-compile-run.txt" "$TMP_ROOT/ranges-native-run.txt"
+
+cat > "$TMP_ROOT/bits-vm.abas" <<'SCRIPT'
+LET genome AS BITVECTOR = BITS "0001_1011"
+PRINT LEN(genome)
+PRINT genome[3]
+PRINT Bits.Count(genome)
+PRINT Bits.ToString(Bits.Flip(genome, 0))
+PRINT Bits.ToString(genome + BITS "01")
+STOP
+SCRIPT
+
+"$ARCOFISSION" reveal "$TMP_ROOT/bits-vm.abas" at A-MIR > "$TMP_ROOT/bits-amir.txt"
+grep -q 'CONST BITS "00011011"' "$TMP_ROOT/bits-amir.txt"
+"$ARCOFISSION" reveal "$TMP_ROOT/bits-vm.abas" at BYTECODE > "$TMP_ROOT/bits-bytecode.txt"
+grep -q 'BITS "00011011"' "$TMP_ROOT/bits-bytecode.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/bits-vm.abas" > "$TMP_ROOT/bits-compile-run.txt"
+grep -q '^8$' "$TMP_ROOT/bits-compile-run.txt"
+grep -q '^10011011$' "$TMP_ROOT/bits-compile-run.txt"
+grep -q '^0001101101$' "$TMP_ROOT/bits-compile-run.txt"
+"$ARCOFISSION" build "$TMP_ROOT/bits-vm.abas" -o "$TMP_ROOT/bits-vm.arcof" > /dev/null
+"$ARCOFISSION" run "$TMP_ROOT/bits-vm.arcof" > "$TMP_ROOT/bits-bytecode-run.txt"
+diff -u "$TMP_ROOT/bits-compile-run.txt" "$TMP_ROOT/bits-bytecode-run.txt"
+"$ARCOFISSION" native "$TMP_ROOT/bits-vm.abas" -o "$TMP_ROOT/bits-native" > /dev/null
+"$TMP_ROOT/bits-native" > "$TMP_ROOT/bits-native-run.txt"
+diff -u "$TMP_ROOT/bits-compile-run.txt" "$TMP_ROOT/bits-native-run.txt"
+
+cat > "$TMP_ROOT/throw-vm.abas" <<'SCRIPT'
+FUNCTION Validate(value)
+IF value < 0 THEN
+THROW "value must be non-negative"
+END IF
+RETURN value
+END FUNCTION
+TRY
+PRINT Validate(-1)
+CATCH err
+PRINT err.Type
+PRINT err.Message
+END TRY
+TRY
+PRINT missing_runtime_value
+CATCH err
+PRINT err.Type
+END TRY
+STOP
+SCRIPT
+
+"$ARCOFISSION" reveal "$TMP_ROOT/throw-vm.abas" at A-MIR > "$TMP_ROOT/throw-amir.txt"
+grep -q "THROW" "$TMP_ROOT/throw-amir.txt"
+if grep -q "unsupported lowering" "$TMP_ROOT/throw-amir.txt"; then
+    echo "ArcoFission reported THROW as unsupported hosted lowering" >&2
+    exit 1
+fi
+"$ARCOFISSION" reveal "$TMP_ROOT/throw-vm.abas" at BYTECODE > "$TMP_ROOT/throw-bytecode.txt"
+grep -q "23 THROW" "$TMP_ROOT/throw-bytecode.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/throw-vm.abas" > "$TMP_ROOT/throw-compile-run.txt"
+grep -q "^UserError$" "$TMP_ROOT/throw-compile-run.txt"
+grep -q "^value must be non-negative$" "$TMP_ROOT/throw-compile-run.txt"
+grep -q "^RuntimeError$" "$TMP_ROOT/throw-compile-run.txt"
+"$ARCOFISSION" bytecode "$TMP_ROOT/throw-vm.abas" -o "$TMP_ROOT/throw-vm.arcof" > /dev/null
+"$ARCOFISSION" run "$TMP_ROOT/throw-vm.arcof" > "$TMP_ROOT/throw-run.txt"
+diff -u "$TMP_ROOT/throw-compile-run.txt" "$TMP_ROOT/throw-run.txt"
+"$ARCOFISSION" build "$TMP_ROOT/throw-vm.abas" -o "$TMP_ROOT/throw-native" > /dev/null
+"$TMP_ROOT/throw-native" > "$TMP_ROOT/throw-native.txt"
+diff -u "$TMP_ROOT/throw-compile-run.txt" "$TMP_ROOT/throw-native.txt"
 
 cat > "$TMP_ROOT/math-vm.abas" <<'SCRIPT'
 PRINT ABS(SIN(PI())) < 0.000001

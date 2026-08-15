@@ -1,0 +1,40 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("GOP START")
+    LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
+    IF gop = 0 THEN
+        systemTable.ConsoleOut.Write("GOP UNAVAILABLE")
+        CPU.HaltForever
+    END IF
+    LET mode AS UEFI.GraphicsOutputMode = UEFI.GOP.Mode(gop)
+    IF mode = 0 THEN
+        systemTable.ConsoleOut.Write("GOP MODE UNAVAILABLE")
+        CPU.HaltForever
+    END IF
+    LET framebuffer AS PHYSICALPTR = UEFI.GOP.FrameBufferBase(gop)
+    LET framebufferSize AS U64 = UEFI.GOP.FrameBufferSize(gop)
+    LET width AS U32 = UEFI.GOP.Width(gop)
+    LET height AS U32 = UEFI.GOP.Height(gop)
+    LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
+    LET format AS U32 = UEFI.GOP.PixelFormat(gop)
+    LET mapped AS MMIOPTR = MEMORY.MapDevice(framebuffer, framebufferSize)
+    LET y AS U32 = 0
+    WHILE y < 100
+        LET x AS U32 = 0
+        WHILE x < 100
+            LET pixelOffset AS U32 = (y * stride + x) * 4
+            LET pixel AS MMIOPTR = ADDRESS.Offset(mapped, pixelOffset)
+            MEMORY.Write32(pixel, 16711935)
+            x = x + 1
+        WEND
+        y = y + 1
+    WEND
+    CPU.MemoryBarrier
+    systemTable.ConsoleOut.Write("GOP DONE")
+    CPU.HaltForever
+END FUNCTION

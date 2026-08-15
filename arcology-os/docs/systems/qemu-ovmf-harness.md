@@ -8,6 +8,10 @@ application under real QEMU + OVMF firmware and checks its console output for an
 `arcology-os/tests/systems/systems_qemu_ovmf_harness_smoke.sh` wires it into the automated test suite for the
 hello-world program specifically.
 
+The direct-port-I/O milestone uses a companion capture mode in
+`systems_port_io_smoke.sh`: QEMU's emulated COM1 is written to a dedicated serial log with
+`-serial file:...`, while the fixture emits its success marker only through `PORT.WriteByte`.
+
 This formalizes the ad hoc boot check performed manually while implementing WP-009 (see
 `arcology-os/docs/systems/pe32-image.md`) into the reusable tool Packet WP-010 asks for, usable both by the
 test suite and directly by a developer.
@@ -82,6 +86,15 @@ passing: it also runs the harness against an expected string that is never print
 that call fails (nonzero exit, `FAIL: expected output not found` on stderr) rather than silently
 succeeding regardless of actual console content.
 
+The Packet 005 COM1 fixture is validated with:
+
+```sh
+ctest --test-dir build --output-on-failure -R systems_port_io_smoke
+```
+
+It searches the dedicated serial capture for `ARCOLOGY PORT I/O ONLINE`; the fixture does not call
+UEFI `ConsoleOut.Write` for that marker.
+
 ## What This Work Package Does Not Do
 
 - Does not build a real FAT-formatted disk image file (via `mtools`/`mkfs.vfat`); the QEMU virtual
@@ -92,3 +105,11 @@ succeeding regardless of actual console content.
   (any `.efi` file and expected string), but only one automated test currently uses it.
 - Does not capture graphical console output (only serial); not needed since the hello-world's only
   observable behavior is text written to `ConOut`.
+
+## GOP framebuffer proof
+
+The GOP fixture is built with `ArcoFission build` and can be observed headlessly with QEMU's
+`egl-headless` display plus the monitor `screendump` command. It discovers GOP through
+`UEFI.GOP.Discover`, maps the reported framebuffer, fills a 100x100 magenta pixel block, and then
+halts. The visual proof is the magenta stripe in the captured PPM/PNG; `GOP DONE` is emitted through
+the UEFI console before the halt as an execution marker.

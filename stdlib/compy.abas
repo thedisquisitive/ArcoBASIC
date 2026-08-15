@@ -9,6 +9,7 @@
 '   F                 FALSE
 '   N<number>;        Number
 '   S<length>:<text>  String
+'   V<bits>:<01text>  BitVector, as its exact bit-length and a "0"/"1" per-bit body
 '   A<count>:...      Array
 '   O<count>:...      Object as packed key/value pairs
 '
@@ -43,6 +44,7 @@ FUNCTION ArcoCompy.PackValue(value)
     END IF
     IF kind == "Number" THEN RETURN "N" + STRING(value) + ";"
     IF kind == "String" THEN RETURN ArcoCompy.StringBody(value)
+    IF kind == "BitVector" THEN RETURN "V" + STRING(LEN(value)) + ":" + Bits.ToString(value)
 
     IF kind == "Array" THEN
         output = "A" + STRING(LEN(value)) + ":"
@@ -136,6 +138,18 @@ FUNCTION ArcoCompy.UnpackStringBody(state)
     RETURN value
 END FUNCTION
 
+FUNCTION ArcoCompy.UnpackBitVectorBody(state)
+    length = ArcoCompy.ReadLength(state)
+    IF state.Error <> "" THEN RETURN Bits.FromString("")
+    IF length > ArcoCompy.Remaining(state) THEN
+        ignored = ArcoCompy.SetError(state, "bit vector length exceeds remaining ACPY payload")
+        RETURN Bits.FromString("")
+    END IF
+    text = String.Slice(state.Text, state.Pos, length)
+    state.Pos = state.Pos + length
+    RETURN Bits.FromString(text)
+END FUNCTION
+
 FUNCTION ArcoCompy.UnpackValueAtDepth(state, depth)
     IF state.Error <> "" THEN RETURN NULL
     IF depth > state.MaxDepth THEN
@@ -151,6 +165,7 @@ FUNCTION ArcoCompy.UnpackValueAtDepth(state, depth)
     IF tag == "F" THEN RETURN FALSE
     IF tag == "N" THEN RETURN NUMBER(ArcoCompy.ReadUntil(state, ";"))
     IF tag == "S" THEN RETURN ArcoCompy.UnpackStringBody(state)
+    IF tag == "V" THEN RETURN ArcoCompy.UnpackBitVectorBody(state)
 
     IF tag == "A" THEN
         count = ArcoCompy.ReadCount(state, "array")

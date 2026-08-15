@@ -32,10 +32,13 @@ add_library(arco_runtime STATIC
     src/frontend/lexer.cpp
     src/frontend/parser.cpp
     src/runtime/runtime.cpp
+    src/runtime/random.cpp
+    src/runtime/runtime_handles.cpp
+    src/runtime/resource_registry.cpp
     ${ARCO_GUI_BACKEND_SOURCE}
 )
 arco_configure_library(arco_runtime)
-target_link_libraries(arco_runtime PRIVATE arcology_os_headers)
+target_link_libraries(arco_runtime PUBLIC arcology_os)
 add_library(ArcoBASIC::runtime ALIAS arco_runtime)
 
 if(ARCO_GUI_BACKEND_AVAILABLE)

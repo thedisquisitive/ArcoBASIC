@@ -1,0 +1,18 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("POOL PRE")
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET status AS U64 = systemTable.BootServices.AllocatePool(4, 16384, bufferAddress)
+    IF status <> 0 THEN
+        systemTable.ConsoleOut.Write("POOL FAIL")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("POOL OK")
+    CPU.HaltForever
+END FUNCTION

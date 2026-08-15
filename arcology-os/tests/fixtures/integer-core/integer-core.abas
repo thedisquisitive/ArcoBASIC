@@ -1,0 +1,20 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+#EXPORT "efi_main"
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET status AS U8 = 0x25
+    LET ready AS BOOL = (status AND 0x20) <> 0
+    LET lowBits AS U8 = status AND 0x0F
+    LET packed AS U16 = 0xABCD
+    LET high AS U16 = packed SHR 8
+    LET signedValue AS I16 = -16
+    LET arithmetic AS I16 = signedValue SAR 2
+    LET wrapped AS U8 = 255 + 1
+    LET quotient AS U16 = 100 \ 3
+    LET remainder AS U16 = 100 MOD 3
+    systemTable.ConsoleOut.Write("integer-core\r\n")
+    RETURN high
+END FUNCTION

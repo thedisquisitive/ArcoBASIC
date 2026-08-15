@@ -51,6 +51,36 @@ END FUNCTION
 SCRIPT
 expect_accept "watchdog_binding" "$TMP_ROOT/watchdog.abas"
 
+# GOP discovery entry point is bound for semantic validation. The raw GUID/output-pointer
+# argument wrapper is intentionally deferred, so this checks only field-chain resolution.
+cat > "$TMP_ROOT/gop_locate.abas" <<'SCRIPT'
+FUNCTION Main(systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.LocateProtocol(0, 0, 0)
+    RETURN 0
+END FUNCTION
+SCRIPT
+expect_accept "gop_locate_binding" "$TMP_ROOT/gop_locate.abas"
+
+# ExitBootServices is exposed as a typed service-table call. The fixture deliberately passes an
+# invalid key (0); runtime handoff requires a prior GetMemoryMap implementation and is tested only
+# at the binding/lowering layer here.
+expect_accept "exit_boot_services_binding" "$SOURCE_DIR/arcology-os/tests/fixtures/uefi-exit-boot-services/exit-boot-services.abas"
+expect_accept "memory_map_binding" "$SOURCE_DIR/arcology-os/tests/fixtures/uefi-memory-map/memory-map-bindings.abas"
+expect_accept "pointer_to_pointer" "$SOURCE_DIR/arcology-os/tests/fixtures/uefi-memory-map/pointer-to-pointer.abas"
+"$ARCOFISSION" reveal "$SOURCE_DIR/arcology-os/tests/fixtures/uefi-memory-map/pointer-to-pointer.abas" at X86_64 > "$TMP_ROOT/pointer_to_pointer.x86"
+grep -qF 'lea rsp' "$TMP_ROOT/pointer_to_pointer.x86" || grep -qF '48 8d 44 24' "$TMP_ROOT/pointer_to_pointer.x86"
+MAP_FIXTURE="$SOURCE_DIR/arcology-os/tests/fixtures/uefi-memory-map/acquire-memory-map.abas"
+"$ARCOFISSION" reveal "$MAP_FIXTURE" at A-MIR > "$TMP_ROOT/memory-map.amir"
+grep -qF 'CALL_EXTERNAL systemTable.BootServices.GetMemoryMap' "$TMP_ROOT/memory-map.amir"
+grep -qF 'CALL AcquireMemoryMap' "$TMP_ROOT/memory-map.amir"
+"$ARCOFISSION" build "$MAP_FIXTURE" -o "$TMP_ROOT/memory-map.efi" --target uefi-x86_64 --entry Main >/dev/null
+test -s "$TMP_ROOT/memory-map.efi"
+HANDOFF_FIXTURE="$SOURCE_DIR/arcology-os/tests/fixtures/uefi-memory-map/exit-boot-services-safe.abas"
+"$ARCOFISSION" reveal "$HANDOFF_FIXTURE" at X86_64 --entry Main > "$TMP_ROOT/handoff.x86"
+grep -qF 'INTERNAL_CALLS 2' "$TMP_ROOT/handoff.x86"
+"$ARCOFISSION" build "$HANDOFF_FIXTURE" -o "$TMP_ROOT/handoff.efi" --target uefi-x86_64 --entry Main >/dev/null
+test -s "$TMP_ROOT/handoff.efi"
+
 # An unknown field on a known UEFI type is rejected with a diagnostic naming what is bound.
 expect_reject "unknown_field" '
 FUNCTION Main(systemTable AS UEFI.SystemTable) AS U64

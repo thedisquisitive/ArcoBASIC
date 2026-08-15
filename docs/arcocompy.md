@@ -121,6 +121,7 @@ ArcoCompy currently supports:
 * booleans
 * numbers
 * strings
+* immutable packed `BITVECTOR` values
 * arrays
 * objects
 * alpha class instances, as object-backed values
@@ -141,6 +142,7 @@ T                 TRUE
 F                 FALSE
 N<number>;        Number
 S<length>:<text>  String
+V<bits>:<01text>  BitVector, as its exact bit-length and a "0"/"1" per-bit body
 A<count>:...      Array
 O<count>:...      Object key/value pairs
 ```

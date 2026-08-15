@@ -1,0 +1,12 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' ADDRESS.Local is the explicit ArcoBASIC pointer-to-pointer construction primitive.
+FUNCTION Main(systemTable AS UEFI.SystemTable) AS U64
+    LET output AS U64 = 0
+    LET outputAddress AS PTR = ADDRESS.Local(output)
+    LET status AS U64 = systemTable.BootServices.LocateProtocol(0, 0, outputAddress)
+    RETURN status
+END FUNCTION

@@ -1,0 +1,87 @@
+' First post-UEFI memory-manager slice. The map buffer is treated as a virtual address after the
+' handoff; descriptor parsing and conventional-page accounting remain ArcoBASIC policy.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION CountConventionalPages(mapBuffer AS U64, mapSize AS U64, descriptorSize AS U64) AS U64
+    IF descriptorSize < 48 THEN
+        RETURN 0
+    END IF
+    IF mapSize < descriptorSize THEN
+        RETURN 0
+    END IF
+
+    LET mapAddress AS VIRTUALPTR = ADDRESS.Virtual(mapBuffer)
+    LET offset AS U64 = 0
+    LET pages AS U64 = 0
+    WHILE offset < mapSize
+        LET descriptor AS VIRTUALPTR = ADDRESS.Offset(mapAddress, offset)
+        LET kind AS U32 = MEMORY.Read32(descriptor)
+        IF kind = 7 THEN
+            LET pageField AS VIRTUALPTR = ADDRESS.Offset(descriptor, 24)
+            LET descriptorPages AS U64 = MEMORY.Read64(pageField)
+            pages = pages + descriptorPages
+        END IF
+        offset = offset + descriptorSize
+    WEND
+    RETURN pages
+END FUNCTION
+
+FUNCTION FirstConventionalBase(mapBuffer AS U64, mapSize AS U64, descriptorSize AS U64) AS U64
+    IF descriptorSize < 48 THEN
+        RETURN 0
+    END IF
+    LET mapAddress AS VIRTUALPTR = ADDRESS.Virtual(mapBuffer)
+    LET offset AS U64 = 0
+    WHILE offset < mapSize
+        LET descriptor AS VIRTUALPTR = ADDRESS.Offset(mapAddress, offset)
+        LET kind AS U32 = MEMORY.Read32(descriptor)
+        IF kind = 7 THEN
+            LET baseField AS VIRTUALPTR = ADDRESS.Offset(descriptor, 8)
+            RETURN MEMORY.Read64(baseField)
+        END IF
+        offset = offset + descriptorSize
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AllocatePagesFromRegion(regionBase AS U64, regionPages AS U64, requestedPages AS U64, allocationIndex AS U64) AS U64
+    IF requestedPages = 0 THEN
+        RETURN 0
+    END IF
+    IF allocationIndex > regionPages THEN
+        RETURN 0
+    END IF
+    IF requestedPages > (regionPages - allocationIndex) THEN
+        RETURN 0
+    END IF
+    RETURN regionBase + ((allocationIndex) * 4096)
+END FUNCTION
+
+FUNCTION AdvancePageAllocation(regionPages AS U64, requestedPages AS U64, allocationIndex AS U64) AS U64
+    IF requestedPages = 0 THEN
+        RETURN allocationIndex
+    END IF
+    IF allocationIndex > regionPages THEN
+        RETURN 0
+    END IF
+    IF requestedPages > (regionPages - allocationIndex) THEN
+        RETURN 0
+    END IF
+    RETURN allocationIndex + requestedPages
+END FUNCTION
+
+FUNCTION IsPageRangeValid(regionPages AS U64, startIndex AS U64, requestedPages AS U64) AS BOOL
+    IF requestedPages = 0 THEN
+        RETURN 0
+    END IF
+    IF startIndex > regionPages THEN
+        RETURN 0
+    END IF
+    IF requestedPages > (regionPages - startIndex) THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION

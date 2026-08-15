@@ -1,0 +1,45 @@
+' ArcoBASIC software raster primitives. These routines operate on validated MMIO-backed surfaces;
+' the compiler supplies only typed address arithmetic, control flow, and volatile memory access.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION PutPixel(framebuffer AS MMIOPTR, width AS U32, height AS U32, stride AS U32, x AS U32, y AS U32, color AS U32) AS U64
+    IF x < width THEN
+        IF y < height THEN
+            LET pixelOffset AS U32 = (y * stride + x) * 4
+            LET pixel AS MMIOPTR = ADDRESS.Offset(framebuffer, pixelOffset)
+            MEMORY.Write32(pixel, color)
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION FillRectClipped(framebuffer AS MMIOPTR, width AS U32, height AS U32, stride AS U32, x AS U32, y AS U32, rectWidth AS U32, rectHeight AS U32, color AS U32) AS U64
+    LET endX AS U32 = x + rectWidth
+    LET endY AS U32 = y + rectHeight
+    IF x < width THEN
+        IF y < height THEN
+            IF endX > width THEN
+                endX = width
+            END IF
+            IF endY > height THEN
+                endY = height
+            END IF
+            LET row AS U32 = y
+            WHILE row < endY
+                LET column AS U32 = x
+                WHILE column < endX
+                    LET pixelOffset AS U32 = (row * stride + column) * 4
+                    LET pixel AS MMIOPTR = ADDRESS.Offset(framebuffer, pixelOffset)
+                    MEMORY.Write32(pixel, color)
+                    column = column + 1
+                WEND
+                row = row + 1
+            WEND
+        END IF
+    END IF
+    CPU.MemoryBarrier
+    RETURN 0
+END FUNCTION

@@ -1,0 +1,17 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION Main() AS U64
+    LET physical AS PHYSICALPTR = ADDRESS.Physical(4096)
+    LET virtual AS VIRTUALPTR = ADDRESS.Virtual(4096)
+    LET device AS MMIOPTR = ADDRESS.MMIO(virtual)
+    LET aligned AS VIRTUALPTR = ADDRESS.AlignDown(virtual, 4096)
+    LET offset AS VIRTUALPTR = ADDRESS.Offset(aligned, 4)
+    MEMORY.Write32(device, 42)
+    LET value AS U32 = MEMORY.Read32(device)
+    CPU.ReadBarrier
+    CPU.WriteBarrier
+    CPU.MemoryBarrier
+    RETURN value
+END FUNCTION

@@ -1,0 +1,10 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' Binding/lowering proof only. A real handoff must acquire a valid memory-map key first.
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET status AS U64 = systemTable.BootServices.ExitBootServices(imageHandle, 0)
+    RETURN status
+END FUNCTION

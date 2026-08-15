@@ -1,4 +1,5 @@
 #include "arco/runtime.hpp"
+#include "arco/runtime_handles.hpp"
 #include "arco/shell.hpp"
 #include "arco/c/arco_c_api.h"
 
@@ -147,6 +148,23 @@ std::string http_get_loopback(int port, const std::string& target) {
 } // namespace
 
 int main() {
+    {
+        arco::RuntimeHandleTable handles;
+        auto object = std::make_shared<int>(42);
+        const auto surface = handles.create("SURFACE", object);
+        const arco::Value value(surface);
+        require(value.is_handle(), "runtime object handles are opaque Value variants");
+        require(handles.valid(value.as_handle(), "SURFACE"), "fresh handle validates by type and generation");
+        arco::Runtime runtime;
+        require(runtime.value_matches_type(value, "SURFACE"), "runtime accepts a matching opaque handle type");
+        require(runtime.value_matches_type(arco::Value(nullptr), "SURFACE"), "typed runtime objects accept their null value");
+        require(!runtime.value_matches_type(value, "IMAGE"), "runtime rejects a handle used as another object type");
+        const auto copied = value;
+        require(arco::values_equal(value, copied), "handle assignment preserves object identity");
+        require(handles.destroy(surface), "destroying an owned handle succeeds");
+        require(!handles.valid(surface), "destroyed handles fail validation");
+        require(!handles.destroy(surface), "destroying an already-destroyed handle fails safely");
+    }
     require(run_capture("PRINT \"HELLO\"\n") == "HELLO\n", "prints strings");
     require(run_capture("PRINT \"a\\nb\"\nPRINT \"col\\tvalue\"\nPRINT \"quote: \\\"ok\\\"\"\nPRINT \"slash: \\\\\"\n") == "a\nb\ncol\tvalue\nquote: \"ok\"\nslash: \\\n", "decodes string escape sequences");
     require(run_capture("name = \"Ada\"\nparts = 3\nPRINT $\"{name} has {parts} parts\"\nPRINT $\"math {1 + 2}\"\nPRINT $\"date {LEN(DATE()) > 0}\"\nPRINT $\"literal {{braces}}\"\n") == "Ada has 3 parts\nmath 3\ndate TRUE\nliteral {braces}\n", "interpolates strings with expressions");
@@ -651,6 +669,63 @@ int main() {
     require(run_capture("PRINT String.Insert(\"abcd\", 2, \"XX\")\nPRINT String.Delete(\"abcd\", 1, 2)\nPRINT String.Join([\"a\", \"b\", \"c\"], \"|\")\ndoc = Document.New(\"hello\")\ndoc = Document.InsertText(doc, 5, \" world\")\nPRINT Document.Text(doc)\ndoc = Document.DeleteRange(doc, 5, 1)\nPRINT Document.LineAt(doc, 0)\ndoc = Document.ReplaceRange(doc, 5, 5, \" there\")\nPRINT Document.Text(doc)\npos = Document.LineColumnAt(Document.New(\"a\\nbc\"), 3)\nPRINT pos.Line\nPRINT pos.Column\nPRINT Document.OffsetAtLineColumn(Document.New(\"a\\nbc\"), 1, 1)\ndoc = Document.ApplyFormat(doc, 0, 5, {\"Bold\": TRUE, \"FontSize\": 22})\nPRINT LEN(Document.Runs(doc))\npacked = Document.Serialize(doc)\nround = Document.Parse(packed)\nPRINT Document.Text(round)\nPRINT Object.Get(Document.Runs(round)[0], \"Bold\")\nbytes = Bytes.New(3, 65)\nbytes = Bytes.SetU8(bytes, 1, 66)\nPRINT Bytes.GetU8(bytes, 1)\nPRINT Bytes.ToText(bytes)\nPRINT Bytes.Length(Bytes.FromText(\"abc\"))\n") == "abXXcd\nad\na|b|c\nhello world\nhelloworld\nhello there\n1\n1\n3\n1\nhello there\nTRUE\n66\nABA\n3\n", "runs text editing, document, and byte helpers");
     require(run_capture("doc = Document.New(\"hello there\")\ndoc = Document.ApplyFormat(doc, 0, 5, {\"Bold\": TRUE, \"FontSize\": 22, \"Align\": \"left\"})\ndoc = Document.ApplyFormat(doc, 5, 6, {\"Bold\": TRUE, \"FontSize\": 22, \"Align\": \"left\"})\nPRINT LEN(Document.Runs(doc))\nPRINT Object.Get(Document.Runs(doc)[0], \"Length\")\ndoc = Document.ApplyFormat(doc, 6, 5, {\"Italic\": TRUE, \"FontSize\": 18, \"Align\": \"right\"})\nPRINT LEN(Document.Runs(doc))\nPRINT Object.Get(Document.Runs(doc)[0], \"Length\")\ndoc = Document.InsertText(doc, 2, \"X\")\nPRINT Document.Text(doc)\nPRINT Object.Get(Document.Runs(doc)[0], \"Length\")\ndoc = Document.DeleteRange(doc, 1, 2)\nPRINT Document.Text(doc)\nPRINT Object.Get(Document.Runs(doc)[1], \"Start\")\npacked = Document.Serialize(doc)\nround = Document.Parse(packed)\nPRINT Object.Get(Document.Runs(round)[1], \"Align\")\n") == "1\n11\n2\n6\nheXllo there\n7\nhllo there\n5\nright\n", "normalizes document formatting runs across edits and persistence");
     require(run_capture("TRY\nPRINT missing_value\nCATCH err\nPRINT err.Message\nEND TRY\nPRINT \"after\"\n") == "undefined variable: missing_value\nafter\n", "catches runtime errors");
+    require(run_capture(
+        "FUNCTION Validate(value)\n"
+        "IF value < 0 THEN\n"
+        "THROW \"value must be non-negative\"\n"
+        "END IF\n"
+        "RETURN value\n"
+        "END FUNCTION\n"
+        "TRY\n"
+        "PRINT Validate(-1)\n"
+        "CATCH err\n"
+        "PRINT err.Type\n"
+        "PRINT err.Message\n"
+        "END TRY\n"
+        "TRY\n"
+        "PRINT missing_again\n"
+        "CATCH err\n"
+        "PRINT err.Type\n"
+        "END TRY\n") == "UserError\nvalue must be non-negative\nRuntimeError\n",
+        "throws and classifies source-defined runtime errors");
+    require(run_capture(
+        "TRY\n"
+        "TRY\n"
+        "THROW \"inner\"\n"
+        "CATCH inner\n"
+        "PRINT inner.Message\n"
+        "THROW \"outer\"\n"
+        "END TRY\n"
+        "CATCH outer\n"
+        "PRINT outer.Type\n"
+        "PRINT outer.Message\n"
+        "END TRY\n") == "inner\nUserError\nouter\n",
+        "propagates throws from catch bodies to outer handlers");
+    arco::Runtime throw_errors;
+    const auto non_string_throw = throw_errors.run_string("THROW 7\n");
+    require(!non_string_throw.ok && non_string_throw.error.find("THROW message must be String; received Number") != std::string::npos,
+            "rejects non-string THROW messages");
+    const auto missing_throw = throw_errors.run_string("THROW\n");
+    require(!missing_throw.ok && missing_throw.error.find("expected an expression after THROW") != std::string::npos,
+            "requires a THROW expression");
+    require(run_capture(
+        "TRY\n"
+        "THROW missing_throw_message\n"
+        "CATCH err\n"
+        "PRINT err.Type\n"
+        "END TRY\n") == "RuntimeError\n",
+        "preserves message-expression failures as runtime errors");
+    const auto located_throw = throw_errors.run_string(
+        "FUNCTION Fail()\n"
+        "THROW \"located\"\n"
+        "END FUNCTION\n"
+        "Fail()\n");
+    require(!located_throw.ok && located_throw.error.find("located") != std::string::npos &&
+                located_throw.error.find("THROW \"located\"") != std::string::npos,
+            "reports the executing THROW source location across a function call");
+    const auto freestanding_throw = throw_errors.run_string("#RUNTIME NONE\nTHROW \"no hosted unwind\"\n");
+    require(!freestanding_throw.ok && freestanding_throw.error.find("hosted runtime error unwinding") != std::string::npos,
+            "rejects THROW under #RUNTIME NONE");
     require(run_capture("x = 10\nx += 5\nx -= 3\nx *= 2\nx /= 4\nPRINT x\n") == "6\n", "runs arithmetic compound assignment");
     require(run_capture("x = 6\nx &= 3\nPRINT x\nx |= 8\nPRINT x\nx ^= 2\nPRINT x\nx <<= 1\nPRINT x\nx >>= 2\nPRINT x\n") == "2\n10\n8\n16\n4\n", "runs bitwise compound assignment");
     require(run_capture("PRINT 6 & 3\nPRINT 6 | 3\nPRINT 6 ^ 3\nPRINT ~6\nPRINT 1 << 4\nPRINT 16 >> 2\n") == "2\n7\n5\n-7\n16\n4\n", "runs symbolic bitwise operators");
@@ -1560,10 +1635,292 @@ int main() {
     require(multiline_repl_output.str().find("\n10\n") != std::string::npos, "runs unnumbered multiline CLASS blocks in REPL");
     require(multiline_repl_output.str().find("block if") != std::string::npos, "runs unnumbered multiline IF blocks in REPL");
 
+    arco::Runtime bit_vectors;
+    std::ostringstream bit_vector_output;
+    bit_vectors.set_output(bit_vector_output);
+    const auto bit_vector_result = bit_vectors.run_string(
+        "LET original AS BITVECTOR = BITS \"0001_1011\"\n"
+        "copy = original\n"
+        "flipped = Bits.Flip(copy, 0)\n"
+        "PRINT LEN(original)\n"
+        "PRINT original[3]\n"
+        "PRINT Bits.Count(original)\n"
+        "PRINT Bits.ToString(flipped)\n"
+        "PRINT Bits.ToString(original)\n"
+        "PRINT Bits.ToString(Bits.Set(original, 1, 1))\n"
+        "PRINT Bits.ToString(Bits.Slice(original, 2, 4))\n"
+        "PRINT Bits.ToString(Bits.Replace(original, 2, 3, BITS \"11\"))\n"
+        "PRINT Bits.ToString(Bits.Reverse(original))\n"
+        "PRINT Bits.ToString(original + BITS \"01\")\n"
+        "PRINT Bits.ToString(Bits.FromArray([1, 0, 1]))\n"
+        "PRINT Bits.ToArray(Bits.FromString(\"01\"))\n"
+        "PRINT LEN(BITS \"\")\n");
+    require(bit_vector_result.ok, "runs BITVECTOR literals and Bits.* operations");
+    require(bit_vector_output.str() ==
+                "8\n1\n4\n10011011\n00011011\n01011011\n0110\n0011011\n11011000\n0001101101\n101\n[0, 1]\n0\n",
+            "preserves leading zeroes, immutable value semantics, and all BITVECTOR transformations");
+    require(!bit_vectors.run_string("PRINT BITS \"0102\"\n").ok, "rejects invalid BITS literal characters");
+    require(!bit_vectors.run_string("PRINT Bits.FromArray([0, 2])\n").ok, "rejects non-bit array elements");
+    require(!bit_vectors.run_string("PRINT Bits.Get(BITS \"1\", 1)\n").ok, "bounds-checks BITVECTOR indexing");
+    require(!bit_vectors.run_string("PRINT Bits.Get(BITS \"1\", 0.5)\n").ok, "requires integral BITVECTOR indices");
+    require(!bit_vectors.run_string("#RUNTIME NONE\nPRINT BITS \"1\"\n").ok,
+            "rejects BITVECTOR literals under #RUNTIME NONE until freestanding lowering exists");
+
+    arco::Runtime slices;
+    std::ostringstream slice_output;
+    slices.set_output(slice_output);
+    const auto slice_result = slices.run_string(
+        "values = [0, 1, 2, 3, 4]\n"
+        "PRINT values[1:4]\n"
+        "PRINT values[:2]\n"
+        "PRINT values[3:]\n"
+        "PRINT values[-3:-1]\n"
+        "PRINT values[::2]\n"
+        "PRINT values[::-1]\n"
+        "PRINT values[4:1:-2]\n"
+        "PRINT \"Aé猫Z\"[1:3]\n"
+        "PRINT \"Aé猫Z\"[::-1]\n"
+        "PRINT Bits.ToString(BITS \"001101\"[1:5:2])\n"
+        "outer = [[1], 2]\n"
+        "copied = COPY outer\n"
+        "copied[1] = 9\n"
+        "copied[0][0] = 7\n"
+        "PRINT outer\n"
+        "PRINT copied\n"
+        "record = {Name: \"Ada\", Nested: [1]}\n"
+        "recordCopy = COPY record\n"
+        "recordCopy.Name = \"Grace\"\n"
+        "nestedCopy = recordCopy.Nested\n"
+        "nestedCopy[0] = 8\n"
+        "PRINT record.Name\n"
+        "PRINT record.Nested[0]\n"
+        "alias = values\n"
+        "values[1:4] = [8, 9]\n"
+        "PRINT values\n"
+        "PRINT alias\n"
+        "values[:0] = [-1]\n"
+        "values[99:] = [10]\n"
+        "PRINT values\n");
+    require(slice_result.ok, "runs collection slices, COPY, and array slice assignment: " + slice_result.error);
+    require(slice_output.str() ==
+                "[1, 2, 3]\n[0, 1]\n[3, 4]\n[2, 3]\n[0, 2, 4]\n[4, 3, 2, 1, 0]\n[4, 2]\né猫\nZ猫éA\n01\n"
+                "[[7], 2]\n[[7], 9]\nAda\n8\n[0, 8, 9, 4]\n[0, 8, 9, 4]\n[-1, 0, 8, 9, 4, 10]\n",
+            "implements normalized slicing, Unicode code points, shallow copying, and resizing replacement");
+    require(!slices.run_string("PRINT [1, 2][::0]\n").ok, "rejects a zero slice step");
+    require(!slices.run_string("PRINT [1, 2][0.5:]\n").ok, "rejects non-integral slice bounds");
+    require(!slices.run_string("value = 3\nPRINT value[:]\n").ok, "rejects invalid slice targets");
+    require(!slices.run_string("values = [1, 2]\nvalues[:] = 3\n").ok,
+            "requires an array replacement for slice assignment");
+    require(!slices.run_string("values = [1, 2]\nvalues[::2] = [3]\n").ok,
+            "rejects stepped slice assignment");
+    const arco::Value copied_number = arco::shallow_copy_value(arco::Value(4));
+    require(copied_number.is_number() && copied_number.as_number() == 4, "COPY leaves scalar values unchanged");
+
+    arco::Runtime tuples;
+    std::ostringstream tuple_output;
+    tuples.set_output(tuple_output);
+    const auto tuple_result = tuples.run_string(
+        "FUNCTION Pair(a, b) AS TUPLE\n"
+        "RETURN (a, b)\n"
+        "END FUNCTION\n"
+        "FUNCTION First(pair AS TUPLE)\n"
+        "RETURN pair[0]\n"
+        "END FUNCTION\n"
+        "empty = ()\n"
+        "single = (7,)\n"
+        "pair = Pair(1, 2)\n"
+        "PRINT empty\n"
+        "PRINT single\n"
+        "PRINT LEN(pair)\n"
+        "PRINT pair[1]\n"
+        "PRINT pair == (1, 2)\n"
+        "PRINT pair[0:1]\n"
+        "sum = 0\n"
+        "FOR item IN pair\n"
+        "sum += item\n"
+        "NEXT\n"
+        "PRINT sum\n"
+        "PRINT First(pair)\n"
+        "LET (left, right) = Pair(3, 4)\n"
+        "PRINT left\n"
+        "PRINT right\n"
+        "(left, right) = (right, left)\n"
+        "PRINT left\n"
+        "PRINT right\n"
+        "(left, right) = [8, 9]\n"
+        "PRINT left\n"
+        "PRINT right\n");
+    require(tuple_result.ok, "runs tuple construction, returns, typing, iteration, slicing, and destructuring: " + tuple_result.error);
+    require(tuple_output.str() == "()\n(7,)\n2\n2\nTRUE\n(1,)\n3\n1\n3\n4\n4\n3\n8\n9\n",
+            "preserves tuple identity, grouping distinction, and atomic swaps");
+    require(!tuples.run_string("value = (1, 2)\nvalue[0] = 9\n").ok, "rejects tuple indexed assignment");
+    require(!tuples.run_string("value = (1, 2)\nArray.Add(value, 3)\n").ok, "rejects tuple use in array mutators");
+    tuples.run_string("arityA = 11\narityB = 12\n");
+    const auto tuple_arity_error = tuples.run_string("(arityA, arityB) = (1,)\n");
+    require(!tuple_arity_error.ok && tuple_arity_error.error.find("expected 2, received 1") != std::string::npos,
+            "reports exact destructuring arity mismatch");
+    require(tuples.get_global("arityA").as_number() == 11 && tuples.get_global("arityB").as_number() == 12,
+            "validates and captures destructuring before assigning any target");
+
+    arco::Runtime callables;
+    std::ostringstream callable_output;
+    callables.set_output(callable_output);
+    const auto callable_result = callables.run_string(
+        "FUNCTION Score(item)\n"
+        "RETURN item.Score\n"
+        "END FUNCTION\n"
+        "FUNCTION Plus(a, b = 2) AS Number\n"
+        "RETURN a + b\n"
+        "END FUNCTION\n"
+        "FUNCTION Invoke(fn AS CALLABLE, value)\n"
+        "RETURN fn(value)\n"
+        "END FUNCTION\n"
+        "CLASS Bias\n"
+        "Offset = 0\n"
+        "FUNCTION Key(item)\n"
+        "RETURN item.Score + SELF.Offset\n"
+        "END FUNCTION\n"
+        "END CLASS\n"
+        "calls = []\n"
+        "FUNCTION Track(value)\n"
+        "Array.Add(calls, value)\n"
+        "RETURN value\n"
+        "END FUNCTION\n"
+        "items = [{Name: \"b\", Score: 2}, {Name: \"a\", Score: 1}, {Name: \"c\", Score: 2}]\n"
+        "key = ADDRESSOF Score\n"
+        "plus = ADDRESSOF Plus\n"
+        "PRINT TYPEOF(key)\n"
+        "PRINT key({Score: 5})\n"
+        "PRINT plus(3)\n"
+        "PRINT Invoke(key, {Score: 7})\n"
+        "ranked = Array.SortBy(items, key)\n"
+        "first = ranked[0]\n"
+        "second = ranked[1]\n"
+        "third = ranked[2]\n"
+        "PRINT first.Name\n"
+        "PRINT second.Name\n"
+        "PRINT third.Name\n"
+        "descending = Array.SortBy(items, key, TRUE)\n"
+        "descFirst = descending[0]\n"
+        "descSecond = descending[1]\n"
+        "descThird = descending[2]\n"
+        "PRINT descFirst.Name\n"
+        "PRINT descSecond.Name\n"
+        "PRINT descThird.Name\n"
+        "minItem = Array.MinBy(items, key)\n"
+        "maxItem = Array.MaxBy(items, key)\n"
+        "PRINT minItem.Name\n"
+        "PRINT maxItem.Name\n"
+        "Array.SortBy([3, 1, 2], ADDRESSOF Track)\n"
+        "PRINT LEN(calls)\n"
+        "bias = Bias()\n"
+        "bias.Offset = 10\n"
+        "biasKey = ADDRESSOF bias.Key\n"
+        "PRINT biasKey({Score: 4})\n");
+    require(callable_result.ok, "runs first-class CALLABLE values and keyed ordering: " + callable_result.error);
+    require(callable_output.str() == "Callable\n5\n5\n7\na\nb\nc\nb\nc\na\na\nb\n3\n14\n",
+            "implements callable invocation, default args, stable SortBy, extrema, and bound methods");
+    require(!callables.run_string("PRINT ADDRESSOF Missing.Function\n").ok, "rejects unknown ADDRESSOF targets");
+    require(!callables.run_string("Array.SortBy([1], \"Score\")\n").ok, "requires a CALLABLE sort key");
+    require(!callables.run_string("FUNCTION Mixed(value)\nIF value == 1 THEN\nRETURN 1\nELSE\nRETURN \"two\"\nEND IF\nEND FUNCTION\nArray.SortBy([1, 2], ADDRESSOF Mixed)\n").ok,
+            "rejects mixed key types for keyed ordering");
+    require(!callables.run_string("FUNCTION Same(value)\nRETURN value\nEND FUNCTION\nPRINT Array.MinBy([], ADDRESSOF Same)\n").ok,
+            "rejects extrema over empty arrays");
+
+    arco::Runtime ranges;
+    std::ostringstream range_output;
+    ranges.set_output(range_output);
+    const auto range_result = ranges.run_string(
+        "squares = [i * i FOR i IN Range(1, 5)]\n"
+        "PRINT squares\n"
+        "evens = [j FOR j IN Range(7) IF j % 2 == 0]\n"
+        "PRINT evens\n"
+        "TRY\n"
+        "PRINT j\n"
+        "CATCH err\n"
+        "PRINT err.Type\n"
+        "END TRY\n"
+        "values = [10, 20, 30]\n"
+        "shifted = [value + 1 FOR value IN values IF value > 10]\n"
+        "PRINT shifted\n"
+        "r = Range(1, 7, 2)\n"
+        "PRINT TYPEOF(r)\n"
+        "PRINT r\n"
+        "PRINT LEN(r)\n"
+        "PRINT r[0]\n"
+        "PRINT r[2]\n"
+        "PRINT r CONTAINS 3\n"
+        "PRINT 4 IN r\n"
+        "total = 0\n"
+        "FOR i IN Range(5)\n"
+        "total += i\n"
+        "NEXT\n"
+        "PRINT total\n"
+        "\n");
+    require(range_result.ok, "runs RANGE values and array comprehensions: " + range_result.error);
+    require(range_output.str() ==
+                "[1, 4, 9, 16]\n[0, 2, 4, 6]\nRuntimeError\n[21, 31]\nRange\nRange(1, 7, 2)\n3\n1\n5\nTRUE\nFALSE\n10\n",
+            "implements range length/indexing/membership/iteration and scoped comprehensions");
+    require(!ranges.run_string("PRINT Range(1, 3, 0)\n").ok, "rejects zero range steps");
+    require(!ranges.run_string("PRINT Range(1.5)\n").ok, "rejects non-integral range bounds");
+    require(!ranges.run_string("PRINT [x FOR x IN 3]\n").ok, "rejects non-iterable comprehensions");
+
     arco::Runtime limited;
     limited.set_limits({2});
     const auto limit_result = limited.run_string("WHILE TRUE\nPRINT 1\nWEND\n");
     require(!limit_result.ok, "enforces instruction limit");
+
+    arco::Runtime unauthorized_source_limit;
+    const auto unauthorized_limit_result = unauthorized_source_limit.run_string(
+        "#INSTRUCTION_LIMIT 1000\nPRINT \"no\"\n");
+    require(!unauthorized_limit_result.ok &&
+                unauthorized_limit_result.error.find("not authorized") != std::string::npos,
+            "embedded runtimes reject source instruction-limit requests by default");
+
+    arco::Runtime authorized_source_limit;
+    authorized_source_limit.set_instruction_limit_policy(true);
+    std::ostringstream authorized_limit_output;
+    authorized_source_limit.set_output(authorized_limit_output);
+    const auto authorized_limit_result = authorized_source_limit.run_string(
+        "#INSTRUCTION_LIMIT 1000\nPRINT \"authorized\"\n");
+    require(authorized_limit_result.ok && authorized_limit_output.str() == "authorized\n",
+            "authorized hosts apply source instruction-limit requests");
+    require(authorized_source_limit.compile_metadata().instruction_limit == 1000,
+            "preserves #INSTRUCTION_LIMIT in compile metadata");
+
+    arco::Runtime capped_source_limit;
+    capped_source_limit.set_instruction_limit_policy(true, 500);
+    const auto capped_limit_result = capped_source_limit.run_string(
+        "#INSTRUCTION_LIMIT 1000\nPRINT \"no\"\n");
+    require(!capped_limit_result.ok && capped_limit_result.error.find("exceeds host maximum 500") != std::string::npos,
+            "host hard maximum rejects larger source requests without clamping");
+
+    arco::Runtime overridden_source_limit;
+    overridden_source_limit.set_instruction_limit_policy(true);
+    overridden_source_limit.set_instruction_limit_override(1000);
+    const auto overridden_limit_result = overridden_source_limit.run_string(
+        "#INSTRUCTION_LIMIT 1\nPRINT \"override\"\n");
+    require(overridden_limit_result.ok, "operator instruction-limit override supersedes the source request");
+
+    for (const std::string bad_limit : {"", "0", "-1", "1.5", "name", "9007199254740992"}) {
+        arco::Runtime malformed_limit;
+        malformed_limit.set_instruction_limit_policy(true);
+        const auto malformed_limit_result = malformed_limit.run_string(
+            "#INSTRUCTION_LIMIT " + bad_limit + "\nPRINT \"no\"\n");
+        require(!malformed_limit_result.ok && malformed_limit_result.error.find("#INSTRUCTION_LIMIT") != std::string::npos,
+                "rejects malformed #INSTRUCTION_LIMIT operand: " + bad_limit);
+    }
+    arco::Runtime duplicate_limit;
+    duplicate_limit.set_instruction_limit_policy(true);
+    require(!duplicate_limit.run_string(
+                "#INSTRUCTION_LIMIT 10\n#INSTRUCTION_LIMIT 20\nPRINT \"no\"\n").ok,
+            "rejects duplicate #INSTRUCTION_LIMIT directives");
+    arco::Runtime freestanding_limit;
+    freestanding_limit.set_instruction_limit_policy(true);
+    const auto freestanding_limit_result = freestanding_limit.run_string(
+        "#INSTRUCTION_LIMIT 10\n#RUNTIME NONE\n");
+    require(!freestanding_limit_result.ok && freestanding_limit_result.error.find("hosted execution") != std::string::npos,
+            "rejects #INSTRUCTION_LIMIT under #RUNTIME NONE regardless of directive order");
 
     ArcoRuntime* c_runtime = arco_create_runtime();
     require(c_runtime != nullptr, "creates C runtime");

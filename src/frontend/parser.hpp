@@ -26,14 +26,23 @@ enum class AstKind {
     MethodCall,
     SuperCall,
     Index,
+    Slice,
+    Copy,
+    AddressOf,
+    Tuple,
     Array,
+    ArrayComprehension,
     Object,
     Print,
     Assign,
+    SliceAssign,
+    Destructure,
     CompoundAssign,
     FlagOperation,
     Flags,
     HardwareSemantic,
+    PortOperation,
+    MemoryOperation,
     ExpressionStatement,
     NoOp,
     Return,
@@ -44,6 +53,7 @@ enum class AstKind {
     Interface,
     InterfaceMethod,
     Try,
+    Throw,
     Goto,
     Stop,
     LoopControl,
@@ -162,6 +172,7 @@ private:
     StmtPtr interface_statement();
     StmtPtr return_statement();
     StmtPtr try_statement();
+    StmtPtr throw_statement();
     StmtPtr goto_statement();
     StmtPtr stop_statement();
     StmtPtr loop_control_statement();

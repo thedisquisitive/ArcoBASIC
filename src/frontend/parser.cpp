@@ -35,6 +35,12 @@ std::string next_wider_type_name(const std::string& type_name) {
 Value apply_binary(TokenType op, const Value& a, const Value& b) {
     switch (op) {
         case TokenType::Plus:
+            if (a.is_bit_vector() || b.is_bit_vector()) {
+                if (!a.is_bit_vector() || !b.is_bit_vector()) {
+                    throw std::runtime_error("bit vector concatenation requires two BITVECTOR values");
+                }
+                return Value(BitVector::from_string(a.as_bit_vector().string() + b.as_bit_vector().string()));
+            }
             if (a.is_string() || b.is_string()) {
                 return a.to_string() + b.to_string();
             }
@@ -45,6 +51,13 @@ Value apply_binary(TokenType op, const Value& a, const Value& b) {
             return a.as_number() * b.as_number();
         case TokenType::Slash:
             return a.as_number() / b.as_number();
+        case TokenType::Backslash: {
+            const double divisor = b.as_number();
+            if (divisor == 0.0) {
+                throw std::runtime_error("integer division divisor cannot be zero");
+            }
+            return std::trunc(a.as_number() / divisor);
+        }
         case TokenType::Mod: {
             const double divisor = b.as_number();
             if (divisor == 0.0) {
@@ -67,6 +80,8 @@ Value apply_binary(TokenType op, const Value& a, const Value& b) {
         case TokenType::ShiftRight:
         case TokenType::ShiftRightWord:
             return static_cast<double>(as_int(a) >> as_int(b));
+        case TokenType::ShiftArithmeticRightWord:
+            return static_cast<double>(as_int(a) >> as_int(b));
         case TokenType::Equal:
             return values_equal(a, b);
         case TokenType::NotEqual:
@@ -88,6 +103,11 @@ Value apply_binary(TokenType op, const Value& a, const Value& b) {
                 }
                 return false;
             }
+            if (a.is_range()) {
+                const double value = b.as_number();
+                if (!std::isfinite(value) || std::floor(value) != value) return false;
+                return a.as_range().contains(static_cast<long long>(value));
+            }
             return a.to_string().find(b.to_string()) != std::string::npos;
         case TokenType::In:
             if (b.is_array()) {
@@ -97,6 +117,11 @@ Value apply_binary(TokenType op, const Value& a, const Value& b) {
                     }
                 }
                 return false;
+            }
+            if (b.is_range()) {
+                const double value = a.as_number();
+                if (!std::isfinite(value) || std::floor(value) != value) return false;
+                return b.as_range().contains(static_cast<long long>(value));
             }
             return b.to_string().find(a.to_string()) != std::string::npos;
         case TokenType::Has:
@@ -124,13 +149,22 @@ std::string uppercase(std::string value) {
 // Matched as a whole leading dot-segment, not a substring, so "SystemTable" does not match "System".
 bool is_hosted_runtime_namespace(const std::string& first_segment) {
     static const std::initializer_list<const char*> forbidden = {
-        "FILE", "NETWORK", "NET", "SYSTEM", "WEB", "PRINTER", "PROCESS", "HOST", "DOCUMENT",
+        "FILE", "NETWORK", "NET", "SYSTEM", "WEB", "PRINTER", "PROCESS", "HOST", "DOCUMENT", "RANDOM", "BITS",
     };
     const std::string upper = uppercase(first_segment);
     for (const char* name : forbidden) {
         if (upper == name) {
             return true;
         }
+    }
+    return false;
+}
+
+bool is_hosted_runtime_call(const std::string& name) {
+    static const std::initializer_list<const char*> forbidden = {"MATH.RANDOM"};
+    const std::string upper = uppercase(name);
+    for (const char* call : forbidden) {
+        if (upper == call) return true;
     }
     return false;
 }
@@ -204,6 +238,7 @@ std::string ast_token_name(TokenType type) {
         case TokenType::Minus: return "-";
         case TokenType::Star: return "*";
         case TokenType::Slash: return "/";
+        case TokenType::Backslash: return "\\";
         case TokenType::Mod: return "%";
         case TokenType::Ampersand:
         case TokenType::BitAnd: return "AND";
@@ -228,6 +263,7 @@ std::string ast_token_name(TokenType type) {
         case TokenType::ShiftLeftWord: return "SHL";
         case TokenType::ShiftRight:
         case TokenType::ShiftRightWord: return "SHR";
+        case TokenType::ShiftArithmeticRightWord: return "SAR";
         case TokenType::Contains: return "CONTAINS";
         case TokenType::In: return "IN";
         case TokenType::Has: return "HAS";
@@ -475,6 +511,9 @@ struct CallExpr final : Expr {
         : name(std::move(name)), args(std::move(args)) {}
 
     Value eval(Runtime& runtime) const override {
+        if (uppercase(name).rfind("PORT.", 0) == 0) {
+            throw std::runtime_error(name + " is available only on a freestanding target with port-I/O support");
+        }
         if (uppercase(name) == "REF" && (args.size() == 1 || args.size() == 2)) {
             if (const auto* variable = dynamic_cast<const VariableExpr*>(args[0].get())) {
                 std::string type_name;
@@ -489,16 +528,27 @@ struct CallExpr final : Expr {
         for (const auto& arg : args) {
             values.push_back(arg->eval(runtime));
         }
+        if (runtime.has_global(name)) {
+            const Value target = runtime.get_global(name);
+            if (runtime.is_callable(target)) return runtime.call_callable(target, values);
+        }
         return runtime.call_host_function(name, values);
     }
     void dump_ast(std::ostream& output, int indent) const override {
-        ast_line(output, indent, "Call " + name);
+        const std::string upper_name = uppercase(name);
+        ast_line(output, indent, upper_name.rfind("PORT.", 0) == 0 ? "PortOperation " + name :
+            (upper_name.rfind("ADDRESS.", 0) == 0 || upper_name.rfind("MEMORY.", 0) == 0 || upper_name.rfind("CPU.", 0) == 0 || upper_name.rfind("GRAPHICS.", 0) == 0 || upper_name == "UEFI.GOP.DISCOVER")
+                ? "MemoryOperation " + name : "Call " + name);
         for (const auto& arg : args) {
             arg->dump_ast(output, indent + 1);
         }
     }
     CanonicalAstNodePtr canonical_ast() const override {
-        auto node = canonical_node(AstKind::Call);
+        const std::string upper_name = uppercase(name);
+        const bool memory = upper_name.rfind("ADDRESS.", 0) == 0 || upper_name.rfind("MEMORY.", 0) == 0 || upper_name.rfind("GRAPHICS.", 0) == 0 || upper_name == "UEFI.GOP.DISCOVER" ||
+            upper_name == "CPU.READBARRIER" || upper_name == "CPU.WRITEBARRIER" || upper_name == "CPU.MEMORYBARRIER" ||
+            upper_name == "CPU.READCR3" || upper_name == "CPU.WRITECR3" || upper_name == "CPU.INVALIDATEPAGE" || upper_name == "CPU.READRSP";
+        auto node = canonical_node(upper_name.rfind("PORT.", 0) == 0 ? AstKind::PortOperation : memory ? AstKind::MemoryOperation : AstKind::Call);
         node->name = name;
         for (const auto& arg : args) {
             node->children.push_back(arg->canonical_ast());
@@ -515,6 +565,9 @@ struct MethodCallExpr final : Expr {
         : full_name(std::move(full_name)), receiver(std::move(receiver)), method(std::move(method)), args(std::move(args)) {}
 
     Value eval(Runtime& runtime) const override {
+        if (uppercase(receiver) == "PORT") {
+            throw std::runtime_error(full_name + " is available only on a freestanding target with port-I/O support");
+        }
         std::vector<Value> values;
         values.reserve(args.size());
         for (const auto& arg : args) {
@@ -537,13 +590,18 @@ struct MethodCallExpr final : Expr {
         return runtime.call_host_function(full_name, values);
     }
     void dump_ast(std::ostream& output, int indent) const override {
-        ast_line(output, indent, "MethodCall " + receiver + "." + method);
+        const std::string upper_receiver = uppercase(receiver);
+        ast_line(output, indent, upper_receiver == "PORT" ? "PortOperation " + full_name :
+            (upper_receiver == "ADDRESS" || upper_receiver == "MEMORY" || upper_receiver == "CPU" || upper_receiver == "GRAPHICS" || upper_receiver == "UEFI.GOP" || (upper_receiver == "UEFI" && uppercase(method).rfind("GOP.", 0) == 0))
+                ? "MemoryOperation " + full_name : "MethodCall " + receiver + "." + method);
         for (const auto& arg : args) {
             arg->dump_ast(output, indent + 1);
         }
     }
     CanonicalAstNodePtr canonical_ast() const override {
-        auto node = canonical_node(AstKind::MethodCall);
+        const std::string upper_receiver = uppercase(receiver);
+        auto node = canonical_node(upper_receiver == "PORT" ? AstKind::PortOperation :
+            (upper_receiver == "ADDRESS" || upper_receiver == "MEMORY" || upper_receiver == "CPU" || upper_receiver == "GRAPHICS" || upper_receiver == "UEFI.GOP" || (upper_receiver == "UEFI" && uppercase(method).rfind("GOP.", 0) == 0)) ? AstKind::MemoryOperation : AstKind::MethodCall);
         node->name = full_name;
         node->secondary_name = receiver;
         node->text = method;
@@ -597,7 +655,29 @@ struct IndexExpr final : Expr {
     IndexExpr(std::unique_ptr<Expr> target, std::unique_ptr<Expr> index) : target(std::move(target)), index(std::move(index)) {}
     Value eval(Runtime& runtime) const override {
         const Value value = target->eval(runtime);
-        const int i = static_cast<int>(index->eval(runtime).as_number());
+        const double numeric_index = index->eval(runtime).as_number();
+        if (value.is_bit_vector()) {
+            if (!std::isfinite(numeric_index) || std::floor(numeric_index) != numeric_index || numeric_index < 0 ||
+                numeric_index >= static_cast<double>(value.as_bit_vector().length)) {
+                throw std::runtime_error("bit vector index out of range");
+            }
+            return value.as_bit_vector().get(static_cast<std::size_t>(numeric_index)) ? 1.0 : 0.0;
+        }
+        if (value.is_tuple()) {
+            if (!std::isfinite(numeric_index) || std::floor(numeric_index) != numeric_index || numeric_index < 0 ||
+                numeric_index >= static_cast<double>(value.as_tuple().size())) {
+                throw std::runtime_error("tuple index out of range");
+            }
+            return value.as_tuple()[static_cast<std::size_t>(numeric_index)];
+        }
+        if (value.is_range()) {
+            if (!std::isfinite(numeric_index) || std::floor(numeric_index) != numeric_index || numeric_index < 0 ||
+                numeric_index >= static_cast<double>(value.as_range().length)) {
+                throw std::runtime_error("range index out of range");
+            }
+            return static_cast<double>(value.as_range().at(static_cast<std::size_t>(numeric_index)));
+        }
+        const int i = static_cast<int>(numeric_index);
         if (value.is_array()) {
             const auto& array = value.as_array();
             if (i < 0 || static_cast<std::size_t>(i) >= array.size()) {
@@ -606,11 +686,11 @@ struct IndexExpr final : Expr {
             return array[static_cast<std::size_t>(i)];
         }
         if (value.is_string()) {
-            const std::string text = value.to_string();
-            if (i < 0 || static_cast<std::size_t>(i) >= text.size()) {
+            const auto points = utf8_codepoints(value.to_string());
+            if (i < 0 || static_cast<std::size_t>(i) >= points.size()) {
                 throw std::runtime_error("string index out of range");
             }
-            return std::string(1, text[static_cast<std::size_t>(i)]);
+            return points[static_cast<std::size_t>(i)];
         }
         throw std::runtime_error("value is not indexable");
     }
@@ -629,6 +709,78 @@ struct IndexExpr final : Expr {
     }
     std::unique_ptr<Expr> target;
     std::unique_ptr<Expr> index;
+};
+
+std::optional<long long> eval_slice_bound(const std::unique_ptr<Expr>& expression, Runtime& runtime,
+                                          const std::string& role) {
+    if (!expression) return std::nullopt;
+    return exact_slice_integer(expression->eval(runtime).as_number(), role);
+}
+
+struct SliceExpr final : Expr {
+    SliceExpr(std::unique_ptr<Expr> target, std::unique_ptr<Expr> start, std::unique_ptr<Expr> end,
+              std::unique_ptr<Expr> step)
+        : target(std::move(target)), start(std::move(start)), end(std::move(end)), step(std::move(step)) {}
+    Value eval(Runtime& runtime) const override {
+        const Value source = target->eval(runtime);
+        const auto first = eval_slice_bound(start, runtime, "start");
+        const auto last = eval_slice_bound(end, runtime, "end");
+        const long long stride = step ? exact_slice_integer(step->eval(runtime).as_number(), "step") : 1;
+        return slice_value(source, first, last, stride);
+    }
+    void dump_ast(std::ostream& output, int indent) const override {
+        ast_line(output, indent, "Slice");
+        target->dump_ast(output, indent + 1);
+        if (start) start->dump_ast(output, indent + 1); else ast_line(output, indent + 1, "OmittedStart");
+        if (end) end->dump_ast(output, indent + 1); else ast_line(output, indent + 1, "OmittedEnd");
+        if (step) step->dump_ast(output, indent + 1); else ast_line(output, indent + 1, "OmittedStep");
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Slice);
+        node->children.push_back(target->canonical_ast());
+        node->children.push_back(start ? start->canonical_ast() : nullptr);
+        node->children.push_back(end ? end->canonical_ast() : nullptr);
+        node->children.push_back(step ? step->canonical_ast() : nullptr);
+        return node;
+    }
+    std::unique_ptr<Expr> target;
+    std::unique_ptr<Expr> start;
+    std::unique_ptr<Expr> end;
+    std::unique_ptr<Expr> step;
+};
+
+struct CopyExpr final : Expr {
+    explicit CopyExpr(std::unique_ptr<Expr> value) : value(std::move(value)) {}
+    Value eval(Runtime& runtime) const override { return shallow_copy_value(value->eval(runtime)); }
+    void dump_ast(std::ostream& output, int indent) const override {
+        ast_line(output, indent, "Copy");
+        value->dump_ast(output, indent + 1);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Copy);
+        node->children.push_back(value->canonical_ast());
+        return node;
+    }
+    std::unique_ptr<Expr> value;
+};
+
+struct AddressOfExpr final : Expr {
+    explicit AddressOfExpr(std::string name) : name(std::move(name)) {}
+    Value eval(Runtime& runtime) const override {
+        const auto dot = name.find('.');
+        if (dot != std::string::npos) {
+            const std::string receiver_name = name.substr(0, dot);
+            if (runtime.has_global(receiver_name)) return runtime.make_callable(name, runtime.get_global(receiver_name));
+        }
+        return runtime.make_callable(name);
+    }
+    void dump_ast(std::ostream& output, int indent) const override { ast_line(output, indent, "AddressOf " + name); }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::AddressOf);
+        node->name = name;
+        return node;
+    }
+    std::string name;
 };
 
 struct ArrayExpr final : Expr {
@@ -652,6 +804,83 @@ struct ArrayExpr final : Expr {
         for (const auto& item : items) {
             node->children.push_back(item->canonical_ast());
         }
+        return node;
+    }
+    std::vector<std::unique_ptr<Expr>> items;
+};
+
+struct ArrayComprehensionExpr final : Expr {
+    ArrayComprehensionExpr(std::unique_ptr<Expr> result, std::string name, std::unique_ptr<Expr> iterable,
+                           std::unique_ptr<Expr> filter)
+        : result(std::move(result)), name(std::move(name)), iterable(std::move(iterable)), filter(std::move(filter)) {}
+    Value eval(Runtime& runtime) const override {
+        const Value values = iterable->eval(runtime);
+        if (!values.is_array() && !values.is_tuple() && !values.is_range()) {
+            throw std::runtime_error("array comprehension expects an array, tuple, or range");
+        }
+        Value::Array output;
+        struct LocalScope {
+            explicit LocalScope(Runtime& runtime) : runtime(runtime) { runtime.push_scope(); }
+            ~LocalScope() { runtime.pop_scope(); }
+            Runtime& runtime;
+        } scope(runtime);
+        auto visit = [&](const Value& value) {
+            runtime.tick();
+            runtime.set_global(name, value);
+            if (filter && !filter->eval(runtime).truthy()) return;
+            output.push_back(result->eval(runtime));
+        };
+        if (values.is_range()) {
+            const auto& range = values.as_range();
+            output.reserve(range.length);
+            for (std::size_t i = 0; i < range.length; ++i) visit(static_cast<double>(range.at(i)));
+        } else {
+            const auto& elements = values.is_tuple() ? values.as_tuple() : values.as_array();
+            if (!filter) output.reserve(elements.size());
+            for (const auto& value : elements) visit(value);
+        }
+        return output;
+    }
+    void dump_ast(std::ostream& output, int indent) const override {
+        ast_line(output, indent, "ArrayComprehension " + name);
+        ast_line(output, indent + 1, "Result");
+        result->dump_ast(output, indent + 2);
+        ast_line(output, indent + 1, "Iterable");
+        iterable->dump_ast(output, indent + 2);
+        if (filter) {
+            ast_line(output, indent + 1, "Filter");
+            filter->dump_ast(output, indent + 2);
+        }
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::ArrayComprehension);
+        node->name = name;
+        node->children.push_back(result->canonical_ast());
+        node->children.push_back(iterable->canonical_ast());
+        if (filter) node->children.push_back(filter->canonical_ast());
+        return node;
+    }
+    std::unique_ptr<Expr> result;
+    std::string name;
+    std::unique_ptr<Expr> iterable;
+    std::unique_ptr<Expr> filter;
+};
+
+struct TupleExpr final : Expr {
+    explicit TupleExpr(std::vector<std::unique_ptr<Expr>> items) : items(std::move(items)) {}
+    Value eval(Runtime& runtime) const override {
+        Value::Array values;
+        values.reserve(items.size());
+        for (const auto& item : items) values.push_back(item->eval(runtime));
+        return Value::tuple(std::move(values));
+    }
+    void dump_ast(std::ostream& output, int indent) const override {
+        ast_line(output, indent, "Tuple");
+        for (const auto& item : items) item->dump_ast(output, indent + 1);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Tuple);
+        for (const auto& item : items) node->children.push_back(item->canonical_ast());
         return node;
     }
     std::vector<std::unique_ptr<Expr>> items;
@@ -742,6 +971,72 @@ struct AssignStmt final : Stmt {
     std::vector<std::unique_ptr<Expr>> indexes;
     std::unique_ptr<Expr> expr;
     std::string type_name;
+};
+
+struct SliceAssignStmt final : Stmt {
+    SliceAssignStmt(std::string name, std::unique_ptr<Expr> start, std::unique_ptr<Expr> end,
+                    std::unique_ptr<Expr> replacement)
+        : name(std::move(name)), start(std::move(start)), end(std::move(end)), replacement(std::move(replacement)) {}
+    void exec(Runtime& runtime) const override {
+        runtime.tick();
+        const auto first = eval_slice_bound(start, runtime, "start");
+        const auto last = eval_slice_bound(end, runtime, "end");
+        runtime.set_global(name, replace_array_slice(runtime.get_global(name), first, last, replacement->eval(runtime)));
+    }
+    void dump_ast(std::ostream& output, int indent) const override {
+        ast_line(output, indent, "SliceAssign " + name);
+        if (start) start->dump_ast(output, indent + 1); else ast_line(output, indent + 1, "OmittedStart");
+        if (end) end->dump_ast(output, indent + 1); else ast_line(output, indent + 1, "OmittedEnd");
+        replacement->dump_ast(output, indent + 1);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::SliceAssign, *this);
+        node->name = name;
+        node->children.push_back(start ? start->canonical_ast() : nullptr);
+        node->children.push_back(end ? end->canonical_ast() : nullptr);
+        node->children.push_back(replacement->canonical_ast());
+        return node;
+    }
+    std::string name;
+    std::unique_ptr<Expr> start;
+    std::unique_ptr<Expr> end;
+    std::unique_ptr<Expr> replacement;
+};
+
+struct DestructureStmt final : Stmt {
+    DestructureStmt(std::vector<std::string> names, std::unique_ptr<Expr> source)
+        : names(std::move(names)), source(std::move(source)) {}
+    void exec(Runtime& runtime) const override {
+        runtime.tick();
+        const Value value = source->eval(runtime);
+        if (!value.is_array() && !value.is_tuple()) {
+            throw std::runtime_error("destructuring expects an array or tuple with arity " + std::to_string(names.size()));
+        }
+        const auto& elements = value.is_tuple() ? value.as_tuple() : value.as_array();
+        if (elements.size() != names.size()) {
+            throw std::runtime_error("destructuring arity mismatch: expected " + std::to_string(names.size()) +
+                                     ", received " + std::to_string(elements.size()));
+        }
+        const Value::Array captured(elements.begin(), elements.end());
+        for (std::size_t i = 0; i < names.size(); ++i) runtime.set_global(names[i], captured[i]);
+    }
+    void dump_ast(std::ostream& output, int indent) const override {
+        std::string targets;
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            if (i) targets += ", ";
+            targets += names[i];
+        }
+        ast_line(output, indent, "Destructure " + targets);
+        source->dump_ast(output, indent + 1);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Destructure, *this);
+        node->names = names;
+        node->children.push_back(source->canonical_ast());
+        return node;
+    }
+    std::vector<std::string> names;
+    std::unique_ptr<Expr> source;
 };
 
 struct CompoundAssignStmt final : Stmt {
@@ -1392,7 +1687,8 @@ struct TryStmt final : Stmt {
             throw;
         } catch (const std::exception& error) {
             if (!error_name.empty()) {
-                runtime.set_global(error_name, Value::Object{{"Message", error.what()}});
+                const bool user_defined = dynamic_cast<const UserError*>(&error) != nullptr;
+                runtime.set_global(error_name, Value::Object{{"Message", error.what()}, {"Type", user_defined ? "UserError" : "RuntimeError"}});
             }
             for (const auto& statement : catch_body) {
                 statement->exec(runtime);
@@ -1416,6 +1712,41 @@ struct TryStmt final : Stmt {
     std::vector<std::unique_ptr<Stmt>> try_body;
     std::string error_name;
     std::vector<std::unique_ptr<Stmt>> catch_body;
+};
+
+std::string public_value_type(const Value& value) {
+    if (value.is_null()) return "Null";
+    if (value.is_bool()) return "Boolean";
+    if (value.is_number()) return "Number";
+    if (value.is_string()) return "String";
+    if (value.is_array()) return "Array";
+    if (value.is_bit_vector()) return "BitVector";
+    if (value.is_tuple()) return "Tuple";
+    if (value.is_range()) return "Range";
+    if (value.is_handle()) return value.as_handle().type;
+    return "Object";
+}
+
+struct ThrowStmt final : Stmt {
+    explicit ThrowStmt(std::unique_ptr<Expr> message) : message(std::move(message)) {}
+    void exec(Runtime& runtime) const override {
+        runtime.tick();
+        const Value value = message->eval(runtime);
+        if (!value.is_string()) {
+            throw std::runtime_error("THROW message must be String; received " + public_value_type(value));
+        }
+        throw UserError(value.to_string(), source_line, source_column);
+    }
+    void dump_ast(std::ostream& output, int indent) const override {
+        ast_line(output, indent, "Throw");
+        message->dump_ast(output, indent + 1);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Throw, *this);
+        node->children.push_back(message->canonical_ast());
+        return node;
+    }
+    std::unique_ptr<Expr> message;
 };
 
 struct GotoStmt final : Stmt {
@@ -1791,10 +2122,11 @@ struct ForEachStmt final : Stmt {
         : name(std::move(name)), iterable(std::move(iterable)), body(std::move(body)) {}
     void exec(Runtime& runtime) const override {
         const Value values = iterable->eval(runtime);
-        if (!values.is_array()) {
-            throw std::runtime_error("FOR IN expects an array");
+        if (!values.is_array() && !values.is_tuple() && !values.is_range()) {
+            throw std::runtime_error("FOR IN expects an array, tuple, or range");
         }
-        for (const auto& value : values.as_array()) {
+        enum class IterationAction { Next, Break };
+        auto run_iteration = [&](const Value& value) {
             runtime.tick();
             runtime.set_global(name, value);
             try {
@@ -1806,10 +2138,22 @@ struct ForEachStmt final : Stmt {
                     throw;
                 }
                 if (control.action() == LoopControlAction::Exit) {
-                    break;
+                    return IterationAction::Break;
                 }
-                continue;
+                return IterationAction::Next;
             }
+            return IterationAction::Next;
+        };
+        if (values.is_range()) {
+            const auto& range = values.as_range();
+            for (std::size_t i = 0; i < range.length; ++i) {
+                if (run_iteration(static_cast<double>(range.at(i))) == IterationAction::Break) break;
+            }
+            return;
+        }
+        const auto& elements = values.is_tuple() ? values.as_tuple() : values.as_array();
+        for (const auto& value : elements) {
+            if (run_iteration(value) == IterationAction::Break) break;
         }
     }
     void dump_ast(std::ostream& output, int indent) const override {
@@ -2156,6 +2500,12 @@ Parser::StmtPtr Parser::statement() {
         parsed = return_statement();
     } else if (match(TokenType::Try)) {
         parsed = try_statement();
+    } else if (match(TokenType::Throw)) {
+        if (freestanding_runtime_none_) {
+            throw std::runtime_error(token_error(previous(),
+                "THROW requires hosted runtime error unwinding and is unavailable under #RUNTIME NONE"));
+        }
+        parsed = throw_statement();
     } else if (match(TokenType::Goto)) {
         parsed = goto_statement();
     } else if (match(TokenType::Stop)) {
@@ -2164,7 +2514,9 @@ Parser::StmtPtr Parser::statement() {
         parsed = flags_statement();
     } else if (check(TokenType::Identifier)) {
         const std::string statement_name = uppercase(peek().lexeme);
-        if (statement_name == "CPU.HALT" || statement_name == "CPU.HALTFOREVER") {
+        if (statement_name == "CPU.HALT" || statement_name == "CPU.HALTFOREVER" || statement_name == "CPU.PAUSE" ||
+            statement_name == "CPU.READBARRIER" || statement_name == "CPU.WRITEBARRIER" || statement_name == "CPU.MEMORYBARRIER" ||
+            statement_name == "CPU.DISABLEINTERRUPTS" || statement_name == "CPU.ENABLEINTERRUPTS" || statement_name == "CPU.BREAKPOINT") {
             parsed = hardware_semantic_statement();
         } else if ((statement_name == "EXIT" || statement_name == "CONTINUE") && current_ + 1 < tokens_.size() &&
             (tokens_[current_ + 1].type == TokenType::For || tokens_[current_ + 1].type == TokenType::While || tokens_[current_ + 1].type == TokenType::Do)) {
@@ -2183,6 +2535,8 @@ Parser::StmtPtr Parser::statement() {
         } else {
             parsed = assignment_statement(false);
         }
+    } else if (check(TokenType::LeftParen)) {
+        parsed = assignment_statement(false);
     } else {
         throw std::runtime_error(token_error(peek(), "expected statement"));
     }
@@ -2203,6 +2557,16 @@ Parser::StmtPtr Parser::print_statement() {
 }
 
 Parser::StmtPtr Parser::assignment_statement(bool had_let) {
+    if (match(TokenType::LeftParen)) {
+        std::vector<std::string> names;
+        do {
+            names.push_back(consume(TokenType::Identifier, "expected identifier in destructuring pattern").lexeme);
+        } while (match(TokenType::Comma));
+        consume(TokenType::RightParen, "expected ')' after destructuring targets");
+        if (names.empty()) throw std::runtime_error(token_error(previous(), "destructuring requires at least one target"));
+        consume(TokenType::Equal, "expected '=' after destructuring targets");
+        return std::make_unique<DestructureStmt>(std::move(names), expression());
+    }
     const Token name = consume(TokenType::Identifier, "expected variable name");
     std::string type_name;
     if (had_let && match(TokenType::As)) {
@@ -2210,7 +2574,23 @@ Parser::StmtPtr Parser::assignment_statement(bool had_let) {
     }
     std::vector<ExprPtr> indexes;
     while (match(TokenType::LeftBracket)) {
-        indexes.push_back(expression());
+        ExprPtr first;
+        if (!check(TokenType::Colon)) first = expression();
+        if (match(TokenType::Colon)) {
+            if (had_let || !indexes.empty()) {
+                throw std::runtime_error(token_error(previous(), "slice assignment requires an existing top-level array variable"));
+            }
+            ExprPtr end;
+            if (!check(TokenType::Colon) && !check(TokenType::RightBracket)) end = expression();
+            if (match(TokenType::Colon)) {
+                throw std::runtime_error(token_error(previous(), "stepped slice assignment is not supported"));
+            }
+            consume(TokenType::RightBracket, "expected ']' after slice");
+            consume(TokenType::Equal, "expected '=' after array slice");
+            return std::make_unique<SliceAssignStmt>(name.lexeme, std::move(first), std::move(end), expression());
+        }
+        if (!first) throw std::runtime_error(token_error(peek(), "expected index or slice"));
+        indexes.push_back(std::move(first));
         consume(TokenType::RightBracket, "expected ']' after index");
     }
     consume(TokenType::Equal, "expected '=' after variable name");
@@ -2282,9 +2662,16 @@ Parser::StmtPtr Parser::flags_statement() {
 
 Parser::StmtPtr Parser::hardware_semantic_statement() {
     const Token operation = consume(TokenType::Identifier, "expected hardware semantic operation");
-    return std::make_unique<HardwareSemanticStmt>(uppercase(operation.lexeme) == "CPU.HALT"
-        ? "CPU.Halt"
-        : "CPU.HaltForever");
+    const std::string name = uppercase(operation.lexeme);
+    if (name == "CPU.HALT") return std::make_unique<HardwareSemanticStmt>("CPU.Halt");
+    if (name == "CPU.PAUSE") return std::make_unique<HardwareSemanticStmt>("CPU.Pause");
+    if (name == "CPU.READBARRIER") return std::make_unique<HardwareSemanticStmt>("CPU.ReadBarrier");
+    if (name == "CPU.WRITEBARRIER") return std::make_unique<HardwareSemanticStmt>("CPU.WriteBarrier");
+    if (name == "CPU.MEMORYBARRIER") return std::make_unique<HardwareSemanticStmt>("CPU.MemoryBarrier");
+    if (name == "CPU.DISABLEINTERRUPTS") return std::make_unique<HardwareSemanticStmt>("CPU.DisableInterrupts");
+    if (name == "CPU.ENABLEINTERRUPTS") return std::make_unique<HardwareSemanticStmt>("CPU.EnableInterrupts");
+    if (name == "CPU.BREAKPOINT") return std::make_unique<HardwareSemanticStmt>("CPU.Breakpoint");
+    return std::make_unique<HardwareSemanticStmt>("CPU.HaltForever");
 }
 
 Parser::StmtPtr Parser::expression_statement() {
@@ -2602,6 +2989,13 @@ Parser::StmtPtr Parser::try_statement() {
     return std::make_unique<TryStmt>(std::move(try_body), std::move(error_name), std::move(catch_body));
 }
 
+Parser::StmtPtr Parser::throw_statement() {
+    if (check(TokenType::Newline) || check(TokenType::End) || check(TokenType::EndKeyword) || check(TokenType::Colon)) {
+        throw std::runtime_error(token_error(peek(), "expected an expression after THROW"));
+    }
+    return std::make_unique<ThrowStmt>(expression());
+}
+
 Parser::StmtPtr Parser::goto_statement() {
     const Token target = consume(TokenType::Number, "expected line number after GOTO");
     return std::make_unique<GotoStmt>(static_cast<int>(target.number));
@@ -2717,7 +3111,7 @@ Parser::ExprPtr Parser::comparison() {
 
 Parser::ExprPtr Parser::shift() {
     auto expr = term();
-    while (match_any({TokenType::ShiftLeft, TokenType::ShiftRight, TokenType::ShiftLeftWord, TokenType::ShiftRightWord})) {
+    while (match_any({TokenType::ShiftLeft, TokenType::ShiftRight, TokenType::ShiftLeftWord, TokenType::ShiftRightWord, TokenType::ShiftArithmeticRightWord})) {
         const TokenType op = previous().type;
         expr = std::make_unique<BinaryExpr>(std::move(expr), op, term());
     }
@@ -2735,7 +3129,7 @@ Parser::ExprPtr Parser::term() {
 
 Parser::ExprPtr Parser::factor() {
     auto expr = unary();
-    while (match_any({TokenType::Star, TokenType::Slash, TokenType::Mod}) || (check(TokenType::Identifier) && uppercase(peek().lexeme) == "MOD" && (advance(), true))) {
+    while (match_any({TokenType::Star, TokenType::Slash, TokenType::Backslash, TokenType::Mod}) || (check(TokenType::Identifier) && uppercase(peek().lexeme) == "MOD" && (advance(), true))) {
         const TokenType op = uppercase(previous().lexeme) == "MOD" ? TokenType::Mod : previous().type;
         expr = std::make_unique<BinaryExpr>(std::move(expr), op, unary());
     }
@@ -2743,6 +3137,23 @@ Parser::ExprPtr Parser::factor() {
 }
 
 Parser::ExprPtr Parser::unary() {
+    if (match(TokenType::AddressOf)) {
+        return std::make_unique<AddressOfExpr>(
+            consume(TokenType::Identifier, "expected qualified callable name after ADDRESSOF").lexeme);
+    }
+    const bool contextual_copy = check(TokenType::Identifier) && uppercase(peek().lexeme) == "COPY" &&
+        current_ + 1 < tokens_.size() &&
+        (tokens_[current_ + 1].type == TokenType::Identifier || tokens_[current_ + 1].type == TokenType::Number ||
+         tokens_[current_ + 1].type == TokenType::String || tokens_[current_ + 1].type == TokenType::InterpolatedString ||
+         tokens_[current_ + 1].type == TokenType::Bits || tokens_[current_ + 1].type == TokenType::LeftParen ||
+         tokens_[current_ + 1].type == TokenType::LeftBracket || tokens_[current_ + 1].type == TokenType::LeftBrace ||
+         tokens_[current_ + 1].type == TokenType::Minus || tokens_[current_ + 1].type == TokenType::Bang ||
+         tokens_[current_ + 1].type == TokenType::Tilde || tokens_[current_ + 1].type == TokenType::TrueKeyword ||
+         tokens_[current_ + 1].type == TokenType::FalseKeyword || tokens_[current_ + 1].type == TokenType::NullKeyword);
+    if (contextual_copy) {
+        advance();
+        return std::make_unique<CopyExpr>(unary());
+    }
     if (match(TokenType::Minus)) {
         return std::make_unique<UnaryExpr>(TokenType::Minus, unary());
     }
@@ -2785,9 +3196,12 @@ Parser::ExprPtr Parser::call() {
             const auto dot = variable->name.find('.');
             if (freestanding_runtime_none_) {
                 const std::string first_segment = dot != std::string::npos ? variable->name.substr(0, dot) : variable->name;
-                if (is_hosted_runtime_namespace(first_segment)) {
+                if (is_hosted_runtime_namespace(first_segment) || is_hosted_runtime_call(variable->name)) {
+                    const std::string construct = is_hosted_runtime_namespace(first_segment)
+                        ? first_segment + ".* calls"
+                        : variable->name + " call";
                     throw std::runtime_error(token_error(previous(),
-                        freestanding_diagnostic(first_segment + ".* calls",
+                        freestanding_diagnostic(construct,
                             "Provide an explicit systems binding instead of the hosted " + first_segment + " runtime, "
                             "or select a hosted runtime profile.")));
                 }
@@ -2811,11 +3225,25 @@ Parser::ExprPtr Parser::call() {
                 expr = std::make_unique<CallExpr>(variable->name, std::move(args));
             }
         } else if (match(TokenType::LeftBracket)) {
-            skip_newlines();
-            auto index = expression();
-            skip_newlines();
+            while (match(TokenType::Newline)) {}
+            ExprPtr first;
+            if (!check(TokenType::Colon)) first = expression();
+            if (match(TokenType::Colon)) {
+                ExprPtr end;
+                ExprPtr step;
+                if (!check(TokenType::Colon) && !check(TokenType::RightBracket)) end = expression();
+                if (match(TokenType::Colon)) {
+                    if (!check(TokenType::RightBracket)) step = expression();
+                }
+                while (match(TokenType::Newline)) {}
+                consume(TokenType::RightBracket, "expected ']' after slice");
+                expr = std::make_unique<SliceExpr>(std::move(expr), std::move(first), std::move(end), std::move(step));
+                continue;
+            }
+            if (!first) throw std::runtime_error(token_error(peek(), "expected index or slice"));
+            while (match(TokenType::Newline)) {}
             consume(TokenType::RightBracket, "expected ']' after index");
-            expr = std::make_unique<IndexExpr>(std::move(expr), std::move(index));
+            expr = std::make_unique<IndexExpr>(std::move(expr), std::move(first));
         } else {
             break;
         }
@@ -2839,6 +3267,23 @@ Parser::ExprPtr Parser::primary() {
     if (match(TokenType::String)) {
         return std::make_unique<LiteralExpr>(previous().lexeme, ast_quote(previous().lexeme));
     }
+    if (match(TokenType::Bits)) {
+        const Token marker = previous();
+        if (freestanding_runtime_none_) {
+            throw std::runtime_error(token_error(marker, "BITS literals are unavailable under #RUNTIME NONE"));
+        }
+        const Token text = consume(TokenType::String, "expected a string literal after BITS");
+        std::string bits;
+        for (std::size_t i = 0; i < text.lexeme.size(); ++i) {
+            const char c = text.lexeme[i];
+            if (c == '_') continue;
+            if (c != '0' && c != '1') {
+                throw std::runtime_error(token_error(text, "BITS literal contains invalid character at offset " + std::to_string(i)));
+            }
+            bits.push_back(c);
+        }
+        return std::make_unique<LiteralExpr>(Value(BitVector::from_string(bits)), "BITS \"" + bits + "\"");
+    }
     if (match(TokenType::InterpolatedString)) {
         return std::make_unique<InterpolatedStringExpr>(previous().lexeme);
     }
@@ -2852,26 +3297,57 @@ Parser::ExprPtr Parser::primary() {
         return std::make_unique<VariableExpr>("IMPLEMENTS");
     }
     if (match(TokenType::LeftParen)) {
-        skip_newlines();
-        auto expr = expression();
-        skip_newlines();
-        consume(TokenType::RightParen, "expected ')' after expression");
-        return expr;
+        while (match(TokenType::Newline)) {}
+        if (match(TokenType::RightParen)) return std::make_unique<TupleExpr>(std::vector<ExprPtr>{});
+        auto first = expression();
+        while (match(TokenType::Newline)) {}
+        if (!match(TokenType::Comma)) {
+            consume(TokenType::RightParen, "expected ')' after expression");
+            return first;
+        }
+        std::vector<ExprPtr> items;
+        items.push_back(std::move(first));
+        while (match(TokenType::Newline)) {}
+        while (!check(TokenType::RightParen)) {
+            items.push_back(expression());
+            while (match(TokenType::Newline)) {}
+            if (!match(TokenType::Comma)) break;
+            while (match(TokenType::Newline)) {}
+        }
+        consume(TokenType::RightParen, "expected ')' after tuple literal");
+        return std::make_unique<TupleExpr>(std::move(items));
     }
     if (match(TokenType::LeftBracket)) {
         std::vector<ExprPtr> items;
         skip_newlines();
         if (!check(TokenType::RightBracket)) {
-            while (true) {
-                items.push_back(expression());
-                skip_newlines();
-                if (!match(TokenType::Comma)) {
-                    break;
+            auto first = expression();
+            skip_newlines();
+            if (match(TokenType::For)) {
+                Token name;
+                if (check(TokenType::Identifier) || check(TokenType::Run)) {
+                    name = advance();
+                } else {
+                    name = consume(TokenType::Identifier, "expected comprehension variable after FOR");
                 }
+                consume(TokenType::In, "expected IN in array comprehension");
+                auto iterable = expression();
+                ExprPtr filter;
+                skip_newlines();
+                if (match(TokenType::If)) filter = expression();
+                skip_newlines();
+                consume(TokenType::RightBracket, "expected ']' after array comprehension");
+                return std::make_unique<ArrayComprehensionExpr>(
+                    std::move(first), name.lexeme, std::move(iterable), std::move(filter));
+            }
+            items.push_back(std::move(first));
+            while (match(TokenType::Comma)) {
                 skip_newlines();
                 if (check(TokenType::RightBracket)) {
                     break;
                 }
+                items.push_back(expression());
+                skip_newlines();
             }
         }
         consume(TokenType::RightBracket, "expected ']' after array literal");

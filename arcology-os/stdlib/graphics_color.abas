@@ -1,0 +1,22 @@
+' Canonical 8-bit-per-channel colors. The renderer chooses which packing helper matches the active
+' GOP format; applications work with channel values rather than backend-specific constants.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION ColorRGB(r AS U32, g AS U32, b AS U32) AS U32
+    RETURN r + (g * 256) + (b * 65536)
+END FUNCTION
+
+FUNCTION ColorBGR(r AS U32, g AS U32, b AS U32) AS U32
+    RETURN b + (g * 256) + (r * 65536)
+END FUNCTION
+
+FUNCTION ColorOpaqueRGB(r AS U32, g AS U32, b AS U32) AS U32
+    RETURN ColorRGB(r, g, b)
+END FUNCTION
+
+FUNCTION ColorOpaqueBGR(r AS U32, g AS U32, b AS U32) AS U32
+    RETURN ColorBGR(r, g, b)
+END FUNCTION

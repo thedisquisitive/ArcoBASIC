@@ -1,0 +1,35 @@
+' Firmware-to-PRD translation policy. Firmware descriptors are consumed once
+' during bootstrap and converted to Arcology states before ExitBootServices.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION PRDTranslateFirmwareMap(database AS MMIOPTR, capacity AS U32, mapBuffer AS MMIOPTR, mapSize AS U64, descriptorSize AS U64) AS BOOL
+    IF descriptorSize < 48 THEN RETURN 0
+    IF mapSize = 0 THEN RETURN 0
+    IF mapSize < descriptorSize THEN RETURN 0
+    LET descriptorCount AS U64 = 0
+    LET remaining AS U64 = mapSize
+    WHILE remaining >= descriptorSize
+        remaining = remaining - descriptorSize
+        descriptorCount = descriptorCount + 1
+    WEND
+    IF descriptorCount > 4294967295 THEN RETURN 0
+    IF PRDInitialize(database, capacity) = 0 THEN RETURN 0
+
+    LET index AS U64 = 0
+    WHILE index < descriptorCount
+        LET descriptorOffset AS U64 = index * descriptorSize
+        LET descriptor AS MMIOPTR = ADDRESS.Offset(mapBuffer, descriptorOffset)
+        LET firmwareType AS U32 = MEMORY.Read32(descriptor)
+        LET base AS U64 = MEMORY.Read64(ADDRESS.Offset(descriptor, 8))
+        LET pages AS U64 = MEMORY.Read64(ADDRESS.Offset(descriptor, 24))
+        IF ValidateRegion(base, pages, descriptorSize) = 0 THEN RETURN 0
+        LET state AS U32 = PRDStateForFirmwareType(firmwareType)
+        LET descriptorFlags AS U32 = PRDFlagsForFirmwareType(firmwareType)
+        IF PRDAddRegion(database, capacity, base, pages, state, 1, 0, firmwareType, descriptorFlags) = 0 THEN RETURN 0
+        index = index + 1
+    WEND
+    RETURN 1
+END FUNCTION

@@ -1,0 +1,19 @@
+#DESCRIPTION "Deterministic and default pseudorandom number generation"
+
+PRINT "Default unit value: " + STRING(Math.Random())
+PRINT "Default die roll: " + STRING(Random.Integer(1, 6))
+
+rng = Random.Create(20260814)
+clone = Random.Clone(rng)
+PRINT "Seeded values:"
+FOR index = 1 TO 5
+    PRINT Random.Integer(0, 100, rng)
+NEXT
+
+directions = ["north", "south", "east", "west"]
+PRINT "Choice: " + Random.Choice(directions, rng)
+PRINT "Sample: " + STRING(Random.Sample(directions, 2, rng))
+PRINT "Shuffle: " + STRING(Random.Shuffle(directions, rng))
+
+Random.Destroy(clone)
+Random.Destroy(rng)

@@ -1,0 +1,65 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+FUNCTION AcquireMemoryMap(systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET nullBuffer AS U64 = 0
+    LET probeStatus AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, nullBuffer, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 0
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocateStatus AS U64 = systemTable.BootServices.AllocatePool(4, allocationSize, bufferAddress)
+    IF allocateStatus <> 0 THEN
+        RETURN 0
+    END IF
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    LET attempts AS U32 = 0
+    WHILE status <> 0
+        IF attempts >= 3 THEN
+            systemTable.BootServices.FreePool(buffer)
+            RETURN 0
+        END IF
+        LET retrySize AS U64 = allocationSize + 65536
+        allocationSize = retrySize
+        LET retryAllocateStatus AS U64 = systemTable.BootServices.AllocatePool(4, allocationSize, bufferAddress)
+        IF retryAllocateStatus <> 0 THEN
+            systemTable.BootServices.FreePool(buffer)
+            RETURN 0
+        END IF
+        status = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+        attempts = attempts + 1
+    WEND
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 0
+    END IF
+    IF mapSize < descriptorSize THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 0
+    END IF
+    RETURN mapKey
+END FUNCTION
+
+FUNCTION ExitBootServicesSafe(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapKey AS U64 = AcquireMemoryMap(systemTable)
+    IF mapKey = 0 THEN
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    RETURN ExitBootServicesSafe(imageHandle, systemTable)
+END FUNCTION

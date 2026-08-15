@@ -36,6 +36,11 @@ inline std::optional<FixedWidthType> lookup_fixed_width_type(const std::string& 
     if (name == "I64") return FixedWidthType{"I64", 8, 8, true, false, false, 9223372036854775807ULL, 9223372036854775808ULL};
     if (name == "BOOL") return FixedWidthType{"BOOL", 1, 1, false, true, false, 1ULL, 0ULL};
     if (name == "PTR") return FixedWidthType{"PTR", 8, 8, false, false, true, 0ULL, 0ULL};
+    if (name == "VIRTUALPTR") return FixedWidthType{"VIRTUALPTR", 8, 8, false, false, true, 0ULL, 0ULL};
+    if (name == "PHYSICALPTR") return FixedWidthType{"PHYSICALPTR", 8, 8, false, false, true, 0ULL, 0ULL};
+    if (name == "MMIOPTR") return FixedWidthType{"MMIOPTR", 8, 8, false, false, true, 0ULL, 0ULL};
+    if (name == "IOPORT") return FixedWidthType{"IOPORT", 2, 2, false, false, true, 65535ULL, 0ULL};
+    if (name == "MEMORYMAPFLAGS") return FixedWidthType{"MEMORYMAPFLAGS", 8, 8, false, false, false, 0ULL, 0ULL};
     return std::nullopt;
 }
 

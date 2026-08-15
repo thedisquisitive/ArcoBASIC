@@ -35,6 +35,8 @@ const std::unordered_map<std::string, TokenType> kKeywords = {
     {"RETURN", TokenType::Return},
     {"TRY", TokenType::Try},
     {"CATCH", TokenType::Catch},
+    {"THROW", TokenType::Throw},
+    {"ADDRESSOF", TokenType::AddressOf},
     {"GOTO", TokenType::Goto},
     {"STOP", TokenType::Stop},
     {"CLASS", TokenType::Class},
@@ -74,6 +76,7 @@ const std::unordered_map<std::string, TokenType> kKeywords = {
     {"FLAGS", TokenType::Flags},
     {"SHL", TokenType::ShiftLeftWord},
     {"SHR", TokenType::ShiftRightWord},
+    {"SAR", TokenType::ShiftArithmeticRightWord},
 };
 
 } // namespace
@@ -133,6 +136,9 @@ std::vector<Token> Lexer::scan_tokens() {
                 break;
             case '/':
                 add(match('=') ? TokenType::SlashEqual : TokenType::Slash);
+                break;
+            case '\\':
+                add(TokenType::Backslash);
                 break;
             case '$':
                 if (match('"')) {
@@ -259,7 +265,13 @@ void Lexer::identifier() {
         return;
     }
     const auto found = kKeywords.find(upper(text));
-    tokens_.push_back(Token{found == kKeywords.end() ? TokenType::Identifier : found->second, text, 0.0, line_, token_column_});
+    TokenType type = found == kKeywords.end() ? TokenType::Identifier : found->second;
+    if (upper(text) == "BITS") {
+        std::size_t lookahead = current_;
+        while (lookahead < source_.size() && (source_[lookahead] == ' ' || source_[lookahead] == '\t')) ++lookahead;
+        if (lookahead < source_.size() && source_[lookahead] == '"') type = TokenType::Bits;
+    }
+    tokens_.push_back(Token{type, text, 0.0, line_, token_column_});
 }
 
 void Lexer::number() {

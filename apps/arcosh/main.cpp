@@ -1,11 +1,34 @@
 #include "arco/shell.hpp"
 
 #include <iostream>
+#include <cctype>
+#include <limits>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+namespace {
+
+std::size_t parse_instruction_limit(const std::string& value) {
+    std::string normalized = value;
+    for (char& c : normalized) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (normalized == "unlimited") return 0;
+    if (value.empty() || value == "0" || value.find_first_not_of("0123456789") != std::string::npos) {
+        throw std::runtime_error("instruction limit must be 1..9007199254740991 or unlimited");
+    }
+    const auto parsed = std::stoull(value);
+    if (parsed == 0 || parsed > 9007199254740991ULL || parsed > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error("instruction limit must be 1..9007199254740991 or unlimited");
+    }
+    return static_cast<std::size_t>(parsed);
+}
+
+} // namespace
+
 int main(int argc, char** argv) {
     arco::Runtime runtime;
+    runtime.set_instruction_limit_policy(true);
     arco::shell::register_shell_builtins(runtime);
 
     int arg_index = 1;
@@ -14,6 +37,20 @@ int main(int argc, char** argv) {
     std::string rc_path;
     while (arg_index < argc) {
         const std::string option = argv[arg_index];
+        if (option == "--instruction-limit") {
+            if (arg_index + 1 >= argc) {
+                std::cerr << "arcosh: --instruction-limit expects COUNT or unlimited\n";
+                return 2;
+            }
+            try {
+                runtime.set_instruction_limit_override(parse_instruction_limit(argv[arg_index + 1]));
+            } catch (const std::exception& error) {
+                std::cerr << "arcosh: " << error.what() << '\n';
+                return 2;
+            }
+            arg_index += 2;
+            continue;
+        }
         if (option == "--no-color") {
             arco::shell::set_color_enabled(false);
             arg_index++;

@@ -1,0 +1,483 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' Minimal APS cutover proof. It creates a three-page identity-mapped hierarchy before the
+' firmware handoff, then continues with only the new CR3 and identity mappings. The physical
+' writes are an explicit bootstrap mechanism; allocation and mapping policy remain here.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(82)
+    SerialByte(51)
+    SerialByte(61)
+    SerialByte(65)
+    SerialByte(84)
+    SerialByte(73)
+    SerialByte(86)
+    SerialByte(69)
+    SerialByte(32)
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(68)
+    SerialByte(61)
+    SerialByte(65)
+    SerialByte(67)
+    SerialByte(84)
+    SerialByte(73)
+    SerialByte(86)
+    SerialByte(69)
+    SerialByte(32)
+    SerialByte(86)
+    SerialByte(82)
+    SerialByte(68)
+    SerialByte(61)
+    SerialByte(65)
+    SerialByte(67)
+    SerialByte(84)
+    SerialByte(73)
+    SerialByte(86)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION GlyphRow(code AS U32, row AS U32) AS U32
+    IF code = 66 THEN
+        IF row = 0 OR row = 3 OR row = 6 THEN RETURN 30
+        RETURN 17
+    END IF
+    IF code = 74 THEN
+        IF row = 0 THEN RETURN 31
+        IF row = 1 OR row = 2 OR row = 3 OR row = 4 THEN RETURN 4
+        IF row = 5 THEN RETURN 20
+        RETURN 8
+    END IF
+    IF code = 72 THEN
+        IF row = 3 THEN RETURN 31
+        RETURN 17
+    END IF
+    IF code = 87 THEN
+        IF row = 0 OR row = 1 OR row = 2 THEN RETURN 17
+        IF row = 3 OR row = 4 OR row = 5 THEN RETURN 21
+        RETURN 10
+    END IF
+    IF code = 67 THEN
+        IF row = 0 OR row = 6 THEN RETURN 14
+        RETURN 16
+    END IF
+    IF code = 82 THEN
+        IF row = 0 THEN RETURN 30
+        IF row = 1 OR row = 2 THEN RETURN 17
+        IF row = 3 THEN RETURN 30
+        IF row = 4 THEN RETURN 20
+        IF row = 5 THEN RETURN 18
+        RETURN 17
+    END IF
+    IF code = 51 THEN
+        IF row = 0 OR row = 6 THEN RETURN 14
+        IF row = 1 OR row = 5 THEN RETURN 17
+        IF row = 2 OR row = 4 THEN RETURN 1
+        RETURN 6
+    END IF
+    IF code = 65 THEN
+        IF row = 0 THEN RETURN 14
+        IF row = 3 THEN RETURN 31
+        RETURN 17
+    END IF
+    IF code = 84 THEN
+        IF row = 0 THEN RETURN 31
+        RETURN 4
+    END IF
+    IF code = 73 THEN
+        IF row = 0 OR row = 6 THEN RETURN 31
+        RETURN 4
+    END IF
+    IF code = 86 THEN
+        IF row < 5 THEN RETURN 17
+        IF row = 5 THEN RETURN 10
+        RETURN 4
+    END IF
+    IF code = 69 THEN
+        IF row = 0 OR row = 3 OR row = 6 THEN RETURN 31
+        RETURN 16
+    END IF
+    IF code = 79 THEN
+        IF row = 0 OR row = 6 THEN RETURN 14
+        RETURN 17
+    END IF
+    IF code = 78 THEN
+        IF row = 0 THEN RETURN 17
+        IF row = 1 OR row = 2 THEN RETURN 25
+        IF row = 3 THEN RETURN 21
+        IF row = 4 OR row = 5 THEN RETURN 19
+        RETURN 17
+    END IF
+    IF code = 68 THEN
+        IF row = 0 OR row = 6 THEN RETURN 30
+        RETURN 17
+    END IF
+    IF code = 83 THEN
+        IF row = 0 OR row = 6 THEN RETURN 14
+        IF row = 1 OR row = 2 THEN RETURN 16
+        IF row = 3 THEN RETURN 14
+        RETURN 1
+    END IF
+    IF code = 76 THEN
+        IF row = 6 THEN RETURN 31
+        RETURN 16
+    END IF
+    IF code = 85 THEN
+        IF row < 6 THEN RETURN 17
+        RETURN 14
+    END IF
+    IF code = 80 THEN
+        IF row = 0 OR row = 3 THEN RETURN 30
+        IF row = 1 OR row = 2 THEN RETURN 17
+        RETURN 16
+    END IF
+    IF code = 71 THEN
+        IF row = 0 THEN RETURN 14
+        IF row = 1 OR row = 2 THEN RETURN 16
+        IF row = 3 THEN RETURN 23
+        IF row = 6 THEN RETURN 14
+        RETURN 17
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION GlyphPixel(pattern AS U32, bit AS U32) AS U32
+    IF bit = 0 THEN RETURN pattern AND 16
+    IF bit = 1 THEN RETURN pattern AND 8
+    IF bit = 2 THEN RETURN pattern AND 4
+    IF bit = 3 THEN RETURN pattern AND 2
+    IF bit = 4 THEN RETURN pattern AND 1
+    RETURN 0
+END FUNCTION
+
+FUNCTION DrawGlyph(framebuffer AS MMIOPTR, stride AS U32, x AS U32, y AS U32, code AS U32) AS U64
+    LET row AS U32 = 0
+    WHILE row < 7
+        LET pattern AS U32 = GlyphRow(code, row)
+        LET bit AS U32 = 0
+        WHILE bit < 5
+            IF GlyphPixel(pattern, bit) <> 0 THEN
+                LET dy AS U32 = 0
+                WHILE dy < 4
+                    LET dx AS U32 = 0
+                    WHILE dx < 4
+                        LET offset AS U32 = ((y + (row * 4) + dy) * stride + x + (bit * 4) + dx) * 4
+                        MEMORY.Write32(ADDRESS.Offset(framebuffer, offset), 16777215)
+                        dx = dx + 1
+                    WEND
+                    dy = dy + 1
+                WEND
+            END IF
+            bit = bit + 1
+        WEND
+        row = row + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION FillRegion(framebuffer AS MMIOPTR, stride AS U32, left AS U32, top AS U32, width AS U32, height AS U32, color AS U32) AS U64
+    LET yy AS U32 = 0
+    WHILE yy < height
+        LET xx AS U32 = 0
+        WHILE xx < width
+            LET offset AS U32 = ((top + yy) * stride + left + xx) * 4
+            MEMORY.Write32(ADDRESS.Offset(framebuffer, offset), color)
+            xx = xx + 1
+        WEND
+        yy = yy + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION DrawFrame(framebuffer AS MMIOPTR, stride AS U32) AS U64
+    FillRegion(framebuffer, stride, 0, 0, 800, 600, 0)
+    FillRegion(framebuffer, stride, 24, 24, 552, 352, 16711935)
+    FillRegion(framebuffer, stride, 28, 28, 544, 344, 0)
+    FillRegion(framebuffer, stride, 28, 28, 544, 36, 65280)
+    FillRegion(framebuffer, stride, 28, 64, 544, 2, 16711935)
+    RETURN 0
+END FUNCTION
+
+FUNCTION DrawContract(framebuffer AS MMIOPTR, stride AS U32) AS U64
+    DrawFrame(framebuffer, stride)
+    ' CONTRACT
+    DrawGlyph(framebuffer, stride, 206, 34, 67)
+    DrawGlyph(framebuffer, stride, 230, 34, 79)
+    DrawGlyph(framebuffer, stride, 254, 34, 78)
+    DrawGlyph(framebuffer, stride, 278, 34, 84)
+    DrawGlyph(framebuffer, stride, 302, 34, 82)
+    DrawGlyph(framebuffer, stride, 326, 34, 65)
+    DrawGlyph(framebuffer, stride, 350, 34, 67)
+    DrawGlyph(framebuffer, stride, 374, 34, 84)
+    ' ID / STATUS / CAPSULE / OBJECT / STATE
+    DrawGlyph(framebuffer, stride, 52, 92, 73)
+    DrawGlyph(framebuffer, stride, 76, 92, 68)
+    DrawGlyph(framebuffer, stride, 52, 126, 83)
+    DrawGlyph(framebuffer, stride, 76, 126, 84)
+    DrawGlyph(framebuffer, stride, 100, 126, 65)
+    DrawGlyph(framebuffer, stride, 124, 126, 84)
+    DrawGlyph(framebuffer, stride, 148, 126, 85)
+    DrawGlyph(framebuffer, stride, 172, 126, 83)
+    DrawGlyph(framebuffer, stride, 52, 160, 67)
+    DrawGlyph(framebuffer, stride, 76, 160, 65)
+    DrawGlyph(framebuffer, stride, 100, 160, 80)
+    DrawGlyph(framebuffer, stride, 124, 160, 83)
+    DrawGlyph(framebuffer, stride, 148, 160, 85)
+    DrawGlyph(framebuffer, stride, 172, 160, 76)
+    DrawGlyph(framebuffer, stride, 196, 160, 69)
+    DrawGlyph(framebuffer, stride, 52, 194, 79)
+    DrawGlyph(framebuffer, stride, 76, 194, 66)
+    DrawGlyph(framebuffer, stride, 100, 194, 74)
+    DrawGlyph(framebuffer, stride, 124, 194, 69)
+    DrawGlyph(framebuffer, stride, 148, 194, 67)
+    DrawGlyph(framebuffer, stride, 172, 194, 84)
+    DrawGlyph(framebuffer, stride, 52, 228, 83)
+    DrawGlyph(framebuffer, stride, 76, 228, 84)
+    DrawGlyph(framebuffer, stride, 100, 228, 65)
+    DrawGlyph(framebuffer, stride, 124, 228, 84)
+    DrawGlyph(framebuffer, stride, 148, 228, 69)
+    DrawGlyph(framebuffer, stride, 172, 228, 76)
+    DrawGlyph(framebuffer, stride, 196, 228, 79)
+    DrawGlyph(framebuffer, stride, 220, 228, 65)
+    DrawGlyph(framebuffer, stride, 244, 228, 68)
+    DrawGlyph(framebuffer, stride, 268, 228, 69)
+    DrawGlyph(framebuffer, stride, 292, 228, 82)
+    ' Live APS authority metadata: OWNER / PROVIDER / RIGHTS.
+    DrawGlyph(framebuffer, stride, 52, 270, 79)
+    DrawGlyph(framebuffer, stride, 76, 270, 87)
+    DrawGlyph(framebuffer, stride, 100, 270, 78)
+    DrawGlyph(framebuffer, stride, 124, 270, 69)
+    DrawGlyph(framebuffer, stride, 148, 270, 82)
+    DrawGlyph(framebuffer, stride, 52, 304, 80)
+    DrawGlyph(framebuffer, stride, 76, 304, 82)
+    DrawGlyph(framebuffer, stride, 100, 304, 79)
+    DrawGlyph(framebuffer, stride, 124, 304, 86)
+    DrawGlyph(framebuffer, stride, 148, 304, 73)
+    DrawGlyph(framebuffer, stride, 172, 304, 68)
+    DrawGlyph(framebuffer, stride, 196, 304, 69)
+    DrawGlyph(framebuffer, stride, 220, 304, 82)
+    DrawGlyph(framebuffer, stride, 52, 338, 82)
+    DrawGlyph(framebuffer, stride, 76, 338, 73)
+    DrawGlyph(framebuffer, stride, 100, 338, 71)
+    DrawGlyph(framebuffer, stride, 124, 338, 72)
+    DrawGlyph(framebuffer, stride, 148, 338, 84)
+    DrawGlyph(framebuffer, stride, 172, 338, 83)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET probe AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 1
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocate AS U64 = systemTable.BootServices.AllocatePool(2, allocationSize, bufferAddress)
+    IF allocate <> 0 THEN
+        RETURN 1
+    END IF
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("APS PRE")
+    LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
+    IF gop = 0 THEN CPU.HaltForever
+    LET mode AS UEFI.GraphicsOutputMode = UEFI.GOP.Mode(gop)
+    IF mode = 0 THEN CPU.HaltForever
+    LET framebuffer AS PHYSICALPTR = UEFI.GOP.FrameBufferBase(gop)
+    LET framebufferValue AS U64 = ADDRESS.Value(framebuffer)
+    LET alignedFramebufferValue AS U64 = framebufferValue AND 18446744073707454464
+    LET framebufferSize AS U64 = UEFI.GOP.FrameBufferSize(gop)
+    LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
+
+    ' Allocate physically contiguous, page-aligned table storage through the firmware handoff ABI.
+    LET root AS U64 = 0
+    LET rootAddress AS PTR = ADDRESS.Local(root)
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 3, rootAddress)
+    IF pageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    LET prdStorage AS U64 = 0
+    LET prdStorageAddress AS PTR = ADDRESS.Local(prdStorage)
+    LET prdStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 16, prdStorageAddress)
+    IF prdStatus <> 0 THEN
+        CPU.HaltForever
+    END IF
+    LET stack AS U64 = CPU.ReadRSP()
+    LET stackBase AS U64 = stack AND 18446744073709547520
+    systemTable.ConsoleOut.Write("APS PAGE")
+    LET pdpt AS U64 = root + 4096
+    LET pageDirectory AS U64 = root + 8192
+
+    ' Clear the root and PDPT through the explicit physical bootstrap access mechanism.
+    LET clearIndex AS U64 = 0
+    WHILE clearIndex < 1536
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(root + (clearIndex * 8)), 0)
+        clearIndex = clearIndex + 1
+    WEND
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(root), pdpt OR 3)
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt), pageDirectory OR 3)
+    ' Conservative 2 MiB identity leaves cover the first 1 GiB without requiring the
+    ' optional 1 GiB-page CPU feature. This includes the bootstrap image, stack, and GOP.
+    LET directoryIndex AS U64 = 0
+    LET framebufferDirectoryIndex AS U64 = 64
+    LET framebufferWindowBase AS U64 = alignedFramebufferValue
+    WHILE directoryIndex < 512
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + (directoryIndex * 8)), (directoryIndex * 2097152) OR 131)
+        directoryIndex = directoryIndex + 1
+    WEND
+    ' Present|RW|PS|PWT|PCD: uncached 2 MiB device mapping for the GOP BAR.
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + (framebufferDirectoryIndex * 8)), framebufferWindowBase OR 131)
+    ' APS virtual alias: 0x20000000 -> GOP BAR physical window.
+    LET aliasIndex AS U64 = 0
+    WHILE aliasIndex < 64
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + ((256 + aliasIndex) * 8)), framebufferWindowBase + (aliasIndex * 2097152) OR 131)
+        aliasIndex = aliasIndex + 1
+    WEND
+    LET rootCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(root))
+    LET pdptCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(pdpt))
+    IF rootCheck <> (pdpt OR 3) THEN
+        systemTable.ConsoleOut.Write("APS ROOT BAD")
+        CPU.HaltForever
+    END IF
+    IF pdptCheck <> (pageDirectory OR 3) THEN
+        systemTable.ConsoleOut.Write("APS PDPT BAD")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS TABLE OK")
+    systemTable.ConsoleOut.Write("APS BUILT")
+
+    ' Visible handoff artifact rendered before ExitBootServices.
+    LET bootstrapMapped AS MMIOPTR = MEMORY.MapDevice(framebuffer, framebufferSize)
+    LET bootstrapY AS U32 = 0
+    WHILE bootstrapY < 140
+        LET bootstrapX AS U32 = 0
+        WHILE bootstrapX < 240
+            LET bootstrapOffset AS U32 = (bootstrapY * stride + bootstrapX) * 4
+            LET bootstrapColor AS U32 = 16777215
+            IF bootstrapY < 24 THEN bootstrapColor = 65280
+            IF bootstrapY >= 24 AND bootstrapY < 48 THEN bootstrapColor = 255
+            IF bootstrapY >= 48 AND bootstrapY < 72 THEN bootstrapColor = 16776960
+            MEMORY.Write32(ADDRESS.Offset(bootstrapMapped, bootstrapOffset), bootstrapColor)
+            bootstrapX = bootstrapX + 1
+        WEND
+        bootstrapY = bootstrapY + 1
+    WEND
+    DrawContract(bootstrapMapped, stride)
+    CPU.MemoryBarrier
+    systemTable.ConsoleOut.Write("\r\n+--------------------------------------------------------------+\r\n")
+    systemTable.ConsoleOut.Write("| APS Bootstrap Authority Contract                            |\r\n")
+    systemTable.ConsoleOut.Write("+--------------------------------------------------------------+\r\n")
+    systemTable.ConsoleOut.Write("| Handle            : APS.Bootstrap.Authority                |\r\n")
+    systemTable.ConsoleOut.Write("| Owner             : APS Substrate                          |\r\n")
+    systemTable.ConsoleOut.Write("| Provider          : APS Bootstrap Provider                 |\r\n")
+    systemTable.ConsoleOut.Write("| Resource Type     : ADDRESS_SPACE                           |\r\n")
+    systemTable.ConsoleOut.Write("| Version           : 1                                       |\r\n")
+    systemTable.ConsoleOut.Write("| State             : Active                                  |\r\n")
+    systemTable.ConsoleOut.Write("|                                                              |\r\n")
+    systemTable.ConsoleOut.Write("| Lifetime          : System                                  |\r\n")
+    systemTable.ConsoleOut.Write("| Rights            : CR3_SWITCH, MAP_MMIO, WRITE_FRAMEBUFFER |\r\n")
+    systemTable.ConsoleOut.Write("| Dependencies      : PRD, VRD, GOP                          |\r\n")
+    systemTable.ConsoleOut.Write("| Metadata          : POST_UEFI APS_OWNED                    |\r\n")
+    systemTable.ConsoleOut.Write("| Capsule           : Bootstrap                              |\r\n")
+    systemTable.ConsoleOut.Write("| Object            : APS Address Space                      |\r\n")
+    systemTable.ConsoleOut.Write("+--------------------------------------------------------------+\r\n")
+
+    ' Mask firmware timer interrupts before the ownership boundary; APS will install its own IDT
+    ' before any future STI/interrupt milestone.
+    CPU.DisableInterrupts
+    LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
+    IF exitStatus <> 0 THEN
+        CPU.HaltForever
+    END IF
+
+    ' The next instruction executes under the APS-created identity hierarchy.
+    CPU.DisableInterrupts
+    CPU.WriteCR3(root)
+    LET activeRoot AS U64 = CPU.ReadCR3()
+    IF activeRoot <> root THEN
+        CPU.HaltForever
+    END IF
+    ' Translation sanity check: this ordinary RAM write must succeed under the APS root.
+    MEMORY.Write32(ADDRESS.Virtual(1048576), 2779096485)
+    ' The first substrate-owned records describe the table and PRD metadata themselves.
+    ' PRD population waits for the validated physical access window; the storage is reserved
+    ' physically but never treated as an ordinary virtual pointer.
+    ' Render through the APS-owned virtual alias rather than the firmware virtual address.
+    LET mapped AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(536870912))
+    LET y AS U32 = 0
+    WHILE y < 140
+        LET x AS U32 = 0
+        WHILE x < 240
+            LET offset AS U32 = (y * stride + x) * 4
+            LET color AS U32 = 16711935
+            IF y < 24 THEN color = 65280
+            IF y >= 24 AND y < 48 THEN color = 255
+            IF y >= 48 AND y < 72 THEN color = 16776960
+            MEMORY.Write32(ADDRESS.Offset(mapped, offset), color)
+            x = x + 1
+        WEND
+        y = y + 1
+    WEND
+    DrawContract(mapped, stride)
+    CPU.MemoryBarrier
+    CPU.HaltForever
+END FUNCTION

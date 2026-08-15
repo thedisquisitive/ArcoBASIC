@@ -1,16 +1,23 @@
 #pragma once
 
 #include "arco/value.hpp"
+#include "arco/runtime_handles.hpp"
+#include "arco/resource_registry.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <iosfwd>
+#include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace arco {
+
+class Pcg32;
 
 struct RuntimeLimits {
     std::size_t instruction_limit = 100000;
@@ -48,6 +55,7 @@ struct CompileMetadata {
     std::string arch;           // architecture selected via #TARGET under a systems profile
     std::string callconv;       // #CALLCONV value, e.g. "UEFI"
     std::string export_symbol;  // #EXPORT value, e.g. "efi_main"
+    std::optional<std::uint64_t> instruction_limit; // hosted #INSTRUCTION_LIMIT request
 };
 
 struct ClassMetadata {
@@ -69,6 +77,11 @@ struct MethodSignature {
 struct InterfaceMetadata {
     std::string name;
     std::vector<MethodSignature> methods;
+};
+
+struct CallableDescriptor {
+    std::string name;
+    std::optional<Value> receiver;
 };
 
 class ExitSignal final : public std::exception {
@@ -104,6 +117,19 @@ private:
 class StopSignal final : public std::exception {
 public:
     const char* what() const noexcept override;
+};
+
+class UserError final : public std::exception {
+public:
+    UserError(std::string message, int source_line = 0, int source_column = 0);
+    const char* what() const noexcept override;
+    int source_line() const noexcept;
+    int source_column() const noexcept;
+
+private:
+    std::string message_;
+    int source_line_;
+    int source_column_;
 };
 
 class Runtime {
@@ -147,11 +173,25 @@ public:
 
     void set_limits(RuntimeLimits limits);
     const RuntimeLimits& limits() const;
+    void set_instruction_limit_policy(bool allow_source_requests,
+                                      std::optional<std::size_t> hard_maximum = std::nullopt);
+    void set_instruction_limit_override(std::optional<std::size_t> limit);
+    void prepare_execution(std::optional<std::uint64_t> source_request = std::nullopt);
     void tick();
     void reset_instruction_count();
 
     Value call_host_function(const std::string& name, const std::vector<Value>& args);
     Value call_method(Value receiver, const std::string& method, const std::vector<Value>& args);
+    Value make_callable(const std::string& name, std::optional<Value> receiver = std::nullopt,
+                        bool require_registered = true);
+    bool is_callable(const Value& value) const;
+    CallableDescriptor callable_descriptor(const Value& value) const;
+    Value call_callable(const Value& callable, const std::vector<Value>& args);
+
+    RuntimeHandleTable& object_handles() { return object_handles_; }
+    const RuntimeHandleTable& object_handles() const { return object_handles_; }
+    ResourceRegistry& resources() { return resources_; }
+    const ResourceRegistry& resources() const { return resources_; }
 
     std::string preprocess_source(const std::string& code);
     std::string preprocess_source(const std::string& code, bool reset_metadata);
@@ -163,6 +203,10 @@ private:
     void ensure_field_assignment_type(const std::string& runtime_class, const std::string& field, const Value& value) const;
 
     RuntimeLimits limits_;
+    RuntimeLimits effective_limits_;
+    bool allow_source_instruction_limits_ = false;
+    std::optional<std::size_t> instruction_limit_hard_maximum_;
+    std::optional<std::size_t> instruction_limit_override_;
     std::size_t instruction_count_ = 0;
     std::ostream* output_;
     CompileMetadata metadata_;
@@ -172,6 +216,10 @@ private:
     std::unordered_map<std::string, ClassMetadata> classes_;
     std::unordered_map<std::string, InterfaceMetadata> interfaces_;
     std::vector<std::string> class_contexts_;
+    RuntimeHandleTable object_handles_;
+    ResourceRegistry resources_;
+    std::shared_ptr<Pcg32> default_random_;
+    std::optional<RuntimeHandle> primary_surface_handle_;
 };
 
 } // namespace arco

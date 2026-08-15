@@ -1,0 +1,37 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+FUNCTION AcquireMemoryMap(systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET nullBuffer AS U64 = 0
+    LET probeStatus AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, nullBuffer, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 0
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocateStatus AS U64 = systemTable.BootServices.AllocatePool(4, allocationSize, bufferAddress)
+    IF allocateStatus <> 0 THEN
+        RETURN 0
+    END IF
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        RETURN 0
+    END IF
+    RETURN mapKey
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapKey AS U64 = AcquireMemoryMap(systemTable)
+    RETURN mapKey
+END FUNCTION

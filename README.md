@@ -230,6 +230,7 @@ examples/             Runnable example programs
 tutorials/            Guided ArcoSH programs
 scripts/              Generic build, install, run, and ArcoSH tools
 docs/                 Generic ArcoBASIC user and developer documentation
+books/                Long-form technical references for Arcology components
 arcology-os/          Arcology OS systems library, UEFI examples, tests, tooling, RFCs, and docs
 arcology-commons/     Standalone Arcology Commons social network written in ArcoBASIC
 lazarus/              Arcology Lazarus recovery appliance and live environment
@@ -451,10 +452,22 @@ TRY
 
 CATCH err
 
+    PRINT err.Type
     PRINT err.Message
 
 END TRY
 ```
+
+Library code can originate a catchable user error with a string message:
+
+```basic
+IF rate < 0 ORELSE rate > 1 THEN
+    THROW "Mutation rate must be between 0 and 1"
+END IF
+```
+
+Caught source-defined errors have `Type = "UserError"`; ordinary runtime failures have
+`Type = "RuntimeError"`.
 
 ---
 
@@ -568,7 +581,39 @@ Math.Pow()
 Math.Clamp()
 Math.Lerp()
 Math.Random()
+Random.Integer(1, 6)
 ```
+
+For reproducible sequences, create an explicit generator:
+
+```basic
+rng = Random.Create(42)
+copy = Random.Clone(rng)
+PRINT Random.Float(rng)
+PRINT Random.Float(copy)
+PRINT Random.Choice(["north", "south", "east", "west"], rng)
+PRINT Random.Sample([1, 2, 3, 4], 2, rng)
+PRINT Random.Shuffle([1, 2, 3, 4], rng)
+Random.Destroy(copy)
+Random.Destroy(rng)
+```
+
+`Random.*` uses deterministic PCG32 streams when seeded. It is not cryptographically secure; do
+not use it for keys, passwords, tokens, salts, or nonces. See [the random-number reference](docs/random.md).
+
+Immutable packed bit vectors are available for genomes and binary flags:
+
+```basic
+LET genome AS BITVECTOR = BITS "0001_1011"
+mutated = Bits.Flip(genome, 0)
+PRINT Bits.ToString(mutated)
+```
+
+See [the bit-vector reference](docs/bit-vectors.md).
+
+Long-running hosted applications can request a finite budget with `#INSTRUCTION_LIMIT`; embedding
+hosts remain authoritative and command-line operators can override it. See
+[hosted instruction limits](docs/instruction-limits.md).
 
 ---
 

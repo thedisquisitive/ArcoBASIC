@@ -71,3 +71,106 @@ arco_add_script_test(
     $<TARGET_FILE:ArcoFission>
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+arco_add_script_test(
+    systems_integer_core_smoke
+    arcology-os/tests/systems/systems_integer_core_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_control_flow_smoke
+    arcology-os/tests/systems/systems_control_flow_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_port_io_smoke
+    arcology-os/tests/systems/systems_port_io_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_memory_address_smoke
+    arcology-os/tests/systems/systems_memory_address_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_gop_discovery_smoke
+    arcology-os/tests/systems/systems_gop_discovery_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_runtime_handle_abi_smoke
+    arcology-os/tests/systems/systems_runtime_handle_abi_smoke.sh
+    $<TARGET_FILE:arco_cli>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    $<TARGET_FILE:ArcoFission>
+)
+arco_add_script_test(
+    systems_arco_basic_substrate_smoke
+    arcology-os/tests/systems/systems_arco_basic_substrate_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_arco_basic_primitives_smoke
+    arcology-os/tests/systems/systems_arco_basic_primitives_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_arco_basic_color_smoke
+    arcology-os/tests/systems/systems_arco_basic_color_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_arco_basic_memory_manager_smoke
+    arcology-os/tests/systems/systems_arco_basic_memory_manager_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_arco_basic_allocator_smoke
+    arcology-os/tests/systems/systems_arco_basic_allocator_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_arco_basic_region_policy_smoke
+    arcology-os/tests/systems/systems_arco_basic_region_policy_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_arco_basic_region_allocator_smoke
+    arcology-os/tests/systems/systems_arco_basic_region_allocator_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_arco_basic_prd_runtime_smoke
+    arcology-os/tests/systems/systems_arco_basic_prd_runtime_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_arco_basic_virtual_region_smoke
+    arcology-os/tests/systems/systems_arco_basic_virtual_region_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_arco_basic_page_table_smoke
+    arcology-os/tests/systems/systems_arco_basic_page_table_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_arco_basic_page_table_geometry_smoke
+    arcology-os/tests/systems/systems_arco_basic_page_table_geometry_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)

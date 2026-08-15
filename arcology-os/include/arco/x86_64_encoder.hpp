@@ -31,6 +31,8 @@ public:
         emit(imm8);
     }
 
+    void sub_rsp_imm32(std::uint32_t imm32) { emit(0x48); emit(0x81); emit(0xEC); emit_u32(imm32); }
+
     // add rsp, imm8 -- REX.W 83 /0 ib
     void add_rsp_imm8(std::uint8_t imm8) {
         emit(0x48);
@@ -38,6 +40,8 @@ public:
         emit(0xC4);
         emit(imm8);
     }
+
+    void add_rsp_imm32(std::uint32_t imm32) { emit(0x48); emit(0x81); emit(0xC4); emit_u32(imm32); }
 
     // mov [base+disp8], src -- REX.W 89 /r, disp8 (SIB byte added automatically when base is
     // RSP or R12, whose low 3 bits collide with the "SIB follows" ModRM.rm encoding)
@@ -50,12 +54,77 @@ public:
         emit_modrm_disp8(0x8B, dst, base, disp8);
     }
 
+    // mov r32, [base+disp] -- 8B /r. A 32-bit destination write zero-extends into the
+    // corresponding 64-bit register, which is exactly what unsigned U32 loads require.
+    void mov_load32_disp8(Reg dst, Reg base, std::uint8_t disp8) {
+        emit_modrm32_disp8(0x8B, dst, base, disp8);
+    }
+
+    void mov_store_disp32(Reg base, std::uint32_t disp32, Reg src) { emit_modrm_disp32(0x89, src, base, disp32); }
+    void mov_load_disp32(Reg dst, Reg base, std::uint32_t disp32) { emit_modrm_disp32(0x8B, dst, base, disp32); }
+    void mov_load32_disp32(Reg dst, Reg base, std::uint32_t disp32) { emit_modrm32_disp32(0x8B, dst, base, disp32); }
+
+    void lea_rsp_disp8(Reg dst, std::uint8_t disp8) { emit_modrm_disp8(0x8D, dst, Reg::RSP, disp8); }
+    void lea_rsp_disp32(Reg dst, std::uint32_t disp32) { emit_modrm_disp32(0x8D, dst, Reg::RSP, disp32); }
+
     // mov dst, src (register to register) -- REX.W 89 /r, register-direct
     void mov_reg_reg(Reg dst, Reg src) {
         emit_rex(src, dst);
         emit(0x89);
         emit(static_cast<std::uint8_t>(0xC0 | (reg_low3(src) << 3) | reg_low3(dst)));
     }
+
+    // mov r32, r32. Any 32-bit register write clears the upper 32 bits of the destination.
+    void mov_reg32_reg32(Reg dst, Reg src) {
+        emit_rex32(src, dst);
+        emit(0x89);
+        emit(static_cast<std::uint8_t>(0xC0 | (reg_low3(src) << 3) | reg_low3(dst)));
+    }
+
+    void add_reg_reg(Reg dst, Reg src) { emit_binary_reg(0x01, dst, src); }
+    void sub_reg_reg(Reg dst, Reg src) { emit_binary_reg(0x29, dst, src); }
+    void and_reg_reg(Reg dst, Reg src) { emit_binary_reg(0x21, dst, src); }
+    void or_reg_reg(Reg dst, Reg src) { emit_binary_reg(0x09, dst, src); }
+    void xor_reg_reg(Reg dst, Reg src) { emit_binary_reg(0x31, dst, src); }
+
+    // Two-operand signed multiply: dst = dst * src.
+    void imul_reg_reg(Reg dst, Reg src) {
+        emit_rex(dst, src);
+        emit(0x0F);
+        emit(0xAF);
+        emit(static_cast<std::uint8_t>(0xC0 | (reg_low3(dst) << 3) | reg_low3(src)));
+    }
+
+    void not_reg(Reg reg) { emit_unary_reg(0x02, reg); }
+    void neg_reg(Reg reg) { emit_unary_reg(0x03, reg); }
+
+    void cmp_reg_reg(Reg left, Reg right) { emit_binary_reg(0x39, left, right); }
+    void cmp_reg_imm32(Reg reg, std::uint32_t value) { emit_imm_reg(0x81, 7, reg, value); }
+
+    void shl_reg_imm8(Reg reg, std::uint8_t count) { emit_shift_imm(reg, 4, count); }
+    void shr_reg_imm8(Reg reg, std::uint8_t count) { emit_shift_imm(reg, 5, count); }
+    void sar_reg_imm8(Reg reg, std::uint8_t count) { emit_shift_imm(reg, 7, count); }
+    void shl_reg_cl(Reg reg) { emit_shift_cl(reg, 4); }
+    void shr_reg_cl(Reg reg) { emit_shift_cl(reg, 5); }
+    void sar_reg_cl(Reg reg) { emit_shift_cl(reg, 7); }
+
+    void xor_reg_imm32(Reg reg, std::uint32_t value) { emit_imm_reg(0x81, 6, reg, value); }
+    void and_reg_imm32(Reg reg, std::uint32_t value) { emit_imm_reg(0x81, 4, reg, value); }
+    void movzx_eax_al() { emit(0x0F); emit(0xB6); emit(0xC0); }
+    void setcc_al(std::uint8_t condition_code) { emit(0x0F); emit(static_cast<std::uint8_t>(0x90 | (condition_code & 0x0F))); emit(0xC0); }
+    void cqo() { emit(0x48); emit(0x99); }
+    // Privileged address-space primitives used by the substrate policy layer.
+    void mov_rax_cr3() { emit(0x0F); emit(0x20); emit(0xD8); }
+    void mov_cr3_rax() { emit(0x0F); emit(0x22); emit(0xD8); }
+    void mov_rax_cr2() { emit(0x0F); emit(0x20); emit(0xD0); }
+    void lgdt_rax() { emit(0x0F); emit(0x01); emit(0x10); }
+    void lidt_rax() { emit(0x0F); emit(0x01); emit(0x18); }
+    void ltr_rax() { emit(0x66); emit(0x0F); emit(0x00); emit(0xD8); }
+    void invlpg_rax() { emit(0x0F); emit(0x01); emit(0x38); }
+    void mov_rax_rsp() { emit(0x48); emit(0x89); emit(0xE0); }
+    void xor_rdx_rdx() { xor_reg_reg(Reg::RDX, Reg::RDX); }
+    void div_reg(Reg divisor) { emit_unary_reg(0x06, divisor); }
+    void idiv_reg(Reg divisor) { emit_unary_reg(0x07, divisor); }
 
     // mov dst, imm64 -- REX.W B8+rd io (always the full 10-byte form; Packet WP-008 non-goal
     // "optimization" -- no attempt is made to use the shorter 5-byte reg32,imm32 form real
@@ -67,6 +136,9 @@ public:
             emit(static_cast<std::uint8_t>((imm64 >> (8 * i)) & 0xFF));
         }
     }
+
+    // cmp rax, imm8 -- 48 83 F8 ib. Used for firmware status checks.
+    void cmp_rax_imm8(std::uint8_t imm8) { emit(0x48); emit(0x83); emit(0xF8); emit(imm8); }
 
     // lea dst, [rip+disp32]. Returns the buffer offset of the 4-byte disp32 field; the caller
     // must patch it (patch_u32) once both the target address and this instruction's own end
@@ -114,7 +186,34 @@ public:
     }
 
     void cli() { emit(0xFA); }
+    void sti() { emit(0xFB); }
     void hlt() { emit(0xF4); }
+    void pause() { emit(0xF3); emit(0x90); }
+    void int3() { emit(0xCC); }
+    void lfence() { emit(0x0F); emit(0xAE); emit(0xE8); }
+    void sfence() { emit(0x0F); emit(0xAE); emit(0xF8); }
+    void mfence() { emit(0x0F); emit(0xAE); emit(0xF0); }
+
+    void mov_load8_rax() { emit(0x0F); emit(0xB6); emit(0x00); }
+    void mov_load16_rax() { emit(0x66); emit(0x0F); emit(0xB7); emit(0x00); }
+    void mov_load32_rax() { emit(0x8B); emit(0x00); }
+    void mov_load64_rax() { emit(0x48); emit(0x8B); emit(0x00); }
+    void mov_store8_rax() { emit(0x88); emit(0x00); }
+    void mov_store16_rax() { emit(0x66); emit(0x89); emit(0x00); }
+    void mov_store32_rax() { emit(0x89); emit(0x00); }
+    void mov_store64_rax() { emit(0x48); emit(0x89); emit(0x00); }
+    void mov_store8_rax_from_cl() { emit(0x88); emit(0x08); }
+    void mov_store16_rax_from_cx() { emit(0x66); emit(0x89); emit(0x08); }
+    void mov_store32_rax_from_ecx() { emit(0x89); emit(0x08); }
+    void mov_store64_rax_from_rcx() { emit(0x48); emit(0x89); emit(0x08); }
+
+    // x86 port-I/O instructions using DX. These forms cover the complete 16-bit port range.
+    void in_al_dx() { emit(0xEC); }
+    void in_ax_dx() { emit(0x66); emit(0xED); }
+    void in_eax_dx() { emit(0xED); }
+    void out_dx_al() { emit(0xEE); }
+    void out_dx_ax() { emit(0x66); emit(0xEF); }
+    void out_dx_eax() { emit(0xEF); }
 
     // The displacement is relative to the instruction following this two-byte jump.
     void jmp_rel8(std::int8_t displacement) {
@@ -122,10 +221,40 @@ public:
         emit(static_cast<std::uint8_t>(displacement));
     }
 
+    // Near unconditional jump with a patchable signed rel32 displacement.
+    std::size_t jmp_rel32_placeholder() {
+        emit(0xE9);
+        const std::size_t offset = code_.size();
+        emit_u32(0);
+        return offset;
+    }
+
+    // Near relative CALL with a patchable signed rel32 displacement.
+    std::size_t call_rel32_placeholder() {
+        emit(0xE8);
+        const std::size_t offset = code_.size();
+        emit_u32(0);
+        return offset;
+    }
+
+    // Near conditional jump with a patchable signed rel32 displacement. The condition code uses
+    // the standard x86 Jcc low nibble (for example 0x4 = JE, 0x5 = JNE).
+    std::size_t jcc_rel32_placeholder(std::uint8_t condition_code) {
+        emit(0x0F);
+        emit(static_cast<std::uint8_t>(0x80 | (condition_code & 0x0F)));
+        const std::size_t offset = code_.size();
+        emit_u32(0);
+        return offset;
+    }
+
     void ret() { emit(0xC3); }
 
     std::size_t size() const { return code_.size(); }
     const std::vector<std::uint8_t>& bytes() const { return code_; }
+
+    void append_bytes(const std::vector<std::uint8_t>& bytes) {
+        code_.insert(code_.end(), bytes.begin(), bytes.end());
+    }
 
     void patch_u32(std::size_t offset, std::uint32_t value) {
         code_[offset] = static_cast<std::uint8_t>(value & 0xFF);
@@ -134,12 +263,45 @@ public:
         code_[offset + 3] = static_cast<std::uint8_t>((value >> 24) & 0xFF);
     }
 
+    void patch_i32(std::size_t offset, std::int32_t value) {
+        patch_u32(offset, static_cast<std::uint32_t>(value));
+    }
+
 private:
     void emit(std::uint8_t byte) { code_.push_back(byte); }
+    void emit_u32(std::uint32_t value) {
+        emit(static_cast<std::uint8_t>(value & 0xFF));
+        emit(static_cast<std::uint8_t>((value >> 8) & 0xFF));
+        emit(static_cast<std::uint8_t>((value >> 16) & 0xFF));
+        emit(static_cast<std::uint8_t>((value >> 24) & 0xFF));
+    }
 
     void emit_rex(Reg reg_field, Reg rm_field) {
         emit(static_cast<std::uint8_t>(0x48 | (reg_needs_rex_extension(reg_field) ? 0x04 : 0) |
                                         (reg_needs_rex_extension(rm_field) ? 0x01 : 0)));
+    }
+
+    void emit_rex32(Reg reg_field, Reg rm_field) {
+        const std::uint8_t rex = static_cast<std::uint8_t>(0x40 |
+            (reg_needs_rex_extension(reg_field) ? 0x04 : 0) |
+            (reg_needs_rex_extension(rm_field) ? 0x01 : 0));
+        if (rex != 0x40) emit(rex);
+    }
+
+    void emit_modrm32_disp8(std::uint8_t opcode, Reg reg_field, Reg base, std::uint8_t disp8) {
+        emit_rex32(reg_field, base);
+        emit(opcode);
+        emit(static_cast<std::uint8_t>(0x40 | (reg_low3(reg_field) << 3) | reg_low3(base)));
+        if (reg_low3(base) == 0x4) emit(0x24);
+        emit(disp8);
+    }
+
+    void emit_modrm32_disp32(std::uint8_t opcode, Reg reg_field, Reg base, std::uint32_t disp32) {
+        emit_rex32(reg_field, base);
+        emit(opcode);
+        emit(static_cast<std::uint8_t>(0x80 | (reg_low3(reg_field) << 3) | reg_low3(base)));
+        if (reg_low3(base) == 0x4) emit(0x24);
+        emit_u32(disp32);
     }
 
     void emit_modrm_disp8(std::uint8_t opcode, Reg reg_field, Reg base, std::uint8_t disp8) {
@@ -150,6 +312,49 @@ private:
             emit(0x24);
         }
         emit(disp8);
+    }
+
+    void emit_modrm_disp32(std::uint8_t opcode, Reg reg_field, Reg base, std::uint32_t disp32) {
+        emit_rex(reg_field, base);
+        emit(opcode);
+        emit(static_cast<std::uint8_t>(0x80 | (reg_low3(reg_field) << 3) | reg_low3(base)));
+        if (reg_low3(base) == 0x4) emit(0x24);
+        emit_u32(disp32);
+    }
+
+    void emit_binary_reg(std::uint8_t opcode, Reg left, Reg right) {
+        emit_rex(right, left);
+        emit(opcode);
+        emit(static_cast<std::uint8_t>(0xC0 | (reg_low3(right) << 3) | reg_low3(left)));
+    }
+
+    void emit_unary_reg(std::uint8_t group, Reg reg) {
+        emit_rex(Reg::RAX, reg);
+        emit(0xF7);
+        emit(static_cast<std::uint8_t>(0xC0 | ((group & 0x07) << 3) | reg_low3(reg)));
+    }
+
+    void emit_shift_imm(Reg reg, std::uint8_t group, std::uint8_t count) {
+        emit_rex(Reg::RAX, reg);
+        emit(0xC1);
+        emit(static_cast<std::uint8_t>(0xC0 | ((group & 0x07) << 3) | reg_low3(reg)));
+        emit(count);
+    }
+
+    void emit_shift_cl(Reg reg, std::uint8_t group) {
+        emit_rex(Reg::RAX, reg);
+        emit(0xD3);
+        emit(static_cast<std::uint8_t>(0xC0 | ((group & 0x07) << 3) | reg_low3(reg)));
+    }
+
+    void emit_imm_reg(std::uint8_t opcode, std::uint8_t group, Reg reg, std::uint32_t value) {
+        emit_rex(Reg::RAX, reg);
+        emit(opcode);
+        emit(static_cast<std::uint8_t>(0xC0 | ((group & 0x07) << 3) | reg_low3(reg)));
+        emit(static_cast<std::uint8_t>(value & 0xFF));
+        emit(static_cast<std::uint8_t>((value >> 8) & 0xFF));
+        emit(static_cast<std::uint8_t>((value >> 16) & 0xFF));
+        emit(static_cast<std::uint8_t>((value >> 24) & 0xFF));
     }
 
     std::vector<std::uint8_t> code_;

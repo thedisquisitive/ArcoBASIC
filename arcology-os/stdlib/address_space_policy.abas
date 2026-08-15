@@ -1,0 +1,13 @@
+' RFC-0020 policy layer: page-table mechanisms remain compiler intrinsics.
+' This source deliberately does not manufacture page tables; it validates the
+' substrate mapping contract before switching an address-space root.
+
+FUNCTION SwitchAddressSpace(root AS U64) AS U64
+    CPU.WriteCR3(root)
+    RETURN CPU.ReadCR3()
+END FUNCTION
+
+FUNCTION InvalidateVirtualPage(address AS VIRTUALPTR) AS U64
+    CPU.InvalidatePage(address)
+    RETURN 0
+END FUNCTION

@@ -1,0 +1,8 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION Main(database AS MMIOPTR) AS U64
+    IF PRDReserveExactRange(database, 1048576, 3, 1, 100) = 0 THEN RETURN 1
+    RETURN PRDRegionState(database, 0)
+END FUNCTION
