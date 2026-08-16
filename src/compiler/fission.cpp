@@ -2363,12 +2363,28 @@ struct BytecodeCursor {
     std::size_t instruction = 0;
 };
 
+struct BytecodeFunction;
+
+// CALL_VALUE resolves its callee name against locals, globals, module functions, and
+// host functions in that order (see the BytecodeOp::CallValue case in execute_function).
+// For a fixed call site that name is almost always the same shape on every execution, so
+// once resolution lands on a plain module function or host function (i.e. not a callable
+// bound to a local/global variable, which can legitimately vary call to call) it is cached
+// as an inline cache on the instruction. This is reset per-module by prepare_bytecode_module.
+enum class CallSiteResolution : std::uint8_t {
+    Unresolved,
+    HostFunction,
+    UserFunction,
+};
+
 struct BytecodeInstruction {
     BytecodeOp op = BytecodeOp::Unsupported;
     std::vector<std::string> operands;
     std::vector<BytecodeOperand> prepared_operands;
     std::vector<BytecodeCursor> prepared_targets;
     int prepared_source_line = 0;
+    mutable CallSiteResolution call_site_resolution = CallSiteResolution::Unresolved;
+    mutable const BytecodeFunction* call_site_function = nullptr;
 };
 
 struct BytecodeBlock {
@@ -4258,6 +4274,8 @@ void prepare_bytecode_module(BytecodeModule& module) {
             auto& block = function.blocks[block_index];
             for (std::size_t instruction_index = 0; instruction_index < block.instructions.size(); ++instruction_index) {
                 auto& instruction = block.instructions[instruction_index];
+                instruction.call_site_resolution = CallSiteResolution::Unresolved;
+                instruction.call_site_function = nullptr;
                 instruction.prepared_operands.clear();
                 instruction.prepared_operands.reserve(instruction.operands.size());
                 for (const auto& operand : instruction.operands) {
@@ -4871,8 +4889,17 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 break;
             case BytecodeOp::CallValue: {
                 std::vector<Value> args;
+                args.reserve(instruction.operands.size() > 2 ? instruction.operands.size() - 2 : 0);
                 for (std::size_t i = 2; i < instruction.operands.size(); ++i) {
                     args.push_back(value_at(i));
+                }
+                if (instruction.call_site_resolution == CallSiteResolution::UserFunction) {
+                    set_temp_at(0, execute_function(module, *instruction.call_site_function, runtime, args, count_instructions));
+                    break;
+                }
+                if (instruction.call_site_resolution == CallSiteResolution::HostFunction) {
+                    set_temp_at(0, runtime.call_host_function(instruction.operands[1], args));
+                    break;
                 }
                 std::optional<Value> callable_target;
                 const auto local_ref = function.local_refs_by_base.find(instruction.operands[1]);
@@ -4904,15 +4931,27 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                         set_temp_at(0, runtime.call_callable(callable,
                             descriptor.receiver.has_value() ? std::vector<Value>(args.begin() + 1, args.end()) : args));
                     }
+                    // A callable bound through a local/global variable is left uncached: the
+                    // variable's value can legitimately differ across calls to this same site.
                 } else if (const BytecodeFunction* user_function = find_function(module, instruction.operands[1])) {
                     set_temp_at(0, execute_function(module, *user_function, runtime, args, count_instructions));
+                    if (local_ref == function.local_refs_by_base.end()) {
+                        // No local in this function can ever shadow this name (locals are fixed
+                        // at compile time), so this call site's target is stable going forward.
+                        instruction.call_site_resolution = CallSiteResolution::UserFunction;
+                        instruction.call_site_function = user_function;
+                    }
                 } else {
                     set_temp_at(0, runtime.call_host_function(instruction.operands[1], args));
+                    if (local_ref == function.local_refs_by_base.end()) {
+                        instruction.call_site_resolution = CallSiteResolution::HostFunction;
+                    }
                 }
                 break;
             }
             case BytecodeOp::CallRuntime: {
                 std::vector<Value> args;
+                args.reserve(instruction.operands.size() > 1 ? instruction.operands.size() - 1 : 0);
                 for (std::size_t i = 1; i < instruction.operands.size(); ++i) {
                     args.push_back(value_at(i));
                 }
@@ -4928,6 +4967,7 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
             }
             case BytecodeOp::Array: {
                 Value::Array values;
+                values.reserve(instruction.operands.size() > 1 ? instruction.operands.size() - 1 : 0);
                 for (std::size_t i = 1; i < instruction.operands.size(); ++i) {
                     values.push_back(value_at(i));
                 }
@@ -4936,6 +4976,7 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
             }
             case BytecodeOp::Tuple: {
                 Value::Array values;
+                values.reserve(instruction.operands.size() > 1 ? instruction.operands.size() - 1 : 0);
                 for (std::size_t i = 1; i < instruction.operands.size(); ++i) {
                     values.push_back(value_at(i));
                 }
