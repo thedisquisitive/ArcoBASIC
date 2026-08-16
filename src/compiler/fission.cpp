@@ -5467,8 +5467,14 @@ std::vector<std::string> split_shell_like(const std::string& line) {
     return words;
 }
 
-std::vector<std::string> native_link_dependencies(const std::filesystem::path& build_dir) {
-    std::ifstream input(build_dir / "CMakeFiles" / "ArcoFission.dir" / "link.txt");
+// Reads an executable target's own link.txt and returns everything from the first ArcoBASIC
+// static library onward (relativized against build_dir), i.e. exactly the flags/libraries a
+// native capsule needs to reproduce that target's link behavior. Shared by the full path (reads
+// ArcoFission's own link line) and the lean "core" path (reads a throwaway probe executable's).
+std::vector<std::string> native_link_dependencies_from(const std::filesystem::path& build_dir,
+                                                        const std::filesystem::path& link_txt_relative,
+                                                        const std::vector<std::string>& start_markers) {
+    std::ifstream input(build_dir / link_txt_relative);
     std::string line;
     if (!std::getline(input, line)) {
         return {};
@@ -5480,7 +5486,7 @@ std::vector<std::string> native_link_dependencies(const std::filesystem::path& b
     for (const auto& word : words) {
         if (!reached_arco_libraries) {
             const std::string filename = std::filesystem::path(word).filename().string();
-            if (filename == "libarco.a" || filename == "libarco_compiler.a") {
+            if (std::find(start_markers.begin(), start_markers.end(), filename) != start_markers.end()) {
                 reached_arco_libraries = true;
             } else {
                 continue;
@@ -5496,6 +5502,19 @@ std::vector<std::string> native_link_dependencies(const std::filesystem::path& b
         deps.push_back(word);
     }
     return deps;
+}
+
+std::vector<std::string> native_link_dependencies(const std::filesystem::path& build_dir) {
+    return native_link_dependencies_from(build_dir, std::filesystem::path("CMakeFiles") / "ArcoFission.dir" / "link.txt",
+        {"libarco.a", "libarco_compiler.a"});
+}
+
+// Only present when the build tree opted in with `cmake --build . --target
+// ArcoFissionCapsuleCoreProbe` (see CMakeLists.txt); empty otherwise, which callers treat as
+// "the lean core libraries aren't built here yet".
+std::vector<std::string> native_core_link_dependencies(const std::filesystem::path& build_dir) {
+    return native_link_dependencies_from(build_dir,
+        std::filesystem::path("CMakeFiles") / "ArcoFissionCapsuleCoreProbe.dir" / "link.txt", {"libarco_compiler_core.a"});
 }
 
 #if defined(__linux__)
@@ -5674,13 +5693,66 @@ Result build_native_windows_bytecode(const std::string& bytecode_binary, const s
 }
 #endif
 
+// True if a program calls a real GUI.* function -- one that would actually reach the stub
+// backend's `unsupported()` (see src/gui/stub_backend.cpp) if linked without the GTK/GLFW
+// backend. GUI.Available and GUI.Backend are excluded since the stub answers those directly
+// (false / "none") rather than throwing, which is exactly how well-behaved ArcoBASIC programs are
+// meant to probe for a GUI backend before using one (see examples/gui_cube.abas). Network.* needs
+// no such carve-out: every Network.* function already degrades gracefully without libcurl (see
+// the #else branch of http_request in runtime.cpp), so it's never a reason to prefer the full
+// runtime. Scans every instruction operand rather than only call-name positions, which is
+// simpler and only risks an occasional unnecessary "full" link (e.g. a string literal that
+// happens to start with "gui." for unrelated reasons), never an incorrect "lean" one.
+bool bytecode_needs_full_runtime(const BytecodeModule& module) {
+    for (const auto& function : module.functions) {
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto& operand : instruction.operands) {
+                    if (operand.size() < 4) continue;
+                    if (std::tolower(static_cast<unsigned char>(operand[0])) != 'g' ||
+                        std::tolower(static_cast<unsigned char>(operand[1])) != 'u' ||
+                        std::tolower(static_cast<unsigned char>(operand[2])) != 'i' || operand[3] != '.') {
+                        continue;
+                    }
+                    const std::string key = lowered_call_key(operand);
+                    if (key != "gui.available" && key != "gui.backend") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// CMake generates every configured target's link.txt at "Generate" time, before anything is
+// actually built -- so a non-empty native_core_link_dependencies() result only means the
+// ArcoFissionCapsuleCoreProbe target is *known*, not that `cmake --build . --target
+// ArcoFissionCapsuleCoreProbe` has ever been run. Confirm the .a files it names actually exist on
+// disk before trusting it.
+bool link_dependencies_resolve(const std::vector<std::string>& deps) {
+    for (const auto& dep : deps) {
+        if (dep.size() > 2 && dep.compare(dep.size() - 2, 2, ".a") == 0 && !std::filesystem::exists(dep)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 Result build_native_bytecode(const std::string& bytecode_binary, const std::string& output_path,
-                             std::optional<std::size_t> instruction_limit_override = std::nullopt) {
+                             std::optional<std::size_t> instruction_limit_override = std::nullopt,
+                             bool prefer_lean_runtime = false) {
 #if defined(__linux__)
     try {
         const std::filesystem::path source_root = source_root_path();
         const std::filesystem::path build_dir = current_executable_dir();
-        const auto link_dependencies = native_link_dependencies(build_dir);
+        bool used_lean_runtime = false;
+        auto link_dependencies = prefer_lean_runtime ? native_core_link_dependencies(build_dir) : std::vector<std::string>();
+        if (!link_dependencies.empty() && link_dependencies_resolve(link_dependencies)) {
+            used_lean_runtime = true;
+        } else {
+            link_dependencies = native_link_dependencies(build_dir);
+        }
         if (link_dependencies.empty()) {
             return {false, "", "native build needs the ArcoBASIC libraries beside ArcoFission; run from a CMake build tree"};
         }
@@ -5742,6 +5814,12 @@ Result build_native_bytecode(const std::string& bytecode_binary, const std::stri
         message << "SOURCE ACCEPTED\n";
         message << "STRUCTURE ASSEMBLED\n";
         message << "BYTECODE EMBEDDED\n";
+        if (prefer_lean_runtime && !used_lean_runtime) {
+            message << "LEAN RUNTIME UNAVAILABLE (run `cmake --build . --target ArcoFissionCapsuleCoreProbe` "
+                       "in the build tree to enable it) -- linked the full runtime instead\n";
+        } else if (used_lean_runtime) {
+            message << "LEAN RUNTIME LINKED (no GUI backend, no libcurl)\n";
+        }
         message << "ELF64 WRITTEN " << output_path << "\n";
         return {true, message.str(), ""};
     } catch (const std::exception& error) {
@@ -6024,7 +6102,8 @@ Result build_native_file(const std::string& path, const std::string& output_path
         auto statements = parser.parse();
 
         const AmirModule amir = build_amir(statements, path, runtime.compile_metadata().instruction_limit);
-        const std::string bytecode = render_binary_bytecode(build_bytecode(amir));
+        const BytecodeModule module = build_bytecode(amir);
+        const std::string bytecode = render_binary_bytecode(module);
         if (target == "windows-x86_64" || target == "windows-x86-64") {
 #if defined(__linux__)
             return build_native_windows_bytecode(bytecode, output_path, instruction_limit_override);
@@ -6032,7 +6111,7 @@ Result build_native_file(const std::string& path, const std::string& output_path
             return {false, "", "Windows capsule cross-builds are only supported from a Linux host"};
 #endif
         }
-        return build_native_bytecode(bytecode, output_path, instruction_limit_override);
+        return build_native_bytecode(bytecode, output_path, instruction_limit_override, !bytecode_needs_full_runtime(module));
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }

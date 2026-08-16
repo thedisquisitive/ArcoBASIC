@@ -65,6 +65,35 @@ target_link_libraries(arco_compiler PUBLIC arco_runtime arcology_os)
 target_compile_definitions(arco_compiler PRIVATE ARCO_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
 add_library(ArcoBASIC::compiler ALIAS arco_compiler)
 
+# A second, lean build of the runtime/compiler libraries without the optional GUI/network
+# backends, so native capsule builds have a portable option for programs that don't call real
+# GUI.* functions (see fission.cpp's bytecode_needs_full_runtime) instead of always inheriting
+# ArcoFission's own GTK/GLFW/curl dependency footprint. Only worth building when the primary
+# arco_runtime above actually differs from this -- i.e. when those were found in the first place
+# -- and EXCLUDE_FROM_ALL so it doesn't add build time to every default build; opt in with
+# `cmake --build . --target ArcoFissionCapsuleCoreProbe`.
+if(ARCO_GUI_BACKEND_AVAILABLE OR CURL_FOUND)
+    add_library(arco_runtime_core STATIC EXCLUDE_FROM_ALL
+        src/frontend/lexer.cpp
+        src/frontend/parser.cpp
+        src/runtime/runtime.cpp
+        src/runtime/random.cpp
+        src/runtime/runtime_handles.cpp
+        src/runtime/resource_registry.cpp
+        src/gui/stub_backend.cpp
+    )
+    arco_configure_library(arco_runtime_core)
+    target_link_libraries(arco_runtime_core PUBLIC arcology_os)
+
+    add_library(arco_compiler_core STATIC EXCLUDE_FROM_ALL src/compiler/fission.cpp)
+    arco_configure_library(arco_compiler_core)
+    target_link_libraries(arco_compiler_core PUBLIC arco_runtime_core arcology_os)
+    target_compile_definitions(arco_compiler_core PRIVATE ARCO_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+
+    add_executable(ArcoFissionCapsuleCoreProbe EXCLUDE_FROM_ALL apps/arcofission/capsule_core_probe.cpp)
+    target_link_libraries(ArcoFissionCapsuleCoreProbe PRIVATE arco_compiler_core)
+endif()
+
 add_library(arco_shell STATIC src/shell/arcosh.cpp)
 arco_configure_library(arco_shell)
 target_link_libraries(arco_shell PUBLIC arco_runtime)

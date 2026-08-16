@@ -83,6 +83,46 @@ build/ArcoFission native examples/hello.bas -o hello
 
 In the alpha compiler model, the executable is native on the outside and runs the ArcoFission bytecode VM on the inside. Native capsules embed a compact binary bytecode payload and link it with the ArcoFission runtime from the active CMake build tree. The hosted VM prepares typed slots and fused numeric bytecode for common loop arithmetic before execution.
 
+### Lean capsules (no GUI/network dependency footprint)
+
+By default, `ArcoFission` links a capsule against whatever it was itself built against -- and on a
+desktop dev machine with GTK/GLFW/X11/libcurl installed, that means every capsule needs those
+(and their own transitive dependencies -- TLS, Kerberos, LDAP, systemd, ~90 shared libraries in
+total) present on the machine it runs on, even a capsule that never calls a `GUI.*` or `Network.*`
+function. That's a real problem for distributing a capsule to a machine you don't control (a
+different distro, a minimal container, a headless server).
+
+Opt in to a second, lean build of the runtime with no GUI backend and no libcurl:
+
+```sh
+cmake --build build --target ArcoFissionCapsuleCoreProbe
+```
+
+(`EXCLUDE_FROM_ALL`, so this doesn't add build time to a normal build; build it once and it stays
+built.) Once that target exists, `native`/`build` automatically link a capsule against it instead
+of the full runtime whenever the program doesn't call a real GUI function -- `GUI.Available()` and
+`GUI.Backend()` still work either way, since the lean build's stub backend answers those directly
+rather than needing a real backend; any other `GUI.*` call still gets the full runtime
+automatically, so nothing breaks, it just isn't lean. `Network.*` functions don't need this
+carve-out at all: every one of them already degrades gracefully without libcurl (`Network.Get`
+etc. return `{Ok: false, Error: "networking was not enabled in this build"}`; `Network.TcpConnect`/
+`Network.ResolveDNS` use plain POSIX sockets and work in both builds).
+
+The command's output says which one it picked:
+
+```text
+LEAN RUNTIME LINKED (no GUI backend, no libcurl)
+```
+
+or, if `ArcoFissionCapsuleCoreProbe` hasn't been built yet:
+
+```text
+LEAN RUNTIME UNAVAILABLE (run `cmake --build . --target ArcoFissionCapsuleCoreProbe` in the build tree to enable it) -- linked the full runtime instead
+```
+
+A lean capsule for a `PRINT`/arithmetic/array-and-object program links against 6 shared libraries
+(libc, libstdc++, libm, libgcc_s, the dynamic linker, and vdso) instead of ~96.
+
 Native capsules built with `native`/`build` and no `--target` are Linux ELF64 outputs.
 
 ## Windows Native Capsules
