@@ -2341,7 +2341,8 @@ enum class BytecodeOp {
     BinaryLocalLocal = 31,
     BinaryLocalConst = 32,
     BranchLocalLocal = 33,
-    Last = BranchLocalLocal,
+    IndexLocalConst = 34,
+    Last = IndexLocalConst,
 };
 
 enum class BytecodeOperandKind {
@@ -2487,6 +2488,11 @@ struct BytecodeInstruction {
     // Runtime::call_host_function_prepared can skip re-lowering it on every execution. Empty
     // when the callee is namespaced (e.g. "Runtime.Print") or otherwise not eligible.
     std::string prepared_call_key;
+    // Reused across executions of a STORE_INDEX instruction (assignments like arr[i] = v or
+    // obj.field = v) to build the index list without a fresh heap allocation on every write.
+    // assign_indexed recurses purely in C++ over this vector with no bytecode execution in
+    // between, so unlike call_args_scratch there isn't even a reentrancy question here.
+    mutable std::vector<Value> store_index_scratch;
 };
 
 struct BytecodeBlock {
@@ -2589,6 +2595,8 @@ std::string bytecode_op_name(BytecodeOp op) {
             return "BINARY_LOCAL_CONST";
         case BytecodeOp::BranchLocalLocal:
             return "BRANCH_LOCAL_LOCAL";
+        case BytecodeOp::IndexLocalConst:
+            return "INDEX_LOCAL_CONST";
     }
     return "UNSUPPORTED";
 }
@@ -2732,6 +2740,26 @@ void optimize_bytecode_block(BytecodeBlock& block) {
                 optimized.push_back(bytecode_instruction(BytecodeOp::BinaryLocalConst,
                     {final.operands[0], binary.operands[1], load_left.operands[1], load_right.operands[1]}));
                 i += 4;
+                continue;
+            }
+        }
+
+        // arr[k]/obj.field with a compile-time-constant index or property name lowers to
+        // LOAD local; CONST key; INDEX target=local key=key -- fuse into one op. This is the
+        // dominant shape for game-style entity/array access (obj.X, edge[0], ...).
+        if (i + 2 < block.instructions.size()) {
+            const auto& load_target = block.instructions[i];
+            const auto& load_key = block.instructions[i + 1];
+            const auto& index = block.instructions[i + 2];
+            if (load_target.op == BytecodeOp::Load && load_target.operands.size() == 2 &&
+                load_key.op == BytecodeOp::Const && load_key.operands.size() == 2 &&
+                index.op == BytecodeOp::Index && index.operands.size() == 3 &&
+                local_ref_text(load_target.operands[1]) && const_ref_text(load_key.operands[1]) &&
+                temp_ref_equals(load_target.operands[0], index.operands[1]) &&
+                temp_ref_equals(load_key.operands[0], index.operands[2])) {
+                optimized.push_back(bytecode_instruction(BytecodeOp::IndexLocalConst,
+                    {index.operands[0], load_target.operands[1], load_key.operands[1]}));
+                i += 3;
                 continue;
             }
         }
@@ -4388,6 +4416,7 @@ void prepare_bytecode_module(BytecodeModule& module) {
                 instruction.call_site_function = nullptr;
                 instruction.call_args_scratch.clear();
                 instruction.prepared_call_key.clear();
+                instruction.store_index_scratch.clear();
                 instruction.prepared_operands.clear();
                 instruction.prepared_operands.reserve(instruction.operands.size());
                 for (const auto& operand : instruction.operands) {
@@ -4985,7 +5014,9 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                     throw std::runtime_error("STORE_INDEX expects a target, at least one index, and a value");
                 }
                 Value target = value_at(0);
-                std::vector<Value> indexes;
+                auto& indexes = instruction.store_index_scratch;
+                indexes.clear();
+                indexes.reserve(instruction.operands.size() > 2 ? instruction.operands.size() - 2 : 0);
                 for (std::size_t i = 1; i + 1 < instruction.operands.size(); ++i) {
                     indexes.push_back(value_at(i));
                 }
@@ -5155,6 +5186,7 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 break;
             }
             case BytecodeOp::Index:
+            case BytecodeOp::IndexLocalConst:
                 set_temp_at(0, index_value(value_at(1), value_at(2)));
                 break;
             case BytecodeOp::Slice: {
