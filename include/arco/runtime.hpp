@@ -181,6 +181,11 @@ public:
     void reset_instruction_count();
 
     Value call_host_function(const std::string& name, const std::vector<Value>& args);
+    // Fast path for a bare (unqualified) call name whose host_functions_ key a caller has
+    // already lowercased once (e.g. cached at bytecode-prepare time). Skips call_host_function's
+    // own re-lowering and its namespaced-class member-access check, both moot for a name with
+    // no '.' -- callers must only use this for names verified dot-free.
+    Value call_host_function_prepared(const std::string& lowered_key, const std::vector<Value>& args);
     Value call_method(Value receiver, const std::string& method, const std::vector<Value>& args);
     Value make_callable(const std::string& name, std::optional<Value> receiver = std::nullopt,
                         bool require_registered = true);

@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -2459,6 +2460,15 @@ inline bool numeric_op_is_comparison(NumericOp op) {
     }
 }
 
+// Mirrors the lowercasing Runtime::call_host_function applies to build its host_functions_ key
+// (see the anonymous-namespace function_key() in runtime.cpp), so a call site's key can be
+// precomputed once at prepare time instead of re-lowered on every execution.
+inline std::string lowered_call_key(const std::string& name) {
+    std::string key = name;
+    for (char& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return key;
+}
+
 struct BytecodeInstruction {
     BytecodeOp op = BytecodeOp::Unsupported;
     std::vector<std::string> operands;
@@ -2468,6 +2478,15 @@ struct BytecodeInstruction {
     mutable CallSiteResolution call_site_resolution = CallSiteResolution::Unresolved;
     mutable const BytecodeFunction* call_site_function = nullptr;
     NumericOp prepared_numeric_op = NumericOp::Unknown;
+    // Reused across executions of a CALL_VALUE/CALL_RUNTIME instruction to build the argument
+    // list without a fresh heap allocation on every call. Safe under recursion: a call's args
+    // are fully copied into the callee's frame before the callee's body (and thus any reentry
+    // into this same instruction) ever runs, so nothing reads this buffer after that point.
+    mutable std::vector<Value> call_args_scratch;
+    // Lowercased callee name, precomputed once for a bare (unqualified, no '.') call target so
+    // Runtime::call_host_function_prepared can skip re-lowering it on every execution. Empty
+    // when the callee is namespaced (e.g. "Runtime.Print") or otherwise not eligible.
+    std::string prepared_call_key;
 };
 
 struct BytecodeBlock {
@@ -4367,6 +4386,8 @@ void prepare_bytecode_module(BytecodeModule& module) {
                 auto& instruction = block.instructions[instruction_index];
                 instruction.call_site_resolution = CallSiteResolution::Unresolved;
                 instruction.call_site_function = nullptr;
+                instruction.call_args_scratch.clear();
+                instruction.prepared_call_key.clear();
                 instruction.prepared_operands.clear();
                 instruction.prepared_operands.reserve(instruction.operands.size());
                 for (const auto& operand : instruction.operands) {
@@ -4392,6 +4413,16 @@ void prepare_bytecode_module(BytecodeModule& module) {
                     case BytecodeOp::BranchLocalLocal:
                         if (!instruction.operands.empty()) {
                             instruction.prepared_numeric_op = numeric_op_from_text(instruction.operands[0]);
+                        }
+                        break;
+                    case BytecodeOp::CallValue:
+                        if (instruction.operands.size() > 1 && instruction.operands[1].find('.') == std::string::npos) {
+                            instruction.prepared_call_key = lowered_call_key(instruction.operands[1]);
+                        }
+                        break;
+                    case BytecodeOp::CallRuntime:
+                        if (!instruction.operands.empty() && instruction.operands[0].find('.') == std::string::npos) {
+                            instruction.prepared_call_key = lowered_call_key(instruction.operands[0]);
                         }
                         break;
                     default:
@@ -5003,17 +5034,23 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 break;
             }
             case BytecodeOp::CallValue: {
-                std::vector<Value> args;
+                auto& args = instruction.call_args_scratch;
+                args.clear();
                 args.reserve(instruction.operands.size() > 2 ? instruction.operands.size() - 2 : 0);
                 for (std::size_t i = 2; i < instruction.operands.size(); ++i) {
                     args.push_back(value_at(i));
                 }
+                const auto call_host = [&](const std::vector<Value>& call_args) {
+                    return instruction.prepared_call_key.empty()
+                        ? runtime.call_host_function(instruction.operands[1], call_args)
+                        : runtime.call_host_function_prepared(instruction.prepared_call_key, call_args);
+                };
                 if (instruction.call_site_resolution == CallSiteResolution::UserFunction) {
                     set_temp_at(0, execute_function(module, *instruction.call_site_function, runtime, args, count_instructions));
                     break;
                 }
                 if (instruction.call_site_resolution == CallSiteResolution::HostFunction) {
-                    set_temp_at(0, runtime.call_host_function(instruction.operands[1], args));
+                    set_temp_at(0, call_host(args));
                     break;
                 }
                 std::optional<Value> callable_target;
@@ -5057,7 +5094,7 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                         instruction.call_site_function = user_function;
                     }
                 } else {
-                    set_temp_at(0, runtime.call_host_function(instruction.operands[1], args));
+                    set_temp_at(0, call_host(args));
                     if (local_ref == function.local_refs_by_base.end()) {
                         instruction.call_site_resolution = CallSiteResolution::HostFunction;
                     }
@@ -5065,7 +5102,8 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 break;
             }
             case BytecodeOp::CallRuntime: {
-                std::vector<Value> args;
+                auto& args = instruction.call_args_scratch;
+                args.clear();
                 args.reserve(instruction.operands.size() > 1 ? instruction.operands.size() - 1 : 0);
                 for (std::size_t i = 1; i < instruction.operands.size(); ++i) {
                     args.push_back(value_at(i));
@@ -5075,8 +5113,10 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                         runtime.output() << args[0].to_string();
                     }
                     runtime.output() << '\n';
-                } else {
+                } else if (instruction.prepared_call_key.empty()) {
                     (void)runtime.call_host_function(instruction.operands[0], args);
+                } else {
+                    (void)runtime.call_host_function_prepared(instruction.prepared_call_key, args);
                 }
                 break;
             }

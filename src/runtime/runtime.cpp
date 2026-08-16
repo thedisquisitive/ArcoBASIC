@@ -4261,6 +4261,15 @@ Value Runtime::call_host_function(const std::string& name, const std::vector<Val
     return found->second(args);
 }
 
+Value Runtime::call_host_function_prepared(const std::string& lowered_key, const std::vector<Value>& args) {
+    tick();
+    const auto found = host_functions_.find(lowered_key);
+    if (found == host_functions_.end()) {
+        throw std::runtime_error("unknown host function: " + lowered_key);
+    }
+    return found->second(args);
+}
+
 Value Runtime::make_callable(const std::string& name, std::optional<Value> receiver, bool require_registered) {
     if (receiver.has_value()) {
         if (!receiver->is_object()) throw std::runtime_error("ADDRESSOF bound receiver must be a class instance");
