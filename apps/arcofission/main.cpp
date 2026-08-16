@@ -25,6 +25,7 @@ void print_usage(std::ostream& output) {
         << "  ArcoFission build FILE -o OUT.efi --target uefi-x86_64 [--entry NAME]\n"
         << "  ArcoFission bytecode FILE -o OUT.arcof\n"
         << "  ArcoFission native FILE -o OUT\n"
+        << "  ArcoFission native FILE -o OUT.exe --target windows-x86_64\n"
         << "  ArcoFission run FILE.arcof\n"
         << "  ArcoFission compile-run FILE\n"
         << "  Hosted run/build commands accept --instruction-limit COUNT|unlimited\n"
@@ -100,8 +101,9 @@ int write_bytecode_file(const std::string& source_path, const std::string& outpu
 }
 
 int write_native_file(const std::string& source_path, const std::string& output_path,
-                      std::optional<std::size_t> instruction_limit = default_unlimited_instruction_limit()) {
-    const auto result = arco::fission::build_native_file(source_path, output_path, instruction_limit);
+                      std::optional<std::size_t> instruction_limit = default_unlimited_instruction_limit(),
+                      const std::string& target = "") {
+    const auto result = arco::fission::build_native_file(source_path, output_path, instruction_limit, target);
     if (!result.ok) {
         std::cerr << "NATIVE BUILD FAILED\n\n" << result.error << '\n';
         return 1;
@@ -210,20 +212,32 @@ int main(int argc, char** argv) {
         if (ends_with(lowercase(output_path), ".arcof")) {
             return write_bytecode_file(argv[2], output_path);
         }
-        return write_native_file(argv[2], output_path, instruction_limit);
+        return write_native_file(argv[2], output_path, instruction_limit, target);
     }
 
     if (argc == 5 && lowercase(argv[1]) == "bytecode" && std::string(argv[3]) == "-o") {
         return write_bytecode_file(argv[2], argv[4]);
     }
 
-    if ((argc == 5 || argc == 7) && lowercase(argv[1]) == "native" && std::string(argv[3]) == "-o") {
-        try {
-            return write_native_file(argv[2], argv[4], hosted_instruction_limit_or_unlimited(argc, argv, 5));
-        } catch (const std::exception& error) {
-            std::cerr << "ArcoFission: " << error.what() << '\n';
-            return 2;
+    if (argc >= 5 && lowercase(argv[1]) == "native" && std::string(argv[3]) == "-o") {
+        std::optional<std::size_t> instruction_limit = default_unlimited_instruction_limit();
+        std::string target;
+        for (int i = 5; i + 1 < argc; i += 2) {
+            if (lowercase(argv[i]) == "--target") {
+                target = lowercase(argv[i + 1]);
+            } else if (lowercase(argv[i]) == "--instruction-limit") {
+                try {
+                    instruction_limit = parse_instruction_limit(argv[i + 1]);
+                } catch (const std::exception& error) {
+                    std::cerr << "ArcoFission: " << error.what() << '\n';
+                    return 2;
+                }
+            } else {
+                std::cerr << "ArcoFission: unrecognized native option " << argv[i] << '\n';
+                return 2;
+            }
         }
+        return write_native_file(argv[2], argv[4], instruction_limit, target);
     }
 
     if ((argc == 3 || argc == 5) && lowercase(argv[1]) == "run") {

@@ -32,6 +32,13 @@ arco_add_script_test(
     $<TARGET_FILE:ArcoFission>
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+arco_add_script_test(
+    arcofission_windows_capsule_smoke
+    tests/integration/arcofission_windows_capsule_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_COMMAND}
+)
 
 arco_add_script_test(
     random_integration_smoke

@@ -1,6 +1,6 @@
 # ArcoFission
 
-ArcoFission is the ArcoBASIC compiler pipeline tool. In the current alpha it can inspect compiler stages, emit hosted bytecode, run hosted bytecode, build Linux ELF64 runtime capsules, and build UEFI x86-64 PE32+ images for the freestanding systems target.
+ArcoFission is the ArcoBASIC compiler pipeline tool. In the current alpha it can inspect compiler stages, emit hosted bytecode, run hosted bytecode, build Linux ELF64 runtime capsules, cross-compile Windows PE32+ runtime capsules from Linux, and build UEFI x86-64 PE32+ images for the freestanding systems target.
 
 ## Build
 
@@ -83,7 +83,46 @@ build/ArcoFission native examples/hello.bas -o hello
 
 In the alpha compiler model, the executable is native on the outside and runs the ArcoFission bytecode VM on the inside. Native capsules embed a compact binary bytecode payload and link it with the ArcoFission runtime from the active CMake build tree. The hosted VM prepares typed slots and fused numeric bytecode for common loop arithmetic before execution.
 
-Native capsules are currently Linux-only ELF64 outputs.
+Native capsules built with `native`/`build` and no `--target` are Linux ELF64 outputs.
+
+## Windows Native Capsules
+
+`ArcoFission` can also cross-compile a capsule to a genuine Windows PE32+ x86-64 executable
+from a Linux host, using a mingw-w64 cross-compiler:
+
+```sh
+sudo apt-get install g++-mingw-w64-x86-64
+```
+
+Configure and build a mingw-w64-targeted tree of the runtime and compiler libraries (a normal
+build tree, just pointed at the cross toolchain file; this only needs `arco_compiler`, not the
+whole project):
+
+```sh
+cmake -S . -B build-windows -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64-x86_64.cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build build-windows --target arco_compiler
+```
+
+Then point `ARCOFISSION_WINDOWS_TOOLCHAIN_DIR` at that tree and build with `--target
+windows-x86_64`:
+
+```sh
+export ARCOFISSION_WINDOWS_TOOLCHAIN_DIR="$PWD/build-windows"
+build/ArcoFission native examples/hello.bas -o hello.exe --target windows-x86_64
+```
+
+The resulting `.exe` is statically linked (`-static -static-libgcc -static-libstdc++`) and
+imports only `KERNEL32.dll` and `msvcrt.dll` -- the two DLLs present on every Windows install --
+so it doesn't require anything else to be installed on the target machine. Run it directly on
+Windows, or under Wine (`wine hello.exe`) on Linux.
+
+This target builds the interpreter/stdlib core only: because the GUI backend is gated to Unix in
+`cmake/Dependencies.cmake` and the mingw cross build won't have libcurl available either, GUI and
+networking builtins compile out automatically for this target (`GUI.*` calls will report the
+backend as unavailable; `Network.*` calls that need DNS/sockets return a not-implemented error --
+see the `#ifdef _WIN32` branches in `src/runtime/runtime.cpp`). A capsule that only uses core
+language features, `PRINT`, arrays/objects, and non-network stdlib works exactly as it does on
+Linux.
 
 ## Instruction Limits
 

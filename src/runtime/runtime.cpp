@@ -169,11 +169,12 @@ std::string query_string(const Value& values) {
     return output;
 }
 
+// Only referenced from the non-Windows branches of network_resolve/tcp_connect below; the
+// `sockaddr` family of types isn't declared at all on Windows since the POSIX socket headers
+// are excluded there (see the #ifndef _WIN32 include block above), so this must not be compiled
+// on Windows rather than merely stubbed.
+#ifndef _WIN32
 std::string sockaddr_address(const sockaddr* address) {
-#ifdef _WIN32
-    (void)address;
-    return "";
-#else
     char buffer[INET6_ADDRSTRLEN]{};
     if (address->sa_family == AF_INET) {
         const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(address);
@@ -187,8 +188,8 @@ std::string sockaddr_address(const sockaddr* address) {
         }
     }
     return "";
-#endif
 }
+#endif
 
 Value network_resolve(const std::string& host) {
     Value::Array addresses;

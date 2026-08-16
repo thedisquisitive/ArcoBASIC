@@ -27,7 +27,8 @@ Result compile_run(const std::string& source, const std::string& source_name,
 Result compile_run_file(const std::string& path,
                         std::optional<std::size_t> instruction_limit_override = std::nullopt);
 Result build_native_file(const std::string& path, const std::string& output_path,
-                         std::optional<std::size_t> instruction_limit_override = std::nullopt);
+                         std::optional<std::size_t> instruction_limit_override = std::nullopt,
+                         const std::string& target = "");
 Result reveal_ast(const std::string& source, const std::string& source_name);
 Result reveal_ast_file(const std::string& path);
 Result reveal_callconv(const std::string& source, const std::string& source_name);

@@ -5521,6 +5521,157 @@ bool is_elf64_file(const std::filesystem::path& path) {
     return input.gcount() == static_cast<std::streamsize>(sizeof(header)) && header[0] == 0x7f && header[1] == 'E' &&
            header[2] == 'L' && header[3] == 'F' && header[4] == 2;
 }
+
+// True for a PE32+ image whose optional header reports the x86-64 machine type -- enough to
+// confirm the cross-compiler actually produced a Windows x86-64 executable rather than, say,
+// silently falling back to a host binary. Doesn't attempt full PE validation.
+bool is_pe64_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    unsigned char dos_header[64] = {};
+    input.read(reinterpret_cast<char*>(dos_header), sizeof(dos_header));
+    if (input.gcount() != static_cast<std::streamsize>(sizeof(dos_header)) || dos_header[0] != 'M' || dos_header[1] != 'Z') {
+        return false;
+    }
+    const std::uint32_t pe_offset = static_cast<std::uint32_t>(dos_header[60]) | (static_cast<std::uint32_t>(dos_header[61]) << 8) |
+        (static_cast<std::uint32_t>(dos_header[62]) << 16) | (static_cast<std::uint32_t>(dos_header[63]) << 24);
+    input.seekg(pe_offset);
+    unsigned char pe_header[6] = {};
+    input.read(reinterpret_cast<char*>(pe_header), sizeof(pe_header));
+    if (input.gcount() != static_cast<std::streamsize>(sizeof(pe_header))) {
+        return false;
+    }
+    const std::uint16_t machine = static_cast<std::uint16_t>(pe_header[4]) | (static_cast<std::uint16_t>(pe_header[5]) << 8);
+    return pe_header[0] == 'P' && pe_header[1] == 'E' && pe_header[2] == 0 && pe_header[3] == 0 && machine == 0x8664;
+}
+#endif
+
+// Shared by every native capsule target: a tiny launcher that embeds the compiled bytecode as a
+// byte string and hands it to the same hosted VM (run_bytecode_binary) the capsule is linked
+// against. What differs per target is only how that launcher gets compiled and linked.
+std::string native_launcher_source(const std::string& bytecode_binary, std::optional<std::size_t> instruction_limit_override) {
+    std::ostringstream out;
+    out << "#include \"arco/fission.hpp\"\n"
+        << "#include <iostream>\n"
+        << "\n"
+        << "int main() {\n"
+        << "    const std::string bytecode(" << cpp_string_literal(bytecode_binary) << ", "
+        << bytecode_binary.size() << ");\n"
+        << "    const auto result = arco::fission::run_bytecode_binary(bytecode, ";
+    if (instruction_limit_override.has_value()) {
+        out << "std::optional<std::size_t>(" << *instruction_limit_override << ")";
+    } else {
+        out << "std::nullopt";
+    }
+    out << ");\n"
+        << "    if (!result.ok) {\n"
+        << "        std::cerr << result.error << '\\n';\n"
+        << "        return 1;\n"
+        << "    }\n"
+        << "    std::cout << result.output;\n"
+        << "    return 0;\n"
+        << "}\n";
+    return out.str();
+}
+
+#if defined(__linux__)
+// Locates a mingw-w64-targeted build tree (arco_runtime/arco_compiler/arcology_os built with
+// cmake/toolchains/mingw-w64-x86_64.cmake) so the Windows capsule target can link against it.
+// Not auto-discovered from the running ArcoFission's own build tree the way the Linux path is,
+// since that tree was built for the host, not for Windows -- callers must point at one via
+// ARCOFISSION_WINDOWS_TOOLCHAIN_DIR.
+std::optional<std::filesystem::path> windows_toolchain_build_dir() {
+    const char* env = std::getenv("ARCOFISSION_WINDOWS_TOOLCHAIN_DIR");
+    if (!env || !*env) {
+        return std::nullopt;
+    }
+    return std::filesystem::path(env);
+}
+
+Result build_native_windows_bytecode(const std::string& bytecode_binary, const std::string& output_path,
+                                     std::optional<std::size_t> instruction_limit_override) {
+    try {
+        const auto windows_build_dir = windows_toolchain_build_dir();
+        if (!windows_build_dir.has_value()) {
+            return {false, "",
+                "Windows capsule builds need a mingw-w64-targeted build tree (configure one with "
+                "cmake/toolchains/mingw-w64-x86_64.cmake and build the arco_compiler target), then point "
+                "ARCOFISSION_WINDOWS_TOOLCHAIN_DIR at it"};
+        }
+        const std::filesystem::path source_root = source_root_path();
+        const std::filesystem::path compiler_lib = *windows_build_dir / "libarco_compiler.a";
+        const std::filesystem::path runtime_lib = *windows_build_dir / "libarco_runtime.a";
+        const std::filesystem::path arcology_lib = *windows_build_dir / "arcology-os" / "libarcology_os.a";
+        for (const auto& lib : {compiler_lib, runtime_lib, arcology_lib}) {
+            if (!std::filesystem::exists(lib)) {
+                return {false, "", "missing " + lib.string() +
+                    " -- build the arco_compiler target in the mingw-w64 tree ARCOFISSION_WINDOWS_TOOLCHAIN_DIR points at"};
+            }
+        }
+
+        const std::filesystem::path tmp_dir = std::filesystem::temp_directory_path() /
+                                              ("arcofission-native-windows-" + std::to_string(static_cast<long long>(::getpid())));
+        std::filesystem::create_directories(tmp_dir);
+        const std::filesystem::path launcher = tmp_dir / "launcher.cpp";
+        {
+            std::ofstream out(launcher);
+            if (!out) {
+                return {false, "", "could not write native launcher source"};
+            }
+            out << native_launcher_source(bytecode_binary, instruction_limit_override);
+        }
+
+        const char* env_cross_cxx = std::getenv("ARCOFISSION_WINDOWS_CXX");
+        const std::string compiler = env_cross_cxx && *env_cross_cxx ? env_cross_cxx : "x86_64-w64-mingw32-g++";
+
+        std::vector<std::string> args{
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-static",
+            "-static-libgcc",
+            "-static-libstdc++",
+            launcher.string(),
+            "-o",
+            output_path,
+            "-I" + (source_root / "include").string(),
+            compiler_lib.string(),
+            runtime_lib.string(),
+            arcology_lib.string(),
+            "-lws2_32",
+        };
+
+        std::ostringstream command;
+        bool first = true;
+        for (const auto& arg : args) {
+            if (!first) {
+                command << ' ';
+            }
+            first = false;
+            command << shell_quote(arg);
+        }
+
+        const int status = std::system(command.str().c_str());
+        std::filesystem::remove_all(tmp_dir);
+        if (status == -1) {
+            return {false, "", "could not launch the mingw-w64 cross-compiler"};
+        }
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            return {false, "", "mingw-w64 cross-compiler failed while building the Windows capsule"};
+        }
+        if (!is_pe64_file(output_path)) {
+            return {false, "", "cross-compiler did not produce a PE32+ x86-64 executable"};
+        }
+
+        std::ostringstream message;
+        message << "SOURCE ACCEPTED\n";
+        message << "STRUCTURE ASSEMBLED\n";
+        message << "BYTECODE EMBEDDED\n";
+        message << "PE32+ WRITTEN " << output_path << "\n";
+        return {true, message.str(), ""};
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
 #endif
 
 Result build_native_bytecode(const std::string& bytecode_binary, const std::string& output_path,
@@ -5543,26 +5694,7 @@ Result build_native_bytecode(const std::string& bytecode_binary, const std::stri
             if (!out) {
                 return {false, "", "could not write native launcher source"};
             }
-            out << "#include \"arco/fission.hpp\"\n"
-                << "#include <iostream>\n"
-                << "\n"
-                << "int main() {\n"
-                << "    const std::string bytecode(" << cpp_string_literal(bytecode_binary) << ", "
-                << bytecode_binary.size() << ");\n"
-                << "    const auto result = arco::fission::run_bytecode_binary(bytecode, ";
-            if (instruction_limit_override.has_value()) {
-                out << "std::optional<std::size_t>(" << *instruction_limit_override << ")";
-            } else {
-                out << "std::nullopt";
-            }
-            out << ");\n"
-                << "    if (!result.ok) {\n"
-                << "        std::cerr << result.error << '\\n';\n"
-                << "        return 1;\n"
-                << "    }\n"
-                << "    std::cout << result.output;\n"
-                << "    return 0;\n"
-                << "}\n";
+            out << native_launcher_source(bytecode_binary, instruction_limit_override);
         }
 
         const std::filesystem::path cache = build_dir / "CMakeCache.txt";
@@ -5881,7 +6013,7 @@ Result compile_run_file(const std::string& path, std::optional<std::size_t> inst
 }
 
 Result build_native_file(const std::string& path, const std::string& output_path,
-                         std::optional<std::size_t> instruction_limit_override) {
+                         std::optional<std::size_t> instruction_limit_override, const std::string& target) {
     try {
         Runtime runtime;
         const std::string processed = runtime.preprocess_source(read_file(path));
@@ -5893,6 +6025,13 @@ Result build_native_file(const std::string& path, const std::string& output_path
 
         const AmirModule amir = build_amir(statements, path, runtime.compile_metadata().instruction_limit);
         const std::string bytecode = render_binary_bytecode(build_bytecode(amir));
+        if (target == "windows-x86_64" || target == "windows-x86-64") {
+#if defined(__linux__)
+            return build_native_windows_bytecode(bytecode, output_path, instruction_limit_override);
+#else
+            return {false, "", "Windows capsule cross-builds are only supported from a Linux host"};
+#endif
+        }
         return build_native_bytecode(bytecode, output_path, instruction_limit_override);
     } catch (const std::exception& error) {
         return {false, "", error.what()};
