@@ -91,12 +91,9 @@ std::string cpp_string_literal(const std::string& text) {
             case '\t':
                 out << "\\t";
                 break;
-            case '\0':
-                out << "\\0";
-                break;
             default:
                 if (c < 32 || c > 126) {
-                    out << "\\x" << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c)
+                    out << "\\" << std::oct << std::setw(3) << std::setfill('0') << static_cast<int>(c)
                         << std::dec << std::setfill(' ');
                 } else {
                     out << static_cast<char>(c);
@@ -2339,11 +2336,39 @@ enum class BytecodeOp {
     Tuple = 27,
     Destructure = 28,
     AddressOf = 29,
+    StoreConst = 30,
+    BinaryLocalLocal = 31,
+    BinaryLocalConst = 32,
+    BranchLocalLocal = 33,
+    Last = BranchLocalLocal,
+};
+
+enum class BytecodeOperandKind {
+    Empty,
+    Temp,
+    Constant,
+    Local,
+    InlineValue,
+    Symbol,
+};
+
+struct BytecodeOperand {
+    BytecodeOperandKind kind = BytecodeOperandKind::Empty;
+    std::size_t index = 0;
+    Value value;
+};
+
+struct BytecodeCursor {
+    std::size_t block = 0;
+    std::size_t instruction = 0;
 };
 
 struct BytecodeInstruction {
     BytecodeOp op = BytecodeOp::Unsupported;
     std::vector<std::string> operands;
+    std::vector<BytecodeOperand> prepared_operands;
+    std::vector<BytecodeCursor> prepared_targets;
+    int prepared_source_line = 0;
 };
 
 struct BytecodeBlock {
@@ -2357,6 +2382,11 @@ struct BytecodeFunction {
     std::vector<std::string> params;
     std::vector<std::string> locals;
     std::vector<BytecodeBlock> blocks;
+    std::unordered_map<std::string, BytecodeCursor> targets;
+    std::unordered_map<std::string, std::string> local_refs_by_base;
+    std::vector<std::string> param_local_refs;
+    std::vector<std::optional<Value>> param_defaults;
+    std::size_t temp_count = 0;
 };
 
 struct BytecodeModule {
@@ -2364,7 +2394,9 @@ struct BytecodeModule {
     int version = 0;
     std::optional<std::uint64_t> instruction_limit;
     std::vector<std::string> constants;
+    std::vector<Value> constant_values;
     std::vector<BytecodeFunction> functions;
+    std::unordered_map<std::string, std::size_t> function_indices;
     std::vector<std::string> diagnostics;
 };
 
@@ -2430,6 +2462,14 @@ std::string bytecode_op_name(BytecodeOp op) {
             return "DESTRUCTURE";
         case BytecodeOp::AddressOf:
             return "ADDRESSOF";
+        case BytecodeOp::StoreConst:
+            return "STORE_CONST";
+        case BytecodeOp::BinaryLocalLocal:
+            return "BINARY_LOCAL_LOCAL";
+        case BytecodeOp::BinaryLocalConst:
+            return "BINARY_LOCAL_CONST";
+        case BytecodeOp::BranchLocalLocal:
+            return "BRANCH_LOCAL_LOCAL";
     }
     return "UNSUPPORTED";
 }
@@ -2501,6 +2541,93 @@ BytecodeInstruction bytecode_instruction(BytecodeOp op, std::vector<std::string>
     instruction.op = op;
     instruction.operands = std::move(operands);
     return instruction;
+}
+
+bool temp_ref_equals(const std::string& left, const std::string& right) {
+    return !left.empty() && left[0] == '%' && left == right;
+}
+
+bool local_ref_text(const std::string& text) {
+    return text.size() > 1 && text[0] == 'L' && text[1] >= '0' && text[1] <= '9';
+}
+
+bool const_ref_text(const std::string& text) {
+    return text.size() > 1 && text[0] == 'K' && text[1] >= '0' && text[1] <= '9';
+}
+
+void optimize_bytecode_block(BytecodeBlock& block) {
+    std::vector<BytecodeInstruction> optimized;
+    optimized.reserve(block.instructions.size());
+
+    for (std::size_t i = 0; i < block.instructions.size();) {
+        if (i + 1 < block.instructions.size()) {
+            const auto& first = block.instructions[i];
+            const auto& second = block.instructions[i + 1];
+            if (first.op == BytecodeOp::Const && first.operands.size() == 2 &&
+                second.op == BytecodeOp::Store && second.operands.size() == 2 &&
+                local_ref_text(second.operands[0]) && const_ref_text(first.operands[1]) &&
+                temp_ref_equals(first.operands[0], second.operands[1])) {
+                optimized.push_back(bytecode_instruction(BytecodeOp::StoreConst,
+                    {second.operands[0], first.operands[1]}));
+                i += 2;
+                continue;
+            }
+        }
+
+        if (i + 3 < block.instructions.size()) {
+            const auto& load_left = block.instructions[i];
+            const auto& load_right = block.instructions[i + 1];
+            const auto& binary = block.instructions[i + 2];
+            const auto& final = block.instructions[i + 3];
+            if (load_left.op == BytecodeOp::Load && load_left.operands.size() == 2 &&
+                load_right.op == BytecodeOp::Load && load_right.operands.size() == 2 &&
+                binary.op == BytecodeOp::Binary && binary.operands.size() == 4 &&
+                local_ref_text(load_left.operands[1]) && local_ref_text(load_right.operands[1]) &&
+                temp_ref_equals(load_left.operands[0], binary.operands[2]) &&
+                temp_ref_equals(load_right.operands[0], binary.operands[3])) {
+                if (final.op == BytecodeOp::Store && final.operands.size() == 2 &&
+                    local_ref_text(final.operands[0]) && temp_ref_equals(binary.operands[0], final.operands[1])) {
+                    optimized.push_back(bytecode_instruction(BytecodeOp::BinaryLocalLocal,
+                        {final.operands[0], binary.operands[1], load_left.operands[1], load_right.operands[1]}));
+                    i += 4;
+                    continue;
+                }
+                if (final.op == BytecodeOp::Branch && final.operands.size() == 3 &&
+                    temp_ref_equals(binary.operands[0], final.operands[0])) {
+                    optimized.push_back(bytecode_instruction(BytecodeOp::BranchLocalLocal,
+                        {binary.operands[1], load_left.operands[1], load_right.operands[1], final.operands[1], final.operands[2]}));
+                    i += 4;
+                    continue;
+                }
+            }
+
+            if (load_left.op == BytecodeOp::Load && load_left.operands.size() == 2 &&
+                load_right.op == BytecodeOp::Const && load_right.operands.size() == 2 &&
+                binary.op == BytecodeOp::Binary && binary.operands.size() == 4 &&
+                final.op == BytecodeOp::Store && final.operands.size() == 2 &&
+                local_ref_text(load_left.operands[1]) && const_ref_text(load_right.operands[1]) &&
+                local_ref_text(final.operands[0]) &&
+                temp_ref_equals(load_left.operands[0], binary.operands[2]) &&
+                temp_ref_equals(load_right.operands[0], binary.operands[3]) &&
+                temp_ref_equals(binary.operands[0], final.operands[1])) {
+                optimized.push_back(bytecode_instruction(BytecodeOp::BinaryLocalConst,
+                    {final.operands[0], binary.operands[1], load_left.operands[1], load_right.operands[1]}));
+                i += 4;
+                continue;
+            }
+        }
+
+        optimized.push_back(std::move(block.instructions[i]));
+        ++i;
+    }
+
+    block.instructions = std::move(optimized);
+}
+
+void optimize_bytecode_function(BytecodeFunction& function) {
+    for (auto& block : function.blocks) {
+        optimize_bytecode_block(block);
+    }
 }
 
 BytecodeModule build_bytecode(const AmirModule& amir) {
@@ -2688,6 +2815,7 @@ BytecodeModule build_bytecode(const AmirModule& amir) {
             }
             function.blocks.push_back(std::move(block));
         }
+        optimize_bytecode_function(function);
         module.functions.push_back(std::move(function));
     }
     return module;
@@ -2704,7 +2832,7 @@ std::string render_bytecode(const BytecodeModule& module) {
     }
 
     out << "OPCODES\n";
-    for (int id = static_cast<int>(BytecodeOp::Label); id <= static_cast<int>(BytecodeOp::AddressOf); ++id) {
+    for (int id = static_cast<int>(BytecodeOp::Label); id <= static_cast<int>(BytecodeOp::Last); ++id) {
         const auto op = static_cast<BytecodeOp>(id);
         out << "    " << id << " " << bytecode_op_name(op) << "\n";
     }
@@ -2771,7 +2899,7 @@ std::vector<std::string> split_words(const std::string& line) {
 }
 
 BytecodeOp bytecode_op_from_name(const std::string& name) {
-    for (int id = static_cast<int>(BytecodeOp::Label); id <= static_cast<int>(BytecodeOp::AddressOf); ++id) {
+    for (int id = static_cast<int>(BytecodeOp::Label); id <= static_cast<int>(BytecodeOp::Last); ++id) {
         const auto op = static_cast<BytecodeOp>(id);
         if (bytecode_op_name(op) == name) {
             return op;
@@ -2850,6 +2978,169 @@ BytecodeModule parse_bytecode(const std::string& text) {
             }
             block->instructions.push_back(bytecode_instruction(bytecode_op_from_name(words[1]), std::move(operands)));
         }
+    }
+    return module;
+}
+
+void append_u8(std::string& out, std::uint8_t value) {
+    out.push_back(static_cast<char>(value));
+}
+
+void append_u32(std::string& out, std::uint32_t value) {
+    for (int shift = 0; shift < 32; shift += 8) {
+        out.push_back(static_cast<char>((value >> shift) & 0xFF));
+    }
+}
+
+void append_u64(std::string& out, std::uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8) {
+        out.push_back(static_cast<char>((value >> shift) & 0xFF));
+    }
+}
+
+void append_string(std::string& out, const std::string& value) {
+    if (value.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error("bytecode string is too large for binary capsule format");
+    }
+    append_u32(out, static_cast<std::uint32_t>(value.size()));
+    out.append(value);
+}
+
+std::string render_binary_bytecode(const BytecodeModule& module) {
+    std::string out;
+    out.reserve(render_bytecode(module).size());
+    out.append("ARCOFBC1", 8);
+    append_u32(out, static_cast<std::uint32_t>(module.version));
+    append_string(out, module.source_name);
+    append_u8(out, module.instruction_limit.has_value() ? 1 : 0);
+    append_u64(out, module.instruction_limit.value_or(0));
+
+    append_u32(out, static_cast<std::uint32_t>(module.diagnostics.size()));
+    for (const auto& diagnostic : module.diagnostics) append_string(out, diagnostic);
+
+    append_u32(out, static_cast<std::uint32_t>(module.constants.size()));
+    for (const auto& constant : module.constants) append_string(out, constant);
+
+    append_u32(out, static_cast<std::uint32_t>(module.functions.size()));
+    for (const auto& function : module.functions) {
+        append_string(out, function.name);
+        append_string(out, function.return_type);
+        append_u32(out, static_cast<std::uint32_t>(function.params.size()));
+        for (const auto& param : function.params) append_string(out, param);
+        append_u32(out, static_cast<std::uint32_t>(function.locals.size()));
+        for (const auto& local : function.locals) append_string(out, local);
+        append_u32(out, static_cast<std::uint32_t>(function.blocks.size()));
+        for (const auto& block : function.blocks) {
+            append_string(out, block.name);
+            append_u32(out, static_cast<std::uint32_t>(block.instructions.size()));
+            for (const auto& instruction : block.instructions) {
+                append_u8(out, static_cast<std::uint8_t>(instruction.op));
+                append_u32(out, static_cast<std::uint32_t>(instruction.operands.size()));
+                for (const auto& operand : instruction.operands) append_string(out, operand);
+            }
+        }
+    }
+    return out;
+}
+
+struct BinaryReader {
+    const std::string& input;
+    std::size_t offset = 0;
+
+    void require(std::size_t bytes) const {
+        if (bytes > input.size() || offset > input.size() - bytes) {
+            throw std::runtime_error("truncated binary bytecode capsule");
+        }
+    }
+
+    std::uint8_t u8() {
+        require(1);
+        return static_cast<std::uint8_t>(input[offset++]);
+    }
+
+    std::uint32_t u32() {
+        require(4);
+        std::uint32_t value = 0;
+        for (int shift = 0; shift < 32; shift += 8) {
+            value |= static_cast<std::uint32_t>(static_cast<unsigned char>(input[offset++])) << shift;
+        }
+        return value;
+    }
+
+    std::uint64_t u64() {
+        require(8);
+        std::uint64_t value = 0;
+        for (int shift = 0; shift < 64; shift += 8) {
+            value |= static_cast<std::uint64_t>(static_cast<unsigned char>(input[offset++])) << shift;
+        }
+        return value;
+    }
+
+    std::string string() {
+        const std::uint32_t size = u32();
+        require(size);
+        std::string value = input.substr(offset, size);
+        offset += size;
+        return value;
+    }
+};
+
+BytecodeModule parse_binary_bytecode(const std::string& binary) {
+    BinaryReader reader{binary};
+    reader.require(8);
+    if (binary.compare(0, 8, "ARCOFBC1") != 0) {
+        throw std::runtime_error("invalid binary bytecode capsule");
+    }
+    reader.offset = 8;
+
+    BytecodeModule module;
+    module.version = static_cast<int>(reader.u32());
+    module.source_name = reader.string();
+    const bool has_instruction_limit = reader.u8() != 0;
+    const std::uint64_t instruction_limit = reader.u64();
+    if (has_instruction_limit) module.instruction_limit = instruction_limit;
+
+    const std::uint32_t diagnostic_count = reader.u32();
+    module.diagnostics.reserve(diagnostic_count);
+    for (std::uint32_t i = 0; i < diagnostic_count; ++i) module.diagnostics.push_back(reader.string());
+
+    const std::uint32_t constant_count = reader.u32();
+    module.constants.reserve(constant_count);
+    for (std::uint32_t i = 0; i < constant_count; ++i) module.constants.push_back(reader.string());
+
+    const std::uint32_t function_count = reader.u32();
+    module.functions.reserve(function_count);
+    for (std::uint32_t i = 0; i < function_count; ++i) {
+        BytecodeFunction function;
+        function.name = reader.string();
+        function.return_type = reader.string();
+        const std::uint32_t param_count = reader.u32();
+        function.params.reserve(param_count);
+        for (std::uint32_t p = 0; p < param_count; ++p) function.params.push_back(reader.string());
+        const std::uint32_t local_count = reader.u32();
+        function.locals.reserve(local_count);
+        for (std::uint32_t l = 0; l < local_count; ++l) function.locals.push_back(reader.string());
+        const std::uint32_t block_count = reader.u32();
+        function.blocks.reserve(block_count);
+        for (std::uint32_t b = 0; b < block_count; ++b) {
+            BytecodeBlock block;
+            block.name = reader.string();
+            const std::uint32_t instruction_count = reader.u32();
+            block.instructions.reserve(instruction_count);
+            for (std::uint32_t n = 0; n < instruction_count; ++n) {
+                BytecodeInstruction instruction;
+                instruction.op = static_cast<BytecodeOp>(reader.u8());
+                const std::uint32_t operand_count = reader.u32();
+                instruction.operands.reserve(operand_count);
+                for (std::uint32_t o = 0; o < operand_count; ++o) instruction.operands.push_back(reader.string());
+                block.instructions.push_back(std::move(instruction));
+            }
+            function.blocks.push_back(std::move(block));
+        }
+        module.functions.push_back(std::move(function));
+    }
+    if (reader.offset != binary.size()) {
+        throw std::runtime_error("binary bytecode capsule has trailing data");
     }
     return module;
 }
@@ -3892,6 +4183,124 @@ Value parse_constant_value(const std::string& text) {
     return std::stod(text);
 }
 
+bool looks_like_inline_bytecode_value(const std::string& text) {
+    if (text.empty()) return false;
+    if (text == "nothing" || text == "null" || text == "true" || text == "false" || text == "[]") return true;
+    if (text.front() == '"') return true;
+    if (text.rfind("BITS \"", 0) == 0) return true;
+    if (text.front() >= '0' && text.front() <= '9') return true;
+    if ((text.front() == '-' || text.front() == '+') && text.size() > 1 && text[1] >= '0' && text[1] <= '9') return true;
+    return false;
+}
+
+std::size_t ref_index(const std::string& ref, char prefix, const std::string& what) {
+    if (ref.empty() || ref[0] != prefix) {
+        throw std::runtime_error("invalid bytecode " + what + " reference: " + ref);
+    }
+    std::size_t offset = 1;
+    if (prefix == '%' && offset < ref.size() && ref[offset] == 't') {
+        ++offset;
+    }
+    if (offset >= ref.size() || ref.find_first_not_of("0123456789", offset) != std::string::npos) {
+        throw std::runtime_error("invalid bytecode " + what + " reference: " + ref);
+    }
+    return static_cast<std::size_t>(std::stoul(ref.substr(offset)));
+}
+
+BytecodeOperand prepare_operand(const std::string& text) {
+    if (text.empty()) return {};
+    if (text[0] == '%') return {BytecodeOperandKind::Temp, ref_index(text, '%', "temporary"), Value()};
+    if (text.size() > 1 && text[0] == 'K' && text[1] >= '0' && text[1] <= '9') {
+        return {BytecodeOperandKind::Constant, ref_index(text, 'K', "constant"), Value()};
+    }
+    if (text.size() > 1 && text[0] == 'L' && text[1] >= '0' && text[1] <= '9') {
+        return {BytecodeOperandKind::Local, ref_index(text, 'L', "local"), Value()};
+    }
+    if (looks_like_inline_bytecode_value(text)) return {BytecodeOperandKind::InlineValue, 0, parse_constant_value(text)};
+    return {BytecodeOperandKind::Symbol, 0, Value()};
+}
+
+void prepare_bytecode_module(BytecodeModule& module) {
+    module.constant_values.clear();
+    module.constant_values.reserve(module.constants.size());
+    for (const auto& constant : module.constants) {
+        module.constant_values.push_back(parse_constant_value(constant));
+    }
+
+    module.function_indices.clear();
+    for (std::size_t function_index = 0; function_index < module.functions.size(); ++function_index) {
+        // Keep the historical first-match behavior used by find_function.
+        module.function_indices.emplace(module.functions[function_index].name, function_index);
+    }
+
+    for (auto& function : module.functions) {
+        function.targets.clear();
+        function.local_refs_by_base.clear();
+        function.param_local_refs.clear();
+        function.param_defaults.clear();
+        function.temp_count = 0;
+
+        for (std::size_t local_index = 0; local_index < function.locals.size(); ++local_index) {
+            function.local_refs_by_base.emplace(local_base_name(function.locals[local_index]), "L" + std::to_string(local_index));
+        }
+
+        function.param_local_refs.reserve(function.params.size());
+        function.param_defaults.reserve(function.params.size());
+        for (const auto& param : function.params) {
+            const auto found = function.local_refs_by_base.find(local_base_name(param));
+            function.param_local_refs.push_back(found == function.local_refs_by_base.end() ? std::string() : found->second);
+            const std::string default_text = param_default_text(param);
+            function.param_defaults.push_back(default_text.empty() ? std::optional<Value>() : std::optional<Value>(parse_constant_value(default_text)));
+        }
+
+        for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
+            function.targets[function.blocks[block_index].name] = BytecodeCursor{block_index, 0};
+            auto& block = function.blocks[block_index];
+            for (std::size_t instruction_index = 0; instruction_index < block.instructions.size(); ++instruction_index) {
+                auto& instruction = block.instructions[instruction_index];
+                instruction.prepared_operands.clear();
+                instruction.prepared_operands.reserve(instruction.operands.size());
+                for (const auto& operand : instruction.operands) {
+                    instruction.prepared_operands.push_back(prepare_operand(operand));
+                    if (!operand.empty() && operand[0] == '%') {
+                        function.temp_count = std::max(function.temp_count, ref_index(operand, '%', "temporary") + 1);
+                    }
+                }
+                if (instruction.op == BytecodeOp::Source && !instruction.operands.empty()) {
+                    instruction.prepared_source_line = std::stoi(instruction.operands.front());
+                }
+                if (instruction.op == BytecodeOp::Label && !instruction.operands.empty()) {
+                    function.targets[instruction.operands.front()] = BytecodeCursor{block_index, instruction_index + 1};
+                }
+            }
+        }
+
+        const auto prepared_target = [&](const std::string& name) {
+            const auto found = function.targets.find(name);
+            if (found == function.targets.end()) {
+                throw std::runtime_error("unresolved bytecode target: " + name);
+            }
+            return found->second;
+        };
+        for (auto& block : function.blocks) {
+            for (auto& instruction : block.instructions) {
+                instruction.prepared_targets.clear();
+                if (instruction.op == BytecodeOp::Jump && !instruction.operands.empty()) {
+                    instruction.prepared_targets.push_back(prepared_target(instruction.operands.front()));
+                } else if (instruction.op == BytecodeOp::Branch && instruction.operands.size() >= 3) {
+                    instruction.prepared_targets.push_back(prepared_target(instruction.operands[1]));
+                    instruction.prepared_targets.push_back(prepared_target(instruction.operands[2]));
+                } else if (instruction.op == BytecodeOp::BranchLocalLocal && instruction.operands.size() >= 5) {
+                    instruction.prepared_targets.push_back(prepared_target(instruction.operands[3]));
+                    instruction.prepared_targets.push_back(prepared_target(instruction.operands[4]));
+                } else if (instruction.op == BytecodeOp::TryBegin && !instruction.operands.empty()) {
+                    instruction.prepared_targets.push_back(prepared_target(instruction.operands.front()));
+                }
+            }
+        }
+    }
+}
+
 long long value_to_int(const Value& value) {
     return static_cast<long long>(value.as_number());
 }
@@ -4010,41 +4419,230 @@ Value eval_binary(const std::string& op, const Value& left, const Value& right) 
     throw std::runtime_error("unsupported bytecode binary operator: " + op);
 }
 
-struct BytecodeFrame {
-    std::unordered_map<std::string, Value> temps;
-    std::unordered_map<std::string, Value> locals;
+struct BytecodeSlot {
+    enum class Kind {
+        Undefined,
+        Value,
+        Number,
+        Boolean,
+    };
+    Kind kind = Kind::Undefined;
+    Value value;
+    double number = 0.0;
+    bool boolean = false;
 };
+
+struct BytecodeFrame {
+    std::vector<BytecodeSlot> temps;
+    std::vector<BytecodeSlot> locals;
+};
+
+BytecodeSlot slot_from_value(Value value) {
+    BytecodeSlot slot;
+    if (value.is_number()) {
+        slot.kind = BytecodeSlot::Kind::Number;
+        slot.number = value.as_number();
+    } else if (value.is_bool()) {
+        slot.kind = BytecodeSlot::Kind::Boolean;
+        slot.boolean = value.truthy();
+    } else {
+        slot.kind = BytecodeSlot::Kind::Value;
+        slot.value = std::move(value);
+    }
+    return slot;
+}
+
+Value slot_value(const BytecodeSlot& slot, const std::string& diagnostic_ref) {
+    switch (slot.kind) {
+        case BytecodeSlot::Kind::Number:
+            return slot.number;
+        case BytecodeSlot::Kind::Boolean:
+            return slot.boolean;
+        case BytecodeSlot::Kind::Value:
+            return slot.value;
+        case BytecodeSlot::Kind::Undefined:
+            throw std::runtime_error("undefined bytecode value: " + diagnostic_ref);
+    }
+    return Value();
+}
+
+std::optional<double> slot_number(const BytecodeSlot& slot) {
+    if (slot.kind == BytecodeSlot::Kind::Number) return slot.number;
+    if (slot.kind == BytecodeSlot::Kind::Boolean) return slot.boolean ? 1.0 : 0.0;
+    return std::nullopt;
+}
+
+bool slot_truthy(const BytecodeSlot& slot, const std::string& diagnostic_ref) {
+    if (slot.kind == BytecodeSlot::Kind::Number) return slot.number != 0.0;
+    if (slot.kind == BytecodeSlot::Kind::Boolean) return slot.boolean;
+    return slot_value(slot, diagnostic_ref).truthy();
+}
+
+std::size_t local_index_from_ref(const std::string& ref) {
+    return ref_index(ref, 'L', "local");
+}
+
+Value temp_value(const BytecodeFrame& frame, std::size_t index, const std::string& ref) {
+    if (index >= frame.temps.size() || frame.temps[index].kind == BytecodeSlot::Kind::Undefined) {
+        throw std::runtime_error("undefined bytecode temporary: " + ref);
+    }
+    return slot_value(frame.temps[index], ref);
+}
+
+void set_temp(BytecodeFrame& frame, const BytecodeOperand& target, Value value, const std::string& ref) {
+    if (target.kind != BytecodeOperandKind::Temp) {
+        throw std::runtime_error("invalid bytecode temporary target: " + ref);
+    }
+    if (target.index >= frame.temps.size()) {
+        frame.temps.resize(target.index + 1);
+    }
+    frame.temps[target.index] = slot_from_value(std::move(value));
+}
+
+void set_temp_slot(BytecodeFrame& frame, const BytecodeOperand& target, BytecodeSlot slot, const std::string& ref) {
+    if (target.kind != BytecodeOperandKind::Temp) {
+        throw std::runtime_error("invalid bytecode temporary target: " + ref);
+    }
+    if (target.index >= frame.temps.size()) {
+        frame.temps.resize(target.index + 1);
+    }
+    frame.temps[target.index] = std::move(slot);
+}
+
+void set_temp_number(BytecodeFrame& frame, const BytecodeOperand& target, double value, const std::string& ref) {
+    BytecodeSlot slot;
+    slot.kind = BytecodeSlot::Kind::Number;
+    slot.number = value;
+    set_temp_slot(frame, target, std::move(slot), ref);
+}
+
+void set_temp_bool(BytecodeFrame& frame, const BytecodeOperand& target, bool value, const std::string& ref) {
+    BytecodeSlot slot;
+    slot.kind = BytecodeSlot::Kind::Boolean;
+    slot.boolean = value;
+    set_temp_slot(frame, target, std::move(slot), ref);
+}
+
+Value local_value(const BytecodeFunction& function, const BytecodeFrame& frame, std::size_t index, const std::string& ref) {
+    if (index >= function.locals.size()) {
+        throw std::runtime_error("local index out of range: " + ref);
+    }
+    if (index < frame.locals.size() && frame.locals[index].kind != BytecodeSlot::Kind::Undefined) {
+        return slot_value(frame.locals[index], ref);
+    }
+    throw std::runtime_error("undefined bytecode local: " + function.locals[index]);
+}
+
+void set_local(const BytecodeFunction& function, BytecodeFrame& frame, std::size_t index, Value value, const std::string& ref) {
+    if (index >= function.locals.size()) {
+        throw std::runtime_error("local index out of range: " + ref);
+    }
+    if (index >= frame.locals.size()) {
+        frame.locals.resize(index + 1);
+    }
+    frame.locals[index] = slot_from_value(std::move(value));
+}
+
+void set_local_slot(const BytecodeFunction& function, BytecodeFrame& frame, std::size_t index, BytecodeSlot slot, const std::string& ref) {
+    if (index >= function.locals.size()) {
+        throw std::runtime_error("local index out of range: " + ref);
+    }
+    if (index >= frame.locals.size()) {
+        frame.locals.resize(index + 1);
+    }
+    frame.locals[index] = std::move(slot);
+}
 
 Value operand_value(const BytecodeModule& module, const BytecodeFunction& function, const BytecodeFrame& frame, const std::string& operand) {
     if (operand.empty()) {
         return Value();
     }
     if (operand[0] == '%') {
-        const auto found = frame.temps.find(operand);
-        if (found == frame.temps.end()) {
-            throw std::runtime_error("undefined bytecode temporary: " + operand);
-        }
-        return found->second;
+        return temp_value(frame, ref_index(operand, '%', "temporary"), operand);
     }
     if (operand[0] == 'K') {
         const std::size_t index = static_cast<std::size_t>(std::stoul(operand.substr(1)));
         if (index >= module.constants.size()) {
             throw std::runtime_error("constant index out of range: " + operand);
         }
+        if (index < module.constant_values.size()) {
+            return module.constant_values[index];
+        }
         return parse_constant_value(module.constants[index]);
     }
     if (operand[0] == 'L') {
-        const auto found = frame.locals.find(operand);
-        if (found != frame.locals.end()) {
-            return found->second;
-        }
         const std::size_t index = static_cast<std::size_t>(std::stoul(operand.substr(1)));
         if (index >= function.locals.size()) {
             throw std::runtime_error("local index out of range: " + operand);
         }
+        if (index < frame.locals.size() && frame.locals[index].kind != BytecodeSlot::Kind::Undefined) {
+            return slot_value(frame.locals[index], operand);
+        }
         throw std::runtime_error("undefined bytecode local: " + function.locals[index]);
     }
     return parse_constant_value(operand);
+}
+
+BytecodeSlot operand_slot(const BytecodeModule& module, const BytecodeFunction& function, const BytecodeFrame& frame,
+                          const BytecodeOperand& operand, const std::string& text) {
+    switch (operand.kind) {
+        case BytecodeOperandKind::Temp:
+            if (operand.index >= frame.temps.size() || frame.temps[operand.index].kind == BytecodeSlot::Kind::Undefined) {
+                throw std::runtime_error("undefined bytecode temporary: " + text);
+            }
+            return frame.temps[operand.index];
+        case BytecodeOperandKind::Constant:
+            if (operand.index >= module.constant_values.size()) {
+                throw std::runtime_error("constant index out of range: " + text);
+            }
+            return slot_from_value(module.constant_values[operand.index]);
+        case BytecodeOperandKind::Local:
+            if (operand.index >= function.locals.size()) {
+                throw std::runtime_error("local index out of range: " + text);
+            }
+            if (operand.index >= frame.locals.size() || frame.locals[operand.index].kind == BytecodeSlot::Kind::Undefined) {
+                throw std::runtime_error("undefined bytecode local: " + function.locals[operand.index]);
+            }
+            return frame.locals[operand.index];
+        case BytecodeOperandKind::InlineValue:
+            return slot_from_value(operand.value);
+        case BytecodeOperandKind::Empty:
+        case BytecodeOperandKind::Symbol:
+            break;
+    }
+    throw std::runtime_error("bytecode operand is not a prepared value: " + text);
+}
+
+Value operand_value(const BytecodeModule& module, const BytecodeFunction& function, const BytecodeFrame& frame,
+                    const BytecodeOperand& operand, const std::string& text) {
+    return slot_value(operand_slot(module, function, frame, operand, text), text);
+}
+
+std::optional<double> operand_number(const BytecodeModule& module, const BytecodeFunction& function, const BytecodeFrame& frame,
+                                     const BytecodeOperand& operand, const std::string& text) {
+    return slot_number(operand_slot(module, function, frame, operand, text));
+}
+
+bool eval_numeric_comparison(const std::string& op, double left, double right) {
+    if (op == "<") return left < right;
+    if (op == "<=") return left <= right;
+    if (op == ">") return left > right;
+    if (op == ">=") return left >= right;
+    if (op == "==" || op == "=") return left == right;
+    if (op == "!=") return left != right;
+    throw std::runtime_error("unsupported fused numeric comparison: " + op);
+}
+
+double eval_numeric_arithmetic(const std::string& op, double left, double right) {
+    if (op == "+") return left + right;
+    if (op == "-") return left - right;
+    if (op == "*") return left * right;
+    if (op == "/") return left / right;
+    if (op == "MOD") {
+        if (right == 0.0) throw std::runtime_error("MOD divisor cannot be zero");
+        return std::fmod(left, right);
+    }
+    throw std::runtime_error("unsupported fused numeric arithmetic: " + op);
 }
 
 std::string local_name(const BytecodeFunction& function, const std::string& ref) {
@@ -4059,6 +4657,10 @@ std::string local_name(const BytecodeFunction& function, const std::string& ref)
 }
 
 const BytecodeFunction* find_function(const BytecodeModule& module, const std::string& name) {
+    const auto indexed = module.function_indices.find(name);
+    if (indexed != module.function_indices.end() && indexed->second < module.functions.size()) {
+        return &module.functions[indexed->second];
+    }
     for (const auto& function : module.functions) {
         if (function.name == name) {
             return &function;
@@ -4136,62 +4738,44 @@ void assign_indexed(Value& target, const std::vector<Value>& indexes, std::size_
     throw std::runtime_error("value is not index-assignable");
 }
 
-Value execute_function(const BytecodeModule& module, const BytecodeFunction& function, Runtime& runtime, const std::vector<Value>& args) {
+Value execute_function(const BytecodeModule& module, const BytecodeFunction& function, Runtime& runtime, const std::vector<Value>& args,
+                       bool count_instructions) {
     if (function.blocks.empty()) {
         throw std::runtime_error(function.name + " has no bytecode blocks");
     }
 
-    struct Cursor {
-        std::size_t block = 0;
-        std::size_t instruction = 0;
-    };
     struct TryHandler {
-        Cursor catch_cursor;
+        BytecodeCursor catch_cursor;
         std::string error_name;
     };
 
-    std::unordered_map<std::string, Cursor> targets;
-    for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
-        targets[function.blocks[block_index].name] = Cursor{block_index, 0};
-        const auto& block = function.blocks[block_index];
-        for (std::size_t instruction_index = 0; instruction_index < block.instructions.size(); ++instruction_index) {
-            const auto& instruction = block.instructions[instruction_index];
-            if (instruction.op == BytecodeOp::Label && !instruction.operands.empty()) {
-                targets[instruction.operands.front()] = Cursor{block_index, instruction_index + 1};
-            }
-        }
-    }
-
     const auto jump_to = [&](const std::string& target) {
-        const auto found = targets.find(target);
-        if (found == targets.end()) {
+        const auto found = function.targets.find(target);
+        if (found == function.targets.end()) {
             throw std::runtime_error("unresolved bytecode target: " + target);
         }
         return found->second;
     };
 
     BytecodeFrame frame;
-    for (std::size_t i = 0; i < function.params.size(); ++i) {
-        for (std::size_t local_index = 0; local_index < function.locals.size(); ++local_index) {
-            if (local_base_name(function.locals[local_index]) == local_base_name(function.params[i])) {
-                if (i < args.size()) {
-                    frame.locals["L" + std::to_string(local_index)] = args[i];
-                } else {
-                    // Caller omitted this argument. Fall back to the parameter's own default
-                    // expression (rendered into the params descriptor by parameter_text) instead
-                    // of leaving the local unbound, which previously surfaced as an opaque
-                    // "undefined bytecode local" failure the first time the body read it.
-                    const std::string default_text = param_default_text(function.params[i]);
-                    if (!default_text.empty()) {
-                        frame.locals["L" + std::to_string(local_index)] = parse_constant_value(default_text);
-                    }
-                }
-                break;
-            }
+    frame.temps.resize(function.temp_count);
+    frame.locals.resize(function.locals.size());
+    for (std::size_t i = 0; i < function.param_local_refs.size(); ++i) {
+        if (function.param_local_refs[i].empty()) {
+            continue;
+        }
+        const std::size_t local_index = local_index_from_ref(function.param_local_refs[i]);
+        if (local_index >= frame.locals.size()) {
+            throw std::runtime_error("local index out of range: " + function.param_local_refs[i]);
+        }
+        if (i < args.size()) {
+            set_local(function, frame, local_index, args[i], function.param_local_refs[i]);
+        } else if (i < function.param_defaults.size() && function.param_defaults[i].has_value()) {
+            set_local(function, frame, local_index, *function.param_defaults[i], function.param_local_refs[i]);
         }
     }
 
-    Cursor cursor{0, 0};
+    BytecodeCursor cursor{0, 0};
     std::vector<TryHandler> try_stack;
     int current_source_line = 0;
     while (cursor.block < function.blocks.size()) {
@@ -4200,77 +4784,105 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
             return Value();
         }
         const BytecodeInstruction& instruction = block.instructions[cursor.instruction++];
-        runtime.tick();
+        const auto& prepared = instruction.prepared_operands;
+        const auto value_at = [&](std::size_t index) {
+            return operand_value(module, function, frame, prepared[index], instruction.operands[index]);
+        };
+        const auto slot_at = [&](std::size_t index) {
+            return operand_slot(module, function, frame, prepared[index], instruction.operands[index]);
+        };
+        const auto number_at = [&](std::size_t index) {
+            return operand_number(module, function, frame, prepared[index], instruction.operands[index]);
+        };
+        const auto set_temp_at = [&](std::size_t index, Value value) {
+            set_temp(frame, prepared[index], std::move(value), instruction.operands[index]);
+        };
+        const auto set_temp_slot_at = [&](std::size_t index, BytecodeSlot slot) {
+            set_temp_slot(frame, prepared[index], std::move(slot), instruction.operands[index]);
+        };
+        const auto local_index_at = [&](std::size_t index) {
+            if (index < prepared.size() && prepared[index].kind == BytecodeOperandKind::Local) return prepared[index].index;
+            return local_index_from_ref(instruction.operands[index]);
+        };
+        if (count_instructions) runtime.tick();
         try {
             switch (instruction.op) {
             case BytecodeOp::Label:
                 break;
             case BytecodeOp::Source:
-                if (!instruction.operands.empty()) current_source_line = std::stoi(instruction.operands.front());
+                current_source_line = instruction.prepared_source_line;
                 break;
             case BytecodeOp::Const:
-                frame.temps[instruction.operands[0]] = operand_value(module, function, frame, instruction.operands[1]);
+                set_temp_slot_at(0, slot_at(1));
                 break;
             case BytecodeOp::Load:
-                frame.temps[instruction.operands[0]] = operand_value(module, function, frame, instruction.operands[1]);
+                set_temp_slot_at(0, slot_at(1));
                 break;
             case BytecodeOp::Store: {
-                const Value value = operand_value(module, function, frame, instruction.operands[1]);
-                frame.locals[instruction.operands[0]] = value;
-                runtime.set_global(local_name(function, instruction.operands[0]), value);
+                set_local_slot(function, frame, local_index_at(0), slot_at(1), instruction.operands[0]);
                 break;
             }
             case BytecodeOp::StoreIndex: {
                 if (instruction.operands.size() < 3) {
                     throw std::runtime_error("STORE_INDEX expects a target, at least one index, and a value");
                 }
-                Value target = operand_value(module, function, frame, instruction.operands[0]);
+                Value target = value_at(0);
                 std::vector<Value> indexes;
                 for (std::size_t i = 1; i + 1 < instruction.operands.size(); ++i) {
-                    indexes.push_back(operand_value(module, function, frame, instruction.operands[i]));
+                    indexes.push_back(value_at(i));
                 }
-                Value value = operand_value(module, function, frame, instruction.operands.back());
+                Value value = value_at(instruction.operands.size() - 1);
                 assign_indexed(target, indexes, 0, value);
-                frame.locals[instruction.operands[0]] = target;
-                runtime.set_global(local_name(function, instruction.operands[0]), target);
+                set_local(function, frame, local_index_at(0), target, instruction.operands[0]);
                 break;
             }
             case BytecodeOp::StoreSlice: {
                 if (instruction.operands.size() != 4) throw std::runtime_error("STORE_SLICE expects four operands");
-                Value target = operand_value(module, function, frame, instruction.operands[0]);
-                const Value first = operand_value(module, function, frame, instruction.operands[1]);
-                const Value last = operand_value(module, function, frame, instruction.operands[2]);
-                const Value replacement = operand_value(module, function, frame, instruction.operands[3]);
+                Value target = value_at(0);
+                const Value first = value_at(1);
+                const Value last = value_at(2);
+                const Value replacement = value_at(3);
                 const auto start = first.is_null() ? std::nullopt
                     : std::optional<long long>(exact_slice_integer(first.as_number(), "start"));
                 const auto end = last.is_null() ? std::nullopt
                     : std::optional<long long>(exact_slice_integer(last.as_number(), "end"));
                 target = replace_array_slice(target, start, end, replacement);
-                frame.locals[instruction.operands[0]] = target;
-                runtime.set_global(local_name(function, instruction.operands[0]), target);
+                set_local(function, frame, local_index_at(0), target, instruction.operands[0]);
                 break;
             }
             case BytecodeOp::Unary:
-                frame.temps[instruction.operands[0]] = eval_unary(instruction.operands[1], operand_value(module, function, frame, instruction.operands[2]));
+                set_temp_at(0, eval_unary(instruction.operands[1], value_at(2)));
                 break;
             case BytecodeOp::Binary:
-                frame.temps[instruction.operands[0]] = eval_binary(instruction.operands[1], operand_value(module, function, frame, instruction.operands[2]),
-                                                                    operand_value(module, function, frame, instruction.operands[3]));
+                if (const auto left = number_at(2), right = number_at(3); left.has_value() && right.has_value()) {
+                    const std::string& op = instruction.operands[1];
+                    if (op == "+") { set_temp_number(frame, prepared[0], *left + *right, instruction.operands[0]); break; }
+                    if (op == "-") { set_temp_number(frame, prepared[0], *left - *right, instruction.operands[0]); break; }
+                    if (op == "*") { set_temp_number(frame, prepared[0], *left * *right, instruction.operands[0]); break; }
+                    if (op == "/") { set_temp_number(frame, prepared[0], *left / *right, instruction.operands[0]); break; }
+                    if (op == "<") { set_temp_bool(frame, prepared[0], *left < *right, instruction.operands[0]); break; }
+                    if (op == "<=") { set_temp_bool(frame, prepared[0], *left <= *right, instruction.operands[0]); break; }
+                    if (op == ">") { set_temp_bool(frame, prepared[0], *left > *right, instruction.operands[0]); break; }
+                    if (op == ">=") { set_temp_bool(frame, prepared[0], *left >= *right, instruction.operands[0]); break; }
+                    if (op == "==" || op == "=") { set_temp_bool(frame, prepared[0], *left == *right, instruction.operands[0]); break; }
+                    if (op == "!=") { set_temp_bool(frame, prepared[0], *left != *right, instruction.operands[0]); break; }
+                }
+                set_temp_at(0, eval_binary(instruction.operands[1], value_at(2), value_at(3)));
                 break;
             case BytecodeOp::CallValue: {
                 std::vector<Value> args;
                 for (std::size_t i = 2; i < instruction.operands.size(); ++i) {
-                    args.push_back(operand_value(module, function, frame, instruction.operands[i]));
+                    args.push_back(value_at(i));
                 }
                 std::optional<Value> callable_target;
-                for (std::size_t local_index = 0; local_index < function.locals.size(); ++local_index) {
-                    if (local_base_name(function.locals[local_index]) == instruction.operands[1]) {
-                        const std::string ref = "L" + std::to_string(local_index);
-                        const auto found = frame.locals.find(ref);
-                        if (found != frame.locals.end() && runtime.is_callable(found->second)) {
-                            callable_target = found->second;
+                const auto local_ref = function.local_refs_by_base.find(instruction.operands[1]);
+                if (local_ref != function.local_refs_by_base.end()) {
+                    const std::size_t local_index = local_index_from_ref(local_ref->second);
+                    if (local_index < frame.locals.size() && frame.locals[local_index].kind != BytecodeSlot::Kind::Undefined) {
+                        Value callable_value = slot_value(frame.locals[local_index], local_ref->second);
+                        if (runtime.is_callable(callable_value)) {
+                            callable_target = std::move(callable_value);
                         }
-                        break;
                     }
                 }
                 if (!callable_target.has_value() && runtime.has_global(instruction.operands[1]) &&
@@ -4287,22 +4899,22 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                         args.insert(args.begin(), *descriptor.receiver);
                     }
                     if (const BytecodeFunction* user_function = find_function(module, resolved_name)) {
-                        frame.temps[instruction.operands[0]] = execute_function(module, *user_function, runtime, args);
+                        set_temp_at(0, execute_function(module, *user_function, runtime, args, count_instructions));
                     } else {
-                        frame.temps[instruction.operands[0]] = runtime.call_callable(callable,
-                            descriptor.receiver.has_value() ? std::vector<Value>(args.begin() + 1, args.end()) : args);
+                        set_temp_at(0, runtime.call_callable(callable,
+                            descriptor.receiver.has_value() ? std::vector<Value>(args.begin() + 1, args.end()) : args));
                     }
                 } else if (const BytecodeFunction* user_function = find_function(module, instruction.operands[1])) {
-                    frame.temps[instruction.operands[0]] = execute_function(module, *user_function, runtime, args);
+                    set_temp_at(0, execute_function(module, *user_function, runtime, args, count_instructions));
                 } else {
-                    frame.temps[instruction.operands[0]] = runtime.call_host_function(instruction.operands[1], args);
+                    set_temp_at(0, runtime.call_host_function(instruction.operands[1], args));
                 }
                 break;
             }
             case BytecodeOp::CallRuntime: {
                 std::vector<Value> args;
                 for (std::size_t i = 1; i < instruction.operands.size(); ++i) {
-                    args.push_back(operand_value(module, function, frame, instruction.operands[i]));
+                    args.push_back(value_at(i));
                 }
                 if (instruction.operands[0] == "Runtime.Print") {
                     if (!args.empty()) {
@@ -4317,17 +4929,17 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
             case BytecodeOp::Array: {
                 Value::Array values;
                 for (std::size_t i = 1; i < instruction.operands.size(); ++i) {
-                    values.push_back(operand_value(module, function, frame, instruction.operands[i]));
+                    values.push_back(value_at(i));
                 }
-                frame.temps[instruction.operands[0]] = Value(std::move(values));
+                set_temp_at(0, Value(std::move(values)));
                 break;
             }
             case BytecodeOp::Tuple: {
                 Value::Array values;
                 for (std::size_t i = 1; i < instruction.operands.size(); ++i) {
-                    values.push_back(operand_value(module, function, frame, instruction.operands[i]));
+                    values.push_back(value_at(i));
                 }
-                frame.temps[instruction.operands[0]] = Value::tuple(std::move(values));
+                set_temp_at(0, Value::tuple(std::move(values)));
                 break;
             }
             case BytecodeOp::Object: {
@@ -4343,35 +4955,32 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                     }
                     values[key] = operand_value(module, function, frame, instruction.operands[i].substr(split + 1));
                 }
-                frame.temps[instruction.operands[0]] = Value(std::move(values));
+                set_temp_at(0, Value(std::move(values)));
                 break;
             }
             case BytecodeOp::Index:
-                frame.temps[instruction.operands[0]] =
-                    index_value(operand_value(module, function, frame, instruction.operands[1]), operand_value(module, function, frame, instruction.operands[2]));
+                set_temp_at(0, index_value(value_at(1), value_at(2)));
                 break;
             case BytecodeOp::Slice: {
                 if (instruction.operands.size() != 5) throw std::runtime_error("SLICE expects five operands");
-                const Value first = operand_value(module, function, frame, instruction.operands[2]);
-                const Value last = operand_value(module, function, frame, instruction.operands[3]);
-                const Value stride = operand_value(module, function, frame, instruction.operands[4]);
+                const Value first = value_at(2);
+                const Value last = value_at(3);
+                const Value stride = value_at(4);
                 const auto start = first.is_null() ? std::nullopt
                     : std::optional<long long>(exact_slice_integer(first.as_number(), "start"));
                 const auto end = last.is_null() ? std::nullopt
                     : std::optional<long long>(exact_slice_integer(last.as_number(), "end"));
                 const long long step = stride.is_null() ? 1 : exact_slice_integer(stride.as_number(), "step");
-                frame.temps[instruction.operands[0]] = slice_value(
-                    operand_value(module, function, frame, instruction.operands[1]), start, end, step);
+                set_temp_at(0, slice_value(value_at(1), start, end, step));
                 break;
             }
             case BytecodeOp::Copy:
                 if (instruction.operands.size() != 2) throw std::runtime_error("COPY expects two operands");
-                frame.temps[instruction.operands[0]] = shallow_copy_value(
-                    operand_value(module, function, frame, instruction.operands[1]));
+                set_temp_at(0, shallow_copy_value(value_at(1)));
                 break;
             case BytecodeOp::Destructure: {
                 if (instruction.operands.size() < 2) throw std::runtime_error("DESTRUCTURE expects a source and targets");
-                const Value source = operand_value(module, function, frame, instruction.operands[0]);
+                const Value source = value_at(0);
                 if (!source.is_array() && !source.is_tuple()) {
                     throw std::runtime_error("destructuring expects an array or tuple with arity " +
                                              std::to_string(instruction.operands.size() - 1));
@@ -4383,8 +4992,7 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 }
                 const Value::Array captured(elements.begin(), elements.end());
                 for (std::size_t i = 1; i < instruction.operands.size(); ++i) {
-                    frame.locals[instruction.operands[i]] = captured[i - 1];
-                    runtime.set_global(local_name(function, instruction.operands[i]), captured[i - 1]);
+                    set_local(function, frame, local_index_at(i), captured[i - 1], instruction.operands[i]);
                 }
                 break;
             }
@@ -4393,25 +5001,86 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 const std::string name = instruction.operands[1];
                 const auto dot = name.find('.');
                 if (dot != std::string::npos && runtime.has_global(name.substr(0, dot))) {
-                    frame.temps[instruction.operands[0]] = runtime.make_callable(
-                        name, runtime.get_global(name.substr(0, dot)), false);
+                    set_temp_at(0, runtime.make_callable(name, runtime.get_global(name.substr(0, dot)), false));
                 } else {
                     if (!find_function(module, name) && !runtime.has_function(name)) {
                         throw std::runtime_error("ADDRESSOF cannot resolve callable: " + name);
                     }
-                    frame.temps[instruction.operands[0]] = runtime.make_callable(name, std::nullopt, false);
+                    set_temp_at(0, runtime.make_callable(name, std::nullopt, false));
+                }
+                break;
+            }
+            case BytecodeOp::StoreConst:
+                if (instruction.operands.size() != 2) throw std::runtime_error("STORE_CONST expects local and constant operands");
+                set_local_slot(function, frame, local_index_at(0), slot_at(1), instruction.operands[0]);
+                break;
+            case BytecodeOp::BinaryLocalLocal: {
+                if (instruction.operands.size() != 4) throw std::runtime_error("BINARY_LOCAL_LOCAL expects local, op, local, local");
+                const auto left = number_at(2);
+                const auto right = number_at(3);
+                if (left.has_value() && right.has_value()) {
+                    const std::string& op = instruction.operands[1];
+                    if (op == "<" || op == "<=" || op == ">" || op == ">=" || op == "==" || op == "=" || op == "!=") {
+                        BytecodeSlot result;
+                        result.kind = BytecodeSlot::Kind::Boolean;
+                        result.boolean = eval_numeric_comparison(op, *left, *right);
+                        set_local_slot(function, frame, local_index_at(0), std::move(result), instruction.operands[0]);
+                    } else {
+                        BytecodeSlot result;
+                        result.kind = BytecodeSlot::Kind::Number;
+                        result.number = eval_numeric_arithmetic(op, *left, *right);
+                        set_local_slot(function, frame, local_index_at(0), std::move(result), instruction.operands[0]);
+                    }
+                    break;
+                }
+                set_local(function, frame, local_index_at(0), eval_binary(instruction.operands[1], value_at(2), value_at(3)), instruction.operands[0]);
+                break;
+            }
+            case BytecodeOp::BinaryLocalConst: {
+                if (instruction.operands.size() != 4) throw std::runtime_error("BINARY_LOCAL_CONST expects local, op, local, constant");
+                const auto left = number_at(2);
+                const auto right = number_at(3);
+                if (left.has_value() && right.has_value()) {
+                    BytecodeSlot result;
+                    result.kind = BytecodeSlot::Kind::Number;
+                    result.number = eval_numeric_arithmetic(instruction.operands[1], *left, *right);
+                    set_local_slot(function, frame, local_index_at(0), std::move(result), instruction.operands[0]);
+                    break;
+                }
+                set_local(function, frame, local_index_at(0), eval_binary(instruction.operands[1], value_at(2), value_at(3)), instruction.operands[0]);
+                break;
+            }
+            case BytecodeOp::BranchLocalLocal: {
+                if (instruction.operands.size() != 5) throw std::runtime_error("BRANCH_LOCAL_LOCAL expects op, local, local, true, false");
+                const auto left = number_at(1);
+                const auto right = number_at(2);
+                bool condition = false;
+                if (left.has_value() && right.has_value()) {
+                    condition = eval_numeric_comparison(instruction.operands[0], *left, *right);
+                } else {
+                    condition = eval_binary(instruction.operands[0], value_at(1), value_at(2)).truthy();
+                }
+                if (instruction.prepared_targets.size() >= 2) {
+                    cursor = condition ? instruction.prepared_targets[0] : instruction.prepared_targets[1];
+                } else {
+                    cursor = condition ? jump_to(instruction.operands[3]) : jump_to(instruction.operands[4]);
                 }
                 break;
             }
             case BytecodeOp::Jump:
-                cursor = jump_to(instruction.operands.front());
+                cursor = instruction.prepared_targets.empty() ? jump_to(instruction.operands.front()) : instruction.prepared_targets.front();
                 break;
             case BytecodeOp::Branch:
-                cursor = operand_value(module, function, frame, instruction.operands[0]).truthy() ? jump_to(instruction.operands[1])
-                                                                                                   : jump_to(instruction.operands[2]);
+                if (instruction.prepared_targets.size() >= 2) {
+                    cursor = slot_truthy(slot_at(0), instruction.operands[0]) ? instruction.prepared_targets[0] : instruction.prepared_targets[1];
+                } else {
+                    cursor = slot_truthy(slot_at(0), instruction.operands[0]) ? jump_to(instruction.operands[1]) : jump_to(instruction.operands[2]);
+                }
                 break;
             case BytecodeOp::TryBegin:
-                try_stack.push_back(TryHandler{jump_to(instruction.operands.front()), instruction.operands.size() > 1 ? instruction.operands[1] : ""});
+                try_stack.push_back(TryHandler{
+                    instruction.prepared_targets.empty() ? jump_to(instruction.operands.front()) : instruction.prepared_targets.front(),
+                    instruction.operands.size() > 1 ? instruction.operands[1] : ""});
                 break;
             case BytecodeOp::TryEnd:
                 if (!try_stack.empty()) {
@@ -4420,7 +5089,7 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 break;
             case BytecodeOp::Throw: {
                 if (instruction.operands.size() != 1) throw std::runtime_error("THROW expects one value");
-                const Value message = operand_value(module, function, frame, instruction.operands.front());
+                const Value message = value_at(0);
                 if (!message.is_string()) {
                     std::string type = "Object";
                     if (message.is_null()) type = "Null";
@@ -4437,7 +5106,7 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
             case BytecodeOp::DeclareInterface:
                 break;
             case BytecodeOp::Return:
-                return instruction.operands.size() > 1 ? operand_value(module, function, frame, instruction.operands[1]) : Value();
+                return instruction.operands.size() > 1 ? value_at(1) : Value();
             case BytecodeOp::Unsupported:
                 if (!instruction.operands.empty() &&
                     (instruction.operands.back().rfind("PORT.", 0) == 0 || instruction.operands.back() == "CPU.Pause")) {
@@ -4466,7 +5135,7 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 bool stored_local = false;
                 for (std::size_t local_index = 0; local_index < function.locals.size(); ++local_index) {
                     if (function.locals[local_index] == handler.error_name) {
-                        frame.locals["L" + std::to_string(local_index)] = error_value;
+                        set_local(function, frame, local_index, error_value, "L" + std::to_string(local_index));
                         stored_local = true;
                         break;
                     }
@@ -4481,7 +5150,10 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
     return Value();
 }
 
-Value execute_bytecode(const BytecodeModule& module, Runtime& runtime) {
+Value execute_bytecode(BytecodeModule& module, Runtime& runtime, bool count_instructions = true) {
+    if (module.constant_values.size() != module.constants.size() || module.function_indices.empty()) {
+        prepare_bytecode_module(module);
+    }
     if (module.functions.empty()) {
         throw std::runtime_error("bytecode module has no functions");
     }
@@ -4492,12 +5164,12 @@ Value execute_bytecode(const BytecodeModule& module, Runtime& runtime) {
     for (const auto& function : module.functions) {
         if (function.name == "Main") continue;
         const BytecodeFunction* callable_function = &function;
-        runtime.register_function(function.name, [&module, &runtime, callable_function](const std::vector<Value>& args) {
-            return execute_function(module, *callable_function, runtime, args);
+        runtime.register_function(function.name, [&module, &runtime, callable_function, count_instructions](const std::vector<Value>& args) {
+            return execute_function(module, *callable_function, runtime, args, count_instructions);
         });
     }
     runtime.prepare_execution(module.instruction_limit);
-    return execute_function(module, *main, runtime, {});
+    return execute_function(module, *main, runtime, {}, count_instructions);
 }
 
 std::filesystem::path source_root_path() {
@@ -4582,6 +5254,13 @@ std::vector<std::string> native_link_dependencies(const std::filesystem::path& b
                 continue;
             }
         }
+        if (!word.empty() && word[0] != '-') {
+            const std::filesystem::path dependency(word);
+            if (!dependency.is_absolute()) {
+                deps.push_back((build_dir / dependency).lexically_normal().string());
+                continue;
+            }
+        }
         deps.push_back(word);
     }
     return deps;
@@ -4612,7 +5291,7 @@ bool is_elf64_file(const std::filesystem::path& path) {
 }
 #endif
 
-Result build_native_bytecode(const std::string& bytecode, const std::string& output_path,
+Result build_native_bytecode(const std::string& bytecode_binary, const std::string& output_path,
                              std::optional<std::size_t> instruction_limit_override = std::nullopt) {
 #if defined(__linux__)
     try {
@@ -4636,8 +5315,9 @@ Result build_native_bytecode(const std::string& bytecode, const std::string& out
                 << "#include <iostream>\n"
                 << "\n"
                 << "int main() {\n"
-                << "    const std::string bytecode = " << cpp_string_literal(bytecode) << ";\n"
-                << "    const auto result = arco::fission::run_bytecode(bytecode, ";
+                << "    const std::string bytecode(" << cpp_string_literal(bytecode_binary) << ", "
+                << bytecode_binary.size() << ");\n"
+                << "    const auto result = arco::fission::run_bytecode_binary(bytecode, ";
             if (instruction_limit_override.has_value()) {
                 out << "std::optional<std::size_t>(" << *instruction_limit_override << ")";
             } else {
@@ -4704,7 +5384,7 @@ Result build_native_bytecode(const std::string& bytecode, const std::string& out
         return {false, "", error.what()};
     }
 #else
-    (void)bytecode;
+    (void)bytecode_binary;
     (void)output_path;
     return {false, "", "native ELF64 builds are only supported on Linux"};
 #endif
@@ -4898,7 +5578,27 @@ Result run_bytecode(const std::string& bytecode, std::optional<std::size_t> inst
         runtime.set_instruction_limit_override(instruction_limit_override);
         std::ostringstream output;
         runtime.set_output(output);
-        (void)execute_bytecode(parse_bytecode(bytecode), runtime);
+        auto module = parse_bytecode(bytecode);
+        prepare_bytecode_module(module);
+        const bool count_instructions = !(instruction_limit_override.has_value() && *instruction_limit_override == 0);
+        (void)execute_bytecode(module, runtime, count_instructions);
+        return {true, output.str(), ""};
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+
+Result run_bytecode_binary(const std::string& bytecode, std::optional<std::size_t> instruction_limit_override) {
+    try {
+        Runtime runtime;
+        runtime.set_instruction_limit_policy(true);
+        runtime.set_instruction_limit_override(instruction_limit_override);
+        std::ostringstream output;
+        runtime.set_output(output);
+        auto module = parse_binary_bytecode(bytecode);
+        prepare_bytecode_module(module);
+        const bool count_instructions = !(instruction_limit_override.has_value() && *instruction_limit_override == 0);
+        (void)execute_bytecode(module, runtime, count_instructions);
         return {true, output.str(), ""};
     } catch (const std::exception& error) {
         return {false, "", error.what()};
@@ -4929,8 +5629,11 @@ Result compile_run(const std::string& source, const std::string& source_name,
         runtime.set_instruction_limit_override(instruction_limit_override);
         std::ostringstream output;
         runtime.set_output(output);
-        (void)execute_bytecode(build_bytecode(build_amir(
-            statements, source_name, preprocess_runtime.compile_metadata().instruction_limit)), runtime);
+        auto module = build_bytecode(build_amir(
+            statements, source_name, preprocess_runtime.compile_metadata().instruction_limit));
+        prepare_bytecode_module(module);
+        const bool count_instructions = !(instruction_limit_override.has_value() && *instruction_limit_override == 0);
+        (void)execute_bytecode(module, runtime, count_instructions);
         return {true, output.str(), ""};
     } catch (const std::exception& error) {
         return {false, "", error.what()};
@@ -4957,7 +5660,7 @@ Result build_native_file(const std::string& path, const std::string& output_path
         auto statements = parser.parse();
 
         const AmirModule amir = build_amir(statements, path, runtime.compile_metadata().instruction_limit);
-        const std::string bytecode = render_bytecode(build_bytecode(amir));
+        const std::string bytecode = render_binary_bytecode(build_bytecode(amir));
         return build_native_bytecode(bytecode, output_path, instruction_limit_override);
     } catch (const std::exception& error) {
         return {false, "", error.what()};
