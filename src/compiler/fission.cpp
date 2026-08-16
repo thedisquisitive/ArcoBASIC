@@ -2352,10 +2352,44 @@ enum class BytecodeOperandKind {
     Symbol,
 };
 
+// A slot holds an executed value in the shape the interpreter needs it in most: Number and
+// Boolean are unpacked so hot numeric/comparison paths avoid touching the `Value` variant at
+// all, and anything else (string, array, object, ...) falls back to carrying a full Value.
+struct BytecodeSlot {
+    enum class Kind {
+        Undefined,
+        Value,
+        Number,
+        Boolean,
+    };
+    Kind kind = Kind::Undefined;
+    Value value;
+    double number = 0.0;
+    bool boolean = false;
+};
+
+BytecodeSlot slot_from_value(Value value) {
+    BytecodeSlot slot;
+    if (value.is_number()) {
+        slot.kind = BytecodeSlot::Kind::Number;
+        slot.number = value.as_number();
+    } else if (value.is_bool()) {
+        slot.kind = BytecodeSlot::Kind::Boolean;
+        slot.boolean = value.truthy();
+    } else {
+        slot.kind = BytecodeSlot::Kind::Value;
+        slot.value = std::move(value);
+    }
+    return slot;
+}
+
 struct BytecodeOperand {
     BytecodeOperandKind kind = BytecodeOperandKind::Empty;
     std::size_t index = 0;
     Value value;
+    // For InlineValue operands, the slot form of `value` computed once by prepare_operand
+    // instead of on every read.
+    BytecodeSlot inline_slot;
 };
 
 struct BytecodeCursor {
@@ -2377,6 +2411,54 @@ enum class CallSiteResolution : std::uint8_t {
     UserFunction,
 };
 
+// The textual operator ("+", "<=", "MOD", ...) carried by BINARY, BINARY_LOCAL_LOCAL,
+// BINARY_LOCAL_CONST, and BRANCH_LOCAL_LOCAL instructions is fixed at compile time. Rather
+// than re-comparing that string against every operator spelling on each execution, prepare
+// time resolves it once into this enum for a plain switch at dispatch.
+enum class NumericOp : std::uint8_t {
+    Unknown,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+};
+
+inline NumericOp numeric_op_from_text(const std::string& op) {
+    if (op == "+") return NumericOp::Add;
+    if (op == "-") return NumericOp::Sub;
+    if (op == "*") return NumericOp::Mul;
+    if (op == "/") return NumericOp::Div;
+    if (op == "MOD") return NumericOp::Mod;
+    if (op == "<") return NumericOp::Lt;
+    if (op == "<=") return NumericOp::Le;
+    if (op == ">") return NumericOp::Gt;
+    if (op == ">=") return NumericOp::Ge;
+    if (op == "==" || op == "=") return NumericOp::Eq;
+    if (op == "!=") return NumericOp::Ne;
+    return NumericOp::Unknown;
+}
+
+inline bool numeric_op_is_comparison(NumericOp op) {
+    switch (op) {
+        case NumericOp::Lt:
+        case NumericOp::Le:
+        case NumericOp::Gt:
+        case NumericOp::Ge:
+        case NumericOp::Eq:
+        case NumericOp::Ne:
+            return true;
+        default:
+            return false;
+    }
+}
+
 struct BytecodeInstruction {
     BytecodeOp op = BytecodeOp::Unsupported;
     std::vector<std::string> operands;
@@ -2385,6 +2467,7 @@ struct BytecodeInstruction {
     int prepared_source_line = 0;
     mutable CallSiteResolution call_site_resolution = CallSiteResolution::Unresolved;
     mutable const BytecodeFunction* call_site_function = nullptr;
+    NumericOp prepared_numeric_op = NumericOp::Unknown;
 };
 
 struct BytecodeBlock {
@@ -2411,6 +2494,7 @@ struct BytecodeModule {
     std::optional<std::uint64_t> instruction_limit;
     std::vector<std::string> constants;
     std::vector<Value> constant_values;
+    std::vector<BytecodeSlot> constant_slots;
     std::vector<BytecodeFunction> functions;
     std::unordered_map<std::string, std::size_t> function_indices;
     std::vector<std::string> diagnostics;
@@ -4232,15 +4316,22 @@ BytecodeOperand prepare_operand(const std::string& text) {
     if (text.size() > 1 && text[0] == 'L' && text[1] >= '0' && text[1] <= '9') {
         return {BytecodeOperandKind::Local, ref_index(text, 'L', "local"), Value()};
     }
-    if (looks_like_inline_bytecode_value(text)) return {BytecodeOperandKind::InlineValue, 0, parse_constant_value(text)};
+    if (looks_like_inline_bytecode_value(text)) {
+        BytecodeOperand operand{BytecodeOperandKind::InlineValue, 0, parse_constant_value(text), {}};
+        operand.inline_slot = slot_from_value(operand.value);
+        return operand;
+    }
     return {BytecodeOperandKind::Symbol, 0, Value()};
 }
 
 void prepare_bytecode_module(BytecodeModule& module) {
     module.constant_values.clear();
     module.constant_values.reserve(module.constants.size());
+    module.constant_slots.clear();
+    module.constant_slots.reserve(module.constants.size());
     for (const auto& constant : module.constants) {
         module.constant_values.push_back(parse_constant_value(constant));
+        module.constant_slots.push_back(slot_from_value(module.constant_values.back()));
     }
 
     module.function_indices.clear();
@@ -4289,6 +4380,22 @@ void prepare_bytecode_module(BytecodeModule& module) {
                 }
                 if (instruction.op == BytecodeOp::Label && !instruction.operands.empty()) {
                     function.targets[instruction.operands.front()] = BytecodeCursor{block_index, instruction_index + 1};
+                }
+                switch (instruction.op) {
+                    case BytecodeOp::Binary:
+                    case BytecodeOp::BinaryLocalLocal:
+                    case BytecodeOp::BinaryLocalConst:
+                        if (instruction.operands.size() > 1) {
+                            instruction.prepared_numeric_op = numeric_op_from_text(instruction.operands[1]);
+                        }
+                        break;
+                    case BytecodeOp::BranchLocalLocal:
+                        if (!instruction.operands.empty()) {
+                            instruction.prepared_numeric_op = numeric_op_from_text(instruction.operands[0]);
+                        }
+                        break;
+                    default:
+                        break;
                 }
             }
         }
@@ -4437,38 +4544,10 @@ Value eval_binary(const std::string& op, const Value& left, const Value& right) 
     throw std::runtime_error("unsupported bytecode binary operator: " + op);
 }
 
-struct BytecodeSlot {
-    enum class Kind {
-        Undefined,
-        Value,
-        Number,
-        Boolean,
-    };
-    Kind kind = Kind::Undefined;
-    Value value;
-    double number = 0.0;
-    bool boolean = false;
-};
-
 struct BytecodeFrame {
     std::vector<BytecodeSlot> temps;
     std::vector<BytecodeSlot> locals;
 };
-
-BytecodeSlot slot_from_value(Value value) {
-    BytecodeSlot slot;
-    if (value.is_number()) {
-        slot.kind = BytecodeSlot::Kind::Number;
-        slot.number = value.as_number();
-    } else if (value.is_bool()) {
-        slot.kind = BytecodeSlot::Kind::Boolean;
-        slot.boolean = value.truthy();
-    } else {
-        slot.kind = BytecodeSlot::Kind::Value;
-        slot.value = std::move(value);
-    }
-    return slot;
-}
 
 Value slot_value(const BytecodeSlot& slot, const std::string& diagnostic_ref) {
     switch (slot.kind) {
@@ -4601,8 +4680,11 @@ Value operand_value(const BytecodeModule& module, const BytecodeFunction& functi
     return parse_constant_value(operand);
 }
 
-BytecodeSlot operand_slot(const BytecodeModule& module, const BytecodeFunction& function, const BytecodeFrame& frame,
-                          const BytecodeOperand& operand, const std::string& text) {
+// Returns a reference into existing storage (a frame slot, or a slot precomputed once by
+// prepare_bytecode_module/prepare_operand) rather than a fresh BytecodeSlot, so reading an
+// operand for arithmetic/branching doesn't copy a Value on every instruction.
+const BytecodeSlot& operand_slot(const BytecodeModule& module, const BytecodeFunction& function, const BytecodeFrame& frame,
+                                 const BytecodeOperand& operand, const std::string& text) {
     switch (operand.kind) {
         case BytecodeOperandKind::Temp:
             if (operand.index >= frame.temps.size() || frame.temps[operand.index].kind == BytecodeSlot::Kind::Undefined) {
@@ -4610,10 +4692,10 @@ BytecodeSlot operand_slot(const BytecodeModule& module, const BytecodeFunction& 
             }
             return frame.temps[operand.index];
         case BytecodeOperandKind::Constant:
-            if (operand.index >= module.constant_values.size()) {
+            if (operand.index >= module.constant_slots.size()) {
                 throw std::runtime_error("constant index out of range: " + text);
             }
-            return slot_from_value(module.constant_values[operand.index]);
+            return module.constant_slots[operand.index];
         case BytecodeOperandKind::Local:
             if (operand.index >= function.locals.size()) {
                 throw std::runtime_error("local index out of range: " + text);
@@ -4623,7 +4705,7 @@ BytecodeSlot operand_slot(const BytecodeModule& module, const BytecodeFunction& 
             }
             return frame.locals[operand.index];
         case BytecodeOperandKind::InlineValue:
-            return slot_from_value(operand.value);
+            return operand.inline_slot;
         case BytecodeOperandKind::Empty:
         case BytecodeOperandKind::Symbol:
             break;
@@ -4661,6 +4743,33 @@ double eval_numeric_arithmetic(const std::string& op, double left, double right)
         return std::fmod(left, right);
     }
     throw std::runtime_error("unsupported fused numeric arithmetic: " + op);
+}
+
+bool eval_numeric_comparison(NumericOp op, double left, double right) {
+    switch (op) {
+        case NumericOp::Lt: return left < right;
+        case NumericOp::Le: return left <= right;
+        case NumericOp::Gt: return left > right;
+        case NumericOp::Ge: return left >= right;
+        case NumericOp::Eq: return left == right;
+        case NumericOp::Ne: return left != right;
+        default:
+            throw std::runtime_error("unsupported fused numeric comparison");
+    }
+}
+
+double eval_numeric_arithmetic(NumericOp op, double left, double right) {
+    switch (op) {
+        case NumericOp::Add: return left + right;
+        case NumericOp::Sub: return left - right;
+        case NumericOp::Mul: return left * right;
+        case NumericOp::Div: return left / right;
+        case NumericOp::Mod:
+            if (right == 0.0) throw std::runtime_error("MOD divisor cannot be zero");
+            return std::fmod(left, right);
+        default:
+            throw std::runtime_error("unsupported fused numeric arithmetic");
+    }
 }
 
 std::string local_name(const BytecodeFunction& function, const std::string& ref) {
@@ -4806,7 +4915,7 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
         const auto value_at = [&](std::size_t index) {
             return operand_value(module, function, frame, prepared[index], instruction.operands[index]);
         };
-        const auto slot_at = [&](std::size_t index) {
+        const auto slot_at = [&](std::size_t index) -> const BytecodeSlot& {
             return operand_slot(module, function, frame, prepared[index], instruction.operands[index]);
         };
         const auto number_at = [&](std::size_t index) {
@@ -4871,22 +4980,28 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
             case BytecodeOp::Unary:
                 set_temp_at(0, eval_unary(instruction.operands[1], value_at(2)));
                 break;
-            case BytecodeOp::Binary:
+            case BytecodeOp::Binary: {
+                bool handled = false;
                 if (const auto left = number_at(2), right = number_at(3); left.has_value() && right.has_value()) {
-                    const std::string& op = instruction.operands[1];
-                    if (op == "+") { set_temp_number(frame, prepared[0], *left + *right, instruction.operands[0]); break; }
-                    if (op == "-") { set_temp_number(frame, prepared[0], *left - *right, instruction.operands[0]); break; }
-                    if (op == "*") { set_temp_number(frame, prepared[0], *left * *right, instruction.operands[0]); break; }
-                    if (op == "/") { set_temp_number(frame, prepared[0], *left / *right, instruction.operands[0]); break; }
-                    if (op == "<") { set_temp_bool(frame, prepared[0], *left < *right, instruction.operands[0]); break; }
-                    if (op == "<=") { set_temp_bool(frame, prepared[0], *left <= *right, instruction.operands[0]); break; }
-                    if (op == ">") { set_temp_bool(frame, prepared[0], *left > *right, instruction.operands[0]); break; }
-                    if (op == ">=") { set_temp_bool(frame, prepared[0], *left >= *right, instruction.operands[0]); break; }
-                    if (op == "==" || op == "=") { set_temp_bool(frame, prepared[0], *left == *right, instruction.operands[0]); break; }
-                    if (op == "!=") { set_temp_bool(frame, prepared[0], *left != *right, instruction.operands[0]); break; }
+                    switch (instruction.prepared_numeric_op) {
+                        case NumericOp::Add: set_temp_number(frame, prepared[0], *left + *right, instruction.operands[0]); handled = true; break;
+                        case NumericOp::Sub: set_temp_number(frame, prepared[0], *left - *right, instruction.operands[0]); handled = true; break;
+                        case NumericOp::Mul: set_temp_number(frame, prepared[0], *left * *right, instruction.operands[0]); handled = true; break;
+                        case NumericOp::Div: set_temp_number(frame, prepared[0], *left / *right, instruction.operands[0]); handled = true; break;
+                        case NumericOp::Lt: set_temp_bool(frame, prepared[0], *left < *right, instruction.operands[0]); handled = true; break;
+                        case NumericOp::Le: set_temp_bool(frame, prepared[0], *left <= *right, instruction.operands[0]); handled = true; break;
+                        case NumericOp::Gt: set_temp_bool(frame, prepared[0], *left > *right, instruction.operands[0]); handled = true; break;
+                        case NumericOp::Ge: set_temp_bool(frame, prepared[0], *left >= *right, instruction.operands[0]); handled = true; break;
+                        case NumericOp::Eq: set_temp_bool(frame, prepared[0], *left == *right, instruction.operands[0]); handled = true; break;
+                        case NumericOp::Ne: set_temp_bool(frame, prepared[0], *left != *right, instruction.operands[0]); handled = true; break;
+                        default: break;
+                    }
                 }
-                set_temp_at(0, eval_binary(instruction.operands[1], value_at(2), value_at(3)));
+                if (!handled) {
+                    set_temp_at(0, eval_binary(instruction.operands[1], value_at(2), value_at(3)));
+                }
                 break;
+            }
             case BytecodeOp::CallValue: {
                 std::vector<Value> args;
                 args.reserve(instruction.operands.size() > 2 ? instruction.operands.size() - 2 : 0);
@@ -5059,17 +5174,16 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 if (instruction.operands.size() != 4) throw std::runtime_error("BINARY_LOCAL_LOCAL expects local, op, local, local");
                 const auto left = number_at(2);
                 const auto right = number_at(3);
-                if (left.has_value() && right.has_value()) {
-                    const std::string& op = instruction.operands[1];
-                    if (op == "<" || op == "<=" || op == ">" || op == ">=" || op == "==" || op == "=" || op == "!=") {
+                if (left.has_value() && right.has_value() && instruction.prepared_numeric_op != NumericOp::Unknown) {
+                    if (numeric_op_is_comparison(instruction.prepared_numeric_op)) {
                         BytecodeSlot result;
                         result.kind = BytecodeSlot::Kind::Boolean;
-                        result.boolean = eval_numeric_comparison(op, *left, *right);
+                        result.boolean = eval_numeric_comparison(instruction.prepared_numeric_op, *left, *right);
                         set_local_slot(function, frame, local_index_at(0), std::move(result), instruction.operands[0]);
                     } else {
                         BytecodeSlot result;
                         result.kind = BytecodeSlot::Kind::Number;
-                        result.number = eval_numeric_arithmetic(op, *left, *right);
+                        result.number = eval_numeric_arithmetic(instruction.prepared_numeric_op, *left, *right);
                         set_local_slot(function, frame, local_index_at(0), std::move(result), instruction.operands[0]);
                     }
                     break;
@@ -5081,10 +5195,15 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 if (instruction.operands.size() != 4) throw std::runtime_error("BINARY_LOCAL_CONST expects local, op, local, constant");
                 const auto left = number_at(2);
                 const auto right = number_at(3);
-                if (left.has_value() && right.has_value()) {
+                if (left.has_value() && right.has_value() && instruction.prepared_numeric_op != NumericOp::Unknown) {
                     BytecodeSlot result;
-                    result.kind = BytecodeSlot::Kind::Number;
-                    result.number = eval_numeric_arithmetic(instruction.operands[1], *left, *right);
+                    if (numeric_op_is_comparison(instruction.prepared_numeric_op)) {
+                        result.kind = BytecodeSlot::Kind::Boolean;
+                        result.boolean = eval_numeric_comparison(instruction.prepared_numeric_op, *left, *right);
+                    } else {
+                        result.kind = BytecodeSlot::Kind::Number;
+                        result.number = eval_numeric_arithmetic(instruction.prepared_numeric_op, *left, *right);
+                    }
                     set_local_slot(function, frame, local_index_at(0), std::move(result), instruction.operands[0]);
                     break;
                 }
@@ -5096,8 +5215,8 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 const auto left = number_at(1);
                 const auto right = number_at(2);
                 bool condition = false;
-                if (left.has_value() && right.has_value()) {
-                    condition = eval_numeric_comparison(instruction.operands[0], *left, *right);
+                if (left.has_value() && right.has_value() && instruction.prepared_numeric_op != NumericOp::Unknown) {
+                    condition = eval_numeric_comparison(instruction.prepared_numeric_op, *left, *right);
                 } else {
                     condition = eval_binary(instruction.operands[0], value_at(1), value_at(2)).truthy();
                 }
