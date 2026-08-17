@@ -15,6 +15,18 @@ std::string upper(std::string value) {
     return value;
 }
 
+// Comment bodies keep only their content, not the leading/trailing whitespace around the ' or
+// REM marker -- regenerating "REM <text>" from a stored " text  " would otherwise double up
+// spacing on round-trip.
+std::string trim(const std::string& value) {
+    const auto first = value.find_first_not_of(" \t\r");
+    if (first == std::string::npos) {
+        return "";
+    }
+    const auto last = value.find_last_not_of(" \t\r");
+    return value.substr(first, last - first + 1);
+}
+
 const std::unordered_map<std::string, TokenType> kKeywords = {
     {"PRINT", TokenType::Print},
     {"RUN", TokenType::Run},
@@ -96,11 +108,14 @@ std::vector<Token> Lexer::scan_tokens() {
             case '\n':
                 newline();
                 break;
-            case '\'':
+            case '\'': {
+                const std::size_t text_start = current_;
                 while (peek() != '\n' && !at_end()) {
                     advance();
                 }
+                tokens_.push_back(Token{TokenType::Comment, trim(source_.substr(text_start, current_ - text_start)), 0.0, line_, token_column_});
                 break;
+            }
             case '(':
                 add(TokenType::LeftParen);
                 break;
@@ -259,9 +274,11 @@ void Lexer::identifier() {
     }
     const std::string text = source_.substr(start_, current_ - start_);
     if (upper(text) == "REM") {
+        const std::size_t text_start = current_;
         while (peek() != '\n' && !at_end()) {
             advance();
         }
+        tokens_.push_back(Token{TokenType::Comment, trim(source_.substr(text_start, current_ - text_start)), 0.0, line_, token_column_});
         return;
     }
     const auto found = kKeywords.find(upper(text));

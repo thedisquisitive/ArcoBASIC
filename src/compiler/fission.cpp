@@ -674,6 +674,9 @@ void render_ast_block(std::ostream& out, const std::vector<CanonicalAstNodePtr>&
 void render_ast_statement(std::ostream& out, const CanonicalAstNode& node, int indent) {
     const std::string pad = indent_pad(indent);
     switch (node.kind) {
+        case AstKind::Comment:
+            out << pad << "REM " << node.text << "\n";
+            return;
         case AstKind::Print:
             out << pad << "PRINT " << render_ast_expression(*node.children.at(0)) << "\n";
             return;
@@ -1439,6 +1442,7 @@ private:
                 lower_expression_statement(function, node);
                 break;
             case AstKind::NoOp:
+            case AstKind::Comment:
                 break;
             case AstKind::Return:
                 current_block(function).instructions.push_back(

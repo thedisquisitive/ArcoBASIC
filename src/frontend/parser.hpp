@@ -45,6 +45,7 @@ enum class AstKind {
     MemoryOperation,
     ExpressionStatement,
     NoOp,
+    Comment,
     Return,
     Function,
     Class,

@@ -1174,6 +1174,26 @@ struct NoOpStmt final : Stmt {
     }
 };
 
+// REM ... and '... comments. Unlike NoOpStmt (blank lines), this deliberately does not tick the
+// instruction counter: a comment costs nothing to "execute" both in the tree-walking interpreter
+// here and in the bytecode VM (see AstKind::Comment in fission.cpp's AMIR lowering, which emits
+// no instructions at all for it, same as NoOp). Exists as a real statement -- rather than being
+// discarded at the lexer the way it used to be -- purely so ArcoFission's canonical-AST
+// pretty-printer can put it back when regenerating source.
+struct CommentStmt final : Stmt {
+    explicit CommentStmt(std::string text) : text(std::move(text)) {}
+    void exec(Runtime&) const override {}
+    void dump_ast(std::ostream& output, int indent) const override {
+        ast_line(output, indent, "Comment " + text);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_statement_node(AstKind::Comment, *this);
+        node->text = text;
+        return node;
+    }
+    std::string text;
+};
+
 struct ReturnStmt final : Stmt {
     explicit ReturnStmt(std::unique_ptr<Expr> value) : value(std::move(value)) {}
     void exec(Runtime& runtime) const override {
@@ -2466,6 +2486,13 @@ Parser::StmtPtr Parser::statement() {
     const Token statement_token = peek();
     if (check(TokenType::Newline) || check(TokenType::End)) {
         auto parsed = std::make_unique<NoOpStmt>();
+        parsed->line_label = label;
+        parsed->source_line = statement_token.line;
+        parsed->source_column = statement_token.column;
+        return parsed;
+    }
+    if (check(TokenType::Comment)) {
+        auto parsed = std::make_unique<CommentStmt>(advance().lexeme);
         parsed->line_label = label;
         parsed->source_line = statement_token.line;
         parsed->source_column = statement_token.column;

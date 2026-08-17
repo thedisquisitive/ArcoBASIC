@@ -7,6 +7,7 @@ namespace arco {
 enum class TokenType {
     End,
     Newline,
+    Comment,
     Identifier,
     Number,
     String,
