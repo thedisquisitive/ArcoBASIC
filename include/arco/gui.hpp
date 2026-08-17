@@ -30,8 +30,14 @@ void circle(int id, double center_x, double center_y, double radius,
             double red, double green, double blue, double alpha);
 void text(int id, const std::string& value, double x, double y, double size,
           double red, double green, double blue, double alpha);
+// Same as text()/measure_text() but rendered in the platform's monospace family instead of the
+// proportional default, for code editors and anything else that needs character columns to line
+// up (tab stops, a text cursor positioned under a specific character, aligned tabular output).
+void text_mono(int id, const std::string& value, double x, double y, double size,
+               double red, double green, double blue, double alpha);
 void image(int id, const std::string& path, double x, double y, double width, double height, double opacity);
 Value measure_text(int id, const std::string& value, double size);
+Value measure_text_mono(int id, const std::string& value, double size);
 void set_clip(int id, double x, double y, double width, double height);
 void reset_clip(int id);
 std::string clipboard_text(int id);

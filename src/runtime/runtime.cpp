@@ -2738,6 +2738,11 @@ Runtime::Runtime()
         expect_arg_count(args, "Process.Run", 1, 1);
         return process_run(args[0].to_string());
     });
+    register_function("Process.Env", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Process.Env", 1, 1);
+        const char* value = std::getenv(args[0].to_string().c_str());
+        return value ? Value(value) : Value("");
+    });
     auto serve_static_function = [](const std::vector<Value>& args) -> Value {
         if (args.empty() || args.size() > 4) {
             throw std::runtime_error("Web.ServeStatic expects root, optional port, optional host, and optional max requests");
@@ -3339,6 +3344,12 @@ Runtime::Runtime()
                   args[5].as_number(), args[6].as_number(), args[7].as_number(), args.size() == 9 ? args[8].as_number() : 1.0);
         return {};
     });
+    register_function("GUI.TextMono", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 8 || args.size() > 9) throw std::runtime_error("GUI.TextMono expects window, text, x, y, size, red, green, blue, and optional alpha");
+        gui::text_mono(static_cast<int>(args[0].as_number()), args[1].to_string(), args[2].as_number(), args[3].as_number(), args[4].as_number(),
+                       args[5].as_number(), args[6].as_number(), args[7].as_number(), args.size() == 9 ? args[8].as_number() : 1.0);
+        return {};
+    });
     register_function("GUI.Image", [](const std::vector<Value>& args) -> Value {
         if (args.size() < 6 || args.size() > 7) throw std::runtime_error("GUI.Image expects window, path, x, y, width, height, and optional opacity");
         gui::image(static_cast<int>(args[0].as_number()), args[1].to_string(), args[2].as_number(), args[3].as_number(),
@@ -3348,6 +3359,10 @@ Runtime::Runtime()
     register_function("GUI.MeasureText", [](const std::vector<Value>& args) -> Value {
         if (args.size() != 3) throw std::runtime_error("GUI.MeasureText expects window, text, and size");
         return gui::measure_text(static_cast<int>(args[0].as_number()), args[1].to_string(), args[2].as_number());
+    });
+    register_function("GUI.MeasureTextMono", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 3) throw std::runtime_error("GUI.MeasureTextMono expects window, text, and size");
+        return gui::measure_text_mono(static_cast<int>(args[0].as_number()), args[1].to_string(), args[2].as_number());
     });
     register_function("GUI.SetClip", [](const std::vector<Value>& args) -> Value {
         if (args.size() != 5) throw std::runtime_error("GUI.SetClip expects window, x, y, width, and height");

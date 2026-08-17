@@ -22,8 +22,10 @@ void rounded_rectangle(int, double, double, double, double, double, double, doub
 void line(int, double, double, double, double, double, double, double, double, double) { unsupported(); }
 void circle(int, double, double, double, double, double, double, double) { unsupported(); }
 void text(int, const std::string&, double, double, double, double, double, double, double) { unsupported(); }
+void text_mono(int, const std::string&, double, double, double, double, double, double, double) { unsupported(); }
 void image(int, const std::string&, double, double, double, double, double) { unsupported(); }
 Value measure_text(int, const std::string&, double) { unsupported(); }
+Value measure_text_mono(int, const std::string&, double) { unsupported(); }
 void set_clip(int, double, double, double, double) { unsupported(); }
 void reset_clip(int) { unsupported(); }
 std::string clipboard_text(int) { unsupported(); }

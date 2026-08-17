@@ -447,11 +447,12 @@ void circle(int id, double center_x, double center_y, double radius, double r, d
     set_color(item.context, r, g, b, a);
     cairo_fill(item.context);
 }
-void text(int id, const std::string& value, double x, double y, double size, double r, double g, double b, double a) {
+void text_family(int id, const std::string& family, const std::string& value, double x, double y, double size,
+                 double r, double g, double b, double a) {
     auto& item = find_window(id);
     PangoLayout* layout = pango_cairo_create_layout(item.context);
     PangoFontDescription* font = pango_font_description_new();
-    pango_font_description_set_family(font, "Sans");
+    pango_font_description_set_family(font, family.c_str());
     pango_font_description_set_absolute_size(font, std::max(1.0, size) * PANGO_SCALE);
     pango_layout_set_font_description(layout, font);
     pango_layout_set_text(layout, value.c_str(), -1);
@@ -460,6 +461,12 @@ void text(int id, const std::string& value, double x, double y, double size, dou
     pango_cairo_show_layout(item.context, layout);
     pango_font_description_free(font);
     g_object_unref(layout);
+}
+void text(int id, const std::string& value, double x, double y, double size, double r, double g, double b, double a) {
+    text_family(id, "Sans", value, x, y, size, r, g, b, a);
+}
+void text_mono(int id, const std::string& value, double x, double y, double size, double r, double g, double b, double a) {
+    text_family(id, "Monospace", value, x, y, size, r, g, b, a);
 }
 void image(int id, const std::string& path, double x, double y, double width, double height, double opacity) {
     auto& item = find_window(id);
@@ -487,11 +494,11 @@ void image(int id, const std::string& path, double x, double y, double width, do
     cairo_paint_with_alpha(item.context, std::clamp(opacity, 0.0, 1.0));
     cairo_restore(item.context);
 }
-Value measure_text(int id, const std::string& value, double size) {
+Value measure_text_family(int id, const std::string& family, const std::string& value, double size) {
     auto& item = find_window(id);
     PangoLayout* layout = pango_cairo_create_layout(item.context);
     PangoFontDescription* font = pango_font_description_new();
-    pango_font_description_set_family(font, "Sans");
+    pango_font_description_set_family(font, family.c_str());
     pango_font_description_set_absolute_size(font, std::max(1.0, size) * PANGO_SCALE);
     pango_layout_set_font_description(layout, font);
     pango_layout_set_text(layout, value.c_str(), -1);
@@ -500,6 +507,12 @@ Value measure_text(int id, const std::string& value, double size) {
     pango_font_description_free(font);
     g_object_unref(layout);
     return Value::Object{{"Width", width}, {"Height", height}};
+}
+Value measure_text(int id, const std::string& value, double size) {
+    return measure_text_family(id, "Sans", value, size);
+}
+Value measure_text_mono(int id, const std::string& value, double size) {
+    return measure_text_family(id, "Monospace", value, size);
 }
 void set_clip(int id, double x, double y, double width, double height) {
     auto& item = find_window(id);
