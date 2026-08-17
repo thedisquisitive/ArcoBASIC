@@ -141,9 +141,10 @@ int main(int argc, char** argv) {
                                     normalized_stage == "abc" || normalized_stage == "arcof";
         const bool wants_callconv = normalized_stage == "callconv" || normalized_stage == "calling-convention";
         const bool wants_x86_64 = normalized_stage == "x86-64" || normalized_stage == "x86_64" || normalized_stage == "native-asm";
+        const bool wants_pretty = normalized_stage == "pretty" || normalized_stage == "source";
 
-        if (!wants_ast && !wants_amir && !wants_bytecode && !wants_callconv && !wants_x86_64) {
-            std::cerr << "ArcoFission: this alpha slice can reveal AST, A-MIR, BYTECODE, CALLCONV, or X86_64\n";
+        if (!wants_ast && !wants_amir && !wants_bytecode && !wants_callconv && !wants_x86_64 && !wants_pretty) {
+            std::cerr << "ArcoFission: this alpha slice can reveal AST, A-MIR, BYTECODE, CALLCONV, PRETTY, or X86_64\n";
             return 2;
         }
 
@@ -156,10 +157,18 @@ int main(int argc, char** argv) {
                                       : wants_bytecode ? arco::fission::reveal_bytecode_file(file)
                                                        : wants_callconv ? arco::fission::reveal_callconv_file(file)
                                                                         : wants_x86_64 ? arco::fission::reveal_x86_64_file(file, entry_function)
-                                                                                       : arco::fission::reveal_amir_file(file);
+                                                                                       : wants_pretty ? arco::fission::reveal_pretty_file(file)
+                                                                                                      : arco::fission::reveal_amir_file(file);
         if (!result.ok) {
             std::cerr << "SOURCE INTAKE FAILED\n\n" << result.error << '\n';
             return 1;
+        }
+
+        if (wants_pretty) {
+            // Raw regenerated ArcoBASIC source, no status banner -- meant to be piped straight
+            // into another `reveal ... at AST` for round-trip comparison, not read as a report.
+            std::cout << result.output;
+            return 0;
         }
 
         std::cout << "SOURCE ACCEPTED\n";

@@ -642,6 +642,107 @@ std::string render_ast_expression(const CanonicalAstNode& node) {
     }
 }
 
+// Statement-level counterpart to render_ast_expression: walks the same RFC-0012 canonical AST
+// (CanonicalAstNode) back into ArcoBASIC source text. This is the experiment for whether that
+// canonical AST can serve as a single source of truth a graph editor and hand-written code both
+// read/write -- if pretty_print_canonical(parse(source)) reparses to the same canonical AST as
+// the original source, the AST is a safe round-trip substrate for that subset of the language.
+// Deliberately covers only the small "v1 graph" subset agreed for the ArcoFlow experiment
+// (sequence, branch, loop, function/return, calls, assignment) rather than the whole grammar;
+// anything else renders as a visible placeholder rather than silently producing wrong code.
+std::string indent_pad(int indent) {
+    return std::string(static_cast<std::size_t>(std::max(0, indent)) * 4, ' ');
+}
+
+const CanonicalAstGroup* find_canonical_group(const CanonicalAstNode& node, const std::string& role) {
+    for (const auto& group : node.groups) {
+        if (group.role == role) {
+            return &group;
+        }
+    }
+    return nullptr;
+}
+
+void render_ast_statement(std::ostream& out, const CanonicalAstNode& node, int indent);
+
+void render_ast_block(std::ostream& out, const std::vector<CanonicalAstNodePtr>& nodes, int indent) {
+    for (const auto& child : nodes) {
+        if (child) render_ast_statement(out, *child, indent);
+    }
+}
+
+void render_ast_statement(std::ostream& out, const CanonicalAstNode& node, int indent) {
+    const std::string pad = indent_pad(indent);
+    switch (node.kind) {
+        case AstKind::Print:
+            out << pad << "PRINT " << render_ast_expression(*node.children.at(0)) << "\n";
+            return;
+        case AstKind::Assign: {
+            std::string target = node.name;
+            for (int i = 0; i < node.integer; ++i) {
+                target += "[" + render_ast_expression(*node.children.at(static_cast<std::size_t>(i))) + "]";
+            }
+            out << pad << "LET " << target << " = " << render_ast_expression(*node.children.back()) << "\n";
+            return;
+        }
+        case AstKind::ExpressionStatement:
+            out << pad << render_ast_expression(*node.children.at(0)) << "\n";
+            return;
+        case AstKind::Return:
+            out << pad << "RETURN";
+            if (!node.children.empty()) out << " " << render_ast_expression(*node.children.at(0));
+            out << "\n";
+            return;
+        case AstKind::If: {
+            out << pad << "IF " << render_ast_expression(*node.children.at(0)) << " THEN\n";
+            if (const auto* then_group = find_canonical_group(node, "then")) render_ast_block(out, then_group->nodes, indent + 1);
+            const auto* else_group = find_canonical_group(node, "else");
+            if (else_group && !else_group->nodes.empty()) {
+                out << pad << "ELSE\n";
+                render_ast_block(out, else_group->nodes, indent + 1);
+            }
+            out << pad << "END IF\n";
+            return;
+        }
+        case AstKind::For: {
+            out << pad << "FOR " << node.name << " = " << render_ast_expression(*node.children.at(0)) << " TO "
+                << render_ast_expression(*node.children.at(1));
+            if (node.children.size() > 2 && node.children[2]) {
+                out << " STEP " << render_ast_expression(*node.children[2]);
+            }
+            out << "\n";
+            if (const auto* body = find_canonical_group(node, "body")) render_ast_block(out, body->nodes, indent + 1);
+            out << pad << "NEXT\n";
+            return;
+        }
+        case AstKind::Function: {
+            out << pad << "FUNCTION " << node.name << "(";
+            for (std::size_t i = 0; i < node.parameters.size(); ++i) {
+                if (i) out << ", ";
+                out << node.parameters[i].name;
+                if (node.parameters[i].default_value) out << " = " << render_ast_expression(*node.parameters[i].default_value);
+            }
+            out << ")";
+            if (!node.type_name.empty()) out << " AS " << node.type_name;
+            out << "\n";
+            if (const auto* body = find_canonical_group(node, "body")) render_ast_block(out, body->nodes, indent + 1);
+            out << pad << "END FUNCTION\n";
+            return;
+        }
+        default:
+            out << pad << "REM <pretty-printing not yet implemented for this construct>\n";
+            return;
+    }
+}
+
+std::string pretty_print_canonical(const std::vector<std::unique_ptr<Stmt>>& statements) {
+    std::ostringstream out;
+    for (const auto& statement : statements) {
+        render_ast_statement(out, *statement->canonical_ast(), 0);
+    }
+    return out.str();
+}
+
 // RFC-0012 canonical frontend -> A-MIR lowering. This builder consumes only the parser-produced
 // canonical AST. It never sees or reinterprets lexer tokens.
 class AstAmirBuilder {
@@ -6136,6 +6237,31 @@ Result reveal_ast(const std::string& source, const std::string& source_name) {
 Result reveal_ast_file(const std::string& path) {
     try {
         return reveal_ast(read_file(path), path);
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+
+Result reveal_pretty(const std::string& source, const std::string& source_name) {
+    try {
+        Runtime runtime;
+        const std::string processed = runtime.preprocess_source(source);
+        Lexer lexer(processed);
+        auto tokens = lexer.scan_tokens();
+
+        Parser parser(tokens, runtime.compile_metadata().runtime_mode == "NONE");
+        auto statements = parser.parse();
+        (void)source_name;
+
+        return {true, pretty_print_canonical(statements), ""};
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+
+Result reveal_pretty_file(const std::string& path) {
+    try {
+        return reveal_pretty(read_file(path), path);
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }
