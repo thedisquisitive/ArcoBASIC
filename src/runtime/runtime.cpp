@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
@@ -38,6 +39,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -332,6 +334,37 @@ Value tcp_close(int client_id) {
     g_tcp_clients.erase(found);
     return true;
 #endif
+}
+
+// Runs `command` through the platform shell and captures its combined stdout+stderr, so a plain
+// capsule (not just arcosh, which has its own richer RUN with interactive-sudo/job-control
+// handling arco_shell/arcosh.cpp) can shell out -- the IDE's "Run" button uses this to invoke
+// ArcoFission against the file it's editing.
+Value process_run(const std::string& command) {
+    const std::string captured_command = command + " 2>&1";
+#ifdef _WIN32
+    FILE* pipe = _popen(captured_command.c_str(), "r");
+#else
+    FILE* pipe = popen(captured_command.c_str(), "r");
+#endif
+    if (!pipe) {
+        return Value::Object{{"Ok", false}, {"Output", ""}, {"ExitCode", -1.0}, {"Error", "could not start command"}};
+    }
+    std::array<char, 4096> chunk{};
+    std::string output;
+    while (fgets(chunk.data(), static_cast<int>(chunk.size()), pipe) != nullptr) {
+        output += chunk.data();
+    }
+#ifdef _WIN32
+    const int code = _pclose(pipe);
+#else
+    const int raw_status = pclose(pipe);
+    const int code = WIFEXITED(raw_status) ? WEXITSTATUS(raw_status) : -1;
+#endif
+    if (!output.empty() && output.back() == '\n') {
+        output.pop_back();
+    }
+    return Value::Object{{"Ok", code == 0}, {"Output", output}, {"ExitCode", static_cast<double>(code)}, {"Error", ""}};
 }
 
 #if defined(ARCO_NETWORK_CURL)
@@ -2701,6 +2734,10 @@ Runtime::Runtime()
     register_function("Net.TcpSend", tcp_send_function);
     register_function("Net.TcpRead", tcp_read_function);
     register_function("Net.TcpClose", tcp_close_function);
+    register_function("Process.Run", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Process.Run", 1, 1);
+        return process_run(args[0].to_string());
+    });
     auto serve_static_function = [](const std::vector<Value>& args) -> Value {
         if (args.empty() || args.size() > 4) {
             throw std::runtime_error("Web.ServeStatic expects root, optional port, optional host, and optional max requests");
