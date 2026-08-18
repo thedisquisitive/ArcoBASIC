@@ -1,0 +1,414 @@
+' ArcoBASIC GUI widget stdlib.
+'
+' Immediate-mode widgets built entirely on the raw GUI.* primitives (Rectangle, Text, MeasureText,
+' the GUI.WaitEvent/PollEvent event shape) -- no new engine capability, just the reusable logic
+' every hand-written ArcoBASIC GUI app (examples/arconote.abas, arcowrite.abas, ...) has been
+' reimplementing from scratch: caret math, click hit-testing, hover tracking, scrolling.
+'
+' Each widget owns its own persistent state as class fields (Text, Caret, ScrollLine, Hovered, ...)
+' rather than hiding it behind an ID-keyed global table. The caller keeps the widget object alive
+' across frames -- typically as a field on its own `app`-style state object, the same convention
+' every existing GUI example already uses for everything else -- and each frame:
+'   1. calls SetBounds(...) if the layout changed (e.g. the window resized)
+'   2. calls Draw(window) to render it
+'   3. calls HandleEvent(window, event) with whatever GUI.WaitEvent/PollEvent returned, and reads
+'      the widget's own fields (.Text, .Caret, ...) afterward for anything it needs
+'
+' This intentionally does not include a generic Panel/child-widget container: that needs a real
+' Widget interface (Draw/HandleEvent as a shared contract) and is a bigger design decision on its
+' own, left for when something actually needs it rather than speculatively built here. VStack/
+' HStack below cover the common "lay these out in a column/row" case without that machinery.
+
+CLASS TextArea
+    Text AS String = ""
+    Caret AS Number = 0
+    ScrollLine AS Number = 0
+    X AS Number = 0
+    Y AS Number = 0
+    Width AS Number = 400
+    Height AS Number = 240
+    FontSize AS Number = 16
+    LineHeight AS Number = 22
+    Padding AS Number = 8
+    BackgroundR AS Number = 0.09
+    BackgroundG AS Number = 0.105
+    BackgroundB AS Number = 0.135
+    TextR AS Number = 0.9
+    TextG AS Number = 0.92
+    TextB AS Number = 0.96
+    CaretR AS Number = 0.4
+    CaretG AS Number = 0.75
+    CaretB AS Number = 1.0
+
+    CONSTRUCTOR(text AS String = "")
+        SELF.Text = text
+        SELF.Caret = String.Length(text)
+    END CONSTRUCTOR
+
+    FUNCTION SetBounds(x, y, width, height)
+        SELF.X = x
+        SELF.Y = y
+        SELF.Width = width
+        SELF.Height = height
+    END FUNCTION
+
+    FUNCTION SetText(text)
+        SELF.Text = text
+        SELF.Caret = String.Length(text)
+        SELF.ScrollLine = 0
+    END FUNCTION
+
+    FUNCTION Lines()
+        RETURN String.Split(SELF.Text, "\n")
+    END FUNCTION
+
+    ' 0-based line containing character offset `offset`.
+    FUNCTION LineAt(offset)
+        before = String.Slice(SELF.Text, 0, offset)
+        RETURN LEN(String.Split(before, "\n")) - 1
+    END FUNCTION
+
+    ' 0-based column (character count into its line) of character offset `offset`.
+    FUNCTION ColumnAt(offset)
+        before = String.Slice(SELF.Text, 0, offset)
+        before_lines = String.Split(before, "\n")
+        RETURN String.Length(before_lines[LEN(before_lines) - 1])
+    END FUNCTION
+
+    ' Inverse of LineAt/ColumnAt: the character offset at a given (line, column), clamped to the
+    ' line's actual length so callers moving the caret vertically don't have to clamp themselves.
+    FUNCTION OffsetAt(line, column)
+        lines = SELF.Lines()
+        target_line = line
+        IF target_line < 0 THEN target_line = 0
+        IF target_line >= LEN(lines) THEN target_line = LEN(lines) - 1
+        target = lines[target_line]
+        clamped_column = column
+        IF clamped_column < 0 THEN clamped_column = 0
+        IF clamped_column > String.Length(target) THEN clamped_column = String.Length(target)
+        offset = 0
+        i = 0
+        WHILE i < target_line
+            offset = offset + String.Length(lines[i]) + 1
+            i = i + 1
+        WEND
+        RETURN offset + clamped_column
+    END FUNCTION
+
+    FUNCTION InsertText(value)
+        SELF.Text = String.Insert(SELF.Text, SELF.Caret, value)
+        SELF.Caret = SELF.Caret + String.Length(value)
+    END FUNCTION
+
+    FUNCTION DeleteBackward()
+        IF SELF.Caret > 0 THEN
+            SELF.Text = String.Delete(SELF.Text, SELF.Caret - 1, 1)
+            SELF.Caret = SELF.Caret - 1
+        END IF
+    END FUNCTION
+
+    FUNCTION DeleteForward()
+        IF SELF.Caret < String.Length(SELF.Text) THEN
+            SELF.Text = String.Delete(SELF.Text, SELF.Caret, 1)
+        END IF
+    END FUNCTION
+
+    FUNCTION MoveLeft()
+        IF SELF.Caret > 0 THEN SELF.Caret = SELF.Caret - 1
+    END FUNCTION
+
+    FUNCTION MoveRight()
+        IF SELF.Caret < String.Length(SELF.Text) THEN SELF.Caret = SELF.Caret + 1
+    END FUNCTION
+
+    FUNCTION MoveHome()
+        SELF.Caret = SELF.OffsetAt(SELF.LineAt(SELF.Caret), 0)
+    END FUNCTION
+
+    FUNCTION MoveEnd()
+        line = SELF.LineAt(SELF.Caret)
+        lines = SELF.Lines()
+        SELF.Caret = SELF.OffsetAt(line, String.Length(lines[line]))
+    END FUNCTION
+
+    FUNCTION MoveUp()
+        line = SELF.LineAt(SELF.Caret)
+        IF line > 0 THEN SELF.Caret = SELF.OffsetAt(line - 1, SELF.ColumnAt(SELF.Caret))
+    END FUNCTION
+
+    FUNCTION MoveDown()
+        line = SELF.LineAt(SELF.Caret)
+        lines = SELF.Lines()
+        IF line < LEN(lines) - 1 THEN SELF.Caret = SELF.OffsetAt(line + 1, SELF.ColumnAt(SELF.Caret))
+    END FUNCTION
+
+    FUNCTION VisibleLines()
+        count = FLOOR((SELF.Height - SELF.Padding * 2) / SELF.LineHeight)
+        IF count < 1 THEN RETURN 1
+        RETURN count
+    END FUNCTION
+
+    ' Scrolls just enough to bring the caret's line back into view. Called after every caret move
+    ' or edit; a no-op if the caret is already visible.
+    FUNCTION EnsureCaretVisible()
+        visible = SELF.VisibleLines()
+        caret_line = SELF.LineAt(SELF.Caret)
+        IF caret_line < SELF.ScrollLine THEN SELF.ScrollLine = caret_line
+        IF caret_line >= SELF.ScrollLine + visible THEN SELF.ScrollLine = caret_line - visible + 1
+        IF SELF.ScrollLine < 0 THEN SELF.ScrollLine = 0
+    END FUNCTION
+
+    ' Nearest character offset to a window-relative point, for click-to-place-caret. Linear scan
+    ' over the target line's character positions rather than assuming a fixed monospace advance,
+    ' so this stays correct even if a future caller points FontSize/rendering at a proportional
+    ' measurement instead of GUI.MeasureTextMono.
+    FUNCTION HitTest(window, px, py)
+        lines = SELF.Lines()
+        relative_row = FLOOR((py - SELF.Y - SELF.Padding) / SELF.LineHeight)
+        line = SELF.ScrollLine + relative_row
+        IF line < 0 THEN line = 0
+        IF line >= LEN(lines) THEN line = LEN(lines) - 1
+        text_line = lines[line]
+        relative_x = px - SELF.X - SELF.Padding
+
+        best_column = 0
+        best_distance = ABS(relative_x)
+        column = 1
+        WHILE column <= String.Length(text_line)
+            measured = GUI.MeasureTextMono(window, String.Slice(text_line, 0, column), SELF.FontSize)
+            width = measured.Width
+            distance = ABS(width - relative_x)
+            IF distance < best_distance THEN
+                best_distance = distance
+                best_column = column
+            END IF
+            column = column + 1
+        WEND
+        RETURN SELF.OffsetAt(line, best_column)
+    END FUNCTION
+
+    FUNCTION Draw(window)
+        GUI.RoundedRectangle(window, SELF.X, SELF.Y, SELF.Width, SELF.Height, 6, SELF.BackgroundR, SELF.BackgroundG, SELF.BackgroundB, 1.0)
+        GUI.SetClip(window, SELF.X, SELF.Y, SELF.Width, SELF.Height)
+
+        lines = SELF.Lines()
+        max_scroll = LEN(lines) - 1
+        IF max_scroll < 0 THEN max_scroll = 0
+        IF SELF.ScrollLine < 0 THEN SELF.ScrollLine = 0
+        IF SELF.ScrollLine > max_scroll THEN SELF.ScrollLine = max_scroll
+
+        visible = SELF.VisibleLines()
+        line_index = SELF.ScrollLine
+        row = 0
+        WHILE line_index < LEN(lines) ANDALSO row < visible
+            GUI.TextMono(window, lines[line_index], SELF.X + SELF.Padding, SELF.Y + SELF.Padding + row * SELF.LineHeight,
+                SELF.FontSize, SELF.TextR, SELF.TextG, SELF.TextB, 1.0)
+            line_index = line_index + 1
+            row = row + 1
+        WEND
+
+        caret_line = SELF.LineAt(SELF.Caret)
+        IF caret_line >= SELF.ScrollLine ANDALSO caret_line < SELF.ScrollLine + visible THEN
+            caret_text = String.Slice(lines[caret_line], 0, SELF.ColumnAt(SELF.Caret))
+            caret_measured = GUI.MeasureTextMono(window, caret_text, SELF.FontSize)
+            caret_x = SELF.X + SELF.Padding + caret_measured.Width
+            caret_y = SELF.Y + SELF.Padding + (caret_line - SELF.ScrollLine) * SELF.LineHeight
+            GUI.Rectangle(window, caret_x, caret_y, 2, SELF.LineHeight - 4, SELF.CaretR, SELF.CaretG, SELF.CaretB, 1.0)
+        END IF
+
+        GUI.ResetClip(window)
+    END FUNCTION
+
+    ' Returns TRUE if the event changed Text (callers can use that to mark themselves dirty).
+    ' Known limitation: no selection yet (shift+arrow, drag-select, cut/copy of a range) --
+    ' backspace/delete only ever act on the single character next to the caret.
+    FUNCTION HandleEvent(window, event)
+        changed = FALSE
+        within = event.X >= SELF.X ANDALSO event.X < SELF.X + SELF.Width ANDALSO event.Y >= SELF.Y ANDALSO event.Y < SELF.Y + SELF.Height
+
+        IF event.Type == "pointer-button" ANDALSO event.Action == "press" ANDALSO event.Button == "left" ANDALSO within THEN
+            SELF.Caret = SELF.HitTest(window, event.X, event.Y)
+            SELF.EnsureCaretVisible()
+        END IF
+
+        IF event.Type == "scroll" ANDALSO within THEN
+            SELF.ScrollLine = SELF.ScrollLine - event.DeltaY
+        END IF
+
+        IF event.Type == "text" THEN
+            SELF.InsertText(event.Text)
+            changed = TRUE
+        END IF
+
+        IF event.Type == "key" ANDALSO (event.Action == "press" ORELSE event.Action == "repeat") THEN
+            IF event.Key == "left" THEN SELF.MoveLeft()
+            IF event.Key == "right" THEN SELF.MoveRight()
+            IF event.Key == "up" THEN SELF.MoveUp()
+            IF event.Key == "down" THEN SELF.MoveDown()
+            IF event.Key == "home" THEN SELF.MoveHome()
+            IF event.Key == "end" THEN SELF.MoveEnd()
+            IF event.Key == "backspace" THEN
+                SELF.DeleteBackward()
+                changed = TRUE
+            END IF
+            IF event.Key == "delete" THEN
+                SELF.DeleteForward()
+                changed = TRUE
+            END IF
+            IF event.Key == "enter" THEN
+                SELF.InsertText("\n")
+                changed = TRUE
+            END IF
+        END IF
+
+        IF changed ORELSE event.Type == "key" THEN SELF.EnsureCaretVisible()
+        RETURN changed
+    END FUNCTION
+END CLASS
+
+CLASS Button
+    Label AS String = ""
+    X AS Number = 0
+    Y AS Number = 0
+    Width AS Number = 120
+    Height AS Number = 36
+    FontSize AS Number = 15
+    Hovered AS Bool = FALSE
+    BackgroundR AS Number = 0.14
+    BackgroundG AS Number = 0.18
+    BackgroundB AS Number = 0.25
+    HoverR AS Number = 0.18
+    HoverG AS Number = 0.24
+    HoverB AS Number = 0.34
+    TextR AS Number = 0.88
+    TextG AS Number = 0.92
+    TextB AS Number = 0.98
+
+    CONSTRUCTOR(label AS String = "")
+        SELF.Label = label
+    END CONSTRUCTOR
+
+    FUNCTION SetBounds(x, y, width, height)
+        SELF.X = x
+        SELF.Y = y
+        SELF.Width = width
+        SELF.Height = height
+    END FUNCTION
+
+    FUNCTION ContainsPoint(px, py)
+        RETURN px >= SELF.X ANDALSO px < SELF.X + SELF.Width ANDALSO py >= SELF.Y ANDALSO py < SELF.Y + SELF.Height
+    END FUNCTION
+
+    FUNCTION Draw(window)
+        r = SELF.BackgroundR
+        g = SELF.BackgroundG
+        b = SELF.BackgroundB
+        IF SELF.Hovered THEN
+            r = SELF.HoverR
+            g = SELF.HoverG
+            b = SELF.HoverB
+        END IF
+        GUI.RoundedRectangle(window, SELF.X, SELF.Y, SELF.Width, SELF.Height, 6, r, g, b, 1.0)
+        measured = GUI.MeasureText(window, SELF.Label, SELF.FontSize)
+        GUI.Text(window, SELF.Label, SELF.X + (SELF.Width - measured.Width) / 2, SELF.Y + (SELF.Height - measured.Height) / 2,
+            SELF.FontSize, SELF.TextR, SELF.TextG, SELF.TextB, 1.0)
+    END FUNCTION
+
+    ' Returns TRUE the frame the button is released while the pointer is over it -- the standard
+    ' "click" definition (press-and-drag-off-then-release doesn't count), and a real fix over
+    ' examples/arconote.abas's hand-rolled sidebar buttons, which only check press.
+    FUNCTION HandleEvent(window, event)
+        clicked = FALSE
+        IF event.Type == "pointer-move" THEN SELF.Hovered = SELF.ContainsPoint(event.X, event.Y)
+        IF event.Type == "pointer-button" ANDALSO event.Action == "release" ANDALSO event.Button == "left" THEN
+            IF SELF.ContainsPoint(event.X, event.Y) THEN clicked = TRUE
+        END IF
+        RETURN clicked
+    END FUNCTION
+END CLASS
+
+CLASS Checkbox
+    Label AS String = ""
+    Checked AS Bool = FALSE
+    X AS Number = 0
+    Y AS Number = 0
+    Size AS Number = 20
+    FontSize AS Number = 15
+    BoxR AS Number = 0.16
+    BoxG AS Number = 0.2
+    BoxB AS Number = 0.28
+    CheckR AS Number = 0.4
+    CheckG AS Number = 0.75
+    CheckB AS Number = 1.0
+    TextR AS Number = 0.85
+    TextG AS Number = 0.89
+    TextB AS Number = 0.95
+
+    CONSTRUCTOR(label AS String = "", checked AS Bool = FALSE)
+        SELF.Label = label
+        SELF.Checked = checked
+    END CONSTRUCTOR
+
+    FUNCTION SetPosition(x, y)
+        SELF.X = x
+        SELF.Y = y
+    END FUNCTION
+
+    ' Width of the checkbox's whole clickable area (box + label), for layout.
+    FUNCTION TotalWidth(window)
+        measured = GUI.MeasureText(window, SELF.Label, SELF.FontSize)
+        RETURN SELF.Size + 8 + measured.Width
+    END FUNCTION
+
+    FUNCTION ContainsPoint(px, py)
+        RETURN px >= SELF.X ANDALSO px < SELF.X + SELF.Size ANDALSO py >= SELF.Y ANDALSO py < SELF.Y + SELF.Size
+    END FUNCTION
+
+    FUNCTION Draw(window)
+        GUI.RoundedRectangle(window, SELF.X, SELF.Y, SELF.Size, SELF.Size, 4, SELF.BoxR, SELF.BoxG, SELF.BoxB, 1.0)
+        IF SELF.Checked THEN
+            inset = SELF.Size / 4
+            GUI.RoundedRectangle(window, SELF.X + inset, SELF.Y + inset, SELF.Size - inset * 2, SELF.Size - inset * 2, 2,
+                SELF.CheckR, SELF.CheckG, SELF.CheckB, 1.0)
+        END IF
+        IF SELF.Label <> "" THEN
+            GUI.Text(window, SELF.Label, SELF.X + SELF.Size + 8, SELF.Y + SELF.Size / 2 - SELF.FontSize / 2,
+                SELF.FontSize, SELF.TextR, SELF.TextG, SELF.TextB, 1.0)
+        END IF
+    END FUNCTION
+
+    ' Returns TRUE the frame Checked flips (click on the box itself, not the label).
+    FUNCTION HandleEvent(window, event)
+        IF event.Type == "pointer-button" ANDALSO event.Action == "release" ANDALSO event.Button == "left" THEN
+            IF SELF.ContainsPoint(event.X, event.Y) THEN
+                SELF.Checked = !SELF.Checked
+                RETURN TRUE
+            END IF
+        END IF
+        RETURN FALSE
+    END FUNCTION
+END CLASS
+
+' Y offsets for stacking `count` items of the given `heights` vertically from `start_y`, `spacing`
+' pixels apart. Stateless on purpose -- apply the returned offsets to widgets' SetBounds/
+' SetPosition yourself; see the module doc comment for why this doesn't own the widgets directly.
+FUNCTION VStack(start_y, heights, spacing = 8)
+    offsets = []
+    y = start_y
+    FOR i = 0 TO LEN(heights) - 1
+        ignored = Array.Add(offsets, y)
+        y = y + heights[i] + spacing
+    NEXT
+    RETURN offsets
+END FUNCTION
+
+' X offsets for laying `widths` out in a row from `start_x`, `spacing` pixels apart.
+FUNCTION HStack(start_x, widths, spacing = 8)
+    offsets = []
+    x = start_x
+    FOR i = 0 TO LEN(widths) - 1
+        ignored = Array.Add(offsets, x)
+        x = x + widths[i] + spacing
+    NEXT
+    RETURN offsets
+END FUNCTION
