@@ -677,31 +677,59 @@ void render_ast_block(std::ostream& out, const std::vector<CanonicalAstNodePtr>&
 
 void render_ast_statement(std::ostream& out, const CanonicalAstNode& node, int indent) {
     const std::string pad = indent_pad(indent);
+    // Traditional BASIC line numbers (`10 PRINT "hi"`) are tracked on every Stmt as line_label,
+    // independent of statement kind. A label belongs on exactly the one physical line a numbered
+    // statement started on -- multi-line constructs (IF/FOR/FUNCTION) use plain `pad`, not
+    // `first_pad`, for their closing END IF/NEXT/END FUNCTION line, so the label doesn't repeat.
+    const std::string first_pad = node.line_label >= 0 ? std::to_string(node.line_label) + " " + pad : pad;
     switch (node.kind) {
         case AstKind::Comment:
-            out << pad << "REM " << node.text << "\n";
+            out << first_pad << "REM " << node.text << "\n";
+            return;
+        case AstKind::Goto:
+            out << first_pad << "GOTO " << node.integer << "\n";
+            return;
+        case AstKind::Stop:
+            out << first_pad << "STOP\n";
             return;
         case AstKind::Print:
-            out << pad << "PRINT " << render_ast_expression(*node.children.at(0)) << "\n";
+            out << first_pad << "PRINT " << render_ast_expression(*node.children.at(0)) << "\n";
             return;
         case AstKind::Assign: {
             std::string target = node.name;
             for (int i = 0; i < node.integer; ++i) {
                 target += "[" + render_ast_expression(*node.children.at(static_cast<std::size_t>(i))) + "]";
             }
-            out << pad << "LET " << target << " = " << render_ast_expression(*node.children.back()) << "\n";
+            out << first_pad << "LET " << target << " = " << render_ast_expression(*node.children.back()) << "\n";
             return;
         }
         case AstKind::ExpressionStatement:
-            out << pad << render_ast_expression(*node.children.at(0)) << "\n";
+            out << first_pad << render_ast_expression(*node.children.at(0)) << "\n";
             return;
+        case AstKind::CompoundAssign: {
+            std::string op_text;
+            switch (node.op) {
+                case TokenType::PlusEqual: op_text = "+="; break;
+                case TokenType::MinusEqual: op_text = "-="; break;
+                case TokenType::StarEqual: op_text = "*="; break;
+                case TokenType::SlashEqual: op_text = "/="; break;
+                case TokenType::AmpersandEqual: op_text = "&="; break;
+                case TokenType::PipeEqual: op_text = "|="; break;
+                case TokenType::CaretEqual: op_text = "^="; break;
+                case TokenType::ShiftLeftEqual: op_text = "<<="; break;
+                case TokenType::ShiftRightEqual: op_text = ">>="; break;
+                default: op_text = "+="; break;
+            }
+            out << first_pad << node.name << " " << op_text << " " << render_ast_expression(*node.children.at(0)) << "\n";
+            return;
+        }
         case AstKind::Return:
-            out << pad << "RETURN";
+            out << first_pad << "RETURN";
             if (!node.children.empty()) out << " " << render_ast_expression(*node.children.at(0));
             out << "\n";
             return;
         case AstKind::If: {
-            out << pad << "IF " << render_ast_expression(*node.children.at(0)) << " THEN\n";
+            out << first_pad << "IF " << render_ast_expression(*node.children.at(0)) << " THEN\n";
             if (const auto* then_group = find_canonical_group(node, "then")) render_ast_block(out, then_group->nodes, indent + 1);
             const auto* else_group = find_canonical_group(node, "else");
             if (else_group && !else_group->nodes.empty()) {
@@ -712,7 +740,7 @@ void render_ast_statement(std::ostream& out, const CanonicalAstNode& node, int i
             return;
         }
         case AstKind::For: {
-            out << pad << "FOR " << node.name << " = " << render_ast_expression(*node.children.at(0)) << " TO "
+            out << first_pad << "FOR " << node.name << " = " << render_ast_expression(*node.children.at(0)) << " TO "
                 << render_ast_expression(*node.children.at(1));
             if (node.children.size() > 2 && node.children[2]) {
                 out << " STEP " << render_ast_expression(*node.children[2]);
@@ -723,7 +751,7 @@ void render_ast_statement(std::ostream& out, const CanonicalAstNode& node, int i
             return;
         }
         case AstKind::Function: {
-            out << pad << "FUNCTION " << node.name << "(";
+            out << first_pad << "FUNCTION " << node.name << "(";
             for (std::size_t i = 0; i < node.parameters.size(); ++i) {
                 if (i) out << ", ";
                 out << node.parameters[i].name;
@@ -737,7 +765,7 @@ void render_ast_statement(std::ostream& out, const CanonicalAstNode& node, int i
             return;
         }
         default:
-            out << pad << "REM <pretty-printing not yet implemented for this construct>\n";
+            out << first_pad << "REM <pretty-printing not yet implemented for this construct>\n";
             return;
     }
 }
