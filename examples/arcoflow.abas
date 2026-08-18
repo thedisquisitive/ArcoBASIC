@@ -88,7 +88,7 @@ CATCH err
     ExitTheProgram(0)
 END TRY
 
-app = {"Path": initial_path, "HasPath": has_path, "Dirty": FALSE, "Running": TRUE, "Status": "Ready", "Output": "", "ToolbarHover": "", "ProjectName": projectName}
+app = {"Path": initial_path, "HasPath": has_path, "Dirty": FALSE, "Running": TRUE, "Status": "Ready", "Output": "", "ToolbarHover": "", "ProjectName": projectName, "CollapsedFolders": []}
 
 editor = TextArea(initial_content)
 runButton = Button("Run (F5)")
@@ -96,12 +96,67 @@ saveButton = Button("Save")
 openButton = Button("Open")
 newButton = Button("New")
 
-' One Button per project file, built once up front like the toolbar buttons above -- SetBounds
-' happens every frame in the main loop (same as the toolbar), but the instances themselves and
-' their click handlers are stable across frames.
-fileButtons = []
-FOR i = 0 TO LEN(projectFiles) - 1
-    ignored = Array.Add(fileButtons, Button(Path.BaseName(projectFiles[i])))
+' Project.Files entries may contain "/" to place a file under one or more folders (e.g.
+' "src/utils/helper.abas"); BuildExplorerRows flattens that into one row per path segment seen
+' (folders get one row the first time they're seen, files always get their own row), each
+' carrying its nesting Depth so the drawing loop can indent it and ComputeVisibleRows can tell
+' whether it's inside a currently-collapsed folder.
+FUNCTION BuildExplorerRows(files)
+    rows = []
+    knownFolders = []
+    FOR i = 0 TO LEN(files) - 1
+        parts = String.Split(files[i], "/")
+        prefix = ""
+        FOR d = 0 TO LEN(parts) - 2
+            IF prefix == "" THEN prefix = parts[d] ELSE prefix = prefix + "/" + parts[d]
+            IF Array.Contains(knownFolders, prefix) == FALSE THEN
+                ignored = Array.Add(knownFolders, prefix)
+                ignored2 = Array.Add(rows, {Kind: "folder", Label: parts[d], Path: prefix, Depth: d})
+            END IF
+        NEXT d
+        ignored3 = Array.Add(rows, {Kind: "file", Label: parts[LEN(parts) - 1], Path: files[i], Depth: LEN(parts) - 1})
+    NEXT i
+    RETURN rows
+END FUNCTION
+
+' Indexes into `rows` that should currently be drawn, given which folder Paths are collapsed --
+' skips every row nested under a collapsed folder (deeper Depth, contiguous following it) without
+' needing the rows themselves to carry parent pointers.
+FUNCTION ComputeVisibleRows(rows, collapsed)
+    visible = []
+    skipDepth = -1
+    FOR i = 0 TO LEN(rows) - 1
+        row = rows[i]
+        IF skipDepth >= 0 ANDALSO row.Depth > skipDepth THEN
+            ' inside a collapsed folder's subtree -- stays hidden
+        ELSE
+            skipDepth = -1
+            ignored = Array.Add(visible, i)
+            IF row.Kind == "folder" ANDALSO Array.Contains(collapsed, row.Path) THEN skipDepth = row.Depth
+        END IF
+    NEXT i
+    RETURN visible
+END FUNCTION
+
+FUNCTION ToggleFolder(path)
+    at = Array.Find(app.CollapsedFolders, path)
+    IF at >= 0 THEN
+        ignored = Array.RemoveAt(app.CollapsedFolders, at)
+    ELSE
+        ignored = Array.Add(app.CollapsedFolders, path)
+    END IF
+END FUNCTION
+
+' One Button per explorer row (folders and files alike -- a folder row's "click" toggles it
+' instead of opening a file), built once up front like the toolbar buttons above. Which of these
+' are actually drawn/hit-tested varies frame to frame with collapse state; see ComputeVisibleRows.
+explorerRows = BuildExplorerRows(projectFiles)
+rowButtons = []
+FOR i = 0 TO LEN(explorerRows) - 1
+    row = explorerRows[i]
+    label = row.Label
+    IF row.Kind == "folder" THEN label = "> " + label
+    ignored = Array.Add(rowButtons, Button(label))
 NEXT i
 sidebarWidth = 0
 IF LEN(projectFiles) > 0 THEN sidebarWidth = 200
@@ -205,32 +260,42 @@ WHILE app.Running
 
     ' Project explorer sidebar -- only takes up space at all when a project with Files was
     ' loaded, so a bare .abas file with no project keeps today's full-width layout untouched.
+    ' Computed once per frame and reused below for event handling too, so a click is tested
+    ' against exactly the rows that were actually drawn (and positioned) this same frame.
+    visibleRows = ComputeVisibleRows(explorerRows, app.CollapsedFolders)
     IF sidebarWidth > 0 THEN
         GUI.Rectangle(window, 0, 0, sidebarWidth, size.Height, 0.045, 0.05, 0.068)
         GUI.Text(window, projectName, 14, 14, 12, 0.5, 0.58, 0.72, 1.0)
         row_heights = []
-        FOR i = 0 TO LEN(projectFiles) - 1
+        FOR i = 0 TO LEN(visibleRows) - 1
             ignored = Array.Add(row_heights, 26)
         NEXT i
         row_offsets = VStack(40, row_heights, 4)
-        FOR i = 0 TO LEN(projectFiles) - 1
-            ' `fileButtons[i].SetBounds(...)` doesn't parse -- indexing then dotting into the
-            ' result is a real, pre-existing lexer gap (`.` only tokenizes as part of a compound
-            ' dotted identifier scanned in one go, not as its own token, so it has nowhere to go
-            ' right after a `]`). Same workaround as Func(...).Field elsewhere: go through a
-            ' plain variable first, which is itself a reference to the same Button instance.
-            fileButton = fileButtons[i]
-            fileButton.SetBounds(8, row_offsets[i], sidebarWidth - 16, 26)
-            IF Path.BaseName(app.Path) == Path.BaseName(projectFiles[i]) THEN
-                fileButton.BackgroundR = 0.16
-                fileButton.BackgroundG = 0.24
-                fileButton.BackgroundB = 0.36
-            ELSE
-                fileButton.BackgroundR = 0.08
-                fileButton.BackgroundG = 0.09
-                fileButton.BackgroundB = 0.12
+        FOR i = 0 TO LEN(visibleRows) - 1
+            ' `rowButtons[rowIndex].SetBounds(...)` doesn't parse -- indexing then dotting into
+            ' the result is a real, pre-existing lexer gap (`.` only tokenizes as part of a
+            ' compound dotted identifier scanned in one go, not as its own token, so it has
+            ' nowhere to go right after a `]`). Same workaround as Func(...).Field elsewhere: go
+            ' through plain variables first, themselves references to the same instances.
+            rowIndex = visibleRows[i]
+            row = explorerRows[rowIndex]
+            rowButton = rowButtons[rowIndex]
+            indent = row.Depth * 14
+            rowButton.SetBounds(8 + indent, row_offsets[i], sidebarWidth - 16 - indent, 26)
+            IF row.Kind == "folder" THEN
+                rowButton.Label = "> " + row.Label
+                IF Array.Contains(app.CollapsedFolders, row.Path) == FALSE THEN rowButton.Label = "v " + row.Label
             END IF
-            fileButton.Draw(window)
+            IF row.Kind == "file" ANDALSO Path.BaseName(app.Path) == Path.BaseName(row.Path) THEN
+                rowButton.BackgroundR = 0.16
+                rowButton.BackgroundG = 0.24
+                rowButton.BackgroundB = 0.36
+            ELSE
+                rowButton.BackgroundR = 0.08
+                rowButton.BackgroundG = 0.09
+                rowButton.BackgroundB = 0.12
+            END IF
+            rowButton.Draw(window)
         NEXT i
     END IF
 
@@ -275,9 +340,17 @@ WHILE app.Running
     IF saveButton.HandleEvent(window, event) THEN ignored = SaveDocument()
     IF runButton.HandleEvent(window, event) THEN ignored = RunProgram()
 
-    FOR i = 0 TO LEN(fileButtons) - 1
-        fileButton = fileButtons[i]
-        IF fileButton.HandleEvent(window, event) THEN ignored = OpenPath(Path.Join(projectRoot, projectFiles[i]))
+    FOR i = 0 TO LEN(visibleRows) - 1
+        rowIndex = visibleRows[i]
+        row = explorerRows[rowIndex]
+        rowButton = rowButtons[rowIndex]
+        IF rowButton.HandleEvent(window, event) THEN
+            IF row.Kind == "folder" THEN
+                ignored = ToggleFolder(row.Path)
+            ELSE
+                ignored = OpenPath(Path.Join(projectRoot, row.Path))
+            END IF
+        END IF
     NEXT i
 
     before_text = editor.Text
