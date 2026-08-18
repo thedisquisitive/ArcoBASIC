@@ -2757,7 +2757,7 @@ Runtime::Runtime()
     // General script-scope-global fallback for the bytecode compiler: every FUNCTION compiles to
     // its own independent set of locals with no visibility into the enclosing script's top-level
     // variables (the same gap Args had above, but for any ordinary top-level variable, e.g.
-    // examples/arcoflow.abas's `app = {...}`). AstAmirBuilder::apply_script_global_scoping in
+    // arcoflow/arcoflow.abas's `app = {...}`). AstAmirBuilder::apply_script_global_scoping in
     // fission.cpp is the actual mechanism -- these two are just the read/write primitive it calls
     // through, mirroring Main's assignments here and seeding every other function's same-named
     // local from here in a synthetic prologue.
@@ -2811,7 +2811,7 @@ Runtime::Runtime()
         return true;
     });
     // Path.* previously existed only in arco_shell (src/shell/arcosh.cpp) -- plain std::filesystem
-    // wrappers with no shell-specific dependency, so a capsule (e.g. examples/arcoflow.abas,
+    // wrappers with no shell-specific dependency, so a capsule (e.g. arcoflow/arcoflow.abas,
     // which needs Path.BaseName for its window title) had no way to reach them despite File.*
     // already being universal. Same gap as Process.Run/Process.Env/GUI.TextMono earlier.
     register_function("Path.Join", [](const std::vector<Value>& args) -> Value {

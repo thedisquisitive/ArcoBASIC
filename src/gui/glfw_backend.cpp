@@ -131,7 +131,7 @@ std::string key_name(int key) {
     if (key >= GLFW_KEY_A && key <= GLFW_KEY_Z) return std::string(1, static_cast<char>('a' + key - GLFW_KEY_A));
     if (key >= GLFW_KEY_0 && key <= GLFW_KEY_9) return std::string(1, static_cast<char>('0' + key - GLFW_KEY_0));
     // F1-F25 were entirely unhandled (fell through to "unknown"), so no ArcoBASIC app could ever
-    // bind a function-key shortcut -- found via examples/arcoflow.abas's F5-to-run binding
+    // bind a function-key shortcut -- found via arcoflow/arcoflow.abas's F5-to-run binding
     // silently never firing.
     if (key >= GLFW_KEY_F1 && key <= GLFW_KEY_F25) return "f" + std::to_string(key - GLFW_KEY_F1 + 1);
     switch (key) {

@@ -1,0 +1,51 @@
+# ArcoFlow
+
+ArcoFlow is the IDE for ArcoBASIC/ArcoFission: an intent-based editor that will eventually offer a
+graph/flowchart canvas (nodes, ports, wires) with a bidirectional Intent-view <-> ArcoBASIC-source
+toggle, alongside plain text editing. It's itself an ArcoBASIC program, built on `stdlib/gui.abas`.
+
+Current state is a working text-editing prototype: edit an ArcoBASIC file, save it, run it via a
+real `Process.Run` -> `ArcoFission compile-run` round trip, see the output. It understands the
+[project format](#project-format) below, including a collapsible project explorer sidebar. No
+Intent/graph view yet, no syntax highlighting yet -- both deliberately deferred.
+
+## Running it
+
+Build a native capsule from the repository root and launch it, optionally pointing at a file or a
+`.arcoproj` project file:
+
+```sh
+build/ArcoFission native arcoflow/arcoflow.abas -o /tmp/arcoflow
+/tmp/arcoflow [path/to/file.abas | path/to/project.arcoproj]
+```
+
+Requires a live Wayland or X11 desktop session. `ARCOFISSION_PATH` can point Run at a specific
+`ArcoFission` binary; it otherwise falls back to whatever's on `PATH`, or a project's own
+`ArcoFissionPath` field if set (see below).
+
+## Project format
+
+A project's manifest is a file named `project.arcoproj`, either opened directly or discovered as a
+sibling of whatever file was opened directly -- entirely optional, a bare `.abas` file with no
+project around it behaves exactly as if none of this existed. The file's entire content is a single
+ArcoBASIC object-literal expression (`Project.Load` in `runtime.cpp` evaluates it through the
+language's own parser, not a bespoke format), for example:
+
+```
+{
+    Name: "My Project",
+    Entry: "main.abas",
+    Files: ["main.abas", "src/app.abas", "src/utils/helper.abas"],
+    Window: {Width: 1000, Height: 700},
+    ArcoFissionPath: ""
+}
+```
+
+All fields are optional. `Files` entries may contain `/` to place a file under one or more folders,
+which the explorer sidebar renders as a collapsible tree (folders sorted before files, alphabetical
+within each level).
+
+## Layout
+
+- `arcoflow.abas` — the editor itself.
+- `concept_render.png` — early concept art for the eventual Intent graph view.

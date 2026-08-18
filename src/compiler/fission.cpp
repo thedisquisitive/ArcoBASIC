@@ -854,7 +854,7 @@ private:
     }
 
     // Every FUNCTION lowers to its own independent AmirFunction with its own locals -- confirmed
-    // by examples/arcoflow.abas's `app = {...}` (assigned once, at script scope) crashing every
+    // by arcoflow/arcoflow.abas's `app = {...}` (assigned once, at script scope) crashing every
     // FUNCTION that merely reads app.Something with "undefined bytecode local: app", the same
     // failure Args had before Runtime.Args/the seed above, just for any ordinary top-level
     // variable instead of one specific name. The tree-walking runtime (arco_cli, ground truth --
