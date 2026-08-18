@@ -41,15 +41,19 @@ arcoflow/build/arcoflow arcoflow/example-project/project.arcoproj
 ### In a browser
 
 ArcoFlow also runs as a WebAssembly capsule (see "Web Capsules" in `docs/arcofission.md` for full
-Emscripten toolchain setup). Once `arcoflow/build.sh` has produced `arcoflow/build/web/arcoflow.*`,
-serve it over plain HTTP and open the printed URL -- opening `arcoflow.html` directly via a
-`file://` URL doesn't work, browsers refuse to fetch a `.wasm` file across the `file://` origin
-(CORS) and the page aborts before it runs:
+Emscripten toolchain setup). Once `arcoflow/build.sh` has produced `arcoflow/build/web/arcoflow.html`,
+just open it -- no server needed, the same way a Godot (or any other) self-contained web export
+works. It's a single file (the wasm module is embedded as base64 inside it, not fetched
+separately, which is what lets a plain `file://` open work at all -- browsers block fetching a
+*separate* `.wasm` across the `file://` origin, which is what "both async and sync fetching of the
+wasm failed" means if you ever see it from an older build):
 
 ```sh
-arcoflow/serve.sh          # serves arcoflow/build/web/ at http://127.0.0.1:8000/arcoflow.html
-arcoflow/serve.sh 8080     # or a specific port
+xdg-open arcoflow/build/web/arcoflow.html   # or just double-click it in a file manager
 ```
+
+`arcoflow/serve.sh` still exists for serving it over real HTTP if you'd rather (e.g. to share a
+link), but it's optional now, not required.
 
 Editing, saving, and the project explorer all work the same as on desktop. `Run` fails gracefully
 with no subprocess to shell out to (there's no `ArcoFission` reachable from inside a browser

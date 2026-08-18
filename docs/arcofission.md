@@ -193,10 +193,15 @@ export ARCOFISSION_WEB_CXX="$HOME/emsdk/upstream/emscripten/em++"  # only if em+
 build/ArcoFission native examples/hello.bas -o hello.html --target web
 ```
 
-This writes `hello.html`, `hello.js`, and `hello.wasm` alongside each other; serve the directory
-over HTTP (`python3 -m http.server`, or any static file server -- `file://` won't work, browsers
-block wasm fetches from it) and open `hello.html`. Console output (`PRINT`, uncaught errors)
-appears both on the page and in the browser's own JS console.
+This writes a single self-contained `hello.html` -- just open it directly (`file://` included, no
+server needed: `-sSINGLE_FILE=1` embeds the wasm module as base64 inside the generated JS, itself
+inlined into the page, rather than the default shape of a bare `fetch()` of a separate `.wasm`
+file, which browsers refuse to do across a `file://` origin -- the same "both async and sync
+fetching of the wasm failed" error you'd get trying to open a plain Emscripten export directly).
+Console output (`PRINT`, uncaught errors) appears both on the page and in the browser's own JS
+console. `--target web -o hello.js` or `-o hello.wasm` instead produces the traditional separate
+`.js`/`.wasm` files (no `-sSINGLE_FILE`, no custom shell) for callers who want that shape instead,
+e.g. a real HTTP-served deployment where the fetch/caching tradeoff runs the other way.
 
 **GUI capsules** (anything using `stdlib/gui.abas`/`GUI.*`, including `arcoflow/arcoflow.abas`
 itself) work too: `src/gui/canvas_backend.cpp` implements the same `arco::gui` interface

@@ -6331,6 +6331,20 @@ Result build_web_bytecode(const std::string& bytecode_binary, const std::string&
         if (std::filesystem::path(output).extension() == ".html") {
             args.push_back("--shell-file");
             args.push_back((source_root / "src" / "gui" / "web_shell.html").string());
+            // Browsers refuse to fetch() a separate .wasm across a file:// origin (CORS), which
+            // is the *default* Emscripten output shape (a bare fetch of a sibling .wasm file) --
+            // meaning double-clicking the .html and opening it directly aborts with "both async
+            // and sync fetching of the wasm failed" unless it's served over real HTTP first.
+            // -sSINGLE_FILE=1 embeds the wasm as base64 directly inside the generated JS (itself
+            // inlined into this single .html, since there's no separate -o .js target here) --
+            // one self-contained file, loadable by just opening it, no server needed at all, the
+            // same way a Godot web export or any other single-file wasm deliverable works. Comes
+            // at some cost (larger file via base64 overhead, a base64-decode at every load
+            // instead of a binary fetch) that's a reasonable tradeoff for "just works," and is
+            // only applied for .html output -- a caller explicitly asking for separate .js/.wasm
+            // (say, for a real CDN-backed deployment where the fetch/caching tradeoff runs the
+            // other way) still gets that.
+            args.push_back("-sSINGLE_FILE=1");
         }
 
         std::ostringstream command;
@@ -6351,9 +6365,21 @@ Result build_web_bytecode(const std::string& bytecode_binary, const std::string&
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             return {false, "", "Emscripten compiler failed while building the web capsule"};
         }
-        const std::filesystem::path wasm_output = std::filesystem::path(output).replace_extension(".wasm");
-        if (!is_wasm_file(wasm_output)) {
-            return {false, "", "Emscripten compiler did not produce a valid wasm module"};
+        // -sSINGLE_FILE=1 above means .html output has no sibling .wasm to check anymore (the
+        // module is embedded as base64 inside the .html itself) -- confirm that file exists and
+        // is a plausible size instead. Anything else (an explicit .js/.wasm request, which
+        // doesn't get -sSINGLE_FILE) still gets the real wasm-magic-number check.
+        if (std::filesystem::path(output).extension() == ".html") {
+            std::error_code size_error;
+            const auto html_size = std::filesystem::file_size(output, size_error);
+            if (size_error || html_size < 1024) {
+                return {false, "", "Emscripten compiler did not produce a usable " + output};
+            }
+        } else {
+            const std::filesystem::path wasm_output = std::filesystem::path(output).replace_extension(".wasm");
+            if (!is_wasm_file(wasm_output)) {
+                return {false, "", "Emscripten compiler did not produce a valid wasm module"};
+            }
         }
 
         std::ostringstream message;
