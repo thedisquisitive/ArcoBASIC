@@ -11,12 +11,19 @@ Intent/graph view yet, no syntax highlighting yet -- both deliberately deferred.
 
 ## Running it
 
-Build a native capsule from the repository root and launch it, optionally pointing at a file or a
-`.arcoproj` project file:
+All builds land inside this folder, under `arcoflow/build/` (gitignored, same as the top-level
+`build/`) -- nothing gets written outside `arcoflow/`. Build both the native and (if you have an
+Emscripten toolchain tree set up -- see below) web capsules with:
 
 ```sh
-build/ArcoFission native arcoflow/arcoflow.abas -o build/arcoflow
-build/arcoflow [path/to/file.abas | path/to/project.arcoproj]
+ARCOFISSION_WEB_TOOLCHAIN_DIR=/path/to/build-wasm arcoflow/build.sh   # web capsule needs this env var
+arcoflow/build.sh                                                     # native only, if you don't
+```
+
+Then launch the native capsule, optionally pointing at a file or a `.arcoproj` project file:
+
+```sh
+arcoflow/build/arcoflow [path/to/file.abas | path/to/project.arcoproj]
 ```
 
 Requires a live Wayland or X11 desktop session. `ARCOFISSION_PATH` can point Run at a specific
@@ -28,18 +35,20 @@ to show an explorer sidebar for -- that's expected, not a bug (see below). To ac
 explorer, point it at `example-project/`, which has a `project.arcoproj` with a couple of folders:
 
 ```sh
-build/arcoflow arcoflow/example-project/project.arcoproj
+arcoflow/build/arcoflow arcoflow/example-project/project.arcoproj
 ```
 
 ### In a browser
 
 ArcoFlow also runs as a WebAssembly capsule (see "Web Capsules" in `docs/arcofission.md` for full
-toolchain setup):
+Emscripten toolchain setup). Once `arcoflow/build.sh` has produced `arcoflow/build/web/arcoflow.*`,
+serve it over plain HTTP and open the printed URL -- opening `arcoflow.html` directly via a
+`file://` URL doesn't work, browsers refuse to fetch a `.wasm` file across the `file://` origin
+(CORS) and the page aborts before it runs:
 
 ```sh
-export ARCOFISSION_WEB_TOOLCHAIN_DIR=/path/to/build-wasm
-build/ArcoFission native arcoflow/arcoflow.abas -o arcoflow.html --target web
-python3 -m http.server   # from the directory holding arcoflow.html/.js/.wasm
+arcoflow/serve.sh          # serves arcoflow/build/web/ at http://127.0.0.1:8000/arcoflow.html
+arcoflow/serve.sh 8080     # or a specific port
 ```
 
 Editing, saving, and the project explorer all work the same as on desktop. `Run` fails gracefully
@@ -72,6 +81,8 @@ within each level).
 ## Layout
 
 - `arcoflow.abas` — the editor itself.
+- `build.sh` / `serve.sh` — build both capsules into `build/`; serve the web one over HTTP.
+- `build/` — build output (gitignored): `build/arcoflow` (native), `build/web/arcoflow.*` (web).
 - `example-project/` — a small sample project (a `project.arcoproj`, a couple of folders) for
   trying the project explorer without having to build one first.
 - `concept_render.png` — early concept art for the eventual Intent graph view.
