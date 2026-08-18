@@ -212,6 +212,10 @@ struct AmirModule {
     std::optional<std::uint64_t> instruction_limit;
     std::vector<AmirFunction> functions;
     std::vector<std::string> diagnostics;
+    // Child class name -> EXTENDS parent name (empty if none). Purely static/compile-time
+    // information (ArcoBASIC has no dynamic reparenting), carried into BytecodeModule so instance
+    // method dispatch can walk it at runtime without re-deriving it from the AST.
+    std::unordered_map<std::string, std::string> class_parents;
 };
 
 AmirInstruction amir_label(std::string target) {
@@ -1376,7 +1380,13 @@ private:
         }
         const auto receiver_dot = target.find('.');
         const std::string receiver_name = receiver_dot == std::string::npos ? "" : target.substr(0, receiver_dot);
-        if (node.kind == AstKind::MethodCall && (has_parameter(function, node.secondary_name) ||
+        // SELF is a parameter now that class methods bind an implicit receiver (see lower_class),
+        // but SELF.Method(...) is always ordinary instance dispatch, never the freestanding/UEFI
+        // external-call path this heuristic exists for -- exclude it explicitly rather than
+        // route every method-calling-another-method-on-itself through CALL_EXTERNAL, which the
+        // bytecode VM doesn't implement.
+        if (node.kind == AstKind::MethodCall && node.secondary_name != "SELF" &&
+            (has_parameter(function, node.secondary_name) ||
             (types_.count(receiver_name) != 0 && types_.at(receiver_name).rfind("UEFI.", 0) == 0))) {
             instruction.kind = AmirInstruction::Kind::CallExternal;
             if (!receiver_name.empty() && types_.count(receiver_name) != 0) instruction.operand_types = {types_.at(receiver_name)};
@@ -1972,6 +1982,23 @@ private:
         module_.functions.push_back(std::move(function));
     }
 
+    // Compiles a CLASS declaration into real, callable bytecode functions instead of the
+    // DECLARE_CLASS marker alone (which the bytecode VM treats as a no-op -- see
+    // BytecodeOp::DeclareClass in execute_function). Synthesizes, per class:
+    //   - ClassName.Method for each method (as before), now with an implicit SELF parameter
+    //     (unless SHARED) so a method body's `SELF.Field` references have something bound to
+    //     read.
+    //   - ClassName.__new: builds a field-initialized instance, delegating to the parent's __new
+    //     first (recursively) so inherited fields are present before this class's own field
+    //     defaults and __class overlay them -- the same order the tree-walking interpreter's
+    //     ClassStmt::exec/.__new (src/frontend/parser.cpp) already uses, just compiled instead of
+    //     evaluated live.
+    //   - ClassName itself: the public constructor. Calls __new, then Init (the CONSTRUCTOR body,
+    //     which the method loop above already compiles under that name) if the class declares
+    //     one, forwarding the constructor's own arguments positionally.
+    // Instance method call dispatch (`instance.Method(...)` resolving to the *runtime* type of
+    // `instance`, not whatever class the compile-time receiver expression happens to be) is a
+    // separate fix in the CallValue interpreter case, since it's inherently a runtime concern.
     void lower_class(AmirFunction& owner, const CanonicalAstNode& node) {
         std::vector<std::string> metadata;
         std::ostringstream header;
@@ -1984,11 +2011,15 @@ private:
         if (header.tellp() > 0) metadata.push_back(header.str());
         current_block(owner).instructions.push_back(amir_declare_class(node.name, std::move(metadata)));
 
+        module_.class_parents[node.name] = node.secondary_name;
+
+        const CanonicalAstNode* init_method = nullptr;
         for (const auto& method : ast_group(node, "methods")) {
             if (method->kind != AstKind::ClassMethod || method->flag2) continue;
             AmirFunction function;
             function.name = node.name + "." + method->name;
             function.return_type = method->type_name.empty() ? "VALUE" : method->type_name;
+            if (!method->flag) function.params.push_back("SELF");
             for (const auto& param : method->parameters) function.params.push_back(parameter_text(param));
             function.blocks.push_back(AmirBlock{"Entry"});
             const std::size_t saved_block = current_block_;
@@ -2000,6 +2031,86 @@ private:
             current_block_ = saved_block;
             loop_stack_ = saved_loops;
             module_.functions.push_back(std::move(function));
+            if (method->name == "Init") init_method = method.get();
+        }
+
+        {
+            AmirFunction new_function;
+            new_function.name = node.name + ".__new";
+            new_function.return_type = "VALUE";
+            new_function.blocks.push_back(AmirBlock{"Entry"});
+            const std::size_t saved_block = current_block_;
+            const auto saved_loops = loop_stack_;
+            current_block_ = 0;
+            loop_stack_.clear();
+
+            const std::string base_temp = temp();
+            if (!node.secondary_name.empty()) {
+                current_block(new_function).instructions.push_back(amir_call_value(base_temp, node.secondary_name + ".__new", {}));
+            } else {
+                current_block(new_function).instructions.push_back(amir_object(base_temp, {}));
+            }
+            const std::string instance_local = "__instance";
+            current_block(new_function).instructions.push_back(amir_store(instance_local, base_temp));
+
+            const std::string class_key = temp();
+            current_block(new_function).instructions.push_back(amir_const(class_key, "\"__class\""));
+            const std::string class_value = temp();
+            current_block(new_function).instructions.push_back(amir_const(class_value, "\"" + escaped(node.name) + "\""));
+            current_block(new_function).instructions.push_back(amir_store_index(instance_local, {class_key, class_value}));
+
+            for (const auto& field : ast_group(node, "fields")) {
+                if (field->kind != AstKind::ClassField || field->flag) continue;
+                const std::string field_key = temp();
+                current_block(new_function).instructions.push_back(amir_const(field_key, "\"" + escaped(field->name) + "\""));
+                std::string field_value;
+                if (!field->children.empty() && field->children[0]) {
+                    field_value = lower_expression(new_function, *field->children[0]);
+                } else {
+                    field_value = temp();
+                    current_block(new_function).instructions.push_back(amir_const(field_value, "nothing"));
+                }
+                current_block(new_function).instructions.push_back(amir_store_index(instance_local, {field_key, field_value}));
+            }
+
+            const std::string result_temp = lower_variable(current_block(new_function), instance_local);
+            current_block(new_function).instructions.push_back(amir_return("VALUE", result_temp));
+            current_block_ = saved_block;
+            loop_stack_ = saved_loops;
+            module_.functions.push_back(std::move(new_function));
+        }
+
+        {
+            AmirFunction ctor_function;
+            ctor_function.name = node.name;
+            ctor_function.return_type = "VALUE";
+            std::vector<std::string> forward_param_names;
+            if (init_method) {
+                for (const auto& param : init_method->parameters) {
+                    ctor_function.params.push_back(parameter_text(param));
+                    forward_param_names.push_back(param.name);
+                }
+            }
+            ctor_function.blocks.push_back(AmirBlock{"Entry"});
+            const std::size_t saved_block = current_block_;
+            const auto saved_loops = loop_stack_;
+            current_block_ = 0;
+            loop_stack_.clear();
+
+            const std::string instance_temp = temp();
+            current_block(ctor_function).instructions.push_back(amir_call_value(instance_temp, node.name + ".__new", {}));
+            if (init_method) {
+                std::vector<std::string> call_args{instance_temp};
+                for (const auto& name : forward_param_names) {
+                    call_args.push_back(lower_variable(current_block(ctor_function), name));
+                }
+                const std::string discard = temp();
+                current_block(ctor_function).instructions.push_back(amir_call_value(discard, node.name + ".Init", std::move(call_args)));
+            }
+            current_block(ctor_function).instructions.push_back(amir_return("VALUE", instance_temp));
+            current_block_ = saved_block;
+            loop_stack_ = saved_loops;
+            module_.functions.push_back(std::move(ctor_function));
         }
     }
 
@@ -2628,6 +2739,8 @@ struct BytecodeModule {
     std::vector<BytecodeFunction> functions;
     std::unordered_map<std::string, std::size_t> function_indices;
     std::vector<std::string> diagnostics;
+    // Child class name -> EXTENDS parent name (empty if none); see AmirModule::class_parents.
+    std::unordered_map<std::string, std::string> class_parents;
 };
 
 std::string bytecode_op_name(BytecodeOp op) {
@@ -2888,6 +3001,7 @@ BytecodeModule build_bytecode(const AmirModule& amir) {
     module.version = 0;
     module.instruction_limit = amir.instruction_limit;
     module.diagnostics = amir.diagnostics;
+    module.class_parents = amir.class_parents;
 
     for (const auto& amir_function : amir.functions) {
         BytecodeFunction function;
@@ -3128,6 +3242,14 @@ std::string render_bytecode(const BytecodeModule& module) {
         out << "END FUNCTION\n\n";
     }
 
+    if (!module.class_parents.empty()) {
+        out << "CLASS_PARENTS " << module.class_parents.size() << "\n";
+        for (const auto& [child, parent] : module.class_parents) {
+            out << "    " << child << " " << (parent.empty() ? "-" : parent) << "\n";
+        }
+        out << "END CLASS_PARENTS\n\n";
+    }
+
     return out.str();
 }
 
@@ -3166,11 +3288,27 @@ BytecodeModule parse_bytecode(const std::string& text) {
     BytecodeModule module;
     BytecodeFunction* function = nullptr;
     BytecodeBlock* block = nullptr;
+    bool in_class_parents = false;
 
     while (std::getline(input, line)) {
         line = trim(line);
         if (line.empty() || line == "ARCOFISSION BYTECODE" || line == "FORMAT .arcof-text" || line == "OPCODES" ||
             line == "END OPCODES" || line == "END CONSTANTS" || line == "END DIAGNOSTICS") {
+            continue;
+        }
+        if (line.rfind("CLASS_PARENTS ", 0) == 0) {
+            in_class_parents = true;
+            continue;
+        }
+        if (line == "END CLASS_PARENTS") {
+            in_class_parents = false;
+            continue;
+        }
+        if (in_class_parents) {
+            const auto words = split_words(line);
+            if (words.size() == 2) {
+                module.class_parents.emplace(words[0], words[1] == "-" ? "" : words[1]);
+            }
             continue;
         }
 
@@ -3292,6 +3430,12 @@ std::string render_binary_bytecode(const BytecodeModule& module) {
             }
         }
     }
+
+    append_u32(out, static_cast<std::uint32_t>(module.class_parents.size()));
+    for (const auto& [child, parent] : module.class_parents) {
+        append_string(out, child);
+        append_string(out, parent);
+    }
     return out;
 }
 
@@ -3391,6 +3535,15 @@ BytecodeModule parse_binary_bytecode(const std::string& binary) {
         }
         module.functions.push_back(std::move(function));
     }
+
+    const std::uint32_t class_parent_count = reader.u32();
+    module.class_parents.reserve(class_parent_count);
+    for (std::uint32_t i = 0; i < class_parent_count; ++i) {
+        std::string child = reader.string();
+        std::string parent = reader.string();
+        module.class_parents.emplace(std::move(child), std::move(parent));
+    }
+
     if (reader.offset != binary.size()) {
         throw std::runtime_error("binary bytecode capsule has trailing data");
     }
@@ -5204,7 +5357,57 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                     runtime.is_callable(runtime.get_global(instruction.operands[1]))) {
                     callable_target = runtime.get_global(instruction.operands[1]);
                 }
-                if (callable_target.has_value()) {
+
+                // Instance method dispatch: `receiver.Method(...)` where `receiver` is a plain
+                // local/global holding a class instance (an Object with __class), not a callable
+                // bound via ADDRESSOF (that's the callable_target branch below). The compile-time-
+                // baked "receiver.Method" text can't be resolved statically the way "GUI.Text"-
+                // style namespaced host calls can: ArcoBASIC is dynamically typed, so the same
+                // call site can see different runtime types across calls (polymorphism through
+                // EXTENDS). Always re-resolves against the receiver's actual __class, walking
+                // class_parents for inherited/overridden methods, rather than being cached like
+                // the branches below -- same reasoning as why callable_target is left uncached.
+                bool dispatched_instance_method = false;
+                if (!callable_target.has_value()) {
+                    const auto dot = instruction.operands[1].find('.');
+                    if (dot != std::string::npos) {
+                        const std::string receiver_name = instruction.operands[1].substr(0, dot);
+                        const std::string method_name = instruction.operands[1].substr(dot + 1);
+                        std::optional<Value> receiver_value;
+                        const auto receiver_local = function.local_refs_by_base.find(receiver_name);
+                        if (receiver_local != function.local_refs_by_base.end()) {
+                            const std::size_t local_index = local_index_from_ref(receiver_local->second);
+                            if (local_index < frame.locals.size() && frame.locals[local_index].kind != BytecodeSlot::Kind::Undefined) {
+                                receiver_value = slot_value(frame.locals[local_index], receiver_local->second);
+                            }
+                        } else if (runtime.has_global(receiver_name)) {
+                            receiver_value = runtime.get_global(receiver_name);
+                        }
+                        if (receiver_value.has_value() && receiver_value->is_object()) {
+                            const auto& receiver_object = receiver_value->as_object();
+                            const auto class_field = receiver_object.find("__class");
+                            if (class_field != receiver_object.end()) {
+                                std::string class_name = class_field->second.to_string();
+                                const BytecodeFunction* method_function = nullptr;
+                                while (!class_name.empty()) {
+                                    method_function = find_function(module, class_name + "." + method_name);
+                                    if (method_function) break;
+                                    const auto parent = module.class_parents.find(class_name);
+                                    class_name = parent == module.class_parents.end() ? std::string() : parent->second;
+                                }
+                                if (method_function) {
+                                    args.insert(args.begin(), *receiver_value);
+                                    set_temp_at(0, execute_function(module, *method_function, runtime, args, count_instructions));
+                                    dispatched_instance_method = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (dispatched_instance_method) {
+                    // handled above
+                } else if (callable_target.has_value()) {
                     const Value callable = *callable_target;
                     const CallableDescriptor descriptor = runtime.callable_descriptor(callable);
                     std::string resolved_name = descriptor.name;

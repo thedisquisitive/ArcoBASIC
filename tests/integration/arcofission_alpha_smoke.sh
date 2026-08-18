@@ -678,7 +678,7 @@ CATCH err
 PRINT err.Message CONTAINS "range"
 END TRY
 CLASS Counter
-FUNCTION Sum(a, b) AS Number
+SHARED FUNCTION Sum(a, b) AS Number
 RETURN a + b
 END FUNCTION
 END CLASS

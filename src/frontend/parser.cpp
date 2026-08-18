@@ -2892,6 +2892,16 @@ Parser::StmtPtr Parser::class_statement() {
         if (check(TokenType::EndKeyword)) {
             break;
         }
+        // Comments between class members: unlike a function body (a flat Stmt list, where a
+        // Comment token becomes a real CommentStmt that round-trips through the pretty-printer),
+        // a class body is parsed straight into typed `fields`/`methods` lists with no sequence to
+        // put a comment node in. Tolerate and drop them here rather than reject valid, documented
+        // code -- full round-trip preservation of class-body comments is a follow-up, not solved
+        // by this.
+        if (match(TokenType::Comment)) {
+            skip_newlines();
+            continue;
+        }
         bool shared = false;
         int access = 0;
         bool abstract = false;
@@ -2971,6 +2981,10 @@ Parser::StmtPtr Parser::interface_statement() {
         skip_line_number();
         if (check(TokenType::EndKeyword)) {
             break;
+        }
+        if (match(TokenType::Comment)) {
+            skip_newlines();
+            continue;
         }
         consume(TokenType::Function, "expected FUNCTION in interface");
         const Token method = consume(TokenType::Identifier, "expected interface method name");
