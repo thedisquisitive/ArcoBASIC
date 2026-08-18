@@ -19,10 +19,12 @@ END IF
 ' object-literal expression (Project.Load in runtime.cpp evaluates it through the language's own
 ' parser, not a bespoke format), living as "project.arcoproj" at a project's root. It's entirely
 ' optional -- opening a bare .abas file with no project around it still works exactly as before.
-' Recognized fields, all optional: Name, Entry, Files (unused so far -- reserved for a future
-' project-tree view), Window: {Width, Height}, ArcoFissionPath.
+' Recognized fields, all optional: Name, Entry, Files (paths relative to the project file --
+' drives the project explorer sidebar below), Window: {Width, Height}, ArcoFissionPath.
 projectName = ""
 projectPath = ""
+projectRoot = ""
+projectFiles = []
 projectWindowWidth = 1000
 projectWindowHeight = 700
 projectArcoFissionPath = ""
@@ -47,12 +49,14 @@ IF projectPath <> "" THEN
         project = Project.Load(projectPath)
         projectName = Object.Get(project, "Name", "")
         projectEntry = Object.Get(project, "Entry", "")
+        projectRoot = Path.DirName(projectPath)
+        projectFiles = Object.Get(project, "Files", [])
         windowConfig = Object.Get(project, "Window", {})
         projectWindowWidth = Object.Get(windowConfig, "Width", projectWindowWidth)
         projectWindowHeight = Object.Get(windowConfig, "Height", projectWindowHeight)
         projectArcoFissionPath = Object.Get(project, "ArcoFissionPath", "")
         IF opened_path == projectPath ANDALSO projectEntry <> "" THEN
-            opened_path = Path.Join(Path.DirName(projectPath), projectEntry)
+            opened_path = Path.Join(projectRoot, projectEntry)
         END IF
     CATCH err
         PRINT "ArcoFlow could not load " + projectPath + ": " + err.Message
@@ -91,6 +95,16 @@ runButton = Button("Run (F5)")
 saveButton = Button("Save")
 openButton = Button("Open")
 newButton = Button("New")
+
+' One Button per project file, built once up front like the toolbar buttons above -- SetBounds
+' happens every frame in the main loop (same as the toolbar), but the instances themselves and
+' their click handlers are stable across frames.
+fileButtons = []
+FOR i = 0 TO LEN(projectFiles) - 1
+    ignored = Array.Add(fileButtons, Button(Path.BaseName(projectFiles[i])))
+NEXT i
+sidebarWidth = 0
+IF LEN(projectFiles) > 0 THEN sidebarWidth = 200
 
 FUNCTION RefreshTitle()
     suffix = ""
@@ -189,10 +203,41 @@ WHILE app.Running
     size = GUI.Size(window)
     GUI.Clear(window, 0.055, 0.062, 0.082)
 
+    ' Project explorer sidebar -- only takes up space at all when a project with Files was
+    ' loaded, so a bare .abas file with no project keeps today's full-width layout untouched.
+    IF sidebarWidth > 0 THEN
+        GUI.Rectangle(window, 0, 0, sidebarWidth, size.Height, 0.045, 0.05, 0.068)
+        GUI.Text(window, projectName, 14, 14, 12, 0.5, 0.58, 0.72, 1.0)
+        row_heights = []
+        FOR i = 0 TO LEN(projectFiles) - 1
+            ignored = Array.Add(row_heights, 26)
+        NEXT i
+        row_offsets = VStack(40, row_heights, 4)
+        FOR i = 0 TO LEN(projectFiles) - 1
+            ' `fileButtons[i].SetBounds(...)` doesn't parse -- indexing then dotting into the
+            ' result is a real, pre-existing lexer gap (`.` only tokenizes as part of a compound
+            ' dotted identifier scanned in one go, not as its own token, so it has nowhere to go
+            ' right after a `]`). Same workaround as Func(...).Field elsewhere: go through a
+            ' plain variable first, which is itself a reference to the same Button instance.
+            fileButton = fileButtons[i]
+            fileButton.SetBounds(8, row_offsets[i], sidebarWidth - 16, 26)
+            IF Path.BaseName(app.Path) == Path.BaseName(projectFiles[i]) THEN
+                fileButton.BackgroundR = 0.16
+                fileButton.BackgroundG = 0.24
+                fileButton.BackgroundB = 0.36
+            ELSE
+                fileButton.BackgroundR = 0.08
+                fileButton.BackgroundG = 0.09
+                fileButton.BackgroundB = 0.12
+            END IF
+            fileButton.Draw(window)
+        NEXT i
+    END IF
+
     toolbar_height = 46
-    GUI.Rectangle(window, 0, 0, size.Width, toolbar_height, 0.075, 0.086, 0.115)
+    GUI.Rectangle(window, sidebarWidth, 0, size.Width - sidebarWidth, toolbar_height, 0.075, 0.086, 0.115)
     button_widths = [70, 90, 70, 70]
-    button_offsets = HStack(12, button_widths, 8)
+    button_offsets = HStack(sidebarWidth + 12, button_widths, 8)
     newButton.SetBounds(button_offsets[0], 8, button_widths[0], 30)
     openButton.SetBounds(button_offsets[1], 8, button_widths[1], 30)
     saveButton.SetBounds(button_offsets[2], 8, button_widths[2], 30)
@@ -205,18 +250,18 @@ WHILE app.Running
     editor_y = toolbar_height + 8
     output_height = 160
     editor_height = size.Height - editor_y - output_height - 40
-    editor.SetBounds(12, editor_y, size.Width - 24, editor_height)
+    editor.SetBounds(sidebarWidth + 12, editor_y, size.Width - sidebarWidth - 24, editor_height)
     editor.Draw(window)
 
     output_y = editor_y + editor_height + 8
-    GUI.RoundedRectangle(window, 12, output_y, size.Width - 24, output_height, 6, 0.07, 0.08, 0.1, 1.0)
-    GUI.Text(window, "OUTPUT", 22, output_y + 8, 12, 0.5, 0.58, 0.7, 1.0)
-    GUI.SetClip(window, 12, output_y, size.Width - 24, output_height)
-    GUI.TextMono(window, app.Output, 22, output_y + 26, 13, 0.82, 0.88, 0.94, 1.0)
+    GUI.RoundedRectangle(window, sidebarWidth + 12, output_y, size.Width - sidebarWidth - 24, output_height, 6, 0.07, 0.08, 0.1, 1.0)
+    GUI.Text(window, "OUTPUT", sidebarWidth + 22, output_y + 8, 12, 0.5, 0.58, 0.7, 1.0)
+    GUI.SetClip(window, sidebarWidth + 12, output_y, size.Width - sidebarWidth - 24, output_height)
+    GUI.TextMono(window, app.Output, sidebarWidth + 22, output_y + 26, 13, 0.82, 0.88, 0.94, 1.0)
     GUI.ResetClip(window)
 
     status_y = size.Height - 26
-    GUI.Text(window, app.Status, 12, status_y, 13, 0.55, 0.62, 0.72, 1.0)
+    GUI.Text(window, app.Status, sidebarWidth + 12, status_y, 13, 0.55, 0.62, 0.72, 1.0)
     GUI.Text(window, "F5 run   Ctrl+S save   Ctrl+O open   Ctrl+N new", size.Width - 340, status_y, 13, 0.45, 0.52, 0.62, 1.0)
 
     GUI.Present(window)
@@ -229,6 +274,11 @@ WHILE app.Running
     IF openButton.HandleEvent(window, event) THEN ignored = OpenDocument()
     IF saveButton.HandleEvent(window, event) THEN ignored = SaveDocument()
     IF runButton.HandleEvent(window, event) THEN ignored = RunProgram()
+
+    FOR i = 0 TO LEN(fileButtons) - 1
+        fileButton = fileButtons[i]
+        IF fileButton.HandleEvent(window, event) THEN ignored = OpenPath(Path.Join(projectRoot, projectFiles[i]))
+    NEXT i
 
     before_text = editor.Text
     changed = editor.HandleEvent(window, event)

@@ -1081,36 +1081,35 @@ private:
     }
 
     std::string lower_expression(AmirFunction& function, const CanonicalAstNode& node, const std::string& expected_type = "") {
-        AmirBlock& out = current_block(function);
         switch (node.kind) {
             case AstKind::Literal: {
                 const std::string result = temp();
                 auto instruction = amir_const(result, node.text);
                 instruction.result_type = type_of_expression(node, expected_type);
-                out.instructions.push_back(std::move(instruction));
+                current_block(function).instructions.push_back(std::move(instruction));
                 return result;
             }
             case AstKind::InterpolatedString: {
                 const std::string result = temp();
-                out.instructions.push_back(amir_eval(result, render_ast_expression(node)));
+                current_block(function).instructions.push_back(amir_eval(result, render_ast_expression(node)));
                 return result;
             }
             case AstKind::Variable:
-                return lower_variable(out, node.name);
+                return lower_variable(current_block(function), node.name);
             case AstKind::Unary: {
                 const std::string result_type = type_of_expression(node, expected_type);
-                const std::string value = node.children.empty() ? lower_fallback(out, node) : lower_expression(function, *node.children[0], result_type);
+                const std::string value = node.children.empty() ? lower_fallback(current_block(function), node) : lower_expression(function, *node.children[0], result_type);
                 const std::string result = temp();
                 auto instruction = amir_unary(result, ast_operator(node.op), value);
                 instruction.result_type = result_type;
                 const std::string unary_type = type_of_expression(*node.children.front(), result_type);
                 if (!unary_type.empty() || !result_type.empty()) instruction.operand_types = {unary_type};
-                out.instructions.push_back(std::move(instruction));
+                current_block(function).instructions.push_back(std::move(instruction));
                 return result;
             }
             case AstKind::Binary:
             case AstKind::Logical: {
-                if (node.children.size() != 2) return lower_fallback(out, node);
+                if (node.children.size() != 2) return lower_fallback(current_block(function), node);
                 // ANDALSO/ORELSE are ArcoBASIC's short-circuit logical operators (AND/OR/NOT stay
                 // deliberately bitwise and always evaluate both sides -- see runtime_tests.cpp);
                 // the generic path below evaluates both children unconditionally before emitting
@@ -1165,7 +1164,7 @@ private:
                 auto instruction = amir_binary(result, ast_operator(node.op), left, right);
                 instruction.result_type = result_type;
                 if (!left_type.empty() || !right_type.empty() || !result_type.empty()) instruction.operand_types = {left_type, right_type};
-                out.instructions.push_back(std::move(instruction));
+                current_block(function).instructions.push_back(std::move(instruction));
                 return result;
             }
             case AstKind::Call:
@@ -1188,7 +1187,7 @@ private:
                 std::vector<std::string> args;
                 for (const auto& child : node.children) args.push_back(lower_expression(function, *child));
                 if (op == "ADDRESS") {
-                    if (args.size() != 1) { report_integer_error("PORT.Address expects one U16 argument"); return lower_fallback(out, node); }
+                    if (args.size() != 1) { report_integer_error("PORT.Address expects one U16 argument"); return lower_fallback(current_block(function), node); }
                     const std::string input_type = type_of_expression(*node.children[0], "U16");
                     if (input_type != "U16") report_integer_error("PORT.Address expects U16; received " + (input_type.empty() ? "unknown" : input_type));
                     if (node.children[0]->kind == AstKind::Literal) {
@@ -1197,17 +1196,17 @@ private:
                             int base = 10;
                             if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) { base = 16; text = text.substr(2); }
                             else if (text.size() > 2 && text[0] == '0' && (text[1] == 'b' || text[1] == 'B')) { base = 2; text = text.substr(2); }
-                            if (std::stoull(text, nullptr, base) > 65535ULL) report_integer_error("PORT.Address literal is out of range 0..65535");
+                            if (std::stoull(text, nullptr, base) > 65535ULL) report_integer_error("PORT.Address literal is current_block(function) of range 0..65535");
                         } catch (...) {
                             report_integer_error("PORT.Address requires an exact integer literal or U16 value");
                         }
                     }
                     const std::string result = temp();
-                    out.instructions.push_back(amir_port("ADDRESS", result, std::move(args), "IOPORT", {input_type}));
+                    current_block(function).instructions.push_back(amir_port("ADDRESS", result, std::move(args), "IOPORT", {input_type}));
                     return result;
                 }
                 if (op == "OFFSET") {
-                    if (args.size() != 2) { report_integer_error("PORT.Offset expects IOPORT and I16 arguments"); return lower_fallback(out, node); }
+                    if (args.size() != 2) { report_integer_error("PORT.Offset expects IOPORT and I16 arguments"); return lower_fallback(current_block(function), node); }
                     if (node.children[1]->kind != AstKind::Literal) {
                         report_integer_error("PORT.Offset requires a statically known displacement in the initial x86-64 systems target");
                     } else {
@@ -1219,20 +1218,20 @@ private:
                         }
                     }
                     const std::string result = temp();
-                    out.instructions.push_back(amir_port("OFFSET", result, std::move(args), "IOPORT", {"IOPORT", "I16"}));
+                    current_block(function).instructions.push_back(amir_port("OFFSET", result, std::move(args), "IOPORT", {"IOPORT", "I16"}));
                     return result;
                 }
                 const bool read = op == "READ8" || op == "READ16" || op == "READ32";
                 const bool write = op == "WRITE8" || op == "WRITE16" || op == "WRITE32";
                 if (!read && !write) {
                     report_integer_error("unknown port intrinsic " + node.name);
-                    return lower_fallback(out, node);
+                    return lower_fallback(current_block(function), node);
                 }
                 const std::string width = op.substr(read ? 4 : 5);
                 const std::string value_type = "U" + width;
                 if (args.empty() || args.size() > (write ? 2U : 1U)) {
                     report_integer_error("PORT." + op + " has the wrong argument count");
-                    return lower_fallback(out, node);
+                    return lower_fallback(current_block(function), node);
                 }
                 const std::string port_type = type_of_expression(*node.children[0]);
                 if (port_type != "IOPORT") report_integer_error("PORT." + op + " expects IOPORT; received " + (port_type.empty() ? "unknown" : port_type));
@@ -1241,7 +1240,7 @@ private:
                     if (supplied != value_type) report_integer_error("PORT." + op + " expects " + value_type + "; received " + (supplied.empty() ? "unknown" : supplied));
                 }
                 const std::string result = temp();
-                out.instructions.push_back(amir_port(op, result, std::move(args), read ? value_type : "", write ? std::vector<std::string>{"IOPORT", value_type} : std::vector<std::string>{"IOPORT"}));
+                current_block(function).instructions.push_back(amir_port(op, result, std::move(args), read ? value_type : "", write ? std::vector<std::string>{"IOPORT", value_type} : std::vector<std::string>{"IOPORT"}));
                 return result;
             }
             case AstKind::MemoryOperation: {
@@ -1249,10 +1248,10 @@ private:
                 if (name == "ADDRESS.LOCAL") {
                     if (node.children.size() != 1 || node.children.front()->kind != AstKind::Variable) {
                         report_integer_error("ADDRESS.Local expects one local variable");
-                        return lower_fallback(out, node);
+                        return lower_fallback(current_block(function), node);
                     }
                     const std::string result = temp();
-                    out.instructions.push_back(amir_memory("LOCAL", result, {node.children.front()->name}, "PTR", {"PTR"}));
+                    current_block(function).instructions.push_back(amir_memory("LOCAL", result, {node.children.front()->name}, "PTR", {"PTR"}));
                     return result;
                 }
                 std::vector<std::string> args;
@@ -1261,7 +1260,7 @@ private:
                     return n == "CPU.READBARRIER" || n == "CPU.WRITEBARRIER" || n == "CPU.MEMORYBARRIER";
                 };
                 if (barrier(name)) {
-                    out.instructions.push_back(amir_barrier(name.substr(4)));
+                    current_block(function).instructions.push_back(amir_barrier(name.substr(4)));
                     return temp();
                 }
                 if (name == "CPU.READCR2" || name == "CPU.READCR3" || name == "CPU.WRITECR3" || name == "CPU.INVALIDATEPAGE" || name == "CPU.LOADGDT" || name == "CPU.LOADIDT" || name == "CPU.LOADTASKREGISTER") {
@@ -1269,12 +1268,12 @@ private:
                     const std::string descriptor_op = name == "CPU.LOADGDT" ? "LGDT" : (name == "CPU.LOADIDT" ? "LIDT" : (name == "CPU.LOADTASKREGISTER" ? "LTR" : op));
                     const std::string result = temp();
                     const bool read = name == "CPU.READCR2" || name == "CPU.READCR3";
-                    out.instructions.push_back(amir_memory(descriptor_op, read ? result : "", std::move(args), read ? "U64" : "", {"U64"}));
+                    current_block(function).instructions.push_back(amir_memory(descriptor_op, read ? result : "", std::move(args), read ? "U64" : "", {"U64"}));
                     return result;
                 }
                 if (name == "CPU.READRSP") {
                     const std::string result = temp();
-                    out.instructions.push_back(amir_memory("READRSP", result, {}, "U64", {}));
+                    current_block(function).instructions.push_back(amir_memory("READRSP", result, {}, "U64", {}));
                     return result;
                 }
                 std::string op = name;
@@ -1287,7 +1286,7 @@ private:
                     }
                     const std::string result = temp();
                     std::string target = discover ? "GOPDISCOVER" : "GOP" + gop_op;
-                    out.instructions.push_back(amir_memory(target, result, std::move(args), type_of_expression(node), {discover ? "UEFI.SystemTable" : "UEFI.GraphicsOutputProtocol"}));
+                    current_block(function).instructions.push_back(amir_memory(target, result, std::move(args), type_of_expression(node), {discover ? "UEFI.SystemTable" : "UEFI.GraphicsOutputProtocol"}));
                     return result;
                 }
                 if (name == "GRAPHICS.PRIMARYSURFACE") {
@@ -1297,7 +1296,7 @@ private:
                     // a runtime-owned surface record without changing source.
                     const std::string system_table = lower_variable(current_block(function), "systemTable");
                     const std::string result = temp();
-                    out.instructions.push_back(amir_memory("GOPDISCOVER", result, {system_table}, "SURFACE", {"UEFI.SystemTable"}));
+                    current_block(function).instructions.push_back(amir_memory("GOPDISCOVER", result, {system_table}, "SURFACE", {"UEFI.SystemTable"}));
                     return result;
                 }
                 if (name == "GRAPHICS.BIND") {
@@ -1305,7 +1304,7 @@ private:
                         report_integer_error("GRAPHICS.Bind expects one SURFACE handle");
                     }
                     const std::string result = temp();
-                    out.instructions.push_back(amir_memory("GRAPHICSBIND", result, std::move(args), "", {"SURFACE"}));
+                    current_block(function).instructions.push_back(amir_memory("GRAPHICSBIND", result, std::move(args), "", {"SURFACE"}));
                     return result;
                 }
                 if (name.rfind("GRAPHICS.", 0) == 0) {
@@ -1314,7 +1313,7 @@ private:
                     call.result_type = type_of_expression(node, expected_type);
                     if (name == "GRAPHICS.DESTROYSURFACE") call.ownership = "Consumed";
                     else call.ownership = "Borrowed";
-                    out.instructions.push_back(std::move(call));
+                    current_block(function).instructions.push_back(std::move(call));
                     return result;
                 }
                 if (op.rfind("ADDRESS.", 0) == 0) op = op.substr(8);
@@ -1355,63 +1354,63 @@ private:
                 }
                 if (name == "ADDRESS.ALIGNUP" || name == "ADDRESS.ALIGNDOWN" || name == "ADDRESS.OFFSET") {
                     const std::string result = temp();
-                    out.instructions.push_back(amir_memory(op, result, std::move(args), result_type, {}));
+                    current_block(function).instructions.push_back(amir_memory(op, result, std::move(args), result_type, {}));
                     return result;
                 }
                 if (name == "ADDRESS.ISALIGNED") {
                     const std::string result = temp();
-                    out.instructions.push_back(amir_memory(op, result, std::move(args), "BOOL", {}));
+                    current_block(function).instructions.push_back(amir_memory(op, result, std::move(args), "BOOL", {}));
                     return result;
                 }
                 if (read || write || name == "ADDRESS.PHYSICAL" || name == "ADDRESS.VIRTUAL" || name == "ADDRESS.VALUE" || name == "ADDRESS.MMIO" || name == "MEMORY.MAP" || name == "MEMORY.MAPDEVICE") {
                     const std::string result = temp();
-                    out.instructions.push_back(amir_memory(op, result, std::move(args), write ? "" : result_type, {}));
+                    current_block(function).instructions.push_back(amir_memory(op, result, std::move(args), write ? "" : result_type, {}));
                     return result;
                 }
                 if (!constructor && name != "ADDRESS.OFFSET" && name != "ADDRESS.ALIGNUP" && name != "ADDRESS.ALIGNDOWN" && name != "ADDRESS.ISALIGNED") report_integer_error("unknown memory/address intrinsic " + node.name);
-                return lower_fallback(out, node);
+                return lower_fallback(current_block(function), node);
             }
             case AstKind::Index: {
-                if (node.children.size() != 2) return lower_fallback(out, node);
+                if (node.children.size() != 2) return lower_fallback(current_block(function), node);
                 const std::string target = lower_expression(function, *node.children[0]);
                 const std::string index = lower_expression(function, *node.children[1]);
                 const std::string result = temp();
-                out.instructions.push_back(amir_index(result, target, index));
+                current_block(function).instructions.push_back(amir_index(result, target, index));
                 return result;
             }
             case AstKind::Slice: {
-                if (node.children.size() != 4) return lower_fallback(out, node);
+                if (node.children.size() != 4) return lower_fallback(current_block(function), node);
                 const std::string target = lower_expression(function, *node.children[0]);
                 auto lower_optional = [&](const CanonicalAstNodePtr& child) {
                     if (child) return lower_expression(function, *child);
                     const std::string omitted = temp();
-                    out.instructions.push_back(amir_const(omitted, "nothing"));
+                    current_block(function).instructions.push_back(amir_const(omitted, "nothing"));
                     return omitted;
                 };
                 const std::string start = lower_optional(node.children[1]);
                 const std::string end = lower_optional(node.children[2]);
                 const std::string step = lower_optional(node.children[3]);
                 const std::string result = temp();
-                out.instructions.push_back(amir_slice(result, target, start, end, step));
+                current_block(function).instructions.push_back(amir_slice(result, target, start, end, step));
                 return result;
             }
             case AstKind::Copy: {
-                if (node.children.empty()) return lower_fallback(out, node);
+                if (node.children.empty()) return lower_fallback(current_block(function), node);
                 const std::string value = lower_expression(function, *node.children[0]);
                 const std::string result = temp();
-                out.instructions.push_back(amir_copy(result, value));
+                current_block(function).instructions.push_back(amir_copy(result, value));
                 return result;
             }
             case AstKind::AddressOf: {
                 const std::string result = temp();
-                out.instructions.push_back(amir_address_of(result, node.name));
+                current_block(function).instructions.push_back(amir_address_of(result, node.name));
                 return result;
             }
             case AstKind::Array: {
                 std::vector<std::string> items;
                 for (const auto& child : node.children) items.push_back(lower_expression(function, *child));
                 const std::string result = temp();
-                out.instructions.push_back(amir_array(result, std::move(items)));
+                current_block(function).instructions.push_back(amir_array(result, std::move(items)));
                 return result;
             }
             case AstKind::ArrayComprehension: {
@@ -1427,7 +1426,13 @@ private:
                 const std::string empty = temp();
                 current_block(function).instructions.push_back(amir_array(empty, {}));
                 current_block(function).instructions.push_back(amir_store(result_name, empty));
-                current_block(function).instructions.push_back(amir_store(items_name, lower_expression(function, *node.children[1])));
+                // lower_expression evaluated into a local first, current_block(function) fetched fresh
+                // afterward: current_block(function) returns a reference into function.blocks (a
+                // std::vector), which control-flow-bearing sub-expressions (this one, ANDALSO/ORELSE)
+                // grow via add_block -- inlining both in one push_back call risks the reference going
+                // stale mid-expression if the vector reallocates (see lower_short_circuit_logical).
+                const std::string comprehension_items = lower_expression(function, *node.children[1]);
+                current_block(function).instructions.push_back(amir_store(items_name, comprehension_items));
                 const std::string zero = temp();
                 current_block(function).instructions.push_back(amir_const(zero, "0"));
                 current_block(function).instructions.push_back(amir_store(index_name, zero));
@@ -1490,7 +1495,7 @@ private:
                 std::vector<std::string> items;
                 for (const auto& child : node.children) items.push_back(lower_expression(function, *child));
                 const std::string result = temp();
-                out.instructions.push_back(amir_tuple(result, std::move(items)));
+                current_block(function).instructions.push_back(amir_tuple(result, std::move(items)));
                 return result;
             }
             case AstKind::Object: {
@@ -1499,11 +1504,11 @@ private:
                     fields.push_back(key + ":" + lower_expression(function, *value));
                 }
                 const std::string result = temp();
-                out.instructions.push_back(amir_object(result, std::move(fields)));
+                current_block(function).instructions.push_back(amir_object(result, std::move(fields)));
                 return result;
             }
             default:
-                return lower_fallback(out, node);
+                return lower_fallback(current_block(function), node);
         }
     }
 
@@ -1646,11 +1651,21 @@ private:
             case AstKind::NoOp:
             case AstKind::Comment:
                 break;
-            case AstKind::Return:
-                current_block(function).instructions.push_back(
-                    node.children.empty() ? amir_return("VALUE", "nothing")
-                                          : amir_return(function.return_type, lower_expression(function, *node.children[0])));
+            case AstKind::Return: {
+                // Evaluate the return value (if any) before touching current_block(function): see
+                // the comment on the ArrayComprehension case above -- inlining lower_expression
+                // into this push_back would risk current_block(function)'s reference into
+                // function.blocks going stale if the expression's own lowering reallocates that
+                // vector (confirmed live with `RETURN a ANDALSO b ANDALSO c ANDALSO d`, which
+                // silently returned "nothing" instead of the real value).
+                if (node.children.empty()) {
+                    current_block(function).instructions.push_back(amir_return("VALUE", "nothing"));
+                } else {
+                    const std::string return_value = lower_expression(function, *node.children[0]);
+                    current_block(function).instructions.push_back(amir_return(function.return_type, return_value));
+                }
                 break;
+            }
             case AstKind::Goto:
                 current_block(function).instructions.push_back(amir_jump("L" + std::to_string(node.integer)));
                 break;
@@ -1688,7 +1703,8 @@ private:
                 if (node.children.empty()) {
                     current_block(function).instructions.push_back(amir_unsupported("THROW without message"));
                 } else {
-                    current_block(function).instructions.push_back(amir_throw(lower_expression(function, *node.children[0])));
+                    const std::string thrown_value = lower_expression(function, *node.children[0]);
+                    current_block(function).instructions.push_back(amir_throw(thrown_value));
                 }
                 break;
             case AstKind::Function:
@@ -1718,7 +1734,8 @@ private:
             current_block(function).instructions.push_back(amir_unsupported("RUN " + render_ast_expression(expr)));
             return;
         }
-        current_block(function).instructions.push_back(amir_call("Runtime.Print", {lower_expression(function, expr)}));
+        const std::string printed_value = lower_expression(function, expr);
+        current_block(function).instructions.push_back(amir_call("Runtime.Print", {printed_value}));
     }
 
     void lower_assignment(AmirFunction& function, const CanonicalAstNode& node) {
@@ -1921,10 +1938,13 @@ private:
         if (node.children.size() < 2) return;
         const std::string end_name = hidden_name("for_end");
         const std::string step_name = hidden_name("for_step");
-        current_block(function).instructions.push_back(amir_store(node.name, lower_expression(function, *node.children[0])));
-        current_block(function).instructions.push_back(amir_store(end_name, lower_expression(function, *node.children[1])));
+        const std::string for_start = lower_expression(function, *node.children[0]);
+        current_block(function).instructions.push_back(amir_store(node.name, for_start));
+        const std::string for_end = lower_expression(function, *node.children[1]);
+        current_block(function).instructions.push_back(amir_store(end_name, for_end));
         if (node.children.size() >= 3) {
-            current_block(function).instructions.push_back(amir_store(step_name, lower_expression(function, *node.children[2])));
+            const std::string for_step = lower_expression(function, *node.children[2]);
+            current_block(function).instructions.push_back(amir_store(step_name, for_step));
         } else {
             const std::string one = temp();
             current_block(function).instructions.push_back(amir_const(one, "1"));
@@ -1989,7 +2009,8 @@ private:
         if (node.children.empty()) return;
         const std::string items_name = hidden_name("each_items");
         const std::string index_name = hidden_name("each_index");
-        current_block(function).instructions.push_back(amir_store(items_name, lower_expression(function, *node.children[0])));
+        const std::string each_items = lower_expression(function, *node.children[0]);
+        current_block(function).instructions.push_back(amir_store(items_name, each_items));
         const std::string zero = temp();
         current_block(function).instructions.push_back(amir_const(zero, "0"));
         current_block(function).instructions.push_back(amir_store(index_name, zero));
@@ -2037,7 +2058,8 @@ private:
     void lower_select(AmirFunction& function, const CanonicalAstNode& node) {
         if (node.children.empty()) return;
         const std::string target_name = hidden_name("select_value");
-        current_block(function).instructions.push_back(amir_store(target_name, lower_expression(function, *node.children[0])));
+        const std::string select_value = lower_expression(function, *node.children[0]);
+        current_block(function).instructions.push_back(amir_store(target_name, select_value));
         std::vector<CanonicalAstNodePtr> branches = ast_group(node, "branches");
         const auto& else_body = ast_group(node, "else");
         if (!else_body.empty()) {
