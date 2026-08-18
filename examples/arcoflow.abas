@@ -96,6 +96,18 @@ saveButton = Button("Save")
 openButton = Button("Open")
 newButton = Button("New")
 
+' Sort key that puts folders before files within each directory level while still keeping every
+' folder immediately before its own descendants (ComputeVisibleRows below relies on a folder's
+' subtree being contiguous). Trick: mark every path segment with "0:" except a *file* row's own
+' final segment, which gets "1:" -- ancestor segments are always folders so they're always "0:",
+' and a plain lexicographic sort then does the right thing for free: "0:src" sorts before both
+' "0:src/..." (a shorter string that's a prefix of a longer one sorts first, i.e. a folder sorts
+' before its own children) and "1:main.abas" (folders before files), while "0:src/0:utils" sorts
+' before "0:src/1:app.abas" (folders before files *within* src specifically).
+FUNCTION RowSortKey(row)
+    RETURN row.SortKey
+END FUNCTION
+
 ' Project.Files entries may contain "/" to place a file under one or more folders (e.g.
 ' "src/utils/helper.abas"); BuildExplorerRows flattens that into one row per path segment seen
 ' (folders get one row the first time they're seen, files always get their own row), each
@@ -107,16 +119,21 @@ FUNCTION BuildExplorerRows(files)
     FOR i = 0 TO LEN(files) - 1
         parts = String.Split(files[i], "/")
         prefix = ""
+        keyPrefix = ""
         FOR d = 0 TO LEN(parts) - 2
             IF prefix == "" THEN prefix = parts[d] ELSE prefix = prefix + "/" + parts[d]
+            IF keyPrefix == "" THEN keyPrefix = "0:" + parts[d] ELSE keyPrefix = keyPrefix + "/0:" + parts[d]
             IF Array.Contains(knownFolders, prefix) == FALSE THEN
                 ignored = Array.Add(knownFolders, prefix)
-                ignored2 = Array.Add(rows, {Kind: "folder", Label: parts[d], Path: prefix, Depth: d})
+                ignored2 = Array.Add(rows, {Kind: "folder", Label: parts[d], Path: prefix, Depth: d, SortKey: keyPrefix})
             END IF
         NEXT d
-        ignored3 = Array.Add(rows, {Kind: "file", Label: parts[LEN(parts) - 1], Path: files[i], Depth: LEN(parts) - 1})
+        fileName = parts[LEN(parts) - 1]
+        fileKey = "1:" + fileName
+        IF keyPrefix <> "" THEN fileKey = keyPrefix + "/" + fileKey
+        ignored3 = Array.Add(rows, {Kind: "file", Label: fileName, Path: files[i], Depth: LEN(parts) - 1, SortKey: fileKey})
     NEXT i
-    RETURN rows
+    RETURN Array.SortBy(rows, ADDRESSOF RowSortKey)
 END FUNCTION
 
 ' Indexes into `rows` that should currently be drawn, given which folder Paths are collapsed --
@@ -150,13 +167,13 @@ END FUNCTION
 ' One Button per explorer row (folders and files alike -- a folder row's "click" toggles it
 ' instead of opening a file), built once up front like the toolbar buttons above. Which of these
 ' are actually drawn/hit-tested varies frame to frame with collapse state; see ComputeVisibleRows.
+' The row is drawn by hand below (see DrawExplorerRow) rather than Button.Draw -- Button's label
+' is centered, which reads fine for a 4-word toolbar button but not for a left-aligned, indented,
+' icon-prefixed tree row -- so these exist purely for SetBounds/ContainsPoint/Hovered/HandleEvent.
 explorerRows = BuildExplorerRows(projectFiles)
 rowButtons = []
 FOR i = 0 TO LEN(explorerRows) - 1
-    row = explorerRows[i]
-    label = row.Label
-    IF row.Kind == "folder" THEN label = "> " + label
-    ignored = Array.Add(rowButtons, Button(label))
+    ignored = Array.Add(rowButtons, Button(""))
 NEXT i
 sidebarWidth = 0
 IF LEN(projectFiles) > 0 THEN sidebarWidth = 200
@@ -281,21 +298,68 @@ WHILE app.Running
             row = explorerRows[rowIndex]
             rowButton = rowButtons[rowIndex]
             indent = row.Depth * 14
-            rowButton.SetBounds(8 + indent, row_offsets[i], sidebarWidth - 16 - indent, 26)
-            IF row.Kind == "folder" THEN
-                rowButton.Label = "> " + row.Label
-                IF Array.Contains(app.CollapsedFolders, row.Path) == FALSE THEN rowButton.Label = "v " + row.Label
+            rowX = 8 + indent
+            rowY = row_offsets[i]
+            rowW = sidebarWidth - 16 - indent
+            rowH = 26
+            rowButton.SetBounds(rowX, rowY, rowW, rowH)
+            isActiveFile = row.Kind == "file" ANDALSO Path.BaseName(app.Path) == Path.BaseName(row.Path)
+            isFolder = row.Kind == "folder"
+
+            ' Background: folders get a distinct base tint from files (visible even before
+            ' reading any text), the active file overrides everything, hover lightens whichever
+            ' applies. Isn't a real % blend, just three hand-picked, visually-checked shades.
+            bgR = 0.08
+            bgG = 0.09
+            bgB = 0.12
+            IF isFolder THEN
+                bgR = 0.065
+                bgG = 0.075
+                bgB = 0.1
             END IF
-            IF row.Kind == "file" ANDALSO Path.BaseName(app.Path) == Path.BaseName(row.Path) THEN
-                rowButton.BackgroundR = 0.16
-                rowButton.BackgroundG = 0.24
-                rowButton.BackgroundB = 0.36
+            IF rowButton.Hovered THEN
+                bgR = bgR + 0.04
+                bgG = bgG + 0.045
+                bgB = bgB + 0.05
+            END IF
+            IF isActiveFile THEN
+                bgR = 0.16
+                bgG = 0.24
+                bgB = 0.36
+            END IF
+            GUI.RoundedRectangle(window, rowX, rowY, rowW, rowH, 4, bgR, bgG, bgB, 1.0)
+
+            ' Left-aligned icon + label rather than Button.Draw's centered text -- reads as an
+            ' actual tree instead of a column of pill buttons, and lets folders/files diverge in
+            ' color: folders amber (matches a closed/open folder's usual warm tone regardless of
+            ' the actual icon glyph used), files a cool white, dimmed further for anything that
+            ' isn't a .abas source file so the project's own code stands out from the rest.
+            icon = "  "
+            textR = 0.82
+            textG = 0.87
+            textB = 0.95
+            IF isFolder THEN
+                textR = 0.86
+                textG = 0.7
+                textB = 0.42
+                icon = "> "
+                IF Array.Contains(app.CollapsedFolders, row.Path) == FALSE THEN icon = "v "
             ELSE
-                rowButton.BackgroundR = 0.08
-                rowButton.BackgroundG = 0.09
-                rowButton.BackgroundB = 0.12
+                IF Path.Extension(row.Path) <> ".abas" THEN
+                    textR = 0.5
+                    textG = 0.53
+                    textB = 0.6
+                END IF
             END IF
-            rowButton.Draw(window)
+            IF isActiveFile THEN
+                textR = 0.95
+                textG = 0.97
+                textB = 1.0
+            END IF
+
+            label = icon + row.Label
+            measured = GUI.MeasureText(window, label, 13)
+            GUI.Text(window, label, rowX + 6, rowY + (rowH - measured.Height) / 2, 13, textR, textG, textB, 1.0)
         NEXT i
     END IF
 
