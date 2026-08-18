@@ -15,27 +15,76 @@ IF GUI.Available() == FALSE THEN
     ExitTheProgram(0)
 END IF
 
+' The ArcoFlow project format (canonized this pass): a ".arcoproj" file is a single ArcoBASIC
+' object-literal expression (Project.Load in runtime.cpp evaluates it through the language's own
+' parser, not a bespoke format), living as "project.arcoproj" at a project's root. It's entirely
+' optional -- opening a bare .abas file with no project around it still works exactly as before.
+' Recognized fields, all optional: Name, Entry, Files (unused so far -- reserved for a future
+' project-tree view), Window: {Width, Height}, ArcoFissionPath.
+projectName = ""
+projectPath = ""
+projectWindowWidth = 1000
+projectWindowHeight = 700
+projectArcoFissionPath = ""
+
+opened_path = ""
+IF LEN(Args) > 0 THEN opened_path = Args[0]
+
+IF opened_path <> "" ANDALSO Path.Extension(opened_path) == ".arcoproj" THEN
+    ' Opened directly as `arcoflow some.arcoproj`: that file IS the project, and its Entry field
+    ' (if any) says which file to actually edit.
+    projectPath = opened_path
+ELSE
+    candidate = Path.Join(Path.DirName(opened_path), "project.arcoproj")
+    IF File.Exists(candidate) THEN projectPath = candidate
+END IF
+
+IF projectPath <> "" THEN
+    TRY
+        ' Object.Get with a default rather than direct dot-access: every field (including the
+        ' whole Window sub-object) is optional, and dotting into a key that's simply absent from
+        ' the project file throws ("undefined property"), not returns something falsy.
+        project = Project.Load(projectPath)
+        projectName = Object.Get(project, "Name", "")
+        projectEntry = Object.Get(project, "Entry", "")
+        windowConfig = Object.Get(project, "Window", {})
+        projectWindowWidth = Object.Get(windowConfig, "Width", projectWindowWidth)
+        projectWindowHeight = Object.Get(windowConfig, "Height", projectWindowHeight)
+        projectArcoFissionPath = Object.Get(project, "ArcoFissionPath", "")
+        IF opened_path == projectPath ANDALSO projectEntry <> "" THEN
+            opened_path = Path.Join(Path.DirName(projectPath), projectEntry)
+        END IF
+    CATCH err
+        PRINT "ArcoFlow could not load " + projectPath + ": " + err.Message
+    END TRY
+END IF
+
 initial_path = "untitled.abas"
 has_path = FALSE
-IF LEN(Args) > 0 THEN
-    initial_path = Args[0]
+IF opened_path <> "" ANDALSO Path.Extension(opened_path) <> ".arcoproj" THEN
+    initial_path = opened_path
     has_path = TRUE
 END IF
 initial_content = ""
 IF File.Exists(initial_path) THEN initial_content = File.ReadText(initial_path)
 
-arcofission_path = Process.Env("ARCOFISSION_PATH")
+arcofission_path = projectArcoFissionPath
+IF arcofission_path == "" THEN arcofission_path = Process.Env("ARCOFISSION_PATH")
 IF arcofission_path == "" THEN arcofission_path = "ArcoFission"
+
+window_title = "ArcoFlow"
+IF projectName <> "" THEN window_title = "ArcoFlow - " + projectName + " - " + Path.BaseName(initial_path)
+IF projectName == "" THEN window_title = "ArcoFlow - " + Path.BaseName(initial_path)
 
 TRY
     GUI.Application("arcoflow", "ArcoFlow")
-    window = GUI.Window("ArcoFlow - " + Path.BaseName(initial_path), 1000, 700)
+    window = GUI.Window(window_title, projectWindowWidth, projectWindowHeight)
 CATCH err
     PRINT "ArcoFlow window could not be opened: " + err.Message
     ExitTheProgram(0)
 END TRY
 
-app = {"Path": initial_path, "HasPath": has_path, "Dirty": FALSE, "Running": TRUE, "Status": "Ready", "Output": "", "ToolbarHover": ""}
+app = {"Path": initial_path, "HasPath": has_path, "Dirty": FALSE, "Running": TRUE, "Status": "Ready", "Output": "", "ToolbarHover": "", "ProjectName": projectName}
 
 editor = TextArea(initial_content)
 runButton = Button("Run (F5)")
@@ -46,7 +95,9 @@ newButton = Button("New")
 FUNCTION RefreshTitle()
     suffix = ""
     IF app.Dirty THEN suffix = " *"
-    GUI.SetTitle(window, "ArcoFlow - " + Path.BaseName(app.Path) + suffix)
+    title = "ArcoFlow - " + Path.BaseName(app.Path) + suffix
+    IF app.ProjectName <> "" THEN title = "ArcoFlow - " + app.ProjectName + " - " + Path.BaseName(app.Path) + suffix
+    GUI.SetTitle(window, title)
 END FUNCTION
 
 FUNCTION MarkDirty()

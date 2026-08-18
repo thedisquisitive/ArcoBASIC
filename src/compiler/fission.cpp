@@ -1047,6 +1047,14 @@ private:
         const std::string result_name = hidden_name("shortcircuit");
         const std::string left = lower_expression(function, *node.children[0], "BOOL");
         current_block(function).instructions.push_back(amir_store(result_name, left));
+        // Reload rather than branching on `left` directly: build_bytecode's peephole optimizer
+        // fuses an adjacent Load+Load+Binary+Store into one BINARY_LOCAL_LOCAL op and drops the
+        // Binary's own temp entirely (same trap apply_script_global_scoping's mirroring hit
+        // above) -- `left` is consumed here by both the Store just above and the Branch below,
+        // and the peephole only looks at the Store, leaving the Branch referencing a temp that
+        // never got emitted ("undefined bytecode temporary"). A fresh Load always materializes.
+        const std::string left_reloaded = temp();
+        current_block(function).instructions.push_back(amir_load(left_reloaded, result_name));
 
         const std::size_t rhs_block = add_block(function, "ShortCircuitRhs");
         const std::size_t end_block = add_block(function, "ShortCircuitEnd");
@@ -1055,10 +1063,10 @@ private:
         // mirror image.
         if (is_and) {
             current_block(function).instructions.push_back(
-                amir_branch(left, block_name(function, rhs_block), block_name(function, end_block)));
+                amir_branch(left_reloaded, block_name(function, rhs_block), block_name(function, end_block)));
         } else {
             current_block(function).instructions.push_back(
-                amir_branch(left, block_name(function, end_block), block_name(function, rhs_block)));
+                amir_branch(left_reloaded, block_name(function, end_block), block_name(function, rhs_block)));
         }
 
         current_block_ = rhs_block;

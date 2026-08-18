@@ -2842,6 +2842,32 @@ Runtime::Runtime()
         expect_arg_count(args, "Path.Extension", 1, 1);
         return std::filesystem::path(args[0].to_string()).extension().string();
     });
+    // The ArcoFlow project format (see [[project_arcoflow_ide]] in agent memory / the working
+    // agreement in the IDE's own project notes): a ".arcoproj" file is a single ArcoBASIC
+    // object-literal expression, not a new file format with its own parser -- reusing the
+    // language's own object-literal syntax means Project.Load needs no new grammar at all, just
+    // a fresh, throwaway Runtime to evaluate the expression in isolation from the caller's own
+    // globals (a project file assigning e.g. `Name` must never collide with the caller's `Name`).
+    // Expected shape (all fields optional, callers fall back on absence):
+    //   { Name: "...", Entry: "main.abas", Files: ["main.abas", ...],
+    //     Window: {Width: 1000, Height: 700}, ArcoFissionPath: "..." }
+    register_function("Project.Load", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Project.Load", 1, 1);
+        const std::string path = args[0].to_string();
+        const std::string text = read_plain_file(path);
+        if (text.find_first_not_of(" \t\r\n") == std::string::npos) {
+            throw std::runtime_error("Project.Load: " + path + " is empty");
+        }
+        Runtime loader;
+        const RunResult result = loader.run_string("LET __ARCOFLOW_PROJECT__ = " + text + "\n");
+        if (!result.ok) {
+            throw std::runtime_error("Project.Load: " + path + ": " + result.error);
+        }
+        if (!loader.has_global("__ARCOFLOW_PROJECT__")) {
+            throw std::runtime_error("Project.Load: " + path + " did not evaluate to a value");
+        }
+        return loader.get_global("__ARCOFLOW_PROJECT__");
+    });
     register_function("Bytes.New", [](const std::vector<Value>& args) -> Value {
         expect_arg_count(args, "Bytes.New", 0, 2);
         const int requested_size = args.empty() ? 0 : static_cast<int>(args[0].as_number());
