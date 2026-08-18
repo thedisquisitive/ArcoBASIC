@@ -6322,6 +6322,16 @@ Result build_web_bytecode(const std::string& bytecode_binary, const std::string&
             runtime_lib.string(),
             arcology_lib.string(),
         };
+        // The default Emscripten HTML shell's "powered by emscripten" progress/status UI is
+        // vestigial for ArcoFission capsules (canvas_backend.cpp creates its own full-viewport
+        // <canvas> for GUI capsules) and its progress-hiding logic doesn't reliably clear once
+        // the module is actually running -- observed stuck forever on "Downloading..." even after
+        // a GUI capsule had fully loaded and was drawing. Only relevant when producing a .html at
+        // all (a bare .js/.wasm output has no shell to speak of).
+        if (std::filesystem::path(output).extension() == ".html") {
+            args.push_back("--shell-file");
+            args.push_back((source_root / "src" / "gui" / "web_shell.html").string());
+        }
 
         std::ostringstream command;
         bool first = true;

@@ -1,0 +1,47 @@
+<!doctype html>
+<!--
+  Minimal Emscripten shell for ArcoFission web capsules (see fission.cpp's build_web_bytecode,
+  which passes this to em++ via --shell-file). The default Emscripten shell's "powered by
+  emscripten" progress/status UI is vestigial here -- src/gui/canvas_backend.cpp creates and
+  manages its own full-viewport <canvas> for GUI capsules, and console-only capsules just want
+  their PRINT output visible -- and its progress-hiding logic doesn't reliably clear once the
+  module is actually up and running (observed stuck forever on "Downloading..." even after a GUI
+  capsule was fully loaded and drawing). This shell has nothing to get stuck on: no progress bar,
+  no status text, no unused default canvas.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>ArcoBASIC</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; height: 100%; }
+  /* Only shown for console-only capsules that never create a GUI window (canvas_backend.cpp's
+     create_window inserts a <canvas> that covers this once a GUI capsule actually opens one). */
+  #arco-console {
+    display: none;
+    white-space: pre-wrap;
+    font: 13px monospace;
+    color: #ddd;
+    padding: 12px;
+  }
+</style>
+</head>
+<body>
+<pre id="arco-console"></pre>
+<script>
+  var Module = {
+    print: function (text) {
+      var el = document.getElementById("arco-console");
+      el.style.display = "block";
+      el.textContent += text + "\n";
+    },
+    printErr: function (text) {
+      var el = document.getElementById("arco-console");
+      el.style.display = "block";
+      el.textContent += text + "\n";
+    },
+  };
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>
