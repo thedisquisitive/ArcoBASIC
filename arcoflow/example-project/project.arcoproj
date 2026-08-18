@@ -1,0 +1,6 @@
+{
+    Name: "Example",
+    Entry: "main.abas",
+    Files: ["main.abas", "src/greet.abas", "src/utils/math.abas"],
+    Window: {Width: 1000, Height: 700}
+}

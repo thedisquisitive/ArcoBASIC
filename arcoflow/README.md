@@ -15,13 +15,21 @@ Build a native capsule from the repository root and launch it, optionally pointi
 `.arcoproj` project file:
 
 ```sh
-build/ArcoFission native arcoflow/arcoflow.abas -o /tmp/arcoflow
-/tmp/arcoflow [path/to/file.abas | path/to/project.arcoproj]
+build/ArcoFission native arcoflow/arcoflow.abas -o build/arcoflow
+build/arcoflow [path/to/file.abas | path/to/project.arcoproj]
 ```
 
 Requires a live Wayland or X11 desktop session. `ARCOFISSION_PATH` can point Run at a specific
 `ArcoFission` binary; it otherwise falls back to whatever's on `PATH`, or a project's own
 `ArcoFissionPath` field if set (see below).
+
+Launched with no argument, or pointed straight at a bare `.abas` file, there's no project around it
+to show an explorer sidebar for -- that's expected, not a bug (see below). To actually see the
+explorer, point it at `example-project/`, which has a `project.arcoproj` with a couple of folders:
+
+```sh
+build/arcoflow arcoflow/example-project/project.arcoproj
+```
 
 ## Project format
 
@@ -48,4 +56,6 @@ within each level).
 ## Layout
 
 - `arcoflow.abas` — the editor itself.
+- `example-project/` — a small sample project (a `project.arcoproj`, a couple of folders) for
+  trying the project explorer without having to build one first.
 - `concept_render.png` — early concept art for the eventual Intent graph view.
