@@ -39,8 +39,8 @@ int main(int argc, char** argv) {
         }
         script_index = 3;
     }
-    if (argc != script_index + 1) {
-        std::cerr << "usage: arco_cli [--instruction-limit COUNT|unlimited] <script.bas>\n"
+    if (argc < script_index + 1) {
+        std::cerr << "usage: arco_cli [--instruction-limit COUNT|unlimited] <script.bas> [args...]\n"
                   << "       unlimited disables instruction-count termination for this invocation\n";
         return 2;
     }
@@ -54,9 +54,15 @@ int main(int argc, char** argv) {
     std::ostringstream buffer;
     buffer << input.rdbuf();
 
+    arco::Value::Array script_args;
+    for (int i = script_index + 1; i < argc; ++i) {
+        script_args.emplace_back(std::string(argv[i]));
+    }
+
     arco::Runtime runtime;
     runtime.set_instruction_limit_policy(true);
     if (instruction_limit.has_value()) runtime.set_instruction_limit_override(instruction_limit);
+    runtime.set_global("Args", arco::Value(std::move(script_args)));
     const auto result = runtime.run_string(buffer.str());
     if (!result.ok) {
         std::cerr << result.error << '\n';

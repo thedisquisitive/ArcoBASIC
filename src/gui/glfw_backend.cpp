@@ -130,6 +130,10 @@ void push_pointer(GLFWwindow* handle, const char* type, double x, double y) {
 std::string key_name(int key) {
     if (key >= GLFW_KEY_A && key <= GLFW_KEY_Z) return std::string(1, static_cast<char>('a' + key - GLFW_KEY_A));
     if (key >= GLFW_KEY_0 && key <= GLFW_KEY_9) return std::string(1, static_cast<char>('0' + key - GLFW_KEY_0));
+    // F1-F25 were entirely unhandled (fell through to "unknown"), so no ArcoBASIC app could ever
+    // bind a function-key shortcut -- found via examples/arcoflow.abas's F5-to-run binding
+    // silently never firing.
+    if (key >= GLFW_KEY_F1 && key <= GLFW_KEY_F25) return "f" + std::to_string(key - GLFW_KEY_F1 + 1);
     switch (key) {
         case GLFW_KEY_ESCAPE: return "escape";
         case GLFW_KEY_ENTER: return "enter";
@@ -317,7 +321,15 @@ void configure_callbacks(WindowRecord& item) {
     });
     glfwSetScrollCallback(item.handle, [](GLFWwindow* handle, double x, double y) {
         auto* item = record(handle);
-        if (item) events.emplace_back(Value::Object{{"Type", "scroll"}, {"Window", item->id}, {"DeltaX", x}, {"DeltaY", y}});
+        if (!item) return;
+        // Scroll wheel motion carries no position of its own -- widgets that only want to react
+        // to a scroll over their own bounds (see stdlib/gui.abas's TextArea.HandleEvent) need the
+        // cursor position at the time of the scroll, so attach it the same way pointer-button
+        // events do.
+        double cursor_x = 0, cursor_y = 0;
+        glfwGetCursorPos(handle, &cursor_x, &cursor_y);
+        events.emplace_back(Value::Object{{"Type", "scroll"}, {"Window", item->id}, {"DeltaX", x}, {"DeltaY", y},
+                                          {"X", cursor_x}, {"Y", cursor_y}});
     });
     glfwSetKeyCallback(item.handle, [](GLFWwindow* handle, int key, int, int action, int mods) {
         auto* item = record(handle);

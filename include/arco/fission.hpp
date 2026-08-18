@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace arco::fission {
 
@@ -19,7 +20,8 @@ Result reveal_bytecode_file(const std::string& path);
 Result run_bytecode(const std::string& bytecode,
                     std::optional<std::size_t> instruction_limit_override = std::nullopt);
 Result run_bytecode_binary(const std::string& bytecode,
-                           std::optional<std::size_t> instruction_limit_override = std::nullopt);
+                           std::optional<std::size_t> instruction_limit_override = std::nullopt,
+                           const std::vector<std::string>& script_args = {});
 Result run_bytecode_file(const std::string& path,
                          std::optional<std::size_t> instruction_limit_override = std::nullopt);
 Result compile_run(const std::string& source, const std::string& source_name,

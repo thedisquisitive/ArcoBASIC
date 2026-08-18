@@ -1,0 +1,197 @@
+#DESCRIPTION "ArcoFlow IDE prototype -- edit, save, run, see output"
+
+' First working prototype of the ArcoFlow IDE discussed in project planning: edit an ArcoBASIC
+' file, save it, run it via ArcoFission, see the output. Pure text editing only -- no Intent/graph
+' view yet, deliberately. This never touches reveal AST/PRETTY, only File.ReadText/WriteText on
+' whatever file is open and Process.Run to shell out to ArcoFission, which is what actually
+' resolves #IMPORT for multi-file projects; this editor only ever shows/saves one file's own raw
+' text, never a preprocessed/#IMPORT-flattened merge, so it can't confuse a multi-file project by
+' writing another module's content back into the file being edited.
+
+#IMPORT "gui"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "ArcoFlow needs a Wayland or X11 desktop session."
+    ExitTheProgram(0)
+END IF
+
+initial_path = "untitled.abas"
+has_path = FALSE
+IF LEN(Args) > 0 THEN
+    initial_path = Args[0]
+    has_path = TRUE
+END IF
+initial_content = ""
+IF File.Exists(initial_path) THEN initial_content = File.ReadText(initial_path)
+
+arcofission_path = Process.Env("ARCOFISSION_PATH")
+IF arcofission_path == "" THEN arcofission_path = "ArcoFission"
+
+TRY
+    GUI.Application("arcoflow", "ArcoFlow")
+    window = GUI.Window("ArcoFlow - " + Path.BaseName(initial_path), 1000, 700)
+CATCH err
+    PRINT "ArcoFlow window could not be opened: " + err.Message
+    ExitTheProgram(0)
+END TRY
+
+app = {"Path": initial_path, "HasPath": has_path, "Dirty": FALSE, "Running": TRUE, "Status": "Ready", "Output": "", "ToolbarHover": ""}
+
+editor = TextArea(initial_content)
+runButton = Button("Run (F5)")
+saveButton = Button("Save")
+openButton = Button("Open")
+newButton = Button("New")
+
+FUNCTION RefreshTitle()
+    suffix = ""
+    IF app.Dirty THEN suffix = " *"
+    GUI.SetTitle(window, "ArcoFlow - " + Path.BaseName(app.Path) + suffix)
+END FUNCTION
+
+FUNCTION MarkDirty()
+    app.Dirty = TRUE
+    RefreshTitle()
+END FUNCTION
+
+FUNCTION SaveDocument()
+    IF app.HasPath == FALSE THEN
+        selected_path = GUI.SaveFileDialog(window, "Save ArcoBASIC File", app.Path)
+        IF selected_path == "" THEN RETURN FALSE
+        app.Path = selected_path
+        app.HasPath = TRUE
+    END IF
+    File.WriteText(app.Path, editor.Text)
+    app.Dirty = FALSE
+    app.Status = "Saved " + app.Path
+    RefreshTitle()
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION OpenPath(selected_path)
+    IF app.Dirty THEN
+        IF GUI.Confirm(window, "Unsaved changes", "Discard the current file and open another?") == FALSE THEN RETURN FALSE
+    END IF
+    IF selected_path == "" THEN RETURN FALSE
+    IF File.Exists(selected_path) == FALSE THEN
+        app.Status = "File does not exist: " + selected_path
+        RETURN FALSE
+    END IF
+    app.Path = selected_path
+    app.HasPath = TRUE
+    editor.SetText(File.ReadText(selected_path))
+    app.Dirty = FALSE
+    app.Status = "Opened " + app.Path
+    RefreshTitle()
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION OpenDocument()
+    selected_path = GUI.OpenFileDialog(window, "Open ArcoBASIC File", app.Path)
+    RETURN OpenPath(selected_path)
+END FUNCTION
+
+FUNCTION NewDocument()
+    IF app.Dirty THEN
+        IF GUI.Confirm(window, "Unsaved changes", "Discard the current file and start a new one?") == FALSE THEN RETURN FALSE
+    END IF
+    editor.SetText("")
+    app.Path = "untitled.abas"
+    app.HasPath = FALSE
+    app.Dirty = TRUE
+    app.Status = "New file"
+    RefreshTitle()
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION RunProgram()
+    IF SaveDocument() == FALSE THEN
+        app.Status = "Run cancelled (file not saved)"
+        RETURN FALSE
+    END IF
+    app.Status = "Running..."
+    command = "\"" + arcofission_path + "\" compile-run \"" + app.Path + "\""
+    result = Process.Run(command)
+    app.Output = result.Output
+    IF result.ExitCode == 0 THEN
+        app.Status = "Finished (exit 0)"
+    ELSE
+        app.Status = "Failed (exit " + STRING(result.ExitCode) + ")"
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION RequestClose()
+    IF app.Dirty THEN
+        IF GUI.Confirm(window, "Unsaved changes", "Close ArcoFlow without saving your changes?") == FALSE THEN
+            GUI.SetShouldClose(window, FALSE)
+            RETURN FALSE
+        END IF
+    END IF
+    app.Running = FALSE
+    RETURN TRUE
+END FUNCTION
+
+RefreshTitle()
+
+WHILE app.Running
+    size = GUI.Size(window)
+    GUI.Clear(window, 0.055, 0.062, 0.082)
+
+    toolbar_height = 46
+    GUI.Rectangle(window, 0, 0, size.Width, toolbar_height, 0.075, 0.086, 0.115)
+    button_widths = [70, 90, 70, 70]
+    button_offsets = HStack(12, button_widths, 8)
+    newButton.SetBounds(button_offsets[0], 8, button_widths[0], 30)
+    openButton.SetBounds(button_offsets[1], 8, button_widths[1], 30)
+    saveButton.SetBounds(button_offsets[2], 8, button_widths[2], 30)
+    runButton.SetBounds(button_offsets[3], 8, button_widths[3], 30)
+    newButton.Draw(window)
+    openButton.Draw(window)
+    saveButton.Draw(window)
+    runButton.Draw(window)
+
+    editor_y = toolbar_height + 8
+    output_height = 160
+    editor_height = size.Height - editor_y - output_height - 40
+    editor.SetBounds(12, editor_y, size.Width - 24, editor_height)
+    editor.Draw(window)
+
+    output_y = editor_y + editor_height + 8
+    GUI.RoundedRectangle(window, 12, output_y, size.Width - 24, output_height, 6, 0.07, 0.08, 0.1, 1.0)
+    GUI.Text(window, "OUTPUT", 22, output_y + 8, 12, 0.5, 0.58, 0.7, 1.0)
+    GUI.SetClip(window, 12, output_y, size.Width - 24, output_height)
+    GUI.TextMono(window, app.Output, 22, output_y + 26, 13, 0.82, 0.88, 0.94, 1.0)
+    GUI.ResetClip(window)
+
+    status_y = size.Height - 26
+    GUI.Text(window, app.Status, 12, status_y, 13, 0.55, 0.62, 0.72, 1.0)
+    GUI.Text(window, "F5 run   Ctrl+S save   Ctrl+O open   Ctrl+N new", size.Width - 340, status_y, 13, 0.45, 0.52, 0.62, 1.0)
+
+    GUI.Present(window)
+
+    event = GUI.WaitEvent(0.04)
+
+    IF event.Type == "close" THEN ignored = RequestClose()
+
+    IF newButton.HandleEvent(window, event) THEN ignored = NewDocument()
+    IF openButton.HandleEvent(window, event) THEN ignored = OpenDocument()
+    IF saveButton.HandleEvent(window, event) THEN ignored = SaveDocument()
+    IF runButton.HandleEvent(window, event) THEN ignored = RunProgram()
+
+    before_text = editor.Text
+    changed = editor.HandleEvent(window, event)
+    IF changed ORELSE editor.Text <> before_text THEN MarkDirty()
+
+    IF event.Type == "key" ANDALSO (event.Action == "press" ORELSE event.Action == "repeat") THEN
+        IF event.Key == "f5" THEN ignored = RunProgram()
+        IF event.Ctrl THEN
+            IF event.Key == "s" THEN ignored = SaveDocument()
+            IF event.Key == "o" THEN ignored = OpenDocument()
+            IF event.Key == "n" THEN ignored = NewDocument()
+        END IF
+    END IF
+WEND
+
+GUI.Close(window)
+IF app.Dirty THEN PRINT "ArcoFlow closed with unsaved changes in " + app.Path

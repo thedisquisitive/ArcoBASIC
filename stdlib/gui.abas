@@ -224,7 +224,14 @@ CLASS TextArea
     ' backspace/delete only ever act on the single character next to the caret.
     FUNCTION HandleEvent(window, event)
         changed = FALSE
-        within = event.X >= SELF.X ANDALSO event.X < SELF.X + SELF.Width ANDALSO event.Y >= SELF.Y ANDALSO event.Y < SELF.Y + SELF.Height
+        ' Only pointer-button, pointer-move, and scroll events carry X/Y at all (close, resize,
+        ' key, and text events don't -- see src/gui/glfw_backend.cpp); compute within only when
+        ' there's actually a position to test, or it reads event.X off an event that doesn't have
+        ' one every time this runs on anything else.
+        within = FALSE
+        IF event.Type == "pointer-button" ORELSE event.Type == "pointer-move" ORELSE event.Type == "scroll" THEN
+            within = event.X >= SELF.X ANDALSO event.X < SELF.X + SELF.Width ANDALSO event.Y >= SELF.Y ANDALSO event.Y < SELF.Y + SELF.Height
+        END IF
 
         IF event.Type == "pointer-button" ANDALSO event.Action == "press" ANDALSO event.Button == "left" ANDALSO within THEN
             SELF.Caret = SELF.HitTest(window, event.X, event.Y)

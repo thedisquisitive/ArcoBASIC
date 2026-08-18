@@ -2743,6 +2743,34 @@ Runtime::Runtime()
         const char* value = std::getenv(args[0].to_string().c_str());
         return value ? Value(value) : Value("");
     });
+    // Not meant to be called directly from ArcoBASIC source -- the AMIR builder emits a call to
+    // this as Main's first instructions (see AstAmirBuilder::build in fission.cpp) so a bare
+    // `Args` reference has a real local to read. Compiled functions treat every free identifier
+    // as a plain local with no mechanism to fall back to a runtime global when the slot was never
+    // stored into, so `Args` (set by whichever entry point actually has real argv -- arco_cli,
+    // native capsules; empty by default otherwise, see execute_bytecode) would otherwise be
+    // "undefined bytecode local: Args" the moment any script referenced it, same as it always was
+    // outside of arcosh (the only place that ever set the Args global before this).
+    register_function("Runtime.Args", [this](const std::vector<Value>&) -> Value {
+        return has_global("Args") ? get_global("Args") : Value(Value::Array{});
+    });
+    // General script-scope-global fallback for the bytecode compiler: every FUNCTION compiles to
+    // its own independent set of locals with no visibility into the enclosing script's top-level
+    // variables (the same gap Args had above, but for any ordinary top-level variable, e.g.
+    // examples/arcoflow.abas's `app = {...}`). AstAmirBuilder::apply_script_global_scoping in
+    // fission.cpp is the actual mechanism -- these two are just the read/write primitive it calls
+    // through, mirroring Main's assignments here and seeding every other function's same-named
+    // local from here in a synthetic prologue.
+    register_function("Runtime.GetGlobal", [this](const std::vector<Value>& args) -> Value {
+        if (args.empty()) throw std::runtime_error("Runtime.GetGlobal expects a name");
+        const std::string name = args[0].to_string();
+        return has_global(name) ? get_global(name) : Value();
+    });
+    register_function("Runtime.SetGlobal", [this](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) throw std::runtime_error("Runtime.SetGlobal expects a name and a value");
+        set_global(args[0].to_string(), args[1]);
+        return Value();
+    });
     auto serve_static_function = [](const std::vector<Value>& args) -> Value {
         if (args.empty() || args.size() > 4) {
             throw std::runtime_error("Web.ServeStatic expects root, optional port, optional host, and optional max requests");
@@ -2781,6 +2809,38 @@ Runtime::Runtime()
         expect_arg_count(args, "File.WriteBytes", 2, 2);
         write_plain_file(args[0].to_string(), string_from_bytes(args[1]), std::ios::binary | std::ios::trunc);
         return true;
+    });
+    // Path.* previously existed only in arco_shell (src/shell/arcosh.cpp) -- plain std::filesystem
+    // wrappers with no shell-specific dependency, so a capsule (e.g. examples/arcoflow.abas,
+    // which needs Path.BaseName for its window title) had no way to reach them despite File.*
+    // already being universal. Same gap as Process.Run/Process.Env/GUI.TextMono earlier.
+    register_function("Path.Join", [](const std::vector<Value>& args) -> Value {
+        if (args.empty()) {
+            throw std::runtime_error("Path.Join expects at least 1 argument");
+        }
+        std::filesystem::path path(args[0].to_string());
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            path /= args[i].to_string();
+        }
+        return path.string();
+    });
+    register_function("Path.Home", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Path.Home", 0, 0);
+        if (const char* home = std::getenv("HOME")) return Value(home);
+        if (const char* user_profile = std::getenv("USERPROFILE")) return Value(user_profile);
+        return Value("");
+    });
+    register_function("Path.BaseName", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Path.BaseName", 1, 1);
+        return std::filesystem::path(args[0].to_string()).filename().string();
+    });
+    register_function("Path.DirName", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Path.DirName", 1, 1);
+        return std::filesystem::path(args[0].to_string()).parent_path().string();
+    });
+    register_function("Path.Extension", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Path.Extension", 1, 1);
+        return std::filesystem::path(args[0].to_string()).extension().string();
     });
     register_function("Bytes.New", [](const std::vector<Value>& args) -> Value {
         expect_arg_count(args, "Bytes.New", 0, 2);

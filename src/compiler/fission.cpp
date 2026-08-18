@@ -796,8 +796,19 @@ public:
         main.return_type = "I32";
         main.blocks.push_back(AmirBlock{"Entry"});
         current_block_ = 0;
+        // Args (e.g. examples/arconote.abas's `IF LEN(Args) > 0 THEN ...`) is a plain local like
+        // any other free identifier by the time it reaches lower_statements below -- seed it as
+        // Main's first instructions from the runtime global of the same name (see
+        // Runtime.Args in runtime.cpp) rather than teaching every LOAD site about a global
+        // fallback. User code that assigns its own Args later just overwrites this normally.
+        {
+            const std::string args_temp = temp();
+            current_block(main).instructions.push_back(amir_call_value(args_temp, "Runtime.Args", {}));
+            current_block(main).instructions.push_back(amir_store("Args", args_temp));
+        }
         lower_statements(main, roots_);
         ensure_terminated(main, current_block_, "I32", "0");
+        apply_script_global_scoping(main);
         module_.functions.insert(module_.functions.begin(), std::move(main));
         validate_module();
         return module_;
@@ -840,6 +851,105 @@ private:
             if ((space == std::string::npos ? param : param.substr(0, space)) == name) return true;
         }
         return false;
+    }
+
+    // Every FUNCTION lowers to its own independent AmirFunction with its own locals -- confirmed
+    // by examples/arcoflow.abas's `app = {...}` (assigned once, at script scope) crashing every
+    // FUNCTION that merely reads app.Something with "undefined bytecode local: app", the same
+    // failure Args had before Runtime.Args/the seed above, just for any ordinary top-level
+    // variable instead of one specific name. The tree-walking runtime (arco_cli, ground truth --
+    // see the reference "x"/"Leak" scoping check this fix was verified against) resolves a free
+    // identifier a function never assigns by reading the enclosing script scope, while a plain
+    // assignment inside the function only ever shadows a local copy (the outer variable is
+    // unchanged when the function returns). This reproduces that: every plain assignment to a
+    // script-scope name in Main also mirrors into a runtime global (Runtime.SetGlobal), and every
+    // other function seeds its own same-named local from that global (Runtime.GetGlobal) in a
+    // synthetic prologue -- so reads see the current script-scope value, and a function-local
+    // assignment still only shadows its own slot, exactly like the tree-walker. Field/element
+    // mutation (STORE_INDEX, e.g. `app.Count = ...`) needs no extra help: objects/arrays are
+    // reference values, so mutating one through the seeded local mutates the same object Main
+    // (and every other function) sees.
+    //
+    // Scoped to names actually shared with another function (assigned in Main AND referenced by
+    // name -- Load/Store/StoreIndex/StoreSlice/Destructure, the same instruction kinds
+    // build_bytecode's local_ref allocates a slot for -- somewhere else), not every Main-level
+    // assignment: a script with no FUNCTIONs, or whose functions are self-contained, gets none of
+    // this instrumentation and compiles exactly as before. That keeps the change scoped to the
+    // pattern that actually needs it instead of shifting every program's temp/instruction count.
+    void apply_script_global_scoping(AmirFunction& main) {
+        std::unordered_set<std::string> assigned_in_main;
+        for (const auto& block : main.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (instruction.kind != AmirInstruction::Kind::Store) continue;
+                const std::string& name = instruction.target;
+                if (name.empty() || name == "Args") continue;
+                if (name.rfind("__fission_", 0) == 0) continue;
+                assigned_in_main.insert(name);
+            }
+        }
+        if (assigned_in_main.empty()) return;
+
+        std::unordered_set<std::string> referenced_elsewhere;
+        for (const auto& function : module_.functions) {
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    switch (instruction.kind) {
+                        case AmirInstruction::Kind::Load:
+                        case AmirInstruction::Kind::Store:
+                        case AmirInstruction::Kind::StoreIndex:
+                        case AmirInstruction::Kind::StoreSlice:
+                            referenced_elsewhere.insert(instruction.target);
+                            break;
+                        case AmirInstruction::Kind::Destructure:
+                            for (const auto& name : instruction.operands) referenced_elsewhere.insert(name);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+        }
+
+        std::unordered_set<std::string> script_globals;
+        for (const auto& name : assigned_in_main) {
+            if (referenced_elsewhere.count(name) > 0) script_globals.insert(name);
+        }
+        if (script_globals.empty()) return;
+
+        for (auto& block : main.blocks) {
+            std::vector<AmirInstruction> mirrored;
+            mirrored.reserve(block.instructions.size());
+            for (auto& instruction : block.instructions) {
+                const bool needs_mirror = instruction.kind == AmirInstruction::Kind::Store &&
+                                           script_globals.count(instruction.target) > 0;
+                const std::string name = instruction.target;
+                mirrored.push_back(std::move(instruction));
+                if (needs_mirror) {
+                    // Reload from the local rather than reusing the Store's own value operand:
+                    // build_bytecode fuses an adjacent Const+Store into a single STORE_CONST and
+                    // drops the Const's temp entirely, which left that temp undefined once this
+                    // pass also referenced it here ("undefined bytecode temporary"). A fresh Load
+                    // always materializes regardless of how the preceding Store got optimized.
+                    const std::string reloaded = temp();
+                    mirrored.push_back(amir_load(reloaded, name));
+                    mirrored.push_back(amir_call_value(temp(), "Runtime.SetGlobal", {"\"" + escaped(name) + "\"", reloaded}));
+                }
+            }
+            block.instructions = std::move(mirrored);
+        }
+
+        for (auto& function : module_.functions) {
+            if (function.blocks.empty()) continue;
+            std::vector<AmirInstruction> prologue;
+            for (const auto& name : script_globals) {
+                if (has_parameter(function, name)) continue;
+                const std::string value_temp = temp();
+                prologue.push_back(amir_call_value(value_temp, "Runtime.GetGlobal", {"\"" + escaped(name) + "\""}));
+                prologue.push_back(amir_store(name, value_temp));
+            }
+            auto& entry = function.blocks.front().instructions;
+            entry.insert(entry.begin(), std::make_move_iterator(prologue.begin()), std::make_move_iterator(prologue.end()));
+        }
     }
 
     bool is_fixed_integer_type(const std::string& type) const {
@@ -927,6 +1037,41 @@ private:
         module_.diagnostics.push_back(message);
     }
 
+    // ANDALSO/ORELSE short-circuit lowering: evaluate the left side, branch on it without ever
+    // touching the right side unless it's actually needed, and merge through a hidden local (the
+    // same merge-through-a-hidden-local pattern ArrayComprehension above uses for its result) --
+    // `out` in lower_expression goes stale the moment current_block_ moves to a new block, so
+    // every push here goes through current_block(function) freshly, never a cached reference.
+    std::string lower_short_circuit_logical(AmirFunction& function, const CanonicalAstNode& node) {
+        const bool is_and = node.op == TokenType::AndAlso;
+        const std::string result_name = hidden_name("shortcircuit");
+        const std::string left = lower_expression(function, *node.children[0], "BOOL");
+        current_block(function).instructions.push_back(amir_store(result_name, left));
+
+        const std::size_t rhs_block = add_block(function, "ShortCircuitRhs");
+        const std::size_t end_block = add_block(function, "ShortCircuitEnd");
+        // AndAlso: only evaluate the right side when the left side was true; short-circuit
+        // straight to the merge (carrying the already-false left value) otherwise. OrElse is the
+        // mirror image.
+        if (is_and) {
+            current_block(function).instructions.push_back(
+                amir_branch(left, block_name(function, rhs_block), block_name(function, end_block)));
+        } else {
+            current_block(function).instructions.push_back(
+                amir_branch(left, block_name(function, end_block), block_name(function, rhs_block)));
+        }
+
+        current_block_ = rhs_block;
+        const std::string right = lower_expression(function, *node.children[1], "BOOL");
+        current_block(function).instructions.push_back(amir_store(result_name, right));
+        current_block(function).instructions.push_back(amir_jump(block_name(function, end_block)));
+
+        current_block_ = end_block;
+        const std::string result = temp();
+        current_block(function).instructions.push_back(amir_load(result, result_name));
+        return result;
+    }
+
     std::string lower_expression(AmirFunction& function, const CanonicalAstNode& node, const std::string& expected_type = "") {
         AmirBlock& out = current_block(function);
         switch (node.kind) {
@@ -958,6 +1103,17 @@ private:
             case AstKind::Binary:
             case AstKind::Logical: {
                 if (node.children.size() != 2) return lower_fallback(out, node);
+                // ANDALSO/ORELSE are ArcoBASIC's short-circuit logical operators (AND/OR/NOT stay
+                // deliberately bitwise and always evaluate both sides -- see runtime_tests.cpp);
+                // the generic path below evaluates both children unconditionally before emitting
+                // a plain BINARY, which is correct for bitwise AND/OR but silently drops the
+                // "short" from ANDALSO/ORELSE (found via arcoflow.abas's
+                // `event.Type == "key" ANDALSO event.Action == ...` evaluating event.Action on
+                // every event, including ones with no Action field at all: "undefined property:
+                // Action" instead of just skipping the right-hand side).
+                if (node.op == TokenType::AndAlso || node.op == TokenType::OrElse) {
+                    return lower_short_circuit_logical(function, node);
+                }
                 const std::string result_type = type_of_expression(node, expected_type);
                 const std::string inferred_left_type = type_of_expression(*node.children[0]);
                 const std::string inferred_right_type = type_of_expression(*node.children[1]);
@@ -5719,6 +5875,16 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
 }
 
 Value execute_bytecode(BytecodeModule& module, Runtime& runtime, bool count_instructions = true) {
+    // Args (command-line arguments the running program sees, e.g. examples/arconote.abas's
+    // `IF LEN(Args) > 0 THEN initial_path = Args[0]`) previously existed only as a global arcosh
+    // set up for shell-invoked scripts (src/shell/arcosh.cpp) -- run_bytecode/run_bytecode_binary/
+    // compile_run never set it at all, so merely reading Args crashed ("undefined bytecode local:
+    // Args") outside the shell, in every hosted and native-capsule execution path. Callers that
+    // have real argv (see run_bytecode_binary below) set Args before calling here; this is just
+    // the universal fallback so an unset Args is an empty array, never undefined.
+    if (!runtime.has_global("Args")) {
+        runtime.set_global("Args", Value(Value::Array{}));
+    }
     if (module.constant_values.size() != module.constants.size() || module.function_indices.empty()) {
         prepare_bytecode_module(module);
     }
@@ -5907,17 +6073,20 @@ std::string native_launcher_source(const std::string& bytecode_binary, std::opti
     std::ostringstream out;
     out << "#include \"arco/fission.hpp\"\n"
         << "#include <iostream>\n"
+        << "#include <vector>\n"
         << "\n"
-        << "int main() {\n"
+        << "int main(int argc, char** argv) {\n"
         << "    const std::string bytecode(" << cpp_string_literal(bytecode_binary) << ", "
         << bytecode_binary.size() << ");\n"
+        << "    std::vector<std::string> script_args;\n"
+        << "    for (int i = 1; i < argc; ++i) script_args.emplace_back(argv[i]);\n"
         << "    const auto result = arco::fission::run_bytecode_binary(bytecode, ";
     if (instruction_limit_override.has_value()) {
         out << "std::optional<std::size_t>(" << *instruction_limit_override << ")";
     } else {
         out << "std::nullopt";
     }
-    out << ");\n"
+    out << ", script_args);\n"
         << "    if (!result.ok) {\n"
         << "        std::cerr << result.error << '\\n';\n"
         << "        return 1;\n"
@@ -6366,13 +6535,18 @@ Result run_bytecode(const std::string& bytecode, std::optional<std::size_t> inst
     }
 }
 
-Result run_bytecode_binary(const std::string& bytecode, std::optional<std::size_t> instruction_limit_override) {
+Result run_bytecode_binary(const std::string& bytecode, std::optional<std::size_t> instruction_limit_override,
+                           const std::vector<std::string>& script_args) {
     try {
         Runtime runtime;
         runtime.set_instruction_limit_policy(true);
         runtime.set_instruction_limit_override(instruction_limit_override);
         std::ostringstream output;
         runtime.set_output(output);
+        Value::Array args_array;
+        args_array.reserve(script_args.size());
+        for (const auto& arg : script_args) args_array.emplace_back(arg);
+        runtime.set_global("Args", Value(std::move(args_array)));
         auto module = parse_binary_bytecode(bytecode);
         prepare_bytecode_module(module);
         const bool count_instructions = !(instruction_limit_override.has_value() && *instruction_limit_override == 0);
