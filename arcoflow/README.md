@@ -55,10 +55,12 @@ xdg-open arcoflow/build/web/arcoflow.html   # or just double-click it in a file 
 `arcoflow/serve.sh` still exists for serving it over real HTTP if you'd rather (e.g. to share a
 link), but it's optional now, not required.
 
-Editing, saving, and the project explorer all work the same as on desktop. `Run` fails gracefully
-with no subprocess to shell out to (there's no `ArcoFission` reachable from inside a browser
-sandbox) -- everything else (`GUI.Image`, real file/save dialogs, clipboard) has the same
-deliberate first-pass gaps documented in `docs/arcofission.md`.
+Editing, saving, the project explorer, and Run all work the same as on desktop. `Run` can't shell
+out to a separate `ArcoFission` process (no subprocess sandbox exists in a browser), so it compiles
+and runs the current source in-process instead, through the exact same compiler this capsule was
+itself built with (`ArcoFission.CompileRunSource` -- see `docs/arcofission.md`) -- everything else
+(`GUI.Image`, real file/save dialogs, clipboard) has the same deliberate first-pass gaps documented
+there.
 
 ## Project format
 

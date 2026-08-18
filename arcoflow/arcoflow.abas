@@ -247,8 +247,16 @@ FUNCTION RunProgram()
         RETURN FALSE
     END IF
     app.Status = "Running..."
-    command = "\"" + arcofission_path + "\" compile-run \"" + app.Path + "\""
-    result = Process.Run(command)
+    IF GUI.Backend() == "canvas" THEN
+        ' No real subprocess sandbox exists in a browser (Process.Run has nothing to shell out
+        ' to), so compile and run the current source in-process instead, via ArcoFission itself
+        ' the exact same compiler this capsule was built with. See ArcoFission.CompileRunSource
+        ' in fission.cpp.
+        result = ArcoFission.CompileRunSource(editor.Text)
+    ELSE
+        command = "\"" + arcofission_path + "\" compile-run \"" + app.Path + "\""
+        result = Process.Run(command)
+    END IF
     app.Output = result.Output
     IF result.ExitCode == 0 THEN
         app.Status = "Finished (exit 0)"

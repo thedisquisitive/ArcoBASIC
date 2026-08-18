@@ -6554,6 +6554,25 @@ std::string emit_ast(const std::vector<std::unique_ptr<Stmt>>& statements, const
     return out.str();
 }
 
+// Lets a running capsule compile-and-run ArcoBASIC source *in-process*, using the exact same
+// compiler this capsule itself was built with -- the fallback examples/arcoflow.abas's Run button
+// (Process.Run -> a separate ArcoFission compile-run invocation) needs on a target with no real
+// subprocess sandbox to spawn that separate process in. The web/WASM target is exactly that: there
+// is no popen() equivalent in a browser, so Process.Run fails immediately there (GUI.Backend() ==
+// "canvas" is how ArcoBASIC code tells that case apart from a desktop build with a real ArcoFission
+// binary reachable). Mirrors Process.Run's own {Ok, Output, ExitCode, Error} shape (see
+// process_run in runtime.cpp) so callers can treat the two uniformly.
+void register_self_compile_run(Runtime& runtime) {
+    runtime.register_function("ArcoFission.CompileRunSource", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) {
+            throw std::runtime_error("ArcoFission.CompileRunSource expects one source-code argument");
+        }
+        const Result result = compile_run(args[0].to_string(), "ArcoFission.CompileRunSource");
+        return Value::Object{{"Ok", result.ok}, {"Output", result.ok ? result.output : result.error},
+                             {"ExitCode", result.ok ? 0.0 : 1.0}, {"Error", result.error}};
+    });
+}
+
 } // namespace
 
 Result reveal_amir(const std::string& source, const std::string& source_name) {
@@ -6739,6 +6758,7 @@ Result run_bytecode_binary(const std::string& bytecode, std::optional<std::size_
         runtime.set_instruction_limit_override(instruction_limit_override);
         std::ostringstream output;
         runtime.set_output(output);
+        register_self_compile_run(runtime);
         Value::Array args_array;
         args_array.reserve(script_args.size());
         for (const auto& arg : script_args) args_array.emplace_back(arg);
@@ -6777,6 +6797,7 @@ Result compile_run(const std::string& source, const std::string& source_name,
         runtime.set_instruction_limit_override(instruction_limit_override);
         std::ostringstream output;
         runtime.set_output(output);
+        register_self_compile_run(runtime);
         auto module = build_bytecode(build_amir(
             statements, source_name, preprocess_runtime.compile_metadata().instruction_limit));
         prepare_bytecode_module(module);

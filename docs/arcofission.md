@@ -211,9 +211,16 @@ the blocking-style `WHILE ... GUI.WaitEvent(...) ... WEND` loop every GUI capsul
 against works unchanged in a browser because the capsule links with `-sASYNCIFY` -- see the
 file-level comment in `canvas_backend.cpp` for how that works and its current limitations
 (`GUI.Image` isn't implemented yet; `GUI.OpenFileDialog`/`SaveFileDialog` use `window.prompt()`
-against Emscripten's in-memory `MEMFS`, not a real native picker or the user's actual disk;
-`Process.Run` -- and so ArcoFlow's own Run button -- has no subprocess to shell out to in a
-browser sandbox and fails gracefully rather than working).
+against Emscripten's in-memory `MEMFS`, not a real native picker or the user's actual disk).
+
+`Process.Run` has no real subprocess to shell out to in a browser sandbox and fails immediately
+there -- but every capsule that links `arco_compiler` (which every native/web capsule does, to
+embed and run its own bytecode) also has the full compiler available in-process, so
+`ArcoFission.CompileRunSource(source)` compiles and runs ArcoBASIC source text directly, no
+subprocess involved, returning the same `{Ok, Output, ExitCode, Error}` shape `Process.Run` does
+(see `register_self_compile_run` in `fission.cpp`). This is what ArcoFlow's own Run button falls
+back to when `GUI.Backend() == "canvas"` instead of shelling out to a separate `ArcoFission`
+invocation the way it does on desktop.
 
 ## Instruction Limits
 
