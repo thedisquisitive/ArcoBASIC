@@ -31,6 +31,22 @@ explorer, point it at `example-project/`, which has a `project.arcoproj` with a 
 build/arcoflow arcoflow/example-project/project.arcoproj
 ```
 
+### In a browser
+
+ArcoFlow also runs as a WebAssembly capsule (see "Web Capsules" in `docs/arcofission.md` for full
+toolchain setup):
+
+```sh
+export ARCOFISSION_WEB_TOOLCHAIN_DIR=/path/to/build-wasm
+build/ArcoFission native arcoflow/arcoflow.abas -o arcoflow.html --target web
+python3 -m http.server   # from the directory holding arcoflow.html/.js/.wasm
+```
+
+Editing, saving, and the project explorer all work the same as on desktop. `Run` fails gracefully
+with no subprocess to shell out to (there's no `ArcoFission` reachable from inside a browser
+sandbox) -- everything else (`GUI.Image`, real file/save dialogs, clipboard) has the same
+deliberate first-pass gaps documented in `docs/arcofission.md`.
+
 ## Project format
 
 A project's manifest is a file named `project.arcoproj`, either opened directly or discovered as a

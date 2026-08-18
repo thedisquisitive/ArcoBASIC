@@ -164,6 +164,52 @@ see the `#ifdef _WIN32` branches in `src/runtime/runtime.cpp`). A capsule that o
 language features, `PRINT`, arrays/objects, and non-network stdlib works exactly as it does on
 Linux.
 
+## Web Capsules
+
+`ArcoFission` can also cross-compile a capsule to WebAssembly, runnable in any browser, using the
+[Emscripten](https://emscripten.org) toolchain:
+
+```sh
+git clone https://github.com/emscripten-core/emsdk.git ~/emsdk
+~/emsdk/emsdk install latest
+~/emsdk/emsdk activate latest
+```
+
+Configure and build an Emscripten-targeted tree of the runtime and compiler libraries (this only
+needs `arco_compiler`, not the whole project; `-DARCO_ENABLE_GUI=ON` is the default and is what
+selects `src/gui/canvas_backend.cpp`, described below, over the stub backend):
+
+```sh
+source ~/emsdk/emsdk_env.sh
+emcmake cmake -S . -B build-wasm -DCMAKE_BUILD_TYPE=Release
+cmake --build build-wasm --target arco_compiler
+```
+
+Then point `ARCOFISSION_WEB_TOOLCHAIN_DIR` at that tree and build with `--target web`:
+
+```sh
+export ARCOFISSION_WEB_TOOLCHAIN_DIR="$PWD/build-wasm"
+export ARCOFISSION_WEB_CXX="$HOME/emsdk/upstream/emscripten/em++"  # only if em++ isn't on PATH
+build/ArcoFission native examples/hello.bas -o hello.html --target web
+```
+
+This writes `hello.html`, `hello.js`, and `hello.wasm` alongside each other; serve the directory
+over HTTP (`python3 -m http.server`, or any static file server -- `file://` won't work, browsers
+block wasm fetches from it) and open `hello.html`. Console output (`PRINT`, uncaught errors)
+appears both on the page and in the browser's own JS console.
+
+**GUI capsules** (anything using `stdlib/gui.abas`/`GUI.*`, including `arcoflow/arcoflow.abas`
+itself) work too: `src/gui/canvas_backend.cpp` implements the same `arco::gui` interface
+`src/gui/glfw_backend.cpp` does for desktop, backed by an HTML5 `<canvas>` instead of
+GLFW+Cairo+Pango+GTK. The window fills the browser viewport rather than being a fixed size, and
+the blocking-style `WHILE ... GUI.WaitEvent(...) ... WEND` loop every GUI capsule is written
+against works unchanged in a browser because the capsule links with `-sASYNCIFY` -- see the
+file-level comment in `canvas_backend.cpp` for how that works and its current limitations
+(`GUI.Image` isn't implemented yet; `GUI.OpenFileDialog`/`SaveFileDialog` use `window.prompt()`
+against Emscripten's in-memory `MEMFS`, not a real native picker or the user's actual disk;
+`Process.Run` -- and so ArcoFlow's own Run button -- has no subprocess to shell out to in a
+browser sandbox and fails gracefully rather than working).
+
 ## Instruction Limits
 
 Hosted run/build commands accept an operator instruction limit:

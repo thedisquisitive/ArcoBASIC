@@ -6076,6 +6076,18 @@ bool is_elf64_file(const std::filesystem::path& path) {
 // True for a PE32+ image whose optional header reports the x86-64 machine type -- enough to
 // confirm the cross-compiler actually produced a Windows x86-64 executable rather than, say,
 // silently falling back to a host binary. Doesn't attempt full PE validation.
+// True for a file starting with WebAssembly's magic number + version 1 -- enough to confirm
+// Emscripten actually produced a wasm binary rather than, say, silently failing to write one.
+// Doesn't attempt full module validation.
+bool is_wasm_file(const std::filesystem::path& path) {
+    unsigned char header[8] = {};
+    std::ifstream input(path, std::ios::binary);
+    input.read(reinterpret_cast<char*>(header), sizeof(header));
+    return input.gcount() == static_cast<std::streamsize>(sizeof(header)) &&
+           header[0] == 0x00 && header[1] == 'a' && header[2] == 's' && header[3] == 'm' &&
+           header[4] == 0x01 && header[5] == 0x00 && header[6] == 0x00 && header[7] == 0x00;
+}
+
 bool is_pe64_file(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     unsigned char dos_header[64] = {};
@@ -6221,6 +6233,124 @@ Result build_native_windows_bytecode(const std::string& bytecode_binary, const s
         message << "STRUCTURE ASSEMBLED\n";
         message << "BYTECODE EMBEDDED\n";
         message << "PE32+ WRITTEN " << output_path << "\n";
+        return {true, message.str(), ""};
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+#endif
+
+#if defined(__linux__)
+// Locates an Emscripten-targeted build tree (arco_runtime/arco_compiler/arcology_os configured
+// with `emcmake cmake -S . -B <dir>` and built, see arcoflow/README.md or docs/) so the web
+// capsule target can link against it. Not auto-discovered the way the same-host native path is,
+// since that tree was built for the browser, not for this host -- callers must point at one via
+// ARCOFISSION_WEB_TOOLCHAIN_DIR, same shape as the Windows cross-build's
+// ARCOFISSION_WINDOWS_TOOLCHAIN_DIR above.
+std::optional<std::filesystem::path> web_toolchain_build_dir() {
+    const char* env = std::getenv("ARCOFISSION_WEB_TOOLCHAIN_DIR");
+    if (!env || !*env) {
+        return std::nullopt;
+    }
+    return std::filesystem::path(env);
+}
+
+Result build_web_bytecode(const std::string& bytecode_binary, const std::string& output_path,
+                          std::optional<std::size_t> instruction_limit_override) {
+    try {
+        const auto web_build_dir = web_toolchain_build_dir();
+        if (!web_build_dir.has_value()) {
+            return {false, "",
+                "Web capsule builds need an Emscripten-targeted build tree (configure one with "
+                "`emcmake cmake -S . -B <dir> -DARCO_ENABLE_GUI=ON` and build the arco_compiler "
+                "target), then point ARCOFISSION_WEB_TOOLCHAIN_DIR at it"};
+        }
+        const std::filesystem::path source_root = source_root_path();
+        const std::filesystem::path compiler_lib = *web_build_dir / "libarco_compiler.a";
+        const std::filesystem::path runtime_lib = *web_build_dir / "libarco_runtime.a";
+        const std::filesystem::path arcology_lib = *web_build_dir / "arcology-os" / "libarcology_os.a";
+        for (const auto& lib : {compiler_lib, runtime_lib, arcology_lib}) {
+            if (!std::filesystem::exists(lib)) {
+                return {false, "", "missing " + lib.string() +
+                    " -- build the arco_compiler target in the Emscripten tree ARCOFISSION_WEB_TOOLCHAIN_DIR points at"};
+            }
+        }
+
+        const std::filesystem::path tmp_dir = std::filesystem::temp_directory_path() /
+                                              ("arcofission-native-web-" + std::to_string(static_cast<long long>(::getpid())));
+        std::filesystem::create_directories(tmp_dir);
+        const std::filesystem::path launcher = tmp_dir / "launcher.cpp";
+        {
+            std::ofstream out(launcher);
+            if (!out) {
+                return {false, "", "could not write web launcher source"};
+            }
+            out << native_launcher_source(bytecode_binary, instruction_limit_override);
+        }
+
+        const char* env_cross_cxx = std::getenv("ARCOFISSION_WEB_CXX");
+        const std::string compiler = env_cross_cxx && *env_cross_cxx ? env_cross_cxx : "em++";
+
+        // em++ picks its output shape (bare .wasm+.js, or a full .html shell too) from -o's
+        // extension; default to the full page if the caller asked for neither, since a lone
+        // .wasm with no way to load it isn't a usable deliverable by itself.
+        std::string output = output_path;
+        const std::string ext = std::filesystem::path(output).extension().string();
+        if (ext != ".html" && ext != ".js" && ext != ".wasm") {
+            output += ".html";
+        }
+
+        std::vector<std::string> args{
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-fexceptions",
+            "-sASYNCIFY",
+            "-sALLOW_MEMORY_GROWTH=1",
+            // Module.ccall/cwrap aren't exported by default -- src/gui/canvas_backend.cpp's DOM
+            // event listeners use Module.ccall to marshal string arguments (key names, typed
+            // text) back into the wasm module. Without this, `Module.ccall` is simply undefined
+            // and every keyboard/text event is silently dropped the moment a listener tries to
+            // call it (mouse/resize events, which pass only numbers through the low-level
+            // Module._arco_gui_push_* form, are unaffected).
+            "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap",
+            launcher.string(),
+            "-o",
+            output,
+            "-I" + (source_root / "include").string(),
+            compiler_lib.string(),
+            runtime_lib.string(),
+            arcology_lib.string(),
+        };
+
+        std::ostringstream command;
+        bool first = true;
+        for (const auto& arg : args) {
+            if (!first) {
+                command << ' ';
+            }
+            first = false;
+            command << shell_quote(arg);
+        }
+
+        const int status = std::system(command.str().c_str());
+        std::filesystem::remove_all(tmp_dir);
+        if (status == -1) {
+            return {false, "", "could not launch the Emscripten compiler (em++)"};
+        }
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            return {false, "", "Emscripten compiler failed while building the web capsule"};
+        }
+        const std::filesystem::path wasm_output = std::filesystem::path(output).replace_extension(".wasm");
+        if (!is_wasm_file(wasm_output)) {
+            return {false, "", "Emscripten compiler did not produce a valid wasm module"};
+        }
+
+        std::ostringstream message;
+        message << "SOURCE ACCEPTED\n";
+        message << "STRUCTURE ASSEMBLED\n";
+        message << "BYTECODE EMBEDDED\n";
+        message << "WEB CAPSULE WRITTEN " << output << "\n";
         return {true, message.str(), ""};
     } catch (const std::exception& error) {
         return {false, "", error.what()};
@@ -6649,6 +6779,13 @@ Result build_native_file(const std::string& path, const std::string& output_path
             return build_native_windows_bytecode(bytecode, output_path, instruction_limit_override);
 #else
             return {false, "", "Windows capsule cross-builds are only supported from a Linux host"};
+#endif
+        }
+        if (target == "web" || target == "wasm" || target == "web-wasm32") {
+#if defined(__linux__)
+            return build_web_bytecode(bytecode, output_path, instruction_limit_override);
+#else
+            return {false, "", "Web capsule cross-builds are only supported from a Linux host"};
 #endif
         }
         return build_native_bytecode(bytecode, output_path, instruction_limit_override, !bytecode_needs_full_runtime(module));

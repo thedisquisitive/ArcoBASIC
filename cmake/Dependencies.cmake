@@ -1,7 +1,14 @@
 set(ARCO_GUI_BACKEND_AVAILABLE FALSE)
 set(ARCO_GUI_BACKEND_SOURCE src/gui/stub_backend.cpp)
 
-if(ARCO_ENABLE_GUI AND UNIX AND NOT APPLE)
+if(ARCO_ENABLE_GUI AND EMSCRIPTEN)
+    # No GLFW/GTK/Cairo/Pango under Emscripten's sysroot -- and no reason to look, since none of
+    # them have web ports arco_runtime could link against anyway. The canvas backend below is a
+    # from-scratch implementation of the same arco::gui interface against HTML5 <canvas>, not a
+    # port of glfw_backend.cpp's dependencies.
+    set(ARCO_GUI_BACKEND_AVAILABLE TRUE)
+    set(ARCO_GUI_BACKEND_SOURCE src/gui/canvas_backend.cpp)
+elseif(ARCO_ENABLE_GUI AND UNIX AND NOT APPLE)
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
         pkg_check_modules(GLFW3 QUIET IMPORTED_TARGET glfw3)

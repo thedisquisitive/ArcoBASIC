@@ -12,6 +12,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(ARCO_ENABLE_GUI "Build the desktop GUI backend when dependencies are available" ON)
 option(ARCO_ENABLE_NETWORK "Build HTTP networking helpers when libcurl is available" ON)
 
+if(EMSCRIPTEN)
+    # Emscripten disables C++ exception support by default (it costs code size); this codebase
+    # uses try/catch pervasively (every ArcoFission entry point, Runtime::run_string, ...) as its
+    # primary error-reporting mechanism, so leaving the default in place doesn't fail to build --
+    # it builds fine and then aborts the whole wasm module the moment anything actually throws.
+    add_compile_options(-fexceptions)
+    add_link_options(-fexceptions)
+endif()
+
 include(cmake/Dependencies.cmake)
 
 function(arco_configure_library target)
@@ -41,7 +50,13 @@ arco_configure_library(arco_runtime)
 target_link_libraries(arco_runtime PUBLIC arcology_os)
 add_library(ArcoBASIC::runtime ALIAS arco_runtime)
 
-if(ARCO_GUI_BACKEND_AVAILABLE)
+if(ARCO_GUI_BACKEND_AVAILABLE AND EMSCRIPTEN)
+    target_compile_definitions(arco_runtime PRIVATE ARCO_GUI_CANVAS=1)
+    # -sASYNCIFY: see src/gui/canvas_backend.cpp's file-level comment -- lets the blocking-style
+    # `WHILE ... GUI.WaitEvent(...) ... WEND` loop every GUI capsule is written with actually work
+    # in a browser without rewriting the VM/runtime into a callback state machine.
+    target_link_options(arco_runtime PUBLIC "-sASYNCIFY" "-sALLOW_MEMORY_GROWTH=1")
+elseif(ARCO_GUI_BACKEND_AVAILABLE)
     target_link_libraries(arco_runtime
         PUBLIC
             PkgConfig::GLFW3

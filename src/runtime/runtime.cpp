@@ -88,6 +88,12 @@ bool gui_session_available() {
     return true;
 #elif defined(__APPLE__)
     return true;
+#elif defined(__EMSCRIPTEN__)
+    // DISPLAY/WAYLAND_DISPLAY are an X11/Wayland desktop-session heuristic that means nothing in
+    // a browser -- a web capsule linked with src/gui/canvas_backend.cpp always has a DOM/<canvas>
+    // available (that's the only way it would have linked at all), so there's no separate
+    // "headless" case to detect here the way there is for a desktop build.
+    return true;
 #else
     const char* display = std::getenv("DISPLAY");
     const char* wayland = std::getenv("WAYLAND_DISPLAY");
