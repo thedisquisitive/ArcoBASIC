@@ -2,7 +2,8 @@
 
 **RFC Number:** RFC-0038
 **Title:** APS Block Storage and Filesystem Provider Substrate
-**Status:** Draft
+**Status:** Implemented (with documented deviations -- see Revision History and
+`.agents/reports/aps-block-storage.md`)
 **Category:** Substrate / Storage
 **Authors:** Arcology Project
 **Created:** 2026-08-19
@@ -560,3 +561,4 @@ dependency.
 |---------|------------|---------------------------------------------------------------------------|
 | 0.1     | 2026-08-19 | Initial draft                                                             |
 | 0.2     | 2026-08-19 | Reconciled with RFC-0039 (ArcologyFS): retitled to "Block Storage and Filesystem Provider Substrate," added §6.3.1 mapping this RFC's `FilesystemProvider` to RFC-0039's `FileSystem`/`Namespace`/`ByteStream` interfaces, tied `Volumes.Mount`/`Unmount` to RFC-0039 §10's namespace-attachment lifecycle, resolved former Open Question #2 |
+| 1.0     | 2026-08-19 | Implemented and validated end-to-end under QEMU/OVMF: a RAM Disk Block Device Provider backed by a QEMU-preloaded real FAT32 image, a read-only FAT32 Filesystem Provider reading a genuine multi-cluster file byte-for-byte via real FAT chain-walking, and a unified namespace layer proven against a decoy mount point, plus the Section 16 negative test (mount rejects a zeroed volume). Three documented deviations (concrete functions instead of interface values; 11-byte 8.3 buffers instead of `STRING`, after `STRING` equality was directly proven to silently return the wrong answer at runtime on this backend; array-free `Enumerate`/`Stat` stand-ins) plus root-directory-only lookup. Found and fixed a real, general parser bug (`IF cond THEN   ' comment` broke parsing) in `src/frontend/parser.cpp`. See `.agents/reports/aps-block-storage.md` for full detail, including two flagged-but-unfixed pre-existing gaps (the `STRING` bug itself, and a `/`-vs-`\` division mistake already latent in RFC-0036's `Timer.Initialize`/`Timer.UptimeMilliseconds`). |

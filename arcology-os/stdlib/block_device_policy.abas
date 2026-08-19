@@ -1,0 +1,104 @@
+' APS RAM Disk Block Device Provider (RFC-0038: APS Block Storage and Filesystem Provider
+' Substrate, Requirements 6.1/6.2). Backs the Filesystem Provider layer (fat32_policy.abas) with
+' no real storage hardware driver needed -- the RAM disk itself is just a byte range in memory.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+' --- A documented deviation, stated up front, in the same spirit as loop_policy.abas's own
+' header note. ---
+'
+' RFC-0038 Section 6.1 specifies `RAMDisk.Create(sizeBytes AS U64) AS BlockDevice` -- a value of
+' an abstract `BlockDevice` interface type, so calling code can hold a RAM disk, a future AHCI
+' device, etc. behind one shape. This implementation exposes `RAMDisk.*` as concrete, directly-
+' named functions instead (`RAMDisk.SectorSize()`, `RAMDisk.ReadSectors(...)`, ...), and
+' `RAMDisk.Create` returns `BOOL`, not a `BlockDevice` value. Reason: this compiler's freestanding
+' x86-64 backend has no runtime-polymorphic dispatch mechanism at all -- confirmed the same way
+' RFC-0037's `Loop.RegisterHook` deviation was confirmed (AmirInstruction::Kind::AddressOf is
+' unhandled by generate_x86_64_function; CallValue can only call a compile-time-known function
+' name). There is only one RAM disk in this milestone -- the same "one instance, fixed scratch
+' state" pattern every prior RFC in this chain has used (one timer, one loop, one exception
+' table) -- so the concrete-function shape loses nothing real yet; it becomes a genuine gap only
+' once a second, different BlockDevice implementation (a real AHCI/NVMe/virtio-blk driver, all
+' explicitly Non-Goals/Future Extensions of this RFC) needs to be swapped in behind the same
+' calling code, at which point this needs the same treatment RFC-0027's freestanding callables
+' would need for Loop.RegisterHook.
+'
+' A second deviation, specific to RAMDisk.Create: RFC-0038's own text says the backing memory
+' should be "AllocatePages-sourced." This implementation's RAMDisk.Create does not allocate
+' memory at all -- it records the size of a *fixed, pre-populated* memory region (see
+' RAMDiskBaseAddress below) whose bytes are already correct by the time this program starts,
+' because the QEMU/OVMF test harness places them there before boot (scripts/run/
+' run-uefi-hello-with-preload.sh, a `-device loader,file=...,addr=...` preload -- see that
+' script's own header comment and .agents/reports/aps-block-storage.md for why). This sidesteps
+' RFC-0038 Stop Condition #17.5's anticipated UEFI-Block-IO-binding gap entirely rather than
+' hitting it: no UEFI protocol call populates this RAM disk in this implementation, at any point.
+' A future increment that actually copies bytes from a live UEFI Block IO device into freshly
+' AllocatePages'd memory would change this function's *body*, not its contract --
+' RAMDisk.SectorSize/SectorCount/ReadSectors/WriteSectors/IsWritable are unaffected either way.
+
+FUNCTION RAMDiskBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(67108864))   ' 0x4000000, 64 MiB -- see header note
+END FUNCTION
+
+FUNCTION RAMDiskStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33751040))   ' 0x2030000
+END FUNCTION
+
+FUNCTION RAMDisk.Create(sizeBytes AS U64) AS BOOL
+    MEMORY.Write64(RAMDiskStateAddress(), sizeBytes \ 512)
+    RETURN 1
+END FUNCTION
+
+FUNCTION RAMDisk.SectorSize() AS U32
+    RETURN 512
+END FUNCTION
+
+FUNCTION RAMDisk.SectorCount() AS U64
+    RETURN MEMORY.Read64(RAMDiskStateAddress())
+END FUNCTION
+
+FUNCTION RAMDisk.IsWritable() AS BOOL
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: MUST reject (return FALSE, MUST NOT partially transfer) a request whose
+' startSector + count exceeds SectorCount().
+FUNCTION RAMDisk.ReadSectors(startSector AS U64, count AS U32, destination AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i))
+        MEMORY.Write8(ADDRESS.Offset(destination, i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: WriteSectors on a device where IsWritable() is FALSE MUST return FALSE without
+' touching the medium -- not reachable for the RAM disk itself (always writable), but implemented
+' symmetrically with ReadSectors for contract completeness; unexercised by this RFC's own QEMU
+' proof, which only reads a pre-populated, read-only-in-spirit test image.
+FUNCTION RAMDisk.WriteSectors(startSector AS U64, count AS U32, source AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(source, i))
+        MEMORY.Write8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION

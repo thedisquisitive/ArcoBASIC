@@ -1,0 +1,159 @@
+' APS unified namespace / volume mounting (RFC-0038 Requirement 6.5). The mechanism by which a
+' Common Filesystem volume and a future ArcFS volume would coexist under the same path space --
+' calling code resolves a path to a provider tag + remainder, never talking to a specific provider
+' by name.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+' --- Documented deviations, matching block_device_policy.abas's and fat32_policy.abas's own
+' header notes. ---
+'
+' Mount points are fixed 16-byte zero-padded ASCII buffers with an explicit length, not STRING --
+' same reason as fat32_policy.abas's path deviation (STRING equality was directly tested and found
+' to silently return the wrong answer at runtime on this backend). `Volumes.Mount`/`Resolve` take
+' an MMIOPTR to such a buffer plus a length, not a STRING.
+'
+' `Volumes.Resolve` returns a provider *tag* (U32), not a `FilesystemProvider` value -- same
+' no-runtime-polymorphism reason RAMDisk.Create/Loop.RegisterHook already deviated for. Only one
+' real tag exists at implementation time (FAT32_PROVIDER_TAG); calling code that receives it back
+' from Resolve is expected to dispatch on it itself (an IF-chain, the same fixed-slot pattern
+' loop_policy.abas's LoopInvokeSlot already established) -- this fixture's own dispatch is exactly
+' that IF-chain, kept deliberately short since there is exactly one real provider to dispatch to.
+
+FUNCTION FAT32_PROVIDER_TAG() AS U32
+    RETURN 1
+END FUNCTION
+
+FUNCTION VolumesMountTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33767424))   ' 0x2034000
+END FUNCTION
+
+FUNCTION VolumesMaxMounts() AS U32
+    RETURN 4
+END FUNCTION
+
+' Row layout, 40 bytes: [nameBuffer 16 bytes][nameLength U64][providerTag U64][active U64]
+FUNCTION VolumesMountRowAddress(row AS U32) AS MMIOPTR
+    RETURN ADDRESS.Offset(VolumesMountTableAddress(), row * 40)
+END FUNCTION
+
+FUNCTION VolumesNameMatches(rowNameBuffer AS MMIOPTR, rowNameLength AS U64, candidate AS MMIOPTR, candidateLength AS U64) AS BOOL
+    IF rowNameLength > candidateLength THEN
+        RETURN 0
+    END IF
+    LET i AS U64 = 0
+    WHILE i < rowNameLength
+        LET a AS U8 = MEMORY.Read8(ADDRESS.Offset(rowNameBuffer, i))
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(candidate, i))
+        IF a <> b THEN
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.5: registering the same mount point twice replaces the provider tag rather than
+' allocating a second row, the same replace-not-duplicate discipline RFC-0037's
+' Loop.RegisterHook already established (Requirement 6.3 there; this RFC's own Section 6.5 does
+' not explicitly demand it, but leaving a stale duplicate row reachable would make longest-prefix
+' matching's result depend on row-scan order instead of being well-defined, which is worse).
+FUNCTION Volumes.Mount(nameBuffer AS MMIOPTR, nameLength AS U64, providerTag AS U32) AS BOOL
+    LET row AS U32 = 0
+    LET existingRow AS U32 = 4294967295
+    LET freeRow AS U32 = 4294967295
+    WHILE row < VolumesMaxMounts()
+        LET base AS MMIOPTR = VolumesMountRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 32))
+        IF active <> 0 THEN
+            LET storedLength AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+            IF storedLength = nameLength THEN
+                IF VolumesNameMatches(base, storedLength, nameBuffer, nameLength) = 1 THEN
+                    existingRow = row
+                END IF
+            END IF
+        ELSE
+            IF freeRow = 4294967295 THEN
+                freeRow = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+
+    LET targetRow AS U32 = existingRow
+    IF targetRow = 4294967295 THEN
+        targetRow = freeRow
+    END IF
+    IF targetRow = 4294967295 THEN
+        RETURN 0
+    END IF
+
+    LET target AS MMIOPTR = VolumesMountRowAddress(targetRow)
+    LET i AS U64 = 0
+    WHILE i < 16
+        LET value AS U8 = 0
+        IF i < nameLength THEN
+            value = MEMORY.Read8(ADDRESS.Offset(nameBuffer, i))
+        END IF
+        MEMORY.Write8(ADDRESS.Offset(target, i), value)
+        i = i + 1
+    WEND
+    MEMORY.Write64(ADDRESS.Offset(target, 16), nameLength)
+    MEMORY.Write64(ADDRESS.Offset(target, 24), providerTag)
+    MEMORY.Write64(ADDRESS.Offset(target, 32), 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION Volumes.Unmount(nameBuffer AS MMIOPTR, nameLength AS U64) AS BOOL
+    LET row AS U32 = 0
+    WHILE row < VolumesMaxMounts()
+        LET base AS MMIOPTR = VolumesMountRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 32))
+        IF active <> 0 THEN
+            LET storedLength AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+            IF storedLength = nameLength THEN
+                IF VolumesNameMatches(base, storedLength, nameBuffer, nameLength) = 1 THEN
+                    MEMORY.Write64(ADDRESS.Offset(base, 32), 0)
+                END IF
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.5: longest-mount-point-prefix matching. Writes the matched provider's tag and the
+' byte offset within `pathBuffer` where the volume-relative remainder begins (== the matched mount
+' point's own length) to the two out-parameters, and returns TRUE; returns FALSE (out-parameters
+' unwritten) if no mounted point is a prefix of the given path.
+FUNCTION Volumes.Resolve(pathBuffer AS MMIOPTR, pathLength AS U64, providerTagOutAddress AS MMIOPTR, remainderOffsetOutAddress AS MMIOPTR) AS BOOL
+    LET row AS U32 = 0
+    LET bestRow AS U32 = 4294967295
+    LET bestLength AS U64 = 0
+    WHILE row < VolumesMaxMounts()
+        LET base AS MMIOPTR = VolumesMountRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 32))
+        IF active <> 0 THEN
+            LET storedLength AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+            IF VolumesNameMatches(base, storedLength, pathBuffer, pathLength) = 1 THEN
+                IF storedLength >= bestLength THEN
+                    bestLength = storedLength
+                    bestRow = row
+                END IF
+            END IF
+        END IF
+        row = row + 1
+    WEND
+
+    IF bestRow = 4294967295 THEN
+        RETURN 0
+    END IF
+
+    LET winner AS MMIOPTR = VolumesMountRowAddress(bestRow)
+    LET tag AS U64 = MEMORY.Read64(ADDRESS.Offset(winner, 24))
+    MEMORY.Write64(providerTagOutAddress, tag)
+    MEMORY.Write64(remainderOffsetOutAddress, bestLength)
+    RETURN 1
+END FUNCTION

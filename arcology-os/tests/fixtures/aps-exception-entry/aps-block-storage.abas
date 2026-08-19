@@ -1,0 +1,732 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' APS Block Storage and Filesystem Provider Substrate proof (RFC-0038). Proves the full chain:
+' a RAM Disk Block Device Provider (RFC-0038 Section 6.1/6.2) backed by memory the QEMU/OVMF test
+' harness pre-populates with a real, independently-generated FAT32 image (arcology-os/scripts/
+' build/build-fat32-test-image.py, verified against real `mtools` in .agents/reports/
+' aps-block-storage.md) -> a read-only FAT32 Filesystem Provider (Section 6.3/6.4) that validates
+' the boot sector, parses real on-disk geometry, and reads a genuinely multi-cluster file back
+' byte-for-byte via real FAT chain-walking -> the unified namespace layer (Section 6.5) resolving
+' a path to that provider through longest-mount-point-prefix matching, exercised against a decoy
+' second mount point to prove it is not merely "the only registered point always wins."
+'
+' No GDT/IDT/interrupt setup is needed or built here -- unlike the RFC-0036/RFC-0037 fixtures,
+' this proof is a straight-line sequence with no hardware interrupt involved, so it stays minimal:
+' identity map, ExitBootServices, CR3 cutover, then the storage proof itself.
+'
+' See stdlib/block_device_policy.abas, fat32_policy.abas, and volumes_policy.abas's own header
+' comments for this RFC's three documented deviations from its own literal spec (concrete
+' functions instead of BlockDevice/FilesystemProvider interface values; 11-byte raw 8.3 name
+' buffers instead of STRING paths; array-free Enumerate/Stat stand-ins) and why each was necessary
+' -- STRING equality was directly proven to silently return the wrong answer at runtime on this
+' backend, not merely unsupported.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+' "APS FAT32 OK\r\n" -- the proof: only printed once Mount, longest-prefix Resolve, Open, and a
+' byte-for-byte (length AND checksum) correct Read of a real, independently-generated multi-
+' cluster FAT32 file have all succeeded.
+FUNCTION SerialMarkerFAT32OK() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(70)
+    SerialByte(65)
+    SerialByte(84)
+    SerialByte(51)
+    SerialByte(50)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+' Mirrors stdlib/block_device_policy.abas (inlined -- this build takes a single source file).
+FUNCTION RAMDiskBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(67108864))   ' 0x4000000
+END FUNCTION
+
+FUNCTION RAMDiskStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33751040))   ' 0x2030000
+END FUNCTION
+
+FUNCTION RAMDisk.Create(sizeBytes AS U64) AS BOOL
+    MEMORY.Write64(RAMDiskStateAddress(), sizeBytes \ 512)
+    RETURN 1
+END FUNCTION
+
+FUNCTION RAMDisk.SectorCount() AS U64
+    RETURN MEMORY.Read64(RAMDiskStateAddress())
+END FUNCTION
+
+FUNCTION RAMDisk.ReadSectors(startSector AS U64, count AS U32, destination AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i))
+        MEMORY.Write8(ADDRESS.Offset(destination, i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Mirrors stdlib/fat32_policy.abas (inlined).
+FUNCTION FAT32StateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33755136))   ' 0x2031000
+END FUNCTION
+
+FUNCTION FAT32ScratchSectorA() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33759232))   ' 0x2032000
+END FUNCTION
+
+FUNCTION FAT32ScratchSectorB() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33763328))   ' 0x2033000
+END FUNCTION
+
+FUNCTION FAT32OpenFileState() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33771520))   ' 0x2035000
+END FUNCTION
+
+FUNCTION FAT32CheckLabel() AS BOOL
+    LET base AS MMIOPTR = FAT32ScratchSectorA()
+    IF MEMORY.Read8(ADDRESS.Offset(base, 82)) <> 70 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 83)) <> 65 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 84)) <> 84 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 85)) <> 51 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 86)) <> 50 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 87)) <> 32 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 88)) <> 32 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 89)) <> 32 THEN RETURN 0
+    RETURN 1
+END FUNCTION
+
+FUNCTION FAT32.Mount() AS BOOL
+    IF RAMDisk.ReadSectors(0, 1, FAT32ScratchSectorA()) = 0 THEN
+        RETURN 0
+    END IF
+    LET signature AS U16 = MEMORY.Read16(ADDRESS.Offset(FAT32ScratchSectorA(), 510))
+    IF signature <> 43605 THEN
+        RETURN 0
+    END IF
+    IF FAT32CheckLabel() = 0 THEN
+        RETURN 0
+    END IF
+
+    LET bytesPerSector AS U64 = MEMORY.Read16(ADDRESS.Offset(FAT32ScratchSectorA(), 11))
+    LET sectorsPerCluster AS U64 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), 13))
+    LET reservedSectorCount AS U64 = MEMORY.Read16(ADDRESS.Offset(FAT32ScratchSectorA(), 14))
+    LET numFATs AS U64 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), 16))
+    LET fatSize32 AS U64 = MEMORY.Read32(ADDRESS.Offset(FAT32ScratchSectorA(), 36))
+    LET rootCluster AS U64 = MEMORY.Read32(ADDRESS.Offset(FAT32ScratchSectorA(), 44))
+
+    IF bytesPerSector = 0 THEN RETURN 0
+    IF sectorsPerCluster = 0 THEN RETURN 0
+    IF reservedSectorCount = 0 THEN RETURN 0
+    IF numFATs = 0 THEN RETURN 0
+    IF fatSize32 = 0 THEN RETURN 0
+    IF rootCluster < 2 THEN RETURN 0
+
+    LET firstDataSector AS U64 = reservedSectorCount + (numFATs * fatSize32)
+    IF firstDataSector >= RAMDisk.SectorCount() THEN RETURN 0
+
+    LET state AS MMIOPTR = FAT32StateAddress()
+    MEMORY.Write64(state, bytesPerSector)
+    MEMORY.Write64(ADDRESS.Offset(state, 8), sectorsPerCluster)
+    MEMORY.Write64(ADDRESS.Offset(state, 16), reservedSectorCount)
+    MEMORY.Write64(ADDRESS.Offset(state, 24), numFATs)
+    MEMORY.Write64(ADDRESS.Offset(state, 32), fatSize32)
+    MEMORY.Write64(ADDRESS.Offset(state, 40), rootCluster)
+    MEMORY.Write64(ADDRESS.Offset(state, 48), firstDataSector)
+    MEMORY.Write64(ADDRESS.Offset(state, 56), 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION FAT32ClusterToSector(cluster AS U64) AS U64
+    LET state AS MMIOPTR = FAT32StateAddress()
+    LET firstDataSector AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 48))
+    LET sectorsPerCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 8))
+    RETURN firstDataSector + ((cluster - 2) * sectorsPerCluster)
+END FUNCTION
+
+FUNCTION FAT32ReadFatEntry(cluster AS U64) AS U64
+    LET state AS MMIOPTR = FAT32StateAddress()
+    LET bytesPerSector AS U64 = MEMORY.Read64(state)
+    LET reservedSectorCount AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 16))
+    LET fatByteOffset AS U64 = (reservedSectorCount * bytesPerSector) + (cluster * 4)
+    LET sector AS U64 = fatByteOffset \ bytesPerSector
+    LET offsetInSector AS U64 = fatByteOffset - (sector * bytesPerSector)
+    RAMDisk.ReadSectors(sector, 1, FAT32ScratchSectorB())
+    LET raw AS U32 = MEMORY.Read32(ADDRESS.Offset(FAT32ScratchSectorB(), offsetInSector))
+    RETURN raw AND 268435455
+END FUNCTION
+
+FUNCTION FAT32NameMatches(entryPtr AS MMIOPTR, nameBuffer AS MMIOPTR) AS BOOL
+    LET i AS U64 = 0
+    WHILE i < 11
+        LET a AS U8 = MEMORY.Read8(ADDRESS.Offset(entryPtr, i))
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(nameBuffer, i))
+        IF a <> b THEN
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION FAT32.Open(nameBuffer AS MMIOPTR) AS BOOL
+    LET state AS MMIOPTR = FAT32StateAddress()
+    LET rootCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 40))
+    LET sectorsPerCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 8))
+    LET bytesPerSector AS U64 = MEMORY.Read64(state)
+
+    LET cluster AS U64 = rootCluster
+    LET searching AS U64 = 1
+    WHILE searching = 1
+        LET baseSector AS U64 = FAT32ClusterToSector(cluster)
+        LET sectorIndex AS U64 = 0
+        WHILE sectorIndex < sectorsPerCluster
+            RAMDisk.ReadSectors(baseSector + sectorIndex, 1, FAT32ScratchSectorA())
+            LET entryOffset AS U64 = 0
+            WHILE entryOffset < bytesPerSector
+                LET firstByte AS U8 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset))
+                IF firstByte = 0 THEN
+                    RETURN 0
+                END IF
+                IF firstByte <> 229 THEN
+                    LET attr AS U8 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset + 11))
+                    LET lfnBits AS U8 = attr AND 15
+                    IF lfnBits <> 15 THEN
+                        LET matchPtr AS MMIOPTR = ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset)
+                        IF FAT32NameMatches(matchPtr, nameBuffer) = 1 THEN
+                            LET hi AS U64 = MEMORY.Read16(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset + 20))
+                            LET lo AS U64 = MEMORY.Read16(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset + 26))
+                            LET size AS U64 = MEMORY.Read32(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset + 28))
+                            LET firstCluster AS U64 = (hi SHL 16) OR lo
+                            LET fileState AS MMIOPTR = FAT32OpenFileState()
+                            MEMORY.Write64(fileState, firstCluster)
+                            MEMORY.Write64(ADDRESS.Offset(fileState, 8), size)
+                            MEMORY.Write64(ADDRESS.Offset(fileState, 16), 0)
+                            MEMORY.Write64(ADDRESS.Offset(fileState, 24), 1)
+                            RETURN 1
+                        END IF
+                    END IF
+                END IF
+                entryOffset = entryOffset + 32
+            WEND
+            sectorIndex = sectorIndex + 1
+        WEND
+        LET nextCluster AS U64 = FAT32ReadFatEntry(cluster)
+        IF nextCluster >= 268435448 THEN
+            searching = 0
+        ELSE
+            cluster = nextCluster
+        END IF
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION FAT32.Read(buffer AS MMIOPTR, maxBytes AS U64) AS U64
+    LET fileState AS MMIOPTR = FAT32OpenFileState()
+    LET isOpen AS U64 = MEMORY.Read64(ADDRESS.Offset(fileState, 24))
+    IF isOpen = 0 THEN
+        RETURN 0
+    END IF
+    LET firstCluster AS U64 = MEMORY.Read64(fileState)
+    LET fileSize AS U64 = MEMORY.Read64(ADDRESS.Offset(fileState, 8))
+    LET position AS U64 = MEMORY.Read64(ADDRESS.Offset(fileState, 16))
+
+    LET remaining AS U64 = fileSize - position
+    LET toRead AS U64 = maxBytes
+    IF remaining < toRead THEN toRead = remaining
+    IF toRead = 0 THEN
+        RETURN 0
+    END IF
+
+    LET state AS MMIOPTR = FAT32StateAddress()
+    LET bytesPerSector AS U64 = MEMORY.Read64(state)
+    LET sectorsPerCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 8))
+    LET clusterSizeBytes AS U64 = bytesPerSector * sectorsPerCluster
+
+    LET clusterIndex AS U64 = position \ clusterSizeBytes
+    LET offsetInCluster AS U64 = position - (clusterIndex * clusterSizeBytes)
+
+    LET cluster AS U64 = firstCluster
+    LET walked AS U64 = 0
+    WHILE walked < clusterIndex
+        cluster = FAT32ReadFatEntry(cluster)
+        walked = walked + 1
+    WEND
+
+    LET written AS U64 = 0
+    WHILE written < toRead
+        LET baseSector AS U64 = FAT32ClusterToSector(cluster)
+        LET sectorInCluster AS U64 = offsetInCluster \ bytesPerSector
+        LET offsetInSector AS U64 = offsetInCluster - (sectorInCluster * bytesPerSector)
+
+        RAMDisk.ReadSectors(baseSector + sectorInCluster, 1, FAT32ScratchSectorA())
+
+        LET availableInSector AS U64 = bytesPerSector - offsetInSector
+        LET remainingInCluster AS U64 = clusterSizeBytes - offsetInCluster
+        LET chunk AS U64 = toRead - written
+        IF availableInSector < chunk THEN chunk = availableInSector
+        IF remainingInCluster < chunk THEN chunk = remainingInCluster
+
+        LET copyIndex AS U64 = 0
+        WHILE copyIndex < chunk
+            LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), offsetInSector + copyIndex))
+            MEMORY.Write8(ADDRESS.Offset(buffer, written + copyIndex), value)
+            copyIndex = copyIndex + 1
+        WEND
+
+        written = written + chunk
+        offsetInCluster = offsetInCluster + chunk
+        position = position + chunk
+
+        IF offsetInCluster >= clusterSizeBytes THEN
+            IF written < toRead THEN
+                cluster = FAT32ReadFatEntry(cluster)
+            END IF
+            offsetInCluster = 0
+        END IF
+    WEND
+
+    MEMORY.Write64(ADDRESS.Offset(fileState, 16), position)
+    RETURN written
+END FUNCTION
+
+FUNCTION FAT32.Close() AS BOOL
+    MEMORY.Write64(ADDRESS.Offset(FAT32OpenFileState(), 24), 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION FAT32.CountEntries() AS U64
+    LET state AS MMIOPTR = FAT32StateAddress()
+    LET rootCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 40))
+    LET sectorsPerCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 8))
+    LET bytesPerSector AS U64 = MEMORY.Read64(state)
+
+    LET count AS U64 = 0
+    LET cluster AS U64 = rootCluster
+    LET scanning AS U64 = 1
+    WHILE scanning = 1
+        LET baseSector AS U64 = FAT32ClusterToSector(cluster)
+        LET sectorIndex AS U64 = 0
+        WHILE sectorIndex < sectorsPerCluster
+            RAMDisk.ReadSectors(baseSector + sectorIndex, 1, FAT32ScratchSectorA())
+            LET entryOffset AS U64 = 0
+            WHILE entryOffset < bytesPerSector
+                LET firstByte AS U8 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset))
+                IF firstByte = 0 THEN
+                    RETURN count
+                END IF
+                IF firstByte <> 229 THEN
+                    LET attr AS U8 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset + 11))
+                    LET lfnBits AS U8 = attr AND 15
+                    IF lfnBits <> 15 THEN
+                        count = count + 1
+                    END IF
+                END IF
+                entryOffset = entryOffset + 32
+            WEND
+            sectorIndex = sectorIndex + 1
+        WEND
+        LET nextCluster AS U64 = FAT32ReadFatEntry(cluster)
+        IF nextCluster >= 268435448 THEN
+            scanning = 0
+        ELSE
+            cluster = nextCluster
+        END IF
+    WEND
+    RETURN count
+END FUNCTION
+
+' Mirrors stdlib/volumes_policy.abas (inlined).
+FUNCTION VolumesMountTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33767424))   ' 0x2034000
+END FUNCTION
+
+FUNCTION VolumesMaxMounts() AS U32
+    RETURN 4
+END FUNCTION
+
+FUNCTION VolumesMountRowAddress(row AS U32) AS MMIOPTR
+    RETURN ADDRESS.Offset(VolumesMountTableAddress(), row * 40)
+END FUNCTION
+
+FUNCTION VolumesNameMatches(rowNameBuffer AS MMIOPTR, rowNameLength AS U64, candidate AS MMIOPTR, candidateLength AS U64) AS BOOL
+    IF rowNameLength > candidateLength THEN
+        RETURN 0
+    END IF
+    LET i AS U64 = 0
+    WHILE i < rowNameLength
+        LET a AS U8 = MEMORY.Read8(ADDRESS.Offset(rowNameBuffer, i))
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(candidate, i))
+        IF a <> b THEN
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION Volumes.Mount(nameBuffer AS MMIOPTR, nameLength AS U64, providerTag AS U32) AS BOOL
+    LET row AS U32 = 0
+    LET existingRow AS U32 = 4294967295
+    LET freeRow AS U32 = 4294967295
+    WHILE row < VolumesMaxMounts()
+        LET base AS MMIOPTR = VolumesMountRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 32))
+        IF active <> 0 THEN
+            LET storedLength AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+            IF storedLength = nameLength THEN
+                IF VolumesNameMatches(base, storedLength, nameBuffer, nameLength) = 1 THEN
+                    existingRow = row
+                END IF
+            END IF
+        ELSE
+            IF freeRow = 4294967295 THEN
+                freeRow = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+
+    LET targetRow AS U32 = existingRow
+    IF targetRow = 4294967295 THEN
+        targetRow = freeRow
+    END IF
+    IF targetRow = 4294967295 THEN
+        RETURN 0
+    END IF
+
+    LET target AS MMIOPTR = VolumesMountRowAddress(targetRow)
+    LET i AS U64 = 0
+    WHILE i < 16
+        LET value AS U8 = 0
+        IF i < nameLength THEN
+            value = MEMORY.Read8(ADDRESS.Offset(nameBuffer, i))
+        END IF
+        MEMORY.Write8(ADDRESS.Offset(target, i), value)
+        i = i + 1
+    WEND
+    MEMORY.Write64(ADDRESS.Offset(target, 16), nameLength)
+    MEMORY.Write64(ADDRESS.Offset(target, 24), providerTag)
+    MEMORY.Write64(ADDRESS.Offset(target, 32), 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION Volumes.Resolve(pathBuffer AS MMIOPTR, pathLength AS U64, providerTagOutAddress AS MMIOPTR, remainderOffsetOutAddress AS MMIOPTR) AS BOOL
+    LET row AS U32 = 0
+    LET bestRow AS U32 = 4294967295
+    LET bestLength AS U64 = 0
+    WHILE row < VolumesMaxMounts()
+        LET base AS MMIOPTR = VolumesMountRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 32))
+        IF active <> 0 THEN
+            LET storedLength AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+            IF VolumesNameMatches(base, storedLength, pathBuffer, pathLength) = 1 THEN
+                IF storedLength >= bestLength THEN
+                    bestLength = storedLength
+                    bestRow = row
+                END IF
+            END IF
+        END IF
+        row = row + 1
+    WEND
+
+    IF bestRow = 4294967295 THEN
+        RETURN 0
+    END IF
+
+    LET winner AS MMIOPTR = VolumesMountRowAddress(bestRow)
+    LET tag AS U64 = MEMORY.Read64(ADDRESS.Offset(winner, 24))
+    MEMORY.Write64(providerTagOutAddress, tag)
+    MEMORY.Write64(remainderOffsetOutAddress, bestLength)
+    RETURN 1
+END FUNCTION
+
+FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET probe AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 1
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocate AS U64 = systemTable.BootServices.AllocatePool(2, allocationSize, bufferAddress)
+    IF allocate <> 0 THEN
+        RETURN 1
+    END IF
+    mapSize = allocationSize
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("APS PRE")
+
+    LET root AS U64 = 0
+    LET rootAddress AS PTR = ADDRESS.Local(root)
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 3, rootAddress)
+    IF pageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    ' A genuine, page-granular scratch buffer for every fixed-size byte buffer the proof below
+    ' needs (mount-point names, a path, an 8.3 name, the read buffer, two out-parameters) --
+    ' NOT ADDRESS.Local()'d individual U64 locals, which are only ever guaranteed to be 8 bytes
+    ' each: writing an 11-byte name into one such local's address would silently overrun into
+    ' whatever stack slot the compiler happened to place next to it. One 4096-byte page, carved up
+    ' at fixed offsets far enough apart that nothing here can collide, is the same discipline every
+    ' other multi-byte structure in this whole RFC chain (GDT/IDT/TSS tables, directory entries)
+    ' already uses.
+    LET scratchRoot AS U64 = 0
+    LET scratchRootAddress AS PTR = ADDRESS.Local(scratchRoot)
+    LET scratchPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 1, scratchRootAddress)
+    IF scratchPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS SCRATCH ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS PAGE")
+    LET pdpt AS U64 = root + 4096
+    LET pageDirectory AS U64 = root + 8192
+
+    LET clearIndex AS U64 = 0
+    WHILE clearIndex < 1536
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(root + (clearIndex * 8)), 0)
+        clearIndex = clearIndex + 1
+    WEND
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(root), pdpt OR 3)
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt), pageDirectory OR 3)
+    LET directoryIndex AS U64 = 0
+    WHILE directoryIndex < 512
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + (directoryIndex * 8)), (directoryIndex * 2097152) OR 131)
+        directoryIndex = directoryIndex + 1
+    WEND
+    LET rootCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(root))
+    LET pdptCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(pdpt))
+    IF rootCheck <> (pdpt OR 3) THEN
+        systemTable.ConsoleOut.Write("APS ROOT BAD")
+        CPU.HaltForever
+    END IF
+    IF pdptCheck <> (pageDirectory OR 3) THEN
+        systemTable.ConsoleOut.Write("APS PDPT BAD")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS TABLE OK")
+
+    CPU.DisableInterrupts
+    LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
+    IF exitStatus <> 0 THEN
+        CPU.HaltForever
+    END IF
+
+    CPU.DisableInterrupts
+    CPU.WriteCR3(root)
+    LET activeRoot AS U64 = CPU.ReadCR3()
+    IF activeRoot <> root THEN
+        CPU.HaltForever
+    END IF
+    MEMORY.Write32(ADDRESS.Virtual(1048576), 2779096485)
+
+    SerialInit()
+
+    ' --- The actual proof. ---
+
+    RAMDisk.Create(8388608)   ' 8 MiB, matching build-fat32-test-image.py's fixed geometry
+
+    IF FAT32.Mount() = 0 THEN
+        systemTable.ConsoleOut.Write("APS MOUNT FAIL")
+        CPU.HaltForever
+    END IF
+
+    ' Scratch page layout (all offsets from scratchRootAddress, MMIO-mapped below the same
+    ' identity map the storage code already reads/writes through):
+    '   +0    rootNameBuffer   (1 byte used)          +16   decoyBuffer  (7 bytes used)
+    '   +32   pathBuffer       (11 bytes used)         +48   nameBuffer   (11 bytes used)
+    '   +64   readBuffer       (64 bytes used)          +256  resolvedTagAddress (8 bytes)
+    '   +264  resolvedRemainderAddress (8 bytes)
+    LET scratch AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(scratchRoot))
+    LET rootNameAddress AS MMIOPTR = ADDRESS.Offset(scratch, 0)
+    LET decoyBuffer AS MMIOPTR = ADDRESS.Offset(scratch, 16)
+    LET pathBuffer AS MMIOPTR = ADDRESS.Offset(scratch, 32)
+    LET nameBuffer AS MMIOPTR = ADDRESS.Offset(scratch, 48)
+    LET readBufferAddress AS MMIOPTR = ADDRESS.Offset(scratch, 64)
+    LET resolvedTagAddress AS MMIOPTR = ADDRESS.Offset(scratch, 256)
+    LET resolvedRemainderAddress AS MMIOPTR = ADDRESS.Offset(scratch, 264)
+
+    ' Register the real mount point ("/") plus a longer decoy ("/OTHER/") to prove longest-
+    ' prefix-match genuinely picks the more specific point when both could apply, not merely "the
+    ' only registered point wins by default."
+    MEMORY.Write8(rootNameAddress, 47)   ' '/'
+    IF Volumes.Mount(rootNameAddress, 1, 1) = 0 THEN
+        systemTable.ConsoleOut.Write("APS VOLUME MOUNT FAIL")
+        CPU.HaltForever
+    END IF
+
+    MEMORY.Write8(ADDRESS.Offset(decoyBuffer, 0), 47)    ' '/'
+    MEMORY.Write8(ADDRESS.Offset(decoyBuffer, 1), 79)    ' 'O'
+    MEMORY.Write8(ADDRESS.Offset(decoyBuffer, 2), 84)    ' 'T'
+    MEMORY.Write8(ADDRESS.Offset(decoyBuffer, 3), 72)    ' 'H'
+    MEMORY.Write8(ADDRESS.Offset(decoyBuffer, 4), 69)    ' 'E'
+    MEMORY.Write8(ADDRESS.Offset(decoyBuffer, 5), 82)    ' 'R'
+    MEMORY.Write8(ADDRESS.Offset(decoyBuffer, 6), 47)    ' '/'
+    IF Volumes.Mount(decoyBuffer, 7, 99) = 0 THEN
+        systemTable.ConsoleOut.Write("APS DECOY MOUNT FAIL")
+        CPU.HaltForever
+    END IF
+
+    ' Resolve "/README.TXT" -- must match "/" (length 1, tag 1), not the decoy (no shared prefix
+    ' beyond the leading '/', and Volumes.Resolve requires the FULL mount-point length to match).
+    MEMORY.Write8(ADDRESS.Offset(pathBuffer, 0), 47)     ' '/'
+    MEMORY.Write8(ADDRESS.Offset(pathBuffer, 1), 82)     ' 'R'
+    MEMORY.Write8(ADDRESS.Offset(pathBuffer, 2), 69)     ' 'E'
+    MEMORY.Write8(ADDRESS.Offset(pathBuffer, 3), 65)     ' 'A'
+    MEMORY.Write8(ADDRESS.Offset(pathBuffer, 4), 68)     ' 'D'
+    MEMORY.Write8(ADDRESS.Offset(pathBuffer, 5), 77)     ' 'M'
+    MEMORY.Write8(ADDRESS.Offset(pathBuffer, 6), 69)     ' 'E'
+    MEMORY.Write8(ADDRESS.Offset(pathBuffer, 7), 46)     ' '.'
+    MEMORY.Write8(ADDRESS.Offset(pathBuffer, 8), 84)     ' 'T'
+    MEMORY.Write8(ADDRESS.Offset(pathBuffer, 9), 88)     ' 'X'
+    MEMORY.Write8(ADDRESS.Offset(pathBuffer, 10), 84)    ' 'T'
+
+    IF Volumes.Resolve(pathBuffer, 11, resolvedTagAddress, resolvedRemainderAddress) = 0 THEN
+        systemTable.ConsoleOut.Write("APS RESOLVE FAIL")
+        CPU.HaltForever
+    END IF
+    LET resolvedTag AS U64 = MEMORY.Read64(resolvedTagAddress)
+    LET resolvedRemainder AS U64 = MEMORY.Read64(resolvedRemainderAddress)
+    IF resolvedTag <> 1 THEN
+        systemTable.ConsoleOut.Write("APS RESOLVE WRONG TAG")
+        CPU.HaltForever
+    END IF
+    IF resolvedRemainder <> 1 THEN
+        systemTable.ConsoleOut.Write("APS RESOLVE WRONG REMAINDER")
+        CPU.HaltForever
+    END IF
+
+    ' The remainder ("README.TXT") is translated to its 8.3 on-disk name directly here rather than
+    ' through a generic path-to-8.3 parser -- see this fixture's header note and RFC-0038's own
+    ' Section 6.5 deferral of a general Files.Open-shaped convenience layer.
+    MEMORY.Write8(ADDRESS.Offset(nameBuffer, 0), 82)     ' 'R'
+    MEMORY.Write8(ADDRESS.Offset(nameBuffer, 1), 69)     ' 'E'
+    MEMORY.Write8(ADDRESS.Offset(nameBuffer, 2), 65)     ' 'A'
+    MEMORY.Write8(ADDRESS.Offset(nameBuffer, 3), 68)     ' 'D'
+    MEMORY.Write8(ADDRESS.Offset(nameBuffer, 4), 77)     ' 'M'
+    MEMORY.Write8(ADDRESS.Offset(nameBuffer, 5), 69)     ' 'E'
+    MEMORY.Write8(ADDRESS.Offset(nameBuffer, 6), 32)     ' ' '
+    MEMORY.Write8(ADDRESS.Offset(nameBuffer, 7), 32)     ' ' '
+    MEMORY.Write8(ADDRESS.Offset(nameBuffer, 8), 84)     ' 'T'
+    MEMORY.Write8(ADDRESS.Offset(nameBuffer, 9), 88)     ' 'X'
+    MEMORY.Write8(ADDRESS.Offset(nameBuffer, 10), 84)    ' 'T'
+
+    IF FAT32.Open(nameBuffer) = 0 THEN
+        systemTable.ConsoleOut.Write("APS OPEN FAIL")
+        CPU.HaltForever
+    END IF
+
+    LET entryCount AS U64 = FAT32.CountEntries()
+    IF entryCount <> 1 THEN
+        systemTable.ConsoleOut.Write("APS COUNT BAD")
+        CPU.HaltForever
+    END IF
+
+    ' README.TXT no longer has an open handle after CountEntries re-scanned the root directory
+    ' using the same shared scratch buffer -- but the open-file *state* (cluster/size/position)
+    ' this fixture tracks separately is untouched by that scan, so re-opening is not required.
+    ' Read the whole file in 64-byte chunks, genuinely exercising multi-cluster chain-walking
+    ' (build-fat32-test-image.py's test file spans 7 clusters at 512 bytes/cluster), summing every
+    ' byte read so the final check is byte-for-byte, not merely length-for-length.
+    LET totalBytes AS U64 = 0
+    LET byteSum AS U64 = 0
+    LET readLoopGuard AS U64 = 0
+    LET reading AS U64 = 1
+    WHILE reading = 1
+        LET got AS U64 = FAT32.Read(readBufferAddress, 64)
+        IF got = 0 THEN
+            reading = 0
+        ELSE
+            LET k AS U64 = 0
+            WHILE k < got
+                LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(readBufferAddress, k))
+                LET bAsU64 AS U64 = b
+                byteSum = byteSum + bAsU64
+                k = k + 1
+            WEND
+            totalBytes = totalBytes + got
+        END IF
+        readLoopGuard = readLoopGuard + 1
+        IF readLoopGuard > 200 THEN
+            systemTable.ConsoleOut.Write("APS READ LOOP GUARD")
+            CPU.HaltForever
+        END IF
+    WEND
+
+    FAT32.Close()
+
+    IF totalBytes <> 3333 THEN
+        systemTable.ConsoleOut.Write("APS SIZE BAD")
+        CPU.HaltForever
+    END IF
+    IF byteSum <> 211490 THEN
+        systemTable.ConsoleOut.Write("APS CHECKSUM BAD")
+        CPU.HaltForever
+    END IF
+
+    SerialMarkerFAT32OK()
+    CPU.HaltForever
+END FUNCTION

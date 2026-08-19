@@ -121,7 +121,13 @@ FUNCTION Timer.FrequencyHz() AS U32
 END FUNCTION
 
 FUNCTION Timer.UptimeMilliseconds() AS U64
-    RETURN (Timer.Ticks() * 1000) / Timer.FrequencyHz()
+    ' Integer division in this dialect is `\`, not `/` (`/` has no freestanding x86-64 codegen at
+    ' all and fails outright, confirmed while implementing RFC-0038 -- see
+    ' .agents/reports/aps-block-storage.md). This function and Timer.Initialize below were never
+    ' exercised through X86_64 codegen by any RFC-0036 QEMU fixture (aps-timer-tick.abas hardcodes
+    ' its reload value as a literal instead), so this bug shipped silently until RFC-0038's own
+    ' sector/cluster arithmetic hit the same mistake directly and it was traced back here.
+    RETURN (Timer.Ticks() * 1000) \ Timer.FrequencyHz()
 END FUNCTION
 
 ' Composes PIC.Remap (reference vector base 32: IRQ0-7 -> 32-39, IRQ8-15 -> 40-47, per RFC-0036
@@ -140,7 +146,7 @@ FUNCTION Timer.Initialize(idtTable AS MMIOPTR, codeSelector AS U16, tickRateHz A
     IF tickRateHz < 19 THEN RETURN 0
     IF tickRateHz > 1193182 THEN RETURN 0
 
-    LET reload AS U32 = (1193182 + (tickRateHz / 2)) / tickRateHz   ' round to nearest
+    LET reload AS U32 = (1193182 + (tickRateHz \ 2)) \ tickRateHz   ' round to nearest
     IF reload > 65535 THEN RETURN 0
     IF reload = 0 THEN reload = 65536 AND 65535    ' 0 means 65536 (max period) on real 8254s
 
@@ -150,7 +156,7 @@ FUNCTION Timer.Initialize(idtTable AS MMIOPTR, codeSelector AS U16, tickRateHz A
     LET entry AS U64 = CPU.ExceptionVectorTableBase() + (32 * 16)   ' vector 32 = IRQ0
     IDTWriteInterruptGate(idtTable, 32, entry, codeSelector, 0)
 
-    MEMORY.Write64(TimerFrequencyScratchAddress(), 1193182 / reload)
+    MEMORY.Write64(TimerFrequencyScratchAddress(), 1193182 \ reload)
     PIC.Unmask(0)
     RETURN 1
 END FUNCTION

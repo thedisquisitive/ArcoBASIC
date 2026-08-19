@@ -1,0 +1,351 @@
+' APS read-only FAT32 Filesystem Provider (RFC-0038 Requirements 6.3/6.4). Reads directly against
+' RAMDisk.* (block_device_policy.abas) -- no BlockDevice-interface indirection, for the same
+' no-polymorphic-dispatch reason that file's own header comment explains for RAMDisk.Create.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+' --- Two more documented deviations, on top of block_device_policy.abas's. ---
+'
+' 1. Paths are NOT STRING. RFC-0038 Section 6.3 specifies `Open(path AS STRING, ...)`. This
+'    implementation takes an 11-byte raw 8.3 short-name buffer (MMIOPTR) instead --
+'    FAT32.Open(nameBuffer AS MMIOPTR) AS BOOL -- matching the on-disk directory-entry name field
+'    exactly. This is not a style preference: STRING equality comparison was tested directly on
+'    this freestanding backend and found to silently return the WRONG answer at runtime (compiles
+'    clean, "SOURCE ACCEPTED", generates code, but `path = "HELLO"` evaluated false for an exact
+'    match under QEMU). That is a correctness bug in the compiler's freestanding STRING support,
+'    not a missing feature reported as missing -- exactly the kind of "looks correct, isn't
+'    correct" trap this project's own testing discipline exists to catch (see
+'    project_arcology_os_exception_entry.md's QEMU-boot-noise lesson, and RFC-0037's own
+'    Timer.Ticks()-vs-pending-table design note, for two earlier examples of the same principle).
+'    It was not chased down and fixed here -- real, separate compiler work, out of this RFC's
+'    scope -- only worked around, the same judgment RFC-0037 made about the BOOL-IF-condition and
+'    TRUE-literal gaps it found. See .agents/reports/aps-block-storage.md for the minimal repro.
+' 2. Root-directory-only: FAT32.Open does not walk subdirectories. RFC-0038 Section 19 already
+'    explicitly leaves long-filename (VFAT) support to implementation judgment as "an acceptable
+'    first cut"; this implementation extends that same judgment to subdirectory traversal for the
+'    same reason (real parsing complexity, not required to prove the read path -- byte-for-byte
+'    correct multi-cluster file reads via genuine FAT chain-walking -- actually works).
+' 3. Enumerate/Stat do not return `DirectoryEntry[]` (RFC-0038 Section 6.3's array-typed return).
+'    Arrays are, like STRING, untested territory on this backend, and this RFC's real
+'    deliverable -- the read path -- does not need them. FAT32.CountEntries()/FAT32.StatSize()
+'    below are minimal, array-free stand-ins that exercise the same directory-scan machinery
+'    Open() uses, without committing to an unverified return-type shape.
+'
+' Only one file may be open at a time in this implementation (the same "one instance" pattern
+' block_device_policy.abas's header comment names) -- FileHandle is therefore not a distinct
+' value at all; Read/Close operate on the single open-file state this file owns.
+
+FUNCTION FAT32StateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33755136))   ' 0x2031000
+END FUNCTION
+
+FUNCTION FAT32ScratchSectorA() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33759232))   ' 0x2032000 -- boot sector / directory scan
+END FUNCTION
+
+FUNCTION FAT32ScratchSectorB() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33763328))   ' 0x2033000 -- FAT entry reads
+END FUNCTION
+
+FUNCTION FAT32OpenFileState() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33771520))   ' 0x2035000
+END FUNCTION
+
+' Geometry cache layout (FAT32StateAddress, all U64 for uniform MEMORY.Read64/Write64 access even
+' where the on-disk field is narrower):
+'   +0  bytesPerSector        +8  sectorsPerCluster     +16 reservedSectorCount
+'   +24 numFATs                +32 fatSize32             +40 rootCluster
+'   +48 firstDataSector (derived: reservedSectorCount + numFATs*fatSize32)
+'   +56 mounted (0/1)
+
+FUNCTION FAT32CheckLabel() AS BOOL
+    LET base AS MMIOPTR = FAT32ScratchSectorA()
+    IF MEMORY.Read8(ADDRESS.Offset(base, 82)) <> 70 THEN RETURN 0    ' 'F'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 83)) <> 65 THEN RETURN 0    ' 'A'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 84)) <> 84 THEN RETURN 0    ' 'T'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 85)) <> 51 THEN RETURN 0    ' '3'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 86)) <> 50 THEN RETURN 0    ' '2'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 87)) <> 32 THEN RETURN 0    ' ' '
+    IF MEMORY.Read8(ADDRESS.Offset(base, 88)) <> 32 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 89)) <> 32 THEN RETURN 0
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.3: Mount MUST validate the device's structure enough to reject a device that does
+' not contain this provider's format, and MUST return FALSE rather than mounting unconditionally
+' (Section 10's fail-closed requirement). Validates the boot signature (0x55AA), the "FAT32   "
+' filesystem-type label, and every geometry field it reads for an impossible zero value before
+' trusting it, per Section 10's bounds-checking requirement.
+FUNCTION FAT32.Mount() AS BOOL
+    IF RAMDisk.ReadSectors(0, 1, FAT32ScratchSectorA()) = 0 THEN
+        RETURN 0
+    END IF
+    LET signature AS U16 = MEMORY.Read16(ADDRESS.Offset(FAT32ScratchSectorA(), 510))
+    IF signature <> 43605 THEN   ' 0xAA55, little-endian read
+        RETURN 0
+    END IF
+    IF FAT32CheckLabel() = 0 THEN
+        RETURN 0
+    END IF
+
+    LET bytesPerSector AS U64 = MEMORY.Read16(ADDRESS.Offset(FAT32ScratchSectorA(), 11))
+    LET sectorsPerCluster AS U64 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), 13))
+    LET reservedSectorCount AS U64 = MEMORY.Read16(ADDRESS.Offset(FAT32ScratchSectorA(), 14))
+    LET numFATs AS U64 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), 16))
+    LET fatSize32 AS U64 = MEMORY.Read32(ADDRESS.Offset(FAT32ScratchSectorA(), 36))
+    LET rootCluster AS U64 = MEMORY.Read32(ADDRESS.Offset(FAT32ScratchSectorA(), 44))
+
+    IF bytesPerSector = 0 THEN RETURN 0
+    IF sectorsPerCluster = 0 THEN RETURN 0
+    IF reservedSectorCount = 0 THEN RETURN 0
+    IF numFATs = 0 THEN RETURN 0
+    IF fatSize32 = 0 THEN RETURN 0
+    IF rootCluster < 2 THEN RETURN 0
+
+    LET firstDataSector AS U64 = reservedSectorCount + (numFATs * fatSize32)
+    IF firstDataSector >= RAMDisk.SectorCount() THEN RETURN 0
+
+    LET state AS MMIOPTR = FAT32StateAddress()
+    MEMORY.Write64(state, bytesPerSector)
+    MEMORY.Write64(ADDRESS.Offset(state, 8), sectorsPerCluster)
+    MEMORY.Write64(ADDRESS.Offset(state, 16), reservedSectorCount)
+    MEMORY.Write64(ADDRESS.Offset(state, 24), numFATs)
+    MEMORY.Write64(ADDRESS.Offset(state, 32), fatSize32)
+    MEMORY.Write64(ADDRESS.Offset(state, 40), rootCluster)
+    MEMORY.Write64(ADDRESS.Offset(state, 48), firstDataSector)
+    MEMORY.Write64(ADDRESS.Offset(state, 56), 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION FAT32.IsWritable() AS BOOL
+    RETURN 0
+END FUNCTION
+
+FUNCTION FAT32ClusterToSector(cluster AS U64) AS U64
+    LET state AS MMIOPTR = FAT32StateAddress()
+    LET firstDataSector AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 48))
+    LET sectorsPerCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 8))
+    RETURN firstDataSector + ((cluster - 2) * sectorsPerCluster)
+END FUNCTION
+
+' Follows the chain: reads the 4-byte FAT32 entry for `cluster` and returns it masked to 28 bits
+' (the low 4 bits of the top byte are reserved). >= 0x0FFFFFF8 signals end-of-chain.
+FUNCTION FAT32ReadFatEntry(cluster AS U64) AS U64
+    LET state AS MMIOPTR = FAT32StateAddress()
+    LET bytesPerSector AS U64 = MEMORY.Read64(state)
+    LET reservedSectorCount AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 16))
+    LET fatByteOffset AS U64 = (reservedSectorCount * bytesPerSector) + (cluster * 4)
+    LET sector AS U64 = fatByteOffset \ bytesPerSector
+    LET offsetInSector AS U64 = fatByteOffset - (sector * bytesPerSector)
+    RAMDisk.ReadSectors(sector, 1, FAT32ScratchSectorB())
+    LET raw AS U32 = MEMORY.Read32(ADDRESS.Offset(FAT32ScratchSectorB(), offsetInSector))
+    RETURN raw AND 268435455   ' 0x0FFFFFFF
+END FUNCTION
+
+FUNCTION FAT32NameMatches(entryPtr AS MMIOPTR, nameBuffer AS MMIOPTR) AS BOOL
+    LET i AS U64 = 0
+    WHILE i < 11
+        LET a AS U8 = MEMORY.Read8(ADDRESS.Offset(entryPtr, i))
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(nameBuffer, i))
+        IF a <> b THEN
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.3: Open. Scans the root directory's cluster chain for an 8.3-name match (skipping
+' deleted entries, 0xE5, and VFAT long-name entries, attribute 0x0F) -- root-directory-only, per
+' this file's header note. On a match, records first cluster / size / position=0 / open=1 as the
+' single open-file state and returns TRUE; returns FALSE (leaving no state open) if not found or
+' the directory ends (a zero first byte) without a match.
+FUNCTION FAT32.Open(nameBuffer AS MMIOPTR) AS BOOL
+    LET state AS MMIOPTR = FAT32StateAddress()
+    LET rootCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 40))
+    LET sectorsPerCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 8))
+    LET bytesPerSector AS U64 = MEMORY.Read64(state)
+
+    LET cluster AS U64 = rootCluster
+    LET searching AS U64 = 1
+    WHILE searching = 1
+        LET baseSector AS U64 = FAT32ClusterToSector(cluster)
+        LET sectorIndex AS U64 = 0
+        WHILE sectorIndex < sectorsPerCluster
+            RAMDisk.ReadSectors(baseSector + sectorIndex, 1, FAT32ScratchSectorA())
+            LET entryOffset AS U64 = 0
+            WHILE entryOffset < bytesPerSector
+                LET firstByte AS U8 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset))
+                IF firstByte = 0 THEN
+                    RETURN 0
+                END IF
+                IF firstByte <> 229 THEN
+                    LET attr AS U8 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset + 11))
+                    LET lfnBits AS U8 = attr AND 15
+                    IF lfnBits <> 15 THEN
+                        LET matchPtr AS MMIOPTR = ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset)
+                        IF FAT32NameMatches(matchPtr, nameBuffer) = 1 THEN
+                            LET hi AS U64 = MEMORY.Read16(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset + 20))
+                            LET lo AS U64 = MEMORY.Read16(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset + 26))
+                            LET size AS U64 = MEMORY.Read32(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset + 28))
+                            LET firstCluster AS U64 = (hi SHL 16) OR lo
+                            LET fileState AS MMIOPTR = FAT32OpenFileState()
+                            MEMORY.Write64(fileState, firstCluster)
+                            MEMORY.Write64(ADDRESS.Offset(fileState, 8), size)
+                            MEMORY.Write64(ADDRESS.Offset(fileState, 16), 0)
+                            MEMORY.Write64(ADDRESS.Offset(fileState, 24), 1)
+                            RETURN 1
+                        END IF
+                    END IF
+                END IF
+                entryOffset = entryOffset + 32
+            WEND
+            sectorIndex = sectorIndex + 1
+        WEND
+        LET nextCluster AS U64 = FAT32ReadFatEntry(cluster)
+        IF nextCluster >= 268435448 THEN   ' 0x0FFFFFF8, end of chain
+            searching = 0
+        ELSE
+            cluster = nextCluster
+        END IF
+    WEND
+    RETURN 0
+END FUNCTION
+
+' Requirement 6.3: Read. Walks the open file's cluster chain from its current position, copying
+' up to maxBytes into `buffer`, and returns the number of bytes actually transferred (0 at
+' end-of-file). This is the real proof surface: correct behavior here requires the FAT
+' chain-walking above to be genuinely correct across a multi-cluster file, not just a
+' single-cluster toy case.
+FUNCTION FAT32.Read(buffer AS MMIOPTR, maxBytes AS U64) AS U64
+    LET fileState AS MMIOPTR = FAT32OpenFileState()
+    LET isOpen AS U64 = MEMORY.Read64(ADDRESS.Offset(fileState, 24))
+    IF isOpen = 0 THEN
+        RETURN 0
+    END IF
+    LET firstCluster AS U64 = MEMORY.Read64(fileState)
+    LET fileSize AS U64 = MEMORY.Read64(ADDRESS.Offset(fileState, 8))
+    LET position AS U64 = MEMORY.Read64(ADDRESS.Offset(fileState, 16))
+
+    LET remaining AS U64 = fileSize - position
+    LET toRead AS U64 = maxBytes
+    IF remaining < toRead THEN toRead = remaining
+    IF toRead = 0 THEN
+        RETURN 0
+    END IF
+
+    LET state AS MMIOPTR = FAT32StateAddress()
+    LET bytesPerSector AS U64 = MEMORY.Read64(state)
+    LET sectorsPerCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 8))
+    LET clusterSizeBytes AS U64 = bytesPerSector * sectorsPerCluster
+
+    LET clusterIndex AS U64 = position \ clusterSizeBytes
+    LET offsetInCluster AS U64 = position - (clusterIndex * clusterSizeBytes)
+
+    LET cluster AS U64 = firstCluster
+    LET walked AS U64 = 0
+    WHILE walked < clusterIndex
+        cluster = FAT32ReadFatEntry(cluster)
+        walked = walked + 1
+    WEND
+
+    LET written AS U64 = 0
+    WHILE written < toRead
+        LET baseSector AS U64 = FAT32ClusterToSector(cluster)
+        LET sectorInCluster AS U64 = offsetInCluster \ bytesPerSector
+        LET offsetInSector AS U64 = offsetInCluster - (sectorInCluster * bytesPerSector)
+
+        RAMDisk.ReadSectors(baseSector + sectorInCluster, 1, FAT32ScratchSectorA())
+
+        LET availableInSector AS U64 = bytesPerSector - offsetInSector
+        LET remainingInCluster AS U64 = clusterSizeBytes - offsetInCluster
+        LET chunk AS U64 = toRead - written
+        IF availableInSector < chunk THEN chunk = availableInSector
+        IF remainingInCluster < chunk THEN chunk = remainingInCluster
+
+        LET copyIndex AS U64 = 0
+        WHILE copyIndex < chunk
+            LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), offsetInSector + copyIndex))
+            MEMORY.Write8(ADDRESS.Offset(buffer, written + copyIndex), value)
+            copyIndex = copyIndex + 1
+        WEND
+
+        written = written + chunk
+        offsetInCluster = offsetInCluster + chunk
+        position = position + chunk
+
+        IF offsetInCluster >= clusterSizeBytes THEN
+            IF written < toRead THEN
+                cluster = FAT32ReadFatEntry(cluster)
+            END IF
+            offsetInCluster = 0
+        END IF
+    WEND
+
+    MEMORY.Write64(ADDRESS.Offset(fileState, 16), position)
+    RETURN written
+END FUNCTION
+
+FUNCTION FAT32.Seek(offset AS U64) AS BOOL
+    LET fileState AS MMIOPTR = FAT32OpenFileState()
+    LET isOpen AS U64 = MEMORY.Read64(ADDRESS.Offset(fileState, 24))
+    IF isOpen = 0 THEN
+        RETURN 0
+    END IF
+    LET fileSize AS U64 = MEMORY.Read64(ADDRESS.Offset(fileState, 8))
+    IF offset > fileSize THEN
+        RETURN 0
+    END IF
+    MEMORY.Write64(ADDRESS.Offset(fileState, 16), offset)
+    RETURN 1
+END FUNCTION
+
+FUNCTION FAT32.Close() AS BOOL
+    MEMORY.Write64(ADDRESS.Offset(FAT32OpenFileState(), 24), 0)
+    RETURN 1
+END FUNCTION
+
+' Minimal, array-free stand-ins for Requirement 6.3's Enumerate/Stat (see this file's header note
+' #3). Exercises the same root-directory-scan machinery FAT32.Open uses.
+FUNCTION FAT32.CountEntries() AS U64
+    LET state AS MMIOPTR = FAT32StateAddress()
+    LET rootCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 40))
+    LET sectorsPerCluster AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 8))
+    LET bytesPerSector AS U64 = MEMORY.Read64(state)
+
+    LET count AS U64 = 0
+    LET cluster AS U64 = rootCluster
+    LET scanning AS U64 = 1
+    WHILE scanning = 1
+        LET baseSector AS U64 = FAT32ClusterToSector(cluster)
+        LET sectorIndex AS U64 = 0
+        WHILE sectorIndex < sectorsPerCluster
+            RAMDisk.ReadSectors(baseSector + sectorIndex, 1, FAT32ScratchSectorA())
+            LET entryOffset AS U64 = 0
+            WHILE entryOffset < bytesPerSector
+                LET firstByte AS U8 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset))
+                IF firstByte = 0 THEN
+                    RETURN count
+                END IF
+                IF firstByte <> 229 THEN
+                    LET attr AS U8 = MEMORY.Read8(ADDRESS.Offset(FAT32ScratchSectorA(), entryOffset + 11))
+                    LET lfnBits AS U8 = attr AND 15
+                    IF lfnBits <> 15 THEN
+                        count = count + 1
+                    END IF
+                END IF
+                entryOffset = entryOffset + 32
+            WEND
+            sectorIndex = sectorIndex + 1
+        WEND
+        LET nextCluster AS U64 = FAT32ReadFatEntry(cluster)
+        IF nextCluster >= 268435448 THEN
+            scanning = 0
+        ELSE
+            cluster = nextCluster
+        END IF
+    WEND
+    RETURN count
+END FUNCTION

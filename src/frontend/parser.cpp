@@ -2708,7 +2708,15 @@ Parser::StmtPtr Parser::expression_statement() {
 Parser::StmtPtr Parser::if_statement() {
     auto condition = expression();
     consume(TokenType::Then, "expected THEN after IF condition");
-    if (!check(TokenType::Newline) && !check(TokenType::End)) {
+    // A trailing same-line comment after THEN (`IF cond THEN   ' why`) must not be mistaken for
+    // the start of a single-line IF's inline body: the lexer emits it as its own Comment token,
+    // which is neither Newline nor End, so without this check the single-line branch below would
+    // consume just the comment as a one-statement then-branch and leave the real body (and the
+    // END IF meant to close this block) as unconsumed trailing tokens -- surfacing far downstream
+    // as a confusing "expected FUNCTION after END" parse failure at the END IF itself. Found via
+    // exactly that symptom while implementing RFC-0038's FAT32 provider, whose own commenting
+    // style (explaining *why* a check exists right after the check) triggered it immediately.
+    if (!check(TokenType::Newline) && !check(TokenType::End) && !check(TokenType::Comment)) {
         std::vector<StmtPtr> then_branch;
         std::vector<StmtPtr> else_branch;
         do {
