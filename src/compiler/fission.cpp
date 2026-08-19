@@ -991,6 +991,7 @@ private:
             if (name == "CPU.READCR3") return "U64";
             if (name == "CPU.READCR2") return "U64";
             if (name == "CPU.READRSP") return "U64";
+            if (name == "CPU.EXCEPTIONVECTORTABLEBASE") return "U64";
             if (name == "GRAPHICS.CREATESURFACE" || name == "GRAPHICS.PRIMARYSURFACE") return "SURFACE";
             if (name == "GRAPHICS.CREATEWINDOW") return "WINDOW";
             if (name == "GRAPHICS.CREATEIMAGE") return "IMAGE";
@@ -1009,6 +1010,7 @@ private:
             const std::string name = upper_ascii(node.name);
             if (name == "CPU.READCR3") return "U64";
             if (name == "CPU.READCR2") return "U64";
+            if (name == "CPU.EXCEPTIONVECTORTABLEBASE") return "U64";
             if (name == "UEFI.GOP.DISCOVER") return "UEFI.GraphicsOutputProtocol";
             if (name == "UEFI.GOP.MODE") return "UEFI.GraphicsOutputMode";
             if (name == "UEFI.GOP.FRAMEBUFFERBASE") return "PHYSICALPTR";
@@ -1274,6 +1276,11 @@ private:
                 if (name == "CPU.READRSP") {
                     const std::string result = temp();
                     current_block(function).instructions.push_back(amir_memory("READRSP", result, {}, "U64", {}));
+                    return result;
+                }
+                if (name == "CPU.EXCEPTIONVECTORTABLEBASE") {
+                    const std::string result = temp();
+                    current_block(function).instructions.push_back(amir_memory("EXCEPTIONVECTORTABLEBASE", result, {}, "U64", {}));
                     return result;
                 }
                 std::string op = name;
@@ -3817,6 +3824,111 @@ struct X86_64CodegenResult {
     std::string entry_symbol;
 };
 
+// Reserved symbol name for the compiler-synthesized exception-entry table (see below). Not a
+// legal ArcoBASIC identifier, so it can never collide with a user-declared function.
+constexpr const char* kExceptionVectorTableSymbol = "$CPU.ExceptionVectorTable";
+
+// Architectural x86-64 vectors whose interrupt gate delivers a hardware-pushed error code. Every
+// other vector 0-31 pushes nothing, so a common handler cannot assume a uniform stack shape
+// without each entry point normalizing this first (arcology-os/.agents/reports/aps-owned-idt.md's
+// "remaining entry-ABI gate": "the next work must normalize CPU error-code/no-error-code frames").
+bool x86_64_vector_has_error_code(int vector) {
+    switch (vector) {
+        case 8: case 10: case 11: case 12: case 13: case 14: case 17: case 21: case 29: case 30:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Synthesizes the common exception-entry stub: 32 fixed-stride (16 byte) per-vector micro-stubs
+// followed by one shared handler, entirely in hand-assembled machine code rather than lowered
+// from A-MIR, since it needs an ABI (interrupt entry/IRETQ) no ordinary ArcoBASIC FUNCTION uses.
+// Always emitted for the x86-64 systems target, addressed from ArcoBASIC policy code via the
+// CPU.ExceptionVectorTableBase() intrinsic (vector N's entry point is `base + N*16`), so
+// `stdlib/descriptor_table_policy.abas`'s BuildMinimalIDT can install a distinct, vector-aware
+// handler for every architectural gate instead of one shared address for all 32.
+//
+// Each per-vector stub normalizes the CPU's inconsistent error-code push into a uniform frame --
+// pushing a placeholder 0 first when the vector has no hardware error code -- then pushes its own
+// vector number and jumps to the shared handler. The shared handler saves every general-purpose
+// register, and implements the first concrete recovery path this table supports: vector 3
+// (#BP, breakpoint/INT3) steps the saved return RIP past the one-byte INT3 opcode and resumes.
+// Every other vector is treated as an unexpected fault and parks the processor (CLI; HLT loop)
+// rather than resuming into undefined state or silently triple-faulting -- a safe, debuggable
+// default until a real per-vector fault policy exists.
+X86_64CodegenResult generate_exception_vector_table() {
+    X86_64CodegenResult result;
+    result.entry_symbol = kExceptionVectorTableSymbol;
+    using Reg = systems::x86_64::Reg;
+
+    constexpr int kVectorCount = 32;
+    constexpr std::size_t kStubStride = 16;
+    const std::size_t common_handler_offset = kVectorCount * kStubStride;
+
+    for (int vector = 0; vector < kVectorCount; ++vector) {
+        const std::size_t stub_start = result.text.size();
+        if (!x86_64_vector_has_error_code(vector)) {
+            result.text.push_imm8(0); // synthetic placeholder error code
+        }
+        result.text.push_imm8(static_cast<std::uint8_t>(vector));
+        const std::size_t jmp_disp = result.text.jmp_rel32_placeholder();
+        const std::int64_t next_instruction = static_cast<std::int64_t>(jmp_disp + 4);
+        result.text.patch_i32(jmp_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(common_handler_offset) - next_instruction));
+        // Pad to the fixed 16-byte stride so vector N's entry is always exactly base + N*16.
+        while (result.text.size() - stub_start < kStubStride) result.text.nop();
+    }
+
+    // Order registers are saved in; restored in exact reverse. RSP itself is never saved here --
+    // IRETQ restores it from the CPU-pushed frame, not from a GPR slot.
+    const Reg kSavedRegisters[] = {
+        Reg::RAX, Reg::RCX, Reg::RDX, Reg::RBX, Reg::RBP, Reg::RSI, Reg::RDI,
+        Reg::R8, Reg::R9, Reg::R10, Reg::R11, Reg::R12, Reg::R13, Reg::R14, Reg::R15,
+    };
+    constexpr int kSavedRegisterCount = 15;
+    for (Reg reg : kSavedRegisters) result.text.push_reg(reg);
+
+    // Stack layout at this point, all offsets from the current RSP:
+    //   +0..+119   the 15 saved GPRs (most recently pushed first)
+    //   +120       vector number (this table's own push)
+    //   +128       error code (real or synthetic placeholder)
+    //   +136       saved RIP (long mode always pushes RSP/SS too, regardless of privilege change)
+    constexpr std::uint32_t kVectorOffset = kSavedRegisterCount * 8;
+    constexpr std::uint32_t kRipOffset = kVectorOffset + 16;
+
+    result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(kVectorOffset));
+    result.text.cmp_reg_imm32(Reg::RAX, 3); // #BP -- the only vector this table recovers from so far
+    const std::size_t not_breakpoint_disp = result.text.jcc_rel32_placeholder(0x5); // JNE
+
+    // Breakpoint recovery: step the saved RIP past the one-byte INT3 opcode it faulted on.
+    result.text.mov_load_disp32(Reg::RAX, Reg::RSP, kRipOffset);
+    result.text.inc_rax();
+    result.text.mov_store_disp32(Reg::RSP, kRipOffset, Reg::RAX);
+    const std::size_t to_restore_disp = result.text.jmp_rel32_placeholder();
+
+    // Unexpected fault: park the processor rather than resuming into undefined state.
+    const std::size_t fault_start = result.text.size();
+    {
+        const std::int64_t next_instruction = static_cast<std::int64_t>(not_breakpoint_disp + 4);
+        result.text.patch_i32(not_breakpoint_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(fault_start) - next_instruction));
+    }
+    const std::size_t spin_start = result.text.size();
+    result.text.cli();
+    result.text.hlt();
+    result.text.jmp_rel8(static_cast<std::int8_t>(static_cast<std::int64_t>(spin_start) - static_cast<std::int64_t>(result.text.size() + 2)));
+
+    const std::size_t restore_start = result.text.size();
+    {
+        const std::int64_t next_instruction = static_cast<std::int64_t>(to_restore_disp + 4);
+        result.text.patch_i32(to_restore_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(restore_start) - next_instruction));
+    }
+    for (int i = kSavedRegisterCount - 1; i >= 0; --i) result.text.pop_reg(kSavedRegisters[i]);
+    result.text.add_rsp_imm8(16); // drop this table's vector-number and error-code pushes
+    result.text.iretq();
+
+    return result;
+}
+
 // Generates x86-64 machine code for a single named function within `module` (Packet WP-008/WP-006,
 // arcology-os/docs/systems/x86-64-codegen.md). Deliberately narrow: supports the A-MIR instruction
 // kinds required by the systems fixtures, including explicit multi-block branches, with a uniform
@@ -4287,6 +4399,16 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     if (!store_result(instruction.result, "U64")) return result;
                     break;
                 }
+                if (op == "EXCEPTIONVECTORTABLEBASE") {
+                    // A cross-symbol RIP-relative reference, resolved by generate_x86_64_program
+                    // through the same internal_calls mechanism ordinary function calls use --
+                    // the "next instruction relative disp32" math is identical for CALL rel32 and
+                    // LEA reg, [rip+disp32], so no separate relocation kind is needed.
+                    const auto disp_offset = result.text.lea_rip_relative(Reg::RAX);
+                    result.internal_calls.push_back({disp_offset, kExceptionVectorTableSymbol});
+                    if (!store_result(instruction.result, "U64")) return result;
+                    break;
+                }
                 if (op == "READCR3") {
                     result.text.mov_rax_cr3();
                     if (!store_result(instruction.result, "U64")) return result;
@@ -4708,6 +4830,21 @@ X86_64CodegenResult generate_x86_64_program(const AmirModule& module, const std:
         }
         if (!has_body) continue; // synthetic declaration-only wrapper
         if (!add_fragment(function.name)) return combined;
+    }
+
+    // Only appended when actually referenced: unlike the fixed CPU.* opcodes (CLI, HLT, LGDT, ...)
+    // this is ~600 bytes of synthesized code, and most programs never call
+    // CPU.ExceptionVectorTableBase(). Appending it unconditionally would silently grow every
+    // compiled UEFI binary, freestanding or not.
+    bool references_exception_table = false;
+    for (const auto& fragment : fragments) {
+        for (const auto& call : fragment.second.internal_calls) {
+            if (call.target == kExceptionVectorTableSymbol) { references_exception_table = true; break; }
+        }
+        if (references_exception_table) break;
+    }
+    if (references_exception_table) {
+        fragments.emplace_back(kExceptionVectorTableSymbol, generate_exception_vector_table());
     }
 
     std::unordered_map<std::string, std::size_t> function_offsets;

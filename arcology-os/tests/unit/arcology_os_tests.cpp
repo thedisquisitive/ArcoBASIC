@@ -382,6 +382,47 @@ int main() {
             asm_.ret();
             require(bytes_equal(asm_.bytes(), {0xC3}), "ret matches nasm");
         }
+        // Common exception-entry stub primitives (arcology-os/.agents/reports/aps-owned-idt.md's
+        // "remaining entry-ABI gate": normalize error-code frames, preserve registers, IRETQ).
+        {
+            Assembler asm_;
+            asm_.push_reg(Reg::RAX);
+            asm_.push_reg(Reg::RBP);
+            asm_.push_reg(Reg::R8);
+            asm_.push_reg(Reg::R15);
+            require(bytes_equal(asm_.bytes(), {0x50, 0x55, 0x41, 0x50, 0x41, 0x57}),
+                    "push r64 matches nasm for both legacy and REX.B-extended registers");
+        }
+        {
+            Assembler asm_;
+            asm_.pop_reg(Reg::R15);
+            asm_.pop_reg(Reg::R8);
+            asm_.pop_reg(Reg::RBP);
+            asm_.pop_reg(Reg::RAX);
+            require(bytes_equal(asm_.bytes(), {0x41, 0x5F, 0x41, 0x58, 0x5D, 0x58}),
+                    "pop r64 matches nasm for both legacy and REX.B-extended registers");
+        }
+        {
+            Assembler asm_;
+            asm_.push_imm8(0);
+            asm_.push_imm8(31);
+            require(bytes_equal(asm_.bytes(), {0x6A, 0x00, 0x6A, 0x1F}), "push imm8 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.iretq();
+            require(bytes_equal(asm_.bytes(), {0x48, 0xCF}), "iretq matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.inc_rax();
+            require(bytes_equal(asm_.bytes(), {0x48, 0xFF, 0xC0}), "inc rax matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.nop();
+            require(bytes_equal(asm_.bytes(), {0x90}), "nop matches nasm");
+        }
     }
 
     // PE32+ image writer (Packet WP-009, arcology-os/docs/systems/pe32-image.md). Field offsets below were

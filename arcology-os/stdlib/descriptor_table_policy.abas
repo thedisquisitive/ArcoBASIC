@@ -56,7 +56,13 @@ FUNCTION IDTWriteInterruptGate(table AS MMIOPTR, index AS U32, handler AS U64, i
     RETURN 1
 END FUNCTION
 
-FUNCTION BuildMinimalIDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, handler AS U64) AS BOOL
+' Every architectural vector (0-31) gets its own entry point into the compiler-synthesized
+' exception-entry table (CPU.ExceptionVectorTableBase(), a fixed 16-byte stride per vector) rather
+' than one shared handler address for all of them. A shared handler could not tell which vector
+' faulted; each per-vector stub already carries that distinction by construction (it normalizes
+' the hardware error-code frame and pushes its own vector number before reaching the common
+' handler). See arcology-os/.agents/reports/aps-owned-idt.md's "remaining entry-ABI gate".
+FUNCTION BuildMinimalIDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR) AS BOOL
     LET index AS U32 = 0
     WHILE index < 256
         LET gate AS MMIOPTR = ADDRESS.Offset(table, index * 16)
@@ -64,11 +70,13 @@ FUNCTION BuildMinimalIDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, handler 
         MEMORY.Write64(ADDRESS.Offset(gate, 8), 0)
         index = index + 1
     WEND
+    LET entry AS U64 = CPU.ExceptionVectorTableBase()
     LET vector AS U32 = 0
     WHILE vector < 32
         LET ist AS U8 = 0
         IF vector = 8 THEN ist = 1
-        IDTWriteInterruptGate(table, vector, handler, ist)
+        IDTWriteInterruptGate(table, vector, entry, ist)
+        entry = entry + 16
         vector = vector + 1
     WEND
     MEMORY.Write16(ADDRESS.Offset(pseudoDescriptor, 0), 4095)

@@ -1,0 +1,10 @@
+' APS exception-entry stub fixture -- reveals the compiler-synthesized common exception-entry
+' table (32 per-vector micro-stubs + one shared handler) via CPU.ExceptionVectorTableBase().
+' See arcology-os/.agents/reports/aps-owned-idt.md's "remaining entry-ABI gate".
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION ExceptionTableBase() AS U64
+    RETURN CPU.ExceptionVectorTableBase()
+END FUNCTION

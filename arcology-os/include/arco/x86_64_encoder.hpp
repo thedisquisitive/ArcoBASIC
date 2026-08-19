@@ -190,6 +190,34 @@ public:
     void hlt() { emit(0xF4); }
     void pause() { emit(0xF3); emit(0x90); }
     void int3() { emit(0xCC); }
+
+    // push/pop r64 -- (REX.B) 50+rd / (REX.B) 58+rd. Operand size is always 64-bit in long mode,
+    // so unlike most instructions here these never take a REX.W bit, only REX.B when the register
+    // is R8-R15. Needed by the exception-entry common handler to save/restore general-purpose
+    // registers around a hardware interrupt (arcology-os/.agents/reports/aps-owned-idt.md's
+    // "remaining entry-ABI gate").
+    void push_reg(Reg r) {
+        if (reg_needs_rex_extension(r)) emit(0x41);
+        emit(static_cast<std::uint8_t>(0x50 + reg_low3(r)));
+    }
+    void pop_reg(Reg r) {
+        if (reg_needs_rex_extension(r)) emit(0x41);
+        emit(static_cast<std::uint8_t>(0x58 + reg_low3(r)));
+    }
+
+    // push imm8 -- 6A ib. Sign-extended to 64 bits and pushed as a single qword, exactly what the
+    // exception-entry stubs need to normalize the CPU's inconsistent error-code push behavior
+    // (some vectors push a hardware error code, most don't) into a uniform stack shape.
+    void push_imm8(std::uint8_t imm8) { emit(0x6A); emit(imm8); }
+
+    // iretq -- REX.W CF. Pops RIP/CS/RFLAGS/RSP/SS (long mode always saves RSP/SS, regardless of
+    // whether the interrupt changed privilege level) and resumes. The only way back out of an
+    // interrupt/exception handler.
+    void iretq() { emit(0x48); emit(0xCF); }
+
+    // inc rax -- REX.W FF /0. Used to step the saved RIP past a one-byte INT3 opcode when
+    // recovering from a deliberate breakpoint.
+    void inc_rax() { emit(0x48); emit(0xFF); emit(0xC0); }
     void lfence() { emit(0x0F); emit(0xAE); emit(0xE8); }
     void sfence() { emit(0x0F); emit(0xAE); emit(0xF8); }
     void mfence() { emit(0x0F); emit(0xAE); emit(0xF0); }
@@ -248,6 +276,7 @@ public:
     }
 
     void ret() { emit(0xC3); }
+    void nop() { emit(0x90); }
 
     std::size_t size() const { return code_.size(); }
     const std::vector<std::uint8_t>& bytes() const { return code_; }
