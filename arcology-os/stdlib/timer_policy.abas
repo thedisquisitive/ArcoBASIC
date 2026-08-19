@@ -1,0 +1,156 @@
+' APS-owned PIC remap / PIT programming / timer policy (RFC-0036: APS Timer and Interrupt Routing
+' Service). The compiler supplies the extended interrupt-vector table (vectors 0-47, exception and
+' hardware-IRQ dispatch alike -- src/compiler/fission.cpp's generate_exception_vector_table) and
+' the CPU.InterruptPendingTableBase() intrinsic; this file owns PIC/PIT device programming and the
+' ArcoBASIC-facing Timer.*/PIC.* surface, using only the existing PORT.Address/PORT.Offset/
+' PORT.ReadByte/PORT.WriteByte primitives -- no new compiler mechanism, per RFC-0036 Requirement
+' 6.5.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+' --- PIC (8259A pair): master at 0x20/0x21, slave at 0xA0/0xA1, cascaded through the master's
+' IRQ2 line. ---
+
+' Reprograms both PICs' vector-base registers via the standard ICW1-ICW4 initialization sequence
+' and masks every line on both controllers (RFC-0036 Requirement 6.1: masking MUST happen before
+' CPU.EnableInterrupts is ever reached with the new IDT active, and this is the first point at
+' which an unmasked-by-firmware line could otherwise slip through unmasked into a vector this
+' table has no handler for). Callers unmask individual lines afterward via PIC.Unmask; this
+' function's own reference caller (Timer.Initialize) unmasks exactly IRQ0.
+FUNCTION PIC.Remap(masterVectorBase AS U8, slaveVectorBase AS U8) AS BOOL
+    LET masterCmd AS IOPORT = PORT.Address(32)    ' 0x20
+    LET masterData AS IOPORT = PORT.Address(33)   ' 0x21
+    LET slaveCmd AS IOPORT = PORT.Address(160)    ' 0xA0
+    LET slaveData AS IOPORT = PORT.Address(161)   ' 0xA1
+
+    PORT.WriteByte(masterCmd, 17)                 ' ICW1: begin init, cascade mode, ICW4 needed
+    PORT.WriteByte(slaveCmd, 17)
+    PORT.WriteByte(masterData, masterVectorBase)  ' ICW2: vector base
+    PORT.WriteByte(slaveData, slaveVectorBase)
+    PORT.WriteByte(masterData, 4)                 ' ICW3: slave attached at master's IRQ2 (bit 2)
+    PORT.WriteByte(slaveData, 2)                  ' ICW3: this PIC's cascade identity is IRQ2
+    PORT.WriteByte(masterData, 1)                 ' ICW4: 8086/8088 mode
+    PORT.WriteByte(slaveData, 1)
+    PORT.WriteByte(masterData, 255)                ' OCW1: mask every line on both controllers
+    PORT.WriteByte(slaveData, 255)
+    RETURN 1
+END FUNCTION
+
+' Read-modify-write a single IRQ line's mask bit (0-7 -> master port 0x21, 8-15 -> slave port
+' 0xA1, bit = irq MOD 8) without disturbing any other line's current mask state.
+FUNCTION PICSetMaskBit(irq AS U8, masked AS BOOL) AS BOOL
+    LET port AS IOPORT = PORT.Address(33)          ' 0x21, master
+    IF irq >= 8 THEN
+        port = PORT.Address(161)                   ' 0xA1, slave
+    END IF
+    LET bitIndex AS U8 = irq AND 7
+    LET bit AS U8 = 1 SHL bitIndex
+    LET current AS U8 = PORT.ReadByte(port)
+    LET updated AS U8 = current
+    IF masked THEN
+        updated = current OR bit
+    ELSE
+        updated = current AND (NOT bit)
+    END IF
+    PORT.WriteByte(port, updated)
+    RETURN 1
+END FUNCTION
+
+FUNCTION PIC.Mask(irq AS U8) AS BOOL
+    RETURN PICSetMaskBit(irq, 1)
+END FUNCTION
+
+FUNCTION PIC.Unmask(irq AS U8) AS BOOL
+    RETURN PICSetMaskBit(irq, 0)
+END FUNCTION
+
+' Sends End-Of-Interrupt. Not part of the ArcoBASIC-facing surface (RFC-0036 Requirement 6.3: EOI
+' is the compiler-generated shared handler's job, structurally, so it can never be forgotten by
+' policy) -- kept here only as documentation of the exact sequence that handler performs, and for
+' any future policy that legitimately needs to re-arm a controller outside the ISR path (none does
+' today).
+FUNCTION PICSendEndOfInterrupt(irq AS U8) AS BOOL
+    IF irq >= 8 THEN
+        PORT.WriteByte(PORT.Address(160), 32)      ' 0xA0 <- 0x20, slave first
+    END IF
+    PORT.WriteByte(PORT.Address(32), 32)           ' 0x20 <- 0x20, master always
+    RETURN 1
+END FUNCTION
+
+' --- PIT (8254) channel 0, wired to the PIC's IRQ0 line on the standard PC platform. ---
+
+' Mode 3 (square wave), binary, lobyte/hibyte access, channel 0: command byte 00110110b = 0x36.
+FUNCTION PITProgramChannel0(reloadValue AS U16) AS BOOL
+    LET lowByte AS U8 = reloadValue AND 255
+    LET highByte AS U8 = (reloadValue SHR 8) AND 255
+    PORT.WriteByte(PORT.Address(67), 54)           ' 0x43 <- 0x36 (mode/command register)
+    PORT.WriteByte(PORT.Address(64), lowByte)      ' 0x40 <- low byte
+    PORT.WriteByte(PORT.Address(64), highByte)     ' 0x40 <- high byte
+    RETURN 1
+END FUNCTION
+
+' --- Timer.* surface. ---
+
+' Ticks since Timer.Initialize; incremented by the compiler-generated shared handler on every IRQ0
+' delivery (CPU.InterruptPendingTableBase() + 0*8, line 0 = IRQ0 under the reference vector base).
+' Deliberately reads, never clears -- a monotonic counter, not a consumed flag (RFC-0036
+' Requirement 6.4 leaves this choice to implementation; Section 19's Open Questions notes a 64-bit
+' counter does not realistically overflow at any sane tick rate).
+FUNCTION Timer.Ticks() AS U64
+    LET table AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(CPU.InterruptPendingTableBase()))
+    RETURN MEMORY.Read64(table)
+END FUNCTION
+
+' Fixed scratch address holding the achieved timer frequency in Hz, set once by Timer.Initialize
+' and read by Timer.FrequencyHz()/Timer.UptimeMilliseconds(). This is policy-owned state, not
+' compiler ABI (unlike CPU.InterruptPendingTableBase()) -- the freestanding profile has no general
+' global-variable mechanism, so a small, fixed, documented scratch address is this codebase's own
+' established way to persist a handful of bytes across calls (the same technique
+' aps-emergency-stack.md used ad hoc before CPU.InterruptPendingTableBase() existed as a real
+' intrinsic; this one stays policy-private because, unlike the pending table, nothing outside
+' ArcoBASIC policy ever needs to address it). Deliberately clear of both
+' kDoubleFaultProbeAddress (0x2000000) and the interrupt-pending table (0x2010000..0x2010080).
+FUNCTION TimerFrequencyScratchAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33652736))   ' 0x2018000
+END FUNCTION
+
+FUNCTION Timer.FrequencyHz() AS U32
+    RETURN MEMORY.Read64(TimerFrequencyScratchAddress()) AND 4294967295
+END FUNCTION
+
+FUNCTION Timer.UptimeMilliseconds() AS U64
+    RETURN (Timer.Ticks() * 1000) / Timer.FrequencyHz()
+END FUNCTION
+
+' Composes PIC.Remap (reference vector base 32: IRQ0-7 -> 32-39, IRQ8-15 -> 40-47, per RFC-0036
+' Requirement 6.1), PIT channel-0 programming, installs the IRQ0 gate into the caller's own
+' already-allocated IDT (reusing IDTWriteInterruptGate's existing per-gate construction, adding
+' one gate rather than a new mechanism -- descriptor_table_policy.abas), and PIC.Unmask(0), in that
+' order, then leaves interrupts disabled on return -- enabling them is the caller's decision
+' (RFC-0037's loop is the first caller expected to do so).
+'
+' Takes idtTable/codeSelector rather than RFC-0036 Section 6.5's illustrative single-argument
+' sketch: that section's code block is explicitly a developer-experience illustration (see its own
+' Section 15's "illustrative, not normative byte-for-byte" precedent for the same kind of sketch),
+' and installing a live IDT gate genuinely requires the table's address and a valid code selector,
+' exactly as IDTWriteInterruptGate already requires them everywhere else in this codebase.
+FUNCTION Timer.Initialize(idtTable AS MMIOPTR, codeSelector AS U16, tickRateHz AS U32) AS BOOL
+    IF tickRateHz < 19 THEN RETURN 0
+    IF tickRateHz > 1193182 THEN RETURN 0
+
+    LET reload AS U32 = (1193182 + (tickRateHz / 2)) / tickRateHz   ' round to nearest
+    IF reload > 65535 THEN RETURN 0
+    IF reload = 0 THEN reload = 65536 AND 65535    ' 0 means 65536 (max period) on real 8254s
+
+    PIC.Remap(32, 40)
+    PITProgramChannel0(reload AND 65535)
+
+    LET entry AS U64 = CPU.ExceptionVectorTableBase() + (32 * 16)   ' vector 32 = IRQ0
+    IDTWriteInterruptGate(idtTable, 32, entry, codeSelector, 0)
+
+    MEMORY.Write64(TimerFrequencyScratchAddress(), 1193182 / reload)
+    PIC.Unmask(0)
+    RETURN 1
+END FUNCTION

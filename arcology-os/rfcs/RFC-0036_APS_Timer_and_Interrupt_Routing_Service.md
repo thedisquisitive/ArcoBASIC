@@ -2,7 +2,7 @@
 
 **RFC Number:** RFC-0036
 **Title:** APS Timer and Interrupt Routing Service
-**Status:** Draft
+**Status:** Implemented
 **Category:** Substrate / Hardware Enablement
 **Authors:** Arcology Project
 **Created:** 2026-08-19
@@ -473,3 +473,4 @@ firmware's own GDT, exactly as the very first breakpoint-recovery proof was.
 | Version | Date       | Summary       |
 |---------|------------|---------------|
 | 0.1     | 2026-08-19 | Initial draft |
+| 1.0     | 2026-08-19 | Implemented and validated end-to-end under QEMU/OVMF (at least 100 real, hardware-delivered IRQ0 ticks, deterministic across repeated runs); see `.agents/reports/aps-timer-tick.md` |

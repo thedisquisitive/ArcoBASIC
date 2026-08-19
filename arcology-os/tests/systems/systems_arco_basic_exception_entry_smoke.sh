@@ -16,12 +16,13 @@ grep -qF 'EXCEPTIONVECTORTABLEBASE' "$TMP_ROOT/amir.txt"
 # internal_calls mechanism ordinary function calls use.
 grep -qF 'REL32_TO $CPU.ExceptionVectorTable' "$TMP_ROOT/x86.txt"
 
-# The table is always appended once: 32 fixed-stride (16 byte) per-vector stubs + the shared
-# handler (dispatches on vector 3 (#BP, resume) vs 0 (#DE, IST1 stack-switch test probe, resume)
-# vs anything else (park)), plus this fixture's own small entry function. A golden byte count
-# catches any accidental change to the table's shape (a stub growing past its 16-byte slot, a
-# register added/removed from the save list, ...).
-grep -qF 'TEXT 644 bytes' "$TMP_ROOT/x86.txt"
+# The table is always appended once: 48 fixed-stride (16 byte) per-vector stubs (32 CPU exceptions
+# + 16 remapped hardware IRQ lines, RFC-0036) + the shared handler (dispatches on vector 3 (#BP,
+# resume) vs vector >= 32 (hardware IRQ: mark pending, EOI, resume) vs 0 (#DE, IST1 stack-switch
+# test probe, resume) vs anything else (park)), plus this fixture's own small entry function. A
+# golden byte count catches any accidental change to the table's shape (a stub growing past its
+# 16-byte slot, a register added/removed from the save list, ...).
+grep -qF 'TEXT 1045 bytes' "$TMP_ROOT/x86.txt"
 
 # The TEXT dump wraps at 8 bytes/line, so flatten it into one contiguous byte stream before
 # substring-matching multi-byte sequences that may straddle a wrap point.

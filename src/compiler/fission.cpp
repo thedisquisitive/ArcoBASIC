@@ -993,6 +993,7 @@ private:
             if (name == "CPU.READRSP") return "U64";
             if (name == "CPU.READCS") return "U64";
             if (name == "CPU.EXCEPTIONVECTORTABLEBASE") return "U64";
+            if (name == "CPU.INTERRUPTPENDINGTABLEBASE") return "U64";
             if (name == "GRAPHICS.CREATESURFACE" || name == "GRAPHICS.PRIMARYSURFACE") return "SURFACE";
             if (name == "GRAPHICS.CREATEWINDOW") return "WINDOW";
             if (name == "GRAPHICS.CREATEIMAGE") return "IMAGE";
@@ -1013,6 +1014,7 @@ private:
             if (name == "CPU.READCR2") return "U64";
             if (name == "CPU.READCS") return "U64";
             if (name == "CPU.EXCEPTIONVECTORTABLEBASE") return "U64";
+            if (name == "CPU.INTERRUPTPENDINGTABLEBASE") return "U64";
             if (name == "UEFI.GOP.DISCOVER") return "UEFI.GraphicsOutputProtocol";
             if (name == "UEFI.GOP.MODE") return "UEFI.GraphicsOutputMode";
             if (name == "UEFI.GOP.FRAMEBUFFERBASE") return "PHYSICALPTR";
@@ -1306,6 +1308,11 @@ private:
                     current_block(function).instructions.push_back(amir_memory("EXCEPTIONVECTORTABLEBASE", result, {}, "U64", {}));
                     return result;
                 }
+                if (name == "CPU.INTERRUPTPENDINGTABLEBASE") {
+                    const std::string result = temp();
+                    current_block(function).instructions.push_back(amir_memory("INTERRUPTPENDINGTABLEBASE", result, {}, "U64", {}));
+                    return result;
+                }
                 std::string op = name;
                 if (name.rfind("UEFI.GOP.", 0) == 0) {
                     const std::string gop_op = name.substr(9);
@@ -1588,6 +1595,11 @@ private:
             current_block(function).instructions.push_back(std::move(instruction));
             return result;
         }
+        if (upper_target == "CPU.EXCEPTIONVECTORTABLEBASE" || upper_target == "CPU.INTERRUPTPENDINGTABLEBASE") {
+            auto instruction = amir_memory(upper_target == "CPU.EXCEPTIONVECTORTABLEBASE" ? "EXCEPTIONVECTORTABLEBASE" : "INTERRUPTPENDINGTABLEBASE", result, {}, "U64", {});
+            current_block(function).instructions.push_back(std::move(instruction));
+            return result;
+        }
         if (upper_target == "CPU.INTERRUPT") {
             if (node.children.size() != 1 || node.children.front()->kind != AstKind::Literal) {
                 report_integer_error("CPU.Interrupt requires a statically known vector in the initial x86-64 systems target");
@@ -1652,6 +1664,23 @@ private:
     void lower_statement(AmirFunction& function, const CanonicalAstNode& node) {
         if (node.line_label >= 0) {
             current_block(function).instructions.push_back(amir_label("L" + std::to_string(node.line_label)));
+        }
+        // Comment/no-op statements carry no codegen effect (see the NoOp/Comment case below), but
+        // pushing a source-position marker for them unconditionally -- as every other statement
+        // kind gets -- can strand that marker instruction after a *preceding* statement's terminal
+        // instruction (RETURN/CpuHaltForever/...) whenever the comment or blank line is the last
+        // thing in a block. A same-line trailing comment on a function's final RETURN is the
+        // ordinary way to hit this: `RETURN <expr>   ' comment` parses as two sibling statements
+        // (Return, then Comment, confirmed via `reveal ... at AST`), and the marker this function
+        // used to push for that second, effect-free statement became the block's new last
+        // instruction -- non-terminal, sitting right after a genuinely terminal RETURN -- which
+        // validate_module correctly flags as "instruction after terminal operation", and which
+        // then failed EFI BUILD FAILED outright, not just a diagnostic. Skipping the marker for
+        // these two kinds specifically (their line-label handling above is unaffected) means a
+        // block's last *emitted* instruction always still corresponds to its last statement with
+        // real effect, exactly as every other statement already guarantees.
+        if (node.kind == AstKind::NoOp || node.kind == AstKind::Comment) {
+            return;
         }
         current_block(function).instructions.push_back(amir_source(node.source_line));
 
@@ -3867,6 +3896,22 @@ struct X86_64CodegenResult {
 // legal ArcoBASIC identifier, so it can never collide with a user-declared function.
 constexpr const char* kExceptionVectorTableSymbol = "$CPU.ExceptionVectorTable";
 
+// Fixed low-memory address of the interrupt-pending table (RFC-0036 Requirement 6.4,
+// CPU.InterruptPendingTableBase()). One U64 monotonic tick counter per IRQ line (16 entries, 8
+// bytes each, index = vector - 32), incremented by the exception-entry table's shared IRQ-dispatch
+// branch and read/reset by ArcoBASIC policy (Timer.Ticks(), stdlib/timer_policy.abas) via ordinary
+// MEMORY.Read64/MEMORY.Write64 -- never by a Load/Store AMIR instruction, since nothing about this
+// address lives inside the compiled image. It cannot live in .text or .rdata (both read-only /
+// execute-only at runtime -- see pe_image.cpp's section characteristics) since the ISR must write
+// it on every tick, so it is a fixed scratch address instead, exactly as
+// aps-emergency-stack.md's kDoubleFaultProbeAddress technique already proved sound under QEMU/OVMF.
+// Deliberately well clear of that address (0x2000000, a single 8-byte write) and, like it, kept
+// well under 128 MiB -- the smallest RAM size a test harness might run this table under with no
+// explicit QEMU -m flag -- so it never silently reads back as zero on unbacked memory.
+constexpr std::uint64_t kInterruptPendingTableAddress = 0x2010000ULL;
+constexpr std::uint32_t kInterruptPendingTableEntryStride = 8;
+constexpr std::uint32_t kInterruptPendingTableEntryCount = 16;
+
 // Architectural x86-64 vectors whose interrupt gate delivers a hardware-pushed error code. Every
 // other vector 0-31 pushes nothing, so a common handler cannot assume a uniform stack shape
 // without each entry point normalizing this first (arcology-os/.agents/reports/aps-owned-idt.md's
@@ -3880,20 +3925,28 @@ bool x86_64_vector_has_error_code(int vector) {
     }
 }
 
-// Synthesizes the common exception-entry stub: 32 fixed-stride (16 byte) per-vector micro-stubs
-// followed by one shared handler, entirely in hand-assembled machine code rather than lowered
-// from A-MIR, since it needs an ABI (interrupt entry/IRETQ) no ordinary ArcoBASIC FUNCTION uses.
-// Always emitted for the x86-64 systems target, addressed from ArcoBASIC policy code via the
-// CPU.ExceptionVectorTableBase() intrinsic (vector N's entry point is `base + N*16`), so
-// `stdlib/descriptor_table_policy.abas`'s BuildMinimalIDT can install a distinct, vector-aware
-// handler for every architectural gate instead of one shared address for all 32.
+// Synthesizes the common interrupt-entry table: 48 fixed-stride (16 byte) per-vector micro-stubs
+// (32 architectural CPU exceptions, vectors 0-31, plus 16 remapped hardware IRQ lines, vectors
+// 32-47 -- RFC-0036 Requirement 6.3) followed by one shared handler, entirely in hand-assembled
+// machine code rather than lowered from A-MIR, since it needs an ABI (interrupt entry/IRETQ) no
+// ordinary ArcoBASIC FUNCTION uses. Always emitted for the x86-64 systems target, addressed from
+// ArcoBASIC policy code via the CPU.ExceptionVectorTableBase() intrinsic (vector N's entry point
+// is `base + N*16`; the symbol's name and scope predate RFC-0036 and are intentionally left
+// unchanged -- see that RFC's Requirement 6.3 -- even though it now covers hardware interrupts
+// too), so `stdlib/descriptor_table_policy.abas`'s BuildMinimalIDT can install a distinct,
+// vector-aware handler for every architectural gate instead of one shared address for all 32, and
+// `stdlib/timer_policy.abas`'s Timer.Initialize can do the same for vector 32 (IRQ0/PIT).
 //
 // Each per-vector stub normalizes the CPU's inconsistent error-code push into a uniform frame --
-// pushing a placeholder 0 first when the vector has no hardware error code -- then pushes its own
+// pushing a placeholder 0 first when the vector has no hardware error code, which every vector
+// 32-47 stub does unconditionally since a hardware IRQ never carries one -- then pushes its own
 // vector number and jumps to the shared handler. The shared handler saves every general-purpose
-// register, and implements the first concrete recovery path this table supports: vector 3
-// (#BP, breakpoint/INT3) steps the saved return RIP past the one-byte INT3 opcode and resumes.
-// Every other vector is treated as an unexpected fault and parks the processor (CLI; HLT loop)
+// register and dispatches three ways: vector 3 (#BP, breakpoint/INT3) simply resumes (INT3 is
+// trap-class, so the saved RIP already points past the one-byte opcode -- see the note below);
+// vector >= 32 (a remapped hardware IRQ) marks the corresponding line pending in the
+// interrupt-pending table and sends EOI (RFC-0036 Requirement 6.3) before resuming -- it MUST NOT
+// call into arbitrary ArcoBASIC code, per RFC-0037 Requirement 6.2's top-half/bottom-half split;
+// every other vector is treated as an unexpected fault and parks the processor (CLI; HLT loop)
 // rather than resuming into undefined state or silently triple-faulting -- a safe, debuggable
 // default until a real per-vector fault policy exists.
 X86_64CodegenResult generate_exception_vector_table() {
@@ -3901,7 +3954,7 @@ X86_64CodegenResult generate_exception_vector_table() {
     result.entry_symbol = kExceptionVectorTableSymbol;
     using Reg = systems::x86_64::Reg;
 
-    constexpr int kVectorCount = 32;
+    constexpr int kVectorCount = 48;
     constexpr std::size_t kStubStride = 16;
     const std::size_t common_handler_offset = kVectorCount * kStubStride;
 
@@ -3938,6 +3991,8 @@ X86_64CodegenResult generate_exception_vector_table() {
     result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(kVectorOffset));
     result.text.cmp_reg_imm32(Reg::RAX, 3); // #BP -- recovers by simply resuming, see below
     const std::size_t is_breakpoint_disp = result.text.jcc_rel32_placeholder(0x4); // JE -> restore
+    result.text.cmp_reg_imm32(Reg::RAX, 32); // vectors >= 32 are remapped hardware IRQs (RFC-0036)
+    const std::size_t is_irq_disp = result.text.jcc_rel32_placeholder(0x3); // JAE -> irq_dispatch
     result.text.cmp_reg_imm32(Reg::RAX, 0); // #DE -- IST1 stack-switch probe, see below
     const std::size_t not_double_fault_disp = result.text.jcc_rel32_placeholder(0x5); // JNE -> fault
 
@@ -3971,6 +4026,67 @@ X86_64CodegenResult generate_exception_vector_table() {
     result.text.mov_reg_reg(Reg::RCX, Reg::RAX);
     result.text.mov_reg_imm64(Reg::RAX, kDoubleFaultProbeAddress);
     result.text.mov_store64_rax_from_rcx();
+    // Falls through to `restore` in every prior version of this table; now the IRQ dispatch block
+    // (below) sits physically between here and `restore`, so an explicit jump is required to keep
+    // this path's behavior unchanged.
+    const std::size_t probe_to_restore_disp = result.text.jmp_rel32_placeholder();
+
+    // IRQ dispatch (RFC-0036 Requirement 6.3): entered with RAX still holding the vector number
+    // (cmp does not modify its operands, so the `cmp rax, 32` above left it intact). This is the
+    // ISR's *entire* payload for a hardware interrupt -- mark the line pending, send EOI, resume --
+    // it MUST NOT call into arbitrary ArcoBASIC code (RFC-0037 Requirement 6.2's top-half/
+    // bottom-half split; the bottom half runs later, outside interrupt context, driven by
+    // Timer.Ticks() reading what this handler wrote).
+    const std::size_t irq_start = result.text.size();
+    {
+        const std::int64_t next_instruction = static_cast<std::int64_t>(is_irq_disp + 4);
+        result.text.patch_i32(is_irq_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(irq_start) - next_instruction));
+    }
+    // R11 holds the vector number for the rest of this block -- one of the 15 registers this table
+    // already saves/restores around the whole handler, so clobbering it here is exactly as safe as
+    // clobbering RAX/RCX/R10 below: the values a caller sees after IRETQ come from the stack slots
+    // this table pushed at entry, never from whatever the handler body left in the registers.
+    result.text.mov_reg_reg(Reg::R11, Reg::RAX);
+
+    // pending_table[vector - 32] += 1. Address arithmetic and the load/increment/store sequence
+    // use only encoder primitives this table (and aps-emergency-stack.md's probe) already exercise
+    // -- no new x86-64 encoder primitive is needed for this RFC (see RFC-0036 Section 16).
+    result.text.mov_reg_reg(Reg::RAX, Reg::R11);
+    result.text.mov_reg_imm64(Reg::RCX, 32);
+    result.text.sub_reg_reg(Reg::RAX, Reg::RCX);                      // RAX = irq_line = vector-32
+    result.text.shl_reg_imm8(Reg::RAX, 3);                            // RAX = irq_line * 8
+    result.text.mov_reg_imm64(Reg::RCX, kInterruptPendingTableAddress);
+    result.text.add_reg_reg(Reg::RAX, Reg::RCX);                      // RAX = &pending_table[irq_line]
+    result.text.mov_reg_reg(Reg::R10, Reg::RAX);                      // preserve address across the load
+    result.text.mov_load64_rax();                                     // RAX = pending_table[irq_line]
+    result.text.mov_reg_imm64(Reg::RCX, 1);
+    result.text.add_reg_reg(Reg::RAX, Reg::RCX);                      // RAX = count + 1
+    result.text.mov_reg_reg(Reg::RCX, Reg::RAX);                      // RCX = value to store
+    result.text.mov_reg_reg(Reg::RAX, Reg::R10);                      // RAX = address again
+    result.text.mov_store64_rax_from_rcx();                           // pending_table[irq_line] = count+1
+
+    // EOI (RFC-0036 Requirement 6.3 step 2): send to the slave PIC (port 0xA0) first if this
+    // vector is in the remapped IRQ8-15 range (>= 40 under the reference vector base 32), then
+    // always to the master (port 0x20). This is structurally unconditional -- every IRQ path
+    // reaches it, with no ArcoBASIC-policy opportunity to skip it -- because a missing or
+    // conditionally-skipped EOI does not fail loudly; it silently stops all future ticks at that
+    // priority level (RFC-0036 Section 2's own stated reason for making this the compiler's job,
+    // not policy's).
+    result.text.mov_reg_reg(Reg::RAX, Reg::R11);
+    result.text.cmp_reg_imm32(Reg::RAX, 40);
+    const std::size_t skip_slave_eoi_disp = result.text.jcc_rel32_placeholder(0x2); // JB -> skip (vector < 40)
+    result.text.mov_reg_imm64(Reg::RAX, 0x20);
+    result.text.mov_reg_imm64(Reg::RDX, 0xA0);
+    result.text.out_dx_al();
+    const std::size_t after_slave_eoi = result.text.size();
+    {
+        const std::int64_t next_instruction = static_cast<std::int64_t>(skip_slave_eoi_disp + 4);
+        result.text.patch_i32(skip_slave_eoi_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(after_slave_eoi) - next_instruction));
+    }
+    result.text.mov_reg_imm64(Reg::RAX, 0x20);
+    result.text.mov_reg_imm64(Reg::RDX, 0x20);
+    result.text.out_dx_al();
+    const std::size_t irq_to_restore_disp = result.text.jmp_rel32_placeholder();
 
     // Breakpoint recovery: #BP is a TRAP, not a fault -- INT3 already pushes the RIP of the
     // instruction *after* the one-byte opcode (unlike a fault, which pushes the address of the
@@ -3985,9 +4101,9 @@ X86_64CodegenResult generate_exception_vector_table() {
     (void)kRipOffset;
 
     const std::size_t restore_start = result.text.size();
-    {
-        const std::int64_t next_instruction = static_cast<std::int64_t>(is_breakpoint_disp + 4);
-        result.text.patch_i32(is_breakpoint_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(restore_start) - next_instruction));
+    for (const std::size_t disp : {is_breakpoint_disp, probe_to_restore_disp, irq_to_restore_disp}) {
+        const std::int64_t next_instruction = static_cast<std::int64_t>(disp + 4);
+        result.text.patch_i32(disp, static_cast<std::int32_t>(static_cast<std::int64_t>(restore_start) - next_instruction));
     }
     for (int i = kSavedRegisterCount - 1; i >= 0; --i) result.text.pop_reg(kSavedRegisters[i]);
     result.text.add_rsp_imm8(16); // drop this table's vector-number and error-code pushes
@@ -4514,6 +4630,23 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     // LEA reg, [rip+disp32], so no separate relocation kind is needed.
                     const auto disp_offset = result.text.lea_rip_relative(Reg::RAX);
                     result.internal_calls.push_back({disp_offset, kExceptionVectorTableSymbol});
+                    if (!store_result(instruction.result, "U64")) return result;
+                    break;
+                }
+                if (op == "INTERRUPTPENDINGTABLEBASE") {
+                    // Unlike the exception-vector table, this is not a symbol living inside the PE
+                    // image: .text is executable+read-only and .rdata is read-only (see
+                    // arcology-os/src/compiler/pe_image.cpp's kSectionMemExecute|kSectionMemRead /
+                    // kSectionMemRead section characteristics), and this table must be *written* by
+                    // the shared handler on every tick. It is instead a fixed, documented low-memory
+                    // scratch address -- exactly the technique RFC-0036 Requirement 6.4 calls out by
+                    // name ("exactly as aps-emergency-stack.md's scratch-address technique worked"),
+                    // just promoted from a test-only hack to real ABI. kInterruptPendingTableAddress
+                    // is chosen well clear of kDoubleFaultProbeAddress (0x2000000, used by the #DE
+                    // IST1-switch test probe) and, like it, deliberately well under 128 MiB -- the
+                    // smallest RAM size a test harness might run this table under with no explicit
+                    // -m -- so it never silently reads back as zero on unbacked memory.
+                    result.text.mov_reg_imm64(Reg::RAX, kInterruptPendingTableAddress);
                     if (!store_result(instruction.result, "U64")) return result;
                     break;
                 }
