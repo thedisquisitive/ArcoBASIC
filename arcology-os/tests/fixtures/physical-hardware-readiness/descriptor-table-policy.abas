@@ -2,6 +2,6 @@
 #TARGET X86_64
 #RUNTIME NONE
 
-FUNCTION ActivateTables(gdt AS U64, idt AS U64, tss AS U64) AS U64
-    RETURN ActivateDescriptorTables(gdt, idt, tss)
+FUNCTION ActivateTables(gdt AS U64, idt AS U64, tss AS U64, codeSelector AS U64) AS U64
+    RETURN ActivateDescriptorTables(gdt, idt, tss, codeSelector)
 END FUNCTION

@@ -199,6 +199,25 @@ public:
     void pause() { emit(0xF3); emit(0x90); }
     void int3() { emit(0xCC); }
 
+    // retfq -- REX.W CB. Far return: pops an 8-byte RIP then an 8-byte-slot CS from the stack and
+    // jumps there, reloading CS in the process -- the only way to change CS in 64-bit mode (there
+    // is no direct "MOV CS, imm" or "JMP FAR imm" available to this encoder). The standard
+    // "push CS; push RIP; far-return" trick: the caller pushes the target CS selector, then the
+    // target RIP, then executes this. Needed to safely activate a newly loaded GDT: after LGDT,
+    // CS still holds its old selector value, which now indexes a possibly-unrelated descriptor in
+    // the new table until something reloads it (aps-owned-gdt.md's "Segment-selector reload" gate).
+    void retfq() { emit(0x48); emit(0xCB); }
+
+    // mov SS, ax -- 8E /r (MOV Sreg, r/m16; reg field 010 selects SS), reading the low 16 bits of
+    // the source register regardless of its full width. After loading a new GDT, SS still holds
+    // whatever selector the firmware assigned -- if that index no longer names a valid descriptor
+    // in the new (typically much smaller) table, it isn't a fault yet, but IRETQ re-validates and
+    // reloads SS from every interrupt frame it pops, and that validation *does* fault (#GP) on a
+    // stale selector. Reloading SS to a selector valid in the new GDT (its data descriptor) is
+    // therefore required for interrupt delivery to keep working after a GDT switch, not just
+    // hygiene the way DS/ES/FS/GS reloads are (those aren't touched by interrupt frame push/pop).
+    void mov_ss_rax() { emit(0x8E); emit(0xD0); }
+
     // push/pop r64 -- (REX.B) 50+rd / (REX.B) 58+rd. Operand size is always 64-bit in long mode,
     // so unlike most instructions here these never take a REX.W bit, only REX.B when the register
     // is R8-R15. Needed by the exception-entry common handler to save/restore general-purpose

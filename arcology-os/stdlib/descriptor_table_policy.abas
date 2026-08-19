@@ -91,8 +91,14 @@ FUNCTION BuildMinimalIDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, codeSele
     RETURN 1
 END FUNCTION
 
-FUNCTION ActivateDescriptorTables(gdtPseudo AS U64, idtPseudo AS U64, tssSelector AS U64) AS U64
+' codeSelector must match BuildMinimalGDT's own layout (its 64-bit code descriptor sits at byte
+' offset 8, so pass 8) -- CPU.LoadGDT alone leaves CS holding its old value, which after this call
+' indexes a possibly-unrelated descriptor in the *new* table until something reloads it.
+' CPU.ReloadCodeSegment performs that reload via a far return, the only way to change CS in 64-bit
+' mode; see x86_64_encoder.hpp's retfq() for the mechanism.
+FUNCTION ActivateDescriptorTables(gdtPseudo AS U64, idtPseudo AS U64, tssSelector AS U64, codeSelector AS U64) AS U64
     CPU.LoadGDT(gdtPseudo)
+    CPU.ReloadCodeSegment(codeSelector)
     CPU.LoadTaskRegister(tssSelector)
     CPU.LoadIDT(idtPseudo)
     RETURN 0

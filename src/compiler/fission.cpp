@@ -1267,9 +1267,9 @@ private:
                     current_block(function).instructions.push_back(amir_barrier(name.substr(4)));
                     return temp();
                 }
-                if (name == "CPU.READCR2" || name == "CPU.READCR3" || name == "CPU.WRITECR3" || name == "CPU.INVALIDATEPAGE" || name == "CPU.LOADGDT" || name == "CPU.LOADIDT" || name == "CPU.LOADTASKREGISTER") {
+                if (name == "CPU.READCR2" || name == "CPU.READCR3" || name == "CPU.WRITECR3" || name == "CPU.INVALIDATEPAGE" || name == "CPU.LOADGDT" || name == "CPU.LOADIDT" || name == "CPU.LOADTASKREGISTER" || name == "CPU.RELOADCODESEGMENT" || name == "CPU.RELOADSTACKSEGMENT") {
                     const std::string op = name == "CPU.READCR2" ? "READCR2" : (name == "CPU.READCR3" ? "READCR3" : (name == "CPU.WRITECR3" ? "WRITECR3" : "INVLPG"));
-                    const std::string descriptor_op = name == "CPU.LOADGDT" ? "LGDT" : (name == "CPU.LOADIDT" ? "LIDT" : (name == "CPU.LOADTASKREGISTER" ? "LTR" : op));
+                    const std::string descriptor_op = name == "CPU.LOADGDT" ? "LGDT" : (name == "CPU.LOADIDT" ? "LIDT" : (name == "CPU.LOADTASKREGISTER" ? "LTR" : (name == "CPU.RELOADCODESEGMENT" ? "RELOADCS" : (name == "CPU.RELOADSTACKSEGMENT" ? "RELOADSS" : op))));
                     const std::string result = temp();
                     const bool read = name == "CPU.READCR2" || name == "CPU.READCR3";
                     current_block(function).instructions.push_back(amir_memory(descriptor_op, read ? result : "", std::move(args), read ? "U64" : "", {"U64"}));
@@ -1572,8 +1572,8 @@ private:
             current_block(function).instructions.push_back(std::move(instruction));
             return result;
         }
-        if (upper_target == "CPU.WRITECR3" || upper_target == "CPU.INVALIDATEPAGE" || upper_target == "CPU.LOADGDT" || upper_target == "CPU.LOADIDT" || upper_target == "CPU.LOADTASKREGISTER") {
-            const std::string op = upper_target == "CPU.WRITECR3" ? "WRITECR3" : (upper_target == "CPU.INVALIDATEPAGE" ? "INVLPG" : (upper_target == "CPU.LOADGDT" ? "LGDT" : (upper_target == "CPU.LOADIDT" ? "LIDT" : "LTR")));
+        if (upper_target == "CPU.WRITECR3" || upper_target == "CPU.INVALIDATEPAGE" || upper_target == "CPU.LOADGDT" || upper_target == "CPU.LOADIDT" || upper_target == "CPU.LOADTASKREGISTER" || upper_target == "CPU.RELOADCODESEGMENT" || upper_target == "CPU.RELOADSTACKSEGMENT") {
+            const std::string op = upper_target == "CPU.WRITECR3" ? "WRITECR3" : (upper_target == "CPU.INVALIDATEPAGE" ? "INVLPG" : (upper_target == "CPU.LOADGDT" ? "LGDT" : (upper_target == "CPU.LOADIDT" ? "LIDT" : (upper_target == "CPU.LOADTASKREGISTER" ? "LTR" : (upper_target == "CPU.RELOADCODESEGMENT" ? "RELOADCS" : "RELOADSS")))));
             current_block(function).instructions.push_back(amir_memory(op, "", std::move(args), "", {"U64"}));
             return result;
         }
@@ -4460,6 +4460,27 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     if (op == "LGDT") result.text.lgdt_rax();
                     else if (op == "LIDT") result.text.lidt_rax();
                     else result.text.ltr_rax();
+                    break;
+                }
+                if (op == "RELOADSS") {
+                    if (instruction.operands.size() != 1 || !load_value(instruction.operands[0], "U64", Reg::RAX)) { result.ok = false; result.error = "malformed stack-segment reload"; return result; }
+                    result.text.mov_ss_rax();
+                    break;
+                }
+                if (op == "RELOADCS") {
+                    // The standard "push CS; push RIP; far-return" trick: push the target
+                    // selector, then a RIP-relative computed address of the very next instruction
+                    // after the RETFQ, then far-return into it. Reloads CS without ever leaving
+                    // the current function or clobbering anything the caller can observe -- this
+                    // reads as an ordinary statement that "returns" immediately after.
+                    if (instruction.operands.size() != 1 || !load_value(instruction.operands[0], "U64", Reg::RAX)) { result.ok = false; result.error = "malformed code-segment reload"; return result; }
+                    result.text.push_reg(Reg::RAX);
+                    const auto resume_disp = result.text.lea_rip_relative(Reg::RAX);
+                    result.text.push_reg(Reg::RAX);
+                    result.text.retfq();
+                    const std::size_t resume_offset = result.text.size();
+                    const std::int64_t next_instruction = static_cast<std::int64_t>(resume_disp + 4);
+                    result.text.patch_i32(resume_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(resume_offset) - next_instruction));
                     break;
                 }
                 if (instruction.operands.empty()) { result.ok = false; result.error = "malformed memory operation"; return result; }
