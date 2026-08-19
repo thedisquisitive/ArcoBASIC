@@ -4449,6 +4449,70 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 const std::string type = instruction.result_type.empty() ? "U64" : instruction.result_type;
                 const std::string left_type = instruction.operand_types.size() > 0 ? instruction.operand_types[0] : type;
                 const std::string right_type = instruction.operand_types.size() > 1 ? instruction.operand_types[1] : type;
+
+                // Freestanding STRING values are pointers to a UTF-16, null-terminated buffer
+                // (see the Const case above: a string literal is encoded once into .rdata and
+                // referenced by a RIP-relative pointer; a STRING parameter/local is whatever
+                // pointer its caller/assignment supplied). Falling through to the generic
+                // load-and-compare path below for "==="/"!=" would compare those two POINTERS,
+                // not the text they reference -- two content-identical strings from different
+                // CONST sites (or a parameter holding a copy of a literal) have different
+                // addresses and would silently compare as never-equal. This was a real, live bug:
+                // confirmed under actual QEMU execution (not just "SOURCE ACCEPTED"), a freestanding
+                // `path = "HELLO"` check returned false even when `path` genuinely held "HELLO" --
+                // see .agents/reports/aps-block-storage.md, which routed around it with raw byte
+                // buffers rather than fix it (out of that RFC's own scope). Fixed here by walking
+                // both UTF-16 buffers unit-by-unit until either a mismatch or a shared null
+                // terminator is found, using only encoder primitives this backend already
+                // exercises elsewhere (mov_load16_rax's [RAX]-addressed word load; the same
+                // jcc-placeholder-then-patch forward-branch idiom the exception-entry table and
+                // RFC-0036's IRQ dispatch already use for exactly this kind of hand-assembled
+                // control flow).
+                if ((left_type == "STRING" || right_type == "STRING") &&
+                    (instruction.target == "==" || instruction.target == "!=")) {
+                    if (!load_value(instruction.operands[0], left_type, Reg::R8) ||
+                        !load_value(instruction.operands[1], right_type, Reg::R9)) return result;
+
+                    const std::size_t loop_start = result.text.size();
+                    result.text.mov_reg_reg(Reg::RAX, Reg::R8);
+                    result.text.mov_load16_rax();                 // EAX = *ptr1 (zero-extended)
+                    result.text.mov_reg_reg(Reg::R10, Reg::RAX);  // R10 = char1
+                    result.text.mov_reg_reg(Reg::RAX, Reg::R9);
+                    result.text.mov_load16_rax();                 // EAX = *ptr2
+                    result.text.cmp_reg_reg(Reg::R10, Reg::RAX);
+                    const std::size_t mismatch_disp = result.text.jcc_rel32_placeholder(0x5); // JNE
+                    result.text.cmp_reg_imm32(Reg::R10, 0);
+                    const std::size_t end_of_string_disp = result.text.jcc_rel32_placeholder(0x4); // JE
+                    result.text.mov_reg_imm64(Reg::RCX, 2);
+                    result.text.add_reg_reg(Reg::R8, Reg::RCX);
+                    result.text.add_reg_reg(Reg::R9, Reg::RCX);
+                    result.text.jmp_rel8(static_cast<std::int8_t>(
+                        static_cast<std::int64_t>(loop_start) - static_cast<std::int64_t>(result.text.size() + 2)));
+
+                    const std::size_t mismatch_start = result.text.size();
+                    {
+                        const std::int64_t next_instruction = static_cast<std::int64_t>(mismatch_disp + 4);
+                        result.text.patch_i32(mismatch_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(mismatch_start) - next_instruction));
+                    }
+                    result.text.mov_reg_imm64(Reg::RAX, instruction.target == "==" ? 0 : 1);
+                    const std::size_t done_disp = result.text.jmp_rel32_placeholder();
+
+                    const std::size_t equal_start = result.text.size();
+                    {
+                        const std::int64_t next_instruction = static_cast<std::int64_t>(end_of_string_disp + 4);
+                        result.text.patch_i32(end_of_string_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(equal_start) - next_instruction));
+                    }
+                    result.text.mov_reg_imm64(Reg::RAX, instruction.target == "==" ? 1 : 0);
+
+                    const std::size_t done_start = result.text.size();
+                    {
+                        const std::int64_t next_instruction = static_cast<std::int64_t>(done_disp + 4);
+                        result.text.patch_i32(done_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(done_start) - next_instruction));
+                    }
+                    if (!store_result(instruction.result, "BOOL")) return result;
+                    break;
+                }
+
                 if (!load_value(instruction.operands[0], left_type, Reg::RAX) ||
                     !load_value(instruction.operands[1], right_type, Reg::RCX)) return result;
                 const std::string op = instruction.target;

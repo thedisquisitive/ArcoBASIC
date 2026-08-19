@@ -265,7 +265,24 @@ public:
     void mfence() { emit(0x0F); emit(0xAE); emit(0xF0); }
 
     void mov_load8_rax() { emit(0x0F); emit(0xB6); emit(0x00); }
-    void mov_load16_rax() { emit(0x66); emit(0x0F); emit(0xB7); emit(0x00); }
+    // MOVZX EAX, WORD PTR [RAX] -- 0F B7 /r, no 0x66 prefix. The 16-bit *source* width is
+    // already encoded by the B7 opcode itself; the destination is the full 32-bit EAX (which
+    // architecturally zero-extends into all of RAX), giving a genuinely clean zero-extending
+    // 16-bit load with no leftover garbage in the upper bits. A 0x66 prefix here does not mean
+    // "zero-extend to 32 bits" the way it correctly does for the 8-bit MOVZX form's non-prefixed
+    // baseline -- it instead toggles the *destination* operand size down to 16-bit (AX, not
+    // EAX/RAX), which real assemblers refuse to encode at all (confirmed with `nasm`: `movzx ax,
+    // word [rax]` is rejected as a source/destination size mismatch -- MOVZX requires a strictly
+    // *wider* destination than its source). This was a real, live bug: every existing caller
+    // (MEMORY.Read16) happened to escape it only because its result always passed through this
+    // codegen's own normalize()/store_result masking down to 16 bits immediately afterward, which
+    // coincidentally discards whatever garbage the wrong encoding left in bits 16-63 of RAX --
+    // but any caller that uses the loaded value directly, without that immediate re-mask (as a
+    // hand-written UTF-16 string-comparison loop needs to), gets genuine garbage in the upper
+    // bits and silently wrong comparisons. Found and fixed implementing that exact string-compare
+    // loop (fission.cpp's Binary-operator STRING-equality case); see
+    // .agents/reports/aps-block-storage.md and the follow-up report on this fix for the full story.
+    void mov_load16_rax() { emit(0x0F); emit(0xB7); emit(0x00); }
     void mov_load32_rax() { emit(0x8B); emit(0x00); }
     void mov_load64_rax() { emit(0x48); emit(0x8B); emit(0x00); }
     void mov_store8_rax() { emit(0x88); emit(0x00); }

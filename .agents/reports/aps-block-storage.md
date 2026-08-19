@@ -112,10 +112,14 @@ path (genuine multi-cluster chain-walking) actually works.
 - **FAT32 write support, subdirectory traversal, and VFAT long filenames are all unimplemented** --
   each an explicit Non-Goal or an RFC-sanctioned scope reduction (Section 19's own allowance for
   the latter two, extended here to subdirectories as well; see "documented deviations" above).
-- **The `STRING`-equality bug found this session (deviation #2 above) was not fixed, only routed
-  around.** It is real, general, and will resurface the moment any future freestanding code
-  compares two `STRING` values with `=`. Worth a dedicated investigation and fix before any future
-  RFC leans on `STRING` for freestanding path/name handling.
+- ~~The `STRING`-equality bug found this session (deviation #2 above) was not fixed, only routed
+  around.~~ **Fixed** in a follow-up pass: see `.agents/reports/freestanding-string-equality.md`.
+  `=`/`<>` on `STRING` operands now compares UTF-16 text content via a hand-assembled comparison
+  loop, and a second, independent encoder bug the fix surfaced (`mov_load16_rax`'s incorrect
+  `0x66` prefix) is fixed too. This RFC's own shipped code (11-byte 8.3 buffers, 16-byte mount-
+  point buffers) was deliberately left as-is rather than reverted back to `STRING` -- it already
+  works and is already proven; the fix means *future* freestanding work no longer needs to avoid
+  `STRING`, not that this RFC needed revisiting.
 - **`stdlib/timer_policy.abas`'s `Timer.Initialize` reload-value rounding and
   `Timer.UptimeMilliseconds` used `/` where `\` is required** -- confirmed broken at X86_64
   codegen (not merely unexercised) by this RFC's own investigation. Fixed as a drive-by correction

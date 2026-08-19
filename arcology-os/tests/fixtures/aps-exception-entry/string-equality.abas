@@ -1,0 +1,102 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' Freestanding STRING equality proof. Confirms the fix documented in
+' .agents/reports/freestanding-string-equality.md: `=`/`<>` on STRING operands now compare UTF-16
+' text content, not the two operands' pointer values -- previously, `path = "HELLO"` silently
+' returned FALSE for an exact match under real execution (compiled clean, generated real code,
+' wrong answer). Ten cases, chosen to specifically catch a naive "compare until either side hits
+' null" loop getting the termination check wrong in either direction (the prefix cases) as well as
+' the boundary of empty strings, not just the original bug's own single reproduction.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Eq(path AS STRING, other AS STRING) AS U64
+    IF path = other THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION NotEq(path AS STRING, other AS STRING) AS U64
+    IF path <> other THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+' "APS STRING EQ OK\r\n" -- printed only if every one of the ten checks below matched its
+' expected result; a single wrong answer means this marker is never reached, and the harness's own
+' timeout produces a clean FAIL rather than a partial/misleading pass.
+FUNCTION SerialMarkerStringEqOK() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(83)
+    SerialByte(84)
+    SerialByte(82)
+    SerialByte(73)
+    SerialByte(78)
+    SerialByte(71)
+    SerialByte(32)
+    SerialByte(69)
+    SerialByte(81)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    SerialInit()
+
+    LET failures AS U64 = 0
+    IF Eq("HELLO", "HELLO") <> 1 THEN failures = failures + 1     ' exact match
+    IF Eq("HELLO", "WORLD") <> 0 THEN failures = failures + 1     ' same length, differ
+    IF Eq("HE", "HELLO") <> 0 THEN failures = failures + 1        ' left is a prefix of right
+    IF Eq("HELLO", "HE") <> 0 THEN failures = failures + 1        ' right is a prefix of left
+    IF Eq("", "") <> 1 THEN failures = failures + 1               ' both empty
+    IF Eq("", "X") <> 0 THEN failures = failures + 1              ' empty vs non-empty
+    IF Eq("X", "") <> 0 THEN failures = failures + 1              ' non-empty vs empty
+    IF NotEq("HELLO", "HELLO") <> 0 THEN failures = failures + 1  ' <> on exact match
+    IF NotEq("HELLO", "WORLD") <> 1 THEN failures = failures + 1  ' <> on mismatch
+    IF Eq("HELLQ", "HELLO") <> 0 THEN failures = failures + 1     ' differ only in last char
+
+    IF failures <> 0 THEN
+        systemTable.ConsoleOut.Write("APS STRING EQ FAIL")
+        CPU.HaltForever
+    END IF
+
+    SerialMarkerStringEqOK()
+    CPU.HaltForever
+END FUNCTION

@@ -364,7 +364,7 @@ int main() {
             asm_.mov_store16_rax_from_cx();
             asm_.mov_store32_rax_from_ecx();
             asm_.mov_store64_rax_from_rcx();
-            require(bytes_equal(asm_.bytes(), {0x0F, 0xB6, 0x00, 0x66, 0x0F, 0xB7, 0x00, 0x8B, 0x00,
+            require(bytes_equal(asm_.bytes(), {0x0F, 0xB6, 0x00, 0x0F, 0xB7, 0x00, 0x8B, 0x00,
                                                 0x48, 0x8B, 0x00, 0x88, 0x08, 0x66, 0x89, 0x08, 0x89, 0x08,
                                                 0x48, 0x89, 0x08}),
                     "volatile memory load/store forms match x86-64 encodings");
