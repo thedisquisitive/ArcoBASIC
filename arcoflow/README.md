@@ -58,9 +58,11 @@ link), but it's optional now, not required.
 Editing, saving, the project explorer, and Run all work the same as on desktop. `Run` can't shell
 out to a separate `ArcoFission` process (no subprocess sandbox exists in a browser), so it compiles
 and runs the current source in-process instead, through the exact same compiler this capsule was
-itself built with (`ArcoFission.CompileRunSource` -- see `docs/arcofission.md`) -- everything else
-(`GUI.Image`, real file/save dialogs, clipboard) has the same deliberate first-pass gaps documented
-there.
+itself built with (`ArcoFission.CompileRunSource` -- see `docs/arcofission.md`). Save and Open use
+the browser's real native file dialog (File System Access API) when it's available, reading from
+and writing to your actual disk, not just an in-page sandbox -- falls back to a simple path prompt
+on browsers without it. `GUI.Image` and clipboard access are still deliberate first-pass gaps,
+documented in `docs/arcofission.md`.
 
 ## Project format
 

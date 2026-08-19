@@ -16,6 +16,12 @@ void set_should_close(int id, bool should_close);
 void set_title(int id, const std::string& title);
 Value window_size(int id);
 void clear(int id, double red, double green, double blue, double alpha);
+// Scales everything drawn after this call (and until the next GUI.Clear, which always resets to
+// unscaled first) by `factor` -- lets a program shrink its whole layout uniformly to fit a
+// smaller window (a narrow phone screen, for instance) without touching every individual drawing
+// coordinate. Coordinates read back from input (GUI.WaitEvent's event.X/Y, GUI.PointerPosition)
+// are NOT auto-adjusted -- a caller using a non-1.0 scale divides those by the same factor itself.
+void set_scale(int id, double factor);
 void pixel(int id, int x, int y, double red, double green, double blue, double alpha);
 void fill_rect(int id, double x, double y, double width, double height,
                double red, double green, double blue, double alpha);

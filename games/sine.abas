@@ -1,0 +1,536 @@
+#DESCRIPTION "SINE -- reconstruct a key's silhouette by tuning sine waves until it fits the lock"
+
+' SINE: the key is not a decorative waveform display -- its actual cut silhouette IS the combined
+' waveform, sampled once per pixel column across the blade and rendered as solid key material
+' below that sampled curve (GUI.Column, one filled vertical strip per pixel -- there's no general
+' polygon-fill primitive available, but a dense column fill under a sampled curve is exactly the
+' bar-chart-under-a-line technique and reads as a solid, sharply-cut silhouette at pixel
+' resolution). The lock profile is the same math, rendered as a thin glowing contour instead of a
+' fill. Changing a slider changes the sample values changes the silhouette changes the fit --
+' that causal chain is the whole game.
+'
+' Built on stdlib/gui.abas's Slider (added alongside this game -- Button/Checkbox already existed
+' there but no drag-value widget did) plus its existing Button/Checkbox.
+
+#IMPORT "gui"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "SINE needs a Wayland or X11 desktop session (or just open the web capsule build in a browser)."
+    ExitTheProgram(0)
+END IF
+
+PI = 3.14159265358979
+TWO_PI = PI * 2
+' Average absolute sample error, in the same units as a single oscillator's amplitude (0..1),
+' that maps to 0% match -- see games/sine.abas calibration notes: 0.5 puts a small ~0.05 amplitude
+' error around 90%+ (near fit) and a genuinely wrong configuration down around 15-40%, matching
+' the intended below-70/70-84/85-94/95+ feel.
+ERROR_SCALE = 0.5
+SAMPLE_COUNT = 96
+
+OSC_COLORS = [
+    {R: 0.35, G: 0.85, B: 0.95},
+    {R: 0.88, G: 0.42, B: 0.92},
+    {R: 0.96, G: 0.72, B: 0.28}
+]
+
+' ---- Signal math -----------------------------------------------------------------------------
+' Knows nothing about keys or locks -- just oscillators in, a normalized sample out. Rendering
+' (below) is the only thing that turns these numbers into a key or a lock contour.
+
+FUNCTION SampleProfile(oscillators, cutFraction)
+    total = 0
+    FOR i = 0 TO LEN(oscillators) - 1
+        osc = oscillators[i]
+        IF osc.Enabled THEN
+            phaseRad = osc.Phase * PI / 180
+            total = total + osc.Amplitude * SIN(osc.Frequency * cutFraction * TWO_PI + phaseRad)
+        END IF
+    NEXT i
+    RETURN total
+END FUNCTION
+
+FUNCTION ComputeMatch(target, player)
+    totalError = 0
+    FOR i = 0 TO SAMPLE_COUNT - 1
+        xFraction = i / (SAMPLE_COUNT - 1)
+        targetY = CLAMP(SampleProfile(target, xFraction), -1, 1)
+        playerY = CLAMP(SampleProfile(player, xFraction), -1, 1)
+        totalError = totalError + ABS(targetY - playerY)
+    NEXT i
+    meanError = totalError / SAMPLE_COUNT
+    RETURN MAX(0, 1 - MIN(1, meanError / ERROR_SCALE))
+END FUNCTION
+
+' ---- Levels ------------------------------------------------------------------------------------
+' A level stores the CORRECT oscillator configuration (Target) and the WRONG starting point
+' (Start) the player begins from -- both driven through the exact same SampleProfile, so the
+' puzzle is physically consistent by construction (the lock and the key are the same math).
+' Target oscillators are always implicitly enabled; player oscillators carry their own Enabled
+' flag from the Enable checkbox. Locked[i] names which of that oscillator's three sliders are
+' frozen for the level (used by the early tutorial levels to isolate one parameter at a time).
+
+FUNCTION Osc(amplitude, frequency, phase)
+    RETURN {Amplitude: amplitude, Frequency: frequency, Phase: phase, Enabled: TRUE}
+END FUNCTION
+
+FUNCTION BuildLevels()
+    levels = []
+
+    ignored = Array.Add(levels, {
+        Name: "Signal Basics", Hint: "Drag AMPLITUDE to change how deep the cut runs.",
+        Target: [Osc(0.70, 3.0, 0)], Start: [Osc(0.15, 3.0, 0)],
+        Locked: [["Frequency", "Phase"]], RequiredMatch: 0.90
+    })
+
+    ignored = Array.Add(levels, {
+        Name: "Tooth Spacing", Hint: "Drag FREQUENCY to change how many teeth cut the blade.",
+        Target: [Osc(0.60, 4.5, 0)], Start: [Osc(0.60, 1.5, 0)],
+        Locked: [["Amplitude", "Phase"]], RequiredMatch: 0.90
+    })
+
+    ignored = Array.Add(levels, {
+        Name: "Alignment", Hint: "Drag PHASE to slide the whole pattern left and right.",
+        Target: [Osc(0.60, 3.5, 200)], Start: [Osc(0.60, 3.5, 20)],
+        Locked: [["Amplitude", "Frequency"]], RequiredMatch: 0.90
+    })
+
+    ignored = Array.Add(levels, {
+        Name: "Two Signals", Hint: "A broad wave and a fine wave now combine into one cut.",
+        Target: [Osc(0.55, 2.0, 0), Osc(0.30, 6.0, 90)],
+        Start: [Osc(0.20, 2.0, 0), Osc(0.10, 6.0, 90)],
+        Locked: [[], []], RequiredMatch: 0.88
+    })
+
+    ignored = Array.Add(levels, {
+        Name: "Find The Fault", Hint: "Only one parameter is significantly wrong here.",
+        Target: [Osc(0.50, 3.0, 60), Osc(0.25, 7.0, 200)],
+        Start: [Osc(0.50, 3.0, 60), Osc(0.25, 2.0, 200)],
+        Locked: [[], []], RequiredMatch: 0.90
+    })
+
+    ignored = Array.Add(levels, {
+        Name: "Three Signals", Hint: "A third, finer wave joins for detail work.",
+        Target: [Osc(0.50, 1.5, 0), Osc(0.30, 4.0, 80), Osc(0.15, 8.0, 160)],
+        Start: [Osc(0.20, 1.5, 0), Osc(0.10, 4.0, 80), Osc(0.05, 8.0, 160)],
+        Locked: [[], [], []], RequiredMatch: 0.88
+    })
+
+    ignored = Array.Add(levels, {
+        Name: "Tighter Tolerance", Hint: "The same three signals, less room for error.",
+        Target: [Osc(0.45, 2.2, 40), Osc(0.30, 5.5, 150), Osc(0.18, 9.0, 280)],
+        Start: [Osc(0.60, 3.0, 100), Osc(0.15, 5.5, 150), Osc(0.18, 9.0, 280)],
+        Locked: [[], [], []], RequiredMatch: 0.90
+    })
+
+    ignored = Array.Add(levels, {
+        Name: "Anchor Signal", Hint: "WAVE 1 is already correct and locked -- work the other two.",
+        Target: [Osc(0.40, 2.0, 0), Osc(0.35, 5.0, 100), Osc(0.20, 8.5, 220)],
+        Start: [Osc(0.40, 2.0, 0), Osc(0.10, 5.0, 20), Osc(0.05, 2.0, 220)],
+        Locked: [["Amplitude", "Frequency", "Phase"], [], []], RequiredMatch: 0.90
+    })
+
+    ignored = Array.Add(levels, {
+        Name: "Fine Work", Hint: "Small errors compound across three interacting signals.",
+        Target: [Osc(0.55, 1.8, 30), Osc(0.30, 4.6, 190), Osc(0.18, 9.4, 310)],
+        Start: [Osc(0.30, 3.0, 200), Osc(0.50, 2.0, 60), Osc(0.05, 6.0, 0)],
+        Locked: [[], [], []], RequiredMatch: 0.92
+    })
+
+    ignored = Array.Add(levels, {
+        Name: "Final Cut", Hint: "Every parameter across all three signals is scrambled.",
+        Target: [Osc(0.50, 2.1, 75), Osc(0.32, 5.8, 210), Osc(0.22, 9.9, 330)],
+        Start: [Osc(0.15, 5.0, 0), Osc(0.45, 2.0, 300), Osc(0.40, 8.0, 100)],
+        Locked: [[], [], []], RequiredMatch: 0.93
+    })
+
+    RETURN levels
+END FUNCTION
+
+' ---- Setup ---------------------------------------------------------------------------------
+
+TRY
+    GUI.Application("arco-sine", "SINE")
+    window = GUI.Window("SINE", 860, 760)
+CATCH err
+    PRINT "SINE window could not be opened: " + err.Message
+    ExitTheProgram(0)
+END TRY
+
+levels = BuildLevels()
+
+' Three oscillator control rows exist up front regardless of level; LoadLevel below hides rows a
+' level doesn't use and disables sliders a level locks. Amplitude/Frequency/Phase ranges are fixed
+' across every level so a player's sense of "how far is the handle" stays consistent.
+oscControls = []
+FOR i = 0 TO 2
+    ignored = Array.Add(oscControls, {
+        Amp: Slider("AMPLITUDE", 0, 0, 1),
+        Freq: Slider("FREQUENCY", 3, 0.5, 10),
+        Phase: Slider("PHASE", 0, 0, 360),
+        Enable: Checkbox("", TRUE)
+    })
+NEXT i
+
+resetButton = Button("Reset")
+testButton = Button("TEST KEY")
+nextButton = Button("Next Level ->")
+
+app = {
+    LevelIndex: 0, OscCount: 0, Match: 0, Adjustments: 0, TestCount: 0,
+    StartTicks: 0, NowTicks: 0, Complete: FALSE, Stars: 0,
+    Anim: {Phase: "idle", Ticks: 0}
+}
+
+FUNCTION CurrentLevel()
+    RETURN levels[app.LevelIndex]
+END FUNCTION
+
+FUNCTION LoadLevel(index)
+    app.LevelIndex = index
+    level = CurrentLevel()
+    app.OscCount = LEN(level.Target)
+    app.Adjustments = 0
+    app.TestCount = 0
+    app.StartTicks = app.NowTicks
+    app.Complete = FALSE
+    app.Stars = 0
+    app.Anim = {Phase: "idle", Ticks: 0}
+
+    FOR i = 0 TO 2
+        ctrl = oscControls[i]
+        used = i < app.OscCount
+        ctrl.Enable.Checked = used
+        IF used THEN
+            start = level.Start[i]
+            locked = level.Locked[i]
+            ctrl.Amp.Value = start.Amplitude
+            ctrl.Freq.Value = start.Frequency
+            ctrl.Phase.Value = start.Phase
+            ctrl.Amp.Disabled = Array.Contains(locked, "Amplitude")
+            ctrl.Freq.Disabled = Array.Contains(locked, "Frequency")
+            ctrl.Phase.Disabled = Array.Contains(locked, "Phase")
+        END IF
+    NEXT i
+END FUNCTION
+
+FUNCTION PlayerOscillators()
+    result = []
+    FOR i = 0 TO app.OscCount - 1
+        ctrl = oscControls[i]
+        ignored = Array.Add(result, {
+            Amplitude: ctrl.Amp.Value, Frequency: ctrl.Freq.Value, Phase: ctrl.Phase.Value,
+            Enabled: ctrl.Enable.Checked
+        })
+    NEXT i
+    RETURN result
+END FUNCTION
+
+ignored = LoadLevel(0)
+
+' ---- Rendering -------------------------------------------------------------------------------
+
+' Fills the region [x, x + width] x [topBound, bottomY] with key material, where the top edge at
+' each pixel column is flat across the bow/tip margins and wave-modulated across the middle --
+' one continuous per-pixel GUI.Column fill produces bow, cut region, and tip as a single silhouette
+' with no seams between differently-drawn parts.
+FUNCTION DrawSilhouette(window, oscillators, x, width, baseTopY, bottomY, maxCutPixels, bowFraction, tipFraction, r, g, b, a)
+    cutSpan = 1 - bowFraction - tipFraction
+    FOR px = 0 TO width - 1
+        xFraction = px / width
+        topY = baseTopY
+        IF xFraction >= bowFraction ANDALSO xFraction <= 1 - tipFraction THEN
+            cutFraction = (xFraction - bowFraction) / cutSpan
+            raw = CLAMP(SampleProfile(oscillators, cutFraction), -1, 1)
+            topY = baseTopY - raw * maxCutPixels
+        END IF
+        GUI.Column(window, x + px, topY, bottomY, r, g, b, a)
+    NEXT px
+END FUNCTION
+
+' A thin glowing contour tracing the profile, centered in its own panel rather than filled as
+' solid material -- this is how the lock's required cut is displayed, distinct from the player's
+' solid key.
+FUNCTION DrawContour(window, oscillators, x, width, centerY, amplitudePixels, bowFraction, tipFraction, r, g, b)
+    cutSpan = 1 - bowFraction - tipFraction
+    FOR px = 0 TO width - 1
+        xFraction = px / width
+        y = centerY
+        IF xFraction >= bowFraction ANDALSO xFraction <= 1 - tipFraction THEN
+            cutFraction = (xFraction - bowFraction) / cutSpan
+            raw = CLAMP(SampleProfile(oscillators, cutFraction), -1, 1)
+            y = centerY - raw * amplitudePixels
+        END IF
+        GUI.Column(window, x + px, y - 5, y + 5, r, g, b, 0.12)
+        GUI.Column(window, x + px, y - 1, y + 1, r, g, b, 1.0)
+    NEXT px
+END FUNCTION
+
+FUNCTION MatchColor(match)
+    ' Steel grey at low match, warming toward a bright unlock-green as match approaches 100% --
+    ' constant visual feedback beyond the percentage number itself.
+    RETURN {
+        R: LERP(0.5, 0.35, match), G: LERP(0.56, 0.92, match), B: LERP(0.64, 0.55, match)
+    }
+END FUNCTION
+
+FUNCTION DrawPanelLabel(window, text, x, y)
+    GUI.Text(window, text, x, y, 12, 0.5, 0.57, 0.68, 1.0)
+END FUNCTION
+
+FUNCTION DrawWaveRow(window, index, x, y, width)
+    ctrl = oscControls[index]
+    accent = OSC_COLORS[index]
+    used = index < app.OscCount
+
+    fade = 1.0
+    IF used == FALSE THEN fade = 0.25
+
+    GUI.Circle(window, x + 6, y + 9, 5, accent.R, accent.G, accent.B, fade)
+    GUI.Text(window, "WAVE " + STRING(index + 1), x + 18, y + 2, 13, 0.82, 0.86, 0.92, fade)
+
+    IF used == FALSE THEN RETURN
+
+    ' obj.Field.Method(...) -- a method call through a chained field access -- doesn't resolve
+    ' correctly (misparsed as if the whole dotted chain were a single host function name, the same
+    ' family of gap as `expr[index].Member` -- see docs/arcofission.md). Binding each widget to its
+    ' own local name first sidesteps it, same fix pattern used throughout arcoflow.abas.
+    amp = ctrl.Amp
+    freq = ctrl.Freq
+    phase = ctrl.Phase
+    enable = ctrl.Enable
+
+    sliderY = y + 30
+    amp.SetBounds(x, sliderY, 150, 16)
+    freq.SetBounds(x + 180, sliderY, 150, 16)
+    phase.SetBounds(x + 360, sliderY, 150, 16)
+    amp.Draw(window)
+    freq.Draw(window)
+    phase.Draw(window)
+
+    enable.SetPosition(x + 540, sliderY - 1)
+    enable.Draw(window)
+END FUNCTION
+
+' ---- Test-key animation ------------------------------------------------------------------------
+' A fixed tick-count state machine (same pattern as games/tetris.abas's gravity clock) driven off
+' the main loop's own ~60Hz WaitEvent cadence -- no separate timer needed. "Rotate the key" isn't
+' attempted literally (GUI.* has no rotation transform); success reads instead through a color
+' flash and the key seating fully into the lock, which is achievable with the primitives on hand
+' and still gives the press a clear physical payoff.
+FUNCTION StartTest()
+    app.TestCount = app.TestCount + 1
+    app.Anim = {Phase: "sliding-in", Ticks: 0}
+END FUNCTION
+
+FUNCTION AdvanceAnimation()
+    IF app.Anim.Phase == "idle" THEN RETURN
+    app.Anim.Ticks = app.Anim.Ticks + 1
+
+    ' Tick counts are deliberately short -- GUI.WaitEvent's real-world cadence in a browser can
+    ' run well under the nominal ~60Hz a fixed 0.016s timeout suggests (Asyncify/emscripten_sleep
+    ' scheduling overhead, background-tab throttling, ...), and a slow test-key payoff reads as
+    ' broken rather than satisfying. Short counts keep the animation snappy even in that worse
+    ' case while still giving LERP something to visibly interpolate over in the common case.
+    IF app.Anim.Phase == "sliding-in" ANDALSO app.Anim.Ticks >= 10 THEN
+        activeLevel = CurrentLevel()
+        IF app.Match >= activeLevel.RequiredMatch THEN
+            app.Anim = {Phase: "success-hold", Ticks: 0}
+            IF app.Match >= 0.98 THEN app.Stars = 3 ELSE IF app.Match >= 0.90 THEN app.Stars = 2 ELSE app.Stars = 1
+            app.Complete = TRUE
+        ELSE
+            app.Anim = {Phase: "reject-wiggle", Ticks: 0}
+        END IF
+    END IF
+
+    IF app.Anim.Phase == "reject-wiggle" ANDALSO app.Anim.Ticks >= 8 THEN
+        app.Anim = {Phase: "sliding-out", Ticks: 0}
+    END IF
+
+    IF app.Anim.Phase == "sliding-out" ANDALSO app.Anim.Ticks >= 8 THEN
+        app.Anim = {Phase: "idle", Ticks: 0}
+    END IF
+END FUNCTION
+
+FUNCTION KeyOffsetX(insertDistance)
+    phase = app.Anim.Phase
+    ticks = app.Anim.Ticks
+    IF phase == "sliding-in" THEN RETURN LERP(0, insertDistance, MIN(1, ticks / 10))
+    IF phase == "reject-wiggle" THEN RETURN insertDistance * 0.55 + SIN(ticks * 1.4) * 6
+    IF phase == "sliding-out" THEN RETURN LERP(insertDistance * 0.55, 0, MIN(1, ticks / 8))
+    ' Once solved the key just stays seated -- there's no transition out of "success-hold" until
+    ' the player moves on (Next Level / Reset), which is the point: a solved key doesn't slide
+    ' back out on its own.
+    IF phase == "success-hold" THEN RETURN insertDistance
+    RETURN 0
+END FUNCTION
+
+' ---- Main loop -----------------------------------------------------------------------------
+
+CONTENT_WIDTH = 740
+' The layout is designed against this size; on a smaller window (a phone in portrait, most of
+' all) GUI.SetScale shrinks everything uniformly to fit rather than clipping it.
+DESIGN_WIDTH = 780
+DESIGN_HEIGHT = 650
+
+WHILE TRUE
+    size = GUI.Size(window)
+    scale = MIN(1, MIN(size.Width / DESIGN_WIDTH, size.Height / DESIGN_HEIGHT))
+    effectiveWidth = size.Width / scale
+    originX = MAX(20, (effectiveWidth - CONTENT_WIDTH) / 2)
+    originY = 20
+    x = originX
+
+    GUI.Clear(window, 0.045, 0.05, 0.065)
+    GUI.SetScale(window, scale)
+
+    level = CurrentLevel()
+    player = PlayerOscillators()
+    app.Match = ComputeMatch(level.Target, player)
+
+    ' Header
+    GUI.Text(window, "SINE", x, originY, 26, 0.92, 0.94, 0.98, 1.0)
+    levelText = "LEVEL " + STRING(app.LevelIndex + 1) + " / " + STRING(LEN(levels)) + "  --  " + level.Name
+    GUI.Text(window, levelText, x + 90, originY + 6, 14, 0.55, 0.62, 0.74, 1.0)
+    resetButton.SetBounds(x + CONTENT_WIDTH - 90, originY - 4, 90, 32)
+    resetButton.Draw(window)
+    GUI.Text(window, level.Hint, x, originY + 36, 12, 0.45, 0.52, 0.63, 1.0)
+
+    ' Lock profile panel
+    lockPanelY = originY + 62
+    lockPanelH = 84
+    GUI.Rectangle(window, x, lockPanelY, CONTENT_WIDTH, lockPanelH, 0.075, 0.083, 0.105, 1.0)
+    ignored = DrawPanelLabel(window, "LOCK PROFILE", x + 10, lockPanelY + 8)
+    ignored = DrawContour(window, level.Target, x + 20, CONTENT_WIDTH - 40, lockPanelY + lockPanelH / 2 + 6,
+        lockPanelH / 2 - 14, 0.18, 0.12, 0.95, 0.85, 0.5)
+
+    ' Key panel -- the lock body sits at the right edge; the key silhouette slides toward it
+    ' during a test.
+    keyPanelY = lockPanelY + lockPanelH + 14
+    keyPanelH = 148
+    GUI.Rectangle(window, x, keyPanelY, CONTENT_WIDTH, keyPanelH, 0.075, 0.083, 0.105, 1.0)
+    ignored = DrawPanelLabel(window, "YOUR KEY", x + 10, keyPanelY + 8)
+
+    lockBodyWidth = 70
+    lockBodyX = x + CONTENT_WIDTH - lockBodyWidth - 16
+    lockBodyY = keyPanelY + 24
+    lockBodyH = keyPanelH - 40
+    keyWidth = CONTENT_WIDTH - lockBodyWidth - 70
+    keyX = x + 20
+    keyBaseTopY = keyPanelY + 34
+    keyBottomY = keyPanelY + keyPanelH - 20
+    insertDistance = lockBodyWidth + 10
+
+    offsetX = KeyOffsetX(insertDistance)
+
+    ' Lock body (drawn first so the key can visibly slide over/into it).
+    lockFlash = 0
+    IF app.Anim.Phase == "success-hold" THEN
+        lockFlash = MAX(0, 1 - app.Anim.Ticks / 16)
+    END IF
+    GUI.RoundedRectangle(window, lockBodyX, lockBodyY, lockBodyWidth, lockBodyH, 8,
+        LERP(0.12, 0.25, lockFlash), LERP(0.14, 0.55, lockFlash), LERP(0.18, 0.3, lockFlash), 1.0)
+    ignored = DrawContour(window, level.Target, lockBodyX + 6, lockBodyWidth - 12, lockBodyY + lockBodyH / 2,
+        lockBodyH / 2 - 10, 0.15, 0.15, 0.5, 0.55, 0.62)
+
+    keyColor = MatchColor(app.Match)
+    ignored = DrawSilhouette(window, player, keyX + offsetX, keyWidth, keyBaseTopY, keyBottomY, 26, 0.2, 0.14,
+        keyColor.R, keyColor.G, keyColor.B, 1.0)
+    ' Bow keyhole -- a background-colored circle punched into the bow region (no boolean-subtract
+    ' primitive exists, so "punching a hole" means drawing the surrounding color back on top).
+    bowCenterX = keyX + offsetX + keyWidth * 0.1
+    GUI.Circle(window, bowCenterX, (keyBaseTopY + keyBottomY) / 2, 8, 0.075, 0.083, 0.105, 1.0)
+    GUI.Circle(window, bowCenterX, (keyBaseTopY + keyBottomY) / 2, 8, keyColor.R, keyColor.G, keyColor.B, 0.0)
+    ' Rounded tip cap.
+    GUI.Circle(window, keyX + offsetX + keyWidth, (keyBaseTopY + keyBottomY) / 2, (keyBottomY - keyBaseTopY) / 2,
+        keyColor.R, keyColor.G, keyColor.B, 1.0)
+
+    IF app.Anim.Phase == "reject-wiggle" ORELSE app.Anim.Phase == "sliding-out" THEN
+        ' Fixed position next to the panel label, not near the lock body -- the key itself
+        ' overlaps that area during the wiggle and would cover the message.
+        GUI.Text(window, "Doesn't fit -- adjust and try again", x + 120, keyPanelY + 8, 12, 0.92, 0.5, 0.5, 1.0)
+    END IF
+
+    ' Match + Test row
+    matchY = keyPanelY + keyPanelH + 16
+    ignored = DrawPanelLabel(window, "MATCH", x, matchY)
+    matchPercentText = STRING(FLOOR(app.Match * 1000) / 10) + "%"
+    matchColor2 = MatchColor(app.Match)
+    GUI.Text(window, matchPercentText, x, matchY + 14, 30, matchColor2.R, matchColor2.G, matchColor2.B, 1.0)
+
+    testButton.SetBounds(x + 200, matchY, 160, 46)
+    testButton.Draw(window)
+
+    IF app.Complete THEN
+        nextButton.SetBounds(x + 380, matchY, 160, 46)
+        nextButton.Draw(window)
+        starText = ""
+        FOR s = 1 TO 3
+            IF s <= app.Stars THEN starText = starText + "*" ELSE starText = starText + "."
+        NEXT s
+        GUI.Text(window, "SIGNAL LOCKED   " + starText, x + 560, matchY + 14, 14, 0.7, 0.95, 0.75, 1.0)
+    END IF
+
+    ' Wave control panel
+    wavesY = matchY + 62
+    GUI.Rectangle(window, x, wavesY, CONTENT_WIDTH, 190, 0.07, 0.078, 0.1, 1.0)
+    FOR i = 0 TO 2
+        ignored = DrawWaveRow(window, i, x + 16, wavesY + 14 + i * 58, CONTENT_WIDTH - 32)
+    NEXT i
+
+    footerY = wavesY + 200
+    GUI.Text(window, "Drag or scroll a slider. Space = Test Key. R = Reset.", x, footerY, 11, 0.4, 0.46, 0.56, 1.0)
+
+    GUI.Present(window)
+
+    event = GUI.WaitEvent(0.016)
+    app.NowTicks = app.NowTicks + 1
+
+    IF event.Type == "close" THEN
+        GUI.Close(window)
+        ExitTheProgram(0)
+    END IF
+
+    ' GUI.SetScale only affects drawing -- event coordinates still arrive in real screen pixels,
+    ' so every slider/button hit test below needs them converted back into the same unscaled
+    ' coordinate space all the drawing above already used.
+    IF event.Type == "pointer-button" ORELSE event.Type == "pointer-move" ORELSE event.Type == "scroll" THEN
+        event.X = event.X / scale
+        event.Y = event.Y / scale
+    END IF
+
+    ignored = AdvanceAnimation()
+
+    IF resetButton.HandleEvent(window, event) THEN ignored = LoadLevel(app.LevelIndex)
+    IF testButton.HandleEvent(window, event) ANDALSO app.Anim.Phase == "idle" THEN ignored = StartTest()
+    IF app.Complete ANDALSO nextButton.HandleEvent(window, event) THEN
+        IF app.LevelIndex + 1 < LEN(levels) THEN ignored = LoadLevel(app.LevelIndex + 1)
+    END IF
+
+    IF app.Anim.Phase == "idle" THEN
+        FOR i = 0 TO app.OscCount - 1
+            ctrl = oscControls[i]
+            amp = ctrl.Amp
+            freq = ctrl.Freq
+            phase = ctrl.Phase
+            enable = ctrl.Enable
+            ampChanged = amp.HandleEvent(window, event)
+            freqChanged = freq.HandleEvent(window, event)
+            phaseChanged = phase.HandleEvent(window, event)
+            enableChanged = enable.HandleEvent(window, event)
+            IF event.Type <> "pointer-move" THEN
+                IF ampChanged ORELSE freqChanged ORELSE phaseChanged ORELSE enableChanged THEN
+                    app.Adjustments = app.Adjustments + 1
+                END IF
+            END IF
+        NEXT i
+    END IF
+
+    IF event.Type == "key" ANDALSO (event.Action == "press" ORELSE event.Action == "repeat") THEN
+        IF event.Key == "space" ANDALSO app.Anim.Phase == "idle" THEN ignored = StartTest()
+        IF event.Key == "r" THEN ignored = LoadLevel(app.LevelIndex)
+        IF event.Key == "enter" ANDALSO app.Complete ANDALSO app.LevelIndex + 1 < LEN(levels) THEN
+            ignored = LoadLevel(app.LevelIndex + 1)
+        END IF
+    END IF
+WEND

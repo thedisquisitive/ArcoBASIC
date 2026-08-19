@@ -14,6 +14,7 @@ void set_should_close(int, bool) { unsupported(); }
 void set_title(int, const std::string&) { unsupported(); }
 Value window_size(int) { unsupported(); }
 void clear(int, double, double, double, double) { unsupported(); }
+void set_scale(int, double) { unsupported(); }
 void pixel(int, int, int, double, double, double, double) { unsupported(); }
 void fill_rect(int, double, double, double, double, double, double, double, double) { unsupported(); }
 void column(int, int, int, int, double, double, double, double) { unsupported(); }

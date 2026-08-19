@@ -3388,6 +3388,11 @@ Runtime::Runtime()
         gui::clear(static_cast<int>(args[0].as_number()), args[1].as_number(), args[2].as_number(), args[3].as_number(), args.size() == 5 ? args[4].as_number() : 1.0);
         return {};
     });
+    register_function("GUI.SetScale", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) throw std::runtime_error("GUI.SetScale expects window and factor");
+        gui::set_scale(static_cast<int>(args[0].as_number()), args[1].as_number());
+        return {};
+    });
     register_function("GUI.Pixel", [](const std::vector<Value>& args) -> Value {
         if (args.size() < 6 || args.size() > 7) throw std::runtime_error("GUI.Pixel expects window, x, y, red, green, blue, and optional alpha");
         gui::pixel(static_cast<int>(args[0].as_number()), static_cast<int>(args[1].as_number()), static_cast<int>(args[2].as_number()),

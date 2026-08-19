@@ -210,8 +210,18 @@ GLFW+Cairo+Pango+GTK. The window fills the browser viewport rather than being a 
 the blocking-style `WHILE ... GUI.WaitEvent(...) ... WEND` loop every GUI capsule is written
 against works unchanged in a browser because the capsule links with `-sASYNCIFY` -- see the
 file-level comment in `canvas_backend.cpp` for how that works and its current limitations
-(`GUI.Image` isn't implemented yet; `GUI.OpenFileDialog`/`SaveFileDialog` use `window.prompt()`
-against Emscripten's in-memory `MEMFS`, not a real native picker or the user's actual disk).
+(`GUI.Image` isn't implemented yet).
+
+`GUI.OpenFileDialog`/`SaveFileDialog` use the real File System Access API
+(`showOpenFilePicker`/`showSaveFilePicker`) when the browser supports it -- a genuine native OS
+file dialog reading from and writing to the user's actual disk, bridged through Asyncify via
+`EM_ASYNC_JS` the same way `emscripten_sleep` is used elsewhere. Browsers without the API (Firefox,
+Safari as of this writing) fall back to a `window.prompt()`-based path into Emscripten's ephemeral
+`MEMFS`, and the same fallback also kicks in if a real picker call fails for any reason other than
+the user's own cancellation (e.g. missing "transient activation" in an unusual call context) so
+Open/Save never just silently do nothing. See the file-level comment in `canvas_backend.cpp` for
+the full mechanics, including how Save's real disk handle gets synced after `File.WriteText`
+completes even though ArcoBASIC's own path-then-write contract has no idea it exists.
 
 `Process.Run` has no real subprocess to shell out to in a browser sandbox and fails immediately
 there -- but every capsule that links `arco_compiler` (which every native/web capsule does, to

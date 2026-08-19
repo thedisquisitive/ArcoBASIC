@@ -12,9 +12,15 @@
 <html>
 <head>
 <meta charset="utf-8">
+<!-- Without this, a mobile browser renders at a simulated desktop-width viewport (~980px) and
+     scales the whole page down -- canvas_backend.cpp's 100vw/100vh canvas sizing would compute
+     against that fake width, and touch targets (sliders, buttons) would end up too small to hit
+     accurately. user-scalable=no/maximum-scale=1 locks out accidental pinch-zoom while playing,
+     the same way a native mobile game would. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>ArcoBASIC</title>
 <style>
-  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; height: 100%; }
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; height: 100%; touch-action: none; }
   /* Only shown for console-only capsules that never create a GUI window (canvas_backend.cpp's
      create_window inserts a <canvas> that covers this once a GUI capsule actually opens one). */
   #arco-console {

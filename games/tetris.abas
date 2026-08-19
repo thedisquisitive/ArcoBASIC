@@ -1,0 +1,540 @@
+#DESCRIPTION "Classic falling-block puzzle -- the obligatory Tetris clone, built as an ArcoFission web capsule"
+
+' A single-file ArcoBASIC Tetris clone. Runs natively (a real Wayland/X11 window via GUI.*) and as
+' a browser capsule (`--target web`, see games/build.sh) through the exact same source -- nothing
+' here is web-specific, GUI.* already abstracts over the desktop GLFW+Cairo backend and the browser
+' <canvas> backend identically (see src/gui/canvas_backend.cpp).
+'
+' #IMPORT "gui" for stdlib/gui.abas's Button class, used only for the on-screen touch controls
+' below -- a physical keyboard is the primary input, but a touchscreen has no keyboard at all, so
+' Tetris is otherwise entirely unplayable on a phone regardless of how well the layout fits.
+'
+' Known simplification: gravity is paced by counting main-loop iterations (see FallInterval below),
+' not real elapsed time -- the runtime has no sub-second clock (Time.Now/Time.Timestamp are only
+' second-resolution). GUI.WaitEvent(0.016) below acts as a ~60Hz tick source when idle, but a burst
+' of input events (e.g. OS key-repeat while holding a movement key) makes the loop return sooner
+' than 16ms and so tick slightly faster than real time during that burst. Not noticeable in normal
+' play; a real fix would need a monotonic clock host function, which doesn't exist yet.
+
+#IMPORT "gui"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "Tetris needs a Wayland or X11 desktop session (or just open the web capsule build in a browser)."
+    ExitTheProgram(0)
+END IF
+
+BOARD_W = 10
+BOARD_H = 20
+CELL = 28
+' The layout below is designed against this size; on a smaller window (a phone in portrait, most
+' of all) GUI.SetScale shrinks everything uniformly to fit rather than clipping or reflowing.
+DESIGN_WIDTH = 620
+DESIGN_HEIGHT = 700
+LINE_SCORES = [0, 100, 300, 500, 800]
+
+' ---- Piece definitions -----------------------------------------------------------------------
+' Each piece is 4 rotation states, each a list of 4 [x, y] cell offsets within a 4x4 box (0..3).
+' Not exact SRS (no distinct spawn/kick tables per piece) -- a simple same-box rotation with a
+' handful of horizontal kick attempts in TryRotate below reads fine for a casual clone without
+' pulling in the full guideline rotation system.
+
+FUNCTION BuildPieces()
+    pieces = []
+
+    ignored = Array.Add(pieces, {
+        Name: "I", R: 0.0, G: 0.9, B: 0.9,
+        Rotations: [
+            [[0, 1], [1, 1], [2, 1], [3, 1]],
+            [[2, 0], [2, 1], [2, 2], [2, 3]],
+            [[0, 2], [1, 2], [2, 2], [3, 2]],
+            [[1, 0], [1, 1], [1, 2], [1, 3]]
+        ]
+    })
+
+    ignored = Array.Add(pieces, {
+        Name: "O", R: 0.95, G: 0.85, B: 0.2,
+        Rotations: [
+            [[1, 0], [2, 0], [1, 1], [2, 1]],
+            [[1, 0], [2, 0], [1, 1], [2, 1]],
+            [[1, 0], [2, 0], [1, 1], [2, 1]],
+            [[1, 0], [2, 0], [1, 1], [2, 1]]
+        ]
+    })
+
+    ignored = Array.Add(pieces, {
+        Name: "T", R: 0.65, G: 0.3, B: 0.85,
+        Rotations: [
+            [[1, 0], [0, 1], [1, 1], [2, 1]],
+            [[1, 0], [1, 1], [2, 1], [1, 2]],
+            [[0, 1], [1, 1], [2, 1], [1, 2]],
+            [[1, 0], [0, 1], [1, 1], [1, 2]]
+        ]
+    })
+
+    ignored = Array.Add(pieces, {
+        Name: "S", R: 0.3, G: 0.85, B: 0.35,
+        Rotations: [
+            [[1, 0], [2, 0], [0, 1], [1, 1]],
+            [[1, 0], [1, 1], [2, 1], [2, 2]],
+            [[1, 1], [2, 1], [0, 2], [1, 2]],
+            [[0, 0], [0, 1], [1, 1], [1, 2]]
+        ]
+    })
+
+    ignored = Array.Add(pieces, {
+        Name: "Z", R: 0.9, G: 0.25, B: 0.25,
+        Rotations: [
+            [[0, 0], [1, 0], [1, 1], [2, 1]],
+            [[2, 0], [1, 1], [2, 1], [1, 2]],
+            [[0, 1], [1, 1], [1, 2], [2, 2]],
+            [[1, 0], [0, 1], [1, 1], [0, 2]]
+        ]
+    })
+
+    ignored = Array.Add(pieces, {
+        Name: "J", R: 0.25, G: 0.4, B: 0.95,
+        Rotations: [
+            [[0, 0], [0, 1], [1, 1], [2, 1]],
+            [[1, 0], [2, 0], [1, 1], [1, 2]],
+            [[0, 1], [1, 1], [2, 1], [2, 2]],
+            [[1, 0], [1, 1], [0, 2], [1, 2]]
+        ]
+    })
+
+    ignored = Array.Add(pieces, {
+        Name: "L", R: 0.95, G: 0.55, B: 0.15,
+        Rotations: [
+            [[2, 0], [0, 1], [1, 1], [2, 1]],
+            [[1, 0], [1, 1], [1, 2], [2, 2]],
+            [[0, 1], [1, 1], [2, 1], [0, 2]],
+            [[0, 0], [1, 0], [1, 1], [1, 2]]
+        ]
+    })
+
+    RETURN pieces
+END FUNCTION
+
+PIECES = BuildPieces()
+
+FUNCTION RandomPieceType()
+    RETURN Random.Integer(0, LEN(PIECES) - 1)
+END FUNCTION
+
+' ---- Board -------------------------------------------------------------------------------------
+' board[y][x] is 0 for empty, or (piece type + 1) for a locked cell -- the +1 keeps 0 free to mean
+' "empty" without needing a separate presence flag alongside the color/type.
+
+FUNCTION EmptyRow()
+    row = []
+    FOR x = 0 TO BOARD_W - 1
+        ignored = Array.Add(row, 0)
+    NEXT x
+    RETURN row
+END FUNCTION
+
+FUNCTION EmptyBoard()
+    board = []
+    FOR y = 0 TO BOARD_H - 1
+        ignored = Array.Add(board, EmptyRow())
+    NEXT y
+    RETURN board
+END FUNCTION
+
+FUNCTION RowFull(row)
+    FOR x = 0 TO BOARD_W - 1
+        IF row[x] == 0 THEN RETURN FALSE
+    NEXT x
+    RETURN TRUE
+END FUNCTION
+
+' ---- Piece geometry ------------------------------------------------------------------------
+
+FUNCTION AbsoluteCells(piece)
+    pieceDef = PIECES[piece.Type]
+    rotations = pieceDef.Rotations
+    cells = rotations[piece.Rotation]
+    result = []
+    FOR i = 0 TO LEN(cells) - 1
+        cell = cells[i]
+        ignored = Array.Add(result, [piece.X + cell[0], piece.Y + cell[1]])
+    NEXT i
+    RETURN result
+END FUNCTION
+
+' Cells above the board (y < 0) are allowed -- that's just the piece still emerging at spawn --
+' but anything at or past the floor, or off either side, or overlapping an already-locked cell, is
+' not.
+FUNCTION CellsValid(cells, board)
+    FOR i = 0 TO LEN(cells) - 1
+        cell = cells[i]
+        cx = cell[0]
+        cy = cell[1]
+        IF cx < 0 ORELSE cx >= BOARD_W THEN RETURN FALSE
+        IF cy >= BOARD_H THEN RETURN FALSE
+        IF cy >= 0 THEN
+            row = board[cy]
+            IF row[cx] <> 0 THEN RETURN FALSE
+        END IF
+    NEXT i
+    RETURN TRUE
+END FUNCTION
+
+' ---- Game state ----------------------------------------------------------------------------
+
+FUNCTION FallIntervalForLevel(level)
+    RETURN MAX(4, 48 - (level - 1) * 4)
+END FUNCTION
+
+FUNCTION SpawnPiece(state)
+    spawnType = state.NextType
+    state.NextType = RandomPieceType()
+    piece = {Type: spawnType, Rotation: 0, X: 3, Y: -2}
+    state.Current = piece
+    IF CellsValid(AbsoluteCells(piece), state.Board) == FALSE THEN
+        state.GameOver = TRUE
+    END IF
+END FUNCTION
+
+FUNCTION NewGame()
+    state = {}
+    state.Board = EmptyBoard()
+    state.Score = 0
+    state.Lines = 0
+    state.Level = 1
+    state.FallInterval = FallIntervalForLevel(1)
+    state.TickCounter = 0
+    state.GameOver = FALSE
+    state.Paused = FALSE
+    state.NextType = RandomPieceType()
+    ignored = SpawnPiece(state)
+    RETURN state
+END FUNCTION
+
+FUNCTION TryMove(state, dx, dy)
+    piece = {Type: state.Current.Type, Rotation: state.Current.Rotation, X: state.Current.X + dx, Y: state.Current.Y + dy}
+    IF CellsValid(AbsoluteCells(piece), state.Board) THEN
+        state.Current = piece
+        RETURN TRUE
+    END IF
+    RETURN FALSE
+END FUNCTION
+
+' Same-box rotation (no per-piece SRS kick table) with a few horizontal nudges tried in turn so a
+' rotation next to a wall or another block still succeeds when a plain in-place turn would not --
+' cheap approximation of "wall kicks" that's good enough for a casual clone.
+FUNCTION TryRotate(state)
+    pieceDef = PIECES[state.Current.Type]
+    rotationCount = LEN(pieceDef.Rotations)
+    newRotation = (state.Current.Rotation + 1) MOD rotationCount
+    kicks = [0, -1, 1, -2, 2]
+    FOR i = 0 TO LEN(kicks) - 1
+        piece = {Type: state.Current.Type, Rotation: newRotation, X: state.Current.X + kicks[i], Y: state.Current.Y}
+        IF CellsValid(AbsoluteCells(piece), state.Board) THEN
+            state.Current = piece
+            RETURN TRUE
+        END IF
+    NEXT i
+    RETURN FALSE
+END FUNCTION
+
+FUNCTION GhostY(state)
+    piece = {Type: state.Current.Type, Rotation: state.Current.Rotation, X: state.Current.X, Y: state.Current.Y}
+    WHILE TRUE
+        piece.Y = piece.Y + 1
+        IF CellsValid(AbsoluteCells(piece), state.Board) == FALSE THEN
+            piece.Y = piece.Y - 1
+            RETURN piece.Y
+        END IF
+    WEND
+END FUNCTION
+
+FUNCTION ApplyLineScore(state, cleared)
+    IF cleared == 0 THEN RETURN
+    state.Score = state.Score + LINE_SCORES[cleared] * state.Level
+    state.Lines = state.Lines + cleared
+    state.Level = FLOOR(state.Lines / 10) + 1
+    state.FallInterval = FallIntervalForLevel(state.Level)
+END FUNCTION
+
+FUNCTION ClearLines(state)
+    cleared = 0
+    y = BOARD_H - 1
+    WHILE y >= 0
+        row = state.Board[y]
+        IF RowFull(row) THEN
+            ignored = Array.RemoveAt(state.Board, y)
+            ignored = Array.Unshift(state.Board, EmptyRow())
+            cleared = cleared + 1
+            ' Do not step y up here -- the row that just slid down into index y (from y - 1) still
+            ' needs checking, so re-examine the same index next iteration.
+        ELSE
+            y = y - 1
+        END IF
+    WEND
+    ignored = ApplyLineScore(state, cleared)
+END FUNCTION
+
+FUNCTION LockPiece(state)
+    cells = AbsoluteCells(state.Current)
+    FOR i = 0 TO LEN(cells) - 1
+        cell = cells[i]
+        cx = cell[0]
+        cy = cell[1]
+        IF cy >= 0 THEN state.Board[cy][cx] = state.Current.Type + 1
+    NEXT i
+    ignored = ClearLines(state)
+    ignored = SpawnPiece(state)
+END FUNCTION
+
+FUNCTION SoftDrop(state)
+    IF TryMove(state, 0, 1) THEN state.Score = state.Score + 1
+END FUNCTION
+
+FUNCTION HardDrop(state)
+    dropped = 0
+    WHILE TryMove(state, 0, 1)
+        dropped = dropped + 1
+    WEND
+    state.Score = state.Score + dropped * 2
+    ignored = LockPiece(state)
+END FUNCTION
+
+' ---- Drawing -------------------------------------------------------------------------------
+
+FUNCTION DrawCell(window, x, y, r, g, b, a)
+    GUI.Rectangle(window, x + 1, y + 1, CELL - 2, CELL - 2, r, g, b, a)
+END FUNCTION
+
+FUNCTION DrawPieceCells(window, cells, boardX, boardY, r, g, b, a)
+    FOR i = 0 TO LEN(cells) - 1
+        cell = cells[i]
+        cx = cell[0]
+        cy = cell[1]
+        IF cy >= 0 THEN ignored = DrawCell(window, boardX + cx * CELL, boardY + cy * CELL, r, g, b, a)
+    NEXT i
+END FUNCTION
+
+FUNCTION DrawBoard(window, state, boardX, boardY)
+    boardPixelW = BOARD_W * CELL
+    boardPixelH = BOARD_H * CELL
+    GUI.Rectangle(window, boardX - 4, boardY - 4, boardPixelW + 8, boardPixelH + 8, 0.03, 0.035, 0.05, 1.0)
+    GUI.Rectangle(window, boardX, boardY, boardPixelW, boardPixelH, 0.08, 0.09, 0.115, 1.0)
+
+    ' Grid lines first, then locked cells on top -- keeps empty cells visibly gridded without a
+    ' per-cell draw call for every empty square.
+    FOR x = 0 TO BOARD_W
+        gx = boardX + x * CELL
+        GUI.Line(window, gx, boardY, gx, boardY + boardPixelH, 1, 0.14, 0.15, 0.19, 1.0)
+    NEXT x
+    FOR y = 0 TO BOARD_H
+        gy = boardY + y * CELL
+        GUI.Line(window, boardX, gy, boardX + boardPixelW, gy, 1, 0.14, 0.15, 0.19, 1.0)
+    NEXT y
+
+    FOR y = 0 TO BOARD_H - 1
+        row = state.Board[y]
+        FOR x = 0 TO BOARD_W - 1
+            value = row[x]
+            IF value <> 0 THEN
+                pieceDef = PIECES[value - 1]
+                ignored = DrawCell(window, boardX + x * CELL, boardY + y * CELL, pieceDef.R, pieceDef.G, pieceDef.B, 1.0)
+            END IF
+        NEXT x
+    NEXT y
+
+    IF state.GameOver == FALSE THEN
+        pieceDef = PIECES[state.Current.Type]
+        ghostY = GhostY(state)
+        ghostPiece = {Type: state.Current.Type, Rotation: state.Current.Rotation, X: state.Current.X, Y: ghostY}
+        ignored = DrawPieceCells(window, AbsoluteCells(ghostPiece), boardX, boardY, pieceDef.R, pieceDef.G, pieceDef.B, 0.25)
+        ignored = DrawPieceCells(window, AbsoluteCells(state.Current), boardX, boardY, pieceDef.R, pieceDef.G, pieceDef.B, 1.0)
+    END IF
+END FUNCTION
+
+FUNCTION DrawNextPreview(window, state, x, y)
+    GUI.Text(window, "NEXT", x, y, 14, 0.55, 0.62, 0.72, 1.0)
+    boxSize = 96
+    previewCell = 20
+    GUI.Rectangle(window, x, y + 20, boxSize, boxSize, 0.045, 0.05, 0.068, 1.0)
+    pieceDef = PIECES[state.NextType]
+    rotations = pieceDef.Rotations
+    cells = rotations[0]
+    FOR i = 0 TO LEN(cells) - 1
+        cell = cells[i]
+        cellX = x + 6 + cell[0] * previewCell
+        cellY = y + 26 + cell[1] * previewCell
+        GUI.Rectangle(window, cellX + 1, cellY + 1, previewCell - 2, previewCell - 2, pieceDef.R, pieceDef.G, pieceDef.B, 1.0)
+    NEXT i
+END FUNCTION
+
+FUNCTION DrawSidebar(window, state, x, y)
+    GUI.Text(window, "TETRIS", x, y, 26, 0.9, 0.92, 0.96, 1.0)
+    GUI.Text(window, "Score", x, y + 44, 13, 0.55, 0.62, 0.72, 1.0)
+    GUI.Text(window, STRING(state.Score), x, y + 62, 20, 0.9, 0.92, 0.96, 1.0)
+    GUI.Text(window, "Lines", x, y + 98, 13, 0.55, 0.62, 0.72, 1.0)
+    GUI.Text(window, STRING(state.Lines), x, y + 116, 20, 0.9, 0.92, 0.96, 1.0)
+    GUI.Text(window, "Level", x, y + 152, 13, 0.55, 0.62, 0.72, 1.0)
+    GUI.Text(window, STRING(state.Level), x, y + 170, 20, 0.9, 0.92, 0.96, 1.0)
+
+    ignored = DrawNextPreview(window, state, x, y + 210)
+
+    controlsY = y + 350
+    GUI.Text(window, "Left/Right  move", x, controlsY, 13, 0.5, 0.57, 0.67, 1.0)
+    GUI.Text(window, "Down        soft drop", x, controlsY + 20, 13, 0.5, 0.57, 0.67, 1.0)
+    GUI.Text(window, "Up          rotate", x, controlsY + 40, 13, 0.5, 0.57, 0.67, 1.0)
+    GUI.Text(window, "Space       hard drop", x, controlsY + 60, 13, 0.5, 0.57, 0.67, 1.0)
+    GUI.Text(window, "P           pause", x, controlsY + 80, 13, 0.5, 0.57, 0.67, 1.0)
+    GUI.Text(window, "R           restart", x, controlsY + 100, 13, 0.5, 0.57, 0.67, 1.0)
+END FUNCTION
+
+FUNCTION DrawOverlay(window, message, boardX, boardY, boardPixelW, boardPixelH)
+    GUI.Rectangle(window, boardX, boardY, boardPixelW, boardPixelH, 0.0, 0.0, 0.0, 0.55)
+    measured = GUI.MeasureText(window, message, 20)
+    textX = boardX + (boardPixelW - measured.Width) / 2
+    textY = boardY + (boardPixelH - measured.Height) / 2
+    GUI.Text(window, message, textX, textY, 20, 0.95, 0.95, 0.98, 1.0)
+END FUNCTION
+
+' Button.HandleEvent only fires on release (a deliberate press-and-drag-off-cancels convention),
+' where a game control wants to react the instant it's pressed -- this does its own "press" hit
+' test instead of reusing Button.ContainsPoint directly.
+'
+' Takes plain X/Y/Width/Height rather than a Button instance -- a free FUNCTION calling a method
+' on a class-instance PARAMETER (button.ContainsPoint(...)) hits a real ArcoFission bytecode
+' compiler gap ("bytecode VM does not implement opcode yet: CALL_EXTERNAL"): the lowering pass
+' that routes UEFI-freestanding external-receiver calls through a not-yet-implemented opcode keys
+' off "is the receiver a function parameter", not "is the receiver actually a UEFI external type",
+' so an ordinary hosted parameter that happens to be a class instance gets misrouted the same way.
+' Passing primitives instead sidesteps it entirely.
+FUNCTION ButtonPressed(x, y, width, height, event)
+    RETURN event.Type == "pointer-button" ANDALSO event.Action == "press" ANDALSO event.Button == "left" ANDALSO event.X >= x ANDALSO event.X < x + width ANDALSO event.Y >= y ANDALSO event.Y < y + height
+END FUNCTION
+
+' ---- Setup and main loop -------------------------------------------------------------------
+
+TRY
+    GUI.Application("arco-tetris", "Tetris")
+    window = GUI.Window("Tetris", 620, 700)
+CATCH err
+    PRINT "Tetris window could not be opened: " + err.Message
+    ExitTheProgram(0)
+END TRY
+
+state = NewGame()
+
+' On-screen touch controls -- always drawn (a mouse can click them too, not just touch), since
+' there's no reliable way to detect "this is a touchscreen" and no reason to bother: an extra row
+' of buttons costs a desktop keyboard player nothing.
+touchLeft = Button("<")
+touchDown = Button("v")
+touchRight = Button(">")
+touchRotate = Button("ROTATE")
+touchDrop = Button("DROP")
+
+WHILE TRUE
+    size = GUI.Size(window)
+    ' Shrink the whole layout uniformly to fit a window smaller than it was designed for (a phone
+    ' screen, above all) rather than clipping it -- GUI.SetScale below does the actual scaling;
+    ' effectiveWidth/Height is how much DESIGN-space fits across the real window at that scale, so
+    ' every position computed below can stay in the same unscaled coordinates as before.
+    scale = MIN(1, MIN(size.Width / DESIGN_WIDTH, size.Height / DESIGN_HEIGHT))
+    effectiveWidth = size.Width / scale
+    effectiveHeight = size.Height / scale
+
+    boardPixelW = BOARD_W * CELL
+    boardPixelH = BOARD_H * CELL
+    sidebarWidth = 220
+    contentWidth = boardPixelW + 24 + sidebarWidth
+    originX = MAX(20, (effectiveWidth - contentWidth) / 2)
+    originY = MAX(20, (effectiveHeight - boardPixelH) / 2)
+    boardX = originX
+    boardY = originY
+    sidebarX = boardX + boardPixelW + 24
+    controlsY = boardY + boardPixelH + 20
+
+    GUI.Clear(window, 0.055, 0.06, 0.078)
+    GUI.SetScale(window, scale)
+    ignored = DrawBoard(window, state, boardX, boardY)
+    ignored = DrawSidebar(window, state, sidebarX, boardY)
+
+    ' On-screen touch controls, centered under the board.
+    buttonWidth = 70
+    buttonGap = 8
+    buttonsWidth = buttonWidth * 5 + buttonGap * 4
+    controlsX = boardX + (boardPixelW - buttonsWidth) / 2
+    touchLeft.SetBounds(controlsX, controlsY, buttonWidth, 44)
+    touchDown.SetBounds(controlsX + (buttonWidth + buttonGap), controlsY, buttonWidth, 44)
+    touchRight.SetBounds(controlsX + (buttonWidth + buttonGap) * 2, controlsY, buttonWidth, 44)
+    touchRotate.SetBounds(controlsX + (buttonWidth + buttonGap) * 3, controlsY, buttonWidth, 44)
+    touchDrop.SetBounds(controlsX + (buttonWidth + buttonGap) * 4, controlsY, buttonWidth, 44)
+    touchLeft.Draw(window)
+    touchDown.Draw(window)
+    touchRight.Draw(window)
+    touchRotate.Draw(window)
+    touchDrop.Draw(window)
+
+    IF state.GameOver THEN
+        ignored = DrawOverlay(window, "GAME OVER -- press R or tap to restart", boardX, boardY, boardPixelW, boardPixelH)
+    ELSE
+        IF state.Paused THEN ignored = DrawOverlay(window, "PAUSED", boardX, boardY, boardPixelW, boardPixelH)
+    END IF
+
+    GUI.Present(window)
+
+    event = GUI.WaitEvent(0.016)
+
+    IF event.Type == "close" THEN
+        GUI.Close(window)
+        ExitTheProgram(0)
+    END IF
+
+    ' GUI.SetScale only affects drawing -- event coordinates still arrive in real screen pixels,
+    ' so they need the same conversion back into DESIGN-space that every drawing coordinate above
+    ' is already in, before any hit-testing (ButtonPressed, ...) can compare them meaningfully.
+    IF event.Type == "pointer-button" ORELSE event.Type == "pointer-move" ORELSE event.Type == "scroll" THEN
+        event.X = event.X / scale
+        event.Y = event.Y / scale
+    END IF
+
+    IF event.Type == "key" ANDALSO (event.Action == "press" ORELSE event.Action == "repeat") THEN
+        IF event.Key == "r" THEN
+            state = NewGame()
+        ELSE
+            IF state.GameOver == FALSE THEN
+                IF event.Key == "p" THEN
+                    state.Paused = NOT state.Paused
+                ELSE
+                    IF state.Paused == FALSE THEN
+                        IF event.Key == "left" THEN ignored = TryMove(state, -1, 0)
+                        IF event.Key == "right" THEN ignored = TryMove(state, 1, 0)
+                        IF event.Key == "down" THEN ignored = SoftDrop(state)
+                        IF event.Key == "up" THEN ignored = TryRotate(state)
+                        IF event.Key == "space" THEN ignored = HardDrop(state)
+                    END IF
+                END IF
+            END IF
+        END IF
+    END IF
+
+    ' A touchscreen has no keyboard at all, so "press R to restart" isn't reachable there -- any
+    ' tap while the game-over overlay is showing restarts instead of needing a dedicated button.
+    IF state.GameOver ANDALSO event.Type == "pointer-button" ANDALSO event.Action == "press" THEN
+        state = NewGame()
+    END IF
+
+    IF state.GameOver == FALSE ANDALSO state.Paused == FALSE THEN
+        IF ButtonPressed(touchLeft.X, touchLeft.Y, touchLeft.Width, touchLeft.Height, event) THEN ignored = TryMove(state, -1, 0)
+        IF ButtonPressed(touchRight.X, touchRight.Y, touchRight.Width, touchRight.Height, event) THEN ignored = TryMove(state, 1, 0)
+        IF ButtonPressed(touchDown.X, touchDown.Y, touchDown.Width, touchDown.Height, event) THEN ignored = SoftDrop(state)
+        IF ButtonPressed(touchRotate.X, touchRotate.Y, touchRotate.Width, touchRotate.Height, event) THEN ignored = TryRotate(state)
+        IF ButtonPressed(touchDrop.X, touchDrop.Y, touchDrop.Width, touchDrop.Height, event) THEN ignored = HardDrop(state)
+    END IF
+
+    IF state.GameOver == FALSE ANDALSO state.Paused == FALSE THEN
+        state.TickCounter = state.TickCounter + 1
+        IF state.TickCounter >= state.FallInterval THEN
+            state.TickCounter = 0
+            IF TryMove(state, 0, 1) == FALSE THEN ignored = LockPiece(state)
+        END IF
+    END IF
+WEND

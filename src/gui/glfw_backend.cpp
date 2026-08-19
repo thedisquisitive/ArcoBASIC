@@ -412,6 +412,15 @@ void clear(int id, double r, double g, double b, double a) {
     cairo_paint(item.context);
     cairo_restore(item.context);
 }
+void set_scale(int id, double factor) {
+    // cairo_paint() above fills the whole surface via the default clip (device-space, unaffected
+    // by any active scale), so unlike the web canvas backend's fillRect-based clear, clear() here
+    // needs no matching reset -- it's already scale-safe. identity-then-scale (not a multiplying
+    // cairo_scale on top of whatever was already there) keeps repeated per-frame calls idempotent.
+    auto& item = find_window(id);
+    cairo_identity_matrix(item.context);
+    cairo_scale(item.context, factor, factor);
+}
 void pixel(int id, int x, int y, double r, double g, double b, double a) {
     auto& item = find_window(id);
     write_pixel(item, x, y, r, g, b, a);

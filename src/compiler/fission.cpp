@@ -6299,11 +6299,18 @@ Result build_web_bytecode(const std::string& bytecode_binary, const std::string&
         if (ext != ".html" && ext != ".js" && ext != ".wasm") {
             output += ".html";
         }
+        // Set below, only meaningful for .html output -- see the -sSINGLE_FILE=1 block and the
+        // post-build verification that has to branch on it too.
+        bool single_file_requested = false;
 
         std::vector<std::string> args{
             compiler,
             "-std=c++17",
-            "-O2",
+            // -Os (optimize for size) rather than -O2: this workload is draw-call and simple-math
+            // bound, not CPU-bound, so the runtime cost of -Os over -O2 is negligible while the
+            // wasm binary itself comes out meaningfully smaller -- matters a lot more here than in
+            // a typical native build, since this binary is downloaded fresh by every visitor.
+            "-Os",
             "-fexceptions",
             "-sASYNCIFY",
             "-sALLOW_MEMORY_GROWTH=1",
@@ -6343,8 +6350,18 @@ Result build_web_bytecode(const std::string& bytecode_binary, const std::string&
             // instead of a binary fetch) that's a reasonable tradeoff for "just works," and is
             // only applied for .html output -- a caller explicitly asking for separate .js/.wasm
             // (say, for a real CDN-backed deployment where the fetch/caching tradeoff runs the
-            // other way) still gets that.
-            args.push_back("-sSINGLE_FILE=1");
+            // other way) still gets that. A caller that IS deploying behind a real HTTP server
+            // (a CDN, a normal web host -- anywhere that isn't a bare file:// double-click) can
+            // opt out with ARCOFISSION_WEB_SINGLE_FILE=0 to get the separate-files shape instead:
+            // a real binary .wasm fetched once and cacheable by the browser/CDN independently of
+            // the .html/.js, and compressible in transit the way base64-inside-JS isn't nearly as
+            // effectively -- both add up to a real difference for repeat visitors and for the
+            // first paint on a slow connection.
+            const char* env_single_file = std::getenv("ARCOFISSION_WEB_SINGLE_FILE");
+            single_file_requested = !env_single_file || std::string(env_single_file) != "0";
+            if (single_file_requested) {
+                args.push_back("-sSINGLE_FILE=1");
+            }
         }
 
         std::ostringstream command;
@@ -6365,11 +6382,13 @@ Result build_web_bytecode(const std::string& bytecode_binary, const std::string&
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             return {false, "", "Emscripten compiler failed while building the web capsule"};
         }
-        // -sSINGLE_FILE=1 above means .html output has no sibling .wasm to check anymore (the
-        // module is embedded as base64 inside the .html itself) -- confirm that file exists and
-        // is a plausible size instead. Anything else (an explicit .js/.wasm request, which
-        // doesn't get -sSINGLE_FILE) still gets the real wasm-magic-number check.
-        if (std::filesystem::path(output).extension() == ".html") {
+        // -sSINGLE_FILE=1 means .html output has no sibling .wasm to check anymore (the module is
+        // embedded as base64 inside the .html itself) -- confirm that file exists and is a
+        // plausible size instead. Without it (either non-.html output, which never gets
+        // -sSINGLE_FILE, or .html built with ARCOFISSION_WEB_SINGLE_FILE=0 above), a real sibling
+        // .wasm exists and gets the real magic-number check -- a small .html shell next to it is
+        // then correct, not a sign anything went wrong.
+        if (single_file_requested) {
             std::error_code size_error;
             const auto html_size = std::filesystem::file_size(output, size_error);
             if (size_error || html_size < 1024) {

@@ -396,6 +396,112 @@ CLASS Checkbox
     END FUNCTION
 END CLASS
 
+' A draggable horizontal value slider -- track + fill + round handle, value linearly mapped
+' between Min and Max. Grab-and-drag anywhere in a generous vertical hit band around the track
+' (not just the thin track itself, and not just the handle), the same "forgiving hit region"
+' choice Button/Checkbox make with their own ContainsPoint. Mouse-wheel over the slider nudges the
+' value by a small fixed fraction of its range, for fine adjustment without needing pixel-perfect
+' dragging (see the Disabled flag below for locking a slider out entirely, e.g. a tutorial level
+' that only wants one parameter touchable at a time).
+CLASS Slider
+    Label AS String = ""
+    Value AS Number = 0
+    Min AS Number = 0
+    Max AS Number = 1
+    X AS Number = 0
+    Y AS Number = 0
+    Width AS Number = 160
+    Height AS Number = 18
+    Dragging AS Bool = FALSE
+    Disabled AS Bool = FALSE
+    FontSize AS Number = 11
+    TrackR AS Number = 0.16
+    TrackG AS Number = 0.19
+    TrackB AS Number = 0.26
+    FillR AS Number = 0.4
+    FillG AS Number = 0.75
+    FillB AS Number = 1.0
+    HandleR AS Number = 0.92
+    HandleG AS Number = 0.95
+    HandleB AS Number = 1.0
+    LabelR AS Number = 0.6
+    LabelG AS Number = 0.67
+    LabelB AS Number = 0.78
+
+    CONSTRUCTOR(label AS String = "", value AS Number = 0, minimum AS Number = 0, maximum AS Number = 1)
+        SELF.Label = label
+        SELF.Value = value
+        SELF.Min = minimum
+        SELF.Max = maximum
+    END CONSTRUCTOR
+
+    FUNCTION SetBounds(x, y, width, height)
+        SELF.X = x
+        SELF.Y = y
+        SELF.Width = width
+        SELF.Height = height
+    END FUNCTION
+
+    FUNCTION Fraction()
+        span = SELF.Max - SELF.Min
+        IF span == 0 THEN RETURN 0
+        RETURN CLAMP((SELF.Value - SELF.Min) / span, 0, 1)
+    END FUNCTION
+
+    FUNCTION SetFraction(fraction)
+        SELF.Value = SELF.Min + CLAMP(fraction, 0, 1) * (SELF.Max - SELF.Min)
+    END FUNCTION
+
+    FUNCTION ContainsPoint(px, py)
+        RETURN px >= SELF.X ANDALSO px < SELF.X + SELF.Width ANDALSO py >= SELF.Y - 8 ANDALSO py < SELF.Y + SELF.Height + 8
+    END FUNCTION
+
+    FUNCTION Draw(window)
+        fade = 1.0
+        IF SELF.Disabled THEN fade = 0.4
+        trackY = SELF.Y + SELF.Height / 2 - 2
+        GUI.RoundedRectangle(window, SELF.X, trackY, SELF.Width, 4, 2, SELF.TrackR, SELF.TrackG, SELF.TrackB, fade)
+        fraction = SELF.Fraction()
+        fillWidth = SELF.Width * fraction
+        IF fillWidth > 0 THEN
+            GUI.RoundedRectangle(window, SELF.X, trackY, fillWidth, 4, 2, SELF.FillR, SELF.FillG, SELF.FillB, fade)
+        END IF
+        handleX = SELF.X + fillWidth
+        handleRadius = SELF.Height / 2
+        GUI.Circle(window, handleX, SELF.Y + handleRadius, handleRadius, SELF.HandleR, SELF.HandleG, SELF.HandleB, fade)
+        IF SELF.Label <> "" THEN
+            GUI.Text(window, SELF.Label, SELF.X, SELF.Y - 16, SELF.FontSize, SELF.LabelR, SELF.LabelG, SELF.LabelB, fade)
+        END IF
+    END FUNCTION
+
+    ' Returns TRUE the frame Value actually changes.
+    FUNCTION HandleEvent(window, event)
+        IF SELF.Disabled THEN RETURN FALSE
+        changed = FALSE
+        IF event.Type == "pointer-button" ANDALSO event.Button == "left" THEN
+            IF event.Action == "press" ANDALSO SELF.ContainsPoint(event.X, event.Y) THEN
+                SELF.Dragging = TRUE
+                before = SELF.Value
+                SELF.SetFraction((event.X - SELF.X) / SELF.Width)
+                IF SELF.Value <> before THEN changed = TRUE
+            END IF
+            IF event.Action == "release" THEN SELF.Dragging = FALSE
+        END IF
+        IF event.Type == "pointer-move" ANDALSO SELF.Dragging THEN
+            before = SELF.Value
+            SELF.SetFraction((event.X - SELF.X) / SELF.Width)
+            IF SELF.Value <> before THEN changed = TRUE
+        END IF
+        IF event.Type == "scroll" ANDALSO SELF.ContainsPoint(event.X, event.Y) THEN
+            before = SELF.Value
+            wheelStep = (SELF.Max - SELF.Min) * 0.0005
+            SELF.Value = CLAMP(SELF.Value - event.DeltaY * wheelStep, SELF.Min, SELF.Max)
+            IF SELF.Value <> before THEN changed = TRUE
+        END IF
+        RETURN changed
+    END FUNCTION
+END CLASS
+
 ' Y offsets for stacking `count` items of the given `heights` vertically from `start_y`, `spacing`
 ' pixels apart. Stateless on purpose -- apply the returned offsets to widgets' SetBounds/
 ' SetPosition yourself; see the module doc comment for why this doesn't own the widgets directly.

@@ -15,15 +15,20 @@
 // the whole runtime rewritten into a callback/state-machine style. This is Emscripten's documented
 // way to port existing blocking game/GUI-loop C++ code to the web with no structural rewrite.
 //
+// open_file_dialog/save_file_dialog use the real File System Access API (showOpenFilePicker/
+// showSaveFilePicker) when the browser supports it -- a genuine native OS file dialog reading from
+// and writing to the user's actual disk, not just Emscripten's ephemeral in-memory MEMFS. Open
+// copies the picked file's bytes into MEMFS at a synthetic path and hands that path back, so
+// File.ReadText keeps working unchanged; Save stashes the real FileSystemFileHandle and syncs
+// MEMFS's content out to disk via an FS.trackingDelegate.onCloseFile hook the moment
+// File.WriteText's own fclose() lands (see js_ensure_initialized and js_pick_open_file/
+// js_pick_save_file below for the full mechanics). Browsers without the API (Firefox, Safari as of
+// this writing) fall back to a window.prompt()-based path into MEMFS, same as before.
+//
 // Known, deliberate gaps for this first pass (each throws a clear error rather than silently
 // misbehaving): GUI.Image (loading an image file is inherently asynchronous in a browser; wiring
-// that through Asyncify + fetch is a real follow-up, not done here). File.* still works against
-// Emscripten's default in-memory filesystem (MEMFS) with no code changes needed on that side, but
-// it's ephemeral -- gone on page reload, invisible to the user's real disk -- so
-// open_file_dialog/save_file_dialog use a plain window.prompt() for a path into that ephemeral FS
-// rather than a real native picker (no synchronous browser API for one; a proper implementation
-// would bridge the File System Access API through Asyncify, another real follow-up). Clipboard
-// access is similarly a no-op stub (real clipboard access is async/permission-gated in browsers).
+// that through Asyncify + fetch is a real follow-up, not done here). Clipboard access is similarly
+// a no-op stub (real clipboard access is async/permission-gated in browsers).
 
 #include "arco/gui.hpp"
 
@@ -68,10 +73,51 @@ Value no_event() { return Value::Object{{"Type", "none"}}; }
 // does the equivalent normalization for desktop's numeric GLFW key codes).
 EM_JS(void, js_ensure_initialized, (), {
     if (Module.arcoGui) return;
-    Module.arcoGui = {canvases: {}, ctxs: {}};
+    Module.arcoGui = {canvases: {}, ctxs: {}, saveHandles: {}};
+    // Bridges a real FileSystemFileHandle (from showSaveFilePicker, see js_pick_save_file below)
+    // back out to the user's actual disk. File.WriteText has no idea any of this exists -- it just
+    // does a normal fopen/fwrite/fclose against MEMFS, the same as it would for any other path.
+    // Emscripten's FS.trackingDelegate.onCloseFile fires for *every* MEMFS file close regardless of
+    // C++ call site, so registering one here is enough to notice "a write just landed at a path we
+    // have a real handle for" without touching File.WriteText or the arco::gui interface at all.
+    // Fire-and-forget async: the real disk write finishes a moment after File.WriteText returns,
+    // not before -- fine for ArcoBASIC source files, which are tiny.
+    if (typeof FS !== "undefined" && FS.trackingDelegate) {
+        FS.trackingDelegate["onCloseFile"] = function(path) {
+            const handle = Module.arcoGui.saveHandles[path];
+            if (!handle) return;
+            delete Module.arcoGui.saveHandles[path];
+            try {
+                const data = FS.readFile(path);
+                (async function() {
+                    try {
+                        const writable = await handle.createWritable();
+                        await writable.write(data);
+                        await writable.close();
+                    } catch (e) {
+                        console.error("ArcoFlow: failed to sync saved file to disk:", e);
+                    }
+                })();
+            } catch (e) {
+                console.error("ArcoFlow: failed to read back saved file for disk sync:", e);
+            }
+        };
+    }
+    // Shared fallback for open_file_dialog/save_file_dialog: window.prompt() for a path into
+    // Emscripten's ephemeral MEMFS. Used when the File System Access API isn't available at all
+    // (Firefox, Safari as of this writing), and also as a safety net if a real picker call throws
+    // for a reason other than the user genuinely cancelling it (e.g. a SecurityError from the
+    // "must be handling a user gesture" requirement -- see js_pick_open_file/js_pick_save_file)
+    // so Open/Save never just silently do nothing with no way for the user to proceed.
+    Module.arcoPromptPath = function(title, initialPath) {
+        const result = window.prompt(title, initialPath);
+        return (result === null || result === "") ? null : result;
+    };
     Module.arcoKeyName = function(e) {
         const key = e.key;
-        if (key.length === 1) return key.toLowerCase();
+        // Named lookup first, length-1 fallback second -- " " (the spacebar's e.key) has length 1
+        // just like any regular character key, so checking length first would return the literal
+        // " " character instead of "space" and never reach the table entry that maps it correctly.
         const named = {
             Escape: "escape", Enter: "enter", " ": "space", Spacebar: "space",
             ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down",
@@ -79,6 +125,7 @@ EM_JS(void, js_ensure_initialized, (), {
             Tab: "tab", Backspace: "backspace", Delete: "delete",
         };
         if (named[key]) return named[key];
+        if (key.length === 1) return key.toLowerCase();
         if (/^F([1-9]|1[0-9]|2[0-5])$/.test(key)) return key.toLowerCase();
         return "unknown";
     };
@@ -206,6 +253,42 @@ EM_JS(void, js_create_window, (int id, const char* title_ptr, int width, int hei
         Module.arcoQueueEvent({type: "key", id: id, key: name, action: "release",
             shift: e.shiftKey ? 1 : 0, ctrl: e.ctrlKey ? 1 : 0, alt: e.altKey ? 1 : 0, meta: e.metaKey ? 1 : 0});
     });
+
+    // Touch input -- translated into the exact same pointer-move/pointer-button events the mouse
+    // listeners above already produce, so nothing at the ArcoBASIC or C++ level needs to know
+    // touch exists at all (a Slider's drag handling, a Button's click test, ... all just see
+    // "pointer" events regardless of which input made them). Single-touch only: these are 2D
+    // single-pointer games and widgets, multi-touch gestures are out of scope. preventDefault on
+    // every touch event keeps the browser's own scroll/pinch-zoom/text-selection from fighting
+    // with dragging a slider or tapping a button.
+    const touchPoint = function(e) {
+        const touch = e.touches[0] || e.changedTouches[0];
+        const rect = canvas.getBoundingClientRect();
+        return {x: touch.clientX - rect.left, y: touch.clientY - rect.top};
+    };
+    canvas.addEventListener("touchstart", function(e) {
+        e.preventDefault();
+        const point = touchPoint(e);
+        canvas.arcoLastPointer = point;
+        Module.arcoQueueEvent({type: "pointer-move", id: id, x: point.x, y: point.y});
+        Module.arcoQueueEvent({type: "pointer-button", id: id, x: point.x, y: point.y,
+            pressed: 1, button: 0, shift: 0, ctrl: 0, alt: 0, meta: 0});
+        canvas.focus();
+    }, {passive: false});
+    canvas.addEventListener("touchmove", function(e) {
+        e.preventDefault();
+        const point = touchPoint(e);
+        canvas.arcoLastPointer = point;
+        Module.arcoQueueEvent({type: "pointer-move", id: id, x: point.x, y: point.y});
+    }, {passive: false});
+    const touchEnd = function(e) {
+        e.preventDefault();
+        const point = touchPoint(e);
+        Module.arcoQueueEvent({type: "pointer-button", id: id, x: point.x, y: point.y,
+            pressed: 0, button: 0, shift: 0, ctrl: 0, alt: 0, meta: 0});
+    };
+    canvas.addEventListener("touchend", touchEnd, {passive: false});
+    canvas.addEventListener("touchcancel", touchEnd, {passive: false});
 });
 
 EM_JS(void, js_destroy_window, (int id), {
@@ -223,11 +306,22 @@ EM_JS(int, js_canvas_height, (int id), { return Module.arcoGui.canvases[id].heig
 EM_JS(void, js_clear, (int id, double r, double g, double b, double a), {
     const canvas = Module.arcoGui.canvases[id];
     const ctx = Module.arcoGui.ctxs[id];
+    // Reset any scale set by a previous frame's GUI.SetScale before clearing -- fillRect's
+    // coordinates go through the current transform like any other draw call, so clearing while
+    // still scaled down would only clear a shrunk rectangle in the corner, not the full canvas.
+    // A game that wants scaling calls GUI.SetScale again right after GUI.Clear each frame, so
+    // resetting here just means "clear always covers everything, scale is re-established after."
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.save();
     ctx.globalAlpha = 1.0;
     ctx.fillStyle = "rgba(" + Math.round(r * 255) + "," + Math.round(g * 255) + "," + Math.round(b * 255) + "," + a + ")";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.restore();
+});
+
+EM_JS(void, js_set_scale, (int id, double factor), {
+    const ctx = Module.arcoGui.ctxs[id];
+    ctx.setTransform(factor, 0, 0, factor, 0, 0);
 });
 
 EM_JS(void, js_fill_rect, (int id, double x, double y, double width, double height, double r, double g, double b, double a), {
@@ -327,25 +421,81 @@ EM_JS(int, js_confirm, (const char* title_ptr, const char* message_ptr), {
     return window.confirm(UTF8ToString(title_ptr) + "\n\n" + UTF8ToString(message_ptr)) ? 1 : 0;
 });
 
-// window.prompt() rather than a real native file picker: see the file-level comment above. The
-// path typed in is used exactly as File.ReadText/WriteText would use any other path, i.e. against
-// Emscripten's in-memory MEMFS, not the user's real disk.
-EM_JS(char*, js_prompt_path, (const char* title_ptr, const char* initial_ptr), {
-    const result = window.prompt(UTF8ToString(title_ptr), UTF8ToString(initial_ptr));
-    if (result === null) return 0;
-    const length = lengthBytesUTF8(result) + 1;
+// Real native pickers via the File System Access API (showOpenFilePicker/showSaveFilePicker),
+// bridged through Asyncify: EM_ASYNC_JS lets this JS body `await` the picker's Promise while
+// looking to the C++ caller like an ordinary blocking function call, exactly like emscripten_sleep
+// elsewhere in this file -- it works because the whole capsule already links with -sASYNCIFY.
+//
+// Open reads the picked file's bytes straight into MEMFS at a synthetic path and hands that path
+// back, so the existing File.ReadText(path) call in arcoflow.abas keeps working completely
+// unchanged. Save is trickier: ArcoBASIC's GUI.SaveFileDialog/File.WriteText are two separate
+// calls (get a path, then separately write to it), but showSaveFilePicker's real disk handle only
+// exists at the *first* call -- so the handle gets stashed in Module.arcoGui.saveHandles, keyed by
+// the same synthetic path, and js_ensure_initialized's FS.trackingDelegate.onCloseFile hook above
+// flushes MEMFS's content out to the real handle the moment File.WriteText's own fclose() fires.
+//
+// Falls back to Module.arcoPromptPath (window.prompt() into MEMFS) both when the API doesn't exist
+// at all (Firefox, Safari as of this writing) and when a real picker call throws for any reason
+// *other* than the user genuinely dismissing it (their spec-mandated AbortError) -- most notably
+// SecurityError ("Must be handling a user gesture to show a file picker"), which showed up in
+// testing whenever the click-to-picker path lands outside the browser's transient-activation
+// window (e.g. CDP-dispatched clicks in headless testing; conceivably real usage too, depending on
+// how long GUI.WaitEvent's poll loop takes to drain the click before dispatching it to Open/Save).
+// Without this fallback that's a silent dead end -- the button visibly does nothing and there's no
+// way for the user to tell why. With it, Open/Save always resolve to either a real result or an
+// explicit cancel, never a mysterious no-op.
+EM_ASYNC_JS(char*, js_pick_open_file, (const char* title_ptr, const char* initial_ptr), {
+    const title = UTF8ToString(title_ptr);
+    const initial = UTF8ToString(initial_ptr);
+    let path = null;
+    if (typeof window.showOpenFilePicker === "function") {
+        try {
+            const [handle] = await window.showOpenFilePicker({multiple: false});
+            const file = await handle.getFile();
+            const bytes = new Uint8Array(await file.arrayBuffer());
+            path = "/tmp/arcoflow-opened-" + Date.now() + "-" + file.name;
+            FS.writeFile(path, bytes);
+        } catch (e) {
+            if (e.name === "AbortError") return 0; // user genuinely cancelled -- no fallback
+            console.warn("ArcoFlow: native file picker unavailable (" + e.name + "), falling back to a path prompt:", e);
+            path = Module.arcoPromptPath(title, initial);
+        }
+    } else {
+        path = Module.arcoPromptPath(title, initial);
+    }
+    if (path === null) return 0;
+    const length = lengthBytesUTF8(path) + 1;
     const buffer = _malloc(length);
-    stringToUTF8(result, buffer, length);
+    stringToUTF8(path, buffer, length);
     return buffer;
 });
 
-std::string prompt_path(const std::string& title, const std::string& initial_path) {
-    char* result = js_prompt_path(title.c_str(), initial_path.c_str());
-    if (!result) return "";
-    std::string value(result);
-    std::free(result);
-    return value;
-}
+EM_ASYNC_JS(char*, js_pick_save_file, (const char* title_ptr, const char* initial_ptr, const char* suggested_name_ptr), {
+    const title = UTF8ToString(title_ptr);
+    const initial = UTF8ToString(initial_ptr);
+    const suggestedName = UTF8ToString(suggested_name_ptr);
+    let path = null;
+    if (typeof window.showSaveFilePicker === "function") {
+        try {
+            const options = suggestedName ? {suggestedName: suggestedName} : {};
+            const handle = await window.showSaveFilePicker(options);
+            path = "/tmp/arcoflow-save-" + Date.now() + "-" + handle.name;
+            Module.arcoGui.saveHandles[path] = handle;
+            FS.writeFile(path, new Uint8Array(0)); // placeholder until the first real File.WriteText
+        } catch (e) {
+            if (e.name === "AbortError") return 0; // user genuinely cancelled -- no fallback
+            console.warn("ArcoFlow: native save picker unavailable (" + e.name + "), falling back to a path prompt:", e);
+            path = Module.arcoPromptPath(title, initial);
+        }
+    } else {
+        path = Module.arcoPromptPath(title, initial);
+    }
+    if (path === null) return 0;
+    const length = lengthBytesUTF8(path) + 1;
+    const buffer = _malloc(length);
+    stringToUTF8(path, buffer, length);
+    return buffer;
+});
 
 } // namespace
 
@@ -433,6 +583,7 @@ Value window_size(int id) {
 }
 
 void clear(int id, double r, double g, double b, double a) { js_clear(id, r, g, b, a); }
+void set_scale(int id, double factor) { js_set_scale(id, factor); }
 void pixel(int id, int x, int y, double r, double g, double b, double a) { js_pixel(id, x, y, r, g, b, a); }
 void fill_rect(int id, double x, double y, double width, double height, double r, double g, double b, double a) {
     js_fill_rect(id, x, y, width, height, r, g, b, a);
@@ -498,10 +649,25 @@ Value pointer_position(int id) {
     return Value::Object{{"X", xy[0]}, {"Y", xy[1]}};
 }
 std::string open_file_dialog(int, const std::string& title, const std::string& initial_path) {
-    return prompt_path(title.empty() ? "Open path" : title, initial_path);
+    char* result = js_pick_open_file((title.empty() ? "Open path" : title).c_str(), initial_path.c_str());
+    if (!result) return "";
+    std::string value(result);
+    std::free(result);
+    return value;
 }
 std::string save_file_dialog(int, const std::string& title, const std::string& initial_path) {
-    return prompt_path(title.empty() ? "Save path" : title, initial_path);
+    // Suggest just the basename -- a directory component wouldn't mean anything to the browser's
+    // own picker, which starts in the user's last-used (or default Downloads) directory, the same
+    // as any other native save dialog.
+    std::string suggested = initial_path;
+    const auto slash = suggested.find_last_of('/');
+    if (slash != std::string::npos) suggested = suggested.substr(slash + 1);
+    char* result = js_pick_save_file((title.empty() ? "Save path" : title).c_str(), initial_path.c_str(),
+                                      suggested.c_str());
+    if (!result) return "";
+    std::string value(result);
+    std::free(result);
+    return value;
 }
 bool confirm(int, const std::string& title, const std::string& message) {
     return js_confirm(title.c_str(), message.c_str()) != 0;
