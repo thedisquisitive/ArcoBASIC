@@ -2,7 +2,8 @@
 
 **RFC Number:** RFC-0037
 **Title:** APS Substrate Dispatch Loop
-**Status:** Draft
+**Status:** Implemented (with one documented deviation -- see Revision History and
+`.agents/reports/aps-loop-dispatch.md`)
 **Category:** Substrate / Execution Model
 **Authors:** Arcology Project
 **Created:** 2026-08-19
@@ -459,3 +460,4 @@ signature; see 17.5 for the fallback if that dependency is not ready.
 | Version | Date       | Summary       |
 |---------|------------|---------------|
 | 0.1     | 2026-08-19 | Initial draft |
+| 1.0     | 2026-08-19 | Implemented and validated end-to-end under QEMU/OVMF (real hardware tick -> top-half ISR -> Loop.RunUntil -> bottom-half dispatch -> registered hook, exactly once per wake, deterministic across repeated runs). One deviation from Section 6.3's literal signature, per Section 17.5's own anticipated fallback: `Loop.RegisterHook` takes a fixed slot index (`hookSlot AS U32`), not `hook AS CALLABLE` -- confirmed RFC-0027 callables have no freestanding-x86-64 codegen support (`AmirInstruction::Kind::AddressOf` is unhandled by `generate_x86_64_function`, and `CallValue` cannot call through a runtime value). See `.agents/reports/aps-loop-dispatch.md` for full detail. |

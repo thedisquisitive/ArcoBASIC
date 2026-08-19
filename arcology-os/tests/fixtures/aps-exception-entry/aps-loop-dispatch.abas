@@ -1,0 +1,467 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' APS Substrate Dispatch Loop proof (RFC-0037). Builds on aps-timer-tick.abas's environment
+' (identity map, IDT, PIC remap, PIT programmed for the default 100 Hz), then instead of a hand-
+' rolled WHILE loop directly polling Timer.Ticks(), registers a hook against event source 0
+' (IRQ0/the timer, per RFC-0036's reference vector base) and lets Loop.RunUntil dispatch it --
+' proving the whole chain end to end: hardware tick -> RFC-0036's top-half ISR (mark pending, EOI)
+' -> Loop.RunUntil's CPU.Halt/dispatch cycle -> LoopDispatchPendingWork's clear-before-invoke ->
+' the registered hook actually running, on a real CPU, exactly N times for N requested wakes.
+'
+' See stdlib/loop_policy.abas's header comment for why Loop.RegisterHook here takes a slot index
+' (0-3) rather than RFC-0037 Section 6.3's literal `hook AS CALLABLE` parameter: indirect
+' invocation through a runtime function value has no freestanding-x86-64 codegen support in this
+' compiler today (confirmed directly; ADDRESSOF/AS CALLABLE lower to real A-MIR but the x86-64
+' backend has no codegen case for it), and RFC-0037 Section 17.5 explicitly directs falling back to
+' a fixed function-pointer-table shape rather than expanding this RFC's scope to build that
+' support inline.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+' "APS LOOP OK\r\n" -- the proof: only printed once Loop.RunUntil has returned exactly the
+' requested wake count AND the registered hook was invoked exactly once per wake (RFC-0036's timer
+' is this fixture's only wake source, so the two counts must agree if -- and only if -- dispatch,
+' clear-before-invoke, and hook invocation all genuinely happened once per real hardware tick).
+FUNCTION SerialMarkerLoopOK() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(76)
+    SerialByte(79)
+    SerialByte(79)
+    SerialByte(80)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+' Mirrors stdlib/descriptor_table_policy.abas + stdlib/timer_policy.abas (inlined -- this build
+' takes a single source file; see aps-timer-tick.abas for the same pattern, unmodified here).
+FUNCTION IDTWriteInterruptGate(table AS MMIOPTR, index AS U32, handler AS U64, codeSelector AS U16, ist AS U8) AS BOOL
+    LET gate AS MMIOPTR = ADDRESS.Offset(table, index * 16)
+    MEMORY.Write16(gate, handler AND 65535)
+    MEMORY.Write16(ADDRESS.Offset(gate, 2), codeSelector)
+    MEMORY.Write8(ADDRESS.Offset(gate, 4), ist AND 7)
+    MEMORY.Write8(ADDRESS.Offset(gate, 5), 142)
+    MEMORY.Write16(ADDRESS.Offset(gate, 6), (handler SHR 16) AND 65535)
+    MEMORY.Write32(ADDRESS.Offset(gate, 8), (handler SHR 32) AND 4294967295)
+    MEMORY.Write32(ADDRESS.Offset(gate, 12), 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION BuildMinimalIDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, codeSelector AS U16) AS BOOL
+    LET index AS U32 = 0
+    WHILE index < 256
+        LET gate AS MMIOPTR = ADDRESS.Offset(table, index * 16)
+        MEMORY.Write64(gate, 0)
+        MEMORY.Write64(ADDRESS.Offset(gate, 8), 0)
+        index = index + 1
+    WEND
+    LET entry AS U64 = CPU.ExceptionVectorTableBase()
+    LET vector AS U32 = 0
+    WHILE vector < 32
+        LET ist AS U8 = 0
+        IF vector = 8 THEN ist = 1
+        IDTWriteInterruptGate(table, vector, entry, codeSelector, ist)
+        entry = entry + 16
+        vector = vector + 1
+    WEND
+    MEMORY.Write16(ADDRESS.Offset(pseudoDescriptor, 0), 4095)
+    MEMORY.Write64(ADDRESS.Offset(pseudoDescriptor, 2), ADDRESS.Value(table))
+    RETURN 1
+END FUNCTION
+
+FUNCTION PIC.Remap(masterVectorBase AS U8, slaveVectorBase AS U8) AS BOOL
+    LET masterCmd AS IOPORT = PORT.Address(32)
+    LET masterData AS IOPORT = PORT.Address(33)
+    LET slaveCmd AS IOPORT = PORT.Address(160)
+    LET slaveData AS IOPORT = PORT.Address(161)
+    PORT.WriteByte(masterCmd, 17)
+    PORT.WriteByte(slaveCmd, 17)
+    PORT.WriteByte(masterData, masterVectorBase)
+    PORT.WriteByte(slaveData, slaveVectorBase)
+    PORT.WriteByte(masterData, 4)
+    PORT.WriteByte(slaveData, 2)
+    PORT.WriteByte(masterData, 1)
+    PORT.WriteByte(slaveData, 1)
+    PORT.WriteByte(masterData, 255)
+    PORT.WriteByte(slaveData, 255)
+    RETURN 1
+END FUNCTION
+
+FUNCTION PICSetMaskBit(irq AS U8, masked AS BOOL) AS BOOL
+    LET port AS IOPORT = PORT.Address(33)
+    IF irq >= 8 THEN
+        port = PORT.Address(161)
+    END IF
+    LET bitIndex AS U8 = irq AND 7
+    LET bit AS U8 = 1 SHL bitIndex
+    LET current AS U8 = PORT.ReadByte(port)
+    LET updated AS U8 = current
+    IF masked THEN
+        updated = current OR bit
+    ELSE
+        updated = current AND (NOT bit)
+    END IF
+    PORT.WriteByte(port, updated)
+    RETURN 1
+END FUNCTION
+
+FUNCTION PIC.Unmask(irq AS U8) AS BOOL
+    RETURN PICSetMaskBit(irq, 0)
+END FUNCTION
+
+FUNCTION PITProgramChannel0(reloadValue AS U16) AS BOOL
+    LET lowByte AS U8 = reloadValue AND 255
+    LET highByte AS U8 = (reloadValue SHR 8) AND 255
+    PORT.WriteByte(PORT.Address(67), 54)
+    PORT.WriteByte(PORT.Address(64), lowByte)
+    PORT.WriteByte(PORT.Address(64), highByte)
+    RETURN 1
+END FUNCTION
+
+FUNCTION Timer.Initialize(idtTable AS MMIOPTR, codeSelector AS U16) AS BOOL
+    PIC.Remap(32, 40)
+    PITProgramChannel0(11931)
+    LET entry AS U64 = CPU.ExceptionVectorTableBase() + (32 * 16)
+    IDTWriteInterruptGate(idtTable, 32, entry, codeSelector, 0)
+    PIC.Unmask(0)
+    RETURN 1
+END FUNCTION
+
+' Mirrors stdlib/loop_policy.abas (inlined -- see that file for full commentary on every piece;
+' this copy trims comments already explained there).
+FUNCTION LoopHookTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33685504))   ' 0x2020000
+END FUNCTION
+
+FUNCTION LoopDispatchCursorAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33689600))   ' 0x2021000
+END FUNCTION
+
+FUNCTION LoopMaxHooks() AS U32
+    RETURN 4
+END FUNCTION
+
+FUNCTION LoopMaxEventSources() AS U32
+    RETURN 16
+END FUNCTION
+
+FUNCTION LoopHookRowAddress(row AS U32) AS MMIOPTR
+    RETURN ADDRESS.Offset(LoopHookTableAddress(), row * 24)
+END FUNCTION
+
+FUNCTION Loop.RegisterHook(eventSource AS U32, hookSlot AS U32) AS BOOL
+    LET row AS U32 = 0
+    LET existingRow AS U32 = 4294967295
+    LET freeRow AS U32 = 4294967295
+    WHILE row < LoopMaxHooks()
+        LET base AS MMIOPTR = LoopHookRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+        IF active <> 0 THEN
+            LET source AS U64 = MEMORY.Read64(base)
+            IF source = eventSource THEN
+                existingRow = row
+            END IF
+        ELSE
+            IF freeRow = 4294967295 THEN
+                freeRow = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+
+    LET targetRow AS U32 = existingRow
+    IF targetRow = 4294967295 THEN
+        targetRow = freeRow
+    END IF
+    IF targetRow = 4294967295 THEN
+        RETURN 0
+    END IF
+
+    LET target AS MMIOPTR = LoopHookRowAddress(targetRow)
+    MEMORY.Write64(target, eventSource)
+    MEMORY.Write64(ADDRESS.Offset(target, 8), hookSlot)
+    MEMORY.Write64(ADDRESS.Offset(target, 16), 1)
+    RETURN 1
+END FUNCTION
+
+' Regression check for Requirement 6.3's replace-not-duplicate semantics (see Main below): counts
+' currently-active rows so the fixture can assert that registering the same event source twice
+' still leaves exactly one row active, with the second call's slot value winning.
+FUNCTION LoopCountActiveRows() AS U32
+    LET row AS U32 = 0
+    LET count AS U32 = 0
+    WHILE row < LoopMaxHooks()
+        LET base AS MMIOPTR = LoopHookRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+        IF active <> 0 THEN
+            count = count + 1
+        END IF
+        row = row + 1
+    WEND
+    RETURN count
+END FUNCTION
+
+FUNCTION LoopFindHook(eventSource AS U32, slotOutAddress AS MMIOPTR) AS BOOL
+    LET row AS U32 = 0
+    WHILE row < LoopMaxHooks()
+        LET base AS MMIOPTR = LoopHookRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+        IF active <> 0 THEN
+            LET source AS U64 = MEMORY.Read64(base)
+            IF source = eventSource THEN
+                LET slot AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 8))
+                MEMORY.Write64(slotOutAddress, slot)
+                RETURN 1
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' This fixture only ever registers slot 0; slots 1-3 exist to satisfy LoopInvokeSlot's fixed
+' IF-chain shape but are never reached.
+FUNCTION LoopHookSlot0() AS U64
+    LET counterAddress AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(33693696))   ' 0x2022000
+    LET current AS U64 = MEMORY.Read64(counterAddress)
+    MEMORY.Write64(counterAddress, current + 1)
+    RETURN 0
+END FUNCTION
+
+FUNCTION LoopHookSlot1() AS U64
+    RETURN 0
+END FUNCTION
+
+FUNCTION LoopHookSlot2() AS U64
+    RETURN 0
+END FUNCTION
+
+FUNCTION LoopHookSlot3() AS U64
+    RETURN 0
+END FUNCTION
+
+FUNCTION LoopInvokeSlot(slot AS U32) AS U64
+    IF slot = 0 THEN RETURN LoopHookSlot0()
+    IF slot = 1 THEN RETURN LoopHookSlot1()
+    IF slot = 2 THEN RETURN LoopHookSlot2()
+    IF slot = 3 THEN RETURN LoopHookSlot3()
+    RETURN 0
+END FUNCTION
+
+FUNCTION LoopDispatchPendingWork() AS U64
+    LET pendingTable AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(CPU.InterruptPendingTableBase()))
+    LET cursorTable AS MMIOPTR = LoopDispatchCursorAddress()
+    LET slotOut AS U64 = 0
+    LET slotOutAddress AS PTR = ADDRESS.Local(slotOut)
+
+    LET source AS U32 = 0
+    WHILE source < LoopMaxEventSources()
+        IF LoopFindHook(source, slotOutAddress) = 1 THEN
+            LET currentCount AS U64 = MEMORY.Read64(ADDRESS.Offset(pendingTable, source * 8))
+            LET lastSeen AS U64 = MEMORY.Read64(ADDRESS.Offset(cursorTable, source * 8))
+            IF currentCount <> lastSeen THEN
+                MEMORY.Write64(ADDRESS.Offset(cursorTable, source * 8), currentCount)
+                LoopInvokeSlot(slotOut AND 4294967295)
+            END IF
+        END IF
+        source = source + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION Loop.RunUntil(maxWakes AS U64) AS U64
+    CPU.EnableInterrupts
+    LET wakes AS U64 = 0
+    WHILE wakes < maxWakes
+        CPU.Halt
+        LoopDispatchPendingWork()
+        wakes = wakes + 1
+    WEND
+    RETURN wakes
+END FUNCTION
+
+FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET probe AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 1
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocate AS U64 = systemTable.BootServices.AllocatePool(2, allocationSize, bufferAddress)
+    IF allocate <> 0 THEN
+        RETURN 1
+    END IF
+    mapSize = allocationSize
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("APS PRE")
+
+    LET root AS U64 = 0
+    LET rootAddress AS PTR = ADDRESS.Local(root)
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 3, rootAddress)
+    IF pageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    LET idtRoot AS U64 = 0
+    LET idtRootAddress AS PTR = ADDRESS.Local(idtRoot)
+    LET idtPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 2, idtRootAddress)
+    IF idtPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS IDT ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS PAGE")
+    LET pdpt AS U64 = root + 4096
+    LET pageDirectory AS U64 = root + 8192
+
+    LET clearIndex AS U64 = 0
+    WHILE clearIndex < 1536
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(root + (clearIndex * 8)), 0)
+        clearIndex = clearIndex + 1
+    WEND
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(root), pdpt OR 3)
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt), pageDirectory OR 3)
+    LET directoryIndex AS U64 = 0
+    WHILE directoryIndex < 512
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + (directoryIndex * 8)), (directoryIndex * 2097152) OR 131)
+        directoryIndex = directoryIndex + 1
+    WEND
+    LET rootCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(root))
+    LET pdptCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(pdpt))
+    IF rootCheck <> (pdpt OR 3) THEN
+        systemTable.ConsoleOut.Write("APS ROOT BAD")
+        CPU.HaltForever
+    END IF
+    IF pdptCheck <> (pageDirectory OR 3) THEN
+        systemTable.ConsoleOut.Write("APS PDPT BAD")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS TABLE OK")
+
+    CPU.DisableInterrupts
+    LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
+    IF exitStatus <> 0 THEN
+        CPU.HaltForever
+    END IF
+
+    CPU.DisableInterrupts
+    CPU.WriteCR3(root)
+    LET activeRoot AS U64 = CPU.ReadCR3()
+    IF activeRoot <> root THEN
+        CPU.HaltForever
+    END IF
+    MEMORY.Write32(ADDRESS.Virtual(1048576), 2779096485)
+
+    SerialInit()
+
+    LET codeSelector AS U16 = CPU.ReadCS()
+    LET idtTable AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(idtRoot))
+    LET idtPseudo AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(idtRoot + 4096))
+    BuildMinimalIDT(idtTable, idtPseudo, codeSelector)
+    CPU.LoadIDT(ADDRESS.Value(idtPseudo))
+
+    Timer.Initialize(idtTable, codeSelector)
+
+    ' Requirement 6.3 regression check: register a decoy hook (slot 1) against event source 0
+    ' first, then the real one (slot 0) -- the second call MUST replace the first's row rather
+    ' than allocating a second one, and the stored slot MUST reflect the second call.
+    Loop.RegisterHook(0, 1)
+    LET registered AS U64 = Loop.RegisterHook(0, 0)
+    IF registered = 0 THEN
+        systemTable.ConsoleOut.Write("APS REGISTER FAIL")
+        CPU.HaltForever
+    END IF
+    LET activeRows AS U32 = LoopCountActiveRows()
+    IF activeRows <> 1 THEN
+        systemTable.ConsoleOut.Write("APS REGISTER REPLACE BAD")
+        CPU.HaltForever
+    END IF
+    LET storedSlotAddress AS MMIOPTR = LoopHookRowAddress(0)
+    LET storedSlot AS U64 = MEMORY.Read64(ADDRESS.Offset(storedSlotAddress, 8))
+    IF storedSlot <> 0 THEN
+        systemTable.ConsoleOut.Write("APS REGISTER SLOT BAD")
+        CPU.HaltForever
+    END IF
+
+    ' The actual proof setup: the hook against event source 0 (IRQ0) is now registered BEFORE the
+    ' Loop starts, per Requirement 6.3's "idempotent-safe to call before the Loop starts" -- from
+    ' here, Loop.RunUntil, not a hand-rolled WHILE, owns CPU.EnableInterrupts/CPU.Halt/dispatch
+    ' entirely.
+    LET requestedWakes AS U64 = 20
+    LET observedWakes AS U64 = Loop.RunUntil(requestedWakes)
+
+    LET counterAddress AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(33693696))   ' 0x2022000
+    LET hookInvocations AS U64 = MEMORY.Read64(counterAddress)
+
+    ' RFC-0036's timer is this fixture's only wake source, so a wake and a hook invocation must be
+    ' exactly 1:1 if -- and only if -- dispatch, clear-before-invoke, and hook invocation all
+    ' genuinely happened once per real hardware tick. Any mismatch (a missed dispatch, a
+    ' double-invoke, a wake that wasn't really a tick) fails closed into CPU.HaltForever rather
+    ' than printing a marker that would misrepresent what was actually proven.
+    IF observedWakes <> requestedWakes THEN
+        systemTable.ConsoleOut.Write("APS WAKE COUNT BAD")
+        CPU.HaltForever
+    END IF
+    IF hookInvocations <> requestedWakes THEN
+        systemTable.ConsoleOut.Write("APS HOOK COUNT BAD")
+        CPU.HaltForever
+    END IF
+
+    SerialMarkerLoopOK()
+    CPU.HaltForever
+END FUNCTION

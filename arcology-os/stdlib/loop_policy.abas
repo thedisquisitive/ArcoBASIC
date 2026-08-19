@@ -1,0 +1,218 @@
+' APS Substrate Dispatch Loop (RFC-0037). Turns "an interrupt happened" (RFC-0036's tick, and
+' every future device interrupt sharing the same top-half/bottom-half shape) into "a registered
+' Provider's hook ran" -- on a single logical processor, cooperatively, deterministically, without
+' a hook or its caller ever needing to remember EOI or re-enabling interrupts by hand.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+' --- A documented deviation from RFC-0037 Section 6.3's literal signature, stated up front. ---
+'
+' RFC-0037 specifies `Loop.RegisterHook(eventSource AS U32, hook AS CALLABLE) AS BOOL`. This
+' implementation instead uses `Loop.RegisterHook(eventSource AS U32, hookSlot AS U32) AS BOOL`.
+'
+' Why: RFC-0027 (First-Class Callables) defines `ADDRESSOF Name` / `AS CALLABLE` / indirect
+' invocation, but none of that machinery has freestanding-x86-64 codegen support today --
+' confirmed directly: `ADDRESSOF Name` parses and lowers to a real A-MIR AddressOf instruction
+' (the frontend/A-MIR layers are RFC-0027-complete), but `generate_x86_64_function`
+' (src/compiler/fission.cpp) has no case for AmirInstruction::Kind::AddressOf at all, and
+' AmirInstruction::Kind::CallValue's freestanding codegen unconditionally resolves its target as a
+' compile-time-known *function name string* looked up against the module's declared functions --
+' it cannot call through a value loaded from a variable/register. This is exactly the gap RFC-0037
+' Section 17.5 names as a stop condition, with an explicit instruction: "fall back to the
+' function-pointer-table shape sketched in Section 15 ... rather than expanding this RFC's scope
+' to fix RFC-0027's freestanding coverage inline." Building genuine indirect invocation (a new
+' AMIR kind, new codegen using the encoder's existing but currently UEFI-vtable-only
+' call_indirect_disp8/32 primitives, target-resolution logic distinguishing a local CALLABLE
+' variable from a declared function name) is real, separate compiler work belonging to RFC-0027's
+' own freestanding-profile completion, not to this RFC.
+'
+' The fallback actually implemented: `LoopInvokeSlot` (below) is Section 15's own
+' `InvokeHookAt(index)` sketch, made concrete as a fixed-size (kLoopMaxHooks = 4) IF-chain over a
+' compile-time-bounded slot index, dispatching to one of a small, fixed set of well-known function
+' names (`LoopHookSlot0`..`LoopHookSlot3`) that the *consuming program* defines -- registration
+' (which event source maps to which slot, and whether that mapping is currently active) remains
+' fully dynamic and runtime-driven, exactly as RFC-0037 Requirement 6.3 specifies; only the set of
+' possible hook *bodies* is fixed per compiled program rather than arbitrary at runtime. Every
+' other requirement in this RFC (Loop structure, top-half/bottom-half discipline, dispatch
+' ordering, replace-on-reregister, Run/RunUntil) is implemented exactly as specified, with no
+' further deviation.
+
+' --- Hook registration table: kLoopMaxHooks rows of (eventSource, hookSlot, active), 24 bytes
+' each, at a fixed scratch address (policy-owned, same pattern as timer_policy.abas's own
+' TimerFrequencyScratchAddress -- see that file's header for why a small fixed address is this
+' codebase's established way to persist state the freestanding profile's lack of a general
+' global-variable mechanism can't otherwise hold). Deliberately clear of every other scratch
+' address this project has claimed so far (0x2000000, 0x2010000..0x2010080, 0x2018000).
+FUNCTION LoopHookTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33685504))   ' 0x2020000
+END FUNCTION
+
+' Dispatch cursor: one U64 per possible event source (RFC-0036's 16 IRQ lines), recording the
+' interrupt-pending-table count last observed for that source. RFC-0036's pending table
+' (CPU.InterruptPendingTableBase()) is a monotonic counter that Timer.Ticks() also reads directly
+' and never clears (RFC-0036 Requirement 6.4 left "counter vs flag" to implementation; that choice
+' was made specifically so direct polling of Timer.Ticks() keeps working). Requirement 6.2's "clear
+' the pending indication before invoking the hook" is therefore implemented here as "advance this
+' Loop's own high-water mark for that source" rather than mutating the shared RFC-0036 table --
+' mutating a table a second, independent consumer (Timer.Ticks()) also reads would make the two
+' consumers race each other for no benefit; a private cursor gives the Loop exactly the
+' clear-before-invoke, re-arrival-not-lost semantics Requirement 6.2 asks for without disturbing
+' RFC-0036's own contract at all.
+FUNCTION LoopDispatchCursorAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33689600))   ' 0x2021000
+END FUNCTION
+
+FUNCTION LoopMaxHooks() AS U32
+    RETURN 4
+END FUNCTION
+
+FUNCTION LoopMaxEventSources() AS U32
+    RETURN 16   ' RFC-0036's IRQ0-15 range; this implementation's event-source space
+END FUNCTION
+
+FUNCTION LoopHookRowAddress(row AS U32) AS MMIOPTR
+    RETURN ADDRESS.Offset(LoopHookTableAddress(), row * 24)
+END FUNCTION
+
+' --- Registration ---
+
+' Requirement 6.3: replaces an existing hook for the same event source rather than allocating a
+' second row for it; claims a free row only when no row is already registered for this source;
+' returns FALSE if the table is full and no existing row can be reused.
+FUNCTION Loop.RegisterHook(eventSource AS U32, hookSlot AS U32) AS BOOL
+    LET row AS U32 = 0
+    LET existingRow AS U32 = 4294967295
+    LET freeRow AS U32 = 4294967295
+    WHILE row < LoopMaxHooks()
+        LET base AS MMIOPTR = LoopHookRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+        IF active <> 0 THEN
+            LET source AS U64 = MEMORY.Read64(base)
+            IF source = eventSource THEN
+                existingRow = row
+            END IF
+        ELSE
+            IF freeRow = 4294967295 THEN
+                freeRow = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+
+    LET targetRow AS U32 = existingRow
+    IF targetRow = 4294967295 THEN
+        targetRow = freeRow
+    END IF
+    IF targetRow = 4294967295 THEN
+        RETURN 0
+    END IF
+
+    LET target AS MMIOPTR = LoopHookRowAddress(targetRow)
+    MEMORY.Write64(target, eventSource)
+    MEMORY.Write64(ADDRESS.Offset(target, 8), hookSlot)
+    MEMORY.Write64(ADDRESS.Offset(target, 16), 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION Loop.UnregisterHook(eventSource AS U32) AS BOOL
+    LET row AS U32 = 0
+    WHILE row < LoopMaxHooks()
+        LET base AS MMIOPTR = LoopHookRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+        IF active <> 0 THEN
+            LET source AS U64 = MEMORY.Read64(base)
+            IF source = eventSource THEN
+                MEMORY.Write64(ADDRESS.Offset(base, 16), 0)
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Returns TRUE and writes the registered slot into slotOut if eventSource has an active
+' registration; returns FALSE (slotOut left unwritten) otherwise.
+FUNCTION LoopFindHook(eventSource AS U32, slotOutAddress AS MMIOPTR) AS BOOL
+    LET row AS U32 = 0
+    WHILE row < LoopMaxHooks()
+        LET base AS MMIOPTR = LoopHookRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+        IF active <> 0 THEN
+            LET source AS U64 = MEMORY.Read64(base)
+            IF source = eventSource THEN
+                LET slot AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 8))
+                MEMORY.Write64(slotOutAddress, slot)
+                RETURN 1
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' --- Dispatch (bottom half; ordinary code running with interrupts enabled, per Requirement 6.2 --
+' never called from an ISR) ---
+
+' Section 15's InvokeHookAt(index), made concrete as the fixed-slot IF-chain this file's header
+' comment explains. A consuming program supplies LoopHookSlot0..LoopHookSlot3; slots this program
+' does not define/use are simply never registered against any event source.
+FUNCTION LoopInvokeSlot(slot AS U32) AS U64
+    IF slot = 0 THEN RETURN LoopHookSlot0()
+    IF slot = 1 THEN RETURN LoopHookSlot1()
+    IF slot = 2 THEN RETURN LoopHookSlot2()
+    IF slot = 3 THEN RETURN LoopHookSlot3()
+    RETURN 0
+END FUNCTION
+
+' For each possible event source, in ascending order (Requirement 6.3's deterministic tie-break --
+' iterating the source space directly, rather than sorting registration-order rows, gets this for
+' free): if it has an active registration AND the RFC-0036 pending-table count has advanced past
+' this Loop's own last-observed cursor for it, advance the cursor *before* invoking the hook (so a
+' re-arrival during the hook's own execution is observed on the Loop's next wake, not lost), then
+' invoke it.
+FUNCTION LoopDispatchPendingWork() AS U64
+    LET pendingTable AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(CPU.InterruptPendingTableBase()))
+    LET cursorTable AS MMIOPTR = LoopDispatchCursorAddress()
+    LET slotOut AS U64 = 0
+    LET slotOutAddress AS PTR = ADDRESS.Local(slotOut)
+
+    LET source AS U32 = 0
+    WHILE source < LoopMaxEventSources()
+        IF LoopFindHook(source, slotOutAddress) = 1 THEN
+            LET currentCount AS U64 = MEMORY.Read64(ADDRESS.Offset(pendingTable, source * 8))
+            LET lastSeen AS U64 = MEMORY.Read64(ADDRESS.Offset(cursorTable, source * 8))
+            IF currentCount <> lastSeen THEN
+                MEMORY.Write64(ADDRESS.Offset(cursorTable, source * 8), currentCount)
+                LoopInvokeSlot(slotOut AND 4294967295)
+            END IF
+        END IF
+        source = source + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' --- Requirement 6.1: the Loop itself. CPU.EnableInterrupts is called exactly once, as the first
+' action of whichever entry point actually runs (production callers use Loop.Run(); tests use
+' Loop.RunUntil()) -- never both, since a real program calls exactly one of the two. ---
+
+FUNCTION Loop.RunUntil(maxWakes AS U64) AS U64
+    CPU.EnableInterrupts
+    LET wakes AS U64 = 0
+    WHILE wakes < maxWakes
+        CPU.Halt
+        LoopDispatchPendingWork()
+        wakes = wakes + 1
+    WEND
+    RETURN wakes
+END FUNCTION
+
+FUNCTION Loop.Run() AS U64
+    CPU.EnableInterrupts
+    WHILE 1 = 1
+        CPU.Halt
+        LoopDispatchPendingWork()
+    WEND
+    RETURN 0
+END FUNCTION
