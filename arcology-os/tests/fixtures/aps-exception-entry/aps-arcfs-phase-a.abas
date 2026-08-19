@@ -1,0 +1,1092 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' ArcologyFS (ArcFS) Phase A proof (RFC-0039 Section 78). Proves the in-memory object/namespace/
+' handle contract end to end under a real CPU: create nested directories and a file, resolve
+' multi-component colon-delimited paths, write and read file content through a handle, rename
+' within the same directory, move to a different directory, and remove -- all while confirming the
+' object's OID never changes (RFC-0039 Section 5.1's central design principle: "a path is a human
+' and programmatic lookup expression. A persistent Object ID is identity.") and that a handle
+' opened after a move still reads the exact same content, proving identity and data both survive a
+' rename/move that a naive path-keyed implementation would lose.
+'
+' No GDT/IDT/interrupt setup, matching RFC-0038's own minimal-fixture precedent: this proof is a
+' straight-line sequence with no hardware interrupt involved.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+' "APS ARCFS PHASE A OK\r\n" -- printed only if every check below passed: nested directory/file
+' creation, multi-component path resolution (including a deliberately-missing path), a
+' byte-for-byte + checksum verified handle write/read round trip, an OID-preserving rename within
+' the same directory, an OID-preserving move to a different directory (with the old path
+' confirmed gone and the new path confirmed resolving to the SAME OID), a handle opened AFTER the
+' move still reading the original content, and removal.
+FUNCTION SerialMarkerArcFSOK() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(65)
+    SerialByte(82)
+    SerialByte(67)
+    SerialByte(70)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(80)
+    SerialByte(72)
+    SerialByte(65)
+    SerialByte(83)
+    SerialByte(69)
+    SerialByte(32)
+    SerialByte(65)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+' Mirrors stdlib/arcfs_policy.abas (inlined -- this build takes a single source file). See that
+' file's header comment for Phase A's documented scope reductions.
+
+FUNCTION ArcFSNextOidAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33816576))
+END FUNCTION
+
+FUNCTION ArcFSObjectTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33820672))
+END FUNCTION
+
+FUNCTION ArcFSNamespaceTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33824768))
+END FUNCTION
+
+FUNCTION ArcFSDataPoolAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33832960))
+END FUNCTION
+
+FUNCTION ArcFSHandleTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34144256))
+END FUNCTION
+
+FUNCTION ArcFSMaxObjects() AS U64
+    RETURN 64
+END FUNCTION
+
+FUNCTION ArcFSMaxNamespaceRows() AS U64
+    RETURN 128
+END FUNCTION
+
+FUNCTION ArcFSMaxHandles() AS U64
+    RETURN 8
+END FUNCTION
+
+FUNCTION ArcFSMaxNameLength() AS U64
+    RETURN 32
+END FUNCTION
+
+FUNCTION ArcFSFileCapacityBytes() AS U64
+    RETURN 4096
+END FUNCTION
+
+FUNCTION ArcFSObjectRowAddress(row AS U64) AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSObjectTableAddress(), row * 40)
+END FUNCTION
+
+FUNCTION ArcFSAllocateOid() AS U64
+    LET oid AS U64 = MEMORY.Read64(ArcFSNextOidAddress())
+    MEMORY.Write64(ArcFSNextOidAddress(), oid + 1)
+    RETURN oid
+END FUNCTION
+
+FUNCTION ArcFSFindObjectRow(oid AS U64) AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = ArcFSMaxObjects()
+    WHILE row < ArcFSMaxObjects()
+        LET base AS MMIOPTR = ArcFSObjectRowAddress(row)
+        LET storedType AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 8))
+        IF storedType <> 0 THEN
+            LET storedOid AS U64 = MEMORY.Read64(base)
+            IF storedOid = oid THEN
+                found = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION ArcFSFindFreeObjectRow() AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = ArcFSMaxObjects()
+    WHILE row < ArcFSMaxObjects()
+        LET base AS MMIOPTR = ArcFSObjectRowAddress(row)
+        LET storedType AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 8))
+        IF storedType = 0 THEN
+            IF found = ArcFSMaxObjects() THEN
+                found = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION ArcFSCreateObject(entryType AS U64) AS U64
+    LET freeRow AS U64 = ArcFSFindFreeObjectRow()
+    IF freeRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET oid AS U64 = ArcFSAllocateOid()
+    LET base AS MMIOPTR = ArcFSObjectRowAddress(freeRow)
+    MEMORY.Write64(base, oid)
+    MEMORY.Write64(ADDRESS.Offset(base, 8), entryType)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), 0)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), freeRow)
+    RETURN oid
+END FUNCTION
+
+FUNCTION ArcFSNamespaceRowAddress(row AS U64) AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSNamespaceTableAddress(), row * 64)
+END FUNCTION
+
+FUNCTION ArcFSNameMatches(rowBase AS MMIOPTR, storedLength AS U64, candidate AS MMIOPTR, candidateLength AS U64) AS BOOL
+    IF storedLength <> candidateLength THEN
+        RETURN 0
+    END IF
+    LET i AS U64 = 0
+    WHILE i < storedLength
+        LET a AS U8 = MEMORY.Read8(ADDRESS.Offset(rowBase, 8 + i))
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(candidate, i))
+        IF a <> b THEN
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION ArcFSFindNamespaceRow(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = ArcFSMaxNamespaceRows()
+    WHILE row < ArcFSMaxNamespaceRows()
+        LET base AS MMIOPTR = ArcFSNamespaceRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 56))
+        IF active <> 0 THEN
+            LET storedParent AS U64 = MEMORY.Read64(base)
+            IF storedParent = parentOID THEN
+                LET storedLength AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 40))
+                IF ArcFSNameMatches(base, storedLength, nameBuffer, nameLength) = 1 THEN
+                    found = row
+                END IF
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION ArcFSFindNamespaceRowByChild(oid AS U64) AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = ArcFSMaxNamespaceRows()
+    WHILE row < ArcFSMaxNamespaceRows()
+        LET base AS MMIOPTR = ArcFSNamespaceRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 56))
+        IF active <> 0 THEN
+            LET child AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 48))
+            IF child = oid THEN
+                found = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION ArcFSFindFreeNamespaceRow() AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = ArcFSMaxNamespaceRows()
+    WHILE row < ArcFSMaxNamespaceRows()
+        LET base AS MMIOPTR = ArcFSNamespaceRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 56))
+        IF active = 0 THEN
+            IF found = ArcFSMaxNamespaceRows() THEN
+                found = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION ArcFSWriteName(base AS MMIOPTR, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < ArcFSMaxNameLength()
+        LET v AS U8 = 0
+        IF i < nameLength THEN
+            v = MEMORY.Read8(ADDRESS.Offset(nameBuffer, i))
+        END IF
+        MEMORY.Write8(ADDRESS.Offset(base, 8 + i), v)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSCreateEntry(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64, entryType AS U64) AS U64
+    IF nameLength = 0 THEN
+        RETURN 0
+    END IF
+    IF nameLength > ArcFSMaxNameLength() THEN
+        RETURN 0
+    END IF
+    LET parentRow AS U64 = ArcFSFindObjectRow(parentOID)
+    IF parentRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET parentType AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(parentRow), 8))
+    IF parentType <> 2 THEN
+        RETURN 0
+    END IF
+    LET existingRow AS U64 = ArcFSFindNamespaceRow(parentOID, nameBuffer, nameLength)
+    IF existingRow <> ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+    LET freeNsRow AS U64 = ArcFSFindFreeNamespaceRow()
+    IF freeNsRow = ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+    LET newOid AS U64 = ArcFSCreateObject(entryType)
+    IF newOid = 0 THEN
+        RETURN 0
+    END IF
+    LET nsBase AS MMIOPTR = ArcFSNamespaceRowAddress(freeNsRow)
+    MEMORY.Write64(nsBase, parentOID)
+    ArcFSWriteName(nsBase, nameBuffer, nameLength)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 40), nameLength)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 48), newOid)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 56), 1)
+    RETURN newOid
+END FUNCTION
+
+FUNCTION ArcFS.CreateFile(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    RETURN ArcFSCreateEntry(parentOID, nameBuffer, nameLength, 1)
+END FUNCTION
+
+FUNCTION ArcFS.CreateDirectory(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    RETURN ArcFSCreateEntry(parentOID, nameBuffer, nameLength, 2)
+END FUNCTION
+
+FUNCTION ArcFS.Lookup(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    LET row AS U64 = ArcFSFindNamespaceRow(parentOID, nameBuffer, nameLength)
+    IF row = ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(ArcFSNamespaceRowAddress(row), 48))
+END FUNCTION
+
+FUNCTION ArcFS.Resolve(pathBuffer AS MMIOPTR, pathLength AS U64) AS U64
+    IF pathLength = 0 THEN
+        RETURN 0
+    END IF
+    LET firstByte AS U8 = MEMORY.Read8(pathBuffer)
+    IF firstByte <> 58 THEN
+        RETURN 0
+    END IF
+    IF pathLength = 1 THEN
+        RETURN 1
+    END IF
+    LET current AS U64 = 1
+    LET cursor AS U64 = 1
+    WHILE cursor < pathLength
+        LET componentStart AS U64 = cursor
+        LET scanning AS U64 = 1
+        WHILE scanning = 1
+            IF cursor >= pathLength THEN
+                scanning = 0
+            ELSE
+                LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(pathBuffer, cursor))
+                IF b = 58 THEN
+                    scanning = 0
+                ELSE
+                    cursor = cursor + 1
+                END IF
+            END IF
+        WEND
+        LET componentLength AS U64 = cursor - componentStart
+        IF componentLength = 0 THEN
+            RETURN 0
+        END IF
+        LET componentPtr AS MMIOPTR = ADDRESS.Offset(pathBuffer, componentStart)
+        LET nextOid AS U64 = ArcFS.Lookup(current, componentPtr, componentLength)
+        IF nextOid = 0 THEN
+            RETURN 0
+        END IF
+        current = nextOid
+        cursor = cursor + 1
+    WEND
+    RETURN current
+END FUNCTION
+
+FUNCTION ArcFS.Rename(oid AS U64, newParentOID AS U64, newNameBuffer AS MMIOPTR, newNameLength AS U64) AS BOOL
+    IF newNameLength = 0 THEN
+        RETURN 0
+    END IF
+    IF newNameLength > ArcFSMaxNameLength() THEN
+        RETURN 0
+    END IF
+    LET oldRow AS U64 = ArcFSFindNamespaceRowByChild(oid)
+    IF oldRow = ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+    LET newParentRow AS U64 = ArcFSFindObjectRow(newParentOID)
+    IF newParentRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET newParentType AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(newParentRow), 8))
+    IF newParentType <> 2 THEN
+        RETURN 0
+    END IF
+    LET collisionRow AS U64 = ArcFSFindNamespaceRow(newParentOID, newNameBuffer, newNameLength)
+    IF collisionRow <> ArcFSMaxNamespaceRows() THEN
+        IF collisionRow <> oldRow THEN
+            RETURN 0
+        END IF
+    END IF
+    LET base AS MMIOPTR = ArcFSNamespaceRowAddress(oldRow)
+    MEMORY.Write64(base, newParentOID)
+    ArcFSWriteName(base, newNameBuffer, newNameLength)
+    MEMORY.Write64(ADDRESS.Offset(base, 40), newNameLength)
+    RETURN 1
+END FUNCTION
+
+FUNCTION ArcFS.Remove(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS BOOL
+    LET row AS U64 = ArcFSFindNamespaceRow(parentOID, nameBuffer, nameLength)
+    IF row = ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+    MEMORY.Write64(ADDRESS.Offset(ArcFSNamespaceRowAddress(row), 56), 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION ArcFSHandleRowAddress(index AS U64) AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSHandleTableAddress(), index * 16)
+END FUNCTION
+
+FUNCTION ArcFS.OpenHandle(oid AS U64) AS U64
+    LET objRow AS U64 = ArcFSFindObjectRow(oid)
+    IF objRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET objType AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(objRow), 8))
+    IF objType <> 1 THEN
+        RETURN 0
+    END IF
+    LET index AS U64 = 0
+    LET found AS U64 = ArcFSMaxHandles()
+    WHILE index < ArcFSMaxHandles()
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSHandleRowAddress(index), 8))
+        IF active = 0 THEN
+            IF found = ArcFSMaxHandles() THEN
+                found = index
+            END IF
+        END IF
+        index = index + 1
+    WEND
+    IF found = ArcFSMaxHandles() THEN
+        RETURN 0
+    END IF
+    LET row AS MMIOPTR = ArcFSHandleRowAddress(found)
+    MEMORY.Write64(row, oid)
+    MEMORY.Write64(ADDRESS.Offset(row, 8), 1)
+    RETURN found + 1
+END FUNCTION
+
+FUNCTION ArcFS.CloseHandle(handle AS U64) AS BOOL
+    IF handle = 0 THEN
+        RETURN 0
+    END IF
+    LET index AS U64 = handle - 1
+    IF index >= ArcFSMaxHandles() THEN
+        RETURN 0
+    END IF
+    MEMORY.Write64(ADDRESS.Offset(ArcFSHandleRowAddress(index), 8), 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION ArcFSHandleOid(handle AS U64) AS U64
+    IF handle = 0 THEN
+        RETURN 0
+    END IF
+    LET index AS U64 = handle - 1
+    IF index >= ArcFSMaxHandles() THEN
+        RETURN 0
+    END IF
+    LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSHandleRowAddress(index), 8))
+    IF active = 0 THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ArcFSHandleRowAddress(index))
+END FUNCTION
+
+FUNCTION ArcFS.HandleWrite(handle AS U64, buffer AS MMIOPTR, byteCount AS U64) AS U64
+    LET oid AS U64 = ArcFSHandleOid(handle)
+    IF oid = 0 THEN
+        RETURN 0
+    END IF
+    LET row AS U64 = ArcFSFindObjectRow(oid)
+    IF row = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET dataSlot AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(row), 24))
+    LET toWrite AS U64 = byteCount
+    IF toWrite > ArcFSFileCapacityBytes() THEN
+        toWrite = ArcFSFileCapacityBytes()
+    END IF
+    LET dest AS MMIOPTR = ADDRESS.Offset(ArcFSDataPoolAddress(), dataSlot * ArcFSFileCapacityBytes())
+    LET i AS U64 = 0
+    WHILE i < toWrite
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, i))
+        MEMORY.Write8(ADDRESS.Offset(dest, i), v)
+        i = i + 1
+    WEND
+    MEMORY.Write64(ADDRESS.Offset(ArcFSObjectRowAddress(row), 16), toWrite)
+    RETURN toWrite
+END FUNCTION
+
+FUNCTION ArcFS.HandleRead(handle AS U64, buffer AS MMIOPTR, maxBytes AS U64) AS U64
+    LET oid AS U64 = ArcFSHandleOid(handle)
+    IF oid = 0 THEN
+        RETURN 0
+    END IF
+    LET row AS U64 = ArcFSFindObjectRow(oid)
+    IF row = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET size AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(row), 16))
+    LET dataSlot AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(row), 24))
+    LET toRead AS U64 = maxBytes
+    IF toRead > size THEN
+        toRead = size
+    END IF
+    LET src AS MMIOPTR = ADDRESS.Offset(ArcFSDataPoolAddress(), dataSlot * ArcFSFileCapacityBytes())
+    LET i AS U64 = 0
+    WHILE i < toRead
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(src, i))
+        MEMORY.Write8(ADDRESS.Offset(buffer, i), v)
+        i = i + 1
+    WEND
+    RETURN toRead
+END FUNCTION
+
+FUNCTION ArcFS.Initialize() AS BOOL
+    LET i AS U64 = 0
+    WHILE i < 2560
+        MEMORY.Write8(ADDRESS.Offset(ArcFSObjectTableAddress(), i), 0)
+        i = i + 1
+    WEND
+    i = 0
+    WHILE i < 8192
+        MEMORY.Write8(ADDRESS.Offset(ArcFSNamespaceTableAddress(), i), 0)
+        i = i + 1
+    WEND
+    i = 0
+    WHILE i < 128
+        MEMORY.Write8(ADDRESS.Offset(ArcFSHandleTableAddress(), i), 0)
+        i = i + 1
+    WEND
+    MEMORY.Write64(ArcFSNextOidAddress(), 2)
+    LET rootBase AS MMIOPTR = ArcFSObjectRowAddress(0)
+    MEMORY.Write64(rootBase, 1)
+    MEMORY.Write64(ADDRESS.Offset(rootBase, 8), 2)
+    MEMORY.Write64(ADDRESS.Offset(rootBase, 16), 0)
+    MEMORY.Write64(ADDRESS.Offset(rootBase, 24), 0)
+    RETURN 1
+END FUNCTION
+
+
+' --- Fixture-only: fills a 97-byte buffer with known, checksummed content (byte-sum 6142) so the
+' write/read round trip can be verified byte-for-byte, not just by length, matching RFC-0038's own
+' FAT32 read proof's discipline. ---
+FUNCTION FillTestContent(buffer AS MMIOPTR) AS U64
+    LET pattern AS MMIOPTR = buffer
+    LET i AS U64 = 0
+    WHILE i < 97
+        LET value AS U8 = 65
+        LET m AS U64 = i - ((i \ 20) * 20)
+        IF m = 0 THEN value = 65
+        IF m = 1 THEN value = 82
+        IF m = 2 THEN value = 67
+        IF m = 3 THEN value = 70
+        IF m = 4 THEN value = 83
+        IF m = 5 THEN value = 32
+        IF m = 6 THEN value = 80
+        IF m = 7 THEN value = 72
+        IF m = 8 THEN value = 65
+        IF m = 9 THEN value = 83
+        IF m = 10 THEN value = 69
+        IF m = 11 THEN value = 32
+        IF m = 12 THEN value = 65
+        IF m = 13 THEN value = 32
+        IF m = 14 THEN value = 68
+        IF m = 15 THEN value = 65
+        IF m = 16 THEN value = 84
+        IF m = 17 THEN value = 65
+        IF m = 18 THEN value = 46
+        IF m = 19 THEN value = 32
+        MEMORY.Write8(ADDRESS.Offset(pattern, i), value)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSChecksum(buffer AS MMIOPTR, count AS U64) AS U64
+    LET sum AS U64 = 0
+    LET i AS U64 = 0
+    WHILE i < count
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, i))
+        LET bAsU64 AS U64 = b
+        sum = sum + bAsU64
+        i = i + 1
+    WEND
+    RETURN sum
+END FUNCTION
+
+' --- Fixture test-orchestration state: two fixed scratch addresses (policy-owned, same discipline
+' as every other table in this file/RFC chain) holding (1) the AllocatePages-obtained scratch page
+' base, so every small helper function below can reconstruct buffer pointers without Main() having
+' to pass them around as parameters, and (2) shared test state (three OIDs, two handles, a
+' failure counter) so those same helper functions can be small, independent FUNCTIONs -- keeping
+' each one's own stack frame well under this backend's 4095-byte frame-size ceiling, which a
+' single flat Main() containing this whole test sequence's ~80 buffer writes and ~25 checks
+' comfortably exceeded (a real, if self-inflicted, limit worth documenting: see
+' .agents/reports/aps-arcfs-phase-a.md). ---
+
+FUNCTION ArcFSTestScratchBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34148352))   ' 0x2091000
+END FUNCTION
+
+FUNCTION ArcFSTestStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34152448))   ' 0x2092000
+END FUNCTION
+
+FUNCTION ArcFSTestScratch() AS MMIOPTR
+    LET base AS U64 = MEMORY.Read64(ArcFSTestScratchBaseAddress())
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(base))
+END FUNCTION
+
+FUNCTION ArcFSTestHomeOidAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestStateAddress(), 0)
+END FUNCTION
+
+FUNCTION ArcFSTestDocsOidAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestStateAddress(), 8)
+END FUNCTION
+
+FUNCTION ArcFSTestNotesOidAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestStateAddress(), 16)
+END FUNCTION
+
+FUNCTION ArcFSTestFailuresAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestStateAddress(), 24)
+END FUNCTION
+
+FUNCTION ArcFSTestFail() AS U64
+    LET f AS U64 = MEMORY.Read64(ArcFSTestFailuresAddress())
+    MEMORY.Write64(ArcFSTestFailuresAddress(), f + 1)
+    RETURN 0
+END FUNCTION
+
+' Scratch buffer layout (offsets within the AllocatePages'd page ArcFSTestScratchBaseAddress
+' points at): names at +0/+64/+128/+192/+256 (32 bytes each), paths at +512/+576/+640/+704/+768/
+' +832/+896 (64 bytes each), write content at +2048, read-back content at +2560.
+
+FUNCTION TestNameHome() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 0)
+END FUNCTION
+
+FUNCTION TestNameDocuments() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 64)
+END FUNCTION
+
+FUNCTION TestNameNotesTxt() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 128)
+END FUNCTION
+
+FUNCTION TestNameRenamedTxt() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 192)
+END FUNCTION
+
+FUNCTION TestNameMovedTxt() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 256)
+END FUNCTION
+
+FUNCTION TestPathNotesFull() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 512)
+END FUNCTION
+
+FUNCTION TestPathDocuments() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 576)
+END FUNCTION
+
+FUNCTION TestPathHome() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 640)
+END FUNCTION
+
+FUNCTION TestPathRoot() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 704)
+END FUNCTION
+
+FUNCTION TestPathMissing() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 768)
+END FUNCTION
+
+FUNCTION TestPathRenamedFull() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 832)
+END FUNCTION
+
+FUNCTION TestPathMovedFull() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 896)
+END FUNCTION
+
+FUNCTION TestWriteContent() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 2048)
+END FUNCTION
+
+FUNCTION TestReadContent() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSTestScratch(), 2560)
+END FUNCTION
+
+FUNCTION ArcFSTestBuildNames() AS U64
+    LET nameHome AS MMIOPTR = TestNameHome()
+    MEMORY.Write8(ADDRESS.Offset(nameHome, 0), 104)
+    MEMORY.Write8(ADDRESS.Offset(nameHome, 1), 111)
+    MEMORY.Write8(ADDRESS.Offset(nameHome, 2), 109)
+    MEMORY.Write8(ADDRESS.Offset(nameHome, 3), 101)
+
+    LET nameDocuments AS MMIOPTR = TestNameDocuments()
+    MEMORY.Write8(ADDRESS.Offset(nameDocuments, 0), 100)
+    MEMORY.Write8(ADDRESS.Offset(nameDocuments, 1), 111)
+    MEMORY.Write8(ADDRESS.Offset(nameDocuments, 2), 99)
+    MEMORY.Write8(ADDRESS.Offset(nameDocuments, 3), 117)
+    MEMORY.Write8(ADDRESS.Offset(nameDocuments, 4), 109)
+    MEMORY.Write8(ADDRESS.Offset(nameDocuments, 5), 101)
+    MEMORY.Write8(ADDRESS.Offset(nameDocuments, 6), 110)
+    MEMORY.Write8(ADDRESS.Offset(nameDocuments, 7), 116)
+    MEMORY.Write8(ADDRESS.Offset(nameDocuments, 8), 115)
+
+    LET nameNotesTxt AS MMIOPTR = TestNameNotesTxt()
+    MEMORY.Write8(ADDRESS.Offset(nameNotesTxt, 0), 110)
+    MEMORY.Write8(ADDRESS.Offset(nameNotesTxt, 1), 111)
+    MEMORY.Write8(ADDRESS.Offset(nameNotesTxt, 2), 116)
+    MEMORY.Write8(ADDRESS.Offset(nameNotesTxt, 3), 101)
+    MEMORY.Write8(ADDRESS.Offset(nameNotesTxt, 4), 115)
+    MEMORY.Write8(ADDRESS.Offset(nameNotesTxt, 5), 46)
+    MEMORY.Write8(ADDRESS.Offset(nameNotesTxt, 6), 116)
+    MEMORY.Write8(ADDRESS.Offset(nameNotesTxt, 7), 120)
+    MEMORY.Write8(ADDRESS.Offset(nameNotesTxt, 8), 116)
+
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestBuildNames2() AS U64
+    LET nameRenamedTxt AS MMIOPTR = TestNameRenamedTxt()
+    MEMORY.Write8(ADDRESS.Offset(nameRenamedTxt, 0), 114)
+    MEMORY.Write8(ADDRESS.Offset(nameRenamedTxt, 1), 101)
+    MEMORY.Write8(ADDRESS.Offset(nameRenamedTxt, 2), 110)
+    MEMORY.Write8(ADDRESS.Offset(nameRenamedTxt, 3), 97)
+    MEMORY.Write8(ADDRESS.Offset(nameRenamedTxt, 4), 109)
+    MEMORY.Write8(ADDRESS.Offset(nameRenamedTxt, 5), 101)
+    MEMORY.Write8(ADDRESS.Offset(nameRenamedTxt, 6), 100)
+    MEMORY.Write8(ADDRESS.Offset(nameRenamedTxt, 7), 46)
+    MEMORY.Write8(ADDRESS.Offset(nameRenamedTxt, 8), 116)
+    MEMORY.Write8(ADDRESS.Offset(nameRenamedTxt, 9), 120)
+    MEMORY.Write8(ADDRESS.Offset(nameRenamedTxt, 10), 116)
+
+    LET nameMovedTxt AS MMIOPTR = TestNameMovedTxt()
+    MEMORY.Write8(ADDRESS.Offset(nameMovedTxt, 0), 109)
+    MEMORY.Write8(ADDRESS.Offset(nameMovedTxt, 1), 111)
+    MEMORY.Write8(ADDRESS.Offset(nameMovedTxt, 2), 118)
+    MEMORY.Write8(ADDRESS.Offset(nameMovedTxt, 3), 101)
+    MEMORY.Write8(ADDRESS.Offset(nameMovedTxt, 4), 100)
+    MEMORY.Write8(ADDRESS.Offset(nameMovedTxt, 5), 46)
+    MEMORY.Write8(ADDRESS.Offset(nameMovedTxt, 6), 116)
+    MEMORY.Write8(ADDRESS.Offset(nameMovedTxt, 7), 120)
+    MEMORY.Write8(ADDRESS.Offset(nameMovedTxt, 8), 116)
+
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestBuildPathNotesFull() AS U64
+    LET p AS MMIOPTR = TestPathNotesFull()
+    MEMORY.Write8(ADDRESS.Offset(p, 0), 58)
+    MEMORY.Write8(ADDRESS.Offset(p, 1), 104)
+    MEMORY.Write8(ADDRESS.Offset(p, 2), 111)
+    MEMORY.Write8(ADDRESS.Offset(p, 3), 109)
+    MEMORY.Write8(ADDRESS.Offset(p, 4), 101)
+    MEMORY.Write8(ADDRESS.Offset(p, 5), 58)
+    MEMORY.Write8(ADDRESS.Offset(p, 6), 100)
+    MEMORY.Write8(ADDRESS.Offset(p, 7), 111)
+    MEMORY.Write8(ADDRESS.Offset(p, 8), 99)
+    MEMORY.Write8(ADDRESS.Offset(p, 9), 117)
+    MEMORY.Write8(ADDRESS.Offset(p, 10), 109)
+    MEMORY.Write8(ADDRESS.Offset(p, 11), 101)
+    MEMORY.Write8(ADDRESS.Offset(p, 12), 110)
+    MEMORY.Write8(ADDRESS.Offset(p, 13), 116)
+    MEMORY.Write8(ADDRESS.Offset(p, 14), 115)
+    MEMORY.Write8(ADDRESS.Offset(p, 15), 58)
+    MEMORY.Write8(ADDRESS.Offset(p, 16), 110)
+    MEMORY.Write8(ADDRESS.Offset(p, 17), 111)
+    MEMORY.Write8(ADDRESS.Offset(p, 18), 116)
+    MEMORY.Write8(ADDRESS.Offset(p, 19), 101)
+    MEMORY.Write8(ADDRESS.Offset(p, 20), 115)
+    MEMORY.Write8(ADDRESS.Offset(p, 21), 46)
+    MEMORY.Write8(ADDRESS.Offset(p, 22), 116)
+    MEMORY.Write8(ADDRESS.Offset(p, 23), 120)
+    MEMORY.Write8(ADDRESS.Offset(p, 24), 116)
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestBuildPathPrefixes() AS U64
+    LET src AS MMIOPTR = TestPathNotesFull()
+    LET pathDocuments AS MMIOPTR = TestPathDocuments()
+    LET pathHome AS MMIOPTR = TestPathHome()
+    LET i AS U64 = 0
+    WHILE i < 15
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(src, i))
+        MEMORY.Write8(ADDRESS.Offset(pathDocuments, i), v)
+        i = i + 1
+    WEND
+    i = 0
+    WHILE i < 5
+        LET v2 AS U8 = MEMORY.Read8(ADDRESS.Offset(src, i))
+        MEMORY.Write8(ADDRESS.Offset(pathHome, i), v2)
+        i = i + 1
+    WEND
+    MEMORY.Write8(TestPathRoot(), 58)
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestBuildPathMissing() AS U64
+    LET src AS MMIOPTR = TestPathNotesFull()
+    LET p AS MMIOPTR = TestPathMissing()
+    LET i AS U64 = 0
+    WHILE i < 16
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(src, i))
+        MEMORY.Write8(ADDRESS.Offset(p, i), v)
+        i = i + 1
+    WEND
+    MEMORY.Write8(ADDRESS.Offset(p, 16), 109)
+    MEMORY.Write8(ADDRESS.Offset(p, 17), 105)
+    MEMORY.Write8(ADDRESS.Offset(p, 18), 115)
+    MEMORY.Write8(ADDRESS.Offset(p, 19), 115)
+    MEMORY.Write8(ADDRESS.Offset(p, 20), 105)
+    MEMORY.Write8(ADDRESS.Offset(p, 21), 110)
+    MEMORY.Write8(ADDRESS.Offset(p, 22), 103)
+    MEMORY.Write8(ADDRESS.Offset(p, 23), 46)
+    MEMORY.Write8(ADDRESS.Offset(p, 24), 116)
+    MEMORY.Write8(ADDRESS.Offset(p, 25), 120)
+    MEMORY.Write8(ADDRESS.Offset(p, 26), 116)
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestBuildPathRenamedFull() AS U64
+    LET src AS MMIOPTR = TestPathNotesFull()
+    LET p AS MMIOPTR = TestPathRenamedFull()
+    LET nameRenamedTxt AS MMIOPTR = TestNameRenamedTxt()
+    LET i AS U64 = 0
+    WHILE i < 16
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(src, i))
+        MEMORY.Write8(ADDRESS.Offset(p, i), v)
+        i = i + 1
+    WEND
+    i = 0
+    WHILE i < 11
+        LET v2 AS U8 = MEMORY.Read8(ADDRESS.Offset(nameRenamedTxt, i))
+        MEMORY.Write8(ADDRESS.Offset(p, 16 + i), v2)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestBuildPathMovedFull() AS U64
+    LET src AS MMIOPTR = TestPathNotesFull()
+    LET p AS MMIOPTR = TestPathMovedFull()
+    LET nameMovedTxt AS MMIOPTR = TestNameMovedTxt()
+    LET i AS U64 = 0
+    WHILE i < 5
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(src, i))
+        MEMORY.Write8(ADDRESS.Offset(p, i), v)
+        i = i + 1
+    WEND
+    MEMORY.Write8(ADDRESS.Offset(p, 5), 58)
+    i = 0
+    WHILE i < 9
+        LET v2 AS U8 = MEMORY.Read8(ADDRESS.Offset(nameMovedTxt, i))
+        MEMORY.Write8(ADDRESS.Offset(p, 6 + i), v2)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestCreateHierarchy() AS U64
+    LET homeOid AS U64 = ArcFS.CreateDirectory(1, TestNameHome(), 4)
+    IF homeOid = 0 THEN ArcFSTestFail()
+    MEMORY.Write64(ArcFSTestHomeOidAddress(), homeOid)
+
+    LET docsOid AS U64 = ArcFS.CreateDirectory(homeOid, TestNameDocuments(), 9)
+    IF docsOid = 0 THEN ArcFSTestFail()
+    MEMORY.Write64(ArcFSTestDocsOidAddress(), docsOid)
+
+    LET notesOid AS U64 = ArcFS.CreateFile(docsOid, TestNameNotesTxt(), 9)
+    IF notesOid = 0 THEN ArcFSTestFail()
+    MEMORY.Write64(ArcFSTestNotesOidAddress(), notesOid)
+
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestResolveChecks() AS U64
+    LET homeOid AS U64 = MEMORY.Read64(ArcFSTestHomeOidAddress())
+    LET docsOid AS U64 = MEMORY.Read64(ArcFSTestDocsOidAddress())
+    LET notesOid AS U64 = MEMORY.Read64(ArcFSTestNotesOidAddress())
+
+    IF ArcFS.Resolve(TestPathNotesFull(), 25) <> notesOid THEN ArcFSTestFail()
+    IF ArcFS.Resolve(TestPathDocuments(), 15) <> docsOid THEN ArcFSTestFail()
+    IF ArcFS.Resolve(TestPathHome(), 5) <> homeOid THEN ArcFSTestFail()
+    IF ArcFS.Resolve(TestPathRoot(), 1) <> 1 THEN ArcFSTestFail()
+    IF ArcFS.Resolve(TestPathMissing(), 27) <> 0 THEN ArcFSTestFail()
+
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestWriteReadRoundTrip() AS U64
+    LET notesOid AS U64 = MEMORY.Read64(ArcFSTestNotesOidAddress())
+    FillTestContent(TestWriteContent())
+
+    LET handle1 AS U64 = ArcFS.OpenHandle(notesOid)
+    IF handle1 = 0 THEN ArcFSTestFail()
+
+    LET written AS U64 = ArcFS.HandleWrite(handle1, TestWriteContent(), 97)
+    IF written <> 97 THEN ArcFSTestFail()
+
+    LET readBack AS U64 = ArcFS.HandleRead(handle1, TestReadContent(), 200)
+    IF readBack <> 97 THEN ArcFSTestFail()
+
+    LET checksum AS U64 = ArcFSChecksum(TestReadContent(), readBack)
+    IF checksum <> 6142 THEN ArcFSTestFail()
+
+    ArcFS.CloseHandle(handle1)
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestRenameChecks() AS U64
+    LET notesOid AS U64 = MEMORY.Read64(ArcFSTestNotesOidAddress())
+    LET docsOid AS U64 = MEMORY.Read64(ArcFSTestDocsOidAddress())
+
+    LET renamed AS U64 = ArcFS.Rename(notesOid, docsOid, TestNameRenamedTxt(), 11)
+    IF renamed = 0 THEN ArcFSTestFail()
+    IF ArcFS.Resolve(TestPathNotesFull(), 25) <> 0 THEN ArcFSTestFail()
+    IF ArcFS.Resolve(TestPathRenamedFull(), 27) <> notesOid THEN ArcFSTestFail()
+
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestMoveChecks() AS U64
+    LET notesOid AS U64 = MEMORY.Read64(ArcFSTestNotesOidAddress())
+    LET homeOid AS U64 = MEMORY.Read64(ArcFSTestHomeOidAddress())
+
+    LET moved AS U64 = ArcFS.Rename(notesOid, homeOid, TestNameMovedTxt(), 9)
+    IF moved = 0 THEN ArcFSTestFail()
+    IF ArcFS.Resolve(TestPathRenamedFull(), 27) <> 0 THEN ArcFSTestFail()
+    IF ArcFS.Resolve(TestPathMovedFull(), 15) <> notesOid THEN ArcFSTestFail()
+
+    LET handle2 AS U64 = ArcFS.OpenHandle(notesOid)
+    IF handle2 = 0 THEN ArcFSTestFail()
+    LET readBack2 AS U64 = ArcFS.HandleRead(handle2, TestReadContent(), 200)
+    IF readBack2 <> 97 THEN ArcFSTestFail()
+    LET checksum2 AS U64 = ArcFSChecksum(TestReadContent(), readBack2)
+    IF checksum2 <> 6142 THEN ArcFSTestFail()
+    ArcFS.CloseHandle(handle2)
+
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSTestRemoveCheck() AS U64
+    LET homeOid AS U64 = MEMORY.Read64(ArcFSTestHomeOidAddress())
+    LET removed AS U64 = ArcFS.Remove(homeOid, TestNameMovedTxt(), 9)
+    IF removed = 0 THEN ArcFSTestFail()
+    IF ArcFS.Resolve(TestPathMovedFull(), 15) <> 0 THEN ArcFSTestFail()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET probe AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 1
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocate AS U64 = systemTable.BootServices.AllocatePool(2, allocationSize, bufferAddress)
+    IF allocate <> 0 THEN
+        RETURN 1
+    END IF
+    mapSize = allocationSize
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("APS PRE")
+
+    LET root AS U64 = 0
+    LET rootAddress AS PTR = ADDRESS.Local(root)
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 3, rootAddress)
+    IF pageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    LET scratchRoot AS U64 = 0
+    LET scratchRootAddress AS PTR = ADDRESS.Local(scratchRoot)
+    LET scratchPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 2, scratchRootAddress)
+    IF scratchPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS SCRATCH ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS PAGE")
+    LET pdpt AS U64 = root + 4096
+    LET pageDirectory AS U64 = root + 8192
+
+    LET clearIndex AS U64 = 0
+    WHILE clearIndex < 1536
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(root + (clearIndex * 8)), 0)
+        clearIndex = clearIndex + 1
+    WEND
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(root), pdpt OR 3)
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt), pageDirectory OR 3)
+    LET directoryIndex AS U64 = 0
+    WHILE directoryIndex < 512
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + (directoryIndex * 8)), (directoryIndex * 2097152) OR 131)
+        directoryIndex = directoryIndex + 1
+    WEND
+    LET rootCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(root))
+    LET pdptCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(pdpt))
+    IF rootCheck <> (pdpt OR 3) THEN
+        systemTable.ConsoleOut.Write("APS ROOT BAD")
+        CPU.HaltForever
+    END IF
+    IF pdptCheck <> (pageDirectory OR 3) THEN
+        systemTable.ConsoleOut.Write("APS PDPT BAD")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS TABLE OK")
+
+    CPU.DisableInterrupts
+    LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
+    IF exitStatus <> 0 THEN
+        CPU.HaltForever
+    END IF
+
+    CPU.DisableInterrupts
+    CPU.WriteCR3(root)
+    LET activeRoot AS U64 = CPU.ReadCR3()
+    IF activeRoot <> root THEN
+        CPU.HaltForever
+    END IF
+    MEMORY.Write32(ADDRESS.Virtual(1048576), 2779096485)
+
+    SerialInit()
+
+    MEMORY.Write64(ArcFSTestScratchBaseAddress(), scratchRoot)
+    LET stateIndex AS U64 = 0
+    WHILE stateIndex < 64
+        MEMORY.Write8(ADDRESS.Offset(ArcFSTestStateAddress(), stateIndex), 0)
+        stateIndex = stateIndex + 1
+    WEND
+
+    ArcFS.Initialize()
+    ArcFSTestBuildNames()
+    ArcFSTestBuildNames2()
+    ArcFSTestBuildPathNotesFull()
+    ArcFSTestBuildPathPrefixes()
+    ArcFSTestBuildPathMissing()
+    ArcFSTestBuildPathRenamedFull()
+    ArcFSTestBuildPathMovedFull()
+    ArcFSTestCreateHierarchy()
+    ArcFSTestResolveChecks()
+    ArcFSTestWriteReadRoundTrip()
+    ArcFSTestRenameChecks()
+    ArcFSTestMoveChecks()
+    ArcFSTestRemoveCheck()
+
+    ' Reports failure count over serial, not systemTable.ConsoleOut.Write -- found the hard way
+    ' while building this fixture: calling ConsoleOut.Write after ExitBootServices hangs in this
+    ' QEMU/OVMF environment (no crash, no fault, just no further output ever). Every other fixture
+    ' in this chain that has a post-ExitBootServices ConsoleOut.Write failure message (RFC-0038's
+    ' "APS MOUNT FAIL" etc.) happens to have never actually hit that code path in a real run --
+    ' this is the first fixture whose own test logic had a genuine bug that exercised one, and
+    ' that is how this was found. See .agents/reports/aps-arcfs-phase-a.md.
+    LET failures AS U64 = MEMORY.Read64(ArcFSTestFailuresAddress())
+    IF failures <> 0 THEN
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(32)
+        LET digit AS U64 = failures
+        IF digit > 9 THEN digit = 9
+        LET digitPlus48 AS U64 = digit + 48
+        LET digitByte AS U8 = digitPlus48
+        SerialByte(digitByte)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    SerialMarkerArcFSOK()
+    CPU.HaltForever
+END FUNCTION

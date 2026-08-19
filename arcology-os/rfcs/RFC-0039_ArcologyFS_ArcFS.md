@@ -2,7 +2,7 @@
 
 **RFC Number:** RFC-0039
 **Title:** ArcologyFS (ArcFS)
-**Status:** Draft
+**Status:** Draft (Phase A implemented and QEMU-proven -- see `.agents/reports/aps-arcfs-phase-a.md`; Phases B-G unstarted)
 **Category:** Storage / Filesystem Architecture
 **Authors:** Arcology Project
 **Created:** 2026-08-19
@@ -2533,3 +2533,4 @@ recovery environment, and long-term storage tooling should be built.
 | Version | Date       | Summary                                                      |
 |---------|------------|---------------------------------------------------------------|
 | 0.1     | 2026-08-19 | Initial draft, provided in full and committed as RFC-0039     |
+| 0.2     | 2026-08-19 | Section 78 Phase A ("in-memory semantic model, no persistent disk yet") implemented and validated end-to-end under QEMU/OVMF: 64-bit OIDs, colon-delimited namespace resolution, a handle layer distinct from OID identity, byte-stream Read/Write, and rename/move/remove, with OID identity proven to survive both a same-directory rename and a cross-directory move (Section 5.1). Six documented Phase A scope reductions (64-bit not 128-bit OIDs, fixed-capacity tables, fixed file capacity, raw byte buffers instead of STRING, no transactions, no capability checks). Status remains Draft -- Phases B-G are unstarted and this RFC is too large for one phase to warrant Implemented. See `.agents/reports/aps-arcfs-phase-a.md` for full detail, including two general findings (a real compiler stack-frame-size ceiling, and a post-ExitBootServices ConsoleOut.Write hang) worth knowing before building Phase B's own proof. |
