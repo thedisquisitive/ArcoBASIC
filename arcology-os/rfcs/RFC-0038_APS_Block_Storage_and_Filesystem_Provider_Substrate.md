@@ -1,7 +1,7 @@
-# RFC-0038: APS Storage and Filesystem Provider Model
+# RFC-0038: APS Block Storage and Filesystem Provider Substrate
 
 **RFC Number:** RFC-0038
-**Title:** APS Storage and Filesystem Provider Model
+**Title:** APS Block Storage and Filesystem Provider Substrate
 **Status:** Draft
 **Category:** Substrate / Storage
 **Authors:** Arcology Project
@@ -9,7 +9,8 @@
 **Last Updated:** 2026-08-19
 **Supersedes:** None
 **Superseded By:** None
-**Related RFCs:** RFC-0000, RFC-0004, RFC-0007, RFC-0017, RFC-0035, RFC-0036, RFC-0037
+**Related RFCs:** RFC-0000, RFC-0004, RFC-0007, RFC-0017, RFC-0035, RFC-0036, RFC-0037, RFC-0039
+(ArcologyFS / ArcFS)
 
 ------------------------------------------------------------------------
 
@@ -19,21 +20,27 @@ APS has no way to read a file. There is no block-device driver, no filesystem, a
 format of any kind reachable from the freestanding profile — every proof fixture that exists is
 one statically-linked image with no persistent storage beyond what UEFI loaded it from.
 
-**A note on scope, stated up front:** this RFC does not specify ArcFS. RFC-0004 and RFC-0007 both
-explicitly exclude ArcFS from even the eventual Seed release, and a full search of this
-repository's history (every commit, every branch) turned up no prior ArcFS design document — only
-placeholder mentions of the name. If a design for ArcFS exists outside this repository, this RFC
-is written to be reconciled with it, not to preempt it: it defines a **Filesystem Provider
-contract** general enough for ArcFS to implement later without this RFC needing to change, and it
-specifies exactly one concrete provider now — a read-only FAT32 implementation — chosen
-specifically because it needs no new on-disk format at all: it is what UEFI's own boot media
-already is, and what `build-arcology-hardware-image.py` already produces.
+**A note on scope, stated up front, revised from this RFC's first draft:** the first draft of this
+RFC was written before ArcFS's own design (RFC-0039, ArcologyFS) was located. It is now located,
+and it is authoritative for ArcFS's on-disk format and native object/namespace model — this RFC
+does not re-specify any of that and defers to RFC-0039 wherever the two would otherwise overlap.
+What this RFC still owns, and what RFC-0039 itself explicitly says it still needs (RFC-0039 §80,
+"Required Pre-Implementation Dependencies," lists a `BlockStorage interface` as an outside
+dependency): the block-device contract underneath any filesystem, ArcFS included, and the generic
+namespace-attachment mechanism (RFC-0039 §10) that lets a filesystem provider — any filesystem
+provider — attach into Arcology's path space. This RFC specifies exactly one concrete
+`BlockDevice` (a RAM disk) and exactly one concrete filesystem provider on top of it (read-only
+FAT32) — chosen specifically because it needs no new on-disk format at all: it is what UEFI's own
+boot media already is, and what `build-arcology-hardware-image.py` already produces. ArcFS is a
+second, much more capable `FilesystemProvider` satisfying the same attachment mechanism; this RFC
+does not implement it, RFC-0039 does.
 
-The result APS gets from this RFC: a Block Device Provider contract, a Filesystem Provider
-contract above it, one real implementation of each (a RAM disk, for testing without hardware; and
-read-only FAT32, for reading real boot media), and a namespace model where a Common Filesystem
-volume and a future ArcFS volume coexist under the same path space through the same contract —
-"use both" by construction, not by special-casing either one.
+The result APS gets from this RFC: a `BlockDevice` contract, a generic `FilesystemProvider`
+contract above it (deliberately shaped to be satisfiable by RFC-0039's own `FileSystem`/
+`Namespace`/`ByteStream` interfaces — see Section 6.3.1), one real implementation of each (a RAM
+disk, for testing without hardware; and read-only FAT32, for reading real boot media), and a
+namespace model where a Common Filesystem volume and an ArcFS volume coexist under the same path
+space through the same contract — "use both" by construction, not by special-casing either one.
 
 ------------------------------------------------------------------------
 
@@ -45,12 +52,15 @@ missing layers — something that can read raw sectors, and something that can i
 filesystem's structure on top of those sectors — and both are currently entirely absent.
 
 This RFC also exists to prevent a specific, foreseeable design mistake: building a filesystem
-layer that only knows how to talk to one on-disk format. RFC-0004/RFC-0007 already commit this
-project to ArcFS eventually existing alongside broad compatibility concerns (reading real UEFI
-media, interop with ordinary tooling for debugging). Designing the provider boundary now, before
-either concrete filesystem's implementation details leak into how *calling code* asks for a file,
-is what makes "common filesystem and ArcFS, both, without every caller caring which" possible at
-all.
+layer that only knows how to talk to one on-disk format. RFC-0039 (ArcologyFS) is explicit that
+ArcFS is meant to be "one implementation behind a replaceable `FileSystem` interface" (RFC-0039
+§46, Decision #18) and that it depends on a `BlockStorage interface` it does not itself define
+(RFC-0039 §80). Designing that provider boundary now, before either concrete filesystem's
+implementation details leak into how *calling code* asks for a file, is what makes "common
+filesystem and ArcFS, both, without every caller caring which" possible at all — and it is what
+lets RFC-0039's own Phase A/B implementation work (its in-memory semantic model and read-only
+image parser) be exercised against a real, running `FilesystemProvider` attachment path well
+before ArcFS's copy-on-write transactional machinery exists.
 
 ------------------------------------------------------------------------
 
@@ -73,10 +83,9 @@ all.
 
 # 4. Non-Goals
 
-- ArcFS's own on-disk format, object model, transactions, versioning, or chunking. RFC-0004's own
-  words: "Seed does not include: ArcFS... Persistent storage." Those remain a future RFC. Where
-  this RFC needs to say anything about what ArcFS will eventually need, it says so as informative
-  guidance (Section 18), never as a normative requirement.
+- ArcFS's own on-disk format, object model, transactions, versioning, checkpoints, or chunking.
+  That is RFC-0039's (ArcologyFS) job in full; this RFC only owns the layer underneath it. Where
+  this RFC references what ArcFS needs, it cites RFC-0039 directly rather than guessing.
 - A real AHCI, NVMe, or virtio-blk driver. Those are each their own future RFC; this RFC's only
   concrete Block Device Provider is a RAM disk, specifically because it lets the Filesystem
   Provider layer be built and proven correct without waiting on any of them.
@@ -190,6 +199,35 @@ therefore always reports `IsWritable() = FALSE`).
 (6.5) strips the prefix before calling into a specific provider. A Filesystem Provider never sees,
 and never needs to know about, any other mounted volume.
 
+## 6.3.1 Relationship to RFC-0039's `FileSystem`/`Namespace`/`ByteStream` interfaces
+
+RFC-0039 §42 sketches ArcFS's own native API shape as three cooperating interfaces —
+`FileSystem` (volume-level: activate/quiesce/flush/snapshot/health), `Namespace`
+(directory-level: resolve/enumerate/create/relink/remove), and `ByteStream` (handle-level:
+read/write/resize/flush) — rather than this RFC's single flat `FilesystemProvider` interface.
+Both shapes are intentional and MUST be reconciled as follows, not treated as competing designs:
+
+- This RFC's `FilesystemProvider` is the **substrate-level attachment contract** — the minimum
+  a filesystem implementation must answer to be mountable at all, satisfiable by a provider as
+  simple as read-only FAT32, which has no meaningful concept of transactions, snapshots, or
+  capability-scoped handles.
+- RFC-0039's `FileSystem`/`Namespace`/`ByteStream` split is **ArcFS's own richer native shape**,
+  a superset exposed by the ArcFS provider specifically. An ArcFS `FilesystemProvider` MUST
+  implement this RFC's contract (so `Volumes.Mount`/`Resolve` and any format-agnostic caller work
+  against it identically to FAT32) and MAY additionally expose the richer RFC-0039 interfaces
+  directly to callers that know they are talking to ArcFS specifically (snapshot creation,
+  explicit transactions, health inspection) — the same capability-queried extension pattern
+  already used elsewhere in this project (`CPU.ReloadStackSegment` added alongside, not instead
+  of, `CPU.ReloadCodeSegment`).
+- Concretely: `FilesystemProvider.Open`/`Read`/`Write`/`Close` map onto a `Namespace.Resolve`
+  followed by `ByteStream` operations on ArcFS's own side; `FilesystemProvider.Mount`/`Unmount`
+  map onto `FileSystem.Activate`/`Quiesce`+`Flush`. A conformant ArcFS provider satisfies both
+  without either interface needing to be contorted to match the other's exact method names.
+- This split mirrors RFC-0039 §76's own two-tier conformance model (§76.1 "Generic FileSystem
+  Provider Conformance" vs. §76.2 "ArcFS Format Conformance") almost exactly: this RFC's Testing
+  Strategy (Section 16) is that generic tier; RFC-0039's own conformance suite (§76.2) is the
+  ArcFS-specific tier layered on top.
+
 ## 6.4 Reference Filesystem Provider: read-only FAT32
 
 Implements the contract in 6.3 against the FAT32 on-disk structure (boot sector, FAT table(s),
@@ -228,12 +266,21 @@ Every mounted volume MUST be registered with the Resource Registry (RFC-0017) as
 `FilesystemProvider` instance, `Lifetime = Explicit`, and a dependency edge to the underlying
 `BlockDevice`'s own Resource record. `Volumes.Resolve` is longest-mount-point-prefix matching
 (`/` MUST always be mountable and, once mounted, matches any path with no more specific mount
-point registered) — this is the entire mechanism by which a Common Filesystem volume and a future
-ArcFS volume coexist: `Volumes.Mount("/", fatProvider)` and, later,
-`Volumes.Mount("/arcfs", someArcFSProvider)` (or ArcFS mounted at `/` with FAT32 relegated to
-`/boot`, an ordering decision left to whoever mounts volumes at bootstrap time, not fixed by this
-RFC) both work through the identical call, because neither provider nor caller code needs to know
-the other format exists.
+point registered) — this is the entire mechanism by which a Common Filesystem volume and an ArcFS
+volume coexist: `Volumes.Mount("/", fatProvider)` and, later, `Volumes.Mount("/arcfs",
+arcFSProvider)` (or ArcFS mounted at `/` with FAT32 relegated to `/boot`, an ordering decision
+left to whoever mounts volumes at bootstrap time, not fixed by this RFC) both work through the
+identical call, because neither provider nor caller code needs to know the other format exists.
+
+`Volumes.Mount`/`Unmount` are this RFC's ArcoBASIC-convenience surface over the more explicit
+lifecycle RFC-0039 §10 defines for namespace attachment (`DISCOVER` → `CREATE` → `ATTACH` →
+`VERIFY` → `ACTIVATE` → attach namespace; and the reverse `QUIESCE` → `FLUSH` → `DETACH` →
+`DETACH` → `DESTROY` on the way out). `Volumes.Mount` MUST perform that full sequence internally
+— `Mount` on the provider corresponds to `CREATE`+`ATTACH`+`VERIFY`+`ACTIVATE`, and `Unmount`
+corresponds to `QUIESCE`+`FLUSH`+`DETACH`+`DETACH`+`DESTROY` — rather than being a thinner
+operation that skips steps a richer provider like ArcFS actually requires. For the FAT32 provider
+(no transactions, nothing to quiesce) most of these steps are no-ops; they are not optional for a
+provider where they are not no-ops.
 
 File-facing calling code (`Files.Open`, etc., once specified — see Section 16's note on RFC-0035)
 goes through `Volumes.Resolve` and never talks to a `FilesystemProvider` directly by name, which is
@@ -251,7 +298,7 @@ something it has to branch on.
               |                                     |
               v                                     v
    +----------------------+              +------------------------+
-   | FilesystemProvider:    |              | (future) FilesystemProvider: |
+   | FilesystemProvider:    |              | FilesystemProvider (RFC-0039): |
    | FAT32 (read-only)       |              | ArcFS                        |
    +-----------+-------------+              +--------------+----------------+
                |                                            |
@@ -420,10 +467,9 @@ provider, and `Volumes.Mount`/`Unmount`/`Resolve`. Out of scope: ArcFS itself (N
 - `Volumes.Mount`/`Unmount`/`Resolve` and their RFC-0017 Resource Registry integration.
 - A deterministically-built known-good FAT32 test image and the tests described in Section 16.
 - A QEMU/OVMF-executed fixture and matching `systems_arco_basic_*_smoke.sh` test.
-- An implementation report under `.agents/reports/`, explicitly noting (per this RFC's own
-  Executive Summary) that ArcFS remains unspecified and that reconciliation with any external
-  ArcFS design, once located, is expected future work rather than something this implementation
-  attempted to guess at.
+- An implementation report under `.agents/reports/`, explicitly noting that implementing ArcFS
+  itself against RFC-0039 is separate, later work — this RFC's deliverable is the attachment
+  substrate ArcFS's implementation will need (Section 6.3.1), not ArcFS itself.
 
 ## 17.4 Acceptance criteria
 
@@ -456,15 +502,11 @@ dependency.
 
 # 18. Future Extensions
 
-- ArcFS as a second `FilesystemProvider` implementation, once its own RFC exists — this is this
-  RFC's central intended extension point, not a hypothetical. Informative guidance only (not
-  normative — Section 4): the roadmap's own description of ArcFS ("Object storage, Transactions,
-  Versioning, Chunking, Stable identity, Namespace model") suggests its `Open`/`Read`/`Write` may
-  eventually need richer semantics (object versions, transactional multi-file commits) than this
-  RFC's minimal contract expresses; if so, those are expected to arrive as an *extension* to the
-  `FilesystemProvider` contract (additional optional interface, capability-queried) rather than a
-  breaking change to it, exactly as this project has already handled other capability growth
-  (`CPU.ReloadStackSegment` added alongside, not instead of, `CPU.ReloadCodeSegment`).
+- ArcFS as this RFC's second, richer `FilesystemProvider` implementation — RFC-0039 is that RFC,
+  now written; implementing it against this RFC's contract (per 6.3.1) is the next concrete step
+  once this RFC's own RAM-disk/FAT32 path is proven, giving RFC-0039's Phase C onward (formatter,
+  transactional writer, snapshots) a real attachment point to land in rather than a hypothetical
+  one.
 - FAT32 write support.
 - Real block-device drivers: AHCI, NVMe, virtio-blk (QEMU-native, useful for faster iteration than
   AHCI emulation during this project's own development).
@@ -484,9 +526,13 @@ dependency.
   intentionally does not decide (Requirement 6.5 supports either), but a real bootstrap sequence
   will need to pick one, and consistency across future fixtures/documentation would benefit from
   deciding explicitly rather than per-fixture.
-- Once ArcFS's real design is located or written, does it satisfy this RFC's `FilesystemProvider`
-  contract as specified, or does reconciling the two need contract changes? Cannot be answered
-  until that design exists; flagged here so it is not forgotten.
+- Resolved by RFC-0039 and Section 6.3.1 above: ArcFS satisfies this RFC's `FilesystemProvider`
+  contract as a base, and exposes its own richer `FileSystem`/`Namespace`/`ByteStream` interfaces
+  (RFC-0039 §42) alongside it rather than requiring this RFC's contract to change shape. Remaining
+  open sub-question: the exact capability-query mechanism a caller uses to detect "this provider
+  is ArcFS, the richer interfaces are available" is not yet specified anywhere in this project —
+  needs its own small RFC or an amendment here once a second real provider (ArcFS) actually
+  exists to test it against.
 - Long-filename (VFAT) support in the read-only FAT32 provider: required for realistic
   interoperability, but adds real parsing complexity. Left to implementation judgment (Section
   17) rather than mandated here; 8.3-name-only is an acceptable first cut if long-filename support
@@ -500,6 +546,7 @@ dependency.
 - RFC-0017 (Substrate Resource Model)
 - RFC-0035 (hosted-only Directory/File/Path services — related by naming convention, not a
   dependency)
+- RFC-0039 (ArcologyFS / ArcFS — the filesystem this RFC's contract exists to make attachable)
 - `arcology-os/scripts/build/build-arcology-hardware-image.py` (existing FAT32 image tooling)
 - Microsoft FAT32 File System Specification (primary source for the on-disk format; this project's
   own established practice is verification against primary sources — see
@@ -509,6 +556,7 @@ dependency.
 
 # 21. Revision History
 
-| Version | Date       | Summary       |
-|---------|------------|---------------|
-| 0.1     | 2026-08-19 | Initial draft |
+| Version | Date       | Summary                                                                 |
+|---------|------------|---------------------------------------------------------------------------|
+| 0.1     | 2026-08-19 | Initial draft                                                             |
+| 0.2     | 2026-08-19 | Reconciled with RFC-0039 (ArcologyFS): retitled to "Block Storage and Filesystem Provider Substrate," added §6.3.1 mapping this RFC's `FilesystemProvider` to RFC-0039's `FileSystem`/`Namespace`/`ByteStream` interfaces, tied `Volumes.Mount`/`Unmount` to RFC-0039 §10's namespace-attachment lifecycle, resolved former Open Question #2 |
