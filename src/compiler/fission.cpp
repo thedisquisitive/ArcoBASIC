@@ -991,6 +991,7 @@ private:
             if (name == "CPU.READCR3") return "U64";
             if (name == "CPU.READCR2") return "U64";
             if (name == "CPU.READRSP") return "U64";
+            if (name == "CPU.READCS") return "U64";
             if (name == "CPU.EXCEPTIONVECTORTABLEBASE") return "U64";
             if (name == "GRAPHICS.CREATESURFACE" || name == "GRAPHICS.PRIMARYSURFACE") return "SURFACE";
             if (name == "GRAPHICS.CREATEWINDOW") return "WINDOW";
@@ -1010,6 +1011,7 @@ private:
             const std::string name = upper_ascii(node.name);
             if (name == "CPU.READCR3") return "U64";
             if (name == "CPU.READCR2") return "U64";
+            if (name == "CPU.READCS") return "U64";
             if (name == "CPU.EXCEPTIONVECTORTABLEBASE") return "U64";
             if (name == "UEFI.GOP.DISCOVER") return "UEFI.GraphicsOutputProtocol";
             if (name == "UEFI.GOP.MODE") return "UEFI.GraphicsOutputMode";
@@ -1276,6 +1278,11 @@ private:
                 if (name == "CPU.READRSP") {
                     const std::string result = temp();
                     current_block(function).instructions.push_back(amir_memory("READRSP", result, {}, "U64", {}));
+                    return result;
+                }
+                if (name == "CPU.READCS") {
+                    const std::string result = temp();
+                    current_block(function).instructions.push_back(amir_memory("READCS", result, {}, "U64", {}));
                     return result;
                 }
                 if (name == "CPU.EXCEPTIONVECTORTABLEBASE") {
@@ -3900,13 +3907,24 @@ X86_64CodegenResult generate_exception_vector_table() {
     result.text.cmp_reg_imm32(Reg::RAX, 3); // #BP -- the only vector this table recovers from so far
     const std::size_t not_breakpoint_disp = result.text.jcc_rel32_placeholder(0x5); // JNE
 
-    // Breakpoint recovery: step the saved RIP past the one-byte INT3 opcode it faulted on.
-    result.text.mov_load_disp32(Reg::RAX, Reg::RSP, kRipOffset);
-    result.text.inc_rax();
-    result.text.mov_store_disp32(Reg::RSP, kRipOffset, Reg::RAX);
-    const std::size_t to_restore_disp = result.text.jmp_rel32_placeholder();
+    // Breakpoint recovery: #BP is a TRAP, not a fault -- INT3 already pushes the RIP of the
+    // instruction *after* the one-byte opcode (unlike a fault, which pushes the address of the
+    // faulting instruction itself for a retry). No adjustment is needed; falling straight through
+    // to the restore-and-resume path below is the whole recovery. An earlier version of this code
+    // added 1 here on the (wrong, fault-shaped) assumption that RIP still pointed at the INT3
+    // byte, which resumed execution one byte into whatever instruction followed it -- harmless by
+    // chance for some instruction shapes and silently catastrophic for others (a CALL immediately
+    // after CPU.Breakpoint, resumed from CALL+1, executes garbage). Found via exactly that: a
+    // deliberately minimal reproduction hung specifically whenever anything with a CALL followed
+    // the breakpoint, and not otherwise.
+    (void)kRipOffset;
 
     // Unexpected fault: park the processor rather than resuming into undefined state.
+    const std::size_t restore_start = result.text.size();
+    for (int i = kSavedRegisterCount - 1; i >= 0; --i) result.text.pop_reg(kSavedRegisters[i]);
+    result.text.add_rsp_imm8(16); // drop this table's vector-number and error-code pushes
+    result.text.iretq();
+
     const std::size_t fault_start = result.text.size();
     {
         const std::int64_t next_instruction = static_cast<std::int64_t>(not_breakpoint_disp + 4);
@@ -3916,15 +3934,7 @@ X86_64CodegenResult generate_exception_vector_table() {
     result.text.cli();
     result.text.hlt();
     result.text.jmp_rel8(static_cast<std::int8_t>(static_cast<std::int64_t>(spin_start) - static_cast<std::int64_t>(result.text.size() + 2)));
-
-    const std::size_t restore_start = result.text.size();
-    {
-        const std::int64_t next_instruction = static_cast<std::int64_t>(to_restore_disp + 4);
-        result.text.patch_i32(to_restore_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(restore_start) - next_instruction));
-    }
-    for (int i = kSavedRegisterCount - 1; i >= 0; --i) result.text.pop_reg(kSavedRegisters[i]);
-    result.text.add_rsp_imm8(16); // drop this table's vector-number and error-code pushes
-    result.text.iretq();
+    (void)restore_start;
 
     return result;
 }
@@ -4112,7 +4122,14 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
         }
     }
 
-    if (frame_size <= 255) result.text.sub_rsp_imm8(static_cast<std::uint8_t>(frame_size));
+    // sub rsp, imm8 (opcode 0x83) sign-extends its one-byte immediate: a frame_size of, say, 200
+    // encoded as that raw byte is read by the CPU as -56, turning the prologue into `add rsp, 56`
+    // -- growing right into the caller's own frame instead of allocating this function's. The
+    // threshold below 128, not 256, is what keeps every encoded byte's sign bit clear. Found via
+    // a genuinely wild jump (#UD at a bogus RIP) chasing an unrelated exception-entry-stub
+    // integration bug: any function whose frame landed in [128,255] bytes silently corrupted the
+    // stack on every call, not just this one.
+    if (frame_size <= 127) result.text.sub_rsp_imm8(static_cast<std::uint8_t>(frame_size));
     else result.text.sub_rsp_imm32(static_cast<std::uint32_t>(frame_size));
 
     // Spill incoming arguments. Register arguments arrive in the four Microsoft x64 integer
@@ -4262,10 +4279,18 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     if (signed_type(left_type)) result.text.idiv_reg(Reg::RCX); else result.text.div_reg(Reg::RCX);
                     if (op == "MOD") result.text.mov_reg_reg(Reg::RAX, Reg::RDX);
                 } else if (op == "<<" || op == ">>") {
+                    // Shift directly into R8 (mirroring the SAR case below), not RAX: the
+                    // out-of-range-shift-count safety check immediately after needs RAX as scratch
+                    // for its own boolean result, and computing the shift into RAX first only to
+                    // have that same register clobbered before the result is ever used discards
+                    // the real shifted value entirely -- silently replacing "x SHR n" with "x"
+                    // whenever the shift count is a runtime value rather than a provably-safe
+                    // compile-time constant. Found via CPU.ExceptionVectorTableBase()'s live IDT
+                    // integration proof: every dynamic-shift-count SHR/SHL in the freestanding
+                    // backend was affected, not just AND-masked nibble extraction.
                     result.text.mov_reg_reg(Reg::R8, Reg::RAX);
-                    result.text.mov_reg_reg(Reg::RCX, Reg::RCX);
-                    if (op == "<<") result.text.shl_reg_cl(Reg::RAX);
-                    else result.text.shr_reg_cl(Reg::RAX);
+                    if (op == "<<") result.text.shl_reg_cl(Reg::R8);
+                    else result.text.shr_reg_cl(Reg::R8);
                     result.text.cmp_reg_imm32(Reg::RCX, static_cast<std::uint32_t>(width_bits(left_type)));
                     result.text.setcc_al(0x2);
                     result.text.movzx_eax_al();
@@ -4396,6 +4421,11 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 const std::string op = instruction.target;
                 if (op == "READRSP") {
                     result.text.mov_rax_rsp();
+                    if (!store_result(instruction.result, "U64")) return result;
+                    break;
+                }
+                if (op == "READCS") {
+                    result.text.mov_rax_cs();
                     if (!store_result(instruction.result, "U64")) return result;
                     break;
                 }
@@ -4752,7 +4782,8 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     if (value_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(value_slot));
                     else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(value_slot));
                 }
-                if (frame_size <= 255) result.text.add_rsp_imm8(static_cast<std::uint8_t>(frame_size));
+                // Same sign-extension hazard as the prologue's sub rsp, imm8 above.
+                if (frame_size <= 127) result.text.add_rsp_imm8(static_cast<std::uint8_t>(frame_size));
                 else result.text.add_rsp_imm32(static_cast<std::uint32_t>(frame_size));
                 result.text.ret();
                 break;

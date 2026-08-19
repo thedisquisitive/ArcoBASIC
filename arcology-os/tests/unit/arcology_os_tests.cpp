@@ -262,6 +262,11 @@ int main() {
             require(bytes_equal(asm_.bytes(), {0x0F, 0x20, 0xD0}), "mov rax, cr2 matches x86-64 encoding");
         }
         {
+            Assembler asm_;
+            asm_.mov_rax_cs();
+            require(bytes_equal(asm_.bytes(), {0x48, 0x8C, 0xC8}), "mov rax, cs matches x86-64 encoding");
+        }
+        {
             Assembler lgdt;
             lgdt.lgdt_rax();
             require(bytes_equal(lgdt.bytes(), {0x0F, 0x01, 0x10}), "lgdt [rax] matches x86-64 encoding");

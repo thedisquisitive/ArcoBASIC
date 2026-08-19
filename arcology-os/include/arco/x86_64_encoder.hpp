@@ -122,6 +122,14 @@ public:
     void ltr_rax() { emit(0x66); emit(0x0F); emit(0x00); emit(0xD8); }
     void invlpg_rax() { emit(0x0F); emit(0x01); emit(0x38); }
     void mov_rax_rsp() { emit(0x48); emit(0x89); emit(0xE0); }
+
+    // mov rax, cs -- REX.W 8C /r (MOV r/m64, Sreg; reg field 001 selects CS), zero-extended into
+    // RAX. Needed to discover the currently-loaded code selector so a newly built IDT's gates
+    // reference a segment that is actually valid right now, rather than assuming a specific GDT
+    // layout is loaded (loading a *replacement* GDT safely also requires reloading CS via a far
+    // jump, which this backend does not yet support -- see aps-owned-gdt.md's "Segment-selector
+    // reload" remaining-activation-gate note).
+    void mov_rax_cs() { emit(0x48); emit(0x8C); emit(0xC8); }
     void xor_rdx_rdx() { xor_reg_reg(Reg::RDX, Reg::RDX); }
     void div_reg(Reg divisor) { emit_unary_reg(0x06, divisor); }
     void idiv_reg(Reg divisor) { emit_unary_reg(0x07, divisor); }

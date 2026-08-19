@@ -1,0 +1,82 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' Regression fixture for a real x86-64 backend bug: INT.SHR/INT.SHL's out-of-range-shift-count
+' safety check computed the shift into RAX, then let the very next instructions (which reuse RAX
+' as scratch for the safety-check boolean) clobber it before the result was ever consumed --
+' silently discarding every dynamic-count SHR/SHL and substituting the unshifted original value
+' instead. `systems_integer_core_smoke.sh` never caught this because it only checks that SHR/SHL
+' *compile*, never that they're numerically correct when actually executed. This fixture is
+' compiled and booted under QEMU/OVMF by systems_arco_basic_shift_correctness_smoke.sh so the
+' check is a real, executed one, not just a compile-time shape check.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+FUNCTION HexNibble(nibbleValue AS U64) AS U64
+    IF nibbleValue < 10 THEN
+        SerialByte(48 + nibbleValue)
+    ELSE
+        SerialByte(55 + nibbleValue)
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Prints all 16 hex digits of a U64, most significant first.
+FUNCTION HexQuad(value AS U64) AS U64
+    LET nibbleIndex AS U64 = 0
+    WHILE nibbleIndex < 16
+        LET shift AS U64 = 60 - (nibbleIndex * 4)
+        HexNibble((value SHR shift) AND 15)
+        nibbleIndex = nibbleIndex + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    SerialInit()
+
+    ' Each nibble of this value is distinct, so any nibble silently reading back the unshifted
+    ' original (or any other wrong nibble) is immediately visible in the printed digit sequence.
+    LET probe AS U64 = 1311768467750121200
+    HexQuad(probe)
+    SerialByte(13)
+    SerialByte(10)
+
+    ' Left shift, same bug class (op == "<<" shared the identical faulty codepath).
+    LET one AS U64 = 1
+    LET shiftAmount AS U64 = 8
+    LET shifted AS U64 = one SHL shiftAmount
+    HexQuad(shifted)
+    SerialByte(13)
+    SerialByte(10)
+
+    CPU.HaltForever
+END FUNCTION

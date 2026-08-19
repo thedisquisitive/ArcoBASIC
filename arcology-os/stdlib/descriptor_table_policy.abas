@@ -44,10 +44,17 @@ FUNCTION BuildMinimalGDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, tssBase 
     RETURN 1
 END FUNCTION
 
-FUNCTION IDTWriteInterruptGate(table AS MMIOPTR, index AS U32, handler AS U64, ist AS U8) AS BOOL
+' codeSelector is the GDT/LDT selector an interrupt on this gate transfers control into -- it must
+' name a currently-loaded, valid 64-bit code descriptor. It is a caller-supplied value rather than
+' a hardcoded constant because that is only ever true of a specific, currently-active GDT layout:
+' when the caller has itself just replaced the GDT (CPU.LoadGDT) a fixed offset into *that* new
+' table is correct, but reusing the existing firmware GDT (CPU.ReadCS(), the selector already
+' loaded and known-valid) is the only safe choice until this backend can reload CS via a far jump
+' (aps-owned-gdt.md's "Segment-selector reload" remaining-activation-gate note).
+FUNCTION IDTWriteInterruptGate(table AS MMIOPTR, index AS U32, handler AS U64, codeSelector AS U16, ist AS U8) AS BOOL
     LET gate AS MMIOPTR = ADDRESS.Offset(table, index * 16)
     MEMORY.Write16(gate, handler AND 65535)
-    MEMORY.Write16(ADDRESS.Offset(gate, 2), 8)
+    MEMORY.Write16(ADDRESS.Offset(gate, 2), codeSelector)
     MEMORY.Write8(ADDRESS.Offset(gate, 4), ist AND 7)
     MEMORY.Write8(ADDRESS.Offset(gate, 5), 142)
     MEMORY.Write16(ADDRESS.Offset(gate, 6), (handler SHR 16) AND 65535)
@@ -62,7 +69,7 @@ END FUNCTION
 ' faulted; each per-vector stub already carries that distinction by construction (it normalizes
 ' the hardware error-code frame and pushes its own vector number before reaching the common
 ' handler). See arcology-os/.agents/reports/aps-owned-idt.md's "remaining entry-ABI gate".
-FUNCTION BuildMinimalIDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR) AS BOOL
+FUNCTION BuildMinimalIDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, codeSelector AS U16) AS BOOL
     LET index AS U32 = 0
     WHILE index < 256
         LET gate AS MMIOPTR = ADDRESS.Offset(table, index * 16)
@@ -75,7 +82,7 @@ FUNCTION BuildMinimalIDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR) AS BOOL
     WHILE vector < 32
         LET ist AS U8 = 0
         IF vector = 8 THEN ist = 1
-        IDTWriteInterruptGate(table, vector, entry, ist)
+        IDTWriteInterruptGate(table, vector, entry, codeSelector, ist)
         entry = entry + 16
         vector = vector + 1
     WEND

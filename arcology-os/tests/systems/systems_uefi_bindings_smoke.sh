@@ -68,7 +68,11 @@ expect_accept "exit_boot_services_binding" "$SOURCE_DIR/arcology-os/tests/fixtur
 expect_accept "memory_map_binding" "$SOURCE_DIR/arcology-os/tests/fixtures/uefi-memory-map/memory-map-bindings.abas"
 expect_accept "pointer_to_pointer" "$SOURCE_DIR/arcology-os/tests/fixtures/uefi-memory-map/pointer-to-pointer.abas"
 "$ARCOFISSION" reveal "$SOURCE_DIR/arcology-os/tests/fixtures/uefi-memory-map/pointer-to-pointer.abas" at X86_64 > "$TMP_ROOT/pointer_to_pointer.x86"
-grep -qF 'lea rsp' "$TMP_ROOT/pointer_to_pointer.x86" || grep -qF '48 8d 44 24' "$TMP_ROOT/pointer_to_pointer.x86"
+# The TEXT dump wraps at 8 bytes/line, so a multi-byte pattern can straddle a wrap point
+# depending on unrelated byte-count changes earlier in the function (for example the prologue's
+# sub rsp, imm8 vs imm32 choice) -- flatten to one contiguous stream before matching.
+awk '/^TEXT [0-9]+ bytes/{on=1; next} /^$/{on=0} on{ $1=""; print }' "$TMP_ROOT/pointer_to_pointer.x86" | tr -d ' \n' > "$TMP_ROOT/pointer_to_pointer.stream"
+grep -qF '488d4424' "$TMP_ROOT/pointer_to_pointer.stream"
 MAP_FIXTURE="$SOURCE_DIR/arcology-os/tests/fixtures/uefi-memory-map/acquire-memory-map.abas"
 "$ARCOFISSION" reveal "$MAP_FIXTURE" at A-MIR > "$TMP_ROOT/memory-map.amir"
 grep -qF 'CALL_EXTERNAL systemTable.BootServices.GetMemoryMap' "$TMP_ROOT/memory-map.amir"

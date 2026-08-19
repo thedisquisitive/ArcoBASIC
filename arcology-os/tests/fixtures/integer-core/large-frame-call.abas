@@ -1,0 +1,74 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' Regression fixture for a real x86-64 backend bug: the prologue/epilogue chose `sub/add rsp,
+' imm8` (opcode 0x83, a SIGN-EXTENDED one-byte immediate) whenever frame_size <= 255, but that
+' opcode form only encodes correctly for values 0-127 -- a frame_size of, say, 200 written as that
+' raw byte is read by the CPU as -56, turning "allocate a 200-byte frame" into "grow the stack
+' upward by 56 bytes into the caller's own frame". Every function whose frame size happened to
+' land in [128, 255] bytes silently corrupted the stack on entry. This fixture's local count is
+' chosen to land in exactly that range; systems_arco_basic_large_frame_call_smoke.sh both checks
+' the emitted encoding statically and boots this under QEMU/OVMF to confirm the corrupted-stack
+' failure mode (a wild jump to a bogus RIP, not a clean hang) is actually gone.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+FUNCTION PrintDot() AS U64
+    SerialByte(46)
+    RETURN 0
+END FUNCTION
+
+' A single loop counter plus a call inside the loop body is already enough scratch-slot traffic
+' (this backend gives every subexpression, not just every named local, its own stack slot) to
+' push frame_size past 127 bytes while staying comfortably under 255, landing in the exact buggy
+' range. Calls PrintDot from inside the loop: with the corrupted-frame bug, this call's own
+' machinery (spilling arguments, saving/restoring across the call) is what actually scribbles over
+' the caller-adjacent memory, since a function with no calls at all can sometimes limp along even
+' with a broken frame.
+FUNCTION LargeFrameLoop() AS U64
+    LET i AS U64 = 0
+    WHILE i < 4
+        PrintDot()
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    SerialInit()
+    LargeFrameLoop()
+    SerialByte(65)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    CPU.HaltForever
+END FUNCTION
