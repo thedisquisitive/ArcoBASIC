@@ -16,12 +16,12 @@ grep -qF 'EXCEPTIONVECTORTABLEBASE' "$TMP_ROOT/amir.txt"
 # internal_calls mechanism ordinary function calls use.
 grep -qF 'REL32_TO $CPU.ExceptionVectorTable' "$TMP_ROOT/x86.txt"
 
-# The table is always appended once: 32 fixed-stride (16 byte) per-vector stubs + a 74-byte
-# shared handler (no RIP adjustment on the #BP recovery path -- INT3 is a trap, not a fault, so
-# the pushed return RIP already points past the one-byte opcode) = 586 bytes, plus this fixture's
-# own small entry function. A golden byte count catches any accidental change to the table's shape
-# (a stub growing past its 16-byte slot, a register added/removed from the save list, ...).
-grep -qF 'TEXT 612 bytes' "$TMP_ROOT/x86.txt"
+# The table is always appended once: 32 fixed-stride (16 byte) per-vector stubs + the shared
+# handler (dispatches on vector 3 (#BP, resume) vs 0 (#DE, IST1 stack-switch test probe, resume)
+# vs anything else (park)), plus this fixture's own small entry function. A golden byte count
+# catches any accidental change to the table's shape (a stub growing past its 16-byte slot, a
+# register added/removed from the save list, ...).
+grep -qF 'TEXT 644 bytes' "$TMP_ROOT/x86.txt"
 
 # The TEXT dump wraps at 8 bytes/line, so flatten it into one contiguous byte stream before
 # substring-matching multi-byte sequences that may straddle a wrap point.
@@ -36,5 +36,12 @@ grep -qF '6a0ee9' "$TMP_ROOT/text_stream.txt"
 # The shared handler ends with the register-restore sequence and IRETQ, never RET -- it is an
 # interrupt handler, not an ordinary function.
 grep -qF '4883c41048cf' "$TMP_ROOT/text_stream.txt"
+
+# The #DE (vector 0) IST1 stack-switch test probe: mov rax,rsp; mov rcx,rax;
+# mov rax,0x2000000 (the fixed scratch address, deliberately well under 128 MiB -- QEMU's own
+# default RAM size with no explicit -m -- since a scratch address the test VM has no backing
+# memory for reads back as silent zero, indistinguishable from the probe never having run); mov
+# [rax],rcx.
+grep -qF '4889e04889c148b80000000200000000488908' "$TMP_ROOT/text_stream.txt"
 
 echo 'PASS: CPU.ExceptionVectorTableBase addresses a synthesized, vector-aware exception-entry table'

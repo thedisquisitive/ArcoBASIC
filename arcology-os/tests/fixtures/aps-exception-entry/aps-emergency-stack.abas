@@ -1,0 +1,321 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' APS emergency-stack (IST1) proof. Extends aps-gdt-reload.abas: instead of the zeroed
+' RSP0/IST1 that proof left as a documented gap, this one allocates a real, dedicated stack and
+' supplies its top to BuildTSS's doubleFaultStack, proving an IDT gate's IST=1 field actually
+' causes the CPU to switch onto it -- not merely that LTR accepts a table with a plausible-looking
+' value in it.
+'
+' Tested via CPU.Interrupt(0) (#DE, divide error), not CPU.Interrupt(8) (#DF, the vector IST1
+' exists for) -- deliberately. Raising a vector this way is a *software* interrupt, and software
+' INT never pushes a hardware error code, not even for a vector whose fault-raised form normally
+' would. Vector 8's stub expects one already on the stack (from a real fault); using it here would
+' silently misalign the whole frame by 8 bytes. Vector 0 has no architectural error code, so a
+' software INT and a genuine hardware fault produce the same stack shape, letting this test
+' validate the IST-switch mechanism generically -- proving BuildMinimalIDT's
+' `IF vector = 8 THEN ist = 1`, the exact same construction, is correct -- without needing to
+' engineer a real fault-on-fault double-fault condition. See fission.cpp's exception-entry table
+' comment on this same point; it is not a general #DF (or #DE) recovery policy.
+'
+' The exception-entry table's shared handler records the RSP it observes for the probe vector to a
+' fixed scratch address (0x2000000, 32 MiB) before resuming; this fixture reads that back afterward and
+' checks it falls inside the emergency stack it built, not the ordinary one.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+' "APS IST1 STACK OK\r\n" -- the proof: only printed if the RSP the exception table recorded for
+' vector 8 falls within [dfStackBase, dfStackTop), the dedicated emergency stack this fixture
+' built and gave to the TSS -- meaning the CPU genuinely switched onto it via IST=1, not just kept
+' running on whatever stack was already active.
+FUNCTION SerialMarkerISTOK() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(73)
+    SerialByte(83)
+    SerialByte(84)
+    SerialByte(49)
+    SerialByte(32)
+    SerialByte(83)
+    SerialByte(84)
+    SerialByte(65)
+    SerialByte(67)
+    SerialByte(75)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+' Mirrors stdlib/descriptor_table_policy.abas (inlined -- this build takes a single source file).
+FUNCTION DescriptorWrite64(table AS MMIOPTR, offset AS U32, value AS U64) AS U64
+    MEMORY.Write64(ADDRESS.Offset(table, offset), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION BuildTSS(tss AS MMIOPTR, ringZeroStack AS U64, doubleFaultStack AS U64) AS BOOL
+    LET offset AS U32 = 0
+    WHILE offset < 104
+        MEMORY.Write8(ADDRESS.Offset(tss, offset), 0)
+        offset = offset + 1
+    WEND
+    MEMORY.Write64(ADDRESS.Offset(tss, 4), ringZeroStack)
+    MEMORY.Write64(ADDRESS.Offset(tss, 36), doubleFaultStack)
+    MEMORY.Write16(ADDRESS.Offset(tss, 102), 104)
+    RETURN 1
+END FUNCTION
+
+FUNCTION BuildTSSDescriptor(table AS MMIOPTR, offset AS U32, tssBase AS U64) AS BOOL
+    LET low AS U64 = 103
+    low = low OR ((tssBase AND 65535) SHL 16)
+    low = low OR (((tssBase SHR 16) AND 255) SHL 32)
+    low = low OR (137 SHL 40)
+    low = low OR (((tssBase SHR 24) AND 255) SHL 56)
+    MEMORY.Write64(ADDRESS.Offset(table, offset), low)
+    MEMORY.Write64(ADDRESS.Offset(table, offset + 8), (tssBase SHR 32) AND 4294967295)
+    RETURN 1
+END FUNCTION
+
+FUNCTION BuildMinimalGDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, tssBase AS U64) AS BOOL
+    ' Null, 64-bit code, long-mode data, and one available 64-bit TSS.
+    DescriptorWrite64(table, 0, 0)
+    DescriptorWrite64(table, 8, 49427445715107839)
+    DescriptorWrite64(table, 16, 58425848876826623)
+    BuildTSSDescriptor(table, 24, tssBase)
+    MEMORY.Write16(ADDRESS.Offset(pseudoDescriptor, 0), 39)
+    MEMORY.Write64(ADDRESS.Offset(pseudoDescriptor, 2), ADDRESS.Value(table))
+    RETURN 1
+END FUNCTION
+
+FUNCTION IDTWriteInterruptGate(table AS MMIOPTR, index AS U32, handler AS U64, codeSelector AS U16, ist AS U8) AS BOOL
+    LET gate AS MMIOPTR = ADDRESS.Offset(table, index * 16)
+    MEMORY.Write16(gate, handler AND 65535)
+    MEMORY.Write16(ADDRESS.Offset(gate, 2), codeSelector)
+    MEMORY.Write8(ADDRESS.Offset(gate, 4), ist AND 7)
+    MEMORY.Write8(ADDRESS.Offset(gate, 5), 142)
+    MEMORY.Write16(ADDRESS.Offset(gate, 6), (handler SHR 16) AND 65535)
+    MEMORY.Write32(ADDRESS.Offset(gate, 8), (handler SHR 32) AND 4294967295)
+    MEMORY.Write32(ADDRESS.Offset(gate, 12), 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION BuildMinimalIDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, codeSelector AS U16) AS BOOL
+    LET index AS U32 = 0
+    WHILE index < 256
+        LET gate AS MMIOPTR = ADDRESS.Offset(table, index * 16)
+        MEMORY.Write64(gate, 0)
+        MEMORY.Write64(ADDRESS.Offset(gate, 8), 0)
+        index = index + 1
+    WEND
+    LET entry AS U64 = CPU.ExceptionVectorTableBase()
+    LET vector AS U32 = 0
+    WHILE vector < 32
+        LET ist AS U8 = 0
+        IF vector = 8 THEN ist = 1
+        ' Vector 0 (#DE) also gets IST1 here, test-only: this fixture's proof raises it via
+        ' CPU.Interrupt(0), not the real #DF vector 8, for the reason explained at the top of this
+        ' file (software INT never pushes an error code, misaligning vector 8's stub). A real #DE
+        ' policy would not normally want its own dedicated stack.
+        IF vector = 0 THEN ist = 1
+        IDTWriteInterruptGate(table, vector, entry, codeSelector, ist)
+        entry = entry + 16
+        vector = vector + 1
+    WEND
+    MEMORY.Write16(ADDRESS.Offset(pseudoDescriptor, 0), 4095)
+    MEMORY.Write64(ADDRESS.Offset(pseudoDescriptor, 2), ADDRESS.Value(table))
+    RETURN 1
+END FUNCTION
+
+FUNCTION ActivateDescriptorTables(gdtPseudo AS U64, idtPseudo AS U64, tssSelector AS U64, codeSelector AS U64) AS U64
+    CPU.LoadGDT(gdtPseudo)
+    CPU.ReloadCodeSegment(codeSelector)
+    CPU.LoadTaskRegister(tssSelector)
+    CPU.LoadIDT(idtPseudo)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET probe AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 1
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocate AS U64 = systemTable.BootServices.AllocatePool(2, allocationSize, bufferAddress)
+    IF allocate <> 0 THEN
+        RETURN 1
+    END IF
+    mapSize = allocationSize
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("APS PRE")
+
+    ' 3 pages for the identity-map root/PDPT/page-directory, 2 pages for the IDT, 1 page for the
+    ' GDT+TSS+pseudo-descriptors, 4 pages (16 KiB) as a dedicated IST1 emergency stack.
+    LET root AS U64 = 0
+    LET rootAddress AS PTR = ADDRESS.Local(root)
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 3, rootAddress)
+    IF pageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    LET idtRoot AS U64 = 0
+    LET idtRootAddress AS PTR = ADDRESS.Local(idtRoot)
+    LET idtPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 2, idtRootAddress)
+    IF idtPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS IDT ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    LET gdtRoot AS U64 = 0
+    LET gdtRootAddress AS PTR = ADDRESS.Local(gdtRoot)
+    LET gdtPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 1, gdtRootAddress)
+    IF gdtPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS GDT ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    LET dfStackBase AS U64 = 0
+    LET dfStackBaseAddress AS PTR = ADDRESS.Local(dfStackBase)
+    LET dfStackPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 4, dfStackBaseAddress)
+    IF dfStackPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS DF STACK ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS PAGE")
+    LET pdpt AS U64 = root + 4096
+    LET pageDirectory AS U64 = root + 8192
+
+    LET clearIndex AS U64 = 0
+    WHILE clearIndex < 1536
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(root + (clearIndex * 8)), 0)
+        clearIndex = clearIndex + 1
+    WEND
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(root), pdpt OR 3)
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt), pageDirectory OR 3)
+    LET directoryIndex AS U64 = 0
+    WHILE directoryIndex < 512
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + (directoryIndex * 8)), (directoryIndex * 2097152) OR 131)
+        directoryIndex = directoryIndex + 1
+    WEND
+    LET rootCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(root))
+    LET pdptCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(pdpt))
+    IF rootCheck <> (pdpt OR 3) THEN
+        systemTable.ConsoleOut.Write("APS ROOT BAD")
+        CPU.HaltForever
+    END IF
+    IF pdptCheck <> (pageDirectory OR 3) THEN
+        systemTable.ConsoleOut.Write("APS PDPT BAD")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS TABLE OK")
+
+    CPU.DisableInterrupts
+    LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
+    IF exitStatus <> 0 THEN
+        CPU.HaltForever
+    END IF
+
+    CPU.DisableInterrupts
+    CPU.WriteCR3(root)
+    LET activeRoot AS U64 = CPU.ReadCR3()
+    IF activeRoot <> root THEN
+        CPU.HaltForever
+    END IF
+    MEMORY.Write32(ADDRESS.Virtual(1048576), 2779096485)
+
+    SerialInit()
+
+    ' The emergency stack itself: 16 KiB, x86-64 stacks grow down, so IST1 must point at the *top*
+    ' (base + size), not the base.
+    LET dfStackSize AS U64 = 16384
+    LET dfStackTop AS U64 = dfStackBase + dfStackSize
+
+    LET gdtTable AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(gdtRoot))
+    LET tssTable AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(gdtRoot + 256))
+    LET gdtPseudo AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(gdtRoot + 512))
+    LET tssBase AS U64 = ADDRESS.Value(tssTable)
+    BuildTSS(tssTable, 0, dfStackTop)
+    BuildMinimalGDT(gdtTable, gdtPseudo, tssBase)
+
+    LET idtTable AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(idtRoot))
+    LET idtPseudo AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(idtRoot + 4096))
+    BuildMinimalIDT(idtTable, idtPseudo, 8)
+
+    ActivateDescriptorTables(ADDRESS.Value(gdtPseudo), ADDRESS.Value(idtPseudo), 24, 8)
+    CPU.ReloadStackSegment(16)
+    CPU.ReloadDataSegments(16)
+
+    LET liveCS AS U64 = CPU.ReadCS()
+    IF liveCS <> 8 THEN
+        CPU.HaltForever
+    END IF
+
+    ' Raise vector 0 (#DE), not 8 -- see this file's header comment. The IDT gate above has IST=1
+    ' for vector 0 too (test-only), so the CPU should switch RSP to dfStackTop before the
+    ' exception-entry table's shared handler ever runs -- the handler records whatever RSP it
+    ' actually observes to a fixed scratch address for this check.
+    CPU.Interrupt(0)
+
+    LET probeAddress AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(33554432))
+    LET observedRSP AS U64 = MEMORY.Read64(probeAddress)
+    IF observedRSP < dfStackBase THEN
+        CPU.HaltForever
+    END IF
+    IF observedRSP > dfStackTop THEN
+        CPU.HaltForever
+    END IF
+
+    SerialMarkerISTOK()
+    CPU.HaltForever
+END FUNCTION

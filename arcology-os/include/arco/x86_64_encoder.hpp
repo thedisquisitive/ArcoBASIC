@@ -218,6 +218,21 @@ public:
     // hygiene the way DS/ES/FS/GS reloads are (those aren't touched by interrupt frame push/pop).
     void mov_ss_rax() { emit(0x8E); emit(0xD0); }
 
+    // mov DS/ES/FS/GS, ax -- 8E /r, same encoding family as mov_ss_rax with a different reg field
+    // (ES=0, DS=3, FS=4, GS=5). None of these are touched by interrupt frame push/pop the way SS
+    // is, so a stale post-GDT-swap selector here isn't load-bearing the way SS's was -- reloading
+    // them is hygiene, not a correctness requirement this encoder has a proof forcing yet.
+    void mov_ds_rax() { emit(0x8E); emit(0xD8); }
+    void mov_es_rax() { emit(0x8E); emit(0xC0); }
+    void mov_fs_rax() { emit(0x8E); emit(0xE0); }
+    void mov_gs_rax() { emit(0x8E); emit(0xE8); }
+
+    // int imm8 -- CD ib. Software interrupt: raises the given vector directly, the same trap-class
+    // delivery as INT3 (the pushed RIP already points past this two-byte instruction, no handler
+    // adjustment needed to resume). Requires a compile-time constant vector, matching this
+    // backend's existing PORT.Offset precedent for operands that must be statically known.
+    void int_imm8(std::uint8_t vector) { emit(0xCD); emit(vector); }
+
     // push/pop r64 -- (REX.B) 50+rd / (REX.B) 58+rd. Operand size is always 64-bit in long mode,
     // so unlike most instructions here these never take a REX.W bit, only REX.B when the register
     // is R8-R15. Needed by the exception-entry common handler to save/restore general-purpose

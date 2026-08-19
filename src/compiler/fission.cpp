@@ -1267,9 +1267,25 @@ private:
                     current_block(function).instructions.push_back(amir_barrier(name.substr(4)));
                     return temp();
                 }
-                if (name == "CPU.READCR2" || name == "CPU.READCR3" || name == "CPU.WRITECR3" || name == "CPU.INVALIDATEPAGE" || name == "CPU.LOADGDT" || name == "CPU.LOADIDT" || name == "CPU.LOADTASKREGISTER" || name == "CPU.RELOADCODESEGMENT" || name == "CPU.RELOADSTACKSEGMENT") {
+                if (name == "CPU.INTERRUPT") {
+                    if (node.children.size() != 1 || node.children.front()->kind != AstKind::Literal) {
+                        report_integer_error("CPU.Interrupt requires a statically known vector in the initial x86-64 systems target");
+                        return lower_fallback(current_block(function), node);
+                    }
+                    long long vector = 0;
+                    try {
+                        vector = std::stoll(node.children.front()->text, nullptr, 0);
+                    } catch (...) {
+                        report_integer_error("CPU.Interrupt vector must be an exact integer literal");
+                        return lower_fallback(current_block(function), node);
+                    }
+                    if (vector < 0 || vector > 255) report_integer_error("CPU.Interrupt vector is outside the supported 0-255 range");
+                    current_block(function).instructions.push_back(amir_barrier("INTERRUPT_" + std::to_string(vector)));
+                    return temp();
+                }
+                if (name == "CPU.READCR2" || name == "CPU.READCR3" || name == "CPU.WRITECR3" || name == "CPU.INVALIDATEPAGE" || name == "CPU.LOADGDT" || name == "CPU.LOADIDT" || name == "CPU.LOADTASKREGISTER" || name == "CPU.RELOADCODESEGMENT" || name == "CPU.RELOADSTACKSEGMENT" || name == "CPU.RELOADDATASEGMENTS") {
                     const std::string op = name == "CPU.READCR2" ? "READCR2" : (name == "CPU.READCR3" ? "READCR3" : (name == "CPU.WRITECR3" ? "WRITECR3" : "INVLPG"));
-                    const std::string descriptor_op = name == "CPU.LOADGDT" ? "LGDT" : (name == "CPU.LOADIDT" ? "LIDT" : (name == "CPU.LOADTASKREGISTER" ? "LTR" : (name == "CPU.RELOADCODESEGMENT" ? "RELOADCS" : (name == "CPU.RELOADSTACKSEGMENT" ? "RELOADSS" : op))));
+                    const std::string descriptor_op = name == "CPU.LOADGDT" ? "LGDT" : (name == "CPU.LOADIDT" ? "LIDT" : (name == "CPU.LOADTASKREGISTER" ? "LTR" : (name == "CPU.RELOADCODESEGMENT" ? "RELOADCS" : (name == "CPU.RELOADSTACKSEGMENT" ? "RELOADSS" : (name == "CPU.RELOADDATASEGMENTS" ? "RELOADDS" : op)))));
                     const std::string result = temp();
                     const bool read = name == "CPU.READCR2" || name == "CPU.READCR3";
                     current_block(function).instructions.push_back(amir_memory(descriptor_op, read ? result : "", std::move(args), read ? "U64" : "", {"U64"}));
@@ -1572,8 +1588,24 @@ private:
             current_block(function).instructions.push_back(std::move(instruction));
             return result;
         }
-        if (upper_target == "CPU.WRITECR3" || upper_target == "CPU.INVALIDATEPAGE" || upper_target == "CPU.LOADGDT" || upper_target == "CPU.LOADIDT" || upper_target == "CPU.LOADTASKREGISTER" || upper_target == "CPU.RELOADCODESEGMENT" || upper_target == "CPU.RELOADSTACKSEGMENT") {
-            const std::string op = upper_target == "CPU.WRITECR3" ? "WRITECR3" : (upper_target == "CPU.INVALIDATEPAGE" ? "INVLPG" : (upper_target == "CPU.LOADGDT" ? "LGDT" : (upper_target == "CPU.LOADIDT" ? "LIDT" : (upper_target == "CPU.LOADTASKREGISTER" ? "LTR" : (upper_target == "CPU.RELOADCODESEGMENT" ? "RELOADCS" : "RELOADSS")))));
+        if (upper_target == "CPU.INTERRUPT") {
+            if (node.children.size() != 1 || node.children.front()->kind != AstKind::Literal) {
+                report_integer_error("CPU.Interrupt requires a statically known vector in the initial x86-64 systems target");
+                return result;
+            }
+            long long vector = 0;
+            try {
+                vector = std::stoll(node.children.front()->text, nullptr, 0);
+            } catch (...) {
+                report_integer_error("CPU.Interrupt vector must be an exact integer literal");
+                return result;
+            }
+            if (vector < 0 || vector > 255) report_integer_error("CPU.Interrupt vector is outside the supported 0-255 range");
+            current_block(function).instructions.push_back(amir_barrier("INTERRUPT_" + std::to_string(vector)));
+            return result;
+        }
+        if (upper_target == "CPU.WRITECR3" || upper_target == "CPU.INVALIDATEPAGE" || upper_target == "CPU.LOADGDT" || upper_target == "CPU.LOADIDT" || upper_target == "CPU.LOADTASKREGISTER" || upper_target == "CPU.RELOADCODESEGMENT" || upper_target == "CPU.RELOADSTACKSEGMENT" || upper_target == "CPU.RELOADDATASEGMENTS") {
+            const std::string op = upper_target == "CPU.WRITECR3" ? "WRITECR3" : (upper_target == "CPU.INVALIDATEPAGE" ? "INVLPG" : (upper_target == "CPU.LOADGDT" ? "LGDT" : (upper_target == "CPU.LOADIDT" ? "LIDT" : (upper_target == "CPU.LOADTASKREGISTER" ? "LTR" : (upper_target == "CPU.RELOADCODESEGMENT" ? "RELOADCS" : (upper_target == "CPU.RELOADSTACKSEGMENT" ? "RELOADSS" : "RELOADDS"))))));
             current_block(function).instructions.push_back(amir_memory(op, "", std::move(args), "", {"U64"}));
             return result;
         }
@@ -3904,8 +3936,41 @@ X86_64CodegenResult generate_exception_vector_table() {
     constexpr std::uint32_t kRipOffset = kVectorOffset + 16;
 
     result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(kVectorOffset));
-    result.text.cmp_reg_imm32(Reg::RAX, 3); // #BP -- the only vector this table recovers from so far
-    const std::size_t not_breakpoint_disp = result.text.jcc_rel32_placeholder(0x5); // JNE
+    result.text.cmp_reg_imm32(Reg::RAX, 3); // #BP -- recovers by simply resuming, see below
+    const std::size_t is_breakpoint_disp = result.text.jcc_rel32_placeholder(0x4); // JE -> restore
+    result.text.cmp_reg_imm32(Reg::RAX, 0); // #DE -- IST1 stack-switch probe, see below
+    const std::size_t not_double_fault_disp = result.text.jcc_rel32_placeholder(0x5); // JNE -> fault
+
+    // IST1 stack-switch probe, TEST-ONLY: records the current RSP (if a gate's IST field is
+    // nonzero and the mechanism is working, the CPU already switched to that TSS.ISTn stack
+    // before this handler ever ran) to a fixed scratch address so the caller can read it back
+    // after resuming and confirm it falls within an emergency stack it built, not the ordinary
+    // one. Deliberately uses vector 0 (#DE, divide error) rather than vector 8 (#DF, the real
+    // architectural reason IST1 exists): this probe is raised via CPU.Interrupt(n), a *software*
+    // interrupt, and software INT never pushes a hardware error code -- not even for a vector
+    // whose fault-raised form normally would (a genuine well-known gotcha; see
+    // aps-emergency-stack.md). Using vector 8 here would silently misalign every stack offset
+    // below by 8 bytes, since its stub expects a real error code already pushed. Vector 0 has no
+    // architectural error code, so software INT and a genuine hardware fault produce the same
+    // stack shape -- letting this probe validate the IST-switch mechanism generically (proving
+    // BuildMinimalIDT's `IF vector = 8 THEN ist = 1`, the exact same construction, is correct)
+    // without needing to engineer a real fault-on-fault double-fault condition, and without the
+    // error-code mismatch. This is deliberately NOT a real double-fault (or divide-error) recovery
+    // policy -- resuming from a genuine hardware fault has no well-defined "resume the faulting
+    // code" semantics the way #BP's trap-class delivery does; production code should treat #DF as
+    // terminal. Resuming here is only sound because CPU.Interrupt(n) is a deliberate trap-class
+    // software interrupt, exactly like INT3. kDoubleFaultProbeAddress is a fixed low-memory
+    // scratch address, safely within the first 1 GiB an APS identity map covers and never
+    // otherwise allocated by these fixtures -- deliberately well under 128 MiB, the smallest RAM
+    // size a test harness might run this table under (QEMU's own default with no explicit -m):
+    // a scratch address at, say, 256 MiB reads back as silent zero on such a VM, not a fault --
+    // the "write" and "read" both appear to succeed, and the missing backing memory looks
+    // identical to the probe never having run at all. Found the hard way debugging exactly that.
+    constexpr std::uint64_t kDoubleFaultProbeAddress = 0x2000000ULL;
+    result.text.mov_rax_rsp();
+    result.text.mov_reg_reg(Reg::RCX, Reg::RAX);
+    result.text.mov_reg_imm64(Reg::RAX, kDoubleFaultProbeAddress);
+    result.text.mov_store64_rax_from_rcx();
 
     // Breakpoint recovery: #BP is a TRAP, not a fault -- INT3 already pushes the RIP of the
     // instruction *after* the one-byte opcode (unlike a fault, which pushes the address of the
@@ -3919,22 +3984,25 @@ X86_64CodegenResult generate_exception_vector_table() {
     // the breakpoint, and not otherwise.
     (void)kRipOffset;
 
-    // Unexpected fault: park the processor rather than resuming into undefined state.
     const std::size_t restore_start = result.text.size();
+    {
+        const std::int64_t next_instruction = static_cast<std::int64_t>(is_breakpoint_disp + 4);
+        result.text.patch_i32(is_breakpoint_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(restore_start) - next_instruction));
+    }
     for (int i = kSavedRegisterCount - 1; i >= 0; --i) result.text.pop_reg(kSavedRegisters[i]);
     result.text.add_rsp_imm8(16); // drop this table's vector-number and error-code pushes
     result.text.iretq();
 
+    // Unexpected fault: park the processor rather than resuming into undefined state.
     const std::size_t fault_start = result.text.size();
     {
-        const std::int64_t next_instruction = static_cast<std::int64_t>(not_breakpoint_disp + 4);
-        result.text.patch_i32(not_breakpoint_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(fault_start) - next_instruction));
+        const std::int64_t next_instruction = static_cast<std::int64_t>(not_double_fault_disp + 4);
+        result.text.patch_i32(not_double_fault_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(fault_start) - next_instruction));
     }
     const std::size_t spin_start = result.text.size();
     result.text.cli();
     result.text.hlt();
     result.text.jmp_rel8(static_cast<std::int8_t>(static_cast<std::int64_t>(spin_start) - static_cast<std::int64_t>(result.text.size() + 2)));
-    (void)restore_start;
 
     return result;
 }
@@ -4414,6 +4482,16 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 else if (instruction.target == "DISABLEINTERRUPTS") result.text.cli();
                 else if (instruction.target == "ENABLEINTERRUPTS") result.text.sti();
                 else if (instruction.target == "BREAKPOINT") result.text.int3();
+                else if (instruction.target.rfind("INTERRUPT_", 0) == 0) {
+                    long long vector = 0;
+                    try {
+                        vector = std::stoll(instruction.target.substr(10));
+                    } catch (...) {
+                        result.ok = false; result.error = "malformed CPU.Interrupt vector"; return result;
+                    }
+                    if (vector < 0 || vector > 255) { result.ok = false; result.error = "CPU.Interrupt vector out of range"; return result; }
+                    result.text.int_imm8(static_cast<std::uint8_t>(vector));
+                }
                 else { result.ok = false; result.error = "unsupported memory barrier " + instruction.target; return result; }
                 break;
 
@@ -4465,6 +4543,14 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 if (op == "RELOADSS") {
                     if (instruction.operands.size() != 1 || !load_value(instruction.operands[0], "U64", Reg::RAX)) { result.ok = false; result.error = "malformed stack-segment reload"; return result; }
                     result.text.mov_ss_rax();
+                    break;
+                }
+                if (op == "RELOADDS") {
+                    if (instruction.operands.size() != 1 || !load_value(instruction.operands[0], "U64", Reg::RAX)) { result.ok = false; result.error = "malformed data-segment reload"; return result; }
+                    result.text.mov_ds_rax();
+                    result.text.mov_es_rax();
+                    result.text.mov_fs_rax();
+                    result.text.mov_gs_rax();
                     break;
                 }
                 if (op == "RELOADCS") {

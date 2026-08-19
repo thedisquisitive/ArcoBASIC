@@ -438,6 +438,20 @@ int main() {
             asm_.mov_ss_rax();
             require(bytes_equal(asm_.bytes(), {0x8E, 0xD0}), "mov ss, ax matches nasm");
         }
+        {
+            Assembler asm_;
+            asm_.mov_ds_rax();
+            asm_.mov_es_rax();
+            asm_.mov_fs_rax();
+            asm_.mov_gs_rax();
+            require(bytes_equal(asm_.bytes(), {0x8E, 0xD8, 0x8E, 0xC0, 0x8E, 0xE0, 0x8E, 0xE8}),
+                    "mov ds/es/fs/gs, ax match nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.int_imm8(8);
+            require(bytes_equal(asm_.bytes(), {0xCD, 0x08}), "int 8 matches nasm");
+        }
     }
 
     // PE32+ image writer (Packet WP-009, arcology-os/docs/systems/pe32-image.md). Field offsets below were
