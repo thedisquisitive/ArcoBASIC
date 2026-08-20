@@ -1,0 +1,648 @@
+# RFC-0040: ArcologyFS (ArcFS) Production Hardening
+
+**RFC Number:** RFC-0040
+**Title:** ArcologyFS (ArcFS) Production Hardening
+**Status:** Draft
+**Category:** Storage / Filesystem Architecture
+**Authors:** Arcology Project
+**Created:** 2026-08-19
+**Last Updated:** 2026-08-19
+**Supersedes:** None
+**Superseded By:** None
+**Related Architecture:** Arcology Object Architecture; Polymorphic Substrate (APS)
+**Related RFCs:** RFC-0000, RFC-0017 (Substrate Resource Model), RFC-0038 (APS Block Storage and Filesystem Provider Substrate), RFC-0039 (ArcologyFS / ArcFS -- this RFC amends and completes it)
+
+------------------------------------------------------------------------
+
+# 1. Executive Summary
+
+RFC-0039 defined ArcologyFS and its reference implementation reached Phases A through G:
+object/namespace/handle semantics, a real on-disk format, a crash-safe copy-on-write commit
+protocol, reflinks with genuine copy-on-write, snapshots, a recovery/health model with real
+ReadOnlySafety enforcement, and one concrete system-integration primitive (update-snapshot
+rollback). Every phase was proven under QEMU on real hardware semantics, not simulated.
+
+None of that work claims to be production-ready, and RFC-0039 itself never claimed otherwise --
+`Status: Draft` was kept deliberately through all seven phases. Each phase's own report names
+specific, bounded simplifications made so the *contract* could be proven before the *scale*
+mattered: fixed-capacity tables sized for tests (64 objects, 128 namespace entries), a bump
+allocator that never reuses a sector, one fixed-size extent per file, in-memory-only attributes,
+64-bit OIDs instead of the specified 128-bit, and a handful of smaller gaps.
+
+This RFC is the plan for closing every one of those *ArcFS-owned* gaps: real free-space
+reclamation, growable metadata trees, variable-length and sparse files, on-disk reflink sharing,
+persistent attributes, 128-bit OIDs, and a complete health/repair model. It explicitly does **not**
+attempt the remaining items from RFC-0039's own Phase G (namespace attachment, system volume use,
+recovery environment support, graphical storage tooling) -- those depend on Arcology subsystems
+that do not exist anywhere in this repository yet, a finding RFC-0039's own Phase G report already
+made in detail (`.agents/reports/aps-arcfs-phase-g.md`), and this RFC does not re-litigate it.
+
+The expected outcome is a filesystem that has closed the gap between "provably correct at small,
+fixed scale" and "usable as a real filesystem" -- without touching anything that already works.
+
+------------------------------------------------------------------------
+
+# 2. Motivation
+
+RFC-0039's own implementation record is unusually explicit about what it did not do, and why. That
+record is the motivation for this RFC: every requirement below traces to a named, dated
+simplification in a specific phase report, not a speculative wish list.
+
+## 2.1 The allocator never gives anything back
+
+Every commit under RFC-0039's reference implementation (Phase C onward) allocates sectors with a
+monotonically increasing cursor and never reuses one. RFC-0039 Phase E built the exact safety
+analysis a reclaiming allocator would need (`ArcFS.IsSectorReachable`,
+`ArcFS.ReclaimableSectorCount`) specifically so this gap could be closed later without redoing that
+analysis -- but nothing consumes it. A volume under the current implementation grows without bound
+and never shrinks. This is the single largest reason the current implementation cannot be used for
+anything real.
+
+## 2.2 Everything is sized for tests, not for use
+
+64 objects. 128 namespace entries. 4096 bytes per file, one fixed extent, no fragmentation. These
+numbers were chosen in Phase A specifically so the object/namespace/handle *contract* could be
+proven against real memory and a real CPU before disk-format complexity existed at all -- a
+deliberate, stated engineering sequencing decision, not an oversight. But a filesystem that can
+hold 64 files and no file larger than 4 KiB is not a filesystem anyone can use.
+
+## 2.3 Format-level gaps accumulated across every phase
+
+Phase B's on-disk format is its own documented minimal subset of RFC-0039's real format: one
+superblock instead of a redundant ring, one checkpoint instead of generation history, flat
+fixed-size record arrays instead of real B+trees, an additive checksum instead of a
+cryptographic-strength one. Phase D's reflinks share data in memory but duplicate it on disk. Phase
+D's attributes never survive a remount at all. Every one of these was named as deferred, not
+missing by accident.
+
+## 2.4 Existing solutions are insufficient because there aren't any yet
+
+There is no other filesystem implementation in this project to fall back on for real workloads.
+Closing these gaps is the only path from "proven correct" to "usable."
+
+------------------------------------------------------------------------
+
+# 3. Goals
+
+This RFC SHALL define:
+
+- A real free-space allocator with crash-safe reclamation, closing RFC-0039 Phase C/E's own
+  documented gap.
+- Growable, disk-backed B+tree metadata structures for the Object Tree, Namespace Tree, and
+  Attribute Tree, replacing the fixed-capacity in-memory arrays every phase through G used.
+- Variable-length, multi-extent, sparse-capable file storage, replacing the fixed single 4096-byte
+  extent per file.
+- On-disk reflink sharing with a persisted, crash-safe reference count, replacing the current
+  per-generation duplication.
+- Persistent typed attributes, surviving a remount.
+- 128-bit Object IDs, matching RFC-0039 Section 17's own specification.
+- A complete RFC-0039 Section 36 health-state model and expanded repair coverage.
+- An explicit on-disk format version bump and migration policy covering all of the above.
+- A phased implementation and validation plan in the same style, and to the same evidentiary
+  standard, as RFC-0039's own Phases A-G.
+
+------------------------------------------------------------------------
+
+# 4. Non-Goals
+
+The following are explicitly out of scope for this RFC:
+
+- **Namespace attachment, system volume use, recovery environment support, graphical storage
+  tooling** (the remaining items from RFC-0039 Section 78 Phase G). Each depends on an Arcology
+  subsystem that does not exist anywhere in this repository -- see
+  `.agents/reports/aps-arcfs-phase-g.md` for the specific missing dependency named for each. This
+  RFC does not attempt them and does not re-derive that finding.
+- **Encryption and compression.** Still explicitly reserved-but-unimplemented per RFC-0039 Sections
+  27-28; this RFC does not change that.
+- **Multi-writer / concurrent access.** The reference implementation remains single-threaded,
+  matching every prior phase's own scope.
+- **Live in-place migration from format major version 1 to major version 2.** This RFC defines the
+  new format and requires old-format volumes to be explicitly reformatted and copied, not upgraded
+  in place. See Section 15.
+- **A real cryptographic hash.** Section 8 upgrades the checksum algorithm to a real
+  non-cryptographic integrity hash (CRC-32C or equivalent); a cryptographic-strength hash remains a
+  future extension, not a requirement here.
+- **UTF-8 string-valued attributes.** Attribute persistence (Section 12) widens the value-type
+  model, but STRING still has no substring/length operations on this compiler backend (RFC-0039
+  Phase A's own scope reduction #4, unchanged) -- string-valued attributes remain out of reach until
+  that is a compiler-level capability, which is outside this RFC's control. See Section 17.5.
+
+------------------------------------------------------------------------
+
+# 5. Terminology
+
+Terms already defined in RFC-0039 Section 6 apply unchanged. New terms:
+
+**Free Extent** -- A contiguous, currently-unallocated range of logical blocks, tracked by the
+Allocation Tree.
+
+**Reclamation Transaction** -- A commit whose only purpose is to mark a superseded, unreachable
+generation's blocks free in the Allocation Tree. Ordinary commit rules apply; there is no separate
+reclamation code path outside the normal commit protocol.
+
+**Format Major Version 2 (FMV2)** -- The on-disk format this RFC defines. Volumes formatted under
+RFC-0039's reference implementation (FMV1) are FMV1 and are not readable by an FMV2-only
+implementation; see Section 15.
+
+**Shared Extent Refcount** -- A persisted count, stored per extent in the Extent Tree, of how many
+reachable generations (active checkpoint or any live snapshot) reference that extent. An extent is
+reclaimable only when this count reaches zero.
+
+------------------------------------------------------------------------
+
+# 6. Relationship to RFC-0039
+
+This RFC does not restate RFC-0039's architecture, design principles, namespace model, security
+model, or terminology; all of that remains normative and unchanged. This RFC amends specific
+RFC-0039 sections whose *requirements* were already normative but whose reference implementation
+fell short, and specifies the concrete mechanism to close each gap:
+
+| RFC-0039 Section | What it already requires | What this RFC adds |
+|---|---|---|
+| 14 (Superblock Ring) | Redundant superblock copies | Section 7: real ring, quorum selection |
+| 15.1 (Checkpoint contents) | Full root-reference set including AllocationTreeRoot, AttributeTreeRoot | Section 8/12: those roots, actually populated |
+| 16 (Metadata Trees) | Checksummed copy-on-write B+trees | Section 9: real growable B+trees |
+| 17 (Object IDs) | 128-bit OIDs | Section 10: widened from the reference implementation's 64-bit |
+| 18-19 (File Data, Sparse Files) | Multi-extent, sparse-capable files | Section 11: real Extent Tree |
+| 20.2 (File data checksums) | "SHOULD use a modern high-performance checksum" | Section 8.4: CRC-32C |
+| 22 (Reflinks) | Shared extents, no data duplication | Section 11.5: on-disk sharing with persisted refcounts |
+| 24 (Typed Attributes) | Persistent, typed | Section 12: Attribute Tree |
+| 29 (Free-Space Management) | Transactional allocation/reclamation | Section 7: the allocator itself |
+| 36 (Health Model) | Full state list | Section 13: all seven states, persisted history |
+| 39 (Offline Check and Repair) | Full defect-class coverage | Section 14: allocation/extent-overlap repair |
+
+Everything in the table's middle column was already `SHALL`/`MUST` in RFC-0039. This RFC is
+implementation completion, not a new architectural direction.
+
+------------------------------------------------------------------------
+
+# 7. Requirement: Real Free-Space Allocation and Reclamation
+
+## 7.1 Allocation Tree
+
+ArcFS SHALL maintain a persistent Allocation Tree (RFC-0039 Section 16.4) tracking every logical
+block's state: free, or allocated with an owning class (metadata, file data, checkpoint/reserved).
+The Allocation Tree SHALL itself be a copy-on-write B+tree (Section 9), checksummed and versioned
+identically to every other metadata tree.
+
+## 7.2 Allocation during commit
+
+`ArcFS.PrepareCommit`'s successor SHALL consult the Allocation Tree for free extents before writing
+any new object, namespace, attribute, or data record, MUST NOT allocate a block the Allocation Tree
+marks as currently allocated, and MUST mark every block it allocates as allocated in a
+copy-on-write update to the Allocation Tree that becomes part of the SAME transaction's checkpoint.
+
+## 7.3 Reclamation is an ordinary commit
+
+Reclaiming a superseded, unreachable generation's blocks SHALL be performed as a Reclamation
+Transaction -- an ordinary commit whose only content is: for every block in a generation
+`ArcFS.IsSectorReachable` (RFC-0039 Phase E, unchanged) reports unreachable, mark it free in the
+Allocation Tree. There SHALL be no separate, non-transactional reclamation code path. This follows
+directly from RFC-0039 Section 5.2 ("committed state is immutable... mutations produce new
+blocks/extents and become visible only when a new checkpoint commits") applying to the Allocation
+Tree exactly as it applies to every other tree.
+
+## 7.4 Crash safety
+
+A crash at any point during a Reclamation Transaction MUST leave every affected block in one of
+exactly two states after recovery: still marked allocated (as if the reclamation transaction never
+ran), or fully marked free (as if it completed). A hybrid -- some blocks freed, others not, from one
+logical reclamation pass -- MUST NOT be observable after recovery. This is RFC-0039 Section 75.5's
+own crash-injection requirement, applied to reclamation specifically, and MUST be proven the same
+way RFC-0039 Phase C proved it for the commit protocol: a fixture that halts a reclamation
+transaction after some writes but before publication, and confirms recovery shows the fully
+pre-reclamation state.
+
+## 7.5 Reuse safety
+
+A block MUST NOT be handed out by Section 7.2's allocation step until the transaction that marked
+it free has been durably published (RFC-0039 Section 15.2's own durability-before-exposure rule,
+applied here). This prevents the classic use-after-crash bug where a freed block is reused before
+its freedom is itself durable, and a crash then leaves two live generations referencing the same
+physical block for incompatible data -- exactly what RFC-0039 Section 29 already forbids
+("no committed generation may describe the same physical block as simultaneously allocated to
+incompatible owners").
+
+------------------------------------------------------------------------
+
+# 8. Requirement: Format-Level Durability Upgrades
+
+## 8.1 Superblock ring
+
+ArcFS SHALL maintain at least 4 redundant superblock copies at fixed, predetermined sectors.
+Activation SHALL read all copies, validate each independently (magic, checksum, format version),
+and select the most recent valid copy by comparing each copy's referenced checkpoint's generation
+number. If copies disagree in a way that cannot be resolved to a single most-recent valid state,
+writable activation MUST fail (RFC-0039 Section 14, already normative).
+
+## 8.2 Checkpoint publication across the ring
+
+Publishing a new checkpoint SHALL write the new superblock content to all ring copies, in a fixed
+order, before the transaction is considered durably published. A crash partway through updating the
+ring MUST still leave at least one superblock copy correctly pointing at either the old or the new
+checkpoint -- never a torn/inconsistent single copy accepted as authoritative.
+
+## 8.3 Generation history
+
+The Checkpoint record SHALL gain a `PreviousGeneration` checkpoint-sector field (RFC-0039 Section
+15.1 already lists `PreviousGeneration` as a required field; the reference implementation's
+Checkpoint record omits it). This SHALL form a backward-linked chain of checkpoints independent of
+snapshots, enabling forensic inspection of recent history without requiring an explicit snapshot to
+have been taken in advance.
+
+## 8.4 Checksum algorithm
+
+ArcFS SHALL replace the additive sum-of-bytes checksum (Phase B's own documented placeholder) with
+CRC-32C for both metadata and file-data checksums, satisfying RFC-0039 Section 20.2's "SHOULD use a
+modern high-performance checksum with strong accidental-corruption detection." The algorithm choice
+SHALL be recorded in the superblock's checksum-algorithm-identifier field (RFC-0039 Section 14,
+already normative) so a future format revision can change it without breaking this one's readers.
+
+------------------------------------------------------------------------
+
+# 9. Requirement: Growable Metadata Trees
+
+## 9.1 On-disk shape
+
+The Object Tree, Namespace Tree, and Attribute Tree SHALL each be real copy-on-write B+trees
+(RFC-0039 Section 16, already normative), not flat fixed-size record arrays. Node size SHALL match
+the logical block size (4096 bytes, RFC-0039 Section 13). Each node SHALL be self-describing
+(node type, key count, checksum covering the whole node) and independently checksummed.
+
+## 9.2 In-memory shape
+
+The in-memory representation SHALL be a bounded LRU node cache backed by dynamically allocated
+pages (via the same `AllocatePages` mechanism every fixture in this chain already uses for its own
+scratch/page-table needs), not a single fixed-size MMIO region. Table capacity SHALL be limited
+only by available memory and the 64-bit block-count fields already present in the checkpoint
+format, not by a compile-time constant.
+
+## 9.3 Split and merge
+
+Node split (on insert into a full node) and merge (on delete leaving a node under a minimum
+occupancy threshold) SHALL follow standard B+tree algorithms. RFC-0039 Section 16's own "precise
+node split heuristics are implementation-defined as long as the persistent format and ordering
+rules are obeyed" remains the governing constraint -- this RFC does not mandate a specific split
+policy beyond correctness.
+
+## 9.4 Migration note
+
+This is the single largest implementation effort in this RFC and the one every other on-disk
+change (Sections 8, 11, 12) depends on, since it replaces the record-array addressing scheme
+(`objectRoot + index`) every existing reader/writer function currently assumes. See Section 16 for
+phase ordering.
+
+------------------------------------------------------------------------
+
+# 10. Requirement: 128-Bit Object IDs
+
+## 10.1 Representation
+
+An OID SHALL be represented as two U64 halves (high, low) throughout every persistent record and
+every in-memory table row, matching RFC-0039 Section 17's "128-bit identifier" requirement. This
+compiler backend has no native 128-bit integer type (confirmed during RFC-0039 Phase A's own
+implementation), so all OID comparison, allocation-counter increment, and equality logic SHALL
+operate on the pair explicitly (compare high halves first, low halves on a tie; increment the low
+half with carry into the high half).
+
+## 10.2 Allocation
+
+The OID allocation counter (RFC-0039 Section 17: "OID allocation MUST make accidental reuse
+practically impossible") SHALL be a 128-bit monotonic counter using the representation in 10.1.
+Given the reference implementation's 64-bit counter already treats overflow as a non-practical
+concern at any sane commit rate (RFC-0039 Phase A's own scope reduction #1), a 128-bit counter's
+overflow is stronger evidence of the same, not a new analysis.
+
+------------------------------------------------------------------------
+
+# 11. Requirement: Extent-Based Variable-Length and Sparse Files
+
+## 11.1 Extent Tree
+
+ArcFS SHALL maintain a per-volume Extent Tree (RFC-0039 Section 16.3) mapping `(OID, logical byte
+range)` to `(physical block range, length, flags, data checksum reference)`. A single file MAY be
+represented by any number of extents.
+
+## 11.2 Variable file size
+
+A file's logical size SHALL NOT be bounded by a fixed per-file capacity. `ArcFS.Resize` (RFC-0039
+Phase D) SHALL grow a file by allocating additional extents as needed (via the Section 7 allocator)
+rather than failing once RFC-0039 Phase D's own fixed 4096-byte ceiling is reached.
+
+## 11.3 Sparse ranges
+
+A logical byte range with no corresponding Extent Tree entry SHALL read as zero bytes without any
+physical allocation (RFC-0039 Section 19, already normative, unimplemented in the reference
+implementation). Writing into a sparse range SHALL allocate only the extent(s) actually touched.
+
+## 11.4 Partial writes and reads
+
+`ArcFS.HandleWrite`/`ArcFS.HandleRead`'s successors SHALL accept an explicit byte offset (RFC-0039
+Phase A's own scope reduction #3 named this as deferred: "no persistent position across calls...
+RFC-0039's own Seek/partial-write semantics are Phase C+ work once real extents exist to seek
+within" -- this is that phase) and SHALL walk the Extent Tree to resolve which physical extent(s)
+a given `(offset, length)` range touches, splitting the I/O across extent boundaries as needed.
+
+## 11.5 On-disk reflink sharing
+
+`ArcFS.Reflink` (RFC-0039 Phase D) SHALL, once the Extent Tree exists, share the SOURCE's actual
+extent entries with the new OID rather than the current implementation's per-commit duplication.
+Each shared extent's Shared Extent Refcount (Section 5) SHALL be incremented on reflink and
+decremented when a generation referencing it becomes unreachable and is reclaimed (Section 7.3). An
+extent SHALL be returned to the free pool only when its refcount reaches zero. The in-memory
+copy-on-write gate RFC-0039 Phase D already built (`ArcFSEnsurePrivateSlot`) SHALL be generalized to
+operate on Extent Tree entries instead of fixed data-pool slots, preserving its existing safety
+property ("a reflink MUST NOT cause later writes to one file to modify the visible data of the
+other") without re-deriving it.
+
+------------------------------------------------------------------------
+
+# 12. Requirement: Persistent Typed Attributes
+
+## 12.1 Attribute Tree
+
+ArcFS SHALL maintain a per-volume Attribute Tree (RFC-0039 Section 16.5) mapping `(OID, attribute
+namespace, attribute name/ID)` to a typed value, replacing RFC-0039 Phase D's in-memory-only
+single-U64-slot implementation. The Checkpoint record SHALL gain `AttributeTreeRoot` and
+`AttributeTreeCount` fields (RFC-0039 Section 15.1 already lists these as required; the reference
+implementation's Checkpoint record omits them).
+
+## 12.2 Value types
+
+The Attribute Tree SHALL support, at minimum, the integer-representable subset of RFC-0039 Section
+24's base value types: unsigned integer, signed integer, boolean, timestamp, and UUID/OID. UTF-8
+string and binary blob attribute values remain unimplemented under this RFC -- see Section 4's own
+Non-Goals and Section 17.5.
+
+## 12.3 Durability
+
+Attribute mutations SHALL commit through the same Prepare/Publish protocol as every other tree
+mutation (RFC-0039 Section 15.2) and MUST be observable after a remount -- closing RFC-0039 Phase
+D's explicitly documented gap ("a value set here does NOT survive `ArcFS.MountImage()`").
+
+------------------------------------------------------------------------
+
+# 13. Requirement: Full Health Model
+
+## 13.1 State list
+
+`ArcFS.GetHealthState`'s successor SHALL report all seven RFC-0039 Section 36 states (Healthy,
+Degraded, ReadOnlySafety, NeedsScrub, NeedsOfflineCheck, Corrupt, Unavailable), not the reference
+implementation's three-state collapse. `ReadOnlySafety` SHALL be reported specifically when
+`ArcFSReadOnlySafetyAddress`'s successor state is armed (RFC-0039 Phase F), distinctly from a
+general `Degraded` finding that has not (yet) armed that flag.
+
+## 13.2 Persisted health history
+
+A small fixed-size Health Record (not a tree -- RFC-0039 Section 36's own health-detail fields are
+bounded and low-cardinality) SHALL be added near the superblock, containing: last scrub
+generation/timestamp/result, last repair generation/timestamp/summary, and cumulative
+checksum-error and I/O-error counters. This record SHALL be updated transactionally alongside
+whatever commit produced the result it records (a scrub's own findings are not committed --
+RFC-0039 Section 20.4 keeps scrubbing read-only -- but a subsequent repair's own commit SHALL record
+the scrub that motivated it).
+
+------------------------------------------------------------------------
+
+# 14. Requirement: Expanded Repair Coverage
+
+## 14.1 Extent-overlap repair
+
+Once the Allocation Tree (Section 7) and Extent Tree (Section 11) exist, ArcFS SHALL define a
+resolution policy for extent-overlap defects (RFC-0039 Phase F detects these but explicitly does
+not repair them, citing the absence of an authoritative-ownership policy). This RFC establishes
+that policy: **the object whose Extent Tree entry has the lower generation number is authoritative;
+the later, conflicting entry is treated as an orphaned extent claim and the OFFENDING OBJECT is
+routed through the existing orphan-reattachment repair (RFC-0039 Phase F) with its data extent
+reference cleared** (an empty file, not deleted -- consistent with RFC-0039 Section 39's own "recovery
+SHOULD preserve it... with provenance metadata" policy, applied to metadata even when the data
+itself cannot be trusted).
+
+## 14.2 Allocation-tree reconciliation
+
+ArcFS SHALL define a repair pass that recomputes the Allocation Tree's free/allocated state
+directly from every reachable generation's actual extent references (the authoritative source per
+RFC-0039 Section 29) and reconciles any divergence from the persisted Allocation Tree, favoring the
+recomputed (conservative -- more things marked allocated, never fewer) result. This is the offline
+analogue of RFC-0039 Section 39's own named "allocation-tree reconciliation" defect class.
+
+------------------------------------------------------------------------
+
+# 15. Format Versioning and Migration
+
+## 15.1 Major version bump
+
+Every requirement in Sections 7-13 changes the on-disk checkpoint record shape, tree structure, or
+both. This RFC SHALL therefore define Format Major Version 2 (FMV2), distinct from the reference
+implementation's FMV1 (RFC-0039 Phases B-G). Per RFC-0039 Section 62.3 (already normative), an
+FMV1-only reader MUST NOT attempt to interpret an FMV2 volume, and vice versa -- these are
+incompatible feature sets, not a compatible extension.
+
+## 15.2 No live migration
+
+This RFC does NOT specify in-place migration from FMV1 to FMV2. An FMV1 volume MUST be migrated by
+formatting a new FMV2 volume and copying content across the generic `FileSystem`/`ByteStream`
+interfaces (RFC-0039 Section 42) -- the same path any two independent filesystem implementations
+would use. In-place migration is a legitimate future extension (RFC-0039 Section 63 already
+anticipates "ArcFS migration tooling") but is explicitly deferred here, matching this RFC's Section
+4 Non-Goals.
+
+## 15.3 Existing FMV1 fixtures
+
+RFC-0039 Phases A-G's own fixtures and reports remain valid as a record of FMV1's behavior and are
+NOT retroactively invalidated by this RFC. FMV1 is not deprecated by this RFC; it simply stops
+being the format new work targets once FMV2 exists.
+
+------------------------------------------------------------------------
+
+# 16. Implementation Phases
+
+Phase lettering continues RFC-0039 Section 78's own A-G sequence.
+
+**Phase H -- Format foundation**
+
+Implement: FMV2 superblock/checkpoint shape (Sections 8, 15); 128-bit OIDs (Section 10); CRC-32C
+checksums (Section 8.4). Deliberately touches every record's byte layout while the underlying
+storage model (flat arrays) is UNCHANGED -- a bounded, provable warm-up before Phase I's much
+larger rewrite, matching this project's own established pattern of proving smaller pieces first.
+
+**Phase I -- Real allocation and reclamation**
+
+Implement: Allocation Tree (Section 7.1); allocator integration into commit (7.2); Reclamation
+Transactions (7.3); crash-injection proof of 7.4; reuse-safety proof of 7.5. Depends on Phase H's
+checkpoint shape. This closes the single largest gap named in Section 2.1 and SHOULD be prioritized
+over Phase J even though Phase J is architecturally prerequisite to some later phases, because a
+volume that still cannot reclaim space is not meaningfully more usable after Phase J alone.
+
+**Phase J -- Growable metadata trees**
+
+Implement: Object Tree, Namespace Tree as real B+trees (Section 9). The largest single rewrite in
+this RFC; every existing read/write function's `objectRoot + index` addressing assumption changes.
+Depends on Phases H and I (the Allocation Tree must exist to back a growable tree's own node
+allocation).
+
+**Phase K -- Extents and sparse files**
+
+Implement: Extent Tree (Section 11.1); variable file size (11.2); sparse ranges (11.3); offset-based
+partial I/O (11.4); on-disk reflink sharing with persisted refcounts (11.5). Depends on Phase J (the
+Extent Tree is itself a B+tree) and Phase I (extent allocation/reclamation uses the same
+allocator).
+
+**Phase L -- Persistent attributes**
+
+Implement: Attribute Tree (Section 12). Depends on Phase J's B+tree infrastructure; otherwise
+independent of Phase K and MAY be implemented in parallel with it.
+
+**Phase M -- Full health and repair**
+
+Implement: seven-state health model (13.1); persisted health record (13.2); extent-overlap repair
+(14.1); allocation-tree reconciliation (14.2). Depends on Phases I and K (both repair classes
+require the Allocation Tree and Extent Tree to exist).
+
+------------------------------------------------------------------------
+
+# 17. AI Implementation Guidance
+
+## 17.1 Required boundaries
+
+Every boundary RFC-0039 Section 79.1 already establishes remains in force unchanged (generic
+`FileSystem` interfaces separate from ArcFS-specific format code; block-storage driver code outside
+ArcFS; explicit serialization functions; checked integer arithmetic; OID identity separate from
+runtime handles; namespace relationships separate from object records; allocation accounting
+derived from committed transactions; never mutate committed metadata in place).
+
+## 17.2 No silent architectural substitution
+
+RFC-0039 Section 79.2's list remains in force. This RFC adds one item specific to itself: an agent
+MUST NOT implement Section 15's FMV2 format changes as an in-place mutation of FMV1 volumes,
+presented as "migration," when Section 15.2 explicitly requires reformat-and-copy instead.
+
+## 17.3 Mandatory acceptance evidence
+
+RFC-0039 Section 79.4's evidence requirements apply unchanged, phase by phase, to every phase in
+Section 16 above: tests added, tests executed under QEMU (not merely compiled), exact pass/fail
+results, corruption/failure injections performed (Section 7.4 in particular requires this, the same
+way RFC-0039 Phase C's crash-injection fixture proved the original commit protocol), documented
+deviations, remaining unsafe assumptions. A phase report in the same style and rigor as
+`.agents/reports/aps-arcfs-phase-a.md` through `aps-arcfs-phase-g.md` is expected for each phase in
+Section 16.
+
+## 17.4 Regression discipline
+
+Every phase in Section 16 MUST be validated against the FULL existing RFC-0039 Phase A-G smoke-test
+suite in addition to its own new fixtures -- not because those tests are expected to still pass
+unchanged against FMV2 volumes (they are not; FMV1 and FMV2 are incompatible per Section 15.1), but
+because an FMV1 compatibility mode (reading/writing FMV1 volumes with the pre-Phase-H code paths)
+MUST remain available and MUST keep passing throughout, so that Section 15.2's reformat-and-copy
+migration path has a working FMV1 reader to copy FROM. Do not delete or break FMV1 support as a
+side effect of building FMV2.
+
+## 17.5 Stop conditions
+
+In addition to RFC-0039 Section 79.5's own list, an agent implementing this RFC MUST stop and
+report rather than improvise if:
+
+- STRING gains real substring/length/formatting operations on this compiler backend during this
+  work -- that changes Section 12.2's and Section 4's own Non-Goal boundary around string-valued
+  attributes, and the RFC's scope should be revisited before proceeding, not silently expanded.
+- The B+tree rewrite in Phase J cannot preserve the existing `ArcFS.Resolve`/`ArcFS.CreateFile`/
+  etc. public API signatures -- RFC-0039 Section 42's own native API shape is normative, and a
+  breaking signature change is an architectural decision, not an implementation detail.
+- Any Phase in Section 16 discovers that RFC-0039's own architecture (not just the reference
+  implementation) is insufficient to express a required behavior -- that is grounds for a further
+  RFC amendment, not a workaround.
+
+------------------------------------------------------------------------
+
+# 18. Testing Strategy
+
+Each phase in Section 16 SHALL include, at minimum:
+
+- **Structural tests**: every new/changed public entry point compiles cleanly at X86_64 codegen
+  level (matching every prior phase's own structural check).
+- **Real QEMU/OVMF proof**: the actual behavior under a real CPU, not merely a clean compile --
+  matching every RFC-0039 Phase A-G fixture's own standard.
+- **Determinism**: every new fixture run at least three times with identical results, matching
+  established project practice.
+- **Negative controls**: for any fixture asserting a safety property (crash-injection results,
+  ReadOnlySafety enforcement, refcount-gated reclamation), a deliberately flipped assertion MUST be
+  shown to fail loudly rather than silently pass -- matching the negative-control discipline used
+  throughout RFC-0039 Phases C-G.
+- **Crash injection** for Phase I specifically (Section 7.4), following RFC-0039 Phase C's own
+  prepare-without-publish technique, extended to reclamation transactions.
+- **Regression** against the full existing FMV1-path test suite per Section 17.4.
+
+------------------------------------------------------------------------
+
+# 19. Security Considerations
+
+Sections 26 (Authority and Security Model), 73 (Fuzzing and Hostile Media), and 74 (Security Threat
+Model) of RFC-0039 remain fully in force and are not amended by this RFC. Two additions specific to
+this RFC's own new surface:
+
+- The Allocation Tree (Section 7) becomes a new attack surface for a hostile/corrupt image: a
+  crafted Allocation Tree claiming blocks are free when they are actually referenced by a reachable
+  generation could cause the allocator to hand out and overwrite live data. Every allocation
+  decision MUST cross-check the Allocation Tree's claim against actual reachability
+  (`ArcFS.IsSectorReachable`, RFC-0039 Phase E, unchanged) before trusting a "free" marking from an
+  UNTRUSTED image at mount time -- matching RFC-0039 Section 5.3's "Implementations MUST NOT guess
+  silently."
+- Shared Extent Refcounts (Section 5, 11.5) are a new integrity-critical field: an underflowed or
+  corrupted refcount could cause a still-referenced extent to be freed and reused while a live
+  generation still points at it. Refcount fields MUST be checksummed as part of their containing
+  Extent Tree node (Section 9.1's own per-node checksum already covers this if refcounts live
+  inside extent records, which they SHALL).
+
+------------------------------------------------------------------------
+
+# 20. Performance Considerations
+
+RFC-0039 Section 60's performance expectations (O(log n) lookup, sequential I/O near backing-device
+capability, bounded commit latency, low-cost snapshots, reflink creation independent of file size)
+become achievable only after Phase J's real B+trees replace the reference implementation's flat
+arrays and linear scans. RFC-0039 Phase B/D/E/F's own documented "O(n) fine at test scale" notes are
+the specific debts Phase J-M pay down. This RFC does not add new performance requirements beyond
+RFC-0039 Section 60's own already-normative targets; it is the path to meeting them.
+
+------------------------------------------------------------------------
+
+# 21. Compatibility
+
+This RFC is compatible with RFC-0038 (Block Storage) without modification -- every phase continues
+to consume the `RAMDisk`/`BlockDevice` contract exactly as RFC-0039 Phases B-G already do. This RFC
+is NOT backward-compatible with RFC-0039 Phase A-G's own FMV1 on-disk format at the volume level
+(Section 15); it IS compatible with RFC-0039's architecture, since every requirement in this RFC
+closes a gap RFC-0039 itself already specified normatively.
+
+------------------------------------------------------------------------
+
+# 22. Open Questions
+
+- Should Phase M's Health Record (13.2) live in a fixed reserved area near the superblock, or as
+  its own tiny tree? This RFC recommends fixed (Section 13.2's own reasoning: low cardinality,
+  bounded fields), but a future increment adding per-scrub history (not just "the last one") would
+  need to revisit this.
+- Section 14.1's extent-overlap resolution policy ("lower generation number wins") is a reasonable
+  default but not the only defensible one; RFC-0039 Section 39 does not mandate a specific policy,
+  and this RFC's choice should be revisited if real-world corruption patterns suggest otherwise.
+- Whether Phase K's on-disk reflink sharing should extend to cross-snapshot deduplication (two
+  files, never reflinked, that happen to contain identical bytes) is explicitly not addressed --
+  that is content-addressed deduplication, an RFC-0039 Section 2 Non-Goal this RFC does not revisit.
+
+------------------------------------------------------------------------
+
+# 23. References
+
+- RFC-0039: ArcologyFS (ArcFS) -- the architecture this RFC completes.
+- RFC-0038: APS Block Storage and Filesystem Provider Substrate -- the `BlockDevice` contract every
+  phase in this RFC continues to consume unchanged.
+- `.agents/reports/aps-arcfs-phase-a.md` through `aps-arcfs-phase-g.md` -- the implementation record
+  every requirement in this RFC traces back to.
+
+------------------------------------------------------------------------
+
+# 24. Revision History
+
+| Version | Date       | Summary                                                        |
+|---------|------------|------------------------------------------------------------------|
+| 0.1     | 2026-08-19 | Initial draft. Written directly from RFC-0039 Phases A-G's own accumulated, dated scope-reduction notes -- every requirement in Sections 7-14 traces to a specific named gap in a specific phase report, not a speculative addition. Defines Format Major Version 2 and a six-phase (H-M) implementation plan. Explicitly excludes RFC-0039 Phase G's remaining namespace-attachment/system-volume/recovery-environment/graphical-tooling items, matching `.agents/reports/aps-arcfs-phase-g.md`'s own finding that their dependencies do not exist in this repository. Status: Draft; no implementation phase has begun. |
