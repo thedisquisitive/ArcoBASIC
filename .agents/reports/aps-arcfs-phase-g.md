@@ -37,57 +37,90 @@ attachment, recovery environment support, graphical storage tooling) remain open
 reasons already given, and DISCOVER-level real hardware enumeration remains RFC-0038's own future
 work. "System volume use" is the one item promoted from open to delivered.
 
+## Addendum 2 (2026-08-20): "namespace attachment" delivered
+
+Written up separately in full: RFC-0041 (Arcology System Namespace) and
+`.agents/reports/arcology-system-namespace.md`. Summary here for Phase G's own bookkeeping: a real,
+general System Namespace now exists (`stdlib/system_namespace_policy.abas`), and attaching an ArcFS
+volume at a namespace location is proven end to end under QEMU/OVMF -- resolving a path that
+crosses the attachment boundary reaches the attached volume's own real file content, byte-for-byte,
+via `ArcFS.Resolve` completely unmodified. This closes the deepest of the three remaining Phase G
+items; RFC-0017 remains unimplemented and undepended-upon, exactly as this report already found.
+
+## Addendum 3 (2026-08-20): "recovery environment support" delivered
+
+`aps-arcfs-system-volume.abas`'s `ArcFS.ActivateSystemVolume` (Addendum 1) is the right policy for
+*ordinary* boot: silent, automatic self-healing. A recovery environment needs the opposite
+default -- visibility before action. `tests/fixtures/recovery-environment/recovery-environment.abas`
+is a distinct boot artifact that stages RFC-0039 Section 39's own Inspect/Apply/Verify as three
+independently serial-reported steps, built entirely from Phase F's existing primitives
+(`ArcFS.ScrubVolume`, `ArcFS.RepairReattachOrphans`, `ArcFS.RepairCommit`) with zero new ArcFS
+functions -- confirming this item really was "mostly wiring," as assessed when the user chose which
+subsystem to start on. Proven under QEMU/OVMF: an already-healthy volume's Inspect stage finds
+nothing and Apply is confirmed to never even run (not merely harmless); the same orphan defect
+Phase F's own fixture builds is found, fixed, and re-verified, with the repaired object confirmed
+to be the same object, same OID, same content. Full suite: 58/58 passing. Negative control
+confirmed real.
+
+Only "graphical storage tooling" remains open, for the reason already given: no inspector UI shell
+exists anywhere in this project to extend.
+
 ## Scope delivered
 
 RFC-0039's Phase G ("namespace attachment; system volume use; recovery environment support;
-update snapshots; graphical storage tooling; ArcoBASIC bindings") is **partially** addressed --
-three items genuinely implemented and QEMU-proven, one item recognized as already satisfied by
-construction, and two items explicitly left open with a stated reason each, rather than silently
+update snapshots; graphical storage tooling; ArcoBASIC bindings") is now addressed for **five of
+its six items**, each genuinely implemented and QEMU-proven or recognized as already satisfied by
+construction. One item remains explicitly open, with a stated reason, rather than silently
 skipped or fabricated.
 
 - **`ArcFS.RollbackToSnapshot(snapshotId)`** (RFC-0039 Section 51, "update snapshots"):
   implemented and proven. Republishes a previously snapshotted generation as the active
   checkpoint -- a real, atomic undo of a bad update.
 - **`ArcFS.ActivateSystemVolume()`** (RFC-0039 Section 37/38, "system volume use," narrowed --
-  see the Addendum above): implemented and proven. A real, self-healing boot-activation policy;
+  see Addendum 1 above): implemented and proven. A real, self-healing boot-activation policy;
   the DISCOVER step of real hardware enumeration remains RFC-0038's own future work.
+- **The Arcology System Namespace** (RFC-0041, "namespace attachment," narrowed -- see Addendum 2
+  above): implemented and proven. A real, general namespace with delegated resolution into an
+  attached ArcFS volume; RFC-0017 remains unimplemented and undepended-upon.
+- **The recovery environment boot artifact** ("recovery environment support," see Addendum 3
+  above): implemented and proven. Stages Inspect/Apply/Verify as independently observable steps,
+  built entirely from Phase F's existing primitives.
 - **ArcoBASIC bindings**: recognized as already satisfied by construction (see below), not newly
   built.
-- **Namespace attachment, recovery environment support, graphical storage tooling**: explicitly
-  left open. Each depends on an Arcology subsystem that does not exist anywhere in this repository
-  yet -- building one would be separate, real scope creep belonging to that subsystem's own RFC,
-  not ArcFS's.
+- **Graphical storage tooling**: explicitly left open. No inspector UI shell exists anywhere in
+  this project to extend -- building one would be separate, real scope creep belonging to a
+  UI-application project, not ArcFS's.
 
-## Why this phase couldn't just implement its own list
+## Why this phase couldn't just implement its own list -- and what changed since
 
 RFC-0039 Section 78's own Phase G items are, overwhelmingly, integration surface with OTHER
-Arcology subsystems -- not additional ArcFS format or protocol work. Three of the six items name
-something that doesn't exist yet in this codebase to integrate with, and remain open. A fourth
-(system volume use) named something that partly doesn't exist -- the split is what the Addendum
-above delivers on the part that was genuinely ArcFS's own:
+Arcology subsystems -- not additional ArcFS format or protocol work. When this report was first
+written, four of the six items named something that didn't exist yet in this codebase to integrate
+with. Since then (Addenda 1-3 above), three of those four gaps were closed by building the missing
+piece for real, each with its own RFC or its own honest scope-narrowing:
 
 - **Namespace attachment** (Section 10's DISCOVER/CREATE/ATTACH/VERIFY/ACTIVATE lifecycle against
-  an Arcology namespace *location*) has no concrete target. This repository has no implemented
-  Arcology object/namespace facility outside ArcFS's own -- confirmed the same way RFC-0038's own
-  implementation confirmed RFC-0017 (Substrate Resource Model) has no concrete freestanding
-  callable surface anywhere in this repository (Phase A's own scope reduction #6 cites the
-  identical finding, independently re-confirmed here).
+  an Arcology namespace *location*) had no concrete target: no Arcology object/namespace facility
+  existed outside ArcFS's own (confirmed the same way RFC-0038's own implementation confirmed
+  RFC-0017 has no freestanding callable surface). **Closed** by RFC-0041 (Addendum 2) -- a real
+  System Namespace now exists, and RFC-0017 remains correctly un-depended-upon.
 - **System volume use**, split: the ATTACH/VERIFY/ACTIVATE part (Section 37/38) is exactly what
-  `ArcFS.ActivateSystemVolume` delivers (Addendum above). The DISCOVER part -- a boot path that
-  enumerates real storage hardware before anything else runs -- still has no target: no boot-time
-  volume-selection mechanism exists anywhere in this project, and real UEFI Block IO Protocol
-  enumeration is RFC-0038's own named future work, not something to improvise here.
-- **Recovery environment support** presumes a distinct recovery boot mode. This project has no
-  second boot path or recovery-specific entry point anywhere; every fixture boots the same
-  ordinary UEFI `Main()` entry every other freestanding fixture in this project does.
+  `ArcFS.ActivateSystemVolume` delivers (Addendum 1). **Closed** for that half. The DISCOVER
+  part -- real UEFI Block IO Protocol enumeration of physical storage -- still has no target and
+  remains open; that is RFC-0038's own named future work, not something to improvise here.
+- **Recovery environment support** presumed a distinct recovery boot mode; this project had no
+  second boot path anywhere. **Closed** (Addendum 3) -- a real, distinct recovery boot artifact
+  now exists, staging Inspect/Apply/Verify instead of ordinary boot's silent self-heal.
 - **Graphical storage tooling** presumes a storage-inspector UI (RFC-0039 Section 44's own
   illustrative volume-inspector text layout). `stdlib/graphics_primitives.abas`/
   `graphics_substrate.abas` exist for pixel-level drawing, but nothing resembling an inspector
-  shell exists to extend -- building one is a UI-application project, not ArcFS's own.
+  shell exists to extend. **Still open** -- building one is a UI-application project, not ArcFS's
+  own, and remains the one genuinely unaddressed Phase G item.
 
-Building fake infrastructure to claim these "done" -- a pretend namespace to attach to, a pretend
-boot path -- would be exactly what RFC-0039 Section 79.2 ("No silent architectural substitution")
-forbids. They are left open, with the specific missing dependency named for each, matching RFC-0039
+Building fake infrastructure to claim any of these "done" before the real piece existed would have
+been exactly what RFC-0039 Section 79.2 ("No silent architectural substitution") forbids. Three of
+the four were instead closed by building the real thing; the fourth (DISCOVER) and graphical
+tooling remain open, with the specific missing dependency named for each, matching RFC-0039
 Section 80's own "Required Pre-Implementation Dependencies" list (which already names several of
 these as open dependencies -- this phase did not discover something new, it confirmed and recorded
 what the RFC itself already flagged).
@@ -145,9 +178,9 @@ this is not a production-ready filesystem:
 - No sparse files, no on-disk reflink sharing (Phase D).
 - No persistent typed attributes (Phase D).
 - Only three health states, only one repair class, no scrub/repair history (Phase F).
-- No namespace attachment, recovery environment, or graphical tooling (this phase). System volume
-  use is now delivered for its ACTIVATE half; real hardware DISCOVERY remains RFC-0038's own
-  future work (see Addendum above).
+- No graphical tooling, and no real hardware storage DISCOVERY (RFC-0038's own future work) --
+  the two genuinely remaining Phase G gaps. Namespace attachment, system volume ACTIVATE, and
+  recovery environment support are all now delivered (see Addenda 1-3 above).
 
 Every one of these is named, in its own phase's report, with the specific reason it was deferred
 rather than attempted and gotten wrong. That is the intended reading of "Draft" here: a large,
