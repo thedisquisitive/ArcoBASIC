@@ -9,10 +9,24 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 # Structural check: every ArcFS Phase A entry point compiles cleanly at X86_64 level (RFC-0039
 # Phase A's own "validate the object and API contract" -- a compile-time check that the contract
 # is at least well-formed, before the real QEMU proof exercises it for real).
+#
+# stdlib/arcfs_policy.abas is no longer self-contained on its own since Phase B's ArcFS.MountImage
+# (appended to the same file) depends on RAMDisk.* (stdlib/block_device_policy.abas, RFC-0038) --
+# this compiler's `reveal` typechecks the whole module regardless of which --entry is requested, so
+# even an unrelated Phase A entry point now fails to reveal from that file alone. Combine the two
+# the same way the fixtures themselves already do.
+{
+    echo "#PROFILE UEFI"
+    echo "#TARGET X86_64"
+    echo "#RUNTIME NONE"
+    grep -v '^#PROFILE\|^#TARGET\|^#RUNTIME' "$ROOT/stdlib/block_device_policy.abas"
+    grep -v '^#PROFILE\|^#TARGET\|^#RUNTIME' "$ROOT/stdlib/arcfs_policy.abas"
+} > "$TMP_ROOT/combined.abas"
+
 for entry in ArcFS.Initialize ArcFS.CreateFile ArcFS.CreateDirectory ArcFS.Lookup ArcFS.Resolve \
              ArcFS.Rename ArcFS.Remove ArcFS.OpenHandle ArcFS.CloseHandle ArcFS.HandleWrite \
              ArcFS.HandleRead; do
-    "$ARCOFISSION" reveal "$ROOT/stdlib/arcfs_policy.abas" at X86_64 --entry "$entry" > "$TMP_ROOT/entry.txt" 2>&1
+    "$ARCOFISSION" reveal "$TMP_ROOT/combined.abas" at X86_64 --entry "$entry" > "$TMP_ROOT/entry.txt" 2>&1
     grep -qF 'X86_64 GENERATED' "$TMP_ROOT/entry.txt" || {
         echo "FAIL: ArcFS Phase A entry point $entry does not compile:" >&2
         cat "$TMP_ROOT/entry.txt" >&2
