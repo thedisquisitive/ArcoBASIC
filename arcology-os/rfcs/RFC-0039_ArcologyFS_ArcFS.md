@@ -10,7 +10,7 @@
 **Supersedes:** None
 **Superseded By:** None
 **Related Architecture:** Arcology Object Architecture; Polymorphic Substrate (APS); Physical Region Database (PRD); Virtual Region Database (VRD); Runtime Handle Model; Resource Model; ArcoBASIC Hardware Semantics
-**Related RFCs:** RFC-0000, RFC-0005 (ArcoBASIC Hardware Semantics), RFC-0015 (Runtime Object Handles), RFC-0017 (Substrate Resource Model), RFC-0018 (Firmware Transition and Memory Ownership), RFC-0019 (Physical Region Database), RFC-0020 (Address Spaces and Virtual Memory), RFC-0036 (APS Timer and Interrupt Routing Service), RFC-0037 (APS Substrate Dispatch Loop), RFC-0038 (APS Block Storage and Filesystem Provider Substrate), RFC-0040 (ArcologyFS Production Hardening -- amends and completes this RFC's Phases A-G reference implementation)
+**Related RFCs:** RFC-0000, RFC-0005 (ArcoBASIC Hardware Semantics), RFC-0015 (Runtime Object Handles), RFC-0017 (Substrate Resource Model), RFC-0018 (Firmware Transition and Memory Ownership), RFC-0019 (Physical Region Database), RFC-0020 (Address Spaces and Virtual Memory), RFC-0036 (APS Timer and Interrupt Routing Service), RFC-0037 (APS Substrate Dispatch Loop), RFC-0038 (APS Block Storage and Filesystem Provider Substrate), RFC-0040 (ArcologyFS Production Hardening -- amends and completes this RFC's Phases A-G reference implementation), RFC-0041 (Arcology System Namespace -- supplies the "namespace attachment" target this RFC's own Section 10 requires and Phase G's report found missing)
 
 ------------------------------------------------------------------------
 

@@ -1,0 +1,431 @@
+' Arcology System Namespace (RFC-0041). A single, colon-delimited tree, separate from and above
+' any individual filesystem's own internal namespace, in which locations can be registered as
+' plain containers, opaque object references, or FILESYSTEM ATTACHMENTS -- a path prefix that
+' delegates the remainder of a resolved path to an already-mounted filesystem's own Resolve
+' function, unchanged. This is the concrete mechanism behind RFC-0039 Section 10's "ATTACH
+' filesystem namespace -> target namespace location," the one piece RFC-0039's own Phase G report
+' found nothing in this repository to attach to.
+'
+' RFC-0041 Phase A scope (in-memory only, no persistence yet -- matching RFC-0039 Phase A's own
+' "validate the object and API contract before disk-format complexity" sequencing exactly):
+' Container/Object-Reference/Filesystem-Attachment entry kinds, delegated resolution, and nothing
+' else. No RFC-0017 dependency, no authority checks, no multiple simultaneous attachments -- all
+' explicitly out of scope, see RFC-0041 Section 4.
+'
+' This file does not modify, and does not need to modify, anything in arcfs_policy.abas. ArcFS's
+' own Resolve/OpenHandle/HandleRead contract (RFC-0039 Phases A-G) is consumed exactly as already
+' proven; delegation is entirely this file's own responsibility.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+' --- Fixed scratch addresses (policy-owned, same discipline as every RFC-0036 through RFC-0040
+' fixed address in this project). Deliberately clear of every address ArcFS's own stdlib claims
+' (0x2040000..0x208FB00), the handle table (0x2090000), and every fixture's own test-scratch
+' region (0x2091000/0x2092000). ---
+
+FUNCTION NamespaceTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34209792))   ' 0x20A0000
+END FUNCTION
+
+FUNCTION NamespaceNextIdAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34213888))   ' 0x20A1000
+END FUNCTION
+
+' Resolve result, 16 bytes: [0] resultKind (0 = not found, 1 = System Namespace entry, 2 = ArcFS
+' object reached via delegation), [8] resultId. Two non-comparable ID spaces (System Namespace
+' Entry IDs and ArcFS OIDs) cannot share one bare U64 return value without risking a caller
+' operating on the wrong object -- RFC-0041 Section 7.4's own explicit design decision.
+FUNCTION NamespaceResolveResultAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34217984))   ' 0x20A2000
+END FUNCTION
+
+' A single constant ':' byte, written once by Namespace.Initialize -- needed so resolving a path
+' that ends EXACTLY at a Filesystem Attachment (no remainder) can still delegate a well-formed
+' root path (":") to the attached filesystem, without a special-cased empty-buffer call.
+FUNCTION NamespaceRootLiteralAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34218496))   ' 0x20A2200
+END FUNCTION
+
+FUNCTION NamespaceMaxEntries() AS U64
+    RETURN 32
+END FUNCTION
+
+FUNCTION NamespaceMaxNameLength() AS U64
+    RETURN 32
+END FUNCTION
+
+' Entry kinds. 0 = free/unused (matching every fixed table in this project's own convention: kind
+' <> 0 is the active check, no separate active flag needed).
+FUNCTION NamespaceKindContainer() AS U64
+    RETURN 1
+END FUNCTION
+
+FUNCTION NamespaceKindObject() AS U64
+    RETURN 2
+END FUNCTION
+
+FUNCTION NamespaceKindFilesystemAttachment() AS U64
+    RETURN 3
+END FUNCTION
+
+' --- Entry table. Row layout, 80 bytes: [parentId U64][name 32 bytes, zero-padded][nameLength
+' U64][kind U64][objectHandle U64][objectKind U64][selfId U64]. objectHandle/objectKind are
+' meaningful only when kind = Object; unused (left zero) otherwise. ---
+
+FUNCTION NamespaceRowAddress(row AS U64) AS MMIOPTR
+    RETURN ADDRESS.Offset(NamespaceTableAddress(), row * 80)
+END FUNCTION
+
+FUNCTION NamespaceAllocateId() AS U64
+    LET nextId AS U64 = MEMORY.Read64(NamespaceNextIdAddress())
+    MEMORY.Write64(NamespaceNextIdAddress(), nextId + 1)
+    RETURN nextId
+END FUNCTION
+
+FUNCTION NamespaceFindFreeRow() AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = NamespaceMaxEntries()
+    WHILE row < NamespaceMaxEntries()
+        LET kind AS U64 = MEMORY.Read64(ADDRESS.Offset(NamespaceRowAddress(row), 48))
+        IF kind = 0 THEN
+            IF found = NamespaceMaxEntries() THEN
+                found = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION NamespaceFindRowById(entryId AS U64) AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = NamespaceMaxEntries()
+    WHILE row < NamespaceMaxEntries()
+        LET base AS MMIOPTR = NamespaceRowAddress(row)
+        LET kind AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 48))
+        IF kind <> 0 THEN
+            LET selfId AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 72))
+            IF selfId = entryId THEN
+                found = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION NamespaceNameMatches(rowBase AS MMIOPTR, storedLength AS U64, candidate AS MMIOPTR, candidateLength AS U64) AS BOOL
+    IF storedLength <> candidateLength THEN
+        RETURN 0
+    END IF
+    LET i AS U64 = 0
+    WHILE i < storedLength
+        LET a AS U8 = MEMORY.Read8(ADDRESS.Offset(rowBase, 8 + i))
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(candidate, i))
+        IF a <> b THEN
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION NamespaceFindChildRow(parentId AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = NamespaceMaxEntries()
+    WHILE row < NamespaceMaxEntries()
+        LET base AS MMIOPTR = NamespaceRowAddress(row)
+        LET kind AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 48))
+        IF kind <> 0 THEN
+            LET storedParent AS U64 = MEMORY.Read64(base)
+            IF storedParent = parentId THEN
+                LET storedLength AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 40))
+                IF NamespaceNameMatches(base, storedLength, nameBuffer, nameLength) = 1 THEN
+                    found = row
+                END IF
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION NamespaceWriteName(base AS MMIOPTR, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < NamespaceMaxNameLength()
+        LET v AS U8 = 0
+        IF i < nameLength THEN
+            v = MEMORY.Read8(ADDRESS.Offset(nameBuffer, i))
+        END IF
+        MEMORY.Write8(ADDRESS.Offset(base, 8 + i), v)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' True if any active Filesystem Attachment entry currently exists -- RFC-0041 Section 7.5's own
+' single-attachment cardinality rule, matching ArcFS's own single-mounted-volume reality.
+FUNCTION NamespaceHasActiveAttachment() AS BOOL
+    LET row AS U64 = 0
+    WHILE row < NamespaceMaxEntries()
+        LET kind AS U64 = MEMORY.Read64(ADDRESS.Offset(NamespaceRowAddress(row), 48))
+        IF kind = NamespaceKindFilesystemAttachment() THEN
+            RETURN 1
+        END IF
+        row = row + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' --- Bootstrap: resets the table and creates the root Container (Entry ID 1, no namespace entry
+' of its own -- matching ArcFS's own root-has-no-name convention). ---
+
+FUNCTION Namespace.Initialize() AS BOOL
+    LET i AS U64 = 0
+    WHILE i < 2560
+        MEMORY.Write8(ADDRESS.Offset(NamespaceTableAddress(), i), 0)
+        i = i + 1
+    WEND
+    MEMORY.Write64(NamespaceNextIdAddress(), 2)
+    MEMORY.Write8(NamespaceRootLiteralAddress(), 58)
+
+    LET rootBase AS MMIOPTR = NamespaceRowAddress(0)
+    MEMORY.Write64(rootBase, 0)
+    MEMORY.Write64(ADDRESS.Offset(rootBase, 48), NamespaceKindContainer())
+    MEMORY.Write64(ADDRESS.Offset(rootBase, 72), 1)
+
+    RETURN 1
+END FUNCTION
+
+' --- Public API: creation. ---
+
+FUNCTION Namespace.CreateContainer(parentId AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    IF nameLength = 0 THEN
+        RETURN 0
+    END IF
+    IF nameLength > NamespaceMaxNameLength() THEN
+        RETURN 0
+    END IF
+    LET parentRow AS U64 = NamespaceFindRowById(parentId)
+    IF parentRow = NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+    LET parentKind AS U64 = MEMORY.Read64(ADDRESS.Offset(NamespaceRowAddress(parentRow), 48))
+    IF parentKind <> NamespaceKindContainer() THEN
+        RETURN 0
+    END IF
+    IF NamespaceFindChildRow(parentId, nameBuffer, nameLength) <> NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+    LET freeRow AS U64 = NamespaceFindFreeRow()
+    IF freeRow = NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+
+    LET entryId AS U64 = NamespaceAllocateId()
+    LET base AS MMIOPTR = NamespaceRowAddress(freeRow)
+    MEMORY.Write64(base, parentId)
+    NamespaceWriteName(base, nameBuffer, nameLength)
+    MEMORY.Write64(ADDRESS.Offset(base, 40), nameLength)
+    MEMORY.Write64(ADDRESS.Offset(base, 48), NamespaceKindContainer())
+    MEMORY.Write64(ADDRESS.Offset(base, 72), entryId)
+    RETURN entryId
+END FUNCTION
+
+FUNCTION Namespace.CreateObject(parentId AS U64, nameBuffer AS MMIOPTR, nameLength AS U64, objectHandle AS U64, objectKind AS U64) AS U64
+    IF nameLength = 0 THEN
+        RETURN 0
+    END IF
+    IF nameLength > NamespaceMaxNameLength() THEN
+        RETURN 0
+    END IF
+    LET parentRow AS U64 = NamespaceFindRowById(parentId)
+    IF parentRow = NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+    LET parentKind AS U64 = MEMORY.Read64(ADDRESS.Offset(NamespaceRowAddress(parentRow), 48))
+    IF parentKind <> NamespaceKindContainer() THEN
+        RETURN 0
+    END IF
+    IF NamespaceFindChildRow(parentId, nameBuffer, nameLength) <> NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+    LET freeRow AS U64 = NamespaceFindFreeRow()
+    IF freeRow = NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+
+    LET entryId AS U64 = NamespaceAllocateId()
+    LET base AS MMIOPTR = NamespaceRowAddress(freeRow)
+    MEMORY.Write64(base, parentId)
+    NamespaceWriteName(base, nameBuffer, nameLength)
+    MEMORY.Write64(ADDRESS.Offset(base, 40), nameLength)
+    MEMORY.Write64(ADDRESS.Offset(base, 48), NamespaceKindObject())
+    MEMORY.Write64(ADDRESS.Offset(base, 56), objectHandle)
+    MEMORY.Write64(ADDRESS.Offset(base, 64), objectKind)
+    MEMORY.Write64(ADDRESS.Offset(base, 72), entryId)
+    RETURN entryId
+END FUNCTION
+
+' RFC-0039 Section 10's ATTACH step, made concrete. Rejects a second attachment while one is
+' already active (RFC-0041 Section 7.5) rather than silently detaching the first.
+FUNCTION Namespace.AttachFilesystem(parentId AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    IF nameLength = 0 THEN
+        RETURN 0
+    END IF
+    IF nameLength > NamespaceMaxNameLength() THEN
+        RETURN 0
+    END IF
+    IF NamespaceHasActiveAttachment() = 1 THEN
+        RETURN 0
+    END IF
+    LET parentRow AS U64 = NamespaceFindRowById(parentId)
+    IF parentRow = NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+    LET parentKind AS U64 = MEMORY.Read64(ADDRESS.Offset(NamespaceRowAddress(parentRow), 48))
+    IF parentKind <> NamespaceKindContainer() THEN
+        RETURN 0
+    END IF
+    IF NamespaceFindChildRow(parentId, nameBuffer, nameLength) <> NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+    LET freeRow AS U64 = NamespaceFindFreeRow()
+    IF freeRow = NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+
+    LET entryId AS U64 = NamespaceAllocateId()
+    LET base AS MMIOPTR = NamespaceRowAddress(freeRow)
+    MEMORY.Write64(base, parentId)
+    NamespaceWriteName(base, nameBuffer, nameLength)
+    MEMORY.Write64(ADDRESS.Offset(base, 40), nameLength)
+    MEMORY.Write64(ADDRESS.Offset(base, 48), NamespaceKindFilesystemAttachment())
+    MEMORY.Write64(ADDRESS.Offset(base, 72), entryId)
+    RETURN entryId
+END FUNCTION
+
+' RFC-0039 Section 10's DETACH step. Removes the attachment's namespace visibility only -- does
+' NOT touch ArcFS's own mount state (that remains the caller's own concern via ArcFS.MountImage/
+' ArcFS.ActivateSystemVolume, exactly as before this RFC existed).
+FUNCTION Namespace.DetachFilesystem(entryId AS U64) AS BOOL
+    LET row AS U64 = NamespaceFindRowById(entryId)
+    IF row = NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+    LET base AS MMIOPTR = NamespaceRowAddress(row)
+    LET kind AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 48))
+    IF kind <> NamespaceKindFilesystemAttachment() THEN
+        RETURN 0
+    END IF
+    MEMORY.Write64(ADDRESS.Offset(base, 48), 0)
+    RETURN 1
+END FUNCTION
+
+' --- Public API: inspection of an Object Reference entry. ---
+
+FUNCTION Namespace.GetObjectHandle(entryId AS U64) AS U64
+    LET row AS U64 = NamespaceFindRowById(entryId)
+    IF row = NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(NamespaceRowAddress(row), 56))
+END FUNCTION
+
+FUNCTION Namespace.GetObjectKind(entryId AS U64) AS U64
+    LET row AS U64 = NamespaceFindRowById(entryId)
+    IF row = NamespaceMaxEntries() THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(NamespaceRowAddress(row), 64))
+END FUNCTION
+
+' --- Public API: colon-delimited path resolution with delegation (RFC-0041 Section 7.4). Paths
+' are root-relative and begin with ':' (RFC-0039 Section 9.1's own grammar, reused verbatim), e.g.
+' ":volumes:data:home:documents:notes.txt"; ":" alone is the System Namespace root. ---
+
+FUNCTION Namespace.Resolve(pathBuffer AS MMIOPTR, pathLength AS U64) AS BOOL
+    LET result AS MMIOPTR = NamespaceResolveResultAddress()
+    MEMORY.Write64(result, 0)
+    MEMORY.Write64(ADDRESS.Offset(result, 8), 0)
+
+    IF pathLength = 0 THEN
+        RETURN 0
+    END IF
+    LET firstByte AS U8 = MEMORY.Read8(pathBuffer)
+    IF firstByte <> 58 THEN
+        RETURN 0
+    END IF
+    IF pathLength = 1 THEN
+        MEMORY.Write64(result, 1)
+        MEMORY.Write64(ADDRESS.Offset(result, 8), 1)
+        RETURN 1
+    END IF
+
+    LET current AS U64 = 1
+    LET cursor AS U64 = 1
+    WHILE cursor < pathLength
+        LET componentStart AS U64 = cursor
+        LET scanning AS U64 = 1
+        WHILE scanning = 1
+            IF cursor >= pathLength THEN
+                scanning = 0
+            ELSE
+                LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(pathBuffer, cursor))
+                IF b = 58 THEN
+                    scanning = 0
+                ELSE
+                    cursor = cursor + 1
+                END IF
+            END IF
+        WEND
+        LET componentLength AS U64 = cursor - componentStart
+        IF componentLength = 0 THEN
+            RETURN 0
+        END IF
+        LET componentPtr AS MMIOPTR = ADDRESS.Offset(pathBuffer, componentStart)
+
+        LET row AS U64 = NamespaceFindChildRow(current, componentPtr, componentLength)
+        IF row = NamespaceMaxEntries() THEN
+            RETURN 0
+        END IF
+        LET base AS MMIOPTR = NamespaceRowAddress(row)
+        LET kind AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 48))
+
+        IF kind = NamespaceKindFilesystemAttachment() THEN
+            LET remainderPtr AS MMIOPTR = ADDRESS.Offset(pathBuffer, cursor)
+            LET remainderLen AS U64 = pathLength - cursor
+            IF remainderLen = 0 THEN
+                remainderPtr = NamespaceRootLiteralAddress()
+                remainderLen = 1
+            END IF
+            LET arcfsOid AS U64 = ArcFS.Resolve(remainderPtr, remainderLen)
+            IF arcfsOid = 0 THEN
+                RETURN 0
+            END IF
+            MEMORY.Write64(result, 2)
+            MEMORY.Write64(ADDRESS.Offset(result, 8), arcfsOid)
+            RETURN 1
+        END IF
+
+        IF cursor >= pathLength THEN
+            IF kind = 0 THEN
+                RETURN 0
+            END IF
+            LET selfId AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 72))
+            MEMORY.Write64(result, 1)
+            MEMORY.Write64(ADDRESS.Offset(result, 8), selfId)
+            RETURN 1
+        END IF
+
+        IF kind <> NamespaceKindContainer() THEN
+            RETURN 0
+        END IF
+        LET selfId2 AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 72))
+        current = selfId2
+        cursor = cursor + 1
+    WEND
+    RETURN 0
+END FUNCTION
