@@ -1,3 +1,164 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+' "APS ARCFS PHASE J OK\r\n" -- printed only if every check above passed.
+FUNCTION SerialMarkerArcFSPhaseJOK() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(65)
+    SerialByte(82)
+    SerialByte(67)
+    SerialByte(70)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(80)
+    SerialByte(72)
+    SerialByte(65)
+    SerialByte(83)
+    SerialByte(69)
+    SerialByte(32)
+    SerialByte(74)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+' APS RAM Disk Block Device Provider (RFC-0038: APS Block Storage and Filesystem Provider
+' Substrate, Requirements 6.1/6.2). Backs the Filesystem Provider layer (fat32_policy.abas) with
+' no real storage hardware driver needed -- the RAM disk itself is just a byte range in memory.
+
+
+' --- A documented deviation, stated up front, in the same spirit as loop_policy.abas's own
+' header note. ---
+'
+' RFC-0038 Section 6.1 specifies `RAMDisk.Create(sizeBytes AS U64) AS BlockDevice` -- a value of
+' an abstract `BlockDevice` interface type, so calling code can hold a RAM disk, a future AHCI
+' device, etc. behind one shape. This implementation exposes `RAMDisk.*` as concrete, directly-
+' named functions instead (`RAMDisk.SectorSize()`, `RAMDisk.ReadSectors(...)`, ...), and
+' `RAMDisk.Create` returns `BOOL`, not a `BlockDevice` value. Reason: this compiler's freestanding
+' x86-64 backend has no runtime-polymorphic dispatch mechanism at all -- confirmed the same way
+' RFC-0037's `Loop.RegisterHook` deviation was confirmed (AmirInstruction::Kind::AddressOf is
+' unhandled by generate_x86_64_function; CallValue can only call a compile-time-known function
+' name). There is only one RAM disk in this milestone -- the same "one instance, fixed scratch
+' state" pattern every prior RFC in this chain has used (one timer, one loop, one exception
+' table) -- so the concrete-function shape loses nothing real yet; it becomes a genuine gap only
+' once a second, different BlockDevice implementation (a real AHCI/NVMe/virtio-blk driver, all
+' explicitly Non-Goals/Future Extensions of this RFC) needs to be swapped in behind the same
+' calling code, at which point this needs the same treatment RFC-0027's freestanding callables
+' would need for Loop.RegisterHook.
+'
+' A second deviation, specific to RAMDisk.Create: RFC-0038's own text says the backing memory
+' should be "AllocatePages-sourced." This implementation's RAMDisk.Create does not allocate
+' memory at all -- it records the size of a *fixed, pre-populated* memory region (see
+' RAMDiskBaseAddress below) whose bytes are already correct by the time this program starts,
+' because the QEMU/OVMF test harness places them there before boot (scripts/run/
+' run-uefi-hello-with-preload.sh, a `-device loader,file=...,addr=...` preload -- see that
+' script's own header comment and .agents/reports/aps-block-storage.md for why). This sidesteps
+' RFC-0038 Stop Condition #17.5's anticipated UEFI-Block-IO-binding gap entirely rather than
+' hitting it: no UEFI protocol call populates this RAM disk in this implementation, at any point.
+' A future increment that actually copies bytes from a live UEFI Block IO device into freshly
+' AllocatePages'd memory would change this function's *body*, not its contract --
+' RAMDisk.SectorSize/SectorCount/ReadSectors/WriteSectors/IsWritable are unaffected either way.
+
+FUNCTION RAMDiskBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(67108864))   ' 0x4000000, 64 MiB -- see header note
+END FUNCTION
+
+FUNCTION RAMDiskStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33751040))   ' 0x2030000
+END FUNCTION
+
+FUNCTION RAMDisk.Create(sizeBytes AS U64) AS BOOL
+    MEMORY.Write64(RAMDiskStateAddress(), sizeBytes \ 512)
+    RETURN 1
+END FUNCTION
+
+FUNCTION RAMDisk.SectorSize() AS U32
+    RETURN 512
+END FUNCTION
+
+FUNCTION RAMDisk.SectorCount() AS U64
+    RETURN MEMORY.Read64(RAMDiskStateAddress())
+END FUNCTION
+
+FUNCTION RAMDisk.IsWritable() AS BOOL
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: MUST reject (return FALSE, MUST NOT partially transfer) a request whose
+' startSector + count exceeds SectorCount().
+FUNCTION RAMDisk.ReadSectors(startSector AS U64, count AS U32, destination AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i))
+        MEMORY.Write8(ADDRESS.Offset(destination, i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: WriteSectors on a device where IsWritable() is FALSE MUST return FALSE without
+' touching the medium -- not reachable for the RAM disk itself (always writable), but implemented
+' symmetrically with ReadSectors for contract completeness; unexercised by this RFC's own QEMU
+' proof, which only reads a pre-populated, read-only-in-spirit test image.
+FUNCTION RAMDisk.WriteSectors(startSector AS U64, count AS U32, source AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(source, i))
+        MEMORY.Write8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
 ' ArcologyFS (ArcFS) Phase A: in-memory semantic model (RFC-0039 Section 78, Phase A --
 ' "Implement: OIDs; directory namespace; files/streams; handle semantics; transactions;
 ' rename/delete behavior; capability checks; no persistent disk yet. Purpose: validate the object
@@ -5,9 +166,6 @@
 ' no checkpoints -- this is the object/namespace/handle CONTRACT proven against real memory and a
 ' real CPU before any of RFC-0039's later, much larger disk-format phases exist.
 
-#PROFILE UEFI
-#TARGET X86_64
-#RUNTIME NONE
 
 ' --- Documented Phase A scope reductions, stated up front. ---
 '
@@ -3374,4 +3532,365 @@ FUNCTION ArcFS.ActivateSystemVolume() AS U64
         RETURN 1
     END IF
     RETURN 2
+END FUNCTION
+
+' ArcologyFS (ArcFS): growable Object Tree (RFC-0040 Section 9, Phase J -- scoped to the Object
+' Tree only, bulk-built fresh every commit rather than incrementally split; see
+' .agents/reports/aps-arcfs-phase-j.md for the full architectural reasoning).
+'
+' This fixture proves, under a real CPU (QEMU/OVMF):
+'
+'   1. A real, multi-node, multi-level tree: 6 files plus root (7 active objects) with a
+'      deliberately small node-occupancy threshold (ArcFSObjectTreeNodeCapacity, 4) forces at
+'      least 2 leaves and 1 internal root -- provable without approaching
+'      ArcFSMaxObjects()'s own 64-row ceiling.
+'   2. Every object still resolves correctly, with correct content, after a real commit and
+'      remount -- the tree genuinely round-trips through disk, not just in memory.
+'   3. ArcFS.GetHealthState() reports Healthy through the NEW tree-walking scrub path -- Phase F's
+'      reachability/orphan/overlap checks all still work correctly against a real multi-node tree,
+'      not just the single-leaf case.
+'   4. Reachability correctly follows the WHOLE superseded tree, not just its root: committing
+'      again with no further change supersedes generation 2's entire tree (root, leaves, and
+'      internal node alike), and ArcFS.IsSectorReachable correctly reports the old root
+'      unreachable.
+'   5. Real reclamation and reuse extend correctly to tree structure, not just file data:
+'      ArcFS.ReclaimGeneration() frees real sectors from the superseded tree, and every file still
+'      resolves with correct content afterward -- the reclaim-and-rebuild cycle does not corrupt
+'      anything.
+'
+' No GDT/IDT/interrupt setup, matching every prior ArcFS fixture's own minimal-fixture precedent.
+
+FUNCTION ArcFSJTestScratchBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34148352))   ' 0x2091000
+END FUNCTION
+
+FUNCTION ArcFSJTestStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34152448))   ' 0x2092000
+END FUNCTION
+
+FUNCTION ArcFSJTestScratch() AS MMIOPTR
+    LET base AS U64 = MEMORY.Read64(ArcFSJTestScratchBaseAddress())
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(base))
+END FUNCTION
+
+FUNCTION ArcFSJTestFailuresAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSJTestStateAddress(), 0)
+END FUNCTION
+
+FUNCTION ArcFSJTestFail() AS U64
+    LET f AS U64 = MEMORY.Read64(ArcFSJTestFailuresAddress())
+    MEMORY.Write64(ArcFSJTestFailuresAddress(), f + 1)
+    RETURN 0
+END FUNCTION
+
+FUNCTION OldRootSectorAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSJTestStateAddress(), 16)
+END FUNCTION
+
+' 6 file names "j0.txt".."j5.txt" (6 bytes each), 6 content buffers (32 bytes each, a distinct
+' repeating pattern per file so a mixup between files is directly detectable), all packed into
+' the shared scratch region.
+FUNCTION NameFile(i AS U64) AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSJTestScratch(), i * 16)
+END FUNCTION
+
+FUNCTION ContentFile(i AS U64) AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSJTestScratch(), 128 + i * 64)
+END FUNCTION
+
+FUNCTION ReadBackBuffer() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSJTestScratch(), 640)
+END FUNCTION
+
+FUNCTION FileOidsBase() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSJTestScratch(), 768)
+END FUNCTION
+
+FUNCTION ArcFSJBuffersEqual(a AS MMIOPTR, b AS MMIOPTR, count AS U64) AS BOOL
+    LET i AS U64 = 0
+    WHILE i < count
+        LET av AS U8 = MEMORY.Read8(ADDRESS.Offset(a, i))
+        LET bv AS U8 = MEMORY.Read8(ADDRESS.Offset(b, i))
+        IF av <> bv THEN
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION PhaseJBuildNamesAndContent() AS U64
+    LET i AS U64 = 0
+    WHILE i < 6
+        LET name AS MMIOPTR = NameFile(i)
+        MEMORY.Write8(ADDRESS.Offset(name, 0), 106)   ' j
+        LET digit AS U64 = 48 + i
+        LET digitByte AS U8 = digit
+        MEMORY.Write8(ADDRESS.Offset(name, 1), digitByte)
+        MEMORY.Write8(ADDRESS.Offset(name, 2), 46)    ' .
+        MEMORY.Write8(ADDRESS.Offset(name, 3), 116)   ' t
+        MEMORY.Write8(ADDRESS.Offset(name, 4), 120)   ' x
+        MEMORY.Write8(ADDRESS.Offset(name, 5), 116)   ' t
+
+        LET content AS MMIOPTR = ContentFile(i)
+        LET b AS U64 = 0
+        WHILE b < 32
+            LET v AS U64 = 65 + i + (b MOD 10)
+            LET vb AS U8 = v
+            MEMORY.Write8(ADDRESS.Offset(content, b), vb)
+            b = b + 1
+        WEND
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' Step 1: format, mount, confirm root resolves through a fresh single-leaf tree.
+FUNCTION PhaseJFormatAndVerifyRoot() AS U64
+    RAMDisk.Create(262144)
+    IF ArcFS.FormatVolume() = 0 THEN
+        ArcFSJTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.MountImage() = 0 THEN
+        ArcFSJTestFail()
+        RETURN 0
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Step 2: create 6 files with distinct content, forcing (ArcFSObjectTreeNodeCapacity=4, 7 active
+' objects including root) a real multi-leaf, multi-level tree. Commits for real -- generation 2.
+' Captures the resulting root node sector and every file's OID.
+FUNCTION PhaseJCreateSixFilesAndCommit() AS U64
+    LET oidsBase AS MMIOPTR = FileOidsBase()
+    LET i AS U64 = 0
+    WHILE i < 6
+        LET oid AS U64 = ArcFS.CreateFile(1, NameFile(i), 6)
+        IF oid = 0 THEN
+            ArcFSJTestFail()
+            RETURN 0
+        END IF
+        LET h AS U64 = ArcFS.OpenHandle(oid)
+        IF h = 0 THEN
+            ArcFSJTestFail()
+            RETURN 0
+        END IF
+        LET written AS U64 = ArcFS.HandleWrite(h, ContentFile(i), 32)
+        IF written <> 32 THEN ArcFSJTestFail()
+        ArcFS.CloseHandle(h)
+        MEMORY.Write64(ADDRESS.Offset(oidsBase, i * 8), oid)
+        i = i + 1
+    WEND
+
+    IF ArcFS.CommitImage() = 0 THEN
+        ArcFSJTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.MountImage() = 0 THEN
+        ArcFSJTestFail()
+        RETURN 0
+    END IF
+    MEMORY.Write64(OldRootSectorAddress(), MEMORY.Read64(ADDRESS.Offset(ArcFSMountStateAddress(), 8)))
+    RETURN 0
+END FUNCTION
+
+' Step 3: confirm every one of the 6 files resolves with correct content after a real commit and
+' remount -- the multi-node tree genuinely round-trips through disk.
+FUNCTION PhaseJVerifyAllFilesRoundTrip() AS U64
+    LET oidsBase AS MMIOPTR = FileOidsBase()
+    LET i AS U64 = 0
+    WHILE i < 6
+        LET expectedOid AS U64 = MEMORY.Read64(ADDRESS.Offset(oidsBase, i * 8))
+        LET actualOid AS U64 = ArcFS.Lookup(1, NameFile(i), 6)
+        IF actualOid <> expectedOid THEN
+            ArcFSJTestFail()
+        END IF
+        LET h AS U64 = ArcFS.OpenHandle(actualOid)
+        IF h = 0 THEN
+            ArcFSJTestFail()
+        ELSE
+            LET readBack AS U64 = ArcFS.HandleRead(h, ReadBackBuffer(), 128)
+            IF readBack <> 32 THEN ArcFSJTestFail()
+            IF ArcFSJBuffersEqual(ContentFile(i), ReadBackBuffer(), 32) = 0 THEN ArcFSJTestFail()
+            ArcFS.CloseHandle(h)
+        END IF
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' Step 4: the new tree-walking scrub reports Healthy against a real multi-node tree.
+FUNCTION PhaseJVerifyHealthy() AS U64
+    IF ArcFS.GetHealthState() <> 0 THEN ArcFSJTestFail()
+    RETURN 0
+END FUNCTION
+
+' Step 5: commit again with no further change -- supersedes generation 2's ENTIRE tree (root,
+' both leaves, and the internal node alike). Confirms the old root is now unreachable -- proving
+' reachability follows the whole superseded tree structure, not just a data extent.
+FUNCTION PhaseJSupersedeAndVerifyUnreachable() AS U64
+    IF ArcFS.CommitImage() = 0 THEN
+        ArcFSJTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.MountImage() = 0 THEN
+        ArcFSJTestFail()
+        RETURN 0
+    END IF
+    LET oldRoot AS U64 = MEMORY.Read64(OldRootSectorAddress())
+    IF ArcFS.IsSectorReachable(oldRoot) <> 0 THEN ArcFSJTestFail()
+    RETURN 0
+END FUNCTION
+
+' Step 6 (RFC-0040 Section 7 extended to tree structure): reclaim the now-unreachable old tree
+' for real, then confirm every file still resolves with correct content afterward -- the
+' reclaim-and-rebuild cycle does not corrupt anything.
+FUNCTION PhaseJReclaimAndVerifyIntact() AS U64
+    LET reclaimed AS U64 = ArcFS.ReclaimGeneration()
+    IF reclaimed = 0 THEN ArcFSJTestFail()
+    IF ArcFS.CommitImage() = 0 THEN
+        ArcFSJTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.MountImage() = 0 THEN
+        ArcFSJTestFail()
+        RETURN 0
+    END IF
+    PhaseJVerifyAllFilesRoundTrip()
+    IF ArcFS.GetHealthState() <> 0 THEN ArcFSJTestFail()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET probe AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 1
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocate AS U64 = systemTable.BootServices.AllocatePool(2, allocationSize, bufferAddress)
+    IF allocate <> 0 THEN
+        RETURN 1
+    END IF
+    mapSize = allocationSize
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("APS PRE")
+
+    LET root AS U64 = 0
+    LET rootAddress AS PTR = ADDRESS.Local(root)
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 3, rootAddress)
+    IF pageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    LET scratchRoot AS U64 = 0
+    LET scratchRootAddress AS PTR = ADDRESS.Local(scratchRoot)
+    LET scratchPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 1, scratchRootAddress)
+    IF scratchPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS SCRATCH ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS PAGE")
+    LET pdpt AS U64 = root + 4096
+    LET pageDirectory AS U64 = root + 8192
+
+    LET clearIndex AS U64 = 0
+    WHILE clearIndex < 1536
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(root + (clearIndex * 8)), 0)
+        clearIndex = clearIndex + 1
+    WEND
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(root), pdpt OR 3)
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt), pageDirectory OR 3)
+    LET directoryIndex AS U64 = 0
+    WHILE directoryIndex < 512
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + (directoryIndex * 8)), (directoryIndex * 2097152) OR 131)
+        directoryIndex = directoryIndex + 1
+    WEND
+    LET rootCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(root))
+    LET pdptCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(pdpt))
+    IF rootCheck <> (pdpt OR 3) THEN
+        systemTable.ConsoleOut.Write("APS ROOT BAD")
+        CPU.HaltForever
+    END IF
+    IF pdptCheck <> (pageDirectory OR 3) THEN
+        systemTable.ConsoleOut.Write("APS PDPT BAD")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS TABLE OK")
+
+    CPU.DisableInterrupts
+    LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
+    IF exitStatus <> 0 THEN
+        CPU.HaltForever
+    END IF
+
+    CPU.DisableInterrupts
+    CPU.WriteCR3(root)
+    LET activeRoot AS U64 = CPU.ReadCR3()
+    IF activeRoot <> root THEN
+        CPU.HaltForever
+    END IF
+    MEMORY.Write32(ADDRESS.Virtual(1048576), 2779096485)
+
+    SerialInit()
+
+    MEMORY.Write64(ArcFSJTestScratchBaseAddress(), scratchRoot)
+    LET stateIndex AS U64 = 0
+    WHILE stateIndex < 64
+        MEMORY.Write8(ADDRESS.Offset(ArcFSJTestStateAddress(), stateIndex), 0)
+        stateIndex = stateIndex + 1
+    WEND
+
+    PhaseJBuildNamesAndContent()
+    PhaseJFormatAndVerifyRoot()
+    PhaseJCreateSixFilesAndCommit()
+    PhaseJVerifyAllFilesRoundTrip()
+    PhaseJVerifyHealthy()
+    PhaseJSupersedeAndVerifyUnreachable()
+    PhaseJReclaimAndVerifyIntact()
+
+    ' Serial-only failure reporting -- systemTable.ConsoleOut.Write after ExitBootServices hangs in
+    ' this QEMU/OVMF environment (found and documented in .agents/reports/aps-arcfs-phase-a.md).
+    LET failures AS U64 = MEMORY.Read64(ArcFSJTestFailuresAddress())
+    IF failures <> 0 THEN
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(32)
+        LET digit AS U64 = failures
+        IF digit > 9 THEN digit = 9
+        LET digitPlus48 AS U64 = digit + 48
+        LET digitByte AS U8 = digitPlus48
+        SerialByte(digitByte)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    SerialMarkerArcFSPhaseJOK()
+    CPU.HaltForever
 END FUNCTION

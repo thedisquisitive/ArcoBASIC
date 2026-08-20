@@ -18,7 +18,7 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 } > "$TMP_ROOT/combined.abas"
 
 for entry in ArcFSAllocateOid ArcFSLastAllocatedOidHigh ArcFSCreateObject ArcFS.Reflink \
-             ArcFSWriteObjectRecord ArcFSLoadOneObject ArcFS.MountImage ArcFS.FormatVolume \
+             ArcFSWriteOneLeafNode ArcFSPopulateObjectRow ArcFS.MountImage ArcFS.FormatVolume \
              ArcFS.PrepareCommit ArcFSSnapshotFindObjectRecord ArcFSScanGeneration; do
     "$ARCOFISSION" reveal "$TMP_ROOT/combined.abas" at X86_64 --entry "$entry" > "$TMP_ROOT/entry.txt" 2>&1
     grep -qF 'X86_64 GENERATED' "$TMP_ROOT/entry.txt" || {
