@@ -2,11 +2,11 @@
 
 **RFC Number:** RFC-0040
 **Title:** ArcologyFS (ArcFS) Production Hardening
-**Status:** Draft
+**Status:** Draft (Phase H implemented and QEMU-proven -- see `.agents/reports/aps-arcfs-phase-h.md`; Phases I-M not yet begun)
 **Category:** Storage / Filesystem Architecture
 **Authors:** Arcology Project
 **Created:** 2026-08-19
-**Last Updated:** 2026-08-19
+**Last Updated:** 2026-08-20
 **Supersedes:** None
 **Superseded By:** None
 **Related Architecture:** Arcology Object Architecture; Polymorphic Substrate (APS)
@@ -646,3 +646,4 @@ closes a gap RFC-0039 itself already specified normatively.
 | Version | Date       | Summary                                                        |
 |---------|------------|------------------------------------------------------------------|
 | 0.1     | 2026-08-19 | Initial draft. Written directly from RFC-0039 Phases A-G's own accumulated, dated scope-reduction notes -- every requirement in Sections 7-14 traces to a specific named gap in a specific phase report, not a speculative addition. Defines Format Major Version 2 and a six-phase (H-M) implementation plan. Explicitly excludes RFC-0039 Phase G's remaining namespace-attachment/system-volume/recovery-environment/graphical-tooling items, matching `.agents/reports/aps-arcfs-phase-g.md`'s own finding that their dependencies do not exist in this repository. Status: Draft; no implementation phase has begun. |
+| 0.2     | 2026-08-20 | Phase H implemented and QEMU-proven: FMV2 superblock ring (4 redundant copies, Section 8.1/8.2), generation history (`previousCheckpointSector`, Section 8.3), CRC-32C checksums replacing the additive-sum placeholder for every record type (Section 8.4), Format Major Version 2 activation (magic `ARCFSB02`, Section 15.1). 128-bit OIDs (Section 10) deliberately NOT delivered this phase -- named, sized (~150 call sites plus a downstream RFC-0041 consumer), and sequenced as the immediate next increment rather than bundled in under-tested; see the phase report for the full reasoning. Real proof under QEMU/OVMF: a fresh FMV2 format/mount, a real generation-2 commit whose checkpoint correctly links back through `previousCheckpointSector`, CRC-32C genuinely catching a flipped byte and failing the mount closed, and the ring correctly tolerating two of its four copies being reverted to stale content. Found and fixed one real consequence of the format-shape change (`ArcFS.ReclaimableSectorCount`'s reachability scan start point) and one real regression in a smoke test's own structural-check entry list (function renames, not the frozen fixture it later runs). Every FMV1 fixture (RFC-0039 Phases A-G, system-volume, RFC-0041's system-namespace, recovery-environment, graphical-storage-tooling) required zero changes -- each inlines its own frozen snapshot of the pre-Phase-H stdlib, matching Section 15.3. See `.agents/reports/aps-arcfs-phase-h.md`. |

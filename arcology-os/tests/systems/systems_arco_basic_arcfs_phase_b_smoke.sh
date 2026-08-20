@@ -18,8 +18,8 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
     grep -v '^#PROFILE\|^#TARGET\|^#RUNTIME' "$ROOT/stdlib/arcfs_policy.abas"
 } > "$TMP_ROOT/combined.abas"
 
-for entry in ArcFS.MountImage ArcFSReadSuperblock ArcFSReadCheckpoint ArcFSLoadObjects \
-             ArcFSLoadNamespace ArcFSMagicMatches ArcFSRecordChecksum; do
+for entry in ArcFS.MountImage ArcFSReadSuperblockRing ArcFSReadCheckpoint ArcFSLoadObjects \
+             ArcFSLoadNamespace ArcFSMagicMatches ArcFSCrc32C; do
     "$ARCOFISSION" reveal "$TMP_ROOT/combined.abas" at X86_64 --entry "$entry" > "$TMP_ROOT/entry.txt" 2>&1
     grep -qF 'X86_64 GENERATED' "$TMP_ROOT/entry.txt" || {
         echo "FAIL: ArcFS Phase B entry point $entry does not compile:" >&2

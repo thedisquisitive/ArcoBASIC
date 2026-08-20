@@ -1,3 +1,164 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+' "APS ARCFS PHASE H OK\r\n" -- printed only if every check above passed.
+FUNCTION SerialMarkerArcFSPhaseHOK() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(65)
+    SerialByte(82)
+    SerialByte(67)
+    SerialByte(70)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(80)
+    SerialByte(72)
+    SerialByte(65)
+    SerialByte(83)
+    SerialByte(69)
+    SerialByte(32)
+    SerialByte(72)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+' APS RAM Disk Block Device Provider (RFC-0038: APS Block Storage and Filesystem Provider
+' Substrate, Requirements 6.1/6.2). Backs the Filesystem Provider layer (fat32_policy.abas) with
+' no real storage hardware driver needed -- the RAM disk itself is just a byte range in memory.
+
+
+' --- A documented deviation, stated up front, in the same spirit as loop_policy.abas's own
+' header note. ---
+'
+' RFC-0038 Section 6.1 specifies `RAMDisk.Create(sizeBytes AS U64) AS BlockDevice` -- a value of
+' an abstract `BlockDevice` interface type, so calling code can hold a RAM disk, a future AHCI
+' device, etc. behind one shape. This implementation exposes `RAMDisk.*` as concrete, directly-
+' named functions instead (`RAMDisk.SectorSize()`, `RAMDisk.ReadSectors(...)`, ...), and
+' `RAMDisk.Create` returns `BOOL`, not a `BlockDevice` value. Reason: this compiler's freestanding
+' x86-64 backend has no runtime-polymorphic dispatch mechanism at all -- confirmed the same way
+' RFC-0037's `Loop.RegisterHook` deviation was confirmed (AmirInstruction::Kind::AddressOf is
+' unhandled by generate_x86_64_function; CallValue can only call a compile-time-known function
+' name). There is only one RAM disk in this milestone -- the same "one instance, fixed scratch
+' state" pattern every prior RFC in this chain has used (one timer, one loop, one exception
+' table) -- so the concrete-function shape loses nothing real yet; it becomes a genuine gap only
+' once a second, different BlockDevice implementation (a real AHCI/NVMe/virtio-blk driver, all
+' explicitly Non-Goals/Future Extensions of this RFC) needs to be swapped in behind the same
+' calling code, at which point this needs the same treatment RFC-0027's freestanding callables
+' would need for Loop.RegisterHook.
+'
+' A second deviation, specific to RAMDisk.Create: RFC-0038's own text says the backing memory
+' should be "AllocatePages-sourced." This implementation's RAMDisk.Create does not allocate
+' memory at all -- it records the size of a *fixed, pre-populated* memory region (see
+' RAMDiskBaseAddress below) whose bytes are already correct by the time this program starts,
+' because the QEMU/OVMF test harness places them there before boot (scripts/run/
+' run-uefi-hello-with-preload.sh, a `-device loader,file=...,addr=...` preload -- see that
+' script's own header comment and .agents/reports/aps-block-storage.md for why). This sidesteps
+' RFC-0038 Stop Condition #17.5's anticipated UEFI-Block-IO-binding gap entirely rather than
+' hitting it: no UEFI protocol call populates this RAM disk in this implementation, at any point.
+' A future increment that actually copies bytes from a live UEFI Block IO device into freshly
+' AllocatePages'd memory would change this function's *body*, not its contract --
+' RAMDisk.SectorSize/SectorCount/ReadSectors/WriteSectors/IsWritable are unaffected either way.
+
+FUNCTION RAMDiskBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(67108864))   ' 0x4000000, 64 MiB -- see header note
+END FUNCTION
+
+FUNCTION RAMDiskStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33751040))   ' 0x2030000
+END FUNCTION
+
+FUNCTION RAMDisk.Create(sizeBytes AS U64) AS BOOL
+    MEMORY.Write64(RAMDiskStateAddress(), sizeBytes \ 512)
+    RETURN 1
+END FUNCTION
+
+FUNCTION RAMDisk.SectorSize() AS U32
+    RETURN 512
+END FUNCTION
+
+FUNCTION RAMDisk.SectorCount() AS U64
+    RETURN MEMORY.Read64(RAMDiskStateAddress())
+END FUNCTION
+
+FUNCTION RAMDisk.IsWritable() AS BOOL
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: MUST reject (return FALSE, MUST NOT partially transfer) a request whose
+' startSector + count exceeds SectorCount().
+FUNCTION RAMDisk.ReadSectors(startSector AS U64, count AS U32, destination AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i))
+        MEMORY.Write8(ADDRESS.Offset(destination, i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: WriteSectors on a device where IsWritable() is FALSE MUST return FALSE without
+' touching the medium -- not reachable for the RAM disk itself (always writable), but implemented
+' symmetrically with ReadSectors for contract completeness; unexercised by this RFC's own QEMU
+' proof, which only reads a pre-populated, read-only-in-spirit test image.
+FUNCTION RAMDisk.WriteSectors(startSector AS U64, count AS U32, source AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(source, i))
+        MEMORY.Write8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
 ' ArcologyFS (ArcFS) Phase A: in-memory semantic model (RFC-0039 Section 78, Phase A --
 ' "Implement: OIDs; directory namespace; files/streams; handle semantics; transactions;
 ' rename/delete behavior; capability checks; no persistent disk yet. Purpose: validate the object
@@ -5,9 +166,6 @@
 ' no checkpoints -- this is the object/namespace/handle CONTRACT proven against real memory and a
 ' real CPU before any of RFC-0039's later, much larger disk-format phases exist.
 
-#PROFILE UEFI
-#TARGET X86_64
-#RUNTIME NONE
 
 ' --- Documented Phase A scope reductions, stated up front. ---
 '
@@ -2563,4 +2721,412 @@ FUNCTION ArcFS.ActivateSystemVolume() AS U64
         RETURN 1
     END IF
     RETURN 2
+END FUNCTION
+
+' ArcologyFS (ArcFS) Phase H: format foundation (RFC-0040 Section 16, Phase H -- "FMV2
+' superblock/checkpoint shape (Sections 8, 15); CRC-32C checksums (Section 8.4)"). 128-bit OIDs
+' (RFC-0040 Section 10) are deliberately NOT in this delivery -- see this fixture's own header in
+' .agents/reports/aps-arcfs-phase-h.md for why (the width change is pervasive: roughly 150 call
+' sites in arcfs_policy.abas alone plus every OID this project's separate System Namespace policy
+' file stores and compares), and bundling the single most pervasive change in this whole RFC into
+' what RFC-0040 Section 16 itself calls "a bounded, provable warm-up before Phase I's much larger
+' rewrite" would contradict Phase H's own stated purpose. It is the very next scoped increment.
+'
+' This fixture proves, under a real CPU (QEMU/OVMF), that FMV2's format actually works and
+' actually catches what it claims to catch:
+'
+'   1. A freshly formatted volume mounts through the new 4-copy superblock ring and resolves its
+'      root, exactly like FMV1 did through its single superblock sector.
+'   2. A real commit (generation 2) publishes correctly, and a remount's own PreviousGeneration
+'      field correctly links back to generation 1's checkpoint sector -- RFC-0040 Section 8.3's
+'      backward-linked history, genuinely walkable, not merely stored and never read.
+'   3. CRC-32C actually detects corruption a checksum is supposed to catch: flipping one byte of
+'      a committed object record makes ArcFS.MountImage() fail closed, matching every prior
+'      phase's own fail-closed contract for untrusted media.
+'   4. The ring survives partial staleness: after generation 2 is fully published (all 4 ring
+'      copies updated), two of the four ring copies are reverted to their captured generation-1
+'      content -- simulating a crash that updated only some ring copies before the publish loop
+'      finished -- and a remount still correctly selects generation 2 via the two copies that DO
+'      have it, never silently falling back to the stale majority-position copies.
+'
+' No GDT/IDT/interrupt setup, matching every prior ArcFS fixture's own minimal-fixture precedent.
+' Test scaffold pattern (small functions, shared state via fixed scratch addresses, never one
+' giant Main()) matches every prior ArcFS fixture's own documented convention.
+
+FUNCTION ArcFSHTestScratchBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34148352))   ' 0x2091000
+END FUNCTION
+
+FUNCTION ArcFSHTestStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34152448))   ' 0x2092000
+END FUNCTION
+
+FUNCTION ArcFSHTestScratch() AS MMIOPTR
+    LET base AS U64 = MEMORY.Read64(ArcFSHTestScratchBaseAddress())
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(base))
+END FUNCTION
+
+FUNCTION ArcFSHTestFailuresAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSHTestStateAddress(), 0)
+END FUNCTION
+
+FUNCTION ArcFSHTestFail() AS U64
+    LET f AS U64 = MEMORY.Read64(ArcFSHTestFailuresAddress())
+    MEMORY.Write64(ArcFSHTestFailuresAddress(), f + 1)
+    RETURN 0
+END FUNCTION
+
+FUNCTION NameFile() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSHTestScratch(), 0)
+END FUNCTION
+
+FUNCTION PathFile() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSHTestScratch(), 128)
+END FUNCTION
+
+FUNCTION WriteContent() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSHTestScratch(), 256)
+END FUNCTION
+
+FUNCTION ReadContent() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSHTestScratch(), 384)
+END FUNCTION
+
+' A full sector's worth (512 bytes) of captured generation-1 ring content, and a separate
+' full-sector scratch buffer for the corruption test -- kept far apart from the small name/path/
+' content buffers above so a 512-byte sector read/write can never touch them.
+FUNCTION Gen1RingCapture() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSHTestScratch(), 1024)
+END FUNCTION
+
+FUNCTION CorruptionScratch() AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSHTestScratch(), 1536)
+END FUNCTION
+
+FUNCTION ArcFSHAppendBytes(dest AS MMIOPTR, destOffset AS U64, src AS MMIOPTR, count AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(src, i))
+        MEMORY.Write8(ADDRESS.Offset(dest, destOffset + i), v)
+        i = i + 1
+    WEND
+    RETURN destOffset + count
+END FUNCTION
+
+FUNCTION ArcFSHBuffersEqual(a AS MMIOPTR, b AS MMIOPTR, count AS U64) AS BOOL
+    LET i AS U64 = 0
+    WHILE i < count
+        LET av AS U8 = MEMORY.Read8(ADDRESS.Offset(a, i))
+        LET bv AS U8 = MEMORY.Read8(ADDRESS.Offset(b, i))
+        IF av <> bv THEN
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION PhaseHBuildNames() AS U64
+    MEMORY.Write8(ADDRESS.Offset(NameFile(), 0), 104)   ' h
+    MEMORY.Write8(ADDRESS.Offset(NameFile(), 1), 101)   ' e
+    MEMORY.Write8(ADDRESS.Offset(NameFile(), 2), 108)   ' l
+    MEMORY.Write8(ADDRESS.Offset(NameFile(), 3), 108)   ' l
+    MEMORY.Write8(ADDRESS.Offset(NameFile(), 4), 111)   ' o
+    MEMORY.Write8(ADDRESS.Offset(NameFile(), 5), 46)    ' .
+    MEMORY.Write8(ADDRESS.Offset(NameFile(), 6), 116)   ' t
+    MEMORY.Write8(ADDRESS.Offset(NameFile(), 7), 120)   ' x
+    MEMORY.Write8(ADDRESS.Offset(NameFile(), 8), 116)   ' t
+    RETURN 0
+END FUNCTION
+
+FUNCTION PhaseHBuildPaths() AS U64
+    MEMORY.Write8(PathFile(), 58)   ' ':'
+    ArcFSHAppendBytes(PathFile(), 1, NameFile(), 9)
+    RETURN 0
+END FUNCTION
+
+FUNCTION PhaseHBuildContent() AS U64
+    LET i AS U64 = 0
+    WHILE i < 32
+        LET v AS U64 = 48 + (i MOD 10)
+        LET vb AS U8 = v
+        MEMORY.Write8(ADDRESS.Offset(WriteContent(), i), vb)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' Step 1: format a brand-new FMV2 volume, confirm it mounts through the new ring and resolves
+' its root exactly like FMV1 did through a single sector, then capture the just-written ring
+' slot 0 (generation 1's content) for the ring-degradation test later.
+FUNCTION PhaseHFormatAndVerifyBaseline() AS U64
+    RAMDisk.Create(131072)
+    IF ArcFS.FormatVolume() = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.MountImage() = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.Resolve(PathFile(), 10) <> 0 THEN ArcFSHTestFail()   ' hello.txt must not exist yet
+    LET rootOid AS U64 = ArcFS.Resolve(ADDRESS.Offset(PathFile(), 0), 1)
+    IF rootOid <> 1 THEN ArcFSHTestFail()   ' ":" alone (first byte of PathFile) resolves to root
+
+    IF RAMDisk.ReadSectors(0, 1, Gen1RingCapture()) = 0 THEN
+        ArcFSHTestFail()
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Step 2: create hello.txt, write its content, and commit for real -- generation 2.
+FUNCTION PhaseHCommitGeneration2() AS U64
+    LET fileOid AS U64 = ArcFS.CreateFile(1, NameFile(), 9)
+    IF fileOid = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+    LET h AS U64 = ArcFS.OpenHandle(fileOid)
+    IF h = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+    LET written AS U64 = ArcFS.HandleWrite(h, WriteContent(), 32)
+    IF written <> 32 THEN ArcFSHTestFail()
+    ArcFS.CloseHandle(h)
+
+    IF ArcFS.CommitImage() = 0 THEN
+        ArcFSHTestFail()
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Step 3 (RFC-0040 Section 8.3): remount and confirm the checkpoint history actually links back.
+' Generation 1's checkpoint was written to sector 4 (ArcFS.FormatVolume's own fixed initial
+' layout, RFC-0040 Section 8.1); generation 2's checkpoint MUST record that as its own
+' PreviousGeneration field, loaded here into mount state offset 80.
+FUNCTION PhaseHVerifyGenerationHistory() AS U64
+    IF ArcFS.MountImage() = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+    LET state AS MMIOPTR = ArcFSMountStateAddress()
+    LET generation AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 56))
+    LET previousCheckpointSector AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 80))
+    IF generation <> 2 THEN ArcFSHTestFail()
+    IF previousCheckpointSector <> 4 THEN ArcFSHTestFail()
+
+    LET fileOid AS U64 = ArcFS.Resolve(PathFile(), 10)
+    IF fileOid = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+    LET h AS U64 = ArcFS.OpenHandle(fileOid)
+    IF h = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+    LET readBack AS U64 = ArcFS.HandleRead(h, ReadContent(), 128)
+    IF readBack <> 32 THEN ArcFSHTestFail()
+    IF ArcFSHBuffersEqual(WriteContent(), ReadContent(), 32) = 0 THEN ArcFSHTestFail()
+    ArcFS.CloseHandle(h)
+    RETURN 0
+END FUNCTION
+
+' Step 4 (RFC-0040 Section 8.4): CRC-32C must actually catch a corrupted record. Flips one byte
+' of hello.txt's own committed object record directly on the BlockDevice, confirms
+' ArcFS.MountImage() fails closed (matching every prior phase's own untrusted-media contract),
+' then restores the original byte so the volume is clean again for the next step.
+FUNCTION PhaseHVerifyCrc32CDetectsCorruption() AS U64
+    LET state AS MMIOPTR = ArcFSMountStateAddress()
+    LET objectRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 8))
+    LET fileRecordSector AS U64 = objectRoot + 1   ' index 0 = root dir, index 1 = hello.txt
+
+    IF RAMDisk.ReadSectors(fileRecordSector, 1, CorruptionScratch()) = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+    LET originalByte AS U8 = MEMORY.Read8(CorruptionScratch())
+    LET flippedByte AS U8 = originalByte XOR 1
+    MEMORY.Write8(CorruptionScratch(), flippedByte)
+    IF RAMDisk.WriteSectors(fileRecordSector, 1, CorruptionScratch()) = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+
+    IF ArcFS.MountImage() <> 0 THEN
+        ArcFSHTestFail()   ' a corrupted record MUST fail closed, not silently mount
+    END IF
+
+    MEMORY.Write8(CorruptionScratch(), originalByte)
+    IF RAMDisk.WriteSectors(fileRecordSector, 1, CorruptionScratch()) = 0 THEN
+        ArcFSHTestFail()
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Step 5 (RFC-0040 Section 8.1/8.2): the ring must tolerate two of its four copies being stale.
+' Reverts ring slots 2 and 3 to their captured generation-1 content -- simulating a crash that
+' updated only slots 0 and 1 before the publish loop finished -- and confirms a remount still
+' selects generation 2 via the copies that actually have it.
+FUNCTION PhaseHVerifyRingDegradationTolerance() AS U64
+    IF ArcFS.MountImage() = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+
+    IF RAMDisk.WriteSectors(2, 1, Gen1RingCapture()) = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+    IF RAMDisk.WriteSectors(3, 1, Gen1RingCapture()) = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+
+    IF ArcFS.MountImage() = 0 THEN
+        ArcFSHTestFail()
+        RETURN 0
+    END IF
+    LET state AS MMIOPTR = ArcFSMountStateAddress()
+    LET generation AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 56))
+    IF generation <> 2 THEN ArcFSHTestFail()
+
+    LET fileOid AS U64 = ArcFS.Resolve(PathFile(), 10)
+    IF fileOid = 0 THEN ArcFSHTestFail()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET probe AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 1
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocate AS U64 = systemTable.BootServices.AllocatePool(2, allocationSize, bufferAddress)
+    IF allocate <> 0 THEN
+        RETURN 1
+    END IF
+    mapSize = allocationSize
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("APS PRE")
+
+    LET root AS U64 = 0
+    LET rootAddress AS PTR = ADDRESS.Local(root)
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 3, rootAddress)
+    IF pageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    LET scratchRoot AS U64 = 0
+    LET scratchRootAddress AS PTR = ADDRESS.Local(scratchRoot)
+    LET scratchPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 1, scratchRootAddress)
+    IF scratchPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS SCRATCH ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS PAGE")
+    LET pdpt AS U64 = root + 4096
+    LET pageDirectory AS U64 = root + 8192
+
+    LET clearIndex AS U64 = 0
+    WHILE clearIndex < 1536
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(root + (clearIndex * 8)), 0)
+        clearIndex = clearIndex + 1
+    WEND
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(root), pdpt OR 3)
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt), pageDirectory OR 3)
+    LET directoryIndex AS U64 = 0
+    WHILE directoryIndex < 512
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + (directoryIndex * 8)), (directoryIndex * 2097152) OR 131)
+        directoryIndex = directoryIndex + 1
+    WEND
+    LET rootCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(root))
+    LET pdptCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(pdpt))
+    IF rootCheck <> (pdpt OR 3) THEN
+        systemTable.ConsoleOut.Write("APS ROOT BAD")
+        CPU.HaltForever
+    END IF
+    IF pdptCheck <> (pageDirectory OR 3) THEN
+        systemTable.ConsoleOut.Write("APS PDPT BAD")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS TABLE OK")
+
+    CPU.DisableInterrupts
+    LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
+    IF exitStatus <> 0 THEN
+        CPU.HaltForever
+    END IF
+
+    CPU.DisableInterrupts
+    CPU.WriteCR3(root)
+    LET activeRoot AS U64 = CPU.ReadCR3()
+    IF activeRoot <> root THEN
+        CPU.HaltForever
+    END IF
+    MEMORY.Write32(ADDRESS.Virtual(1048576), 2779096485)
+
+    SerialInit()
+
+    MEMORY.Write64(ArcFSHTestScratchBaseAddress(), scratchRoot)
+    LET stateIndex AS U64 = 0
+    WHILE stateIndex < 64
+        MEMORY.Write8(ADDRESS.Offset(ArcFSHTestStateAddress(), stateIndex), 0)
+        stateIndex = stateIndex + 1
+    WEND
+
+    PhaseHBuildNames()
+    PhaseHBuildPaths()
+    PhaseHBuildContent()
+    PhaseHFormatAndVerifyBaseline()
+    PhaseHCommitGeneration2()
+    PhaseHVerifyGenerationHistory()
+    PhaseHVerifyCrc32CDetectsCorruption()
+    PhaseHVerifyRingDegradationTolerance()
+
+    ' Serial-only failure reporting -- systemTable.ConsoleOut.Write after ExitBootServices hangs in
+    ' this QEMU/OVMF environment (found and documented in .agents/reports/aps-arcfs-phase-a.md).
+    LET failures AS U64 = MEMORY.Read64(ArcFSHTestFailuresAddress())
+    IF failures <> 0 THEN
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(32)
+        LET digit AS U64 = failures
+        IF digit > 9 THEN digit = 9
+        LET digitPlus48 AS U64 = digit + 48
+        LET digitByte AS U8 = digitPlus48
+        SerialByte(digitByte)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    SerialMarkerArcFSPhaseHOK()
+    CPU.HaltForever
 END FUNCTION
