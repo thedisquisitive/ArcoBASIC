@@ -294,3 +294,9 @@ arco_add_script_test(
     $<TARGET_FILE:ArcoFission>
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+arco_add_script_test(
+    systems_graphical_storage_tooling_smoke
+    arcology-os/tests/systems/systems_graphical_storage_tooling_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)

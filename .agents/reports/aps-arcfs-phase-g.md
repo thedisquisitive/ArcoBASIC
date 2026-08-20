@@ -62,16 +62,59 @@ Phase F's own fixture builds is found, fixed, and re-verified, with the repaired
 to be the same object, same OID, same content. Full suite: 58/58 passing. Negative control
 confirmed real.
 
-Only "graphical storage tooling" remains open, for the reason already given: no inspector UI shell
-exists anywhere in this project to extend.
+Only "graphical storage tooling" remained open, for the reason already given: no inspector UI shell
+existed anywhere in this project to extend.
+
+## Addendum 4 (2026-08-20): "graphical storage tooling" delivered -- Phase G complete
+
+`tests/fixtures/graphical-storage-tooling/graphical-storage-tooling.abas` renders a real, on-screen
+GOP framebuffer visual health indicator for two real ArcFS volume states -- healthy and degraded --
+built with ordinary ArcFS calls and read back via `ArcFS.GetHealthState()`. RFC-0039 Section 59
+requires health state not be conveyed by color alone, so each state renders with a distinct field
+color AND a distinct positional black mark (a center bar for Healthy, a top-left corner block for
+Degraded, a bottom bar reserved for Corrupt) -- verified by reading the fixture's own rendered
+pixels back and confirming each region shows exactly its own state's mark and none of the others',
+proving the shapes are genuinely distinct, not merely differently colored copies of one glyph.
+
+**A real environmental gap, found and fixed, not a logic bug**: `gop-discovery.abas`'s own smoke
+test had only ever checked generated-code *patterns* (AST/A-MIR/X86_64 hexdump matching), never
+actually run under QEMU -- and this project's one existing QEMU harness (`run-uefi-hello.sh`)
+deliberately passes `-vga none -display none`, so GOP had never been proven reachable under this
+project's own test infrastructure at all. The first real run correctly reported `GOP UNAVAILABLE`
+-- accurate, not a bug, since no display device existed for OVMF's GOP driver to bind to. Fixed by
+adding `run-uefi-hello-with-gpu.sh`, identical to the existing harness except `-vga std` in place
+of `-vga none` (`-display none` still keeps the run headless -- the framebuffer memory exists and
+is writable/readable either way, only rendering to an actual window is skipped). The fixture itself
+reports its result over the serial port, not `ConsoleOut.Write`, since a real display device
+present flips OVMF's own ConOut default to the graphics console instead of serial -- the exact
+inverse of the existing harness's own documented reasoning, now documented symmetrically in the new
+script.
+
+Proven under QEMU/OVMF with the new harness: both health regions render the correct field color at
+a point clear of any mark; the correct positional mark reads as pure black; and each region's OTHER
+two possible marks read as NOT black, confirming genuine shape distinction. Passed on the first
+attempt after the harness fix (the GOP-unavailable result before that was the harness gap, not a
+fixture defect); deterministic across three repeated runs. A negative control (flipped the healthy
+region's field-color assertion) confirmed the harness correctly reports failure rather than
+silently passing.
+
+**Phase G is now complete**: all six items from RFC-0039 Section 78 are addressed -- five
+implemented and QEMU-proven (update-snapshot rollback, system-volume ACTIVATE, the Arcology System
+Namespace with real ArcFS attachment, the recovery-environment boot artifact, and graphical storage
+tooling) and one recognized as already satisfied by construction (ArcoBASIC bindings). The one
+residual, explicitly-named exception is real UEFI Block IO Protocol hardware DISCOVERY (the other
+half of "system volume use"), which stays RFC-0038's own separately-tracked future work, not a
+Phase G gap in ArcFS's own sense.
 
 ## Scope delivered
 
 RFC-0039's Phase G ("namespace attachment; system volume use; recovery environment support;
-update snapshots; graphical storage tooling; ArcoBASIC bindings") is now addressed for **five of
-its six items**, each genuinely implemented and QEMU-proven or recognized as already satisfied by
-construction. One item remains explicitly open, with a stated reason, rather than silently
-skipped or fabricated.
+update snapshots; graphical storage tooling; ArcoBASIC bindings") is now addressed for **all six
+of its items** (see Addendum 4), each genuinely implemented and QEMU-proven or recognized as
+already satisfied by construction. The one residual exception -- real UEFI Block IO Protocol
+hardware discovery, the DISCOVER half of "system volume use" -- stays RFC-0038's own
+separately-tracked future work, not a Phase G gap in ArcFS's own sense; see Section "Why this
+phase couldn't just implement its own list" below.
 
 - **`ArcFS.RollbackToSnapshot(snapshotId)`** (RFC-0039 Section 51, "update snapshots"):
   implemented and proven. Republishes a previously snapshotted generation as the active
@@ -87,9 +130,8 @@ skipped or fabricated.
   built entirely from Phase F's existing primitives.
 - **ArcoBASIC bindings**: recognized as already satisfied by construction (see below), not newly
   built.
-- **Graphical storage tooling**: explicitly left open. No inspector UI shell exists anywhere in
-  this project to extend -- building one would be separate, real scope creep belonging to a
-  UI-application project, not ArcFS's.
+- **Graphical storage tooling** (see Addendum 4 above): implemented and proven. A real GOP
+  framebuffer health indicator, verified by reading its own rendered pixels back.
 
 ## Why this phase couldn't just implement its own list -- and what changed since
 
@@ -111,16 +153,16 @@ piece for real, each with its own RFC or its own honest scope-narrowing:
 - **Recovery environment support** presumed a distinct recovery boot mode; this project had no
   second boot path anywhere. **Closed** (Addendum 3) -- a real, distinct recovery boot artifact
   now exists, staging Inspect/Apply/Verify instead of ordinary boot's silent self-heal.
-- **Graphical storage tooling** presumes a storage-inspector UI (RFC-0039 Section 44's own
-  illustrative volume-inspector text layout). `stdlib/graphics_primitives.abas`/
-  `graphics_substrate.abas` exist for pixel-level drawing, but nothing resembling an inspector
-  shell exists to extend. **Still open** -- building one is a UI-application project, not ArcFS's
-  own, and remains the one genuinely unaddressed Phase G item.
+- **Graphical storage tooling** presumed a storage-inspector UI (RFC-0039 Section 44's own
+  illustrative volume-inspector text layout); `stdlib/graphics_primitives.abas`/
+  `graphics_substrate.abas` existed for pixel-level drawing but nothing resembling an inspector
+  shell existed to extend. **Closed** (Addendum 4) -- a real GOP framebuffer health indicator now
+  exists, rendered and self-verified under QEMU with a real display device attached.
 
 Building fake infrastructure to claim any of these "done" before the real piece existed would have
-been exactly what RFC-0039 Section 79.2 ("No silent architectural substitution") forbids. Three of
-the four were instead closed by building the real thing; the fourth (DISCOVER) and graphical
-tooling remain open, with the specific missing dependency named for each, matching RFC-0039
+been exactly what RFC-0039 Section 79.2 ("No silent architectural substitution") forbids. All four
+were instead closed by building the real thing; only DISCOVER-level real hardware enumeration
+remains open, matching RFC-0039
 Section 80's own "Required Pre-Implementation Dependencies" list (which already names several of
 these as open dependencies -- this phase did not discover something new, it confirmed and recorded
 what the RFC itself already flagged).
@@ -178,9 +220,9 @@ this is not a production-ready filesystem:
 - No sparse files, no on-disk reflink sharing (Phase D).
 - No persistent typed attributes (Phase D).
 - Only three health states, only one repair class, no scrub/repair history (Phase F).
-- No graphical tooling, and no real hardware storage DISCOVERY (RFC-0038's own future work) --
-  the two genuinely remaining Phase G gaps. Namespace attachment, system volume ACTIVATE, and
-  recovery environment support are all now delivered (see Addenda 1-3 above).
+- No real hardware storage DISCOVERY (RFC-0038's own future work) -- the one genuinely remaining
+  Phase G gap. Namespace attachment, system volume ACTIVATE, recovery environment support, and
+  graphical storage tooling are all now delivered (see Addenda 1-4 above); Phase G is complete.
 
 Every one of these is named, in its own phase's report, with the specific reason it was deferred
 rather than attempted and gotten wrong. That is the intended reading of "Draft" here: a large,

@@ -1,0 +1,2940 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' Arcology graphical storage inspector proof (RFC-0039 Phase G, 'graphical storage
+' tooling'). Renders a real, on-screen (real GOP framebuffer) visual health indicator
+' for two REAL ArcFS volume states -- healthy and degraded -- built with ordinary ArcFS
+' calls and read back via ArcFS.GetHealthState(), each state rendered with BOTH a distinct
+' color AND a distinct shape mark (RFC-0039 Section 59: health state 'MUST NOT be conveyed
+' by color alone'). Verified by reading the fixture's own written pixels back, the same
+' self-verification discipline every other freestanding fixture in this project uses.
+'
+' Deliberately stays entirely within UEFI boot services (no ExitBootServices, no custom
+' CR3 cutover) -- GOP framebuffer access requires boot services, and every ArcFS scratch
+' address this fixture touches is comfortably within the firmware's own already-valid
+' page tables, exactly like gop-discovery.abas's own proven precedent.
+'
+' Reports its result over the SERIAL port, not systemTable.ConsoleOut.Write -- with a real `-vga
+' std` display device attached (required for GOP to exist at all), OVMF's ConOut defaults to the
+' graphics console instead of serial, which this project's headless QEMU harness cannot capture
+' (see run-uefi-hello-with-gpu.sh's own header comment for the full reasoning).
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+' "APS GRAPHICAL OK\r\n" -- printed only if every check below passed.
+FUNCTION SerialMarkerGraphicalOK() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(71)
+    SerialByte(82)
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(72)
+    SerialByte(73)
+    SerialByte(67)
+    SerialByte(65)
+    SerialByte(76)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+' APS RAM Disk Block Device Provider (RFC-0038: APS Block Storage and Filesystem Provider
+' Substrate, Requirements 6.1/6.2). Backs the Filesystem Provider layer (fat32_policy.abas) with
+' no real storage hardware driver needed -- the RAM disk itself is just a byte range in memory.
+
+
+' --- A documented deviation, stated up front, in the same spirit as loop_policy.abas's own
+' header note. ---
+'
+' RFC-0038 Section 6.1 specifies `RAMDisk.Create(sizeBytes AS U64) AS BlockDevice` -- a value of
+' an abstract `BlockDevice` interface type, so calling code can hold a RAM disk, a future AHCI
+' device, etc. behind one shape. This implementation exposes `RAMDisk.*` as concrete, directly-
+' named functions instead (`RAMDisk.SectorSize()`, `RAMDisk.ReadSectors(...)`, ...), and
+' `RAMDisk.Create` returns `BOOL`, not a `BlockDevice` value. Reason: this compiler's freestanding
+' x86-64 backend has no runtime-polymorphic dispatch mechanism at all -- confirmed the same way
+' RFC-0037's `Loop.RegisterHook` deviation was confirmed (AmirInstruction::Kind::AddressOf is
+' unhandled by generate_x86_64_function; CallValue can only call a compile-time-known function
+' name). There is only one RAM disk in this milestone -- the same "one instance, fixed scratch
+' state" pattern every prior RFC in this chain has used (one timer, one loop, one exception
+' table) -- so the concrete-function shape loses nothing real yet; it becomes a genuine gap only
+' once a second, different BlockDevice implementation (a real AHCI/NVMe/virtio-blk driver, all
+' explicitly Non-Goals/Future Extensions of this RFC) needs to be swapped in behind the same
+' calling code, at which point this needs the same treatment RFC-0027's freestanding callables
+' would need for Loop.RegisterHook.
+'
+' A second deviation, specific to RAMDisk.Create: RFC-0038's own text says the backing memory
+' should be "AllocatePages-sourced." This implementation's RAMDisk.Create does not allocate
+' memory at all -- it records the size of a *fixed, pre-populated* memory region (see
+' RAMDiskBaseAddress below) whose bytes are already correct by the time this program starts,
+' because the QEMU/OVMF test harness places them there before boot (scripts/run/
+' run-uefi-hello-with-preload.sh, a `-device loader,file=...,addr=...` preload -- see that
+' script's own header comment and .agents/reports/aps-block-storage.md for why). This sidesteps
+' RFC-0038 Stop Condition #17.5's anticipated UEFI-Block-IO-binding gap entirely rather than
+' hitting it: no UEFI protocol call populates this RAM disk in this implementation, at any point.
+' A future increment that actually copies bytes from a live UEFI Block IO device into freshly
+' AllocatePages'd memory would change this function's *body*, not its contract --
+' RAMDisk.SectorSize/SectorCount/ReadSectors/WriteSectors/IsWritable are unaffected either way.
+
+FUNCTION RAMDiskBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(67108864))   ' 0x4000000, 64 MiB -- see header note
+END FUNCTION
+
+FUNCTION RAMDiskStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33751040))   ' 0x2030000
+END FUNCTION
+
+FUNCTION RAMDisk.Create(sizeBytes AS U64) AS BOOL
+    MEMORY.Write64(RAMDiskStateAddress(), sizeBytes \ 512)
+    RETURN 1
+END FUNCTION
+
+FUNCTION RAMDisk.SectorSize() AS U32
+    RETURN 512
+END FUNCTION
+
+FUNCTION RAMDisk.SectorCount() AS U64
+    RETURN MEMORY.Read64(RAMDiskStateAddress())
+END FUNCTION
+
+FUNCTION RAMDisk.IsWritable() AS BOOL
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: MUST reject (return FALSE, MUST NOT partially transfer) a request whose
+' startSector + count exceeds SectorCount().
+FUNCTION RAMDisk.ReadSectors(startSector AS U64, count AS U32, destination AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i))
+        MEMORY.Write8(ADDRESS.Offset(destination, i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: WriteSectors on a device where IsWritable() is FALSE MUST return FALSE without
+' touching the medium -- not reachable for the RAM disk itself (always writable), but implemented
+' symmetrically with ReadSectors for contract completeness; unexercised by this RFC's own QEMU
+' proof, which only reads a pre-populated, read-only-in-spirit test image.
+FUNCTION RAMDisk.WriteSectors(startSector AS U64, count AS U32, source AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(source, i))
+        MEMORY.Write8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+' ArcologyFS (ArcFS) Phase A: in-memory semantic model (RFC-0039 Section 78, Phase A --
+' "Implement: OIDs; directory namespace; files/streams; handle semantics; transactions;
+' rename/delete behavior; capability checks; no persistent disk yet. Purpose: validate the object
+' and API contract before disk-format complexity."). No on-disk format, no copy-on-write metadata,
+' no checkpoints -- this is the object/namespace/handle CONTRACT proven against real memory and a
+' real CPU before any of RFC-0039's later, much larger disk-format phases exist.
+
+
+' --- Documented Phase A scope reductions, stated up front. ---
+'
+' 1. 64-bit Object IDs, not RFC-0039's 128-bit. A monotonic counter big enough that overflow is
+'    not a practical concern (RFC-0039 Section 19 already treats even its own 128-bit space's
+'    overflow as a non-concern at any sane rate) -- widening later, if ever needed, changes this
+'    file's OID storage width, not the OID/namespace/handle *contract* Phase A exists to prove.
+' 2. Fixed-capacity in-memory tables (64 objects, 128 namespace entries, 8 open handles), not a
+'    growable structure or an on-disk B+tree -- the same "one instance / small fixed table"
+'    pattern every prior RFC in this chain has used (RFC-0036's pending table, RFC-0037's hook
+'    table, RFC-0038's mount table), extended here to a whole object graph. RFC-0039's own Phase A
+'    description explicitly wants the *contract* proven before disk-format complexity; growable
+'    storage is exactly that complexity, deferred to Phase C (the transactional writer).
+' 3. Fixed 4096-byte file capacity (one data-pool page per file, 1:1 with its object-table row),
+'    not extents or sparse files (RFC-0039 Sections 18-19) -- again, Phase A's job is the handle/
+'    Read/Write *contract*, not real storage layout.
+' 4. Paths are raw byte buffers with an explicit length, not STRING. Not a leftover workaround --
+'    freestanding STRING equality is now fixed (see .agents/reports/
+'    freestanding-string-equality.md) -- but STRING has no substring/indexing/length operations at
+'    all on this backend (LEN/MID are rejected outright, cleanly, as undeclared functions, not
+'    silently wrong), and colon-delimited path parsing fundamentally needs those. Byte buffers with
+'    MEMORY.Read8 loops are the same, already-proven pattern RFC-0038 established for exactly this
+'    reason.
+' 5. No transactions. RFC-0039 Phase A's own list includes "transactions," but every mutation here
+'    (CreateFile, Rename, Remove) is already a single, indivisible operation on fixed in-memory
+'    tables -- there is no multi-step staging area to make atomic yet (Phase A explicitly has "no
+'    persistent disk yet," which in this implementation's judgment means no copy-on-write staging
+'    either). A no-op BeginTransaction/CommitTransaction pair was considered and rejected as
+'    actively misleading -- it would imply composability across multiple calls that does not
+'    exist. Left for Phase C, where a real staging concept has something to stage.
+' 6. No capability/authority checks (RFC-0039 Section 26). RFC-0017 (Substrate Resource Model),
+'    which this would integrate with, has no concrete freestanding callable surface anywhere in
+'    this repository yet (confirmed by search during RFC-0038's own implementation) -- building
+'    one specifically for this file would be separate, real scope creep (RFC-0017's own
+'    implementation), the same judgment RFC-0038 already made about the same gap.
+'
+' Every object has a stable OID independent of its name (RFC-0039 Section 5.1's central design
+' principle) -- Rename below updates only the namespace row referencing an object, never the
+' object's own table row, so a handle opened before a rename/move keeps working, and the OID
+' returned by ArcFS.Resolve after a move is provably identical to the one returned by CreateFile.
+
+' --- Fixed scratch addresses (policy-owned; no AllocatePages needed -- these are ordinary
+' identity-mapped low memory under the same CR3 cutover every freestanding fixture in this project
+' already establishes, exactly like RFC-0036/0037/0038's own fixed-address tables). Deliberately
+' clear of every address this project has already claimed (0x2000000..0x2035000, 0x4000000). ---
+
+FUNCTION ArcFSNextOidAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33816576))   ' 0x2040000
+END FUNCTION
+
+FUNCTION ArcFSObjectTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33820672))   ' 0x2041000
+END FUNCTION
+
+FUNCTION ArcFSNamespaceTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33824768))   ' 0x2042000
+END FUNCTION
+
+FUNCTION ArcFSDataPoolAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33832960))   ' 0x2044000
+END FUNCTION
+
+FUNCTION ArcFSHandleTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34144256))   ' 0x2090000
+END FUNCTION
+
+' ==========================================================================================
+' Phase D: mutation completeness (RFC-0039 Section 78, Phase D -- "create/write/resize;
+' rename/move; delete; sparse files; reflinks; typed attributes").
+' ==========================================================================================
+'
+' Rename/move/delete already exist (Phase A's ArcFS.Rename/ArcFS.Remove) and already survive a
+' commit/remount cycle unchanged -- they mutate the same in-memory tables Phase C's commit
+' protocol already durably writes, so Phase D adds no new API for them; it adds a fixture that
+' actually PROVES the round trip, closing a real gap (Phase C's own proof fixture never renamed or
+' deleted anything against the real on-disk format).
+'
+' What IS new: ArcFS.Resize (grow/shrink within the existing fixed file capacity) and ArcFS.Reflink
+' (RFC-0039 Section 22), both of which need a real answer to "what happens when two OIDs' data
+' currently lives in the same physical page and one of them writes." Phase A/B/C's own "dataSlot =
+' object-table row index" convention has no room for two rows to point at the same slot, so Phase D
+' decouples data-pool slot allocation from object-row allocation entirely: a slot allocator
+' (ArcFSNextDataSlotAddress, a bump counter like Phase C's own sector allocator) plus a per-slot
+' reference-count table (ArcFSSlotRefCountAddress) let Reflink make a second row point at an
+' existing slot without copying anything, and let ArcFSEnsurePrivateSlot -- the copy-on-write gate
+' every mutating data-pool access now passes through -- give a writer its own private copy the
+' MOMENT it actually needs one, never before.
+'
+' Also new: a minimal, documented, IN-MEMORY-ONLY typed-attribute slot per object
+' (ArcFSAttributeTableAddress) -- see that section's own header for why persistence is deferred.
+'
+' Explicitly OUT of Phase D's scope, stated up front like every prior phase's own header note:
+'
+' 1. Sparse files (RFC-0039 Section 19). Every FILE object still gets exactly one mandatory fixed
+'    4096-byte extent (Phase A's own scope reduction #3) -- there is no "hole" concept possible
+'    without a real multi-extent-per-file model, which is a bigger undertaking than this phase's
+'    budget. Deferred to whichever future phase replaces the fixed-single-extent design.
+' 2. On-disk reflink sharing. ArcFS.CommitImage() still writes each active object's CURRENT bytes
+'    to its OWN independent on-disk extent (see ArcFS.PrepareCommit's own updated comment below) --
+'    two objects that are still sharing a data-pool slot in memory at commit time simply get two
+'    identical extents on disk, not one shared one. The in-memory copy-on-write SEMANTIC (Section
+'    22's "a reflink MUST NOT cause later writes to one file to modify the visible data of the
+'    other") is fully proven; the on-disk SPACE SAVING a real reflink implies is not -- that needs
+'    a reference-counted allocation tree, itself already named as Phase E's job in Phase C's own
+'    report.
+' 3. Attribute persistence. ArcFS.SetAttribute's value does not survive ArcFS.MountImage() -- see
+'    that function's own header for the full reasoning (a format change here would have required
+'    touching Phase B's and Phase C's already-proven, committed checkpoint format).
+'
+' --- Fixed scratch addresses for the above (policy-owned, same discipline as every earlier
+' section): a data-pool slot allocator, decoupled from object-row allocation, its per-slot
+' reference-count table, and a parallel Attribute Table (one row per object-table row index,
+' matching that table's own indexing). ---
+
+FUNCTION ArcFSNextDataSlotAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34107392))   ' 0x2087000
+END FUNCTION
+
+FUNCTION ArcFSSlotRefCountAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34111488))   ' 0x2088000
+END FUNCTION
+
+FUNCTION ArcFSAttributeTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34115584))   ' 0x2089000
+END FUNCTION
+
+FUNCTION ArcFSMaxObjects() AS U64
+    RETURN 64
+END FUNCTION
+
+FUNCTION ArcFSMaxNamespaceRows() AS U64
+    RETURN 128
+END FUNCTION
+
+FUNCTION ArcFSMaxHandles() AS U64
+    RETURN 8
+END FUNCTION
+
+FUNCTION ArcFSMaxNameLength() AS U64
+    RETURN 32
+END FUNCTION
+
+FUNCTION ArcFSFileCapacityBytes() AS U64
+    RETURN 4096
+END FUNCTION
+
+' --- Object Tree (RFC-0039 Section 16.1, scaled to a fixed in-memory table). Row layout, 40
+' bytes: [oid U64][type U64: 0=free/unused, 1=FILE, 2=DIRECTORY][size U64][dataSlot U64][reserved
+' U64]. ---
+
+FUNCTION ArcFSObjectRowAddress(row AS U64) AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSObjectTableAddress(), row * 40)
+END FUNCTION
+
+FUNCTION ArcFSAllocateOid() AS U64
+    LET oid AS U64 = MEMORY.Read64(ArcFSNextOidAddress())
+    MEMORY.Write64(ArcFSNextOidAddress(), oid + 1)
+    RETURN oid
+END FUNCTION
+
+FUNCTION ArcFSFindObjectRow(oid AS U64) AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = ArcFSMaxObjects()
+    WHILE row < ArcFSMaxObjects()
+        LET base AS MMIOPTR = ArcFSObjectRowAddress(row)
+        LET storedType AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 8))
+        IF storedType <> 0 THEN
+            LET storedOid AS U64 = MEMORY.Read64(base)
+            IF storedOid = oid THEN
+                found = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION ArcFSFindFreeObjectRow() AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = ArcFSMaxObjects()
+    WHILE row < ArcFSMaxObjects()
+        LET base AS MMIOPTR = ArcFSObjectRowAddress(row)
+        LET storedType AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 8))
+        IF storedType = 0 THEN
+            IF found = ArcFSMaxObjects() THEN
+                found = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+' Allocates a fresh, exclusive data-pool slot (bump allocator, 0..ArcFSMaxObjects()-1, decoupled
+' from object-row allocation as of Phase D -- see that section's own header for why Reflink needs
+' this decoupling). Returns ArcFSMaxObjects() (an invalid slot index) if the data pool is full.
+' Marks the returned slot's reference count as 1 (a fresh slot always starts exclusively owned).
+FUNCTION ArcFSAllocateDataSlot() AS U64
+    LET nextSlot AS U64 = MEMORY.Read64(ArcFSNextDataSlotAddress())
+    IF nextSlot >= ArcFSMaxObjects() THEN
+        RETURN ArcFSMaxObjects()
+    END IF
+    MEMORY.Write64(ArcFSNextDataSlotAddress(), nextSlot + 1)
+    MEMORY.Write64(ADDRESS.Offset(ArcFSSlotRefCountAddress(), nextSlot * 8), 1)
+    RETURN nextSlot
+END FUNCTION
+
+' Internal: allocates a fresh OID, claims a free object-table row, and gives it its OWN exclusive
+' data-pool slot. Returns the new OID, or 0 if either the object table or the data pool is full.
+FUNCTION ArcFSCreateObject(entryType AS U64) AS U64
+    LET freeRow AS U64 = ArcFSFindFreeObjectRow()
+    IF freeRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET dataSlot AS U64 = ArcFSAllocateDataSlot()
+    IF dataSlot = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET oid AS U64 = ArcFSAllocateOid()
+    LET base AS MMIOPTR = ArcFSObjectRowAddress(freeRow)
+    MEMORY.Write64(base, oid)
+    MEMORY.Write64(ADDRESS.Offset(base, 8), entryType)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), 0)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), dataSlot)
+    RETURN oid
+END FUNCTION
+
+' --- Namespace Tree (RFC-0039 Section 16.2, scaled to a fixed in-memory table). Row layout, 64
+' bytes: [parentOID U64][name 32 bytes, zero-padded][nameLength U64][childOID U64][active U64].
+' Renaming/moving an object mutates only this table -- the Object Tree row for that OID, and
+' therefore its OID, is never touched (RFC-0039 Section 5.1). ---
+
+FUNCTION ArcFSNamespaceRowAddress(row AS U64) AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSNamespaceTableAddress(), row * 64)
+END FUNCTION
+
+FUNCTION ArcFSNameMatches(rowBase AS MMIOPTR, storedLength AS U64, candidate AS MMIOPTR, candidateLength AS U64) AS BOOL
+    IF storedLength <> candidateLength THEN
+        RETURN 0
+    END IF
+    LET i AS U64 = 0
+    WHILE i < storedLength
+        LET a AS U8 = MEMORY.Read8(ADDRESS.Offset(rowBase, 8 + i))
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(candidate, i))
+        IF a <> b THEN
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION ArcFSFindNamespaceRow(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = ArcFSMaxNamespaceRows()
+    WHILE row < ArcFSMaxNamespaceRows()
+        LET base AS MMIOPTR = ArcFSNamespaceRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 56))
+        IF active <> 0 THEN
+            LET storedParent AS U64 = MEMORY.Read64(base)
+            IF storedParent = parentOID THEN
+                LET storedLength AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 40))
+                IF ArcFSNameMatches(base, storedLength, nameBuffer, nameLength) = 1 THEN
+                    found = row
+                END IF
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION ArcFSFindNamespaceRowByChild(oid AS U64) AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = ArcFSMaxNamespaceRows()
+    WHILE row < ArcFSMaxNamespaceRows()
+        LET base AS MMIOPTR = ArcFSNamespaceRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 56))
+        IF active <> 0 THEN
+            LET child AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 48))
+            IF child = oid THEN
+                found = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION ArcFSFindFreeNamespaceRow() AS U64
+    LET row AS U64 = 0
+    LET found AS U64 = ArcFSMaxNamespaceRows()
+    WHILE row < ArcFSMaxNamespaceRows()
+        LET base AS MMIOPTR = ArcFSNamespaceRowAddress(row)
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 56))
+        IF active = 0 THEN
+            IF found = ArcFSMaxNamespaceRows() THEN
+                found = row
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION ArcFSWriteName(base AS MMIOPTR, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < ArcFSMaxNameLength()
+        LET v AS U8 = 0
+        IF i < nameLength THEN
+            v = MEMORY.Read8(ADDRESS.Offset(nameBuffer, i))
+        END IF
+        MEMORY.Write8(ADDRESS.Offset(base, 8 + i), v)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' --- Public API: object creation (RFC-0039 Section 42's Namespace.Create*, made concrete). ---
+
+FUNCTION ArcFSCreateEntry(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64, entryType AS U64) AS U64
+    IF nameLength = 0 THEN
+        RETURN 0
+    END IF
+    IF nameLength > ArcFSMaxNameLength() THEN
+        RETURN 0
+    END IF
+
+    LET parentRow AS U64 = ArcFSFindObjectRow(parentOID)
+    IF parentRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET parentType AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(parentRow), 8))
+    IF parentType <> 2 THEN
+        RETURN 0
+    END IF
+
+    LET existingRow AS U64 = ArcFSFindNamespaceRow(parentOID, nameBuffer, nameLength)
+    IF existingRow <> ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+
+    LET freeNsRow AS U64 = ArcFSFindFreeNamespaceRow()
+    IF freeNsRow = ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+
+    LET newOid AS U64 = ArcFSCreateObject(entryType)
+    IF newOid = 0 THEN
+        RETURN 0
+    END IF
+
+    LET nsBase AS MMIOPTR = ArcFSNamespaceRowAddress(freeNsRow)
+    MEMORY.Write64(nsBase, parentOID)
+    ArcFSWriteName(nsBase, nameBuffer, nameLength)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 40), nameLength)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 48), newOid)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 56), 1)
+
+    RETURN newOid
+END FUNCTION
+
+FUNCTION ArcFS.CreateFile(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    RETURN ArcFSCreateEntry(parentOID, nameBuffer, nameLength, 1)
+END FUNCTION
+
+FUNCTION ArcFS.CreateDirectory(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    RETURN ArcFSCreateEntry(parentOID, nameBuffer, nameLength, 2)
+END FUNCTION
+
+' --- Public API: single-component lookup and colon-delimited path resolution (RFC-0039 Section
+' 42's Namespace.Resolve, made concrete). Paths are root-relative and begin with ':'
+' (RFC-0039 Section 9.1), e.g. ":home:documents:notes.txt"; ":" alone is the root. ---
+
+FUNCTION ArcFS.Lookup(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    LET row AS U64 = ArcFSFindNamespaceRow(parentOID, nameBuffer, nameLength)
+    IF row = ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(ArcFSNamespaceRowAddress(row), 48))
+END FUNCTION
+
+FUNCTION ArcFS.Resolve(pathBuffer AS MMIOPTR, pathLength AS U64) AS U64
+    IF pathLength = 0 THEN
+        RETURN 0
+    END IF
+    LET firstByte AS U8 = MEMORY.Read8(pathBuffer)
+    IF firstByte <> 58 THEN
+        RETURN 0
+    END IF
+    IF pathLength = 1 THEN
+        RETURN 1
+    END IF
+
+    LET current AS U64 = 1
+    LET cursor AS U64 = 1
+    WHILE cursor < pathLength
+        LET componentStart AS U64 = cursor
+        LET scanning AS U64 = 1
+        WHILE scanning = 1
+            IF cursor >= pathLength THEN
+                scanning = 0
+            ELSE
+                LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(pathBuffer, cursor))
+                IF b = 58 THEN
+                    scanning = 0
+                ELSE
+                    cursor = cursor + 1
+                END IF
+            END IF
+        WEND
+        LET componentLength AS U64 = cursor - componentStart
+        IF componentLength = 0 THEN
+            RETURN 0
+        END IF
+        LET componentPtr AS MMIOPTR = ADDRESS.Offset(pathBuffer, componentStart)
+        LET nextOid AS U64 = ArcFS.Lookup(current, componentPtr, componentLength)
+        IF nextOid = 0 THEN
+            RETURN 0
+        END IF
+        current = nextOid
+        cursor = cursor + 1
+    WEND
+    RETURN current
+END FUNCTION
+
+' --- Public API: rename/move (OID-preserving) and delete (RFC-0039 Requirement 6.2's own
+' equivalents, Section 55, Section 23). ---
+
+FUNCTION ArcFS.Rename(oid AS U64, newParentOID AS U64, newNameBuffer AS MMIOPTR, newNameLength AS U64) AS BOOL
+    IF newNameLength = 0 THEN
+        RETURN 0
+    END IF
+    IF newNameLength > ArcFSMaxNameLength() THEN
+        RETURN 0
+    END IF
+
+    LET oldRow AS U64 = ArcFSFindNamespaceRowByChild(oid)
+    IF oldRow = ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+
+    LET newParentRow AS U64 = ArcFSFindObjectRow(newParentOID)
+    IF newParentRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET newParentType AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(newParentRow), 8))
+    IF newParentType <> 2 THEN
+        RETURN 0
+    END IF
+
+    LET collisionRow AS U64 = ArcFSFindNamespaceRow(newParentOID, newNameBuffer, newNameLength)
+    IF collisionRow <> ArcFSMaxNamespaceRows() THEN
+        IF collisionRow <> oldRow THEN
+            RETURN 0
+        END IF
+    END IF
+
+    LET base AS MMIOPTR = ArcFSNamespaceRowAddress(oldRow)
+    MEMORY.Write64(base, newParentOID)
+    ArcFSWriteName(base, newNameBuffer, newNameLength)
+    MEMORY.Write64(ADDRESS.Offset(base, 40), newNameLength)
+    RETURN 1
+END FUNCTION
+
+' Removes the namespace relationship only -- the object row (and its OID) is not reclaimed, per
+' RFC-0039 Section 23's own deferred-reclamation policy ("physical extents become reclaimable only
+' when no committed reachable state requires them"; Phase A has no reclamation pass yet).
+FUNCTION ArcFS.Remove(parentOID AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS BOOL
+    LET row AS U64 = ArcFSFindNamespaceRow(parentOID, nameBuffer, nameLength)
+    IF row = ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+    MEMORY.Write64(ADDRESS.Offset(ArcFSNamespaceRowAddress(row), 56), 0)
+    RETURN 1
+END FUNCTION
+
+' --- Public API: handles (RFC-0039 Section 47 -- a runtime handle is distinct from the persistent
+' OID it resolves to; closing a handle does not delete the object, and a rename/move does not
+' invalidate an already-open handle, since the handle only ever stores the OID, never a path). ---
+
+FUNCTION ArcFSHandleRowAddress(index AS U64) AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSHandleTableAddress(), index * 16)
+END FUNCTION
+
+FUNCTION ArcFS.OpenHandle(oid AS U64) AS U64
+    LET objRow AS U64 = ArcFSFindObjectRow(oid)
+    IF objRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET objType AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(objRow), 8))
+    IF objType <> 1 THEN
+        RETURN 0
+    END IF
+
+    LET index AS U64 = 0
+    LET found AS U64 = ArcFSMaxHandles()
+    WHILE index < ArcFSMaxHandles()
+        LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSHandleRowAddress(index), 8))
+        IF active = 0 THEN
+            IF found = ArcFSMaxHandles() THEN
+                found = index
+            END IF
+        END IF
+        index = index + 1
+    WEND
+    IF found = ArcFSMaxHandles() THEN
+        RETURN 0
+    END IF
+
+    LET row AS MMIOPTR = ArcFSHandleRowAddress(found)
+    MEMORY.Write64(row, oid)
+    MEMORY.Write64(ADDRESS.Offset(row, 8), 1)
+    RETURN found + 1
+END FUNCTION
+
+FUNCTION ArcFS.CloseHandle(handle AS U64) AS BOOL
+    IF handle = 0 THEN
+        RETURN 0
+    END IF
+    LET index AS U64 = handle - 1
+    IF index >= ArcFSMaxHandles() THEN
+        RETURN 0
+    END IF
+    MEMORY.Write64(ADDRESS.Offset(ArcFSHandleRowAddress(index), 8), 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION ArcFSHandleOid(handle AS U64) AS U64
+    IF handle = 0 THEN
+        RETURN 0
+    END IF
+    LET index AS U64 = handle - 1
+    IF index >= ArcFSMaxHandles() THEN
+        RETURN 0
+    END IF
+    LET active AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSHandleRowAddress(index), 8))
+    IF active = 0 THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ArcFSHandleRowAddress(index))
+END FUNCTION
+
+' --- Public API: byte streams (RFC-0039 Section 42's ByteStream, made concrete). Read/Write
+' operate on the whole fixed-capacity file at once (no persistent position across calls) -- Phase
+' A's own scope reduction #3 above; RFC-0039's own Seek/partial-write semantics are Phase C+ work
+' once real extents exist to seek within. ---
+
+' Phase D: the copy-on-write gate every MUTATING data-pool access (HandleWrite, Resize) must pass
+' through before touching bytes. If the row's current data slot is exclusively its own (refcount
+' <= 1), returns that slot unchanged -- the overwhelmingly common case, and byte-for-byte the same
+' behavior Phase A/B/C's own HandleWrite always had, since a slot's refcount only ever exceeds 1
+' after a Reflink (RFC-0039 Section 22's own requirement: "a reflink MUST NOT cause later writes to
+' one file to modify the visible data of the other"). Otherwise, allocates a fresh exclusive slot,
+' copies the shared bytes into it, and only THEN repoints the row -- so the write that follows never
+' touches bytes another OID can still see. Returns ArcFSMaxObjects() (an invalid slot index) if no
+' fresh slot is available, in which case the caller MUST refuse the mutation rather than risk
+' writing into a still-shared page.
+FUNCTION ArcFSEnsurePrivateSlot(row AS U64) AS U64
+    LET base AS MMIOPTR = ArcFSObjectRowAddress(row)
+    LET dataSlot AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 24))
+    LET rc AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSSlotRefCountAddress(), dataSlot * 8))
+    IF rc <= 1 THEN
+        RETURN dataSlot
+    END IF
+
+    LET newSlot AS U64 = ArcFSAllocateDataSlot()
+    IF newSlot = ArcFSMaxObjects() THEN
+        RETURN ArcFSMaxObjects()
+    END IF
+
+    LET srcBase AS MMIOPTR = ADDRESS.Offset(ArcFSDataPoolAddress(), dataSlot * ArcFSFileCapacityBytes())
+    LET dstBase AS MMIOPTR = ADDRESS.Offset(ArcFSDataPoolAddress(), newSlot * ArcFSFileCapacityBytes())
+    LET i AS U64 = 0
+    WHILE i < ArcFSFileCapacityBytes()
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(srcBase, i))
+        MEMORY.Write8(ADDRESS.Offset(dstBase, i), v)
+        i = i + 1
+    WEND
+
+    MEMORY.Write64(ADDRESS.Offset(ArcFSSlotRefCountAddress(), dataSlot * 8), rc - 1)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), newSlot)
+    RETURN newSlot
+END FUNCTION
+
+FUNCTION ArcFS.HandleWrite(handle AS U64, buffer AS MMIOPTR, byteCount AS U64) AS U64
+    LET oid AS U64 = ArcFSHandleOid(handle)
+    IF oid = 0 THEN
+        RETURN 0
+    END IF
+    LET row AS U64 = ArcFSFindObjectRow(oid)
+    IF row = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET dataSlot AS U64 = ArcFSEnsurePrivateSlot(row)
+    IF dataSlot = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET toWrite AS U64 = byteCount
+    IF toWrite > ArcFSFileCapacityBytes() THEN
+        toWrite = ArcFSFileCapacityBytes()
+    END IF
+    LET dest AS MMIOPTR = ADDRESS.Offset(ArcFSDataPoolAddress(), dataSlot * ArcFSFileCapacityBytes())
+    LET i AS U64 = 0
+    WHILE i < toWrite
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, i))
+        MEMORY.Write8(ADDRESS.Offset(dest, i), v)
+        i = i + 1
+    WEND
+    MEMORY.Write64(ADDRESS.Offset(ArcFSObjectRowAddress(row), 16), toWrite)
+    RETURN toWrite
+END FUNCTION
+
+FUNCTION ArcFS.HandleRead(handle AS U64, buffer AS MMIOPTR, maxBytes AS U64) AS U64
+    LET oid AS U64 = ArcFSHandleOid(handle)
+    IF oid = 0 THEN
+        RETURN 0
+    END IF
+    LET row AS U64 = ArcFSFindObjectRow(oid)
+    IF row = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET size AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(row), 16))
+    LET dataSlot AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(row), 24))
+    LET toRead AS U64 = maxBytes
+    IF toRead > size THEN
+        toRead = size
+    END IF
+    LET src AS MMIOPTR = ADDRESS.Offset(ArcFSDataPoolAddress(), dataSlot * ArcFSFileCapacityBytes())
+    LET i AS U64 = 0
+    WHILE i < toRead
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(src, i))
+        MEMORY.Write8(ADDRESS.Offset(buffer, i), v)
+        i = i + 1
+    WEND
+    RETURN toRead
+END FUNCTION
+
+' --- Public API: resize (RFC-0039 Section 18's "MUST support... partial final blocks," scaled to
+' Phase A's own fixed-file-capacity model -- Phase D scope reduction, stated in this section's own
+' header below: growth is bounded by ArcFSFileCapacityBytes(), not a real extent allocator). Growing
+' zero-fills the newly exposed range (matching Section 19's "a logical range with no physical
+' extent SHALL read as zero bytes" for the bytes that were never written); shrinking simply lowers
+' the visible size, leaving the now-unreachable bytes in place until something overwrites them.
+' Goes through the same copy-on-write gate HandleWrite does, since growing a shared file would
+' otherwise zero-fill bytes another OID can still see. ---
+
+FUNCTION ArcFS.Resize(handle AS U64, newSize AS U64) AS BOOL
+    LET oid AS U64 = ArcFSHandleOid(handle)
+    IF oid = 0 THEN
+        RETURN 0
+    END IF
+    LET row AS U64 = ArcFSFindObjectRow(oid)
+    IF row = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    IF newSize > ArcFSFileCapacityBytes() THEN
+        RETURN 0
+    END IF
+    LET dataSlot AS U64 = ArcFSEnsurePrivateSlot(row)
+    IF dataSlot = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+
+    LET base AS MMIOPTR = ArcFSObjectRowAddress(row)
+    LET oldSize AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+    IF newSize > oldSize THEN
+        LET dest AS MMIOPTR = ADDRESS.Offset(ArcFSDataPoolAddress(), dataSlot * ArcFSFileCapacityBytes())
+        LET i AS U64 = oldSize
+        WHILE i < newSize
+            MEMORY.Write8(ADDRESS.Offset(dest, i), 0)
+            i = i + 1
+        WEND
+    END IF
+    MEMORY.Write64(ADDRESS.Offset(base, 16), newSize)
+    RETURN 1
+END FUNCTION
+
+' --- Public API: reflinks (RFC-0039 Section 22). The new object gets its OWN OID and namespace
+' entry but SHARES the source's data-pool slot -- a real shared-until-diverged relationship, not an
+' eager copy: nothing is copied at Reflink time. ArcFSEnsurePrivateSlot (used by HandleWrite/Resize
+' above) is what makes the sharing safe -- the FIRST write through either OID after a reflink
+' copies the shared bytes to a fresh, exclusive slot before touching anything, so "a reflink MUST
+' NOT cause later writes to one file to modify the visible data of the other" (Section 22) holds by
+' construction, not by convention. Only FILE objects are reflinkable (matching Section 22's own
+' "efficient file duplication" framing; RFC-0039 does not describe directory reflinking). ---
+
+FUNCTION ArcFS.Reflink(sourceOid AS U64, destParentOid AS U64, destNameBuffer AS MMIOPTR, destNameLength AS U64) AS U64
+    IF destNameLength = 0 THEN
+        RETURN 0
+    END IF
+    IF destNameLength > ArcFSMaxNameLength() THEN
+        RETURN 0
+    END IF
+
+    LET sourceRow AS U64 = ArcFSFindObjectRow(sourceOid)
+    IF sourceRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET sourceType AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(sourceRow), 8))
+    IF sourceType <> 1 THEN
+        RETURN 0
+    END IF
+
+    LET destParentRow AS U64 = ArcFSFindObjectRow(destParentOid)
+    IF destParentRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET destParentType AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(destParentRow), 8))
+    IF destParentType <> 2 THEN
+        RETURN 0
+    END IF
+
+    LET existingRow AS U64 = ArcFSFindNamespaceRow(destParentOid, destNameBuffer, destNameLength)
+    IF existingRow <> ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+    LET freeNsRow AS U64 = ArcFSFindFreeNamespaceRow()
+    IF freeNsRow = ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+    LET freeObjRow AS U64 = ArcFSFindFreeObjectRow()
+    IF freeObjRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+
+    LET sourceSize AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(sourceRow), 16))
+    LET sourceDataSlot AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(sourceRow), 24))
+
+    LET newOid AS U64 = ArcFSAllocateOid()
+    LET newBase AS MMIOPTR = ArcFSObjectRowAddress(freeObjRow)
+    MEMORY.Write64(newBase, newOid)
+    MEMORY.Write64(ADDRESS.Offset(newBase, 8), 1)
+    MEMORY.Write64(ADDRESS.Offset(newBase, 16), sourceSize)
+    MEMORY.Write64(ADDRESS.Offset(newBase, 24), sourceDataSlot)
+
+    LET rcAddr AS MMIOPTR = ADDRESS.Offset(ArcFSSlotRefCountAddress(), sourceDataSlot * 8)
+    LET rc AS U64 = MEMORY.Read64(rcAddr)
+    MEMORY.Write64(rcAddr, rc + 1)
+
+    LET nsBase AS MMIOPTR = ArcFSNamespaceRowAddress(freeNsRow)
+    MEMORY.Write64(nsBase, destParentOid)
+    ArcFSWriteName(nsBase, destNameBuffer, destNameLength)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 40), destNameLength)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 48), newOid)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 56), 1)
+
+    RETURN newOid
+END FUNCTION
+
+' --- Public API: typed attributes (RFC-0039 Section 24), Phase D's own documented minimal subset
+' -- ONE fixed attribute slot per object, U64-valued only. Of Section 24's base value types (UTF-8
+' string, signed/unsigned integer, boolean, timestamp, binary blob, UUID/OID, typed locator), only
+' the integer-representable subset is reachable at all on this backend, for the same reason Phase
+' A's own scope reduction #4 gave: STRING has no substring/length operations here. In-memory only
+' for now -- there is no on-disk Attribute Tree yet (RFC-0039 Section 16.5), so a value set here
+' does NOT survive ArcFS.MountImage(). Persisting it is deferred to a later phase; see this
+' section's own header for the full reasoning. ---
+
+FUNCTION ArcFSAttributeRowAddress(row AS U64) AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSAttributeTableAddress(), row * 24)
+END FUNCTION
+
+FUNCTION ArcFS.SetAttribute(oid AS U64, value AS U64) AS BOOL
+    LET row AS U64 = ArcFSFindObjectRow(oid)
+    IF row = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET base AS MMIOPTR = ArcFSAttributeRowAddress(row)
+    MEMORY.Write64(base, 1)
+    MEMORY.Write64(ADDRESS.Offset(base, 8), 1)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), value)
+    RETURN 1
+END FUNCTION
+
+FUNCTION ArcFS.HasAttribute(oid AS U64) AS BOOL
+    LET row AS U64 = ArcFSFindObjectRow(oid)
+    IF row = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ArcFSAttributeRowAddress(row))
+END FUNCTION
+
+' Returns the stored value, or 0 if the object has no attribute set (or does not exist) -- callers
+' that must distinguish a genuinely-zero value from "absent" should check ArcFS.HasAttribute first.
+FUNCTION ArcFS.GetAttribute(oid AS U64) AS U64
+    LET row AS U64 = ArcFSFindObjectRow(oid)
+    IF row = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    LET base AS MMIOPTR = ArcFSAttributeRowAddress(row)
+    LET present AS U64 = MEMORY.Read64(base)
+    IF present = 0 THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(base, 16))
+END FUNCTION
+
+' --- Bootstrap: resets every table and creates the root directory (OID 1, which -- unlike every
+' other object -- has no namespace entry of its own, matching real filesystems where root has no
+' name; RFC-0039 Section 9.1's "the colon is the namespace component separator," and ":" alone
+' already denotes root directly in ArcFS.Resolve above without ever looking it up by name). ---
+
+FUNCTION ArcFS.Initialize() AS BOOL
+    LET i AS U64 = 0
+    WHILE i < 2560
+        MEMORY.Write8(ADDRESS.Offset(ArcFSObjectTableAddress(), i), 0)
+        i = i + 1
+    WEND
+    i = 0
+    WHILE i < 8192
+        MEMORY.Write8(ADDRESS.Offset(ArcFSNamespaceTableAddress(), i), 0)
+        i = i + 1
+    WEND
+    i = 0
+    WHILE i < 128
+        MEMORY.Write8(ADDRESS.Offset(ArcFSHandleTableAddress(), i), 0)
+        i = i + 1
+    WEND
+    ' Phase D additions: clear the data-slot refcount table (512 bytes) and the Attribute Table
+    ' (1536 bytes), and reset the data-slot bump allocator.
+    i = 0
+    WHILE i < 512
+        MEMORY.Write8(ADDRESS.Offset(ArcFSSlotRefCountAddress(), i), 0)
+        i = i + 1
+    WEND
+    i = 0
+    WHILE i < 1536
+        MEMORY.Write8(ADDRESS.Offset(ArcFSAttributeTableAddress(), i), 0)
+        i = i + 1
+    WEND
+    MEMORY.Write64(ArcFSNextOidAddress(), 2)
+
+    LET rootBase AS MMIOPTR = ArcFSObjectRowAddress(0)
+    MEMORY.Write64(rootBase, 1)
+    MEMORY.Write64(ADDRESS.Offset(rootBase, 8), 2)
+    MEMORY.Write64(ADDRESS.Offset(rootBase, 16), 0)
+    MEMORY.Write64(ADDRESS.Offset(rootBase, 24), 0)
+
+    ' Root claims data-pool slot 0 directly (matching its hardcoded row 0 above, not through
+    ' ArcFSAllocateDataSlot) -- mark that slot exclusively owned and start the bump allocator at 1
+    ' so the next real allocation (Phase D's ArcFSAllocateDataSlot, or a data reload during a
+    ' future mount) never collides with it.
+    MEMORY.Write64(ADDRESS.Offset(ArcFSSlotRefCountAddress(), 0), 1)
+    MEMORY.Write64(ArcFSNextDataSlotAddress(), 1)
+
+    RETURN 1
+END FUNCTION
+
+' ==========================================================================================
+' Phase B: read-only ArcFS image (RFC-0039 Section 78, Phase B -- "superblock parser;
+' checkpoint parser; object/namespace trees; extent reads; checksums; image inspection").
+' ==========================================================================================
+'
+' ArcFS.MountImage() reads a real on-disk (well, on-BlockDevice) image through RFC-0038's
+' RAMDisk.*/BlockDevice contract -- RFC-0039 Section 80 lists a BlockStorage interface as an
+' outside dependency this RFC needs; RFC-0038 is that dependency, used here for the first time --
+' validates its superblock, checkpoint, and every object/namespace record's checksum, and
+' POPULATES Phase A's existing in-memory tables from it. Every Phase A function
+' (Resolve/Lookup/OpenHandle/HandleRead/HandleWrite/Rename/Remove) then works completely
+' unchanged against the loaded data -- this is deliberate, not a shortcut: it is the concrete
+' proof that Phase A's object/namespace/handle contract (RFC-0039's own stated Phase A purpose)
+' is genuinely disk-format-agnostic, not something that happened to work only in memory.
+'
+' This is Phase B's OWN minimal, documented subset of RFC-0039's real on-disk format (Sections
+' 11-17) -- see arcology-os/scripts/build/build-arcfs-test-image.py's own header comment for the
+' full list of simplifications (one superblock, not a ring; one checkpoint, not generation
+' history; flat fixed-size-record arrays, not real B+trees; a simple additive checksum, not a
+' cryptographic one; one contiguous 8-sector extent per file, matching Phase A's own fixed-file-
+' capacity scope reduction). Read-only: there is no writer here, matching Phase A's own decision
+' to defer transactions to Phase C, where a real staging concept will exist to make transactional.
+
+FUNCTION ArcFSSectorScratchAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34099200))   ' 0x2085000
+END FUNCTION
+
+' Mount-time parsed state. All U64 fields:
+'   [0] checkpointSector    -- the ACTIVE checkpoint sector (mirrors the superblock's own pointer)
+'   [8] objectRoot
+'   [16] objectCount
+'   [24] namespaceRoot
+'   [32] namespaceCount
+'   [40] dataRegionStart
+'   [48] maxOidSeen
+'   [56] generation         -- Phase C addition: the active checkpoint's generation number
+'   [64] nextFreeSector     -- Phase C addition: the writer's bump allocator cursor (see Phase C
+'                              section below for why a conservative bump allocator, not a real
+'                              allocation tree, is this phase's documented scope reduction)
+'   [72] pendingCheckpointSector -- Phase C addition: set by ArcFS.PrepareCommit, consumed (and
+'                              cleared) by ArcFS.PublishCommit; 0 means "no prepared commit"
+FUNCTION ArcFSMountStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34103296))   ' 0x2086000
+END FUNCTION
+
+FUNCTION ArcFSMagicMatches(base AS MMIOPTR) AS BOOL
+    IF MEMORY.Read8(ADDRESS.Offset(base, 0)) <> 65 THEN RETURN 0   ' 'A'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 1)) <> 82 THEN RETURN 0   ' 'R'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 2)) <> 67 THEN RETURN 0   ' 'C'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 3)) <> 70 THEN RETURN 0   ' 'F'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 4)) <> 83 THEN RETURN 0   ' 'S'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 5)) <> 66 THEN RETURN 0   ' 'B'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 6)) <> 48 THEN RETURN 0   ' '0'
+    IF MEMORY.Read8(ADDRESS.Offset(base, 7)) <> 49 THEN RETURN 0   ' '1'
+    RETURN 1
+END FUNCTION
+
+' Sums the first `count` bytes at `base` as a U64 accumulator -- safe without a 2^32 mask for
+' every record shape this format defines (a handful of small fixed-size records; the true sum
+' cannot approach 2^32), matching the same simple-additive-checksum choice
+' build-arcfs-test-image.py makes on the Python side.
+FUNCTION ArcFSRecordChecksum(base AS MMIOPTR, count AS U64) AS U64
+    LET sum AS U64 = 0
+    LET i AS U64 = 0
+    WHILE i < count
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(base, i))
+        LET bAsU64 AS U64 = b
+        sum = sum + bAsU64
+        i = i + 1
+    WEND
+    RETURN sum
+END FUNCTION
+
+FUNCTION ArcFSReadSuperblock() AS BOOL
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    IF RAMDisk.ReadSectors(0, 1, scratch) = 0 THEN
+        RETURN 0
+    END IF
+    IF ArcFSMagicMatches(scratch) = 0 THEN
+        RETURN 0
+    END IF
+    LET storedChecksum AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 64))
+    LET computedChecksum AS U64 = ArcFSRecordChecksum(scratch, 64)
+    IF storedChecksum <> computedChecksum THEN
+        RETURN 0
+    END IF
+    LET logicalBlockSize AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 32))
+    IF logicalBlockSize <> 512 THEN
+        RETURN 0
+    END IF
+    LET checkpointSector AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 56))
+    MEMORY.Write64(ArcFSMountStateAddress(), checkpointSector)
+    RETURN 1
+END FUNCTION
+
+FUNCTION ArcFSReadCheckpoint() AS BOOL
+    LET state AS MMIOPTR = ArcFSMountStateAddress()
+    LET checkpointSector AS U64 = MEMORY.Read64(state)
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    IF RAMDisk.ReadSectors(checkpointSector, 1, scratch) = 0 THEN
+        RETURN 0
+    END IF
+    LET storedChecksum AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 48))
+    LET computedChecksum AS U64 = ArcFSRecordChecksum(scratch, 48)
+    IF storedChecksum <> computedChecksum THEN
+        RETURN 0
+    END IF
+    LET generation AS U64 = MEMORY.Read64(scratch)
+    LET objectRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 8))
+    LET objectCount AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 16))
+    LET namespaceRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 24))
+    LET namespaceCount AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 32))
+    LET dataRegionStart AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 40))
+    IF objectCount > ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    IF namespaceCount > ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+    MEMORY.Write64(ADDRESS.Offset(state, 8), objectRoot)
+    MEMORY.Write64(ADDRESS.Offset(state, 16), objectCount)
+    MEMORY.Write64(ADDRESS.Offset(state, 24), namespaceRoot)
+    MEMORY.Write64(ADDRESS.Offset(state, 32), namespaceCount)
+    MEMORY.Write64(ADDRESS.Offset(state, 40), dataRegionStart)
+    MEMORY.Write64(ADDRESS.Offset(state, 56), generation)
+    ' Conservative bump-allocator cursor: every FILE object owns at most 8 extent sectors, so
+    ' dataRegionStart + objectCount*8 is guaranteed >= the highest sector this generation actually
+    ' used, even though it usually overshoots (not every object is a FILE). Phase C's own
+    ' documented scope reduction (see below): never reuse a sector, even a wasted one -- real
+    ' reclamation of an old generation's unreachable sectors is explicitly Phase E's job.
+    MEMORY.Write64(ADDRESS.Offset(state, 64), dataRegionStart + objectCount * 8)
+    RETURN 1
+END FUNCTION
+
+' Loads one object record (index into the on-disk array, 0-based) into Phase A's in-memory
+' Object Table row of the SAME index -- matching Phase A's own dataSlot=row-index convention, so
+' a FILE object's on-disk extent and its in-memory data-pool slot share the identical index too.
+FUNCTION ArcFSLoadOneObject(index AS U64) AS BOOL
+    LET state AS MMIOPTR = ArcFSMountStateAddress()
+    LET objectRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 8))
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    IF RAMDisk.ReadSectors(objectRoot + index, 1, scratch) = 0 THEN
+        RETURN 0
+    END IF
+    LET storedChecksum AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 32))
+    LET computedChecksum AS U64 = ArcFSRecordChecksum(scratch, 32)
+    IF storedChecksum <> computedChecksum THEN
+        RETURN 0
+    END IF
+    LET oid AS U64 = MEMORY.Read64(scratch)
+    LET objType AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 8))
+    LET size AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 16))
+    LET extentSector AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 24))
+
+    LET row AS MMIOPTR = ArcFSObjectRowAddress(index)
+    MEMORY.Write64(row, oid)
+    MEMORY.Write64(ADDRESS.Offset(row, 8), objType)
+    MEMORY.Write64(ADDRESS.Offset(row, 16), size)
+    MEMORY.Write64(ADDRESS.Offset(row, 24), index)
+
+    ' Phase D: a freshly loaded object always owns its data-pool slot exclusively -- on-disk
+    ' extent sharing from a prior in-memory Reflink is not implemented (see this section's own
+    ' Phase D header note), so every object a mount produces starts with refcount 1, same as a
+    ' plain ArcFSCreateObject would.
+    MEMORY.Write64(ADDRESS.Offset(ArcFSSlotRefCountAddress(), index * 8), 1)
+
+    LET maxOid AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 48))
+    IF oid > maxOid THEN
+        MEMORY.Write64(ADDRESS.Offset(state, 48), oid)
+    END IF
+
+    IF objType = 1 THEN
+        LET dest AS MMIOPTR = ADDRESS.Offset(ArcFSDataPoolAddress(), index * ArcFSFileCapacityBytes())
+        IF RAMDisk.ReadSectors(extentSector, 8, dest) = 0 THEN
+            RETURN 0
+        END IF
+    END IF
+
+    RETURN 1
+END FUNCTION
+
+FUNCTION ArcFSLoadObjects() AS BOOL
+    LET objectCount AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSMountStateAddress(), 16))
+    LET index AS U64 = 0
+    WHILE index < objectCount
+        IF ArcFSLoadOneObject(index) = 0 THEN
+            RETURN 0
+        END IF
+        index = index + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION ArcFSLoadOneNamespaceEntry(index AS U64) AS BOOL
+    LET state AS MMIOPTR = ArcFSMountStateAddress()
+    LET namespaceRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 24))
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    IF RAMDisk.ReadSectors(namespaceRoot + index, 1, scratch) = 0 THEN
+        RETURN 0
+    END IF
+    LET storedChecksum AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 56))
+    LET computedChecksum AS U64 = ArcFSRecordChecksum(scratch, 56)
+    IF storedChecksum <> computedChecksum THEN
+        RETURN 0
+    END IF
+    LET parentOID AS U64 = MEMORY.Read64(scratch)
+    LET nameLength AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 40))
+    LET childOID AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 48))
+    IF nameLength > ArcFSMaxNameLength() THEN
+        RETURN 0
+    END IF
+
+    LET row AS MMIOPTR = ArcFSNamespaceRowAddress(index)
+    MEMORY.Write64(row, parentOID)
+    ArcFSWriteName(row, ADDRESS.Offset(scratch, 8), nameLength)
+    MEMORY.Write64(ADDRESS.Offset(row, 40), nameLength)
+    MEMORY.Write64(ADDRESS.Offset(row, 48), childOID)
+    MEMORY.Write64(ADDRESS.Offset(row, 56), 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION ArcFSLoadNamespace() AS BOOL
+    LET namespaceCount AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSMountStateAddress(), 32))
+    LET index AS U64 = 0
+    WHILE index < namespaceCount
+        IF ArcFSLoadOneNamespaceEntry(index) = 0 THEN
+            RETURN 0
+        END IF
+        index = index + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Requirement (RFC-0039 Section 10's ACTIVATE step, made concrete): resets Phase A's in-memory
+' tables, then loads a real BlockDevice-backed image into them. Fails closed -- returns FALSE,
+' leaving whatever Initialize() alone produced (an empty tree with just the root directory) -- on
+' any magic mismatch, checksum failure, or over-capacity table, exactly like RFC-0038's FAT32.Mount
+' before it.
+FUNCTION ArcFS.MountImage() AS BOOL
+    ArcFS.Initialize()
+    MEMORY.Write64(ADDRESS.Offset(ArcFSMountStateAddress(), 48), 0)
+
+    IF ArcFSReadSuperblock() = 0 THEN
+        RETURN 0
+    END IF
+    IF ArcFSReadCheckpoint() = 0 THEN
+        RETURN 0
+    END IF
+    IF ArcFSLoadObjects() = 0 THEN
+        RETURN 0
+    END IF
+    IF ArcFSLoadNamespace() = 0 THEN
+        RETURN 0
+    END IF
+
+    LET maxOid AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSMountStateAddress(), 48))
+    MEMORY.Write64(ArcFSNextOidAddress(), maxOid + 1)
+
+    ' Phase D: every loaded object claimed data-pool slots 0..objectCount-1 (ArcFSLoadOneObject's
+    ' own index-as-slot convention); bump the allocator past all of them so the next real
+    ' ArcFS.CreateFile/CreateDirectory/Reflink call after this mount allocates a genuinely fresh
+    ' slot instead of colliding with one a just-loaded object still owns.
+    LET loadedObjectCount AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSMountStateAddress(), 16))
+    MEMORY.Write64(ArcFSNextDataSlotAddress(), loadedObjectCount)
+    RETURN 1
+END FUNCTION
+
+' ==========================================================================================
+' Phase C: formatter and transactional writer (RFC-0039 Section 78, Phase C -- "allocation
+' tree; copy-on-write metadata; commit protocol; durable checkpoint publication; crash-injection
+' tests").
+' ==========================================================================================
+'
+' Two capabilities, both new:
+'
+' 1. ArcFS.FormatVolume() -- RFC-0039 Section 40's Formatting, made concrete: writes a brand-new
+'    generation-1 volume (superblock + checkpoint + a lone root-directory object record) to a
+'    BlockDevice that Phase B's ArcFS.MountImage can then read back.
+'
+' 2. ArcFS.PrepareCommit() / ArcFS.PublishCommit() / ArcFS.CommitImage() -- RFC-0039 Section
+'    15.2's commit protocol, made concrete: takes whatever Phase A's in-memory tables currently
+'    hold (mutated by ordinary CreateFile/CreateDirectory/Rename/Remove/HandleWrite calls, exactly
+'    as before -- Phase C changes nothing about how the tree is edited, only how it becomes
+'    durable) and writes it to the BlockDevice as a brand-new generation, in the copy-on-write
+'    sense RFC-0039 Section 5.2 requires: EVERY object/namespace/data record this commit needs is
+'    written to a FRESH sector the previous committed generation never used, and the previously
+'    committed checkpoint's own sectors are never modified in place. The single point where the
+'    new generation becomes authoritative is one single-sector write: the superblock's
+'    checkpointSector field. Splitting "prepare" (everything except that one write) from
+'    "publish" (exactly that one write) is what makes the crash-injection tests below possible
+'    without needing to simulate a real power cut: calling PrepareCommit and then simply not
+'    calling PublishCommit IS the crash -- the old generation remains the only one any subsequent
+'    ArcFS.MountImage() call can ever see, because nothing on disk points at the new one yet.
+'
+' Documented Phase C scope reductions, stated up front, in the same spirit as every prior phase's
+' own header note:
+'
+' 1. "Allocation tree" here is a conservative monotonic bump allocator (ArcFSMountStateAddress
+'    offset 64, ratcheted forward by every ReadCheckpoint/PrepareCommit call), not a real
+'    allocation tree with free-space reclamation. It never reuses a sector, so it trivially
+'    satisfies RFC-0039 Section 29's "no committed generation may describe the same physical
+'    block as simultaneously allocated to incompatible owners" -- correct, but wasteful: an old
+'    generation's now-unreachable sectors are never reclaimed. RFC-0039 Section 78's own Phase E
+'    ("Snapshots and reclamation... safe reclamation") is explicitly where that belongs; this
+'    phase's job is proving the commit protocol is atomic, not proving space efficiency.
+' 2. "Flush" is a no-op. RFC-0038's RAMDisk.WriteSectors is an ordinary synchronous memory copy --
+'    there is no volatile device write-back cache to order against in this milestone's model, so
+'    RFC-0039 Section 15.2's "ensure durability boundary reached" / "flush/order the checkpoint
+'    write" steps collapse to "the write already happened." A real block device's distinct
+'    completion-to-cache vs. durable-completion semantics (RFC-0039 Section 34) is RFC-0038's own
+'    future work, not something this phase can prove against a RAM disk.
+' 3. Object/namespace/data extent writes are NOT individually copy-on-write against each other
+'    within one commit (there is no intra-transaction rollback) -- if PrepareCommit fails partway
+'    through (e.g. a RAMDisk.WriteSectors call returns FALSE because the device is too small), the
+'    already-written sectors for that attempt are simply abandoned as unreachable garbage, exactly
+'    like an aborted transaction per RFC-0039 Section 15.3 -- they were never reachable from any
+'    checkpoint (the previous generation's checkpoint is untouched, and the new one is never
+'    written), so this is correct, not merely convenient.
+' 4. No multi-writer/multi-transaction concurrency (RFC-0039 Section 32) -- there is exactly one
+'    in-memory tree and one BlockDevice, matching every prior phase's "one instance" pattern.
+
+' Builds a fresh, zeroed on-disk object record in `scratch` and computes its checksum. Does not
+' write it anywhere -- the caller decides which sector.
+FUNCTION ArcFSWriteObjectRecord(scratch AS MMIOPTR, oid AS U64, objType AS U64, size AS U64, extentSector AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < 512
+        MEMORY.Write8(ADDRESS.Offset(scratch, i), 0)
+        i = i + 1
+    WEND
+    MEMORY.Write64(scratch, oid)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 8), objType)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 16), size)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 24), extentSector)
+    LET checksum AS U64 = ArcFSRecordChecksum(scratch, 32) AND 4294967295
+    MEMORY.Write32(ADDRESS.Offset(scratch, 32), checksum)
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSWriteNamespaceRecord(scratch AS MMIOPTR, parentOid AS U64, nameBuffer AS MMIOPTR, nameLength AS U64, childOid AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < 512
+        MEMORY.Write8(ADDRESS.Offset(scratch, i), 0)
+        i = i + 1
+    WEND
+    MEMORY.Write64(scratch, parentOid)
+    ArcFSWriteName(scratch, nameBuffer, nameLength)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 40), nameLength)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 48), childOid)
+    LET checksum AS U64 = ArcFSRecordChecksum(scratch, 56) AND 4294967295
+    MEMORY.Write32(ADDRESS.Offset(scratch, 56), checksum)
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSWriteCheckpointRecord(scratch AS MMIOPTR, generation AS U64, objectRoot AS U64, objectCount AS U64, namespaceRoot AS U64, namespaceCount AS U64, dataRegionStart AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < 512
+        MEMORY.Write8(ADDRESS.Offset(scratch, i), 0)
+        i = i + 1
+    WEND
+    MEMORY.Write64(scratch, generation)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 8), objectRoot)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 16), objectCount)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 24), namespaceRoot)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 32), namespaceCount)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 40), dataRegionStart)
+    LET checksum AS U64 = ArcFSRecordChecksum(scratch, 48) AND 4294967295
+    MEMORY.Write32(ADDRESS.Offset(scratch, 48), checksum)
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSWriteSuperblockRecord(scratch AS MMIOPTR, checkpointSector AS U64, totalBlocks AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < 512
+        MEMORY.Write8(ADDRESS.Offset(scratch, i), 0)
+        i = i + 1
+    WEND
+    MEMORY.Write8(ADDRESS.Offset(scratch, 0), 65)    ' 'A'
+    MEMORY.Write8(ADDRESS.Offset(scratch, 1), 82)    ' 'R'
+    MEMORY.Write8(ADDRESS.Offset(scratch, 2), 67)    ' 'C'
+    MEMORY.Write8(ADDRESS.Offset(scratch, 3), 70)    ' 'F'
+    MEMORY.Write8(ADDRESS.Offset(scratch, 4), 83)    ' 'S'
+    MEMORY.Write8(ADDRESS.Offset(scratch, 5), 66)    ' 'B'
+    MEMORY.Write8(ADDRESS.Offset(scratch, 6), 48)    ' '0'
+    MEMORY.Write8(ADDRESS.Offset(scratch, 7), 49)    ' '1'
+    MEMORY.Write32(ADDRESS.Offset(scratch, 8), 1)    ' format major
+    MEMORY.Write32(ADDRESS.Offset(scratch, 12), 0)   ' format minor
+    MEMORY.Write64(ADDRESS.Offset(scratch, 16), 42)  ' volume UUID placeholder, high half
+    MEMORY.Write64(ADDRESS.Offset(scratch, 24), 1)   ' volume UUID placeholder, low half
+    MEMORY.Write32(ADDRESS.Offset(scratch, 32), 512)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 40), totalBlocks)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 48), 0)   ' feature flags: none defined yet
+    MEMORY.Write64(ADDRESS.Offset(scratch, 56), checkpointSector)
+    LET checksum AS U64 = ArcFSRecordChecksum(scratch, 64) AND 4294967295
+    MEMORY.Write32(ADDRESS.Offset(scratch, 64), checksum)
+    RETURN 0
+END FUNCTION
+
+' Requirement (RFC-0039 Section 40): formats a brand-new ArcFS volume on whatever BlockDevice is
+' currently backing RAMDisk.* -- generation 1, a lone root-directory object (OID 1, matching
+' ArcFS.Initialize's own in-memory root), no namespace entries yet. Resets the in-memory tables to
+' match via ArcFS.Initialize() so the caller's view is consistent with what was just written.
+FUNCTION ArcFS.FormatVolume() AS BOOL
+    ArcFS.Initialize()
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    LET totalBlocks AS U64 = RAMDisk.SectorCount()
+
+    ArcFSWriteObjectRecord(scratch, 1, 2, 0, 0)
+    IF RAMDisk.WriteSectors(2, 1, scratch) = 0 THEN
+        RETURN 0
+    END IF
+
+    ArcFSWriteCheckpointRecord(scratch, 1, 2, 1, 3, 0, 3)
+    IF RAMDisk.WriteSectors(1, 1, scratch) = 0 THEN
+        RETURN 0
+    END IF
+
+    ArcFSWriteSuperblockRecord(scratch, 1, totalBlocks)
+    IF RAMDisk.WriteSectors(0, 1, scratch) = 0 THEN
+        RETURN 0
+    END IF
+
+    LET state AS MMIOPTR = ArcFSMountStateAddress()
+    MEMORY.Write64(state, 1)
+    MEMORY.Write64(ADDRESS.Offset(state, 8), 2)
+    MEMORY.Write64(ADDRESS.Offset(state, 16), 1)
+    MEMORY.Write64(ADDRESS.Offset(state, 24), 3)
+    MEMORY.Write64(ADDRESS.Offset(state, 32), 0)
+    MEMORY.Write64(ADDRESS.Offset(state, 40), 3)
+    MEMORY.Write64(ADDRESS.Offset(state, 48), 1)
+    MEMORY.Write64(ADDRESS.Offset(state, 56), 1)
+    MEMORY.Write64(ADDRESS.Offset(state, 64), 3)
+    RETURN 1
+END FUNCTION
+
+' RFC-0039 Section 15.2 steps 1-6: allocate fresh sectors for every active object/namespace
+' record and every FILE's data extent, write them all, then write the new checkpoint record
+' itself -- all to sectors the previously committed generation never touched. Does NOT touch the
+' superblock; the previous generation remains the only one visible to a fresh ArcFS.MountImage()
+' call until ArcFS.PublishCommit() runs. On any failure, clears the pending-commit marker first so
+' a caller can never accidentally publish a half-written attempt.
+'
+' Phase F addition (RFC-0039 Section 38): refuses outright while ArcFSReadOnlySafetyAddress is
+' set -- a structural defect was found in the mounted generation, and ordinary mutation on top of
+' a known-bad tree is exactly what ReadOnlySafety exists to prevent. ArcFS.RepairCommit is the
+' one sanctioned way through this guard.
+FUNCTION ArcFS.PrepareCommit() AS BOOL
+    IF MEMORY.Read64(ArcFSReadOnlySafetyAddress()) <> 0 THEN
+        RETURN 0
+    END IF
+    LET state AS MMIOPTR = ArcFSMountStateAddress()
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    MEMORY.Write64(ADDRESS.Offset(state, 72), 0)
+
+    LET activeObjectCount AS U64 = 0
+    LET row AS U64 = 0
+    WHILE row < ArcFSMaxObjects()
+        LET objActive AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(row), 8))
+        IF objActive <> 0 THEN
+            activeObjectCount = activeObjectCount + 1
+        END IF
+        row = row + 1
+    WEND
+
+    LET activeNamespaceCount AS U64 = 0
+    row = 0
+    WHILE row < ArcFSMaxNamespaceRows()
+        LET nsActive AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSNamespaceRowAddress(row), 56))
+        IF nsActive <> 0 THEN
+            activeNamespaceCount = activeNamespaceCount + 1
+        END IF
+        row = row + 1
+    WEND
+
+    LET newObjectRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 64))
+    LET newNamespaceRoot AS U64 = newObjectRoot + activeObjectCount
+    LET newDataRegionStart AS U64 = newNamespaceRoot + activeNamespaceCount
+
+    LET diskIndex AS U64 = 0
+    LET fileDiskIndex AS U64 = 0
+    row = 0
+    WHILE row < ArcFSMaxObjects()
+        LET base AS MMIOPTR = ArcFSObjectRowAddress(row)
+        LET objType AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 8))
+        IF objType <> 0 THEN
+            LET oid AS U64 = MEMORY.Read64(base)
+            LET size AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 16))
+            LET extentSector AS U64 = 0
+            IF objType = 1 THEN
+                extentSector = newDataRegionStart + fileDiskIndex * 8
+            END IF
+            ArcFSWriteObjectRecord(scratch, oid, objType, size, extentSector)
+            IF RAMDisk.WriteSectors(newObjectRoot + diskIndex, 1, scratch) = 0 THEN
+                RETURN 0
+            END IF
+            IF objType = 1 THEN
+                ' Phase D: read the row's OWN dataSlot field rather than assuming dataSlot equals
+                ' the row index. That assumption held for every object through Phase C (dataSlot
+                ' was always assigned equal to the owning row), but Reflink (Phase D) breaks it on
+                ' purpose -- two rows can share one dataSlot until one of them writes. Reading the
+                ' field is a strict generalization: for every pre-Phase-D object dataSlot still
+                ' equals row, so this produces byte-identical output for Phase C's own fixtures.
+                LET dataSlot AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 24))
+                LET dataSrc AS MMIOPTR = ADDRESS.Offset(ArcFSDataPoolAddress(), dataSlot * ArcFSFileCapacityBytes())
+                IF RAMDisk.WriteSectors(extentSector, 8, dataSrc) = 0 THEN
+                    RETURN 0
+                END IF
+                fileDiskIndex = fileDiskIndex + 1
+            END IF
+            diskIndex = diskIndex + 1
+        END IF
+        row = row + 1
+    WEND
+
+    LET nsDiskIndex AS U64 = 0
+    row = 0
+    WHILE row < ArcFSMaxNamespaceRows()
+        LET nsBase AS MMIOPTR = ArcFSNamespaceRowAddress(row)
+        LET nsActive2 AS U64 = MEMORY.Read64(ADDRESS.Offset(nsBase, 56))
+        IF nsActive2 <> 0 THEN
+            LET parentOid AS U64 = MEMORY.Read64(nsBase)
+            LET nameLength AS U64 = MEMORY.Read64(ADDRESS.Offset(nsBase, 40))
+            LET childOid AS U64 = MEMORY.Read64(ADDRESS.Offset(nsBase, 48))
+            LET nameBuf AS MMIOPTR = ADDRESS.Offset(nsBase, 8)
+            ArcFSWriteNamespaceRecord(scratch, parentOid, nameBuf, nameLength, childOid)
+            IF RAMDisk.WriteSectors(newNamespaceRoot + nsDiskIndex, 1, scratch) = 0 THEN
+                RETURN 0
+            END IF
+            nsDiskIndex = nsDiskIndex + 1
+        END IF
+        row = row + 1
+    WEND
+
+    LET newCheckpointSector AS U64 = newDataRegionStart + fileDiskIndex * 8
+    LET oldGeneration AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 56))
+    LET newGeneration AS U64 = oldGeneration + 1
+    ArcFSWriteCheckpointRecord(scratch, newGeneration, newObjectRoot, activeObjectCount, newNamespaceRoot, activeNamespaceCount, newDataRegionStart)
+    IF RAMDisk.WriteSectors(newCheckpointSector, 1, scratch) = 0 THEN
+        RETURN 0
+    END IF
+
+    MEMORY.Write64(ADDRESS.Offset(state, 72), newCheckpointSector)
+    MEMORY.Write64(ADDRESS.Offset(state, 56), newGeneration)
+    MEMORY.Write64(ADDRESS.Offset(state, 64), newCheckpointSector + 1)
+    RETURN 1
+END FUNCTION
+
+' RFC-0039 Section 15.2 step 7: the single atomic publication point. Rewrites the superblock so
+' its checkpointSector field points at the checkpoint ArcFS.PrepareCommit just wrote -- one
+' single-sector write, matching the commit-ordering requirement that the new generation must not
+' be "exposed as durable" any earlier than this. Refuses if no commit is currently prepared.
+FUNCTION ArcFS.PublishCommit() AS BOOL
+    LET state AS MMIOPTR = ArcFSMountStateAddress()
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    LET pendingCheckpointSector AS U64 = MEMORY.Read64(ADDRESS.Offset(state, 72))
+    IF pendingCheckpointSector = 0 THEN
+        RETURN 0
+    END IF
+
+    LET totalBlocks AS U64 = RAMDisk.SectorCount()
+    ArcFSWriteSuperblockRecord(scratch, pendingCheckpointSector, totalBlocks)
+    IF RAMDisk.WriteSectors(0, 1, scratch) = 0 THEN
+        RETURN 0
+    END IF
+
+    MEMORY.Write64(state, pendingCheckpointSector)
+    MEMORY.Write64(ADDRESS.Offset(state, 72), 0)
+    RETURN 1
+END FUNCTION
+
+' Convenience: prepare then publish in one call, for the ordinary (non-crash-injection) case.
+' Returns TRUE only if the ENTIRE commit -- including publication -- succeeded.
+FUNCTION ArcFS.CommitImage() AS BOOL
+    IF ArcFS.PrepareCommit() = 0 THEN
+        RETURN 0
+    END IF
+    RETURN ArcFS.PublishCommit()
+END FUNCTION
+
+' ==========================================================================================
+' Phase E: snapshots and reclamation (RFC-0039 Section 78, Phase E -- "snapshot roots;
+' generation pinning; shared extent accounting; safe reclamation").
+' ==========================================================================================
+'
+' A snapshot (RFC-0039 Section 21) is a persistent reference to a committed generation that
+' survives later commits. Because Phase C's bump allocator NEVER reuses a sector, every past
+' checkpoint's bytes are still physically present on the BlockDevice for as long as this milestone
+' exists -- nothing has ever been destroyed. What a snapshot actually buys, and the entire reason
+' Phase E exists, is the SAFETY ANALYSIS a future reclaiming allocator would need before it is
+' allowed to destroy anything: ArcFS.IsSectorReachable / ArcFS.ReclaimableSectorCount compute
+' exactly which sectors are safe to reuse (reachable from neither the active checkpoint nor any
+' live snapshot) -- "generation pinning" and "shared extent accounting," proven correct here, ready
+' for a future allocator to consult. Teaching the allocator to actually REUSE that space is
+' deliberately NOT done in this phase; see the scope-reduction note below for why.
+'
+' A critical design decision, stated up front: snapshots in this implementation are STRICTLY
+' READ-ONLY and are NEVER loaded into the live Object/Namespace/data-pool tables Phase A defined --
+' those tables are the WRITE PATH's own state, the thing ArcFS.PrepareCommit reads FROM. Mounting a
+' snapshot into them (the obvious-looking shortcut: just reuse ArcFS.MountImage against the
+' snapshot's checkpoint sector) would silently repoint ArcFSMountStateAddress's own "active
+' checkpoint" and "next free sector" bookkeeping at the OLD generation's much smaller numbers --
+' the very next ArcFS.CommitImage() call would then allocate sectors that a newer, real generation
+' already occupies, corrupting it. Instead, every snapshot-read function below (ArcFS.
+' SnapshotResolve, ArcFS.SnapshotReadFile) works by scanning the snapshot's own on-disk records
+' directly via RAMDisk.ReadSectors, exactly mirroring Phase B's own loader logic but writing
+' nothing into the live tables and touching no write-path state at all. Slower per call, but the
+' live tree's integrity can never depend on which snapshot was most recently inspected.
+'
+' Documented Phase E scope reductions, in the same spirit as every prior phase's own header note:
+'
+' 1. No real space reuse. ArcFS.ReclaimableSectorCount() proves WHAT could be reclaimed; nothing in
+'    this phase teaches ArcFS.PrepareCommit's bump allocator to actually consult it and reuse those
+'    sectors. That changes the bump allocator's core "never reuse a sector" invariant Phase C
+'    established specifically to avoid a free-list's own crash-safety questions -- a real free-list
+'    allocator needs the same careful crash-injection analysis Phase C gave the commit protocol
+'    itself, and is deliberately left for a later increment.
+' 2. Fixed-capacity snapshot table (8 slots), matching every "one instance / small fixed table"
+'    pattern this whole project chain has used.
+' 3. A snapshot pins exactly one checkpoint (one generation); there is no retention policy,
+'    labeling, or creation-time metadata beyond generation + checkpoint sector (RFC-0039 Section
+'    21's "human label... creator/authority metadata... optional descriptive attributes" are not
+'    implemented -- the same STRING-has-no-operations limitation Phase A's own scope reduction #4
+'    already gave for why labels are awkward on this backend).
+' 4. ArcFS.ReclaimableSectorCount() is a straightforward O(sectors x live-references) scan, not an
+'    interval index -- fine at this milestone's tiny (sub-300-sector) test scale, not a production
+'    algorithm.
+
+FUNCTION ArcFSSnapshotTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34119680))   ' 0x208A000
+END FUNCTION
+
+FUNCTION ArcFSNextSnapshotIdAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34123776))   ' 0x208B000
+END FUNCTION
+
+' Scratch state for "peeking" an arbitrary checkpoint's fields WITHOUT touching the live mount
+' state (ArcFSMountStateAddress is write-path state; this is a read-only side table). 56 bytes:
+' [0]objectRoot [8]objectCount [16]namespaceRoot [24]namespaceCount [32]dataRegionStart
+' [40]foundSize [48]foundExtentSector -- the last two are scratch outputs for
+' ArcFSSnapshotFindObjectRecord below, reusing this same block rather than a separate one.
+FUNCTION ArcFSPeekStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34127872))   ' 0x208C000
+END FUNCTION
+
+' A full 4096-byte scratch buffer for ArcFS.SnapshotReadFile below -- an extent is always 8
+' sectors (4096 bytes), which does not fit the 512-byte ArcFSSectorScratchAddress used for single
+' metadata records, and reading it straight into the CALLER's buffer would overrun that buffer
+' whenever maxBytes < 4096 (every fixture in this chain calls with a smaller maxBytes).
+FUNCTION ArcFSSnapshotExtentScratchAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34131968))   ' 0x208D000
+END FUNCTION
+
+FUNCTION ArcFSMaxSnapshots() AS U64
+    RETURN 8
+END FUNCTION
+
+' Snapshot Tree (RFC-0039 Section 16.7, scaled to a fixed table). Row layout, 32 bytes:
+' [active U64][snapshotId U64][generation U64][checkpointSector U64].
+FUNCTION ArcFSSnapshotRowAddress(slot AS U64) AS MMIOPTR
+    RETURN ADDRESS.Offset(ArcFSSnapshotTableAddress(), slot * 32)
+END FUNCTION
+
+FUNCTION ArcFSFindFreeSnapshotRow() AS U64
+    LET slot AS U64 = 0
+    LET found AS U64 = ArcFSMaxSnapshots()
+    WHILE slot < ArcFSMaxSnapshots()
+        LET active AS U64 = MEMORY.Read64(ArcFSSnapshotRowAddress(slot))
+        IF active = 0 THEN
+            IF found = ArcFSMaxSnapshots() THEN
+                found = slot
+            END IF
+        END IF
+        slot = slot + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION ArcFSFindSnapshotRowById(snapshotId AS U64) AS U64
+    LET slot AS U64 = 0
+    LET found AS U64 = ArcFSMaxSnapshots()
+    WHILE slot < ArcFSMaxSnapshots()
+        LET base AS MMIOPTR = ArcFSSnapshotRowAddress(slot)
+        LET active AS U64 = MEMORY.Read64(base)
+        IF active <> 0 THEN
+            LET storedId AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 8))
+            IF storedId = snapshotId THEN
+                found = slot
+            END IF
+        END IF
+        slot = slot + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION ArcFSAllocateSnapshotId() AS U64
+    LET nextId AS U64 = MEMORY.Read64(ArcFSNextSnapshotIdAddress())
+    MEMORY.Write64(ArcFSNextSnapshotIdAddress(), nextId + 1)
+    RETURN nextId + 1
+END FUNCTION
+
+' RFC-0039 Section 21: "Creating a snapshot SHALL create a persistent reference to a committed
+' generation/root set without copying all referenced file data." Pins the CURRENTLY ACTIVE
+' checkpoint -- state offset 0, kept continuously in sync by ArcFS.PublishCommit -- so it survives
+' any number of later commits. Returns the new snapshot ID (never 0), or 0 on failure (the
+' snapshot table is full, or nothing has ever been committed/mounted yet).
+FUNCTION ArcFS.CreateSnapshot() AS U64
+    LET activeCheckpointSector AS U64 = MEMORY.Read64(ArcFSMountStateAddress())
+    IF activeCheckpointSector = 0 THEN
+        RETURN 0
+    END IF
+    LET generation AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSMountStateAddress(), 56))
+
+    LET slot AS U64 = ArcFSFindFreeSnapshotRow()
+    IF slot = ArcFSMaxSnapshots() THEN
+        RETURN 0
+    END IF
+
+    LET snapshotId AS U64 = ArcFSAllocateSnapshotId()
+    LET base AS MMIOPTR = ArcFSSnapshotRowAddress(slot)
+    MEMORY.Write64(base, 1)
+    MEMORY.Write64(ADDRESS.Offset(base, 8), snapshotId)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), generation)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), activeCheckpointSector)
+    RETURN snapshotId
+END FUNCTION
+
+' RFC-0039 Section 21: "Deleting a snapshot removes its root reference transactionally." Removing
+' the pin does not touch any BlockDevice sector -- it only makes the generation eligible for
+' ArcFS.IsSectorReachable to report FALSE, i.e. eligible for a future allocator's reclamation.
+FUNCTION ArcFS.DeleteSnapshot(snapshotId AS U64) AS BOOL
+    LET slot AS U64 = ArcFSFindSnapshotRowById(snapshotId)
+    IF slot = ArcFSMaxSnapshots() THEN
+        RETURN 0
+    END IF
+    MEMORY.Write64(ArcFSSnapshotRowAddress(slot), 0)
+    RETURN 1
+END FUNCTION
+
+' Reads and validates an arbitrary checkpoint sector (active or a snapshot's -- this function does
+' not care which) into ArcFSPeekStateAddress, WITHOUT touching ArcFSMountStateAddress. Mirrors
+' ArcFSReadCheckpoint's own validation exactly (same field offsets, same checksum coverage).
+FUNCTION ArcFSPeekCheckpoint(checkpointSector AS U64) AS BOOL
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    IF RAMDisk.ReadSectors(checkpointSector, 1, scratch) = 0 THEN
+        RETURN 0
+    END IF
+    LET storedChecksum AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 48))
+    LET computedChecksum AS U64 = ArcFSRecordChecksum(scratch, 48)
+    IF storedChecksum <> computedChecksum THEN
+        RETURN 0
+    END IF
+    LET peek AS MMIOPTR = ArcFSPeekStateAddress()
+    MEMORY.Write64(peek, MEMORY.Read64(ADDRESS.Offset(scratch, 8)))
+    MEMORY.Write64(ADDRESS.Offset(peek, 8), MEMORY.Read64(ADDRESS.Offset(scratch, 16)))
+    MEMORY.Write64(ADDRESS.Offset(peek, 16), MEMORY.Read64(ADDRESS.Offset(scratch, 24)))
+    MEMORY.Write64(ADDRESS.Offset(peek, 24), MEMORY.Read64(ADDRESS.Offset(scratch, 32)))
+    MEMORY.Write64(ADDRESS.Offset(peek, 32), MEMORY.Read64(ADDRESS.Offset(scratch, 40)))
+    RETURN 1
+END FUNCTION
+
+' A generation's on-disk range is [min(objectRoot, checkpointSector), max(objectRoot,
+' checkpointSector)]. This holds for every generation ArcFS.PrepareCommit ever writes (checkpoint
+' is always the LAST sector of the range, written after every object/namespace/data record) AND
+' for ArcFS.FormatVolume's own generation 1 (the one anomaly: its checkpoint is written FIRST, at
+' sector 1, with its lone root object at sector 2 -- min/max still gives the correct [1,2] range).
+FUNCTION ArcFSGenerationRangeContains(checkpointSector AS U64, sector AS U64) AS BOOL
+    IF ArcFSPeekCheckpoint(checkpointSector) = 0 THEN
+        RETURN 0
+    END IF
+    LET objectRoot AS U64 = MEMORY.Read64(ArcFSPeekStateAddress())
+    LET lo AS U64 = objectRoot
+    LET hi AS U64 = checkpointSector
+    IF checkpointSector < objectRoot THEN
+        lo = checkpointSector
+        hi = objectRoot
+    END IF
+    IF sector < lo THEN
+        RETURN 0
+    END IF
+    IF sector > hi THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+' RFC-0039 Section 78's "generation pinning": a sector is reachable -- and therefore MUST NOT be
+' reclaimed -- iff it falls within the ACTIVE checkpoint's own generation range, or within any
+' LIVE snapshot's pinned generation range. Nothing else pins a generation in this implementation.
+FUNCTION ArcFS.IsSectorReachable(sector AS U64) AS BOOL
+    LET activeCheckpointSector AS U64 = MEMORY.Read64(ArcFSMountStateAddress())
+    IF activeCheckpointSector <> 0 THEN
+        IF ArcFSGenerationRangeContains(activeCheckpointSector, sector) = 1 THEN
+            RETURN 1
+        END IF
+    END IF
+
+    LET slot AS U64 = 0
+    WHILE slot < ArcFSMaxSnapshots()
+        LET base AS MMIOPTR = ArcFSSnapshotRowAddress(slot)
+        LET active AS U64 = MEMORY.Read64(base)
+        IF active <> 0 THEN
+            LET snapCheckpointSector AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 24))
+            IF ArcFSGenerationRangeContains(snapCheckpointSector, sector) = 1 THEN
+                RETURN 1
+            END IF
+        END IF
+        slot = slot + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' RFC-0039 Section 78's "safe reclamation": counts every sector between the volume's first real
+' generation (sector 1) and the bump allocator's current high-water mark that ArcFS.
+' IsSectorReachable reports unreachable -- i.e. sectors a future reclaiming allocator could safely
+' reuse today. Does not reclaim anything itself; see this section's own scope-reduction note #1.
+FUNCTION ArcFS.ReclaimableSectorCount() AS U64
+    LET highWaterMark AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSMountStateAddress(), 64))
+    LET reclaimable AS U64 = 0
+    LET sector AS U64 = 1
+    WHILE sector < highWaterMark
+        IF ArcFS.IsSectorReachable(sector) = 0 THEN
+            reclaimable = reclaimable + 1
+        END IF
+        sector = sector + 1
+    WEND
+    RETURN reclaimable
+END FUNCTION
+
+' RFC-0039 Section 30's "snapshot-retained bytes": total sectors that are live ONLY because a
+' snapshot pins them (i.e. excluding whatever the active checkpoint's own range already accounts
+' for -- a snapshot of the CURRENTLY active generation retains nothing additional). Generation
+' ranges never overlap by construction (each commit starts at the bump allocator's then-current
+' high-water mark, strictly above every earlier range), so this is a plain sum, no double-counting
+' possible.
+FUNCTION ArcFS.SnapshotRetainedSectorCount() AS U64
+    LET activeCheckpointSector AS U64 = MEMORY.Read64(ArcFSMountStateAddress())
+    LET retained AS U64 = 0
+    LET slot AS U64 = 0
+    WHILE slot < ArcFSMaxSnapshots()
+        LET base AS MMIOPTR = ArcFSSnapshotRowAddress(slot)
+        LET active AS U64 = MEMORY.Read64(base)
+        IF active <> 0 THEN
+            LET snapCheckpointSector AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 24))
+            IF snapCheckpointSector <> activeCheckpointSector THEN
+                IF ArcFSPeekCheckpoint(snapCheckpointSector) = 1 THEN
+                    LET objectRoot AS U64 = MEMORY.Read64(ArcFSPeekStateAddress())
+                    LET lo AS U64 = objectRoot
+                    LET hi AS U64 = snapCheckpointSector
+                    IF snapCheckpointSector < objectRoot THEN
+                        lo = snapCheckpointSector
+                        hi = objectRoot
+                    END IF
+                    retained = retained + (hi - lo + 1)
+                END IF
+            END IF
+        END IF
+        slot = slot + 1
+    WEND
+    RETURN retained
+END FUNCTION
+
+' --- Read-only snapshot inspection (RFC-0039 Section 21: "Initial ArcFS snapshots SHALL be
+' read-only"). Scans the snapshot's own on-disk records directly, exactly mirroring Phase B's
+' loader logic -- but never writes into the live Object/Namespace tables and never touches
+' write-path state (see this section's own header for why that separation is load-bearing, not
+' style). ---
+
+FUNCTION ArcFSSnapshotFindNamespaceRecord(namespaceRoot AS U64, namespaceCount AS U64, parentOid AS U64, nameBuffer AS MMIOPTR, nameLength AS U64) AS U64
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    LET index AS U64 = 0
+    WHILE index < namespaceCount
+        IF RAMDisk.ReadSectors(namespaceRoot + index, 1, scratch) = 0 THEN
+            RETURN 0
+        END IF
+        LET storedChecksum AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 56))
+        LET computedChecksum AS U64 = ArcFSRecordChecksum(scratch, 56)
+        IF storedChecksum = computedChecksum THEN
+            LET storedParent AS U64 = MEMORY.Read64(scratch)
+            IF storedParent = parentOid THEN
+                LET storedLength AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 40))
+                IF ArcFSNameMatches(scratch, storedLength, nameBuffer, nameLength) = 1 THEN
+                    RETURN MEMORY.Read64(ADDRESS.Offset(scratch, 48))
+                END IF
+            END IF
+        END IF
+        index = index + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' Finds an object record by OID within [objectRoot, objectRoot+objectCount), writing its size and
+' extent sector into ArcFSPeekStateAddress offsets 40/48 on success.
+FUNCTION ArcFSSnapshotFindObjectRecord(objectRoot AS U64, objectCount AS U64, oid AS U64) AS BOOL
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    LET index AS U64 = 0
+    WHILE index < objectCount
+        IF RAMDisk.ReadSectors(objectRoot + index, 1, scratch) = 0 THEN
+            RETURN 0
+        END IF
+        LET storedChecksum AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 32))
+        LET computedChecksum AS U64 = ArcFSRecordChecksum(scratch, 32)
+        IF storedChecksum = computedChecksum THEN
+            LET storedOid AS U64 = MEMORY.Read64(scratch)
+            IF storedOid = oid THEN
+                LET peek AS MMIOPTR = ArcFSPeekStateAddress()
+                MEMORY.Write64(ADDRESS.Offset(peek, 40), MEMORY.Read64(ADDRESS.Offset(scratch, 16)))
+                MEMORY.Write64(ADDRESS.Offset(peek, 48), MEMORY.Read64(ADDRESS.Offset(scratch, 24)))
+                RETURN 1
+            END IF
+        END IF
+        index = index + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' Colon-delimited path resolution against a snapshot's pinned generation -- the read-only
+' counterpart to ArcFS.Resolve, walking the SAME root-relative syntax (RFC-0039 Section 9.1) but
+' consulting on-disk namespace records instead of the live table at every step.
+FUNCTION ArcFS.SnapshotResolve(snapshotId AS U64, pathBuffer AS MMIOPTR, pathLength AS U64) AS U64
+    LET slot AS U64 = ArcFSFindSnapshotRowById(snapshotId)
+    IF slot = ArcFSMaxSnapshots() THEN
+        RETURN 0
+    END IF
+    LET checkpointSector AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSSnapshotRowAddress(slot), 24))
+    IF ArcFSPeekCheckpoint(checkpointSector) = 0 THEN
+        RETURN 0
+    END IF
+    LET namespaceRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSPeekStateAddress(), 16))
+    LET namespaceCount AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSPeekStateAddress(), 24))
+
+    IF pathLength = 0 THEN
+        RETURN 0
+    END IF
+    LET firstByte AS U8 = MEMORY.Read8(pathBuffer)
+    IF firstByte <> 58 THEN
+        RETURN 0
+    END IF
+    IF pathLength = 1 THEN
+        RETURN 1
+    END IF
+
+    LET current AS U64 = 1
+    LET cursor AS U64 = 1
+    WHILE cursor < pathLength
+        LET componentStart AS U64 = cursor
+        LET scanning AS U64 = 1
+        WHILE scanning = 1
+            IF cursor >= pathLength THEN
+                scanning = 0
+            ELSE
+                LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(pathBuffer, cursor))
+                IF b = 58 THEN
+                    scanning = 0
+                ELSE
+                    cursor = cursor + 1
+                END IF
+            END IF
+        WEND
+        LET componentLength AS U64 = cursor - componentStart
+        IF componentLength = 0 THEN
+            RETURN 0
+        END IF
+        LET componentPtr AS MMIOPTR = ADDRESS.Offset(pathBuffer, componentStart)
+        LET nextOid AS U64 = ArcFSSnapshotFindNamespaceRecord(namespaceRoot, namespaceCount, current, componentPtr, componentLength)
+        IF nextOid = 0 THEN
+            RETURN 0
+        END IF
+        current = nextOid
+        cursor = cursor + 1
+    WEND
+    RETURN current
+END FUNCTION
+
+' Reads a FILE object's content directly from a snapshot's pinned generation -- the read-only
+' counterpart to ArcFS.OpenHandle + ArcFS.HandleRead, in one call since a snapshot handle has no
+' write side to justify a separate open/close lifecycle.
+FUNCTION ArcFS.SnapshotReadFile(snapshotId AS U64, oid AS U64, buffer AS MMIOPTR, maxBytes AS U64) AS U64
+    LET slot AS U64 = ArcFSFindSnapshotRowById(snapshotId)
+    IF slot = ArcFSMaxSnapshots() THEN
+        RETURN 0
+    END IF
+    LET checkpointSector AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSSnapshotRowAddress(slot), 24))
+    IF ArcFSPeekCheckpoint(checkpointSector) = 0 THEN
+        RETURN 0
+    END IF
+    LET objectRoot AS U64 = MEMORY.Read64(ArcFSPeekStateAddress())
+    LET objectCount AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSPeekStateAddress(), 8))
+    IF ArcFSSnapshotFindObjectRecord(objectRoot, objectCount, oid) = 0 THEN
+        RETURN 0
+    END IF
+
+    LET size AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSPeekStateAddress(), 40))
+    LET extentSector AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSPeekStateAddress(), 48))
+    LET toRead AS U64 = maxBytes
+    IF toRead > size THEN
+        toRead = size
+    END IF
+
+    ' Read the full 4096-byte extent into its own dedicated scratch buffer first, THEN copy only
+    ' the requested prefix into the caller's buffer -- reading straight into `buffer` would overrun
+    ' it whenever maxBytes < 4096, which every caller in this chain passes.
+    LET fullExtent AS MMIOPTR = ArcFSSnapshotExtentScratchAddress()
+    IF RAMDisk.ReadSectors(extentSector, 8, fullExtent) = 0 THEN
+        RETURN 0
+    END IF
+    LET i AS U64 = 0
+    WHILE i < toRead
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(fullExtent, i))
+        MEMORY.Write8(ADDRESS.Offset(buffer, i), v)
+        i = i + 1
+    WEND
+    RETURN toRead
+END FUNCTION
+
+' ==========================================================================================
+' Phase F: recovery and health (RFC-0039 Section 78, Phase F -- "scrub; offline checker; repair
+' planning; ReadOnlySafety activation; inspector health interface").
+' ==========================================================================================
+'
+' ArcFSScanGeneration is the one real structural-validation pass every public function in this
+' section builds on. Given a checkpoint sector, it re-verifies every object and namespace
+' record's checksum (RFC-0039 Section 39's "checksum verification"), performs a real graph
+' reachability analysis from root through the namespace tree ("namespace reachability analysis" /
+' "orphan/unreachable object detection" -- not merely "does some record name me as a child," a
+' full transitive-from-root check via relaxation), and detects overlapping file extents ("extent
+' overlap detection"). It reads directly off the BlockDevice via RAMDisk.ReadSectors, exactly like
+' Phase E's snapshot-read functions, and touches no live table -- a scrub must be safely callable
+' without disturbing whatever is currently mounted.
+'
+' RFC-0039 Section 38's ReadOnlySafety is made concrete, not just reported: ArcFS.MountImageSafe
+' mounts normally, then runs the same scan against the newly active generation; if it finds any
+' defect, the volume is still fully READABLE (the committed checkpoint is not itself corrupt) but
+' ArcFS.PrepareCommit now refuses every ordinary mutation attempt until ArcFS.RepairCommit (the one
+' sanctioned exception) both fixes the defect and successfully re-verifies a clean scan.
+'
+' RFC-0039 Section 39's Inspect/Plan/Apply/Verify repair staging is implemented for exactly one
+' repair case, chosen because RFC-0039 itself names the correct outcome: "When data cannot be
+' reattached to its original namespace, recovery SHOULD preserve it in a clearly identified
+' recovery namespace/object collection with provenance metadata." ArcFS.RepairReattachOrphans
+' (Apply) re-parents every orphaned object into a root-level `:lost+found` directory under a
+' synthetic `orphan-<oid>` name -- the OID itself IS the provenance record, since it is exactly
+' the identity the object had before it lost its namespace entry. ArcFS.RepairCommit (Apply's own
+' commit, then Verify) is the only function in this codebase allowed to commit while
+' ReadOnlySafety is set, because fixing that exact condition is its entire purpose; it re-arms
+' ReadOnlySafety if a fresh scan afterward still finds a defect, rather than trusting the repair
+' blindly.
+'
+' Documented Phase F scope reductions, in the same spirit as every prior phase's own header note:
+'
+' 1. ArcFS.GetHealthState() collapses RFC-0039 Section 36's full state list (Healthy, Degraded,
+'    ReadOnlySafety, NeedsScrub, NeedsOfflineCheck, Corrupt, Unavailable) down to three: Healthy
+'    (0), Degraded (1, defects found but the volume is readable), Corrupt (2, the superblock
+'    itself is unreadable or invalid). The distinctions this collapses away (ReadOnlySafety vs.
+'    NeedsScrub vs. NeedsOfflineCheck) are real per RFC-0039 but are not independently
+'    OBSERVABLE from anything this implementation currently tracks beyond "defects found" -- a
+'    finer state machine would need scrub-history/repair-history persistence this phase does not
+'    add (see reduction #3).
+' 2. Repair covers exactly one defect class (orphaned objects). Extent-overlap defects are
+'    DETECTED (ArcFSScanGeneration counts them) but this phase has no repair for them -- a real
+'    fix would need to choose which of two overlapping objects is authoritative, which is a
+'    policy decision RFC-0039 does not make for this implementation to invent silently (Section
+'    5.3: "Implementations MUST NOT guess silently").
+' 3. No scrub/repair HISTORY is persisted (RFC-0039 Section 36's own "scrub history... repair
+'    history" health-detail fields). Every function in this section computes its answer fresh,
+'    live, each call.
+' 4. ArcFSScanGeneration is O(objectCount^2 + objectCount x namespaceCount), matching Phase E's
+'    own documented performance scope reduction -- fine at this milestone's tiny test scale.
+' 5. Extent-overlap detection's own logic is exercised by direct review and the fixture's own
+'    orphan-repair scenario exercises every OTHER pass in ArcFSScanGeneration end to end, but no
+'    fixture in this phase constructs a deliberately overlapping-extent image to exercise that
+'    ONE specific defect class under QEMU -- stated plainly rather than silently left untested.
+
+FUNCTION ArcFSVisitedOidListAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34136064))   ' 0x208E000
+END FUNCTION
+
+FUNCTION ArcFSVisitedCountAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34136576))   ' 0x208E200
+END FUNCTION
+
+' Scratch object array populated fresh by every ArcFSScanGeneration call, up to ArcFSMaxObjects()
+' entries, 24 bytes each: [oid][type][extentSector]. type = 0 marks a slot whose on-disk record
+' failed its checksum (already counted as a defect) -- every later pass skips it, matching the
+' Object Table's own free/invalid convention.
+FUNCTION ArcFSScanObjectArrayAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34136832))   ' 0x208E300
+END FUNCTION
+
+' Scratch namespace array, up to ArcFSMaxNamespaceRows() entries, 16 bytes each: [parentOid]
+' [childOid]. parentOid = 0 marks a slot whose on-disk record failed its checksum (already
+' counted as a defect; 0 is a safe sentinel since no real object ever has OID 0).
+FUNCTION ArcFSScanNamespaceArrayAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34138368))   ' 0x208E900
+END FUNCTION
+
+FUNCTION ArcFSDefectCountAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34140416))   ' 0x208F100
+END FUNCTION
+
+' RFC-0039 Section 38: non-zero means the mounted generation has a known structural defect and
+' ArcFS.PrepareCommit MUST refuse ordinary mutation until ArcFS.RepairCommit both fixes it and
+' re-verifies a clean scan.
+FUNCTION ArcFSReadOnlySafetyAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34140672))   ' 0x208F200
+END FUNCTION
+
+FUNCTION ArcFSRepairNameScratchAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34140928))   ' 0x208F300
+END FUNCTION
+
+FUNCTION ArcFSVisitedReset() AS U64
+    MEMORY.Write64(ArcFSVisitedCountAddress(), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSIsOidVisited(oid AS U64) AS BOOL
+    LET count AS U64 = MEMORY.Read64(ArcFSVisitedCountAddress())
+    LET i AS U64 = 0
+    WHILE i < count
+        LET v AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSVisitedOidListAddress(), i * 8))
+        IF v = oid THEN
+            RETURN 1
+        END IF
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSMarkOidVisited(oid AS U64) AS U64
+    IF ArcFSIsOidVisited(oid) = 1 THEN
+        RETURN 0
+    END IF
+    LET count AS U64 = MEMORY.Read64(ArcFSVisitedCountAddress())
+    IF count >= ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    MEMORY.Write64(ADDRESS.Offset(ArcFSVisitedOidListAddress(), count * 8), oid)
+    MEMORY.Write64(ArcFSVisitedCountAddress(), count + 1)
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSAddDefect() AS U64
+    MEMORY.Write64(ArcFSDefectCountAddress(), MEMORY.Read64(ArcFSDefectCountAddress()) + 1)
+    RETURN 0
+END FUNCTION
+
+FUNCTION ArcFSRangesOverlap(aStart AS U64, aLen AS U64, bStart AS U64, bLen AS U64) AS BOOL
+    LET aEnd AS U64 = aStart + aLen - 1
+    LET bEnd AS U64 = bStart + bLen - 1
+    IF aEnd < bStart THEN
+        RETURN 0
+    END IF
+    IF bEnd < aStart THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+' The one real structural-validation pass this whole section builds on. Given a checkpoint
+' sector, returns the total defect count found: checksum failures, unreachable (orphaned)
+' objects, and overlapping file extents. Touches no live table -- entirely disk-scan-based, like
+' Phase E's own snapshot-read functions.
+FUNCTION ArcFSScanGeneration(checkpointSector AS U64) AS U64
+    MEMORY.Write64(ArcFSDefectCountAddress(), 0)
+    IF ArcFSPeekCheckpoint(checkpointSector) = 0 THEN
+        ArcFSAddDefect()
+        RETURN MEMORY.Read64(ArcFSDefectCountAddress())
+    END IF
+    LET peek AS MMIOPTR = ArcFSPeekStateAddress()
+    LET objectRoot AS U64 = MEMORY.Read64(peek)
+    LET objectCount AS U64 = MEMORY.Read64(ADDRESS.Offset(peek, 8))
+    LET namespaceRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(peek, 16))
+    LET namespaceCount AS U64 = MEMORY.Read64(ADDRESS.Offset(peek, 24))
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+
+    ' Pass 1: validate every object record once, populating the scratch object array.
+    LET objArray AS MMIOPTR = ArcFSScanObjectArrayAddress()
+    LET i AS U64 = 0
+    WHILE i < objectCount
+        LET entry AS MMIOPTR = ADDRESS.Offset(objArray, i * 24)
+        MEMORY.Write64(entry, 0)
+        MEMORY.Write64(ADDRESS.Offset(entry, 8), 0)
+        MEMORY.Write64(ADDRESS.Offset(entry, 16), 0)
+        IF RAMDisk.ReadSectors(objectRoot + i, 1, scratch) = 0 THEN
+            ArcFSAddDefect()
+        ELSE
+            LET storedChecksum AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 32))
+            LET computedChecksum AS U64 = ArcFSRecordChecksum(scratch, 32)
+            IF storedChecksum <> computedChecksum THEN
+                ArcFSAddDefect()
+            ELSE
+                MEMORY.Write64(entry, MEMORY.Read64(scratch))
+                MEMORY.Write64(ADDRESS.Offset(entry, 8), MEMORY.Read64(ADDRESS.Offset(scratch, 8)))
+                MEMORY.Write64(ADDRESS.Offset(entry, 16), MEMORY.Read64(ADDRESS.Offset(scratch, 24)))
+            END IF
+        END IF
+        i = i + 1
+    WEND
+
+    ' Pass 2: validate every namespace record once, populating the scratch namespace array --
+    ' each record's checksum is checked exactly once here, never again during the relaxation
+    ' below, so a genuinely corrupt record is counted as exactly one defect, not once per pass.
+    LET nsArray AS MMIOPTR = ArcFSScanNamespaceArrayAddress()
+    LET j AS U64 = 0
+    WHILE j < namespaceCount
+        LET nsEntry AS MMIOPTR = ADDRESS.Offset(nsArray, j * 16)
+        MEMORY.Write64(nsEntry, 0)
+        MEMORY.Write64(ADDRESS.Offset(nsEntry, 8), 0)
+        IF RAMDisk.ReadSectors(namespaceRoot + j, 1, scratch) = 0 THEN
+            ArcFSAddDefect()
+        ELSE
+            LET storedChecksum2 AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 56))
+            LET computedChecksum2 AS U64 = ArcFSRecordChecksum(scratch, 56)
+            IF storedChecksum2 <> computedChecksum2 THEN
+                ArcFSAddDefect()
+            ELSE
+                MEMORY.Write64(nsEntry, MEMORY.Read64(scratch))
+                MEMORY.Write64(ADDRESS.Offset(nsEntry, 8), MEMORY.Read64(ADDRESS.Offset(scratch, 48)))
+            END IF
+        END IF
+        j = j + 1
+    WEND
+
+    ' Pass 3: namespace reachability from root, via relaxation over the ALREADY-validated
+    ' in-memory namespace array (no further disk I/O). Converges within objectCount iterations:
+    ' every iteration either marks at least one previously-unvisited object visited, or nothing
+    ' changes and no further iteration could help.
+    ArcFSVisitedReset()
+    ArcFSMarkOidVisited(1)
+    LET pass AS U64 = 0
+    WHILE pass < objectCount
+        LET k AS U64 = 0
+        WHILE k < namespaceCount
+            LET nsEntry2 AS MMIOPTR = ADDRESS.Offset(nsArray, k * 16)
+            LET parentOid AS U64 = MEMORY.Read64(nsEntry2)
+            IF parentOid <> 0 THEN
+                LET childOid AS U64 = MEMORY.Read64(ADDRESS.Offset(nsEntry2, 8))
+                IF ArcFSIsOidVisited(parentOid) = 1 THEN
+                    ArcFSMarkOidVisited(childOid)
+                END IF
+            END IF
+            k = k + 1
+        WEND
+        pass = pass + 1
+    WEND
+
+    ' Pass 4: orphan detection -- every valid object (excluding root) not reached above.
+    LET m AS U64 = 0
+    WHILE m < objectCount
+        LET objEntry AS MMIOPTR = ADDRESS.Offset(objArray, m * 24)
+        LET objType AS U64 = MEMORY.Read64(ADDRESS.Offset(objEntry, 8))
+        IF objType <> 0 THEN
+            LET oid AS U64 = MEMORY.Read64(objEntry)
+            IF oid <> 1 THEN
+                IF ArcFSIsOidVisited(oid) = 0 THEN
+                    ArcFSAddDefect()
+                END IF
+            END IF
+        END IF
+        m = m + 1
+    WEND
+
+    ' Pass 5: extent overlap -- every pair of valid FILE objects, counted once per overlapping
+    ' pair (RFC-0039 Section 39's "extent overlap detection").
+    LET p AS U64 = 0
+    WHILE p < objectCount
+        LET pEntry AS MMIOPTR = ADDRESS.Offset(objArray, p * 24)
+        LET pType AS U64 = MEMORY.Read64(ADDRESS.Offset(pEntry, 8))
+        IF pType = 1 THEN
+            LET pExtent AS U64 = MEMORY.Read64(ADDRESS.Offset(pEntry, 16))
+            LET q AS U64 = p + 1
+            WHILE q < objectCount
+                LET qEntry AS MMIOPTR = ADDRESS.Offset(objArray, q * 24)
+                LET qType AS U64 = MEMORY.Read64(ADDRESS.Offset(qEntry, 8))
+                IF qType = 1 THEN
+                    LET qExtent AS U64 = MEMORY.Read64(ADDRESS.Offset(qEntry, 16))
+                    IF ArcFSRangesOverlap(pExtent, 8, qExtent, 8) = 1 THEN
+                        ArcFSAddDefect()
+                    END IF
+                END IF
+                q = q + 1
+            WEND
+        END IF
+        p = p + 1
+    WEND
+
+    RETURN MEMORY.Read64(ArcFSDefectCountAddress())
+END FUNCTION
+
+' RFC-0039 Section 20.4: online read-only integrity scrub of the currently ACTIVE generation.
+' Safely callable at any time -- reads the superblock itself fresh, touches no live table.
+FUNCTION ArcFS.ScrubVolume() AS U64
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    IF RAMDisk.ReadSectors(0, 1, scratch) = 0 THEN
+        RETURN 1
+    END IF
+    IF ArcFSMagicMatches(scratch) = 0 THEN
+        RETURN 1
+    END IF
+    LET storedChecksum AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 64))
+    LET computedChecksum AS U64 = ArcFSRecordChecksum(scratch, 64)
+    IF storedChecksum <> computedChecksum THEN
+        RETURN 1
+    END IF
+    LET checkpointSector AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 56))
+    RETURN ArcFSScanGeneration(checkpointSector)
+END FUNCTION
+
+' RFC-0039 Section 36's HealthReporter, scaled to three states -- see this section's own scope
+' reduction #1 for why the finer states collapse here. 0 = Healthy, 1 = Degraded (defects found,
+' volume still readable), 2 = Corrupt (superblock itself unreadable or invalid).
+FUNCTION ArcFS.GetHealthState() AS U64
+    LET scratch AS MMIOPTR = ArcFSSectorScratchAddress()
+    IF RAMDisk.ReadSectors(0, 1, scratch) = 0 THEN
+        RETURN 2
+    END IF
+    IF ArcFSMagicMatches(scratch) = 0 THEN
+        RETURN 2
+    END IF
+    LET storedChecksum AS U64 = MEMORY.Read32(ADDRESS.Offset(scratch, 64))
+    LET computedChecksum AS U64 = ArcFSRecordChecksum(scratch, 64)
+    IF storedChecksum <> computedChecksum THEN
+        RETURN 2
+    END IF
+    LET defects AS U64 = ArcFS.ScrubVolume()
+    IF defects > 0 THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+' RFC-0039 Section 37/38's activation + ReadOnlySafety, made concrete: 0 = failed to mount at
+' all (Section 37's activation could not even establish a trustworthy committed checkpoint), 1 =
+' mounted read-write (healthy), 2 = mounted READ-ONLY (Section 38: the committed checkpoint is
+' trustworthy and fully readable, but a structural defect makes further mutation unsafe until
+' repaired). Sets ArcFSReadOnlySafetyAddress, which ArcFS.PrepareCommit consults below.
+FUNCTION ArcFS.MountImageSafe() AS U64
+    MEMORY.Write64(ArcFSReadOnlySafetyAddress(), 0)
+    IF ArcFS.MountImage() = 0 THEN
+        RETURN 0
+    END IF
+    LET activeCheckpointSector AS U64 = MEMORY.Read64(ArcFSMountStateAddress())
+    LET defects AS U64 = ArcFSScanGeneration(activeCheckpointSector)
+    IF defects > 0 THEN
+        MEMORY.Write64(ArcFSReadOnlySafetyAddress(), 1)
+        RETURN 2
+    END IF
+    RETURN 1
+END FUNCTION
+
+' Internal: attaches an EXISTING object (one that already has an OID and an object-table row) to
+' a new namespace location -- unlike ArcFSCreateEntry, this creates no object, and unlike
+' ArcFS.Rename, this does not require an existing active namespace row to relocate (an orphan, by
+' definition, has none). Used only by ArcFS.RepairReattachOrphans below.
+FUNCTION ArcFSAttachExistingObject(parentOid AS U64, nameBuffer AS MMIOPTR, nameLength AS U64, childOid AS U64) AS BOOL
+    LET freeNsRow AS U64 = ArcFSFindFreeNamespaceRow()
+    IF freeNsRow = ArcFSMaxNamespaceRows() THEN
+        RETURN 0
+    END IF
+    LET nsBase AS MMIOPTR = ArcFSNamespaceRowAddress(freeNsRow)
+    MEMORY.Write64(nsBase, parentOid)
+    ArcFSWriteName(nsBase, nameBuffer, nameLength)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 40), nameLength)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 48), childOid)
+    MEMORY.Write64(ADDRESS.Offset(nsBase, 56), 1)
+    RETURN 1
+END FUNCTION
+
+' Formats `value` as ASCII decimal digits at `dest`, returning the digit count written. A small,
+' generic, reusable utility -- needed because ArcFS.RepairReattachOrphans below must synthesize a
+' name like "orphan-42" and STRING has no such formatting operation on this backend (Phase A's
+' own scope reduction #4).
+FUNCTION ArcFSWriteDecimal(dest AS MMIOPTR, value AS U64) AS U64
+    IF value = 0 THEN
+        MEMORY.Write8(dest, 48)
+        RETURN 1
+    END IF
+    LET v AS U64 = value
+    LET count AS U64 = 0
+    WHILE v > 0
+        LET digit AS U64 = v MOD 10
+        LET digitByte AS U8 = digit + 48
+        MEMORY.Write8(ADDRESS.Offset(dest, count), digitByte)
+        v = v \ 10
+        count = count + 1
+    WEND
+    LET lo AS U64 = 0
+    LET hi AS U64 = count - 1
+    WHILE lo < hi
+        LET a AS U8 = MEMORY.Read8(ADDRESS.Offset(dest, lo))
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(dest, hi))
+        MEMORY.Write8(ADDRESS.Offset(dest, lo), b)
+        MEMORY.Write8(ADDRESS.Offset(dest, hi), a)
+        lo = lo + 1
+        hi = hi - 1
+    WEND
+    RETURN count
+END FUNCTION
+
+' RFC-0039 Section 39's repair, Apply step, for exactly one defect class (see this section's own
+' scope reduction #2): every orphaned object in the LIVE mounted tree is re-parented into a
+' root-level `:lost+found` directory (created if it does not already exist) under a synthetic
+' `orphan-<oid>` name. Operates on the live in-memory tables, not the disk directly -- unlike the
+' read-only scan functions above, repair's whole point is to eventually commit a fix, and only the
+' live tree is ever committed. Returns the count of objects reattached.
+FUNCTION ArcFS.RepairReattachOrphans() AS U64
+    LET nameBuf AS MMIOPTR = ArcFSRepairNameScratchAddress()
+    LET lostFoundName AS MMIOPTR = nameBuf
+    MEMORY.Write8(ADDRESS.Offset(lostFoundName, 0), 108)
+    MEMORY.Write8(ADDRESS.Offset(lostFoundName, 1), 111)
+    MEMORY.Write8(ADDRESS.Offset(lostFoundName, 2), 115)
+    MEMORY.Write8(ADDRESS.Offset(lostFoundName, 3), 116)
+    MEMORY.Write8(ADDRESS.Offset(lostFoundName, 4), 43)
+    MEMORY.Write8(ADDRESS.Offset(lostFoundName, 5), 102)
+    MEMORY.Write8(ADDRESS.Offset(lostFoundName, 6), 111)
+    MEMORY.Write8(ADDRESS.Offset(lostFoundName, 7), 117)
+    MEMORY.Write8(ADDRESS.Offset(lostFoundName, 8), 110)
+    MEMORY.Write8(ADDRESS.Offset(lostFoundName, 9), 100)
+
+    LET lostFoundOid AS U64 = ArcFS.Lookup(1, lostFoundName, 10)
+    IF lostFoundOid = 0 THEN
+        lostFoundOid = ArcFS.CreateDirectory(1, lostFoundName, 10)
+        IF lostFoundOid = 0 THEN
+            RETURN 0
+        END IF
+    END IF
+
+    LET synthName AS MMIOPTR = ADDRESS.Offset(nameBuf, 16)
+    LET repaired AS U64 = 0
+    LET row AS U64 = 0
+    WHILE row < ArcFSMaxObjects()
+        LET base AS MMIOPTR = ArcFSObjectRowAddress(row)
+        LET objType AS U64 = MEMORY.Read64(ADDRESS.Offset(base, 8))
+        IF objType <> 0 THEN
+            LET oid AS U64 = MEMORY.Read64(base)
+            IF oid <> 1 THEN
+                IF ArcFSFindNamespaceRowByChild(oid) = ArcFSMaxNamespaceRows() THEN
+                    MEMORY.Write8(synthName, 111)
+                    MEMORY.Write8(ADDRESS.Offset(synthName, 1), 114)
+                    MEMORY.Write8(ADDRESS.Offset(synthName, 2), 112)
+                    MEMORY.Write8(ADDRESS.Offset(synthName, 3), 104)
+                    MEMORY.Write8(ADDRESS.Offset(synthName, 4), 97)
+                    MEMORY.Write8(ADDRESS.Offset(synthName, 5), 110)
+                    MEMORY.Write8(ADDRESS.Offset(synthName, 6), 45)
+                    LET digitCount AS U64 = ArcFSWriteDecimal(ADDRESS.Offset(synthName, 7), oid)
+                    LET totalLen AS U64 = 7 + digitCount
+                    IF ArcFSAttachExistingObject(lostFoundOid, synthName, totalLen, oid) = 1 THEN
+                        repaired = repaired + 1
+                    END IF
+                END IF
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    RETURN repaired
+END FUNCTION
+
+' The one sanctioned exception to the ReadOnlySafety guard below: repair's entire purpose is
+' fixing the defect that caused ReadOnlySafety in the first place, so it must be able to commit
+' while that flag is set. Temporarily clears the flag, attempts an ordinary commit, then re-scans
+' the newly active generation and re-arms the flag if a defect still remains -- RFC-0039 Section
+' 39's own Apply -> Verify staging, concretely: Verify is not assumed, it is re-run for real.
+FUNCTION ArcFS.RepairCommit() AS BOOL
+    MEMORY.Write64(ArcFSReadOnlySafetyAddress(), 0)
+    IF ArcFS.CommitImage() = 0 THEN
+        RETURN 0
+    END IF
+    LET activeCheckpointSector AS U64 = MEMORY.Read64(ArcFSMountStateAddress())
+    LET defects AS U64 = ArcFSScanGeneration(activeCheckpointSector)
+    IF defects > 0 THEN
+        MEMORY.Write64(ArcFSReadOnlySafetyAddress(), 1)
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+' ==========================================================================================
+' Phase G: system integration (RFC-0039 Section 78, Phase G -- "namespace attachment; system
+' volume use; recovery environment support; update snapshots; graphical storage tooling;
+' ArcoBASIC bindings").
+' ==========================================================================================
+'
+' Phase G's own list is mostly integration surface with OTHER Arcology subsystems, not additional
+' ArcFS format/protocol work -- and most of those subsystems do not exist yet anywhere in this
+' repository. Rather than inventing fake infrastructure to claim a hollow "done," this section
+' honestly separates what ArcFS can genuinely deliver on its own from what it cannot, item by
+' item, matching RFC-0039 Section 80's own "Required Pre-Implementation Dependencies" list (this
+' RFC already names these as open dependencies, not something this phase silently discovered):
+'
+' - "Update snapshots" (Section 51's own illustrative workflow: CREATE snapshot "pre-update" ->
+'   WRITE new content -> VERIFY -> COMMIT -> MARK boot generation) is squarely within ArcFS's own
+'   reach, given Phase E's snapshot infrastructure and Phase C's commit protocol -- ArcFS.
+'   RollbackToSnapshot below is the concrete, missing half of that workflow (undoing a bad update),
+'   and IS implemented and proven in this phase.
+' - "ArcoBASIC bindings" are, in this specific implementation, already satisfied BY CONSTRUCTION:
+'   every ArcFS.* function in this file already IS a native ArcoBASIC-callable entry point. This
+'   compiler has no separate host/guest language boundary or FFI layer -- there is no additional
+'   "binding" artifact to build. RFC-0039 Section 43's own illustrative syntax (`FILE.OPEN(...)`,
+'   `.READTEXT()`, object-inspection properties) describes a friendlier OO-flavored surface this
+'   implementation does not wrap ArcFS.* in, but that is a naming/ergonomics choice, not a missing
+'   capability -- and RFC-0039 itself never mandates that exact surface, only that ArcoBASIC be
+'   "pleasant to use... without exposing raw on-disk machinery for ordinary tasks" (Section 43's
+'   own framing), which every ArcFS.* function already is.
+' - "Namespace attachment" (RFC-0039 Section 10's DISCOVER/CREATE/ATTACH/VERIFY/ACTIVATE lifecycle
+'   against an Arcology namespace LOCATION) has no concrete target to attach TO: this repository
+'   has no implemented Arcology object/namespace facility outside ArcFS's own (confirmed the same
+'   way RFC-0038's own implementation confirmed RFC-0017's Substrate Resource Model has no
+'   concrete freestanding callable surface anywhere in this repository -- Phase A's own scope
+'   reduction #6 cites the identical finding). Building one would be separate, real scope creep:
+'   RFC-0017's/an Arcology namespace RFC's own implementation, not ArcFS's.
+' - "System volume use" presumes a boot path that selects and activates a system ArcFS volume
+'   before the rest of the OS starts -- no such boot-time volume-selection mechanism exists
+'   anywhere in this project yet (every ArcFS fixture in this whole chain formats or mounts its
+'   own volume explicitly, from a fresh boot, for exactly that one fixture).
+' - "Recovery environment support" presumes a distinct recovery boot mode/environment -- this
+'   project has no second boot path or recovery-specific entry point anywhere; every fixture boots
+'   the same ordinary UEFI entry Main() every other freestanding fixture in this project does.
+' - "Graphical storage tooling" presumes a GUI/inspector shell -- this project's `stdlib/
+'   graphics_primitives.abas`/`graphics_substrate.abas` exist for pixel-level drawing, but nothing
+'   resembling a storage-inspector UI (RFC-0039 Section 44's own illustrative volume-inspector
+'   text layout) exists to extend, and building one is a UI-application project, not ArcFS's own.
+'
+' None of these five items can be honestly claimed "implemented" without either fabricating a
+' target for ArcFS to integrate with or silently redefining what the RFC asked for -- both are
+' exactly what RFC-0039 Section 79.2's own "No silent architectural substitution" rule forbids.
+' They are left explicitly OPEN, not implemented, not attempted.
+
+' RFC-0039 Section 51's "update snapshots" rollback: republishes a PREVIOUSLY SNAPSHOTTED
+' generation as the active checkpoint -- a real, atomic undo. Reuses ArcFS.PublishCommit's exact
+' mechanism (stage a checkpoint sector as "pending," then perform the one single-sector superblock
+' write that makes it active) rather than duplicating that logic -- the only difference from an
+' ordinary commit's publish step is WHICH checkpoint sector gets staged: a snapshot's old one,
+' instead of a freshly prepared new one. Does not itself refresh the live in-memory tables -- a
+' caller that wants those to reflect the rolled-back generation calls ArcFS.MountImage()
+' afterward, exactly as after any other change to the active checkpoint.
+FUNCTION ArcFS.RollbackToSnapshot(snapshotId AS U64) AS BOOL
+    LET slot AS U64 = ArcFSFindSnapshotRowById(snapshotId)
+    IF slot = ArcFSMaxSnapshots() THEN
+        RETURN 0
+    END IF
+    LET checkpointSector AS U64 = MEMORY.Read64(ADDRESS.Offset(ArcFSSnapshotRowAddress(slot), 24))
+    MEMORY.Write64(ADDRESS.Offset(ArcFSMountStateAddress(), 72), checkpointSector)
+    RETURN ArcFS.PublishCommit()
+END FUNCTION
+
+' --- Phase G addendum: "system volume use," narrowed honestly. RFC-0039 Section 10's own
+' attachment lifecycle is DISCOVER -> CREATE -> ATTACH -> VERIFY -> ACTIVATE -> ATTACH namespace.
+' The LAST step (attach to an Arcology namespace location) stays explicitly out of scope -- no
+' such namespace exists in this repository, unchanged from this section's own header above. The
+' FIRST step (DISCOVER: enumerate real UEFI Block IO Protocol handles instead of relying on the
+' fixed-address RAM-disk preload every fixture in this whole chain uses) also stays out of scope
+' here -- it is RFC-0038's own named future work (that RFC's Section 17.5 stop condition
+' explicitly warns against improvising new UEFI protocol bindings as a side effect of unrelated
+' work, and this addendum does not violate that).
+'
+' What IS genuinely new: RFC-0039 Section 37's activation checklist and Section 38's
+' ReadOnlySafety, turned into a real BOOT POLICY rather than a set of tools a human runs by hand.
+' Phase F built ScrubVolume/GetHealthState/MountImageSafe/RepairReattachOrphans/RepairCommit as
+' separate primitives a caller composes manually (exactly what every Phase F fixture does).
+' ArcFS.ActivateSystemVolume composes them automatically, the way a real boot sequence would:
+' mount safely, and if a recoverable structural defect is found, repair it and re-verify BEFORE
+' ever surfacing ReadOnlySafety to whatever comes next in the boot sequence -- self-healing at
+' boot, with read-only as the honest fallback only when automatic repair genuinely cannot clear
+' the defect, never a silent guess (RFC-0039 Section 5.3).
+
+' Returns 0 = Unavailable (no trustworthy committed checkpoint could be established at all), 1 =
+' Healthy and read-write (no defect found, or one was found and automatically repaired this
+' boot), 2 = ReadOnlySafety (a defect was found and automatic repair could not fully clear it).
+FUNCTION ArcFS.ActivateSystemVolume() AS U64
+    LET result AS U64 = ArcFS.MountImageSafe()
+    IF result = 0 THEN
+        RETURN 0
+    END IF
+    IF result = 1 THEN
+        RETURN 1
+    END IF
+
+    ' result = 2 (ReadOnlySafety): attempt the one repair this project implements, automatically,
+    ' then re-activate to CONFIRM it actually cleared the defect -- never trust a repair blindly,
+    ' the same discipline ArcFS.RepairCommit itself already applies to its own commit.
+    ArcFS.RepairReattachOrphans()
+    IF ArcFS.RepairCommit() = 0 THEN
+        RETURN 2
+    END IF
+
+    LET reactivated AS U64 = ArcFS.MountImageSafe()
+    IF reactivated = 1 THEN
+        RETURN 1
+    END IF
+    RETURN 2
+END FUNCTION
+' ArcoBASIC software raster primitives. These routines operate on validated MMIO-backed surfaces;
+' the compiler supplies only typed address arithmetic, control flow, and volatile memory access.
+
+
+FUNCTION PutPixel(framebuffer AS MMIOPTR, width AS U32, height AS U32, stride AS U32, x AS U32, y AS U32, color AS U32) AS U64
+    IF x < width THEN
+        IF y < height THEN
+            LET pixelOffset AS U32 = (y * stride + x) * 4
+            LET pixel AS MMIOPTR = ADDRESS.Offset(framebuffer, pixelOffset)
+            MEMORY.Write32(pixel, color)
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION FillRectClipped(framebuffer AS MMIOPTR, width AS U32, height AS U32, stride AS U32, x AS U32, y AS U32, rectWidth AS U32, rectHeight AS U32, color AS U32) AS U64
+    LET endX AS U32 = x + rectWidth
+    LET endY AS U32 = y + rectHeight
+    IF x < width THEN
+        IF y < height THEN
+            IF endX > width THEN
+                endX = width
+            END IF
+            IF endY > height THEN
+                endY = height
+            END IF
+            LET row AS U32 = y
+            WHILE row < endY
+                LET column AS U32 = x
+                WHILE column < endX
+                    LET pixelOffset AS U32 = (row * stride + column) * 4
+                    LET pixel AS MMIOPTR = ADDRESS.Offset(framebuffer, pixelOffset)
+                    MEMORY.Write32(pixel, color)
+                    column = column + 1
+                WEND
+                row = row + 1
+            WEND
+        END IF
+    END IF
+    CPU.MemoryBarrier
+    RETURN 0
+END FUNCTION
+
+' --- Fixture-only test state, reusing the same fixed scratch address every prior fixture in this
+' chain uses for its own test bookkeeping (each fixture is its own standalone compiled binary, so
+' reusing the address is safe -- established precedent throughout this project). ---
+
+FUNCTION GUITestStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34152448))   ' 0x2092000
+END FUNCTION
+
+FUNCTION GUITestFailuresAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(GUITestStateAddress(), 0)
+END FUNCTION
+
+FUNCTION GUITestFail() AS U64
+    LET f AS U64 = MEMORY.Read64(GUITestFailuresAddress())
+    MEMORY.Write64(GUITestFailuresAddress(), f + 1)
+    RETURN 0
+END FUNCTION
+
+FUNCTION NameHome() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34148352))   ' 0x2091000
+END FUNCTION
+
+FUNCTION NameDocuments() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34148480))   ' 0x2091080
+END FUNCTION
+
+FUNCTION NameNotes() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34148608))   ' 0x2091100
+END FUNCTION
+
+FUNCTION ContentA() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34148736))   ' 0x2091180
+END FUNCTION
+
+FUNCTION GUIBuildNames() AS U64
+    MEMORY.Write8(ADDRESS.Offset(NameHome(), 0), 104)
+    MEMORY.Write8(ADDRESS.Offset(NameHome(), 1), 111)
+    MEMORY.Write8(ADDRESS.Offset(NameHome(), 2), 109)
+    MEMORY.Write8(ADDRESS.Offset(NameHome(), 3), 101)
+
+    MEMORY.Write8(ADDRESS.Offset(NameDocuments(), 0), 100)
+    MEMORY.Write8(ADDRESS.Offset(NameDocuments(), 1), 111)
+    MEMORY.Write8(ADDRESS.Offset(NameDocuments(), 2), 99)
+    MEMORY.Write8(ADDRESS.Offset(NameDocuments(), 3), 117)
+    MEMORY.Write8(ADDRESS.Offset(NameDocuments(), 4), 109)
+    MEMORY.Write8(ADDRESS.Offset(NameDocuments(), 5), 101)
+    MEMORY.Write8(ADDRESS.Offset(NameDocuments(), 6), 110)
+    MEMORY.Write8(ADDRESS.Offset(NameDocuments(), 7), 116)
+    MEMORY.Write8(ADDRESS.Offset(NameDocuments(), 8), 115)
+
+    MEMORY.Write8(ADDRESS.Offset(NameNotes(), 0), 110)
+    MEMORY.Write8(ADDRESS.Offset(NameNotes(), 1), 111)
+    MEMORY.Write8(ADDRESS.Offset(NameNotes(), 2), 116)
+    MEMORY.Write8(ADDRESS.Offset(NameNotes(), 3), 101)
+    MEMORY.Write8(ADDRESS.Offset(NameNotes(), 4), 115)
+    MEMORY.Write8(ADDRESS.Offset(NameNotes(), 5), 46)
+    MEMORY.Write8(ADDRESS.Offset(NameNotes(), 6), 116)
+    MEMORY.Write8(ADDRESS.Offset(NameNotes(), 7), 120)
+    MEMORY.Write8(ADDRESS.Offset(NameNotes(), 8), 116)
+
+    LET i AS U64 = 0
+    WHILE i < 40
+        LET v AS U64 = 65 + (i MOD 26)
+        LET vb AS U8 = v
+        MEMORY.Write8(ADDRESS.Offset(ContentA(), i), vb)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION GUISetupHealthyVolume() AS U64
+    RAMDisk.Create(131072)
+    IF ArcFS.FormatVolume() = 0 THEN
+        GUITestFail()
+        RETURN 0
+    END IF
+    LET homeOid AS U64 = ArcFS.CreateDirectory(1, NameHome(), 4)
+    IF homeOid = 0 THEN GUITestFail()
+    LET docsOid AS U64 = ArcFS.CreateDirectory(homeOid, NameDocuments(), 9)
+    IF docsOid = 0 THEN GUITestFail()
+    LET notesOid AS U64 = ArcFS.CreateFile(docsOid, NameNotes(), 9)
+    IF notesOid = 0 THEN GUITestFail()
+
+    LET h AS U64 = ArcFS.OpenHandle(notesOid)
+    IF h = 0 THEN
+        GUITestFail()
+        RETURN 0
+    END IF
+    LET written AS U64 = ArcFS.HandleWrite(h, ContentA(), 40)
+    IF written <> 40 THEN GUITestFail()
+    ArcFS.CloseHandle(h)
+
+    IF ArcFS.CommitImage() = 0 THEN GUITestFail()
+    RETURN 0
+END FUNCTION
+
+FUNCTION GUIDegradeVolume() AS U64
+    LET homeOid AS U64 = ArcFS.Lookup(1, NameHome(), 4)
+    LET realDocsOid AS U64 = ArcFS.Lookup(homeOid, NameDocuments(), 9)
+    IF realDocsOid = 0 THEN
+        GUITestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.Remove(realDocsOid, NameNotes(), 9) = 0 THEN GUITestFail()
+    IF ArcFS.CommitImage() = 0 THEN GUITestFail()
+    RETURN 0
+END FUNCTION
+
+FUNCTION PixelAddress(framebuffer AS MMIOPTR, stride AS U32, x AS U32, y AS U32) AS MMIOPTR
+    LET offset AS U32 = (y * stride + x) * 4
+    RETURN ADDRESS.Offset(framebuffer, offset)
+END FUNCTION
+
+' Renders one health-state indicator: a solid color field (RFC-0039 Section 59: color alone is
+' never the only signal) PLUS a black positional mark whose LOCATION differs per state -- a
+' center bar for Healthy, a top-left corner block for Degraded, a full-width bottom bar for
+' Corrupt -- so the three states remain visually distinguishable even without color.
+FUNCTION DrawHealthIndicator(framebuffer AS MMIOPTR, width AS U32, height AS U32, stride AS U32, originX AS U32, originY AS U32, healthState AS U64) AS U64
+    LET fieldColor AS U32 = 65280
+    IF healthState = 1 THEN
+        fieldColor = 16776960
+    END IF
+    IF healthState = 2 THEN
+        fieldColor = 16711680
+    END IF
+    FillRectClipped(framebuffer, width, height, stride, originX, originY, 80, 60, fieldColor)
+
+    IF healthState = 0 THEN
+        FillRectClipped(framebuffer, width, height, stride, originX + 35, originY + 25, 10, 10, 0)
+    END IF
+    IF healthState = 1 THEN
+        FillRectClipped(framebuffer, width, height, stride, originX, originY, 15, 15, 0)
+    END IF
+    IF healthState = 2 THEN
+        FillRectClipped(framebuffer, width, height, stride, originX, originY + 50, 80, 10, 0)
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Verifies a rendered indicator by reading its own pixels back: the field color at a point clear
+' of any mark, black at the point where THIS state's own mark lives, and NOT black at the points
+' where the OTHER two states' marks would live -- proving the shapes are genuinely distinct, not
+' merely differently colored copies of the same glyph.
+FUNCTION VerifyHealthIndicator(framebuffer AS MMIOPTR, stride AS U32, originX AS U32, originY AS U32, healthState AS U64) AS U64
+    LET expectedColor AS U32 = 65280
+    IF healthState = 1 THEN
+        expectedColor = 16776960
+    END IF
+    IF healthState = 2 THEN
+        expectedColor = 16711680
+    END IF
+
+    LET fieldPixel AS U32 = MEMORY.Read32(PixelAddress(framebuffer, stride, originX + 60, originY + 30))
+    IF fieldPixel <> expectedColor THEN GUITestFail()
+
+    LET centerMark AS U32 = MEMORY.Read32(PixelAddress(framebuffer, stride, originX + 40, originY + 30))
+    LET cornerMark AS U32 = MEMORY.Read32(PixelAddress(framebuffer, stride, originX + 5, originY + 5))
+    LET bottomMark AS U32 = MEMORY.Read32(PixelAddress(framebuffer, stride, originX + 40, originY + 55))
+
+    IF healthState = 0 THEN
+        IF centerMark <> 0 THEN GUITestFail()
+        IF cornerMark = 0 THEN GUITestFail()
+        IF bottomMark = 0 THEN GUITestFail()
+    END IF
+    IF healthState = 1 THEN
+        IF cornerMark <> 0 THEN GUITestFail()
+        IF centerMark = 0 THEN GUITestFail()
+        IF bottomMark = 0 THEN GUITestFail()
+    END IF
+    IF healthState = 2 THEN
+        IF bottomMark <> 0 THEN GUITestFail()
+        IF centerMark = 0 THEN GUITestFail()
+        IF cornerMark = 0 THEN GUITestFail()
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("APS GUI PRE")
+    SerialInit()
+
+    LET stateIndex AS U64 = 0
+    WHILE stateIndex < 64
+        MEMORY.Write8(ADDRESS.Offset(GUITestStateAddress(), stateIndex), 0)
+        stateIndex = stateIndex + 1
+    WEND
+
+    LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
+    IF gop = 0 THEN
+        systemTable.ConsoleOut.Write("APS GOP UNAVAILABLE")
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+    LET mode AS UEFI.GraphicsOutputMode = UEFI.GOP.Mode(gop)
+    IF mode = 0 THEN
+        systemTable.ConsoleOut.Write("APS GOP MODE UNAVAILABLE")
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+    LET framebufferPhys AS PHYSICALPTR = UEFI.GOP.FrameBufferBase(gop)
+    LET framebufferSize AS U64 = UEFI.GOP.FrameBufferSize(gop)
+    LET width AS U32 = UEFI.GOP.Width(gop)
+    LET height AS U32 = UEFI.GOP.Height(gop)
+    LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
+    LET framebuffer AS MMIOPTR = MEMORY.MapDevice(framebufferPhys, framebufferSize)
+    systemTable.ConsoleOut.Write("APS GOP READY")
+
+    IF width < 220 THEN
+        systemTable.ConsoleOut.Write("APS GOP TOO SMALL")
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+    IF height < 140 THEN
+        systemTable.ConsoleOut.Write("APS GOP TOO SMALL")
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    GUIBuildNames()
+    GUISetupHealthyVolume()
+    LET healthyState AS U64 = ArcFS.GetHealthState()
+    IF healthyState <> 0 THEN GUITestFail()
+    DrawHealthIndicator(framebuffer, width, height, stride, 10, 10, healthyState)
+
+    GUIDegradeVolume()
+    LET degradedState AS U64 = ArcFS.GetHealthState()
+    IF degradedState <> 1 THEN GUITestFail()
+    DrawHealthIndicator(framebuffer, width, height, stride, 110, 10, degradedState)
+
+    CPU.MemoryBarrier
+
+    VerifyHealthIndicator(framebuffer, stride, 10, 10, healthyState)
+    VerifyHealthIndicator(framebuffer, stride, 110, 10, degradedState)
+
+    LET failures AS U64 = MEMORY.Read64(GUITestFailuresAddress())
+    IF failures <> 0 THEN
+        systemTable.ConsoleOut.Write("APS GRAPHICAL FAIL")
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(32)
+        LET digit AS U64 = failures
+        IF digit > 9 THEN digit = 9
+        LET digitPlus48 AS U64 = digit + 48
+        LET digitByte AS U8 = digitPlus48
+        SerialByte(digitByte)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    SerialMarkerGraphicalOK()
+    systemTable.ConsoleOut.Write("APS GRAPHICAL OK")
+    CPU.HaltForever
+END FUNCTION
