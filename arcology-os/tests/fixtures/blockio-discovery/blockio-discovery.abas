@@ -1,0 +1,51 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' Structural/codegen proof for UEFI.BLOCKIO.* (RFC-0038 Section 17.5's own named stop condition).
+' Mirrors gop-discovery.abas's own scope exactly: this fixture proves the AST/A-MIR/X86_64 shape
+' of discovery, field access, and a real ReadBlocks call compiles and lowers correctly. It is not
+' yet a live QEMU proof against a real attached disk -- see uefi-bindings.md's own "What This
+' Binding Does Not Do" for that follow-on, tracked separately from this compiler-level binding.
+
+FUNCTION ReadOneBlock(blockIo AS UEFI.BlockIoProtocol, mediaId AS U32, lba AS U64, bufferSize AS U64, buffer AS PTR) AS U64
+    RETURN blockIo.ReadBlocks(mediaId, lba, bufferSize, buffer)
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("BLOCKIO START")
+    LET blockIo AS UEFI.BlockIoProtocol = UEFI.BLOCKIO.Discover(systemTable)
+    IF blockIo = 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO UNAVAILABLE")
+        CPU.HaltForever
+    END IF
+
+    LET mediaId AS U32 = UEFI.BLOCKIO.MediaId(blockIo)
+    LET mediaFlags AS U32 = UEFI.BLOCKIO.MediaFlags(blockIo)
+    LET mediaPresent AS U32 = (mediaFlags \ 256) AND 255
+    LET blockSize AS U32 = UEFI.BLOCKIO.BlockSize(blockIo)
+    LET lastBlock AS U64 = UEFI.BLOCKIO.LastBlock(blockIo)
+    IF mediaPresent = 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO NO MEDIA")
+        CPU.HaltForever
+    END IF
+    IF blockSize = 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO ZERO BLOCK SIZE")
+        CPU.HaltForever
+    END IF
+
+    LET scratch AS U64 = 0
+    LET scratchAddress AS PTR = ADDRESS.Local(scratch)
+    LET readStatus AS U64 = ReadOneBlock(blockIo, mediaId, 0, 8, scratchAddress)
+    IF readStatus = 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO READ OK")
+    ELSE
+        systemTable.ConsoleOut.Write("BLOCKIO READ FAILED")
+    END IF
+
+    CPU.MemoryBarrier
+    systemTable.ConsoleOut.Write("BLOCKIO DONE")
+    CPU.HaltForever
+END FUNCTION

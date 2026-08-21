@@ -102,6 +102,12 @@ arco_add_script_test(
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 arco_add_script_test(
+    systems_blockio_discovery_smoke
+    arcology-os/tests/systems/systems_blockio_discovery_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
     systems_runtime_handle_abi_smoke
     arcology-os/tests/systems/systems_runtime_handle_abi_smoke.sh
     $<TARGET_FILE:arco_cli>

@@ -1020,6 +1020,9 @@ private:
             if (name == "UEFI.GOP.FRAMEBUFFERBASE") return "PHYSICALPTR";
             if (name == "UEFI.GOP.FRAMEBUFFERSIZE") return "U64";
             if (name == "UEFI.GOP.WIDTH" || name == "UEFI.GOP.HEIGHT" || name == "UEFI.GOP.PIXELSPERSCANLINE" || name == "UEFI.GOP.PIXELFORMAT") return "U32";
+            if (name == "UEFI.BLOCKIO.DISCOVER") return "UEFI.BlockIoProtocol";
+            if (name == "UEFI.BLOCKIO.MEDIAID" || name == "UEFI.BLOCKIO.MEDIAFLAGS" || name == "UEFI.BLOCKIO.BLOCKSIZE") return "U32";
+            if (name == "UEFI.BLOCKIO.LASTBLOCK") return "U64";
             if (name == "ADDRESS.PHYSICAL") return "PHYSICALPTR";
             if (name == "ADDRESS.VIRTUAL") return "VIRTUALPTR";
             if (name == "ADDRESS.MMIO") return "MMIOPTR";
@@ -1324,6 +1327,18 @@ private:
                     const std::string result = temp();
                     std::string target = discover ? "GOPDISCOVER" : "GOP" + gop_op;
                     current_block(function).instructions.push_back(amir_memory(target, result, std::move(args), type_of_expression(node), {discover ? "UEFI.SystemTable" : "UEFI.GraphicsOutputProtocol"}));
+                    return result;
+                }
+                if (name.rfind("UEFI.BLOCKIO.", 0) == 0) {
+                    const std::string blockio_op = name.substr(13);
+                    const bool discover = blockio_op == "DISCOVER";
+                    const bool field = blockio_op == "MEDIAID" || blockio_op == "MEDIAFLAGS" || blockio_op == "BLOCKSIZE" || blockio_op == "LASTBLOCK";
+                    if (node.children.size() != 1 || (discover && type_of_expression(*node.children.front()) != "UEFI.SystemTable") || (field && type_of_expression(*node.children.front()) != "UEFI.BlockIoProtocol")) {
+                        report_integer_error("UEFI.BLOCKIO." + blockio_op + " received an invalid operand");
+                    }
+                    const std::string result = temp();
+                    std::string target = discover ? "BLOCKIODISCOVER" : "BLOCKIO" + blockio_op;
+                    current_block(function).instructions.push_back(amir_memory(target, result, std::move(args), type_of_expression(node), {discover ? "UEFI.SystemTable" : "UEFI.BlockIoProtocol"}));
                     return result;
                 }
                 if (name == "GRAPHICS.PRIMARYSURFACE") {
@@ -2596,6 +2611,7 @@ void render_instruction(std::ostream& out, const AmirInstruction& instruction, c
             const bool address_op = instruction.target == "PHYSICAL" || instruction.target == "VIRTUAL" || instruction.target == "MMIO" ||
                 instruction.target == "VALUE" || instruction.target == "OFFSET" || instruction.target == "ALIGNUP" || instruction.target == "ALIGNDOWN" || instruction.target == "ISALIGNED";
             if (instruction.target == "GOPDISCOVER") out << "UEFI.GOP.DISCOVER";
+            else if (instruction.target == "BLOCKIODISCOVER") out << "UEFI.BLOCKIO.DISCOVER";
             else out << (address_op ? "ADDRESS." : "MEMORY.") << instruction.target;
             for (const auto& operand : instruction.operands) out << ' ' << operand;
             out << "\n";
@@ -4842,6 +4858,78 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     } else {
                         if (offset <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RAX, static_cast<std::uint8_t>(offset));
                         else result.text.mov_load_disp32(Reg::RAX, Reg::RAX, static_cast<std::uint32_t>(offset));
+                    }
+                    if (!store_result(instruction.result, instruction.result_type)) return result;
+                    break;
+                }
+                if (op == "BLOCKIODISCOVER") {
+                    // EFI_BLOCK_IO_PROTOCOL_GUID discovery via LocateProtocol, mirroring
+                    // GOPDISCOVER exactly (RFC-0038 Section 17.5's own instruction to extend
+                    // uefi-bindings.md's conventions rather than improvise a new binding style).
+                    // GUID halves verified against MdePkg/Include/Protocol/BlockIo.h and
+                    // cross-checked against the already-proven GOP GUID's own conversion.
+                    if (!load_value(instruction.operands[0], "UEFI.SystemTable", Reg::RAX)) return result;
+                    result.text.mov_load_disp8(Reg::R11, Reg::RAX, 0x60); // SystemTable.BootServices
+                    const int guid_offset = scratch_base;
+                    const int output_offset = scratch_base + 16;
+                    result.text.mov_reg_imm64(Reg::RDX, 0x11D26459964E5B21ULL);
+                    if (guid_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(guid_offset), Reg::RDX);
+                    else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(guid_offset), Reg::RDX);
+                    result.text.mov_reg_imm64(Reg::RDX, 0x3B7269C9A000398EULL);
+                    if (guid_offset + 8 <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(guid_offset + 8), Reg::RDX);
+                    else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(guid_offset + 8), Reg::RDX);
+                    if (guid_offset <= 127) result.text.lea_rsp_disp8(Reg::RCX, static_cast<std::uint8_t>(guid_offset));
+                    else result.text.lea_rsp_disp32(Reg::RCX, static_cast<std::uint32_t>(guid_offset));
+                    result.text.xor_rdx_rdx();
+                    if (output_offset <= 127) result.text.lea_rsp_disp8(Reg::R8, static_cast<std::uint8_t>(output_offset));
+                    else result.text.lea_rsp_disp32(Reg::R8, static_cast<std::uint32_t>(output_offset));
+                    result.text.mov_reg_imm64(Reg::RAX, 0);
+                    if (output_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(output_offset), Reg::RAX);
+                    else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(output_offset), Reg::RAX);
+                    result.text.call_indirect_disp32(Reg::R11, 0x140);
+                    // LocateProtocol returns EFI_STATUS in RAX. A failed discovery (no attached
+                    // block device on this handle set) is represented as a null typed value for
+                    // source-level guards, exactly matching GOPDISCOVER's own contract.
+                    result.text.cmp_rax_imm8(0);
+                    const std::size_t failed_displacement = result.text.jcc_rel32_placeholder(0x5); // JNE
+                    if (output_offset <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(output_offset));
+                    else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(output_offset));
+                    const std::size_t success_jump = result.text.jmp_rel32_placeholder();
+                    const std::size_t failure_target = result.text.size();
+                    result.text.mov_reg_imm64(Reg::RAX, 0);
+                    const std::size_t done_target = result.text.size();
+                    result.text.patch_i32(failed_displacement, static_cast<std::int32_t>(failure_target) -
+                        static_cast<std::int32_t>(failed_displacement + 4));
+                    result.text.patch_i32(success_jump, static_cast<std::int32_t>(done_target) -
+                        static_cast<std::int32_t>(success_jump + 4));
+                    if (!store_result(instruction.result, "UEFI.BlockIoProtocol")) return result;
+                    break;
+                }
+                if (op.rfind("BLOCKIO", 0) == 0 && op != "BLOCKIODISCOVER") {
+                    // Plain EFI_BLOCK_IO_MEDIA field reads. The generic CallExternal path only
+                    // resolves chains ending in a METHOD call, so these are hand-rolled the same
+                    // way GOPWIDTH/GOPHEIGHT/etc. are -- one pointer hop (BlockIoProtocol.Media,
+                    // offset 0x08) then a single field load. MediaFlags returns the raw packed
+                    // RemovableMedia/MediaPresent/LogicalPartition/ReadOnly BOOLEAN word at
+                    // Media+0x04 rather than exposing a single byte field: the encoder has no
+                    // displacement-addressed single-byte load primitive, and adding one purely
+                    // for this would be new shared-infrastructure risk for no real gain -- stdlib
+                    // callers extract the byte they want with an ordinary SHR/AND (both already
+                    // proven ArcoBASIC operators), an honest, named, minimal-risk scope reduction.
+                    if (!load_value(instruction.operands[0], "UEFI.BlockIoProtocol", Reg::RAX)) return result;
+                    result.text.mov_load_disp8(Reg::RAX, Reg::RAX, 0x08); // BlockIoProtocol.Media
+                    int offset = 0x00;
+                    bool wide = false;
+                    if (op == "BLOCKIOMEDIAID") offset = 0x00;
+                    else if (op == "BLOCKIOMEDIAFLAGS") offset = 0x04;
+                    else if (op == "BLOCKIOBLOCKSIZE") offset = 0x0C;
+                    else if (op == "BLOCKIOLASTBLOCK") { offset = 0x18; wide = true; }
+                    if (wide) {
+                        if (offset <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RAX, static_cast<std::uint8_t>(offset));
+                        else result.text.mov_load_disp32(Reg::RAX, Reg::RAX, static_cast<std::uint32_t>(offset));
+                    } else {
+                        if (offset <= 127) result.text.mov_load32_disp8(Reg::RAX, Reg::RAX, static_cast<std::uint8_t>(offset));
+                        else result.text.mov_load32_disp32(Reg::RAX, Reg::RAX, static_cast<std::uint32_t>(offset));
                     }
                     if (!store_result(instruction.result, instruction.result_type)) return result;
                     break;

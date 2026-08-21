@@ -233,3 +233,142 @@ The prerequisite raw service entries are now recorded as well: `GetMemoryMap` at
 `AllocatePool` at `0x40`, and `FreePool` at `0x48`. These accept the firmware ABI's pointer-shaped
 arguments, but a typed ArcoBASIC memory-map wrapper has not yet been claimed; callers must not pass
 placeholder zeros on real hardware.
+
+## `EFI_BLOCK_IO_PROTOCOL` -- closing RFC-0038 Section 17.5's own named stop condition
+
+RFC-0038 (APS Block Storage and Filesystem Provider Substrate) Section 17.5 names, verbatim,
+"discovering that the boot-media RAM-disk-population step needs UEFI protocol surface this
+project's frontend does not yet bind" as its own explicit stop condition, and directs that this
+document ("the source of truth for what's currently bound") be extended "following that document's
+own conventions rather than improvising a new binding style." This section is that extension.
+
+### Source
+
+`MdePkg/Include/Protocol/BlockIo.h` (TianoCore edk2, fetched directly, the same primary-source
+discipline every other binding above follows), plus `MdePkg/Include/Uefi/UefiBaseType.h` for
+`EFI_LBA` (`UINT64`) and `MdePkg/Include/X64/ProcessorBind.h` for `BOOLEAN` (1 byte) and `UINTN`
+(`UINT64` on X64).
+
+### `EFI_BLOCK_IO_PROTOCOL_GUID`
+
+```c
+#define EFI_BLOCK_IO_PROTOCOL_GUID \
+  {0x964e5b21, 0x6459, 0x11d2, {0x8e, 0x39, 0x0, 0xa0, 0xc9, 0x69, 0x72, 0x3b}}
+```
+
+Converted to the two little-endian `U64` halves the `UEFI.BLOCKIO.DISCOVER` intrinsic materializes
+on the stack before calling `LocateProtocol`, using the identical byte-layout convention already
+proven correct for the GOP GUID (`data1` LE + `data2` LE + `data3` LE, concatenated with `data4`'s
+raw bytes, then split into two 8-byte little-endian words):
+
+- Low `U64` (bytes 0-7): `0x11D26459964E5B21`
+- High `U64` (bytes 8-15): `0x3B7269C9A000398E`
+
+Confirmed directly in the generated machine code
+(`ArcoFission reveal ... at X86_64`): `48 ba 21 5b 4e 96 59 64 d2 11` (`mov rdx,
+0x11D26459964E5B21`) immediately followed by `48 ba 8e 39 00 a0 c9 69 72 3b` (`mov rdx,
+0x3B7269C9A000398E`), then `41 ff 93 40 01 00 00` (`call [r11+0x140]`, `LocateProtocol`) -- the same
+instruction shape the GOP smoke test already checks for its own GUID.
+
+### `EFI_BLOCK_IO_PROTOCOL` (48 bytes) -> ArcoBASIC `UEFI.BlockIoProtocol`
+
+| Field | Type | Size | Offset |
+|---|---|---|---|
+| `Revision` | `UINT64` | 8 | 0 |
+| `Media` | `EFI_BLOCK_IO_MEDIA*` | 8 | 8 (0x08) |
+| **`Reset`** | `EFI_BLOCK_RESET` (fn ptr) | 8 | 16 (0x10) |
+| **`ReadBlocks`** | `EFI_BLOCK_READ` (fn ptr) | 8 | 24 (0x18) |
+| **`WriteBlocks`** | `EFI_BLOCK_WRITE` (fn ptr) | 8 | 32 (0x20) |
+| **`FlushBlocks`** | `EFI_BLOCK_FLUSH` (fn ptr) | 8 | 40 (0x28) |
+
+`Reset`, `ReadBlocks`, `WriteBlocks`, and `FlushBlocks` are real protocol methods (implicit `This`,
+verified `EFIAPI` signatures below) and are registered as `is_method = true` fields in
+`UEFI.BlockIoProtocol`, bound the same way `UEFI.SimpleTextOutputProtocol.Write` is. Unlike `Write`,
+these are called through the **already-generic** `CallExternal` codegen (`src/compiler/fission.cpp`)
+that `systemTable.BootServices.GetMemoryMap(...)` already exercises for a 5-argument, stack-passed
+call -- confirmed by `ArcoFission reveal ... at X86_64` on a `blockIo AS UEFI.BlockIoProtocol`
+parameter producing `41 ff 53 18` (`call [r11+0x18]`), the exact registered `ReadBlocks` offset,
+with **no new calling-convention codegen written for this binding**.
+
+Verified prototypes (`BlockIo.h`):
+
+```c
+typedef EFI_STATUS (EFIAPI *EFI_BLOCK_RESET)(IN EFI_BLOCK_IO_PROTOCOL *This, IN BOOLEAN ExtendedVerification);
+typedef EFI_STATUS (EFIAPI *EFI_BLOCK_READ)(IN EFI_BLOCK_IO_PROTOCOL *This, IN UINT32 MediaId, IN EFI_LBA Lba, IN UINTN BufferSize, OUT VOID *Buffer);
+typedef EFI_STATUS (EFIAPI *EFI_BLOCK_WRITE)(IN EFI_BLOCK_IO_PROTOCOL *This, IN UINT32 MediaId, IN EFI_LBA Lba, IN UINTN BufferSize, IN VOID *Buffer);
+typedef EFI_STATUS (EFIAPI *EFI_BLOCK_FLUSH)(IN EFI_BLOCK_IO_PROTOCOL *This);
+```
+
+### `EFI_BLOCK_IO_MEDIA` (48 bytes) -> documented as `UEFI.BlockIoMedia`, read through hand-rolled accessors
+
+```c
+typedef struct {
+  UINT32     MediaId;
+  BOOLEAN    RemovableMedia;
+  BOOLEAN    MediaPresent;
+  BOOLEAN    LogicalPartition;
+  BOOLEAN    ReadOnly;
+  BOOLEAN    WriteCaching;
+  UINT32     BlockSize;
+  UINT32     IoAlign;
+  EFI_LBA    LastBlock;
+  EFI_LBA    LowestAlignedLba;
+  UINT32     LogicalBlocksPerPhysicalBlock;
+  UINT32     OptimalTransferLengthGranularity;
+} EFI_BLOCK_IO_MEDIA;
+```
+
+| Field | Type | Size | Offset |
+|---|---|---|---|
+| `MediaId` | `UINT32` | 4 | 0 |
+| `RemovableMedia` | `BOOLEAN` | 1 | 4 |
+| `MediaPresent` | `BOOLEAN` | 1 | 5 |
+| `LogicalPartition` | `BOOLEAN` | 1 | 6 |
+| `ReadOnly` | `BOOLEAN` | 1 | 7 |
+| `WriteCaching` | `BOOLEAN` | 1 | 8 |
+| *(padding)* | -- | 3 | 9 |
+| `BlockSize` | `UINT32` | 4 | 12 (0x0C) |
+| `IoAlign` | `UINT32` | 4 | 16 |
+| *(padding)* | -- | 4 | 20 |
+| `LastBlock` | `EFI_LBA` (`UINT64`) | 8 | 24 (0x18) |
+| `LowestAlignedLba` | `EFI_LBA` | 8 | 32 |
+| `LogicalBlocksPerPhysicalBlock` | `UINT32` | 4 | 40 |
+| `OptimalTransferLengthGranularity` | `UINT32` | 4 | 44 |
+
+Like `UEFI.GraphicsOutputMode`'s own registry entry, `UEFI.BlockIoMedia` is registered in
+`uefi_bindings.hpp` for documentation/consistency but is **not consulted** by its own accessors:
+`CallExternal` only resolves chains ending in a method call, so a struct that is read-only data
+throughout still needs hand-rolled accessors regardless of what is registered. `UEFI.BLOCKIO.*`
+field intrinsics are bound the same way `UEFI.GOP.WIDTH`/`HEIGHT`/etc. are:
+
+- `UEFI.BLOCKIO.MEDIAID(blockIo)` -> `U32`, `Media+0x00`
+- `UEFI.BLOCKIO.MEDIAFLAGS(blockIo)` -> `U32`, `Media+0x04` -- the raw packed
+  `RemovableMedia`/`MediaPresent`/`LogicalPartition`/`ReadOnly` word, **not** four separate bit
+  accessors. The x86-64 encoder has no displacement-addressed single-byte load primitive, and this
+  binding does not add one purely for this: adding a new primitive to shared encoder infrastructure
+  for a single caller is a real risk for no real gain when the existing 32-bit displacement load
+  (already proven by `UEFI.GOP.WIDTH`) can read the whole packed word instead. Callers extract the
+  byte they want with an ordinary `SHR`/`AND` (both already-proven ArcoBASIC operators) at the
+  stdlib level -- an honest, named, minimal-risk scope reduction, not a silently missing feature.
+- `UEFI.BLOCKIO.BLOCKSIZE(blockIo)` -> `U32`, `Media+0x0C`
+- `UEFI.BLOCKIO.LASTBLOCK(blockIo)` -> `U64`, `Media+0x18`
+
+`IoAlign`, `LowestAlignedLba`, `LogicalBlocksPerPhysicalBlock`, and
+`OptimalTransferLengthGranularity` are not bound in this milestone -- not needed by the reference
+`ReadSectors`/`WriteSectors` provider this binding exists to support.
+
+### What This Binding Does Not Do
+
+- Does not bind `Revision` behind a source-level accessor (recorded in the registry for
+  completeness/future chaining only).
+- Does not bind `IoAlign`, `LowestAlignedLba`, `LogicalBlocksPerPhysicalBlock`, or
+  `OptimalTransferLengthGranularity`.
+- Does not expose `RemovableMedia`/`MediaPresent`/`LogicalPartition`/`ReadOnly` as individual typed
+  fields -- only the packed `MediaFlags` word (see above).
+- Does not attempt multi-handle enumeration (`LocateHandleBuffer`/`HandleProtocol` over every
+  `EFI_BLOCK_IO_PROTOCOL` handle); `UEFI.BLOCKIO.DISCOVER` calls `LocateProtocol`, which returns the
+  first matching instance firmware offers, matching `UEFI.GOP.DISCOVER`'s own established scope.
+- Does not attach a real disk device in the existing QEMU test harness by itself -- the harness's
+  RAM-preload trick (`-device loader,file=...,addr=...`) still populates `stdlib/block_device_policy.abas`'s
+  `RAMDisk.*` provider; a genuine end-to-end proof against an emulated disk (virtio-blk/AHCI via
+  `-drive`) is separate follow-on work, tracked in the RFC-0038 status update alongside this binding.

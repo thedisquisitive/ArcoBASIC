@@ -129,6 +129,56 @@ inline std::optional<UefiType> lookup_uefi_type(const std::string& name) {
             },
         };
     }
+    // EFI_BLOCK_IO_PROTOCOL (RFC-0038 Section 17.5's own named stop condition, closed here) --
+    // verified field-by-field against MdePkg/Include/Protocol/BlockIo.h (TianoCore edk2), the
+    // same primary-source discipline every other binding in this file already follows. Natural
+    // C alignment, 48 bytes total: Revision(U64,0), Media(EFI_BLOCK_IO_MEDIA*,8),
+    // Reset/ReadBlocks/WriteBlocks/FlushBlocks (function pointers, 8 bytes each, 16/24/32/40).
+    // ReadBlocks/WriteBlocks/Reset/FlushBlocks are real protocol methods (implicit This, real
+    // EFIAPI signatures verified against the same header: Reset(This, ExtendedVerification),
+    // ReadBlocks/WriteBlocks(This, MediaId, Lba, BufferSize, Buffer), FlushBlocks(This)) --
+    // callable through the SAME generic CallExternal mechanism systemTable.BootServices.* already
+    // uses (including its own stack-argument handling for ReadBlocks/WriteBlocks' 5th argument),
+    // so no new calling-convention codegen was needed for the calls themselves, only for
+    // discovery (see UEFI.BLOCKIO.DISCOVER in fission.cpp, mirroring UEFI.GOP.DISCOVER's own
+    // LocateProtocol pattern with EFI_BLOCK_IO_PROTOCOL_GUID instead).
+    if (name == "UEFI.BlockIoProtocol") {
+        return UefiType{
+            "UEFI.BlockIoProtocol",
+            48,
+            {
+                UefiField{"Revision", "Revision", 0x00, "U64", false, false, ""},
+                UefiField{"Media", "Media", 0x08, "UEFI.BlockIoMedia", false, false, ""},
+                UefiField{"Reset", "Reset", 0x10, "", true, true, "U64"},
+                UefiField{"ReadBlocks", "ReadBlocks", 0x18, "", true, true, "U64"},
+                UefiField{"WriteBlocks", "WriteBlocks", 0x20, "", true, true, "U64"},
+                UefiField{"FlushBlocks", "FlushBlocks", 0x28, "", true, true, "U64"},
+            },
+        };
+    }
+    // EFI_BLOCK_IO_MEDIA, verified against the same header. 48 bytes, natural C alignment:
+    // MediaId(UINT32,0), RemovableMedia/MediaPresent/LogicalPartition/ReadOnly (BOOLEAN, 1 byte
+    // each, 4/5/6/7 -- packed, no gap), WriteCaching(BOOLEAN,8, 3 bytes trailing padding to the
+    // next UINT32-aligned offset), BlockSize(UINT32,12), IoAlign(UINT32,16),
+    // LastBlock(EFI_LBA/UINT64,24 -- 4 bytes padding before it for 8-byte alignment),
+    // LowestAlignedLba(UINT64,32), LogicalBlocksPerPhysicalBlock(UINT32,40),
+    // OptimalTransferLengthGranularity(UINT32,44). Documentation-only entry (not consulted by
+    // the hand-rolled UEFI.BLOCKIO.MEDIA* accessors in fission.cpp, matching how
+    // UEFI.GraphicsOutputMode's own registry entry is likewise unused by GOP's hand-rolled
+    // accessors -- the generic CallExternal path only resolves terminal METHOD calls, not plain
+    // data fields, so a struct that is read-only data throughout still needs hand-rolled
+    // accessors regardless of what is registered here).
+    if (name == "UEFI.BlockIoMedia") {
+        return UefiType{
+            "UEFI.BlockIoMedia",
+            48,
+            {
+                UefiField{"MediaId", "MediaId", 0x00, "U32", false, false, ""},
+                UefiField{"BlockSize", "BlockSize", 0x0C, "U32", false, false, ""},
+                UefiField{"LastBlock", "LastBlock", 0x18, "U64", false, false, ""},
+            },
+        };
+    }
     return std::nullopt;
 }
 
