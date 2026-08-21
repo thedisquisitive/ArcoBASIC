@@ -336,3 +336,9 @@ arco_add_script_test(
     $<TARGET_FILE:ArcoFission>
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+arco_add_script_test(
+    systems_arco_basic_arcfs_offset_io_smoke
+    arcology-os/tests/systems/systems_arco_basic_arcfs_offset_io_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
