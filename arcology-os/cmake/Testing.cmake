@@ -283,6 +283,12 @@ arco_add_script_test(
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 arco_add_script_test(
+    systems_arco_basic_string_len_mid_smoke
+    arcology-os/tests/systems/systems_arco_basic_string_len_mid_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
     systems_arco_basic_arcfs_phase_a_smoke
     arcology-os/tests/systems/systems_arco_basic_arcfs_phase_a_smoke.sh
     $<TARGET_FILE:ArcoFission>

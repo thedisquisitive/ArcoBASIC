@@ -34,7 +34,12 @@ grep -q "%t5 := LOAD count" "$TMP_ROOT/amir.txt"
 grep -q "%t7 := \\* %t5, %t6" "$TMP_ROOT/amir.txt"
 grep -q "STORE score" "$TMP_ROOT/amir.txt"
 grep -q "%t8 := CONST \"abc\"" "$TMP_ROOT/amir.txt"
-grep -q "%t9 := CALL LEN %t8" "$TMP_ROOT/amir.txt"
+# LEN on a genuine STRING argument now carries an explicit :U64 result-type annotation in A-MIR
+# text (freestanding LEN/MID support, .agents/reports/freestanding-len-mid.md) -- a real, deliberate
+# improvement (LEN's result really is U64), not a regression; every other LEN use in this file
+# (arrays, ranges, bitvectors, objects) is untouched, since that annotation is only ever added when
+# the first argument is confidently STRING.
+grep -q "%t9 :U64 := CALL LEN %t8" "$TMP_ROOT/amir.txt"
 grep -q "CALL Runtime.Print %t9" "$TMP_ROOT/amir.txt"
 grep -q " := ARRAY" "$TMP_ROOT/amir.txt"
 grep -q " := INDEX" "$TMP_ROOT/amir.txt"

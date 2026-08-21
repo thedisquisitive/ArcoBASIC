@@ -1,0 +1,148 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' Freestanding LEN/MID proof. Confirms the fix documented in .agents/reports/freestanding-len-mid.md:
+' LEN(text)/MID(text, start, length) previously failed compilation outright as "not a declared
+' function" -- freestanding STRING had no substring/length operations at all. Both are now real,
+' hand-assembled codegen. LEN counts UTF-16 code units up to the null terminator. MID uses classic
+' 1-based BASIC MID$ indexing (start=1 is the first character); start=0, a start past the end of the
+' string, or length=0 all produce an empty string; a length reaching past the end of the string
+' clamps to whatever remains. MID's result lives in one shared, fixed scratch buffer (this backend
+' has no heap allocator) -- valid only until the next MID() call, the same "one shared scratch
+' region, copy out if you need to keep it" idiom arcology-os/stdlib/arcfs_policy.abas already uses
+' pervasively (ArcFSNodeScratchAddress and friends). That aliasing is a documented scope reduction,
+' POSITIVELY proven below (not just asserted), and a nested MID(MID(...)) call is proven safe
+' despite sharing that one buffer -- the read cursor never falls behind the write cursor within a
+' single call, the same reasoning a forward memmove(dst<=src) already relies on.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+FUNCTION StrLen(s AS STRING) AS U64
+    RETURN LEN(s)
+END FUNCTION
+
+FUNCTION Sub(s AS STRING, start AS U64, length AS U64) AS STRING
+    RETURN MID(s, start, length)
+END FUNCTION
+
+FUNCTION EqStr(a AS STRING, b AS STRING) AS U64
+    IF a = b THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+' "APS LEN MID OK\r\n" -- printed only if every check below matched its expected result.
+FUNCTION SerialMarkerLenMidOK() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(76)
+    SerialByte(69)
+    SerialByte(78)
+    SerialByte(32)
+    SerialByte(77)
+    SerialByte(73)
+    SerialByte(68)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    SerialInit()
+
+    LET failures AS U64 = 0
+
+    ' --- LEN ---
+    IF StrLen("HELLO") <> 5 THEN failures = failures + 1
+    IF StrLen("") <> 0 THEN failures = failures + 1
+    LET longWord AS STRING = "ARCOBASIC"
+    IF StrLen(longWord) <> 9 THEN failures = failures + 1
+    IF LEN("HELLO WORLD") <> 11 THEN failures = failures + 1   ' direct call, not through a parameter
+
+    ' --- MID: classic 1-based indexing, via a STRING-parameter wrapper ---
+    IF EqStr(Sub("HELLO", 1, 5), "HELLO") <> 1 THEN failures = failures + 1    ' whole string
+    IF EqStr(Sub("HELLO", 2, 3), "ELL") <> 1 THEN failures = failures + 1      ' middle slice
+    IF EqStr(Sub("HELLO", 1, 2), "HE") <> 1 THEN failures = failures + 1       ' prefix
+    IF EqStr(Sub("HELLO", 4, 2), "LO") <> 1 THEN failures = failures + 1       ' suffix, exact end
+    IF EqStr(Sub("HELLO", 4, 10), "LO") <> 1 THEN failures = failures + 1      ' length clamps past end
+    IF EqStr(Sub("HELLO", 6, 3), "") <> 1 THEN failures = failures + 1         ' start one past end
+    IF EqStr(Sub("HELLO", 100, 5), "") <> 1 THEN failures = failures + 1       ' start way past end
+    IF EqStr(Sub("HELLO", 0, 3), "") <> 1 THEN failures = failures + 1         ' start=0 is invalid
+    IF EqStr(Sub("", 1, 5), "") <> 1 THEN failures = failures + 1              ' empty source
+    IF EqStr(Sub("HELLO", 3, 0), "") <> 1 THEN failures = failures + 1         ' length=0
+
+    ' --- MID: direct calls, and a variable-sourced (not literal) string ---
+    IF EqStr(MID("WORLD", 2, 3), "ORL") <> 1 THEN failures = failures + 1
+    LET greeting AS STRING = "GOODBYE"
+    IF EqStr(MID(greeting, 1, 4), "GOOD") <> 1 THEN failures = failures + 1
+
+    ' --- Nested MID(MID(...)): the inner result lives in the SAME shared buffer the outer call
+    ' both reads from and writes into -- proven safe here under real execution, not just reasoned
+    ' about (read cursor stays >= write cursor throughout, so no read ever sees already-overwritten
+    ' data).
+    IF EqStr(MID(MID("HELLO WORLD", 7, 5), 1, 3), "WOR") <> 1 THEN failures = failures + 1
+
+    ' --- Documented scope reduction, POSITIVELY proven: MID's single shared result buffer means a
+    ' STRING local holding one MID() result becomes ALIASED (not merely stale/garbage) once a LATER
+    ' MID() call overwrites that same buffer, unless the caller copies it out immediately.
+    LET first AS STRING = MID("HELLO", 1, 2)            ' "HE"
+    LET beforeOverwrite AS U64 = EqStr(first, "HE")
+    LET second AS STRING = MID("WORLD", 1, 2)           ' "WO" -- overwrites the same shared buffer
+    LET afterOverwrite AS U64 = EqStr(first, "HE")
+    IF beforeOverwrite <> 1 THEN failures = failures + 1
+    IF afterOverwrite <> 0 THEN failures = failures + 1        ' first no longer reads "HE"
+    IF EqStr(first, "WO") <> 1 THEN failures = failures + 1    ' -- it now reads "WO": aliased, not garbage
+    IF EqStr(second, "WO") <> 1 THEN failures = failures + 1
+
+    IF failures <> 0 THEN
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(32)
+        LET digit AS U64 = failures
+        IF digit > 9 THEN digit = 9
+        LET digitPlus48 AS U64 = digit + 48
+        LET digitByte AS U8 = digitPlus48
+        SerialByte(digitByte)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    SerialMarkerLenMidOK()
+    CPU.HaltForever
+END FUNCTION

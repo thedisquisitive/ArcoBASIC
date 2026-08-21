@@ -999,6 +999,8 @@ private:
             if (name == "GRAPHICS.CREATEIMAGE") return "IMAGE";
             if (name == "FILES.OPEN") return "FILE";
             if (name == "NETWORK.CONNECT") return "SOCKET";
+            if (name == "LEN") return "U64";
+            if (name == "MID") return "STRING";
         }
         if (node.kind == AstKind::PortOperation) {
             const std::string name = upper_ascii(node.name);
@@ -1637,6 +1639,52 @@ private:
             return result;
         }
         AmirInstruction instruction = amir_call_value(result, target, std::move(args));
+        if (upper_target == "LEN" || upper_target == "MID") {
+            // Freestanding STRING has no substring/length operations at all (LEN/MID were
+            // rejected outright as "undeclared function" -- see the generic CallValue error in
+            // generate_x86_64_function). Both become real, hand-assembled STRING builtins here --
+            // but ONLY when the first argument is confidently STRING. `LEN` in particular is
+            // ALREADY legitimately used elsewhere in this same shared AMIR pipeline for arrays,
+            // ranges, bitvectors, and objects (the hosted runtime's own LEN, runtime.cpp:2332,
+            // and the internal array-length AMIR calls this file itself synthesizes at :1506/
+            // :2121) -- those must fall through to the ordinary generic path completely
+            // unchanged, not be hard-errored here just because the name matches. A real
+            // regression found this way, not assumed: an early version of this special case
+            // intercepted every call literally named LEN/MID regardless of argument type, which
+            // broke `LEN(someRange)`/`LEN(someBitvector)`/`LEN(someObjectArray)` outright
+            // (arcofission_alpha_smoke caught it on the very first full-suite run).
+            //
+            // type_of_expression alone cannot tell a bare string LITERAL argument from a bare
+            // numeric one (a Literal node with no "expected" type hint just echoes that hint
+            // back -- see its own Literal case) -- it infers a literal's type from a SIBLING
+            // operand or the caller's own expected type, and LEN/MID's lone string argument has
+            // neither. Disambiguated instead exactly the way the Const codegen case already
+            // does for the same reason: a raw string literal's own AST text still carries its
+            // opening quote.
+            const auto string_typed = [&](const CanonicalAstNode& arg) -> std::string {
+                if (arg.kind == AstKind::Literal && !arg.text.empty() && arg.text.front() == '"') return "STRING";
+                return type_of_expression(arg);
+            };
+            const bool first_arg_is_string = !node.children.empty() && string_typed(*node.children.front()) == "STRING";
+            if (!first_arg_is_string) {
+                current_block(function).instructions.push_back(std::move(instruction));
+                return result;
+            }
+            const std::size_t expected_args = upper_target == "LEN" ? 1 : 3;
+            if (node.children.size() != expected_args) {
+                report_integer_error(upper_target + " expects exactly " + std::to_string(expected_args) +
+                    (expected_args == 1 ? " argument" : " arguments") + " (got " + std::to_string(node.children.size()) + ")");
+                return result;
+            }
+            instruction.operand_types = {"STRING"};
+            if (upper_target == "MID") {
+                instruction.operand_types.push_back(type_of_expression(*node.children[1]));
+                instruction.operand_types.push_back(type_of_expression(*node.children[2]));
+            }
+            instruction.result_type = upper_target == "LEN" ? "U64" : "STRING";
+            current_block(function).instructions.push_back(std::move(instruction));
+            return result;
+        }
         if (upper_target == "GRAPHICS.CREATESURFACE" || upper_target == "GRAPHICS.PRIMARYSURFACE" || upper_target == "GRAPHICS.CREATEWINDOW" ||
             upper_target == "GRAPHICS.CREATEIMAGE" || upper_target == "FILES.OPEN" || upper_target == "NETWORK.CONNECT") {
             instruction.result_type = type_of_expression(node);
@@ -3928,6 +3976,24 @@ constexpr std::uint64_t kInterruptPendingTableAddress = 0x2010000ULL;
 constexpr std::uint32_t kInterruptPendingTableEntryStride = 8;
 constexpr std::uint32_t kInterruptPendingTableEntryCount = 16;
 
+// Fixed low-memory result buffer for the freestanding MID(text, start, length) builtin (see the
+// CallValue case in generate_x86_64_function). Same reasoning and same technique as
+// kInterruptPendingTableAddress just above: nothing about a NEWLY CONSTRUCTED string's buffer can
+// live in .text/.rdata (read-only), and this backend has no heap allocator at all (confirmed
+// directly -- every freestanding STRING value until now was either an .rdata literal or a pointer
+// copied straight through from somewhere else; MID is the first freestanding builtin that must
+// hand back a buffer nobody else already owns). One shared, single fixed buffer, not one per call
+// site -- the same "one instance, fixed scratch state, valid only until next overwritten" idiom
+// this codebase already uses pervasively (ArcFSNodeScratchAddress, ArcFSSectorScratchAddress, and
+// every other *ScratchAddress in arcology-os/stdlib/*.abas): callers that need to keep more than
+// one MID result alive at once must copy one out immediately, exactly like those. Capacity is a
+// documented, honest scope reduction, not a silent one: up to kMidResultMaxUnits UTF-16 code units
+// (a longer request is truncated to that cap, not rejected) plus one null-terminator unit.
+// Deliberately well clear of both the address above and 0x2000000/0x2030000, the range every
+// arcology-os stdlib file's own MMIO scratch addresses already occupy.
+constexpr std::uint64_t kMidResultAddress = 0x2018000ULL;
+constexpr std::uint64_t kMidResultMaxUnits = 256ULL;
+
 // Architectural x86-64 vectors whose interrupt gate delivers a hardware-pushed error code. Every
 // other vector 0-31 pushes nothing, so a common handler cannot assume a uniform stack shape
 // without each entry point normalizing this first (arcology-os/.agents/reports/aps-owned-idt.md's
@@ -4992,6 +5058,149 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
             }
 
             case AmirInstruction::Kind::CallValue: {
+                // LEN(text)/MID(text, start, length) on a freestanding STRING (a pointer to a
+                // null-terminated UTF-16 buffer -- see the Const case above and lower_call's own
+                // header note). No runtime helper exists to call on this backend, so both are
+                // hand-assembled here, mirroring the STRING ==/!= fix's own shape in the Binary
+                // case above: walk the buffer unit-by-unit with the same encoder primitives
+                // (mov_load16_rax, the jcc-placeholder-then-patch forward-branch idiom, jmp_rel8
+                // to loop). Gated on operand_types (populated only by lower_call's own LEN/MID
+                // special case) so this can never intercept the unrelated internal "LEN" AMIR
+                // call target the array/FOR EACH lowering path synthesizes elsewhere -- that one
+                // never sets operand_types, so it falls through unchanged to the ordinary
+                // declared-function lookup below, exactly as it did before this case existed.
+                const std::string upper_call_target = upper_ascii(instruction.target);
+                const bool string_len_or_mid = (upper_call_target == "LEN" || upper_call_target == "MID") &&
+                    !instruction.operand_types.empty() && instruction.operand_types.front() == "STRING";
+                if (string_len_or_mid && upper_call_target == "LEN") {
+                    if (instruction.operands.size() != 1) {
+                        result.ok = false; result.error = "LEN expects exactly 1 argument"; return result;
+                    }
+                    if (!load_value(instruction.operands[0], "STRING", Reg::R8)) return result;
+                    result.text.mov_reg_imm64(Reg::R9, 0); // R9 = running unit count
+
+                    const std::size_t loop_start = result.text.size();
+                    result.text.mov_reg_reg(Reg::RAX, Reg::R8);
+                    result.text.mov_load16_rax();               // EAX = *R8 (zero-extended)
+                    result.text.cmp_reg_imm32(Reg::RAX, 0);
+                    const std::size_t end_disp = result.text.jcc_rel32_placeholder(0x4); // JE
+                    result.text.mov_reg_imm64(Reg::RCX, 2);
+                    result.text.add_reg_reg(Reg::R8, Reg::RCX); // advance pointer past this unit
+                    result.text.mov_reg_imm64(Reg::RCX, 1);
+                    result.text.add_reg_reg(Reg::R9, Reg::RCX); // count++
+                    result.text.jmp_rel8(static_cast<std::int8_t>(
+                        static_cast<std::int64_t>(loop_start) - static_cast<std::int64_t>(result.text.size() + 2)));
+
+                    const std::size_t end_start = result.text.size();
+                    {
+                        const std::int64_t next_instruction = static_cast<std::int64_t>(end_disp + 4);
+                        result.text.patch_i32(end_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(end_start) - next_instruction));
+                    }
+                    result.text.mov_reg_reg(Reg::RAX, Reg::R9);
+                    if (!store_result(instruction.result, "U64")) return result;
+                    break;
+                }
+                if (string_len_or_mid && upper_call_target == "MID") {
+                    if (instruction.operands.size() != 3) {
+                        result.ok = false; result.error = "MID expects exactly 3 arguments"; return result;
+                    }
+                    const std::string start_type = instruction.operand_types.size() > 1 ? instruction.operand_types[1] : "U64";
+                    const std::string length_type = instruction.operand_types.size() > 2 ? instruction.operand_types[2] : "U64";
+                    // R8=source ptr (advances), R9=start-then-skip-counter, R12=length-then-copy-
+                    // counter, R13=dest ptr (fixed base, then advances during the copy loop),
+                    // R14=constant -1 (this encoder has no SUB-by-immediate primitive; every
+                    // decrement below is `add reg, R14` instead, the same trick already used for
+                    // "+2 per UTF-16 unit" via a preloaded RCX in the STRING equality fix above).
+                    if (!load_value(instruction.operands[0], "STRING", Reg::R8)) return result;
+                    if (!load_value(instruction.operands[1], start_type, Reg::R9)) return result;
+                    if (!load_value(instruction.operands[2], length_type, Reg::R12)) return result;
+                    result.text.mov_reg_imm64(Reg::R13, kMidResultAddress);
+                    result.text.mov_reg_imm64(Reg::R14, 0xFFFFFFFFFFFFFFFFULL); // -1
+
+                    // 1-based start (classic MID$ convention): start==0 is out of range -> force
+                    // an empty result by zeroing the copy count and skipping the skip-loop
+                    // entirely, rather than underflowing "start - 1".
+                    result.text.cmp_reg_imm32(Reg::R9, 0);
+                    const std::size_t start_zero_disp = result.text.jcc_rel32_placeholder(0x4); // JE -> force-empty
+                    result.text.add_reg_reg(Reg::R9, Reg::R14); // R9 = start - 1 (0-based skip count)
+
+                    const std::size_t skip_loop_start = result.text.size();
+                    result.text.cmp_reg_imm32(Reg::R9, 0);
+                    const std::size_t skip_done_disp = result.text.jcc_rel32_placeholder(0x4); // JE -> clamp/copy, R12 untouched
+                    result.text.mov_reg_reg(Reg::RAX, Reg::R8);
+                    result.text.mov_load16_rax();
+                    result.text.cmp_reg_imm32(Reg::RAX, 0);
+                    const std::size_t skip_exhausted_disp = result.text.jcc_rel32_placeholder(0x4); // JE -> force-empty (string shorter than start)
+                    result.text.mov_reg_imm64(Reg::RCX, 2);
+                    result.text.add_reg_reg(Reg::R8, Reg::RCX);
+                    result.text.add_reg_reg(Reg::R9, Reg::R14);
+                    result.text.jmp_rel8(static_cast<std::int8_t>(
+                        static_cast<std::int64_t>(skip_loop_start) - static_cast<std::int64_t>(result.text.size() + 2)));
+
+                    // Landing point for BOTH "start==0" and "skip exhausted the source string
+                    // early": force the copy count to 0 and fall straight through into
+                    // clamp/copy, whose own `length==0` check then naturally produces an empty
+                    // (just null-terminated) result with no separate code path needed.
+                    const std::size_t force_empty_start = result.text.size();
+                    {
+                        const std::int64_t next_instruction = static_cast<std::int64_t>(start_zero_disp + 4);
+                        result.text.patch_i32(start_zero_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(force_empty_start) - next_instruction));
+                    }
+                    {
+                        const std::int64_t next_instruction = static_cast<std::int64_t>(skip_exhausted_disp + 4);
+                        result.text.patch_i32(skip_exhausted_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(force_empty_start) - next_instruction));
+                    }
+                    result.text.mov_reg_imm64(Reg::R12, 0);
+
+                    const std::size_t clamp_start = result.text.size();
+                    {
+                        const std::int64_t next_instruction = static_cast<std::int64_t>(skip_done_disp + 4);
+                        result.text.patch_i32(skip_done_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(clamp_start) - next_instruction));
+                    }
+                    result.text.cmp_reg_imm32(Reg::R12, static_cast<std::uint32_t>(kMidResultMaxUnits));
+                    const std::size_t clamp_ok_disp = result.text.jcc_rel32_placeholder(0x6); // JBE (unsigned <=)
+                    result.text.mov_reg_imm64(Reg::R12, kMidResultMaxUnits);
+                    const std::size_t clamp_done_start = result.text.size();
+                    {
+                        const std::int64_t next_instruction = static_cast<std::int64_t>(clamp_ok_disp + 4);
+                        result.text.patch_i32(clamp_ok_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(clamp_done_start) - next_instruction));
+                    }
+
+                    const std::size_t copy_loop_start = result.text.size();
+                    result.text.cmp_reg_imm32(Reg::R12, 0);
+                    const std::size_t copy_done_disp1 = result.text.jcc_rel32_placeholder(0x4); // JE
+                    result.text.mov_reg_reg(Reg::RAX, Reg::R8);
+                    result.text.mov_load16_rax();
+                    result.text.cmp_reg_imm32(Reg::RAX, 0);
+                    const std::size_t copy_done_disp2 = result.text.jcc_rel32_placeholder(0x4); // JE -- source exhausted early
+                    result.text.mov_reg_reg(Reg::RCX, Reg::RAX); // RCX = the char just read
+                    result.text.mov_reg_reg(Reg::RAX, Reg::R13); // RAX = dest ptr
+                    result.text.mov_store16_rax_from_cx();
+                    result.text.mov_reg_imm64(Reg::RCX, 2);
+                    result.text.add_reg_reg(Reg::R8, Reg::RCX);
+                    result.text.add_reg_reg(Reg::R13, Reg::RCX);
+                    result.text.add_reg_reg(Reg::R12, Reg::R14); // R12 -= 1
+                    result.text.jmp_rel8(static_cast<std::int8_t>(
+                        static_cast<std::int64_t>(copy_loop_start) - static_cast<std::int64_t>(result.text.size() + 2)));
+
+                    const std::size_t copy_done_start = result.text.size();
+                    {
+                        const std::int64_t next_instruction = static_cast<std::int64_t>(copy_done_disp1 + 4);
+                        result.text.patch_i32(copy_done_disp1, static_cast<std::int32_t>(static_cast<std::int64_t>(copy_done_start) - next_instruction));
+                    }
+                    {
+                        const std::int64_t next_instruction = static_cast<std::int64_t>(copy_done_disp2 + 4);
+                        result.text.patch_i32(copy_done_disp2, static_cast<std::int32_t>(static_cast<std::int64_t>(copy_done_start) - next_instruction));
+                    }
+                    result.text.mov_reg_imm64(Reg::RCX, 0);
+                    result.text.mov_reg_reg(Reg::RAX, Reg::R13);
+                    result.text.mov_store16_rax_from_cx(); // null-terminate
+
+                    result.text.mov_reg_imm64(Reg::RAX, kMidResultAddress); // always the fixed base, never the advanced R13
+                    if (!store_result(instruction.result, "STRING")) return result;
+                    break;
+                }
+
                 const AmirFunction* callee = nullptr;
                 for (const auto& candidate : module.functions) {
                     if (candidate.name == instruction.target) { callee = &candidate; break; }
