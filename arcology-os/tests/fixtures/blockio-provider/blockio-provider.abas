@@ -1,0 +1,309 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' Real hardware end-to-end proof for the UefiBlockDevice.* provider
+' (stdlib/uefi_block_device_policy.abas, frozen copy inlined below, matching this project's own
+' established fixture convention -- this compiler's freestanding target takes one source file, no
+' module/include system). Exercises the RFC-0038 Section 6.1 BlockDevice contract shape
+' (SectorSize/SectorCount/IsWritable/ReadSectors/WriteSectors) against a genuinely attached QEMU
+' disk (run-uefi-hello-with-blockio-disk.sh), not the RAM-preload trick RAMDisk.* uses.
+
+' UEFI-backed BlockDevice Provider (RFC-0038 Section 6.1/6.2), backed by a REAL discovered
+' EFI_BLOCK_IO_PROTOCOL device -- the hardware-side follow-on to RFC-0038 Section 17.5's stop
+' condition, closed at the compiler-binding level in
+' .agents/reports/aps-blockio-discovery-binding.md, and proven against a real attached QEMU disk
+' in .agents/reports/aps-blockio-disk-provider.md.
+
+
+' --- Documented deviations, stated up front, same spirit as block_device_policy.abas's own
+' header note. ---
+'
+' 1. Same "concrete functions instead of an abstract BlockDevice interface value" deviation
+'    RAMDisk.* already documents -- this backend has no runtime-polymorphic dispatch at all.
+'
+' 2. A SECOND, NEW deviation this provider needed that RAMDisk.* did not: the discovered
+'    UEFI.BlockIoProtocol value itself cannot be persisted across calls as a still-typed value the
+'    way mediaId/blockSize/sectorCount can. What CAN be persisted -- and what genuinely works,
+'    confirmed directly against real generated x86-64 before relying on it -- is the raw protocol
+'    pointer as a plain U64, RELOADED and RE-DECLARED with an explicit `AS UEFI.BlockIoProtocol`
+'    type annotation in each function that needs to call a real protocol method. This works
+'    because this compiler's field-chain resolution (src/compiler/fission.cpp) keys off a
+'    variable's DECLARED type (tracked per-function in a name->type map populated by every typed
+'    LET, not only function parameters), not off whether the variable literally is a parameter --
+'    an is_method call on ANY local variable carrying an explicit UEFI.* type annotation resolves
+'    through the same generic CallExternal path a genuine parameter would. Confirmed in generated
+'    x86-64: `call [r11+0x18]`, ReadBlocks's own registered offset, appears identically whether
+'    blockIo arrives as a parameter or is reloaded from memory and re-annotated. (An earlier,
+'    narrower reading of this constraint -- assuming only literal parameters work -- is corrected
+'    here; not a defect in the earlier binding work, just an incomplete first read of the
+'    resolution code before this provider needed the fuller picture.)
+'
+' 3. `UefiBlockDevice.Discover` requires the discovered media's own BlockSize to be exactly 512.
+'    UEFI.BLOCKIO.MediaFlags only exposes the packed RemovableMedia/MediaPresent/LogicalPartition/
+'    ReadOnly word (uefi-bindings.md's own documented scope reduction: no single-byte
+'    displacement-addressed encoder primitive exists, so a whole packed word is read instead of
+'    one bit) -- this provider extracts the bits it needs from that word via ordinary SHR/AND.
+'
+' 4. UEFI.BLOCKIO.DISCOVER is a single LocateProtocol call (matching UEFI.GOP.DISCOVER's own
+'    documented single-handle scope): it returns whichever EFI_BLOCK_IO_PROTOCOL handle firmware
+'    hands back first, not necessarily any particular disk a caller has in mind. This provider
+'    does not attempt multi-handle enumeration/selection -- callers that need a SPECIFIC device
+'    among several need a future, separate enumeration binding, out of scope here.
+
+FUNCTION UefiBlockDeviceStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(37748736))   ' 0x2400000, this provider's own scratch state
+END FUNCTION
+
+' State layout, all within one page: blockIo pointer (U64, +0), mediaId (U32, +8), sectorCount
+' (U64, +16), writable flag (U32, +24), discovered flag (U32, +28).
+FUNCTION UefiBlockDeviceStatePointerAddress() AS MMIOPTR
+    RETURN UefiBlockDeviceStateAddress()
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateMediaIdAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 8)
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateSectorCountAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 16)
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateWritableAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 24)
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateDiscoveredAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 28)
+END FUNCTION
+
+' Discovers a real EFI_BLOCK_IO_PROTOCOL device and records its identity/geometry into fixed
+' scratch state for every later UefiBlockDevice.* call to use. Requires the discovered media to be
+' present and to use exactly 512-byte sectors (scope reduction #3 above) -- returns FALSE rather
+' than a partially-usable provider otherwise, matching RFC-0038 Requirement 6.1's own fail-closed
+' spirit for RAMDisk.
+FUNCTION UefiBlockDevice.Discover(systemTable AS UEFI.SystemTable) AS BOOL
+    LET blockIo AS UEFI.BlockIoProtocol = UEFI.BLOCKIO.Discover(systemTable)
+    IF blockIo = 0 THEN
+        RETURN 0
+    END IF
+
+    LET mediaFlags AS U32 = UEFI.BLOCKIO.MediaFlags(blockIo)
+    LET mediaPresent AS U32 = (mediaFlags \ 256) AND 255
+    LET readOnly AS U32 = (mediaFlags \ 16777216) AND 255
+    IF mediaPresent = 0 THEN
+        RETURN 0
+    END IF
+
+    LET blockSize AS U32 = UEFI.BLOCKIO.BlockSize(blockIo)
+    IF blockSize <> 512 THEN
+        RETURN 0
+    END IF
+
+    LET lastBlock AS U64 = UEFI.BLOCKIO.LastBlock(blockIo)
+    LET mediaId AS U32 = UEFI.BLOCKIO.MediaId(blockIo)
+
+    MEMORY.Write64(UefiBlockDeviceStatePointerAddress(), blockIo)
+    MEMORY.Write32(UefiBlockDeviceStateMediaIdAddress(), mediaId)
+    MEMORY.Write64(UefiBlockDeviceStateSectorCountAddress(), lastBlock + 1)
+    IF readOnly = 0 THEN
+        MEMORY.Write32(UefiBlockDeviceStateWritableAddress(), 1)
+    ELSE
+        MEMORY.Write32(UefiBlockDeviceStateWritableAddress(), 0)
+    END IF
+    MEMORY.Write32(UefiBlockDeviceStateDiscoveredAddress(), 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION UefiBlockDevice.IsDiscovered() AS BOOL
+    RETURN MEMORY.Read32(UefiBlockDeviceStateDiscoveredAddress())
+END FUNCTION
+
+FUNCTION UefiBlockDevice.SectorSize() AS U32
+    RETURN 512
+END FUNCTION
+
+FUNCTION UefiBlockDevice.SectorCount() AS U64
+    RETURN MEMORY.Read64(UefiBlockDeviceStateSectorCountAddress())
+END FUNCTION
+
+FUNCTION UefiBlockDevice.IsWritable() AS BOOL
+    RETURN MEMORY.Read32(UefiBlockDeviceStateWritableAddress())
+END FUNCTION
+
+' Requirement 6.1: MUST reject (return FALSE, MUST NOT partially transfer) a request whose
+' startSector + count exceeds SectorCount() -- checked BEFORE the real ReadBlocks call, matching
+' RAMDisk.ReadSectors's own bounds-check-first shape.
+FUNCTION UefiBlockDevice.ReadSectors(startSector AS U64, count AS U32, destination AS MMIOPTR) AS BOOL
+    LET total AS U64 = UefiBlockDevice.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET blockIo AS UEFI.BlockIoProtocol = MEMORY.Read64(UefiBlockDeviceStatePointerAddress())
+    LET mediaId AS U32 = MEMORY.Read32(UefiBlockDeviceStateMediaIdAddress())
+    LET bufferSize AS U64 = countAsU64 * 512
+    LET status AS U64 = blockIo.ReadBlocks(mediaId, startSector, bufferSize, destination)
+    RETURN status = 0
+END FUNCTION
+
+' Requirement 6.1: WriteSectors on a device where IsWritable() is FALSE MUST return FALSE without
+' touching the medium -- checked before ever calling the real WriteBlocks method, matching
+' RAMDisk.WriteSectors's own contract, now genuinely reachable (a real EFI_BLOCK_IO_MEDIA can
+' legitimately be read-only, unlike RAMDisk's always-writable fixed region).
+FUNCTION UefiBlockDevice.WriteSectors(startSector AS U64, count AS U32, source AS MMIOPTR) AS BOOL
+    IF UefiBlockDevice.IsWritable() = 0 THEN
+        RETURN 0
+    END IF
+    LET total AS U64 = UefiBlockDevice.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET blockIo AS UEFI.BlockIoProtocol = MEMORY.Read64(UefiBlockDeviceStatePointerAddress())
+    LET mediaId AS U32 = MEMORY.Read32(UefiBlockDeviceStateMediaIdAddress())
+    LET bufferSize AS U64 = countAsU64 * 512
+    LET status AS U64 = blockIo.WriteBlocks(mediaId, startSector, bufferSize, source)
+    RETURN status = 0
+END FUNCTION
+
+FUNCTION BufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(39321600))   ' 0x2580000, this fixture's own scratch buffer
+END FUNCTION
+
+FUNCTION PrintDigit(systemTable AS UEFI.SystemTable, d AS U64) AS BOOL
+    IF d = 0 THEN
+        systemTable.ConsoleOut.Write("0")
+    ELSE
+        IF d = 1 THEN
+            systemTable.ConsoleOut.Write("1")
+        ELSE
+            IF d = 2 THEN
+                systemTable.ConsoleOut.Write("2")
+            ELSE
+                IF d = 3 THEN
+                    systemTable.ConsoleOut.Write("3")
+                ELSE
+                    IF d = 4 THEN
+                        systemTable.ConsoleOut.Write("4")
+                    ELSE
+                        IF d = 5 THEN
+                            systemTable.ConsoleOut.Write("5")
+                        ELSE
+                            IF d = 6 THEN
+                                systemTable.ConsoleOut.Write("6")
+                            ELSE
+                                IF d = 7 THEN
+                                    systemTable.ConsoleOut.Write("7")
+                                ELSE
+                                    IF d = 8 THEN
+                                        systemTable.ConsoleOut.Write("8")
+                                    ELSE
+                                        systemTable.ConsoleOut.Write("9")
+                                    END IF
+                                END IF
+                            END IF
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION PrintU64(systemTable AS UEFI.SystemTable, value AS U64) AS BOOL
+    IF value >= 10 THEN
+        PrintU64(systemTable, value \ 10)
+    END IF
+    PrintDigit(systemTable, value MOD 10)
+    RETURN 1
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("BLOCKIO PROVIDER START")
+
+    LET discovered AS BOOL = UefiBlockDevice.Discover(systemTable)
+    IF discovered = 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO PROVIDER DISCOVER FAILED")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("BLOCKIO PROVIDER DISCOVERED")
+
+    LET sectorSize AS U32 = UefiBlockDevice.SectorSize()
+    LET sectorCount AS U64 = UefiBlockDevice.SectorCount()
+    LET writable AS BOOL = UefiBlockDevice.IsWritable()
+    LET sectorSizeAsU64 AS U64 = sectorSize
+    systemTable.ConsoleOut.Write("SECTORSIZE=")
+    PrintU64(systemTable, sectorSizeAsU64)
+    systemTable.ConsoleOut.Write(" SECTORCOUNT=")
+    PrintU64(systemTable, sectorCount)
+    systemTable.ConsoleOut.Write(" WRITABLE=")
+    PrintU64(systemTable, writable)
+    systemTable.ConsoleOut.Write(" END")
+
+    IF sectorCount <> 128 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO PROVIDER UNEXPECTED SECTOR COUNT")
+        CPU.HaltForever
+    END IF
+
+    ' Requirement 6.1: out-of-bounds request MUST be rejected, not partially transferred.
+    LET buffer AS MMIOPTR = BufferAddress()
+    LET oobStatus AS BOOL = UefiBlockDevice.ReadSectors(127, 5, buffer)
+    IF oobStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO PROVIDER OOB READ WRONGLY ACCEPTED")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("BLOCKIO PROVIDER OOB READ REJECTED")
+
+    ' Real read through the provider: sector 5 carries build-blockio-test-disk.py's magic pattern.
+    LET readOk AS BOOL = UefiBlockDevice.ReadSectors(5, 1, buffer)
+    IF readOk = 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO PROVIDER READ FAILED")
+        CPU.HaltForever
+    END IF
+    LET b0 AS U8 = MEMORY.Read8(buffer)
+    LET b1 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 1))
+    LET b2 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 2))
+    LET b3 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 3))
+    IF b0 = 65 AND b1 = 82 AND b2 = 67 AND b3 = 79 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO PROVIDER SECTOR5 MAGIC MATCH")
+    ELSE
+        systemTable.ConsoleOut.Write("BLOCKIO PROVIDER SECTOR5 MAGIC NOMATCH")
+    END IF
+
+    ' Real write+read-back through the provider: sector 10, never written at image-build time.
+    MEMORY.Write8(buffer, 90)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 1), 65)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 2), 80)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 3), 33)
+    LET writeOk AS BOOL = UefiBlockDevice.WriteSectors(10, 1, buffer)
+    IF writeOk = 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO PROVIDER WRITE FAILED")
+        CPU.HaltForever
+    END IF
+    MEMORY.Write8(buffer, 0)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 1), 0)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 2), 0)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 3), 0)
+    LET rereadOk AS BOOL = UefiBlockDevice.ReadSectors(10, 1, buffer)
+    IF rereadOk = 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO PROVIDER REREAD FAILED")
+        CPU.HaltForever
+    END IF
+    LET r0 AS U8 = MEMORY.Read8(buffer)
+    LET r1 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 1))
+    LET r2 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 2))
+    LET r3 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 3))
+    IF r0 = 90 AND r1 = 65 AND r2 = 80 AND r3 = 33 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO PROVIDER WRITE READBACK MATCH")
+    ELSE
+        systemTable.ConsoleOut.Write("BLOCKIO PROVIDER WRITE READBACK MISMATCH")
+    END IF
+
+    CPU.MemoryBarrier
+    systemTable.ConsoleOut.Write("BLOCKIO PROVIDER DONE")
+    CPU.HaltForever
+END FUNCTION

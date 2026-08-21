@@ -1,0 +1,174 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' Real hardware proof for RFC-0038's Block I/O binding: discovers a genuine EFI_BLOCK_IO_PROTOCOL
+' handle under QEMU/OVMF (no RAM-preload trick), reads a known sector from the attached test disk,
+' and performs a real write+read-back round trip against a different, deliberately unused sector.
+'
+' UEFI.BLOCKIO.Discover is a single LocateProtocol call (matching UEFI.GOP.Discover's own
+' documented single-handle scope) -- it returns whichever EFI_BLOCK_IO_PROTOCOL handle firmware
+' hands back first. The QEMU harness (run-uefi-hello-with-blockio-disk.sh) attaches TWO real block
+' devices: the boot media itself (a `fat:` directory OVMF boots BOOTX64.EFI from, also a real
+' Block I/O handle once enumerated) and a dedicated virtio-blk disk built by
+' build-blockio-test-disk.py with a known magic pattern at sector 5. This fixture does not assume
+' which one gets discovered -- it reports the magic-sector check as MATCH or NOMATCH either way,
+' honestly, rather than asserting a specific outcome the binding itself does not control.
+
+FUNCTION BufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(39321600))   ' 0x2580000, this fixture's own scratch buffer
+END FUNCTION
+
+' This dialect has no ELSEIF -- nested IF/ELSE only (confirmed: a flat ELSEIF chain fails to
+' parse, "expected '=' after variable name").
+FUNCTION PrintDigit(systemTable AS UEFI.SystemTable, d AS U64) AS BOOL
+    IF d = 0 THEN
+        systemTable.ConsoleOut.Write("0")
+    ELSE
+        IF d = 1 THEN
+            systemTable.ConsoleOut.Write("1")
+        ELSE
+            IF d = 2 THEN
+                systemTable.ConsoleOut.Write("2")
+            ELSE
+                IF d = 3 THEN
+                    systemTable.ConsoleOut.Write("3")
+                ELSE
+                    IF d = 4 THEN
+                        systemTable.ConsoleOut.Write("4")
+                    ELSE
+                        IF d = 5 THEN
+                            systemTable.ConsoleOut.Write("5")
+                        ELSE
+                            IF d = 6 THEN
+                                systemTable.ConsoleOut.Write("6")
+                            ELSE
+                                IF d = 7 THEN
+                                    systemTable.ConsoleOut.Write("7")
+                                ELSE
+                                    IF d = 8 THEN
+                                        systemTable.ConsoleOut.Write("8")
+                                    ELSE
+                                        systemTable.ConsoleOut.Write("9")
+                                    END IF
+                                END IF
+                            END IF
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 1
+END FUNCTION
+
+' Recursive decimal printer (most-significant digit first) built entirely from string LITERALS --
+' no dynamic STRING construction needed. Recursion under this freestanding backend was already
+' confirmed working under real QEMU by RFC-0040 Phase J before being relied on here.
+FUNCTION PrintU64(systemTable AS UEFI.SystemTable, value AS U64) AS BOOL
+    IF value >= 10 THEN
+        PrintU64(systemTable, value \ 10)
+    END IF
+    PrintDigit(systemTable, value MOD 10)
+    RETURN 1
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("BLOCKIO DISK START")
+
+    LET blockIo AS UEFI.BlockIoProtocol = UEFI.BLOCKIO.Discover(systemTable)
+    IF blockIo = 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO DISK UNAVAILABLE")
+        CPU.HaltForever
+    END IF
+
+    LET mediaId AS U32 = UEFI.BLOCKIO.MediaId(blockIo)
+    LET mediaFlags AS U32 = UEFI.BLOCKIO.MediaFlags(blockIo)
+    LET mediaPresent AS U32 = (mediaFlags \ 256) AND 255
+    LET blockSize AS U32 = UEFI.BLOCKIO.BlockSize(blockIo)
+    LET lastBlock AS U64 = UEFI.BLOCKIO.LastBlock(blockIo)
+
+    LET mediaIdAsU64 AS U64 = mediaId
+    LET mediaFlagsAsU64 AS U64 = mediaFlags
+    LET blockSizeAsU64 AS U64 = blockSize
+    systemTable.ConsoleOut.Write("MEDIAID=")
+    PrintU64(systemTable, mediaIdAsU64)
+    systemTable.ConsoleOut.Write(" FLAGS=")
+    PrintU64(systemTable, mediaFlagsAsU64)
+    systemTable.ConsoleOut.Write(" BLOCKSIZE=")
+    PrintU64(systemTable, blockSizeAsU64)
+    systemTable.ConsoleOut.Write(" LASTBLOCK=")
+    PrintU64(systemTable, lastBlock)
+    systemTable.ConsoleOut.Write(" END")
+
+    IF mediaPresent = 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO DISK NO MEDIA")
+        CPU.HaltForever
+    END IF
+    IF blockSize <> 512 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO DISK UNEXPECTED BLOCK SIZE")
+        CPU.HaltForever
+    END IF
+    IF lastBlock = 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO DISK ZERO CAPACITY")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("BLOCKIO DISK MEDIA OK")
+
+    ' Real read: sector 5 of whichever device firmware discovered. "ARCO" is the magic pattern's
+    ' first four bytes (build-blockio-test-disk.py); checked byte-by-byte, not via STRING (raw
+    ' disk bytes are not a UTF-16 buffer).
+    LET buffer AS MMIOPTR = BufferAddress()
+    LET readStatus AS U64 = blockIo.ReadBlocks(mediaId, 5, 512, buffer)
+    IF readStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO DISK READ FAILED")
+        CPU.HaltForever
+    END IF
+    LET b0 AS U8 = MEMORY.Read8(buffer)
+    LET b1 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 1))
+    LET b2 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 2))
+    LET b3 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 3))
+    IF b0 = 65 AND b1 = 82 AND b2 = 67 AND b3 = 79 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO DISK SECTOR5 MAGIC MATCH")
+    ELSE
+        systemTable.ConsoleOut.Write("BLOCKIO DISK SECTOR5 MAGIC NOMATCH")
+    END IF
+
+    ' Real write+read-back: sector 10, a pattern build-blockio-test-disk.py never writes, proving
+    ' WriteBlocks for real (not just ReadBlocks). Deliberately far from sectors 0-5.
+    MEMORY.Write8(buffer, 90)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 1), 65)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 2), 80)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 3), 33)
+    LET writeStatus AS U64 = blockIo.WriteBlocks(mediaId, 10, 512, buffer)
+    IF writeStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO DISK WRITE FAILED")
+        CPU.HaltForever
+    END IF
+
+    ' Zero the in-memory buffer before re-reading so a stale copy can't fake a match.
+    MEMORY.Write8(buffer, 0)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 1), 0)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 2), 0)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 3), 0)
+    LET rereadStatus AS U64 = blockIo.ReadBlocks(mediaId, 10, 512, buffer)
+    IF rereadStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO DISK REREAD FAILED")
+        CPU.HaltForever
+    END IF
+    LET r0 AS U8 = MEMORY.Read8(buffer)
+    LET r1 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 1))
+    LET r2 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 2))
+    LET r3 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 3))
+    IF r0 = 90 AND r1 = 65 AND r2 = 80 AND r3 = 33 THEN
+        systemTable.ConsoleOut.Write("BLOCKIO DISK WRITE READBACK MATCH")
+    ELSE
+        systemTable.ConsoleOut.Write("BLOCKIO DISK WRITE READBACK MISMATCH")
+    END IF
+
+    CPU.MemoryBarrier
+    systemTable.ConsoleOut.Write("BLOCKIO DISK DONE")
+    CPU.HaltForever
+END FUNCTION

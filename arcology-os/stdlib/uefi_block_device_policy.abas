@@ -1,0 +1,160 @@
+' UEFI-backed BlockDevice Provider (RFC-0038 Section 6.1/6.2), backed by a REAL discovered
+' EFI_BLOCK_IO_PROTOCOL device -- the hardware-side follow-on to RFC-0038 Section 17.5's stop
+' condition, closed at the compiler-binding level in
+' .agents/reports/aps-blockio-discovery-binding.md, and proven against a real attached QEMU disk
+' in .agents/reports/aps-blockio-disk-provider.md.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+' --- Documented deviations, stated up front, same spirit as block_device_policy.abas's own
+' header note. ---
+'
+' 1. Same "concrete functions instead of an abstract BlockDevice interface value" deviation
+'    RAMDisk.* already documents -- this backend has no runtime-polymorphic dispatch at all.
+'
+' 2. A SECOND, NEW deviation this provider needed that RAMDisk.* did not: the discovered
+'    UEFI.BlockIoProtocol value itself cannot be persisted across calls as a still-typed value the
+'    way mediaId/blockSize/sectorCount can. What CAN be persisted -- and what genuinely works,
+'    confirmed directly against real generated x86-64 before relying on it -- is the raw protocol
+'    pointer as a plain U64, RELOADED and RE-DECLARED with an explicit `AS UEFI.BlockIoProtocol`
+'    type annotation in each function that needs to call a real protocol method. This works
+'    because this compiler's field-chain resolution (src/compiler/fission.cpp) keys off a
+'    variable's DECLARED type (tracked per-function in a name->type map populated by every typed
+'    LET, not only function parameters), not off whether the variable literally is a parameter --
+'    an is_method call on ANY local variable carrying an explicit UEFI.* type annotation resolves
+'    through the same generic CallExternal path a genuine parameter would. Confirmed in generated
+'    x86-64: `call [r11+0x18]`, ReadBlocks's own registered offset, appears identically whether
+'    blockIo arrives as a parameter or is reloaded from memory and re-annotated. (An earlier,
+'    narrower reading of this constraint -- assuming only literal parameters work -- is corrected
+'    here; not a defect in the earlier binding work, just an incomplete first read of the
+'    resolution code before this provider needed the fuller picture.)
+'
+' 3. `UefiBlockDevice.Discover` requires the discovered media's own BlockSize to be exactly 512.
+'    UEFI.BLOCKIO.MediaFlags only exposes the packed RemovableMedia/MediaPresent/LogicalPartition/
+'    ReadOnly word (uefi-bindings.md's own documented scope reduction: no single-byte
+'    displacement-addressed encoder primitive exists, so a whole packed word is read instead of
+'    one bit) -- this provider extracts the bits it needs from that word via ordinary SHR/AND.
+'
+' 4. UEFI.BLOCKIO.DISCOVER is a single LocateProtocol call (matching UEFI.GOP.DISCOVER's own
+'    documented single-handle scope): it returns whichever EFI_BLOCK_IO_PROTOCOL handle firmware
+'    hands back first, not necessarily any particular disk a caller has in mind. This provider
+'    does not attempt multi-handle enumeration/selection -- callers that need a SPECIFIC device
+'    among several need a future, separate enumeration binding, out of scope here.
+
+FUNCTION UefiBlockDeviceStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(37748736))   ' 0x2400000, this provider's own scratch state
+END FUNCTION
+
+' State layout, all within one page: blockIo pointer (U64, +0), mediaId (U32, +8), sectorCount
+' (U64, +16), writable flag (U32, +24), discovered flag (U32, +28).
+FUNCTION UefiBlockDeviceStatePointerAddress() AS MMIOPTR
+    RETURN UefiBlockDeviceStateAddress()
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateMediaIdAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 8)
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateSectorCountAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 16)
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateWritableAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 24)
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateDiscoveredAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 28)
+END FUNCTION
+
+' Discovers a real EFI_BLOCK_IO_PROTOCOL device and records its identity/geometry into fixed
+' scratch state for every later UefiBlockDevice.* call to use. Requires the discovered media to be
+' present and to use exactly 512-byte sectors (scope reduction #3 above) -- returns FALSE rather
+' than a partially-usable provider otherwise, matching RFC-0038 Requirement 6.1's own fail-closed
+' spirit for RAMDisk.
+FUNCTION UefiBlockDevice.Discover(systemTable AS UEFI.SystemTable) AS BOOL
+    LET blockIo AS UEFI.BlockIoProtocol = UEFI.BLOCKIO.Discover(systemTable)
+    IF blockIo = 0 THEN
+        RETURN 0
+    END IF
+
+    LET mediaFlags AS U32 = UEFI.BLOCKIO.MediaFlags(blockIo)
+    LET mediaPresent AS U32 = (mediaFlags \ 256) AND 255
+    LET readOnly AS U32 = (mediaFlags \ 16777216) AND 255
+    IF mediaPresent = 0 THEN
+        RETURN 0
+    END IF
+
+    LET blockSize AS U32 = UEFI.BLOCKIO.BlockSize(blockIo)
+    IF blockSize <> 512 THEN
+        RETURN 0
+    END IF
+
+    LET lastBlock AS U64 = UEFI.BLOCKIO.LastBlock(blockIo)
+    LET mediaId AS U32 = UEFI.BLOCKIO.MediaId(blockIo)
+
+    MEMORY.Write64(UefiBlockDeviceStatePointerAddress(), blockIo)
+    MEMORY.Write32(UefiBlockDeviceStateMediaIdAddress(), mediaId)
+    MEMORY.Write64(UefiBlockDeviceStateSectorCountAddress(), lastBlock + 1)
+    IF readOnly = 0 THEN
+        MEMORY.Write32(UefiBlockDeviceStateWritableAddress(), 1)
+    ELSE
+        MEMORY.Write32(UefiBlockDeviceStateWritableAddress(), 0)
+    END IF
+    MEMORY.Write32(UefiBlockDeviceStateDiscoveredAddress(), 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION UefiBlockDevice.IsDiscovered() AS BOOL
+    RETURN MEMORY.Read32(UefiBlockDeviceStateDiscoveredAddress())
+END FUNCTION
+
+FUNCTION UefiBlockDevice.SectorSize() AS U32
+    RETURN 512
+END FUNCTION
+
+FUNCTION UefiBlockDevice.SectorCount() AS U64
+    RETURN MEMORY.Read64(UefiBlockDeviceStateSectorCountAddress())
+END FUNCTION
+
+FUNCTION UefiBlockDevice.IsWritable() AS BOOL
+    RETURN MEMORY.Read32(UefiBlockDeviceStateWritableAddress())
+END FUNCTION
+
+' Requirement 6.1: MUST reject (return FALSE, MUST NOT partially transfer) a request whose
+' startSector + count exceeds SectorCount() -- checked BEFORE the real ReadBlocks call, matching
+' RAMDisk.ReadSectors's own bounds-check-first shape.
+FUNCTION UefiBlockDevice.ReadSectors(startSector AS U64, count AS U32, destination AS MMIOPTR) AS BOOL
+    LET total AS U64 = UefiBlockDevice.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET blockIo AS UEFI.BlockIoProtocol = MEMORY.Read64(UefiBlockDeviceStatePointerAddress())
+    LET mediaId AS U32 = MEMORY.Read32(UefiBlockDeviceStateMediaIdAddress())
+    LET bufferSize AS U64 = countAsU64 * 512
+    LET status AS U64 = blockIo.ReadBlocks(mediaId, startSector, bufferSize, destination)
+    RETURN status = 0
+END FUNCTION
+
+' Requirement 6.1: WriteSectors on a device where IsWritable() is FALSE MUST return FALSE without
+' touching the medium -- checked before ever calling the real WriteBlocks method, matching
+' RAMDisk.WriteSectors's own contract, now genuinely reachable (a real EFI_BLOCK_IO_MEDIA can
+' legitimately be read-only, unlike RAMDisk's always-writable fixed region).
+FUNCTION UefiBlockDevice.WriteSectors(startSector AS U64, count AS U32, source AS MMIOPTR) AS BOOL
+    IF UefiBlockDevice.IsWritable() = 0 THEN
+        RETURN 0
+    END IF
+    LET total AS U64 = UefiBlockDevice.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET blockIo AS UEFI.BlockIoProtocol = MEMORY.Read64(UefiBlockDeviceStatePointerAddress())
+    LET mediaId AS U32 = MEMORY.Read32(UefiBlockDeviceStateMediaIdAddress())
+    LET bufferSize AS U64 = countAsU64 * 512
+    LET status AS U64 = blockIo.WriteBlocks(mediaId, startSector, bufferSize, source)
+    RETURN status = 0
+END FUNCTION

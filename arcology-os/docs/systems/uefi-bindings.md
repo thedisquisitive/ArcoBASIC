@@ -176,9 +176,20 @@ types), so it cannot produce false positives outside the systems surface it is s
   `OutputString`.
 - Does not inject the implicit `This` argument into A-MIR (see above -- WP-008).
 - Does not produce UTF-16 constants (WP-007).
-- Does not validate field chains through variables that are not themselves a function parameter
-  (e.g. a local variable reassigned from a parameter) -- only direct parameter-rooted chains are
-  checked, matching WP-004's `CallExternal` classification scope.
+- The compile-time DIAGNOSTIC check (`Parser::validate_uefi_field_chain`, giving a named-field
+  error at the call site) only fires for chains rooted at a declared function parameter --
+  `current_function_parameter_types_` tracks parameters only, not arbitrary locals.
+  **Correction, found while building the Block I/O hardware provider
+  (`.agents/reports/aps-blockio-disk-provider.md`): this does NOT mean actual CODEGEN requires a
+  parameter.** `CallExternal`'s own classification in `src/compiler/fission.cpp` also accepts a
+  local variable whose declared type (tracked per-function in a separate `types_` map, populated
+  by every typed `LET`, not only parameters) starts with `"UEFI."` -- a local reloaded from memory
+  and re-declared with an explicit `AS UEFI.SomeType` annotation resolves and lowers identically
+  to a genuine parameter, confirmed directly in generated machine code
+  (`stdlib/uefi_block_device_policy.abas` relies on exactly this). The practical effect of the
+  narrower parser-level check is only that such a call skips the nice named-field pre-flight
+  diagnostic -- an unbound field on a locally-retyped chain still fails, just later, at
+  `CallExternal` codegen (`"external call field ... is not bound on ..."`), not at parse time.
 
 The binding registry also contains minimal GOP mode metadata for the framebuffer phase:
 `UEFI.GraphicsOutputProtocol.Mode`, `UEFI.GraphicsOutputMode.FrameBufferBase` (`PHYSICALPTR`),
