@@ -17,10 +17,17 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
     grep -v '^#PROFILE\|^#TARGET\|^#RUNTIME' "$ROOT/stdlib/arcfs_policy.abas"
 } > "$TMP_ROOT/combined.abas"
 
+# RFC-0040 Section 11.1 (implemented in a later increment, see aps-arcfs-extent-tree-reflink.md)
+# replaced the fixed-list extent functions this list originally named
+# (ArcFSAllocateOneSector/ArcFSWriteExtentListRecord/ArcFSBuildAndWriteExtentList/
+# ArcFSLoadExtentListIntoPool/ArcFSExtentListContainsSector/ArcFSExtentListChunkAt/
+# ArcFSExtentListsOverlap, all genuinely removed, not just renamed) with a real Extent Tree --
+# updated here to their real successors, the same "grep every tests/systems/*.sh for the old
+# name too" discipline this project's own prior renames already established.
 for entry in ArcFSMaxFileChunks ArcFSSlotSizeBytes ArcFSChunkTouchedGet ArcFSChunkTouchedSet \
-             ArcFSAllocateOneSector ArcFSWriteExtentListRecord ArcFSBuildAndWriteExtentList \
-             ArcFSLoadExtentListIntoPool ArcFSExtentListContainsSector ArcFSExtentListChunkAt \
-             ArcFSExtentListsOverlap ArcFSEnsurePrivateSlot ArcFS.HandleWrite ArcFS.HandleRead \
+             ArcFSGatherSortedExtentEntries ArcFSWriteOneExtentLeafNode ArcFSBuildExtentTree \
+             ArcFSExtentTreeLoadDataSlotIntoRow ArcFSExtentTreeContainsSectorForSlot ArcFSExtentTreeChunkAt \
+             ArcFSDataSlotsOverlap ArcFSEnsurePrivateSlot ArcFS.HandleWrite ArcFS.HandleRead \
              ArcFS.Resize ArcFSWriteOneLeafNode ArcFSPopulateObjectRow ArcFSLoadObjects \
              ArcFSTreeContainsSector ArcFSScanGeneration ArcFS.SnapshotReadFile ArcFS.Reflink \
              ArcFS.FormatVolume ArcFS.PrepareCommit ArcFS.MountImage ArcFS.ReclaimGeneration; do
