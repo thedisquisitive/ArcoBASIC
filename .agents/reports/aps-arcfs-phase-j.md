@@ -167,15 +167,95 @@ really collected.
 
 ## Remaining activation gate
 
-- **Namespace Tree and Attribute Tree remain flat arrays**, the next natural replication of this
-  phase's own proven pattern, not yet begun.
+- **Namespace Tree is now a real B+tree too (see Addendum below); Attribute Tree remains a flat
+  array**, deferred to Phase L (persistent attributes), which is the natural place to redesign it
+  since it has no real persistent design at all yet (Phase D's own scope reduction).
 - **In-memory representation is not yet the dynamic, unbounded LRU cache RFC-0040 Section 9.2
-  literally specifies** -- the working set stays capped at `ArcFSMaxObjects()` (64), Phase A's own
-  original scope reduction, still in force.
+  literally specifies** -- the working set stays capped at `ArcFSMaxObjects()` (64) and
+  `ArcFSMaxNamespaceRows()` (128), Phase A's own original scope reduction, still in force for both
+  trees.
 - **Key-guided descent through internal nodes is not yet implemented** -- every reader walks every
   child. Correct, O(node count) rather than O(log n); the routing keys are already real and
   correctly computed, so this is additive when it becomes worth doing.
-- **Phase K (extents/sparse files/on-disk reflink sharing), Phase L (persistent attributes), and
-  Phase M (full health/repair) remain ahead**, in that order, per RFC-0040 Section 16's own
-  dependency chain. This report covers Phase J (Object Tree only) only; RFC-0040's own `Status`
-  remains `Draft`.
+- **Phase K (extents/sparse files) is implemented** (see `.agents/reports/aps-arcfs-phase-k.md`);
+  **Phase L (persistent attributes) and Phase M (full health/repair) remain ahead**, per RFC-0040
+  Section 16's own dependency chain. RFC-0040's own `Status` remains `Draft`.
+
+## Addendum (2026-08-20): the Namespace Tree, finishing this phase
+
+RFC-0040 Section 9 names three trees (Object, Namespace, Attribute); this phase originally
+delivered only the Object Tree, explicitly naming the Namespace Tree as "the next natural
+replication of this phase's own proven pattern" above. It is now delivered too, closing that gap
+-- Phase J is complete as far as this RFC's own two GROWABLE-METADATA trees go (the Attribute Tree
+has no real persistent design at all yet, independent of this phase's own scope, and stays
+deferred to Phase L per RFC-0040 Section 16's own dependency ordering).
+
+**What's new.** A namespace leaf entry (56 bytes: `parentOid`+`name`(32)+`nameLength`+`childOid`,
+the same shape the in-memory row already used) gets its own leaf writer/walker
+(`ArcFSWriteOneNamespaceLeafNode`, `ArcFSNamespaceTreeCollectAllEntriesInto`/`Tolerant`,
+`ArcFSNamespaceTreeContainsSector`) -- but internal nodes are NOT duplicated: `ArcFSWriteOneInternalNode`'s
+own (key, childSector) pair layout was already written generically (it takes a raw `levelSource`
+pointer, nothing object-specific), so the Namespace Tree's own internal levels are built and walked
+by the literal SAME function and fanout constant, unchanged. Only the leaf level needed a second
+implementation, exactly the pattern Phase K already used for its own extent-list functions
+alongside the Object Tree's leaf functions.
+
+**A real, load-bearing difference the Object Tree never surfaced.** The Namespace Tree can be
+GENUINELY EMPTY -- a freshly formatted volume has zero namespace entries (root itself has no
+namespace record; it IS the implicit root), and removing every remaining entry returns to this
+same state. The Object Tree never hits this (root is always at least one active object), so
+Phase J's own design never had to invent a sentinel for "no tree at all." This increment does:
+`namespaceRoot = 0` is the explicit sentinel throughout, checked via `namespaceCount = 0` (or the
+gather/build function's own count) before `namespaceRoot` is EVER treated as a real sector --
+`ArcFS.FormatVolume` now writes it explicitly rather than a leftover placeholder value, and every
+consumer (`ArcFSLoadNamespace`, `ArcFS.PrepareCommit`, `ArcFSSnapshotFindNamespaceRecord`,
+`ArcFSGenerationContainsSector`, `ArcFSScanGeneration`) short-circuits on it the same way.
+
+**A necessary consequence of pulling the Namespace Tree out of the metadata range check.**
+`ArcFSGenerationMetadataRangeContains`'s own contiguous-range reachability check had already been
+narrowed once, in Phase J proper, to exclude the Object Tree (`[namespaceRoot, checkpointSector]`,
+relying on namespace records + bitmap + checkpoint staying a contiguous append run). Making the
+Namespace Tree scattered/reusable too breaks that same assumption one field further -- so the
+range narrows AGAIN, down to just `[allocationBitmapSector, checkpointSector]`, the one remaining
+genuinely-contiguous pair (`ArcFS.PrepareCommit` still allocates them back to back). This required
+widening the `ArcFSPeekStateAddress` scratch block by one field (`allocationBitmapSector`, captured
+by `ArcFSPeekCheckpoint`) -- safe, since the address gap after it already had a full unused page.
+`ArcFSGenerationContainsSector` now checks the Object Tree AND the Namespace Tree explicitly (via
+each tree's own `ContainsSector` function), the same widening discipline Phase I first established
+for data extents and Phase J itself repeated for tree nodes, now applied a third time.
+
+**The scrubber's Pass 2/3 were rewritten to consume a real tree walk**, exactly mirroring how
+Phase J's own Pass 1 already replaced a flat per-record scan with `ArcFSTreeCollectAllEntriesTolerant`.
+Pass 3's own relaxation ALGORITHM, and the 16-byte `[parentOid][childOid]` scratch array it reads,
+are completely UNCHANGED -- only where that array's contents come from changed, from a direct
+per-sector read to a defect-tolerant tree walk reshaped into the same layout. Both passes are now
+bounded by the walk's own collected count, not the checkpoint's claimed count, matching the
+"bounded by collected, not claimed" discipline Pass 1/4 already established.
+
+**One function genuinely removed**, matching this phase's own precedent for
+`ArcFSWriteObjectRecord`/`ArcFSLoadOneObject`: `ArcFSWriteNamespaceRecord` (the old flat
+per-sector-record writer) is gone, replaced by `ArcFSWriteOneNamespaceLeafNode`.
+
+**Real QEMU/OVMF proof** (`aps-arcfs-namespace-tree.abas`, 7 steps): format+mount against a
+genuinely empty namespace -- the FIRST real exercise of the `namespaceRoot=0` short-circuit under
+QEMU, since no fixture in this chain had previously used a tree-based namespace loader at all
+(every prior fixture's own "format, mount, resolve root" first step technically exercised this
+code path, just never with tree-walking logic behind it until now). 6 files under root force a
+real multi-leaf, multi-level Namespace Tree (capacity 4, same forcing number Phase J's own Object
+Tree fixture used). Every file resolves with correct, distinct content after a real commit and
+remount. `GetHealthState()` reports Healthy through the entirely new tree-sourced Pass 2/3 path.
+Committing again with no further change supersedes the WHOLE namespace tree, and
+`ArcFS.IsSectorReachable` correctly reports the old namespace root unreachable -- the same "follows
+an entire superseded tree, not one sector" proof Phase J's own report already established for the
+Object Tree, now repeated for the Namespace Tree specifically. Real reclamation frees that
+superseded tree with every file still intact afterward. Orphaning one file (`ArcFS.Remove`, which
+deactivates only the namespace row, leaving the object alive -- Phase F's own established
+mechanism) correctly flips the scrub to Degraded (1), the direct proof that orphan detection still
+fires when its relaxation input comes from a real tree walk instead of the old flat scan.
+
+Passed on the FIRST real QEMU attempt. A negative control (flipping the unreachability assertion
+to expect the wrong outcome) confirmed the fixture correctly reports `FAIL 1` rather than silently
+passing. Deterministic across 3 repeated runs. Full suite re-run clean alongside the new
+`arcfs_namespace_tree_smoke` test; no stale structural-check entries found in any other smoke test
+(only the removed `ArcFSWriteNamespaceRecord` and the retired `ArcFSLoadOneNamespaceEntry`, neither
+of which any other script's own entry list ever named).
