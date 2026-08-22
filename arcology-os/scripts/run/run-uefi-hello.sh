@@ -51,6 +51,9 @@ if [ ! -f "$EFI_FILE" ]; then
     exit 2
 fi
 
+# shellcheck source=./_qemu_stream_common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_qemu_stream_common.sh"
+
 # A directory served as a virtual FAT filesystem via QEMU's built-in `fat:` driver is an
 # "equivalent test image" to a real FAT-formatted partition (Packet WP-010 explicitly allows
 # either) and needs no extra tools (mtools/mkfs.vfat) beyond QEMU itself.
@@ -68,7 +71,7 @@ cp "$EFI_FILE" "$BOOT_DIR/EFI/BOOT/BOOTX64.EFI"
 # address, now confirmed as a real ceiling on the whole default RAM size). RFC-0042 Phase Q's own
 # production-scale ArcFS capacities do not fit inside that default -- this is a deliberate,
 # documented infrastructure change, not an incidental bump; see .agents/reports/aps-qemu-ram-ceiling.md.
-OUTPUT="$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
+qemu_run_and_check "$TIMEOUT_SECONDS" "$EXPECTED" "$QEMU_BIN" \
     -bios "$OVMF_FD" \
     -m 512 \
     -drive file="fat:rw:$BOOT_DIR",format=raw \
@@ -77,14 +80,5 @@ OUTPUT="$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
     -display none \
     -serial stdio \
     -monitor none \
-    -no-reboot 2>/dev/null || true)"
-
-if printf '%s' "$OUTPUT" | grep -aqF "$EXPECTED"; then
-    echo "PASS: $EXPECTED"
-    exit 0
-fi
-
-echo "FAIL: expected output not found: $EXPECTED" >&2
-echo "--- captured console output (last 4000 bytes) ---" >&2
-printf '%s' "$OUTPUT" | tail -c 4000 >&2
-exit 1
+    -no-reboot
+exit $?

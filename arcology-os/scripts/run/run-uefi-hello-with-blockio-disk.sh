@@ -63,6 +63,9 @@ if [ ! -f "$DISK_IMAGE" ]; then
     exit 2
 fi
 
+# shellcheck source=./_qemu_stream_common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_qemu_stream_common.sh"
+
 BOOT_DIR="$(mktemp -d)"
 trap 'rm -rf "$BOOT_DIR"' EXIT
 mkdir -p "$BOOT_DIR/EFI/BOOT"
@@ -87,7 +90,7 @@ cp "$EFI_FILE" "$BOOT_DIR/EFI/BOOT/BOOTX64.EFI"
 # empirically insufficient for RFC-0042 Phase Q's production-scale ArcFS capacities (-nodefaults
 # above suppresses default DEVICES, not the default RAM size, so this is still needed here); see
 # run-uefi-hello.sh's own header note and .agents/reports/aps-qemu-ram-ceiling.md for the full story.
-OUTPUT="$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
+qemu_run_and_check "$TIMEOUT_SECONDS" "$EXPECTED" "$QEMU_BIN" \
     -nodefaults \
     -bios "$OVMF_FD" \
     -m 512 \
@@ -100,14 +103,5 @@ OUTPUT="$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
     -display none \
     -serial stdio \
     -monitor none \
-    -no-reboot 2>/dev/null || true)"
-
-if printf '%s' "$OUTPUT" | grep -aqF "$EXPECTED"; then
-    echo "PASS: $EXPECTED"
-    exit 0
-fi
-
-echo "FAIL: expected output not found: $EXPECTED" >&2
-echo "--- captured console output (last 4000 bytes) ---" >&2
-printf '%s' "$OUTPUT" | tail -c 4000 >&2
-exit 1
+    -no-reboot
+exit $?

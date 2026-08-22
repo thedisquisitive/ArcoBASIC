@@ -20,12 +20,15 @@ if [ ! -f "$IMAGE_FILE" ]; then
     exit 2
 fi
 
+# shellcheck source=./_qemu_stream_common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_qemu_stream_common.sh"
+
 # -m 512: explicit, generous RAM, matching every other harness script in this directory now (see
 # run-uefi-hello.sh's own header note and .agents/reports/aps-qemu-ram-ceiling.md) -- QEMU's own
 # default (no -m flag) is 128 MiB, confirmed empirically insufficient for RFC-0042 Phase Q's
 # production-scale ArcFS capacities. Kept consistent here too even though this harness's own
 # existing artifact doesn't need it yet, so every script in this directory shares one RAM budget.
-OUTPUT=$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
+qemu_run_and_check "$TIMEOUT_SECONDS" "$EXPECTED" "$QEMU_BIN" \
     -bios "$OVMF_FD" \
     -m 512 \
     -drive "file=$IMAGE_FILE,format=raw" \
@@ -34,14 +37,5 @@ OUTPUT=$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
     -display none \
     -serial stdio \
     -monitor none \
-    -no-reboot 2>/dev/null || true)
-
-if printf '%s' "$OUTPUT" | grep -aqF "$EXPECTED"; then
-    echo "PASS: $EXPECTED"
-    exit 0
-fi
-
-echo "FAIL: expected output not found: $EXPECTED" >&2
-echo "--- captured console output (last 4000 bytes) ---" >&2
-printf '%s' "$OUTPUT" | tail -c 4000 >&2
-exit 1
+    -no-reboot
+exit $?

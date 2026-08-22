@@ -64,6 +64,9 @@ if [ ! -f "$IMAGE_FILE" ]; then
     exit 2
 fi
 
+# shellcheck source=./_qemu_stream_common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_qemu_stream_common.sh"
+
 # -nodefaults: without it, QEMU's default "pc" machine type auto-adds an empty IDE CD-ROM drive
 # that also presents a real EFI_BLOCK_IO_PROTOCOL handle, the same reason
 # run-uefi-hello-with-blockio-disk.sh already needs it -- not load-bearing for THIS harness's own
@@ -71,7 +74,7 @@ fi
 # directory. qemu-xhci: a real USB 3 host controller; usb-storage attached to it is what makes
 # OVMF's own USB Mass Storage Class driver bind to this image at all, instead of it being invisible
 # to firmware's own boot-device enumeration.
-OUTPUT="$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
+qemu_run_and_check "$TIMEOUT_SECONDS" "$EXPECTED" "$QEMU_BIN" \
     -nodefaults \
     -bios "$OVMF_FD" \
     -m 512 \
@@ -83,14 +86,5 @@ OUTPUT="$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
     -display none \
     -serial stdio \
     -monitor none \
-    -no-reboot 2>/dev/null || true)"
-
-if printf '%s' "$OUTPUT" | grep -aqF "$EXPECTED"; then
-    echo "PASS: $EXPECTED"
-    exit 0
-fi
-
-echo "FAIL: expected output not found: $EXPECTED" >&2
-echo "--- captured console output (last 4000 bytes) ---" >&2
-printf '%s' "$OUTPUT" | tail -c 4000 >&2
-exit 1
+    -no-reboot
+exit $?
