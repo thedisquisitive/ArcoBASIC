@@ -49,6 +49,15 @@ inline std::optional<UefiType> lookup_uefi_type(const std::string& name) {
             "UEFI.SystemTable",
             120,
             {
+                // EFI_SYSTEM_TABLE.ConIn (offset 0x30, between Hdr+FirmwareVendor+FirmwareRevision
+                // and ConsoleOutHandle/ConOut) -- RFC-0007's own real keyboard-input prerequisite.
+                // Verified against the same standard EDK2 EFI_SYSTEM_TABLE layout ConsoleOut's own
+                // already-proven 0x40 offset and BootServices' own already-proven 0x60 offset both
+                // come from (MdePkg/Include/Uefi/UefiSpec.h) -- Hdr(24,0x00) + FirmwareVendor(8,
+                // 0x18) + FirmwareRevision(4+4 pad,0x20) + ConsoleInHandle(8,0x28) + ConIn(8,0x30) +
+                // ConsoleOutHandle(8,0x38) + ConOut(8,0x40): the existing 0x40 offset is only
+                // consistent with this exact layout, cross-checking this new field's own offset.
+                UefiField{"ConsoleIn", "ConIn", 0x30, "UEFI.SimpleTextInputProtocol", false, false, ""},
                 UefiField{"ConsoleOut", "ConOut", 0x40, "UEFI.SimpleTextOutputProtocol", false, false, ""},
                 UefiField{"BootServices", "BootServices", 0x60, "UEFI.BootServices", false, false, ""},
             },
@@ -140,6 +149,25 @@ inline std::optional<UefiType> lookup_uefi_type(const std::string& name) {
             80,
             {
                 UefiField{"Write", "OutputString", 0x08, "", true, true, "U64"},
+            },
+        };
+    }
+    // EFI_SIMPLE_TEXT_INPUT_PROTOCOL (MdePkg/Include/Protocol/SimpleTextIn.h), RFC-0007's own real
+    // keyboard-input prerequisite. Natural C alignment, 24 bytes: Reset(function ptr,0),
+    // ReadKeyStroke(function ptr,8), WaitForKey(EFI_EVENT,16). ReadKeyStroke(This, Key*) is a real
+    // protocol method (implicit This, one explicit output-pointer argument) -- the exact same
+    // shape ConsoleOut.Write's own already-proven OutputString(This, String*) call uses, so it
+    // needs no new calling-convention codegen, matching every other UEFI method binding in this
+    // table. Returns EFI_NOT_READY (a real, expected status, not an error) when no keystroke is
+    // currently buffered -- callers poll rather than block, matching this backend's own
+    // established "no blocking primitives, callers loop" precedent (e.g. UefiBlockDevice.* itself
+    // never blocks on I/O completion either).
+    if (name == "UEFI.SimpleTextInputProtocol") {
+        return UefiType{
+            "UEFI.SimpleTextInputProtocol",
+            24,
+            {
+                UefiField{"ReadKeyStroke", "ReadKeyStroke", 0x08, "", true, true, "U64"},
             },
         };
     }

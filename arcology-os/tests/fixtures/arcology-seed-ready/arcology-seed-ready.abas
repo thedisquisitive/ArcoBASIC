@@ -1,0 +1,195 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' RFC-0007: ArcoBASIC Interactive Program Model, first real increment -- boots directly into
+' READY. and stays there, reading real keyboard input and dispatching a small, real, hand-written
+' set of Immediate Mode commands, instead of proving one thing and halting like every other fixture
+' in this project's history. This is the first fixture in the whole project that does NOT
+' CPU.HaltForever after its own setup -- it genuinely keeps running.
+'
+' Three real prerequisites this fixture closes, found and closed together in one session:
+'
+' 1. Real keyboard input: EFI_SIMPLE_TEXT_INPUT_PROTOCOL had no binding anywhere in this project.
+'    New UefiField entries -- SystemTable.ConsoleIn (offset 0x30, cross-checked against
+'    ConsoleOut's own already-proven 0x40 and BootServices' own already-proven 0x60, both from the
+'    same standard EDK2 EFI_SYSTEM_TABLE layout) and UEFI.SimpleTextInputProtocol.ReadKeyStroke
+'    (offset 0x08, same implicit-This method shape as ConsoleOut.Write's own OutputString) -- both
+'    resolve through the existing generic CallExternal path, no new codegen needed. ReadKeyStroke
+'    returns EFI_NOT_READY (not an error) when no key is buffered; this fixture polls, matching
+'    this backend's own "no blocking primitives" precedent (UefiBlockDevice.* itself never blocks
+'    on I/O completion either).
+'
+' 2. Real DYNAMIC text output: every ConsoleOut.Write call in this whole project before this
+'    fixture passed a compile-time string literal. Proven here (a probe, before committing to this
+'    design) that ConsoleOut.Write's real ABI need is just "a pointer to a null-terminated CHAR16
+'    buffer" -- it accepts a raw MMIOPTR to a buffer THIS fixture constructs itself at runtime via
+'    MEMORY.Write16, with no dependency on ArcoBASIC's own STRING literal machinery at all. This is
+'    what makes echoing an arbitrary just-typed keystroke possible without a new compiler feature.
+'
+' 3. A genuinely non-halting loop: proven under QEMU with real injected keystrokes (QEMU's own
+'    human-monitor `sendkey` command over a UNIX socket, scripts/run/run-uefi-hello-with-keyboard.sh
+'    -- the same real scancode-delivery path a physical keyboard driver uses, not a shortcut).
+'
+' Deliberately, honestly OUT OF SCOPE for this increment (RFC-0007 defines much more than this):
+' Program Mode (numbered lines, Resident Program Memory, LIST/RUN/NEW), PEEK/POKE, and a random
+' selection among multiple OT messages (this shows exactly one, fixed, representative message).
+' Command recognition covers HELP and OT (RFC-0007 Section 8's own two simplest, storage-free
+' commands) plus one TEST-ONLY hidden command, EXIT, that this real spec does NOT define -- a real
+' Arcology Seed keeps running forever; EXIT exists purely so automated QEMU testing can terminate
+' deterministically instead of running to a fixed timeout every time. Command matching is
+' case-insensitive (a real usability choice, not required by the RFC, but standard in classic BASIC
+' environments and free to add given only three short command words).
+
+FUNCTION ScratchBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(39845888))   ' 0x2600000, this fixture's own scratch region
+END FUNCTION
+
+' State layout, all within one page: key input scratch (4 bytes EFI_INPUT_KEY, +0), single-char
+' echo buffer (4 bytes UTF-16 char + null, +8), line buffer (up to 120 UTF-16 units, +16).
+FUNCTION KeyBufferAddress() AS MMIOPTR
+    RETURN ScratchBaseAddress()
+END FUNCTION
+
+FUNCTION EchoBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(ScratchBaseAddress(), 8)
+END FUNCTION
+
+FUNCTION LineBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(ScratchBaseAddress(), 16)
+END FUNCTION
+
+FUNCTION LineBufferMaxChars() AS U32
+    RETURN 120
+END FUNCTION
+
+' Prints exactly one UTF-16 character by constructing a real, self-contained null-terminated
+' buffer and passing it directly to ConsoleOut.Write -- see this file's own header comment for why
+' this works with no dependency on ArcoBASIC's own STRING literal machinery.
+FUNCTION EchoChar(systemTable AS UEFI.SystemTable, charCode AS U16) AS BOOL
+    LET buf AS MMIOPTR = EchoBufferAddress()
+    MEMORY.Write16(buf, charCode)
+    MEMORY.Write16(ADDRESS.Offset(buf, 2), 0)
+    systemTable.ConsoleOut.Write(buf)
+    RETURN 1
+END FUNCTION
+
+FUNCTION LineIsHelp(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 4 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U16 = MEMORY.Read16(lineBuf)
+    LET c1 AS U16 = MEMORY.Read16(ADDRESS.Offset(lineBuf, 2))
+    LET c2 AS U16 = MEMORY.Read16(ADDRESS.Offset(lineBuf, 4))
+    LET c3 AS U16 = MEMORY.Read16(ADDRESS.Offset(lineBuf, 6))
+    IF c0 = 72 OR c0 = 104 THEN
+        IF c1 = 69 OR c1 = 101 THEN
+            IF c2 = 76 OR c2 = 108 THEN
+                IF c3 = 80 OR c3 = 112 THEN
+                    RETURN 1
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION LineIsOt(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 2 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U16 = MEMORY.Read16(lineBuf)
+    LET c1 AS U16 = MEMORY.Read16(ADDRESS.Offset(lineBuf, 2))
+    IF c0 = 79 OR c0 = 111 THEN
+        IF c1 = 84 OR c1 = 116 THEN
+            RETURN 1
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+' TEST-ONLY -- not part of RFC-0007's own real command set. See this file's own header comment.
+FUNCTION LineIsExit(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 4 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U16 = MEMORY.Read16(lineBuf)
+    LET c1 AS U16 = MEMORY.Read16(ADDRESS.Offset(lineBuf, 2))
+    LET c2 AS U16 = MEMORY.Read16(ADDRESS.Offset(lineBuf, 4))
+    LET c3 AS U16 = MEMORY.Read16(ADDRESS.Offset(lineBuf, 6))
+    IF c0 = 69 OR c0 = 101 THEN
+        IF c1 = 88 OR c1 = 120 THEN
+            IF c2 = 73 OR c2 = 105 THEN
+                IF c3 = 84 OR c3 = 116 THEN
+                    RETURN 1
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("\r\nARCOLOGY SEED\r\n\r\nREADY.\r\n")
+
+    LET lineBuf AS MMIOPTR = LineBufferAddress()
+    LET lineLen AS U32 = 0
+    LET maxChars AS U32 = LineBufferMaxChars()
+    LET running AS BOOL = 1
+
+    WHILE running = 1
+        LET keyBuf AS MMIOPTR = KeyBufferAddress()
+        LET status AS U64 = systemTable.ConsoleIn.ReadKeyStroke(keyBuf)
+        IF status = 0 THEN
+            LET unicodeChar AS U16 = MEMORY.Read16(ADDRESS.Offset(keyBuf, 2))
+            IF unicodeChar = 13 THEN
+                systemTable.ConsoleOut.Write("\r\n")
+                IF lineLen = 0 THEN
+                    systemTable.ConsoleOut.Write("READY.\r\n")
+                ELSE
+                    IF LineIsHelp(lineBuf, lineLen) = 1 THEN
+                        systemTable.ConsoleOut.Write("IMMEDIATE MODE COMMANDS: HELP  OT\r\n")
+                    ELSE
+                        IF LineIsOt(lineBuf, lineLen) = 1 THEN
+                            systemTable.ConsoleOut.Write("THE WAGON HAS BROKEN DOWN.\r\n")
+                        ELSE
+                            IF LineIsExit(lineBuf, lineLen) = 1 THEN
+                                systemTable.ConsoleOut.Write("ARCOLOGY SEED HALT\r\n")
+                                running = 0
+                            ELSE
+                                systemTable.ConsoleOut.Write("?SYNTAX ERROR\r\n")
+                            END IF
+                        END IF
+                    END IF
+                    IF running = 1 THEN
+                        systemTable.ConsoleOut.Write("READY.\r\n")
+                    END IF
+                END IF
+                lineLen = 0
+            ELSE
+                IF unicodeChar = 8 THEN
+                    IF lineLen > 0 THEN
+                        lineLen = lineLen - 1
+                        EchoChar(systemTable, 8)
+                        EchoChar(systemTable, 32)
+                        EchoChar(systemTable, 8)
+                    END IF
+                ELSE
+                    IF unicodeChar >= 32 THEN
+                        IF unicodeChar < 127 THEN
+                            IF lineLen < maxChars THEN
+                                MEMORY.Write16(ADDRESS.Offset(lineBuf, lineLen * 2), unicodeChar)
+                                lineLen = lineLen + 1
+                                EchoChar(systemTable, unicodeChar)
+                            END IF
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+    WEND
+
+    CPU.HaltForever
+END FUNCTION

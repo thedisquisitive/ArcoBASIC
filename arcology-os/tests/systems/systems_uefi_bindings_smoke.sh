@@ -91,16 +91,18 @@ FUNCTION Main(systemTable AS UEFI.SystemTable) AS U64
     systemTable.Foo.Bar(1)
     RETURN 0
 END FUNCTION' \
-    'UEFI.SystemTable has no bound field or method "Foo" in this milestone. Bound fields: ConsoleOut, BootServices.'
+    'UEFI.SystemTable has no bound field or method "Foo" in this milestone. Bound fields: ConsoleIn, ConsoleOut, BootServices.'
 
 # A real UEFI field that this milestone deliberately did not bind is rejected honestly (not
-# silently accepted, and not confused with an invented/nonexistent field).
+# silently accepted, and not confused with an invented/nonexistent field). StdErr (RFC-0007 has no
+# need for it; ConIn itself is now bound as ConsoleIn -- see the "unknown_field" case above for its
+# own real, current field list).
 expect_reject "real_but_unbound_field" '
 FUNCTION Main(systemTable AS UEFI.SystemTable) AS U64
-    systemTable.ConIn.Reset(1)
+    systemTable.StdErr.Reset(1)
     RETURN 0
 END FUNCTION' \
-    'UEFI.SystemTable has no bound field or method "ConIn" in this milestone.'
+    'UEFI.SystemTable has no bound field or method "StdErr" in this milestone.'
 
 # An unknown method on a correctly-resolved protocol is rejected, and the diagnostic names the
 # protocol type the chain actually resolved to (not the root type or an empty string).
