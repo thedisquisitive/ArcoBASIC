@@ -1,4 +1,13 @@
 build/
+# The bare pattern above matches any directory literally named "build" at any depth (equivalent to
+# **/build/) -- intended for the top-level CMake build output directory, but it also silently
+# swallows these two real SOURCE directories of build-related shell/Python scripts (found the hard
+# way: three new .py files added under arcology-os/scripts/build/ never showed up in `git status`
+# at all). Re-included explicitly rather than anchoring the pattern to `/build/`, since several
+# OTHER nested "build" directories in this tree (lazarus/build, arcoflow/build, games/build,
+# lazarus-os/build, etc.) genuinely are build-output directories that should stay ignored.
+!arcology-os/scripts/build/
+!scripts/build/
 build-*/
 dist/
 /var/
@@ -13,6 +22,8 @@ CMakeCache.txt
 *.exe
 
 .DS_Store
+__pycache__/
+*.pyc
 
 # Legacy root-level generated/runtime artifacts (new output belongs under dist/ or var/)
 arcoalpha/
