@@ -1,14 +1,43 @@
 # WP-030: "Render and Halt" Physical Hardware Validation Package (Lenovo E15 Gen2)
 
-**Status:** CORE RESULT CONFIRMED ON REAL HARDWARE (photographic evidence) — a small number of
-platform-detail and stability-duration fields below still require the human tester's own account
-before this package can be marked fully complete.
+**Status:** CORE RESULT CONFIRMED ON REAL HARDWARE for the ORIGINAL artifact below (photographic
+evidence, checksums `d3cb63b3...`/`27bc14c68...`) — but the fixture's own source has SINCE CHANGED
+(Revision 2, see below) in response to real findings from that exact hardware run. The bytes
+currently in `arcology-os/dist/render-and-halt/` no longer match the validated checksums and have
+NOT yet been re-confirmed on real hardware.
 **Date prepared:** 2026-08-22
 **Date of real-hardware attempt:** 2026-08-22
 
 **This is the first artifact in the entire Arcology OS project confirmed to run on real physical
 hardware.** Every prior QEMU-only proof in this project's history, however extensive, remained
-unconfirmed on real silicon until this result.
+unconfirmed on real silicon until this result. This finding stands regardless of the Revision 2
+update below — the checksums it was confirmed against are recorded permanently in this section.
+
+## Revision 2 (2026-08-22, same day): two real findings from that hardware run, now fixed
+
+The human tester who ran the original artifact reported two real, honest observations directly
+from the Lenovo E15 Gen 2 screen: (1) the `ConsoleOut.Write` text markers ran together on one line
+with no separator, and (2) the pixel-fill render loop was noticeably slow. Both are now fixed in
+the fixture's own source (see `render-and-halt.abas`'s own header comment for the full reasoning):
+
+1. **Text readability**: this dialect's `ConsoleOut.Write` never auto-appends a newline (matching
+   real UEFI's own `OutputString` contract) — every message now ends with an explicit `\r\n`
+   escape sequence (confirmed real, not a literal backslash-r-backslash-n, via the lexer's own
+   escape handling in `src/frontend/lexer.cpp`). Confirmed under QEMU: each marker now appears on
+   its own line in the captured serial/console trace.
+2. **Render speed**: the original loop wrote one pixel at a time via `MEMORY.Write32` — cheap on
+   QEMU's virtual framebuffer, but real GOP framebuffer MMIO has real per-write overhead a virtual
+   one does not. New `FillRun` helper writes PAIRS of same-color pixels via one 64-bit MMIO write
+   (falling back to a single 32-bit write for a trailing odd pixel), halving the write count for
+   every solid-color run without changing a single byte of what gets written — the existing
+   pixel-readback self-verification needed no changes at all.
+
+Both fixes re-verified under QEMU: real positive pass, real negative control (corrupted
+accent-pixel check still correctly reports `VERIFY FAILED`/`VFAC`, not a false `DONE`), 3x
+determinism, both the plain-block-device and real-USB-Mass-Storage-Class boot paths. New checksums
+below. **This Revision 2 artifact has NOT yet been run on real hardware** — the render-speed
+improvement in particular can only be meaningfully judged by a human watching the real screen
+again.
 
 Do not mark this report complete from QEMU results. Fill every bracketed field during a physical
 test and attach photographs using repository-relative paths. Matches `.agents/reports/
@@ -29,16 +58,23 @@ project prepared for a specific, named real machine rather than an unspecified "
 Arcology test laptop" — fill in the exact CPU/firmware fields below during the real test; this
 report does not assume them.
 
-## Build Identity
+## Build Identity — ORIGINAL (validated on real hardware, see photo/checklist below)
 
 - Git commit: `b32545a6881c64ab00f6bc696cf218375fb8ef06` (`RFC-0006: real GOP "render and halt" bring-up test + real USB boot proof`) — the artifact below was built from this commit (checksums confirmed byte-identical to the pre-commit build, as expected — nothing in the fixture's own source changed after that build). A later commit touching `src/graphics/graphics.cpp`, `stdlib/graphics_primitives.abas`, or `tests/fixtures/render-and-halt/render-and-halt.abas` should get a fresh build before physical testing.
-- Dirty-tree statement at physical test: `[required; use a clean checkout of the commit above]`
+- Compiler/version: `ArcoFission 0.1.0`
+- EFI SHA-256: `d3cb63b3cf5efc6f8831ea970431ac2bba96bf0f1e9a7cf080a44041380fd82b`
+- Image SHA-256: `27bc14c68fa6aa3c9eb4887c0162608d0e4b077dbf532690edb930abbbc1981a`
+
+## Build Identity — REVISION 2 (current source; NOT yet run on real hardware)
+
+- Git commit: `[fill in at physical test time — the commit this Revision 2 update was committed in, or later if the source has not changed]`
 - Compiler/version: `ArcoFission 0.1.0`
 - Image filename: `arcology-render-and-halt-x86_64.img`
 - Artifact directory: `arcology-os/dist/render-and-halt/`
-- EFI SHA-256: `d3cb63b3cf5efc6f8831ea970431ac2bba96bf0f1e9a7cf080a44041380fd82b`
-- Image SHA-256: `27bc14c68fa6aa3c9eb4887c0162608d0e4b077dbf532690edb930abbbc1981a`
+- EFI SHA-256: `67c1e2875fbf8bb4ae8c6799c076a8afd6312957f66abfa1c224b6c110671f73`
+- Image SHA-256: `1dbdf41bf1d9893be1e4a67049964972b40820e72f259b7f58b94e1eb0ee2bf4`
 - Full checksums: `arcology-os/dist/render-and-halt/SHA256SUMS`
+- Dirty-tree statement at physical test: `[required; use a clean checkout of the commit above]`
 - Media write command/tool: `sudo dd if=arcology-render-and-halt-x86_64.img of=/dev/sda bs=4M conv=fsync status=progress && sync` — run by the assistant on the user's explicit, confirmed instruction. `/dev/sda` was independently confirmed as the correct target before writing (`lsblk`: TYPE=disk, TRAN=usb, RM=1, MODEL="USB 2.0 FD", SIZE=28.9G — the drive's prior GPT contents, including a partition the user had labeled `LAZARUS_STATE`, were confirmed with the user before wiping). Post-write verification: `sha256sum` of the first 67108864 bytes read back directly from `/dev/sda` matched the source image's checksum exactly (`27bc14c68f...981a`) — a real, byte-for-byte confirmed write, not merely a `dd` exit code of 0.
 
 **Pre-physical-test sanity check already performed (QEMU, not a substitute for the checklist

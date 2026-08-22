@@ -97,21 +97,51 @@ FUNCTION SerialMarker(b0 AS U64, b1 AS U64, b2 AS U64, b3 AS U64) AS U64
     RETURN 0
 END FUNCTION
 
+' Fills one horizontal, single-color run [xStart, xEnd) on row y with colorValue, writing PAIRS
+' of pixels via one 64-bit MMIO write wherever possible instead of one 32-bit write per pixel
+' (falling back to a single 32-bit write for a leftover odd pixel at the end of the run). Real
+' hardware finding (Lenovo ThinkPad E15 Gen 2, WP-030's own first physical validation): QEMU's
+' virtual framebuffer write is essentially free, but a real GOP framebuffer aperture is a real
+' hardware interconnect with real per-write overhead -- at a real panel's resolution (~2 million
+' pixels), one Write32 per pixel was visibly, noticeably slow. Halving the write COUNT (not the
+' total bytes moved) directly addresses that per-write overhead; write-combining hardware also
+' generally benefits from fewer, wider bursts rather than many small ones. Never changes what
+' bytes end up written -- each pair's two pixels are always the SAME color within one call, so
+' this is purely a batching change, not a rendering change; the existing pixel-readback
+' self-verification below needed no changes at all.
+FUNCTION FillRun(mapped AS MMIOPTR, stride AS U32, y AS U32, xStart AS U32, xEnd AS U32, colorValue AS U32) AS BOOL
+    LET colorAsU64 AS U64 = colorValue
+    LET packed AS U64 = colorAsU64 OR (colorAsU64 SHL 32)
+    LET x AS U32 = xStart
+    WHILE x + 1 < xEnd
+        LET pixelOffset AS U32 = (y * stride + x) * 4
+        LET pixel AS MMIOPTR = ADDRESS.Offset(mapped, pixelOffset)
+        MEMORY.Write64(pixel, packed)
+        x = x + 2
+    WEND
+    IF x < xEnd THEN
+        LET pixelOffset AS U32 = (y * stride + x) * 4
+        LET pixel AS MMIOPTR = ADDRESS.Offset(mapped, pixelOffset)
+        MEMORY.Write32(pixel, colorValue)
+    END IF
+    RETURN 1
+END FUNCTION
+
 FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
     systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
-    systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT START")
+    systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT START\r\n")
     SerialInit()
     SerialMarker(83, 84, 65, 82)   ' STAR
 
     LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
     IF gop = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT GOP UNAVAILABLE")
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT GOP UNAVAILABLE\r\n")
         SerialMarker(78, 79, 71, 79)   ' NOGO(P)
         CPU.HaltForever
     END IF
     LET mode AS UEFI.GraphicsOutputMode = UEFI.GOP.Mode(gop)
     IF mode = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT MODE UNAVAILABLE")
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT MODE UNAVAILABLE\r\n")
         SerialMarker(78, 79, 77, 68)   ' NOMD
         CPU.HaltForever
     END IF
@@ -122,12 +152,12 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     LET height AS U32 = UEFI.GOP.Height(gop)
     LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
     IF width = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT ZERO WIDTH")
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT ZERO WIDTH\r\n")
         SerialMarker(90, 87, 68, 84)   ' ZWDT
         CPU.HaltForever
     END IF
     IF height = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT ZERO HEIGHT")
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT ZERO HEIGHT\r\n")
         SerialMarker(90, 72, 71, 84)   ' ZHGT
         CPU.HaltForever
     END IF
@@ -150,27 +180,13 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
                 inAccentRow = 1
             END IF
         END IF
-        LET x AS U32 = 0
-        WHILE x < width
-            LET pixelOffset AS U32 = (y * stride + x) * 4
-            LET pixel AS MMIOPTR = ADDRESS.Offset(mapped, pixelOffset)
-            LET inAccentCol AS BOOL = 0
-            IF x >= accentLeft THEN
-                IF x < accentRight THEN
-                    inAccentCol = 1
-                END IF
-            END IF
-            IF inAccentRow = 1 THEN
-                IF inAccentCol = 1 THEN
-                    MEMORY.Write32(pixel, 65535)         ' bright accent (yellow or cyan depending on the real channel order)
-                ELSE
-                    MEMORY.Write32(pixel, 2105376)        ' dark gray background (R=G=B=0x20)
-                END IF
-            ELSE
-                MEMORY.Write32(pixel, 2105376)            ' same dark gray background
-            END IF
-            x = x + 1
-        WEND
+        IF inAccentRow = 1 THEN
+            FillRun(mapped, stride, y, 0, accentLeft, 2105376)
+            FillRun(mapped, stride, y, accentLeft, accentRight, 65535)
+            FillRun(mapped, stride, y, accentRight, width, 2105376)
+        ELSE
+            FillRun(mapped, stride, y, 0, width, 2105376)
+        END IF
         y = y + 1
     WEND
 
@@ -190,17 +206,17 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     LET accentValue AS U32 = MEMORY.Read32(accentProbe)
 
     IF bgValue <> 2105376 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT VERIFY FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT VERIFY FAILED\r\n")
         SerialMarker(86, 70, 66, 71)   ' VFBG (background verify failed)
         CPU.HaltForever
     END IF
     IF accentValue <> 65535 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT VERIFY FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT VERIFY FAILED\r\n")
         SerialMarker(86, 70, 65, 67)   ' VFAC (accent verify failed)
         CPU.HaltForever
     END IF
 
-    systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT DONE")
+    systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT DONE\r\n")
     SerialMarker(68, 79, 78, 69)   ' DONE
     CPU.HaltForever
 END FUNCTION

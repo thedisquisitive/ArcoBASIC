@@ -20,6 +20,15 @@
 ' the SAME robust-to-discovery-order technique Phase 1's own multi-blockio-discovery.abas fixture
 ' already proved, reused here rather than trusting a specific index.
 '
+' Real hardware finding (Lenovo ThinkPad E15 Gen 2, first physical run of this fixture): the
+' ConsoleOut.Write text markers ran together on one line (this dialect never auto-appends a
+' newline, matching real UEFI's own OutputString contract -- every ConsoleOut.Write call below now
+' ends with an explicit carriage-return-plus-linefeed escape sequence), and the original
+' one-Write32-per-pixel render loop was noticeably slow on a real GOP framebuffer aperture (QEMU's
+' own virtual framebuffer write is effectively free, real hardware is not) -- both fixed here,
+' matching render-and-halt.abas's own identical fixes and reasoning (see that fixture's header
+' comment).
+'
 ' Frozen copies of stdlib/uefi_block_device_policy.abas, stdlib/block_device_policy.abas, and
 ' stdlib/arcfs_policy.abas are inlined below, matching this project's established no-include-system
 ' fixture convention (same recipe RFC-0043 Phase V's aps-arcfs-sysvol-writer.abas/
@@ -6953,9 +6962,32 @@ FUNCTION GptSysvolBufferAddress() AS MMIOPTR
     RETURN ADDRESS.MMIO(ADDRESS.Virtual(39845888))   ' 0x2600000, this fixture's own scratch buffer
 END FUNCTION
 
+' Fills one horizontal, single-color run [xStart, xEnd) on row y with colorValue via paired
+' 64-bit MMIO writes wherever possible (falling back to one 32-bit write for a leftover odd
+' pixel) -- matches render-and-halt.abas's own identical fix, applied here for the same real
+' reason (see that fixture's own header comment): a real GOP framebuffer aperture has real
+' per-write overhead a virtual QEMU one does not, and halving write count directly addresses it.
+FUNCTION FillRun(mapped AS MMIOPTR, stride AS U32, y AS U32, xStart AS U32, xEnd AS U32, colorValue AS U32) AS BOOL
+    LET colorAsU64 AS U64 = colorValue
+    LET packed AS U64 = colorAsU64 OR (colorAsU64 SHL 32)
+    LET x AS U32 = xStart
+    WHILE x + 1 < xEnd
+        LET pixelOffset AS U32 = (y * stride + x) * 4
+        LET pixel AS MMIOPTR = ADDRESS.Offset(mapped, pixelOffset)
+        MEMORY.Write64(pixel, packed)
+        x = x + 2
+    WEND
+    IF x < xEnd THEN
+        LET pixelOffset AS U32 = (y * stride + x) * 4
+        LET pixel AS MMIOPTR = ADDRESS.Offset(mapped, pixelOffset)
+        MEMORY.Write32(pixel, colorValue)
+    END IF
+    RETURN 1
+END FUNCTION
+
 FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
     systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
-    systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL START")
+    systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL START\r\n")
     SerialInit()
     SerialMarker(83, 84, 65, 82)   ' STAR
 
@@ -6972,7 +7004,7 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     ' order technique Phase 1's own multi-blockio-discovery.abas fixture already proved.
     LET count AS U64 = UefiBlockDevice.DiscoverAll(systemTable)
     IF count < 2 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL TOO FEW HANDLES")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL TOO FEW HANDLES\r\n")
         SerialMarker(84, 70, 72, 78)   ' TFHN
         CPU.HaltForever
     END IF
@@ -6989,21 +7021,21 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         i = i + 1
     WEND
     IF arcfsIndex = 999 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL ARCFS PARTITION NOT FOUND")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL ARCFS PARTITION NOT FOUND\r\n")
         SerialMarker(78, 79, 80, 84)   ' NOPT
         CPU.HaltForever
     END IF
 
     LET selected AS BOOL = UefiBlockDevice.SelectDiscovered(arcfsIndex)
     IF selected = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL SELECT FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL SELECT FAILED\r\n")
         SerialMarker(78, 83, 69, 76)   ' NSEL
         CPU.HaltForever
     END IF
 
     ArcFS.SelectBlockDevice(ArcFS.BlockDeviceProviderUefi())
     IF ArcFS.ActiveBlockDevice() <> 1 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL PROVIDER SELECT FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL PROVIDER SELECT FAILED\r\n")
         SerialMarker(78, 80, 82, 86)   ' NPRV
         CPU.HaltForever
     END IF
@@ -7012,12 +7044,12 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     ' fresh volume, write one real file, and commit, exactly matching RFC-0043 Phase V's own
     ' writer-half proof, now on the SAME disk the system booted from instead of a separate device.
     IF ArcFS.FormatVolume() = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL FORMAT FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL FORMAT FAILED\r\n")
         SerialMarker(78, 70, 77, 84)   ' NFMT
         CPU.HaltForever
     END IF
     IF ArcFS.MountImage() = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL MOUNT FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL MOUNT FAILED\r\n")
         SerialMarker(78, 77, 78, 84)   ' NMNT
         CPU.HaltForever
     END IF
@@ -7032,7 +7064,7 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     MEMORY.Write8(ADDRESS.Offset(nameBuf, 6), 116)   ' t
     LET oid AS U64 = ArcFS.CreateFile(1, nameBuf, 7)
     IF oid = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL CREATE FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL CREATE FAILED\r\n")
         SerialMarker(78, 67, 82, 84)   ' NCRT
         CPU.HaltForever
     END IF
@@ -7047,24 +7079,24 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     MEMORY.Write8(ADDRESS.Offset(content, 6), 33)    ' !
     LET h AS U64 = ArcFS.OpenHandle(oid)
     IF h = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL OPEN FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL OPEN FAILED\r\n")
         SerialMarker(78, 79, 80, 78)   ' NOPN
         CPU.HaltForever
     END IF
     LET written AS U64 = ArcFS.HandleWrite(h, content, 7, 0)
     IF written <> 7 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL WRITE FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL WRITE FAILED\r\n")
         SerialMarker(78, 87, 82, 84)   ' NWRT
         CPU.HaltForever
     END IF
     ArcFS.CloseHandle(h)
 
     IF ArcFS.CommitImage() = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL COMMIT FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL COMMIT FAILED\r\n")
         SerialMarker(78, 67, 77, 84)   ' NCMT
         CPU.HaltForever
     END IF
-    systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL COMMIT OK")
+    systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL COMMIT OK\r\n")
     SerialMarker(67, 77, 79, 75)   ' CMOK
 
     ' The real boot-policy proof (RFC-0039 Phase G): re-activate the volume just committed via the
@@ -7073,11 +7105,11 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     ' disk (RFC-0043 Phase V only ever proved it on a SEPARATE physical disk from the boot medium).
     LET activation AS U64 = ArcFS.ActivateSystemVolume()
     IF activation <> 1 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL ACTIVATE FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL ACTIVATE FAILED\r\n")
         SerialMarker(78, 65, 67, 84)   ' NACT
         CPU.HaltForever
     END IF
-    systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL ACTIVATED")
+    systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL ACTIVATED\r\n")
     SerialMarker(65, 67, 84, 79)   ' ACTO
 
     ' Real GOP render + pixel-readback self-verification, the SAME logic render-and-halt.abas
@@ -7086,13 +7118,13 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     ' format/write/commit/activate) completed, not just that ArcFS's own internal state looks right.
     LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
     IF gop = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL GOP UNAVAILABLE")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL GOP UNAVAILABLE\r\n")
         SerialMarker(78, 79, 71, 79)   ' NOGO
         CPU.HaltForever
     END IF
     LET mode AS UEFI.GraphicsOutputMode = UEFI.GOP.Mode(gop)
     IF mode = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL MODE UNAVAILABLE")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL MODE UNAVAILABLE\r\n")
         SerialMarker(78, 79, 77, 68)   ' NOMD
         CPU.HaltForever
     END IF
@@ -7103,12 +7135,12 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     LET height AS U32 = UEFI.GOP.Height(gop)
     LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
     IF width = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL ZERO WIDTH")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL ZERO WIDTH\r\n")
         SerialMarker(90, 87, 68, 84)   ' ZWDT
         CPU.HaltForever
     END IF
     IF height = 0 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL ZERO HEIGHT")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL ZERO HEIGHT\r\n")
         SerialMarker(90, 72, 71, 84)   ' ZHGT
         CPU.HaltForever
     END IF
@@ -7128,27 +7160,13 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
                 inAccentRow = 1
             END IF
         END IF
-        LET x AS U32 = 0
-        WHILE x < width
-            LET pixelOffset AS U32 = (y * stride + x) * 4
-            LET pixel AS MMIOPTR = ADDRESS.Offset(mapped, pixelOffset)
-            LET inAccentCol AS BOOL = 0
-            IF x >= accentLeft THEN
-                IF x < accentRight THEN
-                    inAccentCol = 1
-                END IF
-            END IF
-            IF inAccentRow = 1 THEN
-                IF inAccentCol = 1 THEN
-                    MEMORY.Write32(pixel, 65535)
-                ELSE
-                    MEMORY.Write32(pixel, 2105376)
-                END IF
-            ELSE
-                MEMORY.Write32(pixel, 2105376)
-            END IF
-            x = x + 1
-        WEND
+        IF inAccentRow = 1 THEN
+            FillRun(mapped, stride, y, 0, accentLeft, 2105376)
+            FillRun(mapped, stride, y, accentLeft, accentRight, 65535)
+            FillRun(mapped, stride, y, accentRight, width, 2105376)
+        ELSE
+            FillRun(mapped, stride, y, 0, width, 2105376)
+        END IF
         y = y + 1
     WEND
 
@@ -7164,17 +7182,17 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     LET accentValue AS U32 = MEMORY.Read32(accentProbe)
 
     IF bgValue <> 2105376 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL VERIFY FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL VERIFY FAILED\r\n")
         SerialMarker(86, 70, 66, 71)   ' VFBG
         CPU.HaltForever
     END IF
     IF accentValue <> 65535 THEN
-        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL VERIFY FAILED")
+        systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL VERIFY FAILED\r\n")
         SerialMarker(86, 70, 65, 67)   ' VFAC
         CPU.HaltForever
     END IF
 
-    systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL DONE")
+    systemTable.ConsoleOut.Write("ARCOLOGY GPT SYSVOL DONE\r\n")
     SerialMarker(68, 79, 78, 69)   ' DONE
     CPU.HaltForever
 END FUNCTION

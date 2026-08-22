@@ -1,7 +1,40 @@
 # WP-031: Single-Disk GPT ArcFS System Volume + Render Physical Hardware Validation Package (Lenovo E15 Gen 2)
 
-**Status:** READY FOR HUMAN EXECUTION — NOT YET VALIDATED
+**Status:** CORE RESULT CONFIRMED ON REAL HARDWARE for the ORIGINAL artifact below (informal
+real-time report, not a full structured checklist — see Observation) — but the fixture's own
+source has SINCE CHANGED (Revision 2, see below) in response to real findings from that exact
+hardware run. The bytes currently in `arcology-os/dist/gpt-sysvol-render/` no longer match the
+confirmed checksums and have NOT yet been re-confirmed on real hardware.
 **Date prepared:** 2026-08-22
+**Date of real-hardware attempt:** 2026-08-22
+
+**This is the first time the real single-disk GPT ESP+ArcFS boot chain (RFC-0044) has run on real
+physical hardware.** The human tester reported: the boot reached the real GOP test card (matching
+WP-030's own already-validated render), confirming real firmware ESP boot, real multi-handle
+BlockIo discovery, and real `ArcFS.FormatVolume`/write/commit/`ActivateSystemVolume` all completed
+against the real physical USB flash drive before the render started. Two real, honest observations
+came with it — see Revision 2 immediately below; both are now fixed in the current source.
+
+## Revision 2 (2026-08-22, same day): two real findings from that hardware run, now fixed
+
+Identical findings and identical fixes to `WP-030-render-and-halt-hardware-validation.md`'s own
+Revision 2 (this fixture's Main logic is a close relative of `render-and-halt.abas`'s own, sharing
+the same GOP render code) — see that document for the full reasoning:
+
+1. **Text readability**: every `ConsoleOut.Write` call now ends with an explicit `\r\n`. The
+   original run reported "on the same line with no separator" between the `START` marker and the
+   next one, exactly matching the concatenated-output finding WP-030 also made.
+2. **Render speed**: the original tester reported "that slow software render is... noticeable." New
+   `FillRun` helper (identical technique to `render-and-halt.abas`'s own fix) halves the MMIO write
+   count for the render by writing pixel PAIRS via 64-bit writes instead of one 32-bit write per
+   pixel — no change to what bytes get written, so the existing pixel-readback self-verification
+   needed no changes.
+
+Both fixes re-verified under QEMU: real positive pass on the GPT-partitioned disk image (real USB
+Mass Storage Class + real GOP), real negative control, 3x determinism, and the real ArcFS
+format/write/commit/activate chain all still passing (full serial trace: `STAR` → `CMOK` → `ACTO` →
+`DONE`, each on its own line now). New checksums below. **This Revision 2 artifact has NOT yet been
+run on real hardware.**
 
 Do not mark this report complete from QEMU results. Fill every bracketed field during a physical
 test and attach photographs using repository-relative paths. Matches `.agents/reports/
@@ -38,14 +71,22 @@ software-level robustness already built into the artifact below — nothing extr
 needs to do — but it is worth knowing this is a REAL discovery-order finding, not a hypothetical
 one, in case real hardware's own enumeration order differs yet again from what QEMU showed.
 
-## Build Identity
+## Build Identity — ORIGINAL (run on real hardware, see Observation below)
 
-- Git commit: `[fill in at physical test time — the commit this package itself was committed in, or later if the source has not changed]`
+- Git commit: `090b061` (`RFC-0044 Phases 3+4: real single-disk ArcFS boot chain + hardware package`)
+- Compiler/version: `ArcoFission 0.1.0`
+- EFI SHA-256: `878bab42975eab39bd3115cfe4f9d42cefe5308730953dff00c042894ce11175`
+- Image SHA-256: `d234dff7fe7393f74636d425daa0c92a0f0d2cc83d5b76fb396aac7ced2b7e27`
+- Media write command/tool: `sudo dd if=arcology-gpt-sysvol-render-x86_64.img of=/dev/sda bs=4M conv=fsync status=progress && sync` — run by the assistant on the user's explicit instruction, onto the same `/dev/sda` USB stick WP-030 already used. Post-write verification: `sha256sum` of the first 76562944 bytes read back directly from `/dev/sda` matched the source image's checksum exactly, AND `parted -s /dev/sda unit s print` independently confirmed the real, physical partition table matched the intended layout (ESP 2048s-133119s fat32 boot/esp; ArcFS 133120s-149503s msftdata) — not just a file-level check.
+
+## Build Identity — REVISION 2 (current source; NOT yet run on real hardware)
+
+- Git commit: `[fill in at physical test time — the commit this Revision 2 update was committed in, or later if the source has not changed]`
 - Compiler/version: `ArcoFission 0.1.0`
 - Image filename: `arcology-gpt-sysvol-render-x86_64.img`
 - Artifact directory: `arcology-os/dist/gpt-sysvol-render/`
-- EFI SHA-256: `878bab42975eab39bd3115cfe4f9d42cefe5308730953dff00c042894ce11175`
-- Image SHA-256: `d234dff7fe7393f74636d425daa0c92a0f0d2cc83d5b76fb396aac7ced2b7e27`
+- EFI SHA-256: `d8f9bb1f954e433b09808de95b646872825d65152bef6ac552061f8dd1f1cc5e`
+- Image SHA-256: `7518bca7b07f7f95094a6bad31d45672155d20cd9346224f2761a10c23fdf4f0`
 - Full checksums: `arcology-os/dist/gpt-sysvol-render/SHA256SUMS`
 - Image size: 76,562,944 bytes (~73 MiB) — a real GPT-partitioned disk image (protective MBR + primary/backup GPT + 64 MiB ESP + 8 MiB reserved ArcFS partition), NOT the superfloppy whole-device-FAT32 shape WP-026/WP-030's own images use.
 - Media write command/tool: `[required]`
@@ -168,13 +209,30 @@ visual state (the test card or its absence) is directly observable, not the inte
 
 ## Observation
 
-- Start time/timezone: `[required]`
-- Exact observed behavior: `[required]`
-- Which markers (if any) were visible on screen before the final render: `[required]`
-- Stable-display duration: `[required]`
-- Unexpected behavior: `[none or details]`
-- Photograph paths: `[required]`
-- Tester name/identifier: `[required]`
+**For the ORIGINAL artifact** (informal real-time report, not a full structured session — a fresh
+run against Revision 2 with the full checklist above still needed):
+
+- Start time/timezone: `[not recorded]`
+- Exact observed behavior: the first text marker (`ARCOLOGY GPT SYSVOL START`) appeared, then a
+  real, noticeable pause (consistent with real `ArcFS.FormatVolume`/write/commit I/O against the
+  physical USB 2.0 flash drive, genuinely slower than QEMU's virtual block device), then another
+  marker printed quickly on the same line with no separator (the concatenated-text finding, now
+  fixed in Revision 2), then the display switched to graphics mode and rendered the test card. The
+  render itself was reported as noticeably slow (the render-speed finding, now fixed in Revision 2).
+  Tester's own words: "Yep that seems to work. Not a very descriptive text output... I saw the
+  first message, it pauses for a bit, then on the same line with no separator quickly prints
+  something else before going into graphics mode. That slow software render is uh... noticeable."
+- Which markers (if any) were visible on screen before the final render: at least `START` and one
+  subsequent marker (exact identity not confirmed — could be `COMMIT OK` or `ACTIVATED`, both print
+  in quick succession per the QEMU trace) were directly visible, confirming this firmware does NOT
+  default `ConsoleOut` to serial-only with a real GOP device attached.
+- Stable-display duration: `[not recorded]`
+- Unexpected behavior: none beyond the two Revision 2 findings above (both expected/benign, not
+  correctness failures).
+- Photograph paths: none for this run (informal report only).
+- Tester name/identifier: `[not recorded]`
+
+**For Revision 2**: `[pending a fresh run]`
 
 ## Firmware Quirk Decision
 
