@@ -83,9 +83,14 @@ cp "$EFI_FILE" "$BOOT_DIR/EFI/BOOT/BOOTX64.EFI"
 # confirmed against real OVMF, that handle is what LocateProtocol returns FIRST, ahead of either
 # explicit drive above, defeating the addr= ordering entirely. -vga none/-net none/-serial stdio
 # below re-add every default this harness still needs.
+# -m 512: explicit, generous RAM -- QEMU's own default (no -m flag) is 128 MiB, confirmed
+# empirically insufficient for RFC-0042 Phase Q's production-scale ArcFS capacities (-nodefaults
+# above suppresses default DEVICES, not the default RAM size, so this is still needed here); see
+# run-uefi-hello.sh's own header note and .agents/reports/aps-qemu-ram-ceiling.md for the full story.
 OUTPUT="$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
     -nodefaults \
     -bios "$OVMF_FD" \
+    -m 512 \
     -drive file="$DISK_IMAGE",format=raw,if=none,id=blockio0 \
     -device virtio-blk-pci,drive=blockio0,addr=0x3 \
     -drive file="fat:rw:$BOOT_DIR",format=raw,if=none,id=bootdisk \

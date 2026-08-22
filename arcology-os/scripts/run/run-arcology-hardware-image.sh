@@ -20,8 +20,14 @@ if [ ! -f "$IMAGE_FILE" ]; then
     exit 2
 fi
 
+# -m 512: explicit, generous RAM, matching every other harness script in this directory now (see
+# run-uefi-hello.sh's own header note and .agents/reports/aps-qemu-ram-ceiling.md) -- QEMU's own
+# default (no -m flag) is 128 MiB, confirmed empirically insufficient for RFC-0042 Phase Q's
+# production-scale ArcFS capacities. Kept consistent here too even though this harness's own
+# existing artifact doesn't need it yet, so every script in this directory shares one RAM budget.
 OUTPUT=$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
     -bios "$OVMF_FD" \
+    -m 512 \
     -drive "file=$IMAGE_FILE,format=raw" \
     -net none \
     -vga none \

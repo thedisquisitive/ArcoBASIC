@@ -61,8 +61,12 @@ trap 'rm -rf "$BOOT_DIR"' EXIT
 mkdir -p "$BOOT_DIR/EFI/BOOT"
 cp "$EFI_FILE" "$BOOT_DIR/EFI/BOOT/BOOTX64.EFI"
 
+# -m 512: explicit, generous RAM -- QEMU's own default (no -m flag) is 128 MiB, confirmed
+# empirically insufficient for RFC-0042 Phase Q's production-scale ArcFS capacities; see
+# run-uefi-hello.sh's own header note and .agents/reports/aps-qemu-ram-ceiling.md for the full story.
 OUTPUT="$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
     -bios "$OVMF_FD" \
+    -m 512 \
     -drive file="fat:rw:$BOOT_DIR",format=raw \
     -net none \
     -vga std \

@@ -61,8 +61,16 @@ cp "$EFI_FILE" "$BOOT_DIR/EFI/BOOT/BOOTX64.EFI"
 
 # -vga none forces OVMF's console onto the serial port (with a display device present, ConOut
 # defaults to the graphics console instead, which a headless harness cannot capture).
+# -m 512: explicit, generous RAM. QEMU's own default (no -m flag) for this machine type is 128 MiB
+# -- confirmed empirically, not assumed (a probe fixture wrote/read back a known pattern across a
+# range of physical addresses; every address at or above 128 MiB silently read back as 0, the same
+# "unbacked memory reads as zero" gotcha this project has already documented once for a single fixed
+# address, now confirmed as a real ceiling on the whole default RAM size). RFC-0042 Phase Q's own
+# production-scale ArcFS capacities do not fit inside that default -- this is a deliberate,
+# documented infrastructure change, not an incidental bump; see .agents/reports/aps-qemu-ram-ceiling.md.
 OUTPUT="$(timeout "$TIMEOUT_SECONDS" "$QEMU_BIN" \
     -bios "$OVMF_FD" \
+    -m 512 \
     -drive file="fat:rw:$BOOT_DIR",format=raw \
     -net none \
     -vga none \
