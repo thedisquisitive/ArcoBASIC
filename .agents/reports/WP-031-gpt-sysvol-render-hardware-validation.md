@@ -1,12 +1,10 @@
 # WP-031: Single-Disk GPT ArcFS System Volume + Render Physical Hardware Validation Package (Lenovo E15 Gen 2)
 
-**Status:** CORE RESULT CONFIRMED ON REAL HARDWARE for the ORIGINAL artifact below (informal
-real-time report, not a full structured checklist — see Observation) — but the fixture's own
-source has SINCE CHANGED (Revision 2, see below) in response to real findings from that exact
-hardware run. The bytes currently in `arcology-os/dist/gpt-sysvol-render/` no longer match the
-confirmed checksums and have NOT yet been re-confirmed on real hardware.
+**Status:** CORE RESULT CONFIRMED ON REAL HARDWARE for BOTH the original artifact AND Revision 2
+(informal real-time reports, not a full structured checklist — see Observation). Remaining
+platform-detail/timing/tester-identity fields below are still open for a future formal session.
 **Date prepared:** 2026-08-22
-**Date of real-hardware attempt:** 2026-08-22
+**Date of real-hardware attempt:** 2026-08-22 (original), 2026-08-22 (Revision 2, same day)
 
 **This is the first time the real single-disk GPT ESP+ArcFS boot chain (RFC-0044) has run on real
 physical hardware.** The human tester reported: the boot reached the real GOP test card (matching
@@ -33,8 +31,13 @@ the same GOP render code) — see that document for the full reasoning:
 Both fixes re-verified under QEMU: real positive pass on the GPT-partitioned disk image (real USB
 Mass Storage Class + real GOP), real negative control, 3x determinism, and the real ArcFS
 format/write/commit/activate chain all still passing (full serial trace: `STAR` → `CMOK` → `ACTO` →
-`DONE`, each on its own line now). New checksums below. **This Revision 2 artifact has NOT yet been
-run on real hardware.**
+`DONE`, each on its own line now). New checksums below.
+
+**Revision 2 CONFIRMED on real hardware the same day**: written to the same USB stick, byte-for-byte
+verified (device readback matched the source checksum) and the physical device's own partition
+table independently re-confirmed with `parted`. Human tester's own words: "That is much better."
+Both fixes held on the real Lenovo E15 Gen 2 — text markers on separate lines, and the render
+snapping in visibly faster than the original run.
 
 Do not mark this report complete from QEMU results. Fill every bracketed field during a physical
 test and attach photographs using repository-relative paths. Matches `.agents/reports/

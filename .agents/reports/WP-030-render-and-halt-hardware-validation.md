@@ -1,10 +1,11 @@
 # WP-030: "Render and Halt" Physical Hardware Validation Package (Lenovo E15 Gen2)
 
 **Status:** CORE RESULT CONFIRMED ON REAL HARDWARE for the ORIGINAL artifact below (photographic
-evidence, checksums `d3cb63b3...`/`27bc14c68...`) — but the fixture's own source has SINCE CHANGED
-(Revision 2, see below) in response to real findings from that exact hardware run. The bytes
-currently in `arcology-os/dist/render-and-halt/` no longer match the validated checksums and have
-NOT yet been re-confirmed on real hardware.
+evidence, checksums `d3cb63b3...`/`27bc14c68...`). Revision 2's underlying fix (identical
+`FillRun`/`\r\n` logic) has ALSO been confirmed on the same real hardware — but via
+`gpt-sysvol-render.abas`'s own real run (WP-031, which shares this exact render code), not this
+fixture's own Revision 2 bytes directly re-flashed and observed standalone. Re-flashing THIS
+specific artifact is still open as a quick confirming step, not a real risk.
 **Date prepared:** 2026-08-22
 **Date of real-hardware attempt:** 2026-08-22
 
