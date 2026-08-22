@@ -1,0 +1,206 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' RFC-0006: real hardware bring-up, "render and halt." Discovers the real GOP framebuffer (same
+' binding gop-discovery.abas already proves compiles correctly, RFC-0014) and fills the ENTIRE
+' real screen -- not a small fixed-size corner square -- with a two-tone test card: a dark
+' background field plus a large bright rectangle covering the middle half of the screen in both
+' dimensions. Width/Height/PixelsPerScanLine are all read from the REAL discovered mode, not
+' hardcoded, so this renders correctly at whatever resolution the real display actually reports.
+' Both pixel values (dark gray background, bright accent) stay clearly a "deliberate render, not
+' noise" test card regardless of whether the real GOP mode's own channel order is RGB or BGR
+' (RFC-0014's PixelRedGreenBlueReserved8/PixelBlueGreenRedReserved8) -- the two tones just trade
+' places, neither becomes invisible or looks like corruption.
+'
+' Dual-reports its result, matching graphical-storage-tooling.abas's own established pattern for
+' this exact situation (RFC-0014, `.agents/reports/aps-arcfs-phase-g.md` Addendum 4): ConsoleOut
+' text markers for a human watching the REAL screen (matching WP-026's own proven text-banner
+' shape -- if GOP is genuinely unavailable, this still reports that instead of hanging silently),
+' AND a serial marker for automated QEMU verification, since a real GOP device attached flips
+' OVMF's own ConOut default to the graphics console instead of serial, which a headless harness
+' cannot capture otherwise.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+' "ARCOLOGY RENDER AND HALT <TEXT>\r\n" over serial, for automated verification.
+FUNCTION SerialMarker(b0 AS U64, b1 AS U64, b2 AS U64, b3 AS U64) AS U64
+    SerialByte(65)
+    SerialByte(82)
+    SerialByte(67)
+    SerialByte(79)
+    SerialByte(76)
+    SerialByte(79)
+    SerialByte(71)
+    SerialByte(89)
+    SerialByte(32)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(78)
+    SerialByte(68)
+    SerialByte(69)
+    SerialByte(82)
+    SerialByte(32)
+    SerialByte(65)
+    SerialByte(78)
+    SerialByte(68)
+    SerialByte(32)
+    SerialByte(72)
+    SerialByte(65)
+    SerialByte(76)
+    SerialByte(84)
+    SerialByte(32)
+    IF b0 <> 0 THEN
+        LET c0 AS U8 = b0
+        SerialByte(c0)
+    END IF
+    IF b1 <> 0 THEN
+        LET c1 AS U8 = b1
+        SerialByte(c1)
+    END IF
+    IF b2 <> 0 THEN
+        LET c2 AS U8 = b2
+        SerialByte(c2)
+    END IF
+    IF b3 <> 0 THEN
+        LET c3 AS U8 = b3
+        SerialByte(c3)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT START")
+    SerialInit()
+    SerialMarker(83, 84, 65, 82)   ' STAR
+
+    LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
+    IF gop = 0 THEN
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT GOP UNAVAILABLE")
+        SerialMarker(78, 79, 71, 79)   ' NOGO(P)
+        CPU.HaltForever
+    END IF
+    LET mode AS UEFI.GraphicsOutputMode = UEFI.GOP.Mode(gop)
+    IF mode = 0 THEN
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT MODE UNAVAILABLE")
+        SerialMarker(78, 79, 77, 68)   ' NOMD
+        CPU.HaltForever
+    END IF
+
+    LET framebuffer AS PHYSICALPTR = UEFI.GOP.FrameBufferBase(gop)
+    LET framebufferSize AS U64 = UEFI.GOP.FrameBufferSize(gop)
+    LET width AS U32 = UEFI.GOP.Width(gop)
+    LET height AS U32 = UEFI.GOP.Height(gop)
+    LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
+    IF width = 0 THEN
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT ZERO WIDTH")
+        SerialMarker(90, 87, 68, 84)   ' ZWDT
+        CPU.HaltForever
+    END IF
+    IF height = 0 THEN
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT ZERO HEIGHT")
+        SerialMarker(90, 72, 71, 84)   ' ZHGT
+        CPU.HaltForever
+    END IF
+
+    LET mapped AS MMIOPTR = MEMORY.MapDevice(framebuffer, framebufferSize)
+
+    ' The bright accent rectangle covers the middle half of the screen in both dimensions --
+    ' unmistakable at any real resolution, not a fixed pixel count that could be a tiny sliver on
+    ' a real high-resolution panel or run off-screen on a small one.
+    LET accentLeft AS U32 = width \ 4
+    LET accentRight AS U32 = accentLeft + (width \ 2)
+    LET accentTop AS U32 = height \ 4
+    LET accentBottom AS U32 = accentTop + (height \ 2)
+
+    LET y AS U32 = 0
+    WHILE y < height
+        LET inAccentRow AS BOOL = 0
+        IF y >= accentTop THEN
+            IF y < accentBottom THEN
+                inAccentRow = 1
+            END IF
+        END IF
+        LET x AS U32 = 0
+        WHILE x < width
+            LET pixelOffset AS U32 = (y * stride + x) * 4
+            LET pixel AS MMIOPTR = ADDRESS.Offset(mapped, pixelOffset)
+            LET inAccentCol AS BOOL = 0
+            IF x >= accentLeft THEN
+                IF x < accentRight THEN
+                    inAccentCol = 1
+                END IF
+            END IF
+            IF inAccentRow = 1 THEN
+                IF inAccentCol = 1 THEN
+                    MEMORY.Write32(pixel, 65535)         ' bright accent (yellow or cyan depending on the real channel order)
+                ELSE
+                    MEMORY.Write32(pixel, 2105376)        ' dark gray background (R=G=B=0x20)
+                END IF
+            ELSE
+                MEMORY.Write32(pixel, 2105376)            ' same dark gray background
+            END IF
+            x = x + 1
+        WEND
+        y = y + 1
+    WEND
+
+    CPU.MemoryBarrier
+
+    ' Real self-verification, not just "GOP discovery succeeded": read back one pixel from the
+    ' background field and one from the accent rectangle's own center, confirming the actual
+    ' framebuffer bytes match what was just written -- the same discipline graphical-storage-
+    ' tooling.abas's own proof already established for reading rendered pixels back.
+    LET bgProbeOffset AS U32 = (10 * stride + 10) * 4
+    LET bgProbe AS MMIOPTR = ADDRESS.Offset(mapped, bgProbeOffset)
+    LET bgValue AS U32 = MEMORY.Read32(bgProbe)
+    LET accentCenterX AS U32 = accentLeft + (width \ 4)
+    LET accentCenterY AS U32 = accentTop + (height \ 4)
+    LET accentProbeOffset AS U32 = (accentCenterY * stride + accentCenterX) * 4
+    LET accentProbe AS MMIOPTR = ADDRESS.Offset(mapped, accentProbeOffset)
+    LET accentValue AS U32 = MEMORY.Read32(accentProbe)
+
+    IF bgValue <> 2105376 THEN
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT VERIFY FAILED")
+        SerialMarker(86, 70, 66, 71)   ' VFBG (background verify failed)
+        CPU.HaltForever
+    END IF
+    IF accentValue <> 65535 THEN
+        systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT VERIFY FAILED")
+        SerialMarker(86, 70, 65, 67)   ' VFAC (accent verify failed)
+        CPU.HaltForever
+    END IF
+
+    systemTable.ConsoleOut.Write("ARCOLOGY RENDER AND HALT DONE")
+    SerialMarker(68, 79, 78, 69)   ' DONE
+    CPU.HaltForever
+END FUNCTION

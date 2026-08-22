@@ -415,6 +415,12 @@ arco_add_script_test(
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 arco_add_script_test(
+    systems_render_and_halt_smoke
+    arcology-os/tests/systems/systems_render_and_halt_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
     systems_arco_basic_arcfs_phase_h_smoke
     arcology-os/tests/systems/systems_arco_basic_arcfs_phase_h_smoke.sh
     $<TARGET_FILE:ArcoFission>
