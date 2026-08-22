@@ -24,7 +24,7 @@ report does not assume them.
 
 ## Build Identity
 
-- Git commit: `27ba5ca7ad2a11835487be19f03f204be03b6178` (`ArcFS Phase X: physical-hardware validation package`) — the artifact below was built from this commit; a later commit touching `src/graphics/graphics.cpp`, `stdlib/graphics_primitives.abas`, or `tests/fixtures/render-and-halt/render-and-halt.abas` should get a fresh build before physical testing.
+- Git commit: `b32545a6881c64ab00f6bc696cf218375fb8ef06` (`RFC-0006: real GOP "render and halt" bring-up test + real USB boot proof`) — the artifact below was built from this commit (checksums confirmed byte-identical to the pre-commit build, as expected — nothing in the fixture's own source changed after that build). A later commit touching `src/graphics/graphics.cpp`, `stdlib/graphics_primitives.abas`, or `tests/fixtures/render-and-halt/render-and-halt.abas` should get a fresh build before physical testing.
 - Dirty-tree statement at physical test: `[required; use a clean checkout of the commit above]`
 - Compiler/version: `ArcoFission 0.1.0`
 - Image filename: `arcology-render-and-halt-x86_64.img`
