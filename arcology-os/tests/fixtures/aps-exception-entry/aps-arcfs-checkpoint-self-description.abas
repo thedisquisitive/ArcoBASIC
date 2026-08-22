@@ -1,3 +1,174 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+' "APS ARCFS CHECKPOINT COMPAT OK\r\n" -- printed only if every check below passed.
+FUNCTION SerialMarkerArcFSCheckpointCompatOK() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(65)
+    SerialByte(82)
+    SerialByte(67)
+    SerialByte(70)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(67)
+    SerialByte(72)
+    SerialByte(69)
+    SerialByte(67)
+    SerialByte(75)
+    SerialByte(80)
+    SerialByte(79)
+    SerialByte(73)
+    SerialByte(78)
+    SerialByte(84)
+    SerialByte(32)
+    SerialByte(67)
+    SerialByte(79)
+    SerialByte(77)
+    SerialByte(80)
+    SerialByte(65)
+    SerialByte(84)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+' APS RAM Disk Block Device Provider (RFC-0038: APS Block Storage and Filesystem Provider
+' Substrate, Requirements 6.1/6.2). Backs the Filesystem Provider layer (fat32_policy.abas) with
+' no real storage hardware driver needed -- the RAM disk itself is just a byte range in memory.
+
+
+' --- A documented deviation, stated up front, in the same spirit as loop_policy.abas's own
+' header note. ---
+'
+' RFC-0038 Section 6.1 specifies `RAMDisk.Create(sizeBytes AS U64) AS BlockDevice` -- a value of
+' an abstract `BlockDevice` interface type, so calling code can hold a RAM disk, a future AHCI
+' device, etc. behind one shape. This implementation exposes `RAMDisk.*` as concrete, directly-
+' named functions instead (`RAMDisk.SectorSize()`, `RAMDisk.ReadSectors(...)`, ...), and
+' `RAMDisk.Create` returns `BOOL`, not a `BlockDevice` value. Reason: this compiler's freestanding
+' x86-64 backend has no runtime-polymorphic dispatch mechanism at all -- confirmed the same way
+' RFC-0037's `Loop.RegisterHook` deviation was confirmed (AmirInstruction::Kind::AddressOf is
+' unhandled by generate_x86_64_function; CallValue can only call a compile-time-known function
+' name). There is only one RAM disk in this milestone -- the same "one instance, fixed scratch
+' state" pattern every prior RFC in this chain has used (one timer, one loop, one exception
+' table) -- so the concrete-function shape loses nothing real yet; it becomes a genuine gap only
+' once a second, different BlockDevice implementation (a real AHCI/NVMe/virtio-blk driver, all
+' explicitly Non-Goals/Future Extensions of this RFC) needs to be swapped in behind the same
+' calling code, at which point this needs the same treatment RFC-0027's freestanding callables
+' would need for Loop.RegisterHook.
+'
+' A second deviation, specific to RAMDisk.Create: RFC-0038's own text says the backing memory
+' should be "AllocatePages-sourced." This implementation's RAMDisk.Create does not allocate
+' memory at all -- it records the size of a *fixed, pre-populated* memory region (see
+' RAMDiskBaseAddress below) whose bytes are already correct by the time this program starts,
+' because the QEMU/OVMF test harness places them there before boot (scripts/run/
+' run-uefi-hello-with-preload.sh, a `-device loader,file=...,addr=...` preload -- see that
+' script's own header comment and .agents/reports/aps-block-storage.md for why). This sidesteps
+' RFC-0038 Stop Condition #17.5's anticipated UEFI-Block-IO-binding gap entirely rather than
+' hitting it: no UEFI protocol call populates this RAM disk in this implementation, at any point.
+' A future increment that actually copies bytes from a live UEFI Block IO device into freshly
+' AllocatePages'd memory would change this function's *body*, not its contract --
+' RAMDisk.SectorSize/SectorCount/ReadSectors/WriteSectors/IsWritable are unaffected either way.
+
+FUNCTION RAMDiskBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(67108864))   ' 0x4000000, 64 MiB -- see header note
+END FUNCTION
+
+FUNCTION RAMDiskStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33751040))   ' 0x2030000
+END FUNCTION
+
+FUNCTION RAMDisk.Create(sizeBytes AS U64) AS BOOL
+    MEMORY.Write64(RAMDiskStateAddress(), sizeBytes \ 512)
+    RETURN 1
+END FUNCTION
+
+FUNCTION RAMDisk.SectorSize() AS U32
+    RETURN 512
+END FUNCTION
+
+FUNCTION RAMDisk.SectorCount() AS U64
+    RETURN MEMORY.Read64(RAMDiskStateAddress())
+END FUNCTION
+
+FUNCTION RAMDisk.IsWritable() AS BOOL
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: MUST reject (return FALSE, MUST NOT partially transfer) a request whose
+' startSector + count exceeds SectorCount().
+FUNCTION RAMDisk.ReadSectors(startSector AS U64, count AS U32, destination AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i))
+        MEMORY.Write8(ADDRESS.Offset(destination, i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: WriteSectors on a device where IsWritable() is FALSE MUST return FALSE without
+' touching the medium -- not reachable for the RAM disk itself (always writable), but implemented
+' symmetrically with ReadSectors for contract completeness; unexercised by this RFC's own QEMU
+' proof, which only reads a pre-populated, read-only-in-spirit test image.
+FUNCTION RAMDisk.WriteSectors(startSector AS U64, count AS U32, source AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(source, i))
+        MEMORY.Write8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
 ' ArcologyFS (ArcFS) Phase A: in-memory semantic model (RFC-0039 Section 78, Phase A --
 ' "Implement: OIDs; directory namespace; files/streams; handle semantics; transactions;
 ' rename/delete behavior; capability checks; no persistent disk yet. Purpose: validate the object
@@ -5,9 +176,6 @@
 ' no checkpoints -- this is the object/namespace/handle CONTRACT proven against real memory and a
 ' real CPU before any of RFC-0039's later, much larger disk-format phases exist.
 
-#PROFILE UEFI
-#TARGET X86_64
-#RUNTIME NONE
 
 ' --- Documented Phase A scope reductions, stated up front. ---
 '
@@ -1483,55 +1651,6 @@ FUNCTION ArcFSCrc32C(base AS MMIOPTR, count AS U64) AS U64
     RETURN (crc XOR 4294967295) AND 4294967295
 END FUNCTION
 
-' RFC-0042 Section 7: the superblock's own feature-flags field (offset 48, inside the checksummed
-' region) split into three 16-bit sub-fields -- compat (bits 0-15, an older reader MAY safely
-' ignore), incompat (bits 16-31, an older reader MUST refuse to mount for), ro-compat (bits 32-47,
-' an older reader MAY mount read-only but MUST NOT mount read-write) -- plus 16 bits of genuine
-' forward-compatible headroom (48-63, MUST be written as 0, MUST be ignored, never rejected, by a
-' reader that finds them nonzero). The field has held a literal 0 and the comment "none defined
-' yet" since Phase H; this is that mechanism's first real use, even though no actual feature bit is
-' defined by this RFC itself (Section 7.3's own "never live inside this RFC's own new fields" --
-' Section 8's checkpoint self-description is unconditional baseline behavior, not an optional
-' feature gated by a bit).
-FUNCTION ArcFSRecognizedIncompatMask() AS U64
-    RETURN 0
-END FUNCTION
-
-FUNCTION ArcFSRecognizedRoCompatMask() AS U64
-    RETURN 0
-END FUNCTION
-
-' A mount-time-only companion address (the same "0 is impossible for a real checksum-verified
-' scratch overwrite, so pair it with its own address instead of widening a return type" idiom
-' ArcFSLastAllocatedOidHigh already established): the feature-flags field belonging to whichever
-' ring slot ArcFSSelectRingCheckpoint's own scan most recently selected as best.
-FUNCTION ArcFSLastSelectedFeatureFlagsAddress() AS MMIOPTR
-    RETURN ADDRESS.MMIO(ADDRESS.Virtual(35147776))   ' 0x2185000
-END FUNCTION
-
-' RFC-0042 Section 7.2: the mount-time contract. Returns 0 (refuse to mount) if ANY unrecognized
-' incompat bit is set; 2 (mount read-only) if no unrecognized incompat bit is set but an
-' unrecognized ro-compat bit is; 1 (mount normally) otherwise -- including when every bit is 0,
-' every volume this build has ever formatted, unchanged. `bits - (bits AND mask)` computes exactly
-' the bits set in `bits` but not in `mask` without needing a bitwise NOT this backend has no
-' operator for (verified: only AND/OR/XOR exist as binary bitwise operators here) -- safe because
-' `bits AND mask` is always a bitwise subset of `bits`, so ordinary subtraction never borrows.
-' `flags` is a reserved word in this dialect (confirmed directly, the same gotcha this project has
-' already hit for `next`) -- the parameter is named `rawFlags` instead.
-FUNCTION ArcFSCheckFeatureFlags(rawFlags AS U64) AS U64
-    LET incompatBits AS U64 = (rawFlags \ 65536) MOD 65536
-    LET roCompatBits AS U64 = (rawFlags \ 4294967296) MOD 65536
-    LET unrecognizedIncompat AS U64 = incompatBits - (incompatBits AND ArcFSRecognizedIncompatMask())
-    IF unrecognizedIncompat <> 0 THEN
-        RETURN 0
-    END IF
-    LET unrecognizedRoCompat AS U64 = roCompatBits - (roCompatBits AND ArcFSRecognizedRoCompatMask())
-    IF unrecognizedRoCompat <> 0 THEN
-        RETURN 2
-    END IF
-    RETURN 1
-END FUNCTION
-
 ' RFC-0042 Section 8.2: disambiguates a checkpoint record written before this RFC (104-byte
 ' payload, checksum at the fixed legacy offset 104) from one written by this build or later (a
 ' self-describing recordLength field AT offset 104, checksum at offset recordLength) purely by
@@ -1670,11 +1789,6 @@ FUNCTION ArcFSSelectRingCheckpoint() AS U64
                     IF logicalBlockSize = 512 THEN
                         IF formatMajor = 2 THEN
                             LET candidateCheckpointSector AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 56))
-                            ' RFC-0042 Section 7: this ring slot's own feature-flags field,
-                            ' extracted here (still inside the already-validated 64-byte
-                            ' checksummed superblock region) since `scratch` is about to be
-                            ' re-read as the candidate checkpoint below.
-                            LET candidateFlags AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 48))
                             ' Re-read scratch as the candidate checkpoint -- safe: this ring
                             ' slot's own superblock fields have already been extracted above into
                             ' locals, not left depending on scratch's contents any further.
@@ -1685,12 +1799,10 @@ FUNCTION ArcFSSelectRingCheckpoint() AS U64
                                         bestGeneration = candidateGeneration
                                         bestCheckpointSector = candidateCheckpointSector
                                         foundAny = 1
-                                        MEMORY.Write64(ArcFSLastSelectedFeatureFlagsAddress(), candidateFlags)
                                     ELSE
                                         IF candidateGeneration > bestGeneration THEN
                                             bestGeneration = candidateGeneration
                                             bestCheckpointSector = candidateCheckpointSector
-                                            MEMORY.Write64(ArcFSLastSelectedFeatureFlagsAddress(), candidateFlags)
                                         END IF
                                     END IF
                                 END IF
@@ -2002,27 +2114,9 @@ FUNCTION ArcFS.MountImage() AS BOOL
     ArcFS.Initialize()
     MEMORY.Write64(ADDRESS.Offset(ArcFSMountStateAddress(), 48), 0)
     MEMORY.Write64(ADDRESS.Offset(ArcFSMountStateAddress(), 88), 0)
-    ' RFC-0042 Section 7.2: every mount attempt starts from a clean ReadOnlySafety slate -- a real
-    ' bug this increment's own fixture caught on its first attempt: an unrecognized ro-compat bit
-    ' from an EARLIER mount left the flag armed forever afterward, since nothing in this function
-    ' ever cleared it (only ArcFS.MountImageSafe did, defensively, before calling this). A later,
-    ' genuinely clean remount (flags restored to 0) still reported read-only and refused real
-    ' commits -- found and fixed before shipping, not a latent gap left for later.
-    MEMORY.Write64(ArcFSReadOnlySafetyAddress(), 0)
 
     IF ArcFSReadSuperblockRing() = 0 THEN
         RETURN 0
-    END IF
-    ' RFC-0042 Section 7.2: refuse outright on an unrecognized INCOMPAT bit; arm ReadOnlySafety
-    ' (the same flag RFC-0039 Phase F's own repair-gate mechanism already established) on an
-    ' unrecognized RO-COMPAT bit with no unrecognized incompat bit; otherwise mount normally --
-    ' including the all-zero-flags case, every volume this build has ever formatted, unchanged.
-    LET featureCheck AS U64 = ArcFSCheckFeatureFlags(MEMORY.Read64(ArcFSLastSelectedFeatureFlagsAddress()))
-    IF featureCheck = 0 THEN
-        RETURN 0
-    END IF
-    IF featureCheck = 2 THEN
-        MEMORY.Write64(ArcFSReadOnlySafetyAddress(), 1)
     END IF
     IF ArcFSReadCheckpoint() = 0 THEN
         RETURN 0
@@ -5591,13 +5685,6 @@ FUNCTION ArcFS.MountImageSafe() AS U64
         MEMORY.Write64(ArcFSReadOnlySafetyAddress(), 1)
         RETURN 2
     END IF
-    ' RFC-0042 Section 7.2: ArcFS.MountImage itself may already have armed ReadOnlySafety (an
-    ' unrecognized ro-compat feature bit), with no scrub-detected defect involved at all -- checked
-    ' AFTER the scrub above so a genuine defect still reports through that path first, matching
-    ' this function's own established precedent of naming the more specific reason.
-    IF MEMORY.Read64(ArcFSReadOnlySafetyAddress()) <> 0 THEN
-        RETURN 2
-    END IF
     RETURN 1
 END FUNCTION
 
@@ -6003,4 +6090,383 @@ FUNCTION ArcFS.ActivateSystemVolume() AS U64
         RETURN 1
     END IF
     RETURN 2
+END FUNCTION
+
+' ==========================================================================================
+' RFC-0042 Section 9: a real backward-compatibility proof for the self-describing checkpoint
+' record (RFC-0042 Section 8). See .agents/reports/aps-arcfs-checkpoint-self-description.md for
+' the full design, including the scope note on why the "legacy writer" below runs in the same
+' compiled program as the current reader rather than a genuinely separate historical binary.
+' ==========================================================================================
+
+' A byte-for-byte REPLICA of the pre-RFC-0042 ArcFSWriteCheckpointRecord shape: 104-byte payload,
+' checksum at the fixed legacy offset 104, no recordLength field at all. Confirmed identical to
+' the removed function by direct comparison against source control history. Used ONLY to prove
+' ArcFSVerifyCheckpointChecksum's own legacy-interpretation branch against a genuinely
+' differently-shaped on-disk record.
+FUNCTION LegacyWriteCheckpointRecord(scratch AS MMIOPTR, generation AS U64, objectRoot AS U64, objectCount AS U64, namespaceRoot AS U64, namespaceCount AS U64, dataRegionStart AS U64, previousCheckpointSector AS U64, allocationBitmapSector AS U64, highWaterMark AS U64, attributeTreeRoot AS U64, attributeTreeCount AS U64, extentTreeRoot AS U64, extentTreeCount AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < 512
+        MEMORY.Write8(ADDRESS.Offset(scratch, i), 0)
+        i = i + 1
+    WEND
+    MEMORY.Write64(scratch, generation)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 8), objectRoot)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 16), objectCount)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 24), namespaceRoot)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 32), namespaceCount)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 40), dataRegionStart)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 48), previousCheckpointSector)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 56), allocationBitmapSector)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 64), highWaterMark)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 72), attributeTreeRoot)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 80), attributeTreeCount)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 88), extentTreeRoot)
+    MEMORY.Write64(ADDRESS.Offset(scratch, 96), extentTreeCount)
+    LET checksum AS U64 = ArcFSCrc32C(scratch, 104) AND 4294967295
+    MEMORY.Write32(ADDRESS.Offset(scratch, 104), checksum)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SCTestScratchBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34148352))   ' 0x2091000
+END FUNCTION
+
+FUNCTION SCTestStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34152448))   ' 0x2092000
+END FUNCTION
+
+FUNCTION SCTestScratch() AS MMIOPTR
+    LET base AS U64 = MEMORY.Read64(SCTestScratchBaseAddress())
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(base))
+END FUNCTION
+
+FUNCTION SCTestFailuresAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(SCTestStateAddress(), 0)
+END FUNCTION
+
+FUNCTION SCTestFail() AS U64
+    LET f AS U64 = MEMORY.Read64(SCTestFailuresAddress())
+    MEMORY.Write64(SCTestFailuresAddress(), f + 1)
+    RETURN 0
+END FUNCTION
+
+FUNCTION OidAAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(SCTestStateAddress(), 16)
+END FUNCTION
+
+FUNCTION NameA() AS MMIOPTR
+    RETURN ADDRESS.Offset(SCTestScratch(), 0)
+END FUNCTION
+
+FUNCTION DowngradeScratch() AS MMIOPTR
+    RETURN ADDRESS.Offset(SCTestScratch(), 512)
+END FUNCTION
+
+' Step 1: format, mount, create a real file with real content and a real attribute, commit --
+' producing a genuine self-describing (recordLength-bearing) checkpoint on the simulated disk.
+FUNCTION SCStepOneCreateAndCommit() AS U64
+    RAMDisk.Create(1048576)
+    IF ArcFS.FormatVolume() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.MountImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+
+    MEMORY.Write8(ADDRESS.Offset(NameA(), 0), 97)    ' a
+    MEMORY.Write8(ADDRESS.Offset(NameA(), 1), 46)    ' .
+    MEMORY.Write8(ADDRESS.Offset(NameA(), 2), 116)   ' t
+    MEMORY.Write8(ADDRESS.Offset(NameA(), 3), 120)   ' x
+    MEMORY.Write8(ADDRESS.Offset(NameA(), 4), 116)   ' t
+
+    LET oidA AS U64 = ArcFS.CreateFile(1, NameA(), 5)
+    IF oidA = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    MEMORY.Write64(OidAAddress(), oidA)
+
+    LET h AS U64 = ArcFS.OpenHandle(oidA)
+    IF h = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    LET pattern AS MMIOPTR = ADDRESS.Offset(SCTestScratch(), 1024)
+    LET i AS U64 = 0
+    WHILE i < 100
+        LET v AS U64 = 65 + (i MOD 26)
+        LET vb AS U8 = v
+        MEMORY.Write8(ADDRESS.Offset(pattern, i), vb)
+        i = i + 1
+    WEND
+    LET written AS U64 = ArcFS.HandleWrite(h, pattern, 100, 0)
+    IF written <> 100 THEN SCTestFail()
+    ArcFS.CloseHandle(h)
+
+    IF ArcFS.SetAttribute(oidA, 1, ArcFSAttrTypeUnsigned(), 424242, 0) = 0 THEN SCTestFail()
+
+    IF ArcFS.CommitImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Step 2/3: read every field back out of the ACTUAL on-disk checkpoint sector, confirm it really
+' is self-describing, then re-write that SAME sector using the byte-for-byte legacy replica --
+' downgrading its real on-disk SHAPE in place, not just re-deriving equivalent bytes from memory.
+' Remount and confirm it reads back correctly via the LEGACY interpretation path specifically,
+' with real content intact.
+FUNCTION SCStepTwoDowngradeAndVerifyLegacyPath() AS U64
+    IF ArcFS.MountImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    LET activeCheckpointSector AS U64 = MEMORY.Read64(ArcFSMountStateAddress())
+    IF activeCheckpointSector = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+
+    LET scratch AS MMIOPTR = DowngradeScratch()
+    IF RAMDisk.ReadSectors(activeCheckpointSector, 1, scratch) = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+
+    LET recordLength AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 104))
+    IF recordLength <> 112 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+
+    LET generation AS U64 = MEMORY.Read64(scratch)
+    LET objectRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 8))
+    LET objectCount AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 16))
+    LET namespaceRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 24))
+    LET namespaceCount AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 32))
+    LET dataRegionStart AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 40))
+    LET previousCheckpointSector AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 48))
+    LET allocationBitmapSector AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 56))
+    LET highWaterMark AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 64))
+    LET attributeTreeRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 72))
+    LET attributeTreeCount AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 80))
+    LET extentTreeRoot AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 88))
+    LET extentTreeCount AS U64 = MEMORY.Read64(ADDRESS.Offset(scratch, 96))
+
+    LegacyWriteCheckpointRecord(scratch, generation, objectRoot, objectCount, namespaceRoot, namespaceCount, dataRegionStart, previousCheckpointSector, allocationBitmapSector, highWaterMark, attributeTreeRoot, attributeTreeCount, extentTreeRoot, extentTreeCount)
+    IF RAMDisk.WriteSectors(activeCheckpointSector, 1, scratch) = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+
+    ' The real proof: a fresh remount against a checkpoint sector that is now, ON DISK, in the
+    ' exact pre-RFC-0042 shape.
+    IF ArcFS.MountImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+
+    LET oidA AS U64 = MEMORY.Read64(OidAAddress())
+    LET h AS U64 = ArcFS.OpenHandle(oidA)
+    IF h = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    LET readBack AS MMIOPTR = ADDRESS.Offset(SCTestScratch(), 2048)
+    LET readCount AS U64 = ArcFS.HandleRead(h, readBack, 100, 0)
+    ArcFS.CloseHandle(h)
+    IF readCount <> 100 THEN SCTestFail()
+    LET pattern AS MMIOPTR = ADDRESS.Offset(SCTestScratch(), 1024)
+    LET i AS U64 = 0
+    WHILE i < 100
+        IF MEMORY.Read8(ADDRESS.Offset(readBack, i)) <> MEMORY.Read8(ADDRESS.Offset(pattern, i)) THEN SCTestFail()
+        i = i + 1
+    WEND
+    IF ArcFS.GetAttribute(oidA, 1) <> 424242 THEN SCTestFail()
+    IF ArcFS.GetHealthState() <> 0 THEN SCTestFail()
+    RETURN 0
+END FUNCTION
+
+' Step 4: commit a FRESH generation using the current build (writing a real recordLength-bearing
+' record again) and confirm it ALSO mounts correctly, via the SELF-DESCRIBING path -- proving the
+' volume moved between both shapes in place, mid-lifetime, with no reformat anywhere in this
+' fixture's own history.
+FUNCTION SCStepThreeCommitAgainAndVerifySelfDescribingPath() AS U64
+    LET oidA AS U64 = MEMORY.Read64(OidAAddress())
+    IF ArcFS.SetAttribute(oidA, 2, ArcFSAttrTypeUnsigned(), 777, 0) = 0 THEN SCTestFail()
+    IF ArcFS.CommitImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.MountImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+
+    LET activeCheckpointSector AS U64 = MEMORY.Read64(ArcFSMountStateAddress())
+    LET scratch AS MMIOPTR = DowngradeScratch()
+    IF RAMDisk.ReadSectors(activeCheckpointSector, 1, scratch) = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    IF MEMORY.Read64(ADDRESS.Offset(scratch, 104)) <> 112 THEN SCTestFail()
+
+    LET oidA2 AS U64 = MEMORY.Read64(OidAAddress())
+    IF ArcFS.GetAttribute(oidA2, 1) <> 424242 THEN SCTestFail()
+    IF ArcFS.GetAttribute(oidA2, 2) <> 777 THEN SCTestFail()
+    IF ArcFS.GetHealthState() <> 0 THEN SCTestFail()
+    RETURN 0
+END FUNCTION
+
+' Step 5: negative control. Write a deliberately implausible recordLength (below this build's own
+' minimum of 112) directly onto a real checkpoint sector and confirm the mount fails closed --
+' neither interpretation validates (the legacy checksum at offset 104 no longer matches, since that
+' offset now holds a small integer, not real checksum bytes; the self-describing interpretation
+' rejects the candidate length outright for being too small).
+FUNCTION SCStepFourCorruptRecordLengthAndVerifyFailsClosed() AS U64
+    LET activeCheckpointSector AS U64 = MEMORY.Read64(ArcFSMountStateAddress())
+    LET scratch AS MMIOPTR = DowngradeScratch()
+    IF RAMDisk.ReadSectors(activeCheckpointSector, 1, scratch) = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    MEMORY.Write64(ADDRESS.Offset(scratch, 104), 50)
+    IF RAMDisk.WriteSectors(activeCheckpointSector, 1, scratch) = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+
+    IF ArcFS.MountImage() <> 0 THEN SCTestFail()
+    RETURN 0
+END FUNCTION
+FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET probe AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 1
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocate AS U64 = systemTable.BootServices.AllocatePool(2, allocationSize, bufferAddress)
+    IF allocate <> 0 THEN
+        RETURN 1
+    END IF
+    mapSize = allocationSize
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("APS PRE")
+
+    LET root AS U64 = 0
+    LET rootAddress AS PTR = ADDRESS.Local(root)
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 3, rootAddress)
+    IF pageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    LET scratchRoot AS U64 = 0
+    LET scratchRootAddress AS PTR = ADDRESS.Local(scratchRoot)
+    LET scratchPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 1, scratchRootAddress)
+    IF scratchPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS SCRATCH ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS PAGE")
+    LET pdpt AS U64 = root + 4096
+    LET pageDirectory AS U64 = root + 8192
+
+    LET clearIndex AS U64 = 0
+    WHILE clearIndex < 1536
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(root + (clearIndex * 8)), 0)
+        clearIndex = clearIndex + 1
+    WEND
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(root), pdpt OR 3)
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt), pageDirectory OR 3)
+    LET directoryIndex AS U64 = 0
+    WHILE directoryIndex < 512
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + (directoryIndex * 8)), (directoryIndex * 2097152) OR 131)
+        directoryIndex = directoryIndex + 1
+    WEND
+    LET rootCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(root))
+    LET pdptCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(pdpt))
+    IF rootCheck <> (pdpt OR 3) THEN
+        systemTable.ConsoleOut.Write("APS ROOT BAD")
+        CPU.HaltForever
+    END IF
+    IF pdptCheck <> (pageDirectory OR 3) THEN
+        systemTable.ConsoleOut.Write("APS PDPT BAD")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS TABLE OK")
+
+    CPU.DisableInterrupts
+    LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
+    IF exitStatus <> 0 THEN
+        CPU.HaltForever
+    END IF
+
+    CPU.DisableInterrupts
+    CPU.WriteCR3(root)
+    LET activeRoot AS U64 = CPU.ReadCR3()
+    IF activeRoot <> root THEN
+        CPU.HaltForever
+    END IF
+    MEMORY.Write32(ADDRESS.Virtual(1048576), 2779096485)
+
+    SerialInit()
+
+    MEMORY.Write64(SCTestScratchBaseAddress(), scratchRoot)
+    LET stateIndex AS U64 = 0
+    WHILE stateIndex < 64
+        MEMORY.Write8(ADDRESS.Offset(SCTestStateAddress(), stateIndex), 0)
+        stateIndex = stateIndex + 1
+    WEND
+
+    SCStepOneCreateAndCommit()
+    SCStepTwoDowngradeAndVerifyLegacyPath()
+    SCStepThreeCommitAgainAndVerifySelfDescribingPath()
+    SCStepFourCorruptRecordLengthAndVerifyFailsClosed()
+
+    LET failures AS U64 = MEMORY.Read64(SCTestFailuresAddress())
+    IF failures <> 0 THEN
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(32)
+        LET digit AS U64 = failures
+        IF digit > 9 THEN digit = 9
+        LET digitPlus48 AS U64 = digit + 48
+        LET digitByte AS U8 = digitPlus48
+        SerialByte(digitByte)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    SerialMarkerArcFSCheckpointCompatOK()
+    CPU.HaltForever
 END FUNCTION

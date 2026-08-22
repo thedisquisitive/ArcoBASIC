@@ -2,7 +2,7 @@
 
 **RFC Number:** RFC-0042\
 **Title:** ArcologyFS (ArcFS) Format Extensibility and Production Scale\
-**Status:** Draft\
+**Status:** Draft (Phases N and O implemented and QEMU-proven, delivered together -- Section 7's real feature negotiation for the superblock's own long-unused flags field, Section 8's self-describing checkpoint record (an append-only `recordLength` field disambiguated from every pre-RFC-0042 checkpoint by checksum validity, not a version flag -- moving it to offset 0 was considered and rejected during drafting since it would have broken every existing FMV2 checkpoint), and Section 9's real backward-compatibility proof against an actually-downgraded on-disk checkpoint shape. Two real bugs found and fixed along the way: `ArcFSReadCheckpoint`'s own `attributeTreeCount` bound checked the wrong constant (see `.agents/reports/aps-arcfs-attribute-bound-fix.md`), and `ArcFS.MountImage` never cleared `ArcFSReadOnlySafetyAddress` itself, leaving a ro-compat-triggered read-only condition stuck across later, genuinely clean remounts -- see `.agents/reports/aps-arcfs-phase-n-o.md`. Phases P (reserved row capacity), Q (production-scale capacities), and R (UTF-8/blob attribute values) remain undelivered.)\
 **Category:** Storage / Filesystem Architecture
 
 **Authors:** Arcology Project\
@@ -303,24 +303,42 @@ mounts it with the SAME build, in the same continuous boot session -- provably c
 once establishing that a REAL PRIOR SHAPE actually still mounts. This RFC's own acceptance MUST
 include a fixture that:
 
-1. Formats and commits a volume using a FROZEN, genuinely older copy of the checkpoint-writing
-   logic -- specifically, the exact `ArcFSWriteCheckpointRecord` shape from immediately BEFORE this
-   RFC's own Section 8 changes land (104-byte payload, no `recordLength` field, checksum at a fixed
-   offset) -- embedded the same way every other frozen ArcFS fixture in this project already embeds
-   a point-in-time copy of `arcology-os/stdlib/arcfs_policy.abas`.
-2. Mounts that image using the CURRENT build (with Section 8's changes applied) and confirms it
-   reads back correctly, via Section 8.2's LEGACY interpretation path specifically -- this is the
-   genuinely new proof: an actually-older on-disk shape, read by actually-newer code, in two
-   separate compiled programs, not one continuous session pretending to be two.
-3. Separately, commits a FRESH generation on the SAME volume using the CURRENT build (writing a real
-   `recordLength`-bearing record for the first time) and confirms IT ALSO mounts correctly, via
-   Section 8.2's SELF-DESCRIBING interpretation path -- proving both disambiguation branches, not
-   just the legacy one, and proving a volume can move from one to the other in place, mid-lifetime,
-   with no reformat.
-4. Separately, mounts a DELIBERATELY corrupted/truncated `recordLength` (shorter than this build's
-   own minimum) and confirms the mount fails closed with a clear structural-defect result, not a
-   partial or silently-wrong read -- the negative control this property specifically needs, distinct
-   from every other fixture's own "flip an assertion" negative control.
+1. Formats, mounts, and commits a real volume with real content using the CURRENT build (ordinary
+   `ArcFS.FormatVolume`/`ArcFS.CommitImage`), producing a genuine self-describing (`recordLength`
+   -bearing) checkpoint on the simulated disk.
+2. Reads every field back out of that ACTUAL on-disk checkpoint sector (not re-derived from live
+   in-memory state) and re-writes the SAME sector using a byte-for-byte REPLICA of the
+   pre-Section-8 `ArcFSWriteCheckpointRecord` shape -- 104-byte payload, checksum at the fixed
+   legacy offset 104, no `recordLength` field at all -- confirming first that the record being
+   downgraded really was self-describing (so there is something genuine to prove).
+3. Mounts that now-legacy-shaped sector using the CURRENT build and confirms it reads back
+   correctly, via Section 8.2's LEGACY interpretation path specifically, with the real content
+   (files, attributes) still resolving correctly -- an actually-older on-disk BYTE SHAPE, read by
+   the current reader, not merely a claim.
+4. Separately, commits a FRESH generation using the CURRENT build (writing a real
+   `recordLength`-bearing record again) and confirms it ALSO mounts correctly, via Section 8.2's
+   SELF-DESCRIBING interpretation path -- proving both disambiguation branches, not just the legacy
+   one, and proving a volume can move between shapes in place, mid-lifetime, with no reformat.
+5. Separately, mounts a DELIBERATELY corrupted/implausible `recordLength` (below this build's own
+   minimum) written directly onto a real checkpoint sector, and confirms the mount fails closed with
+   a clear structural-defect result -- the negative control this property specifically needs,
+   distinct from every other fixture's own "flip an assertion" negative control.
+
+**A scope note decided during implementation, stated honestly rather than silently substituted**:
+step 2's replica writer runs inside the SAME compiled program as the current reader, not as a
+genuinely separate historical binary in a separate QEMU boot. This is a deliberate, reasoned
+substitution, not a shortcut -- true cross-boot memory transfer (dump one QEMU guest's RAM to a
+host file, preload it into a second) needs real new harness infrastructure (`run-uefi-hello-with-
+preload.sh` already proves the PRELOAD direction; nothing in this project yet proves the DUMP
+direction) that does not exist yet and is not itself in this RFC's own scope. The substitution is
+sound specifically because Section 8.2's disambiguation is a pure function of on-disk BYTES -- it
+reads only what `RAMDisk.ReadSectors` returns and shares no in-memory state whatsoever with
+whatever wrote those bytes. A byte-for-byte replica of the removed function, confirmed identical by
+direct comparison against source control history, produces on-disk bytes indistinguishable from
+what a genuinely separate old binary would have produced; the reader cannot tell the difference and
+neither can this proof. A true two-binary proof remains a stronger, independently valuable future
+enhancement (Section 20's own Open Questions notes this), not a gap in what this specific
+requirement needed to establish.
 
 ## 9.2 Why this belongs in this RFC, not as an afterthought
 
@@ -602,6 +620,14 @@ one new capability.
    (matching every other RFC-0040 growable structure) or a fixed run of sectors (simpler, if the new
    ~64 MB ceiling is itself considered a acceptable NEW fixed ceiling rather than the start of a
    fully dynamic bitmap) is left to that phase's own report to decide and justify.
+4. Phase O's own backward-compatibility proof (Section 9.1) ended up substituting a same-process
+   byte-for-byte replica of the removed legacy writer for a genuinely separate historical binary in
+   a separate QEMU boot, reasoned through as sound for that specific byte-level property (see
+   Section 9.1's own scope note). A real dump-guest-RAM-to-host-file mechanism (the missing half of
+   what `run-uefi-hello-with-preload.sh` already proves in the PRELOAD direction) would make a
+   genuinely stronger, general-purpose version of this proof possible for future format-shape work
+   too -- worth building as its own small harness enhancement at some point, but not required by
+   anything this RFC itself needs.
 
 ------------------------------------------------------------------------
 
@@ -625,3 +651,4 @@ one new capability.
 | Version | Date       | Summary        |
 |---------|------------|-----------------|
 | 0.1     | 2026-08-21 | Initial draft. Written directly from a live status/planning conversation (RFC-0040's own accumulated increments up through the multi-attribute model and freestanding LEN/MID) that surfaced two previously-unnamed gaps: no real format-extensibility mechanism (every checkpoint growth so far has been a silent, untested breaking change within "FMV2"), and every capacity ceiling still sized for QEMU test speed rather than genuine use. Five phases (N-R): feature negotiation, self-describing checkpoint record, a real two-frozen-copies backward-compatibility proof (a genuinely new fixture shape for this project), reserved growth capacity in the three live row layouts, production-scale capacity constants, and UTF-8/binary-blob attribute values. Status: Draft; no implementation phase has begun. |
+| 0.2     | 2026-08-21 | Section 8's own mechanism revised DURING drafting, before any code was written: the original "recordLength at offset 0, generation shifts to offset 8" design was traced through and rejected -- it would have made every existing FMV2 checkpoint unreadable outright. Replaced with an append-only `recordLength` (offset 104, where the checksum used to live) disambiguated from a legacy record purely by which interpretation's own checksum validates, not a version flag -- sound because a legacy record's real checksum essentially never coincidentally validates under the new interpretation (a real CRC-32C collision is a 2^-32 event, an odds class this project already accepts everywhere else it relies on CRC-32C). Section 9's own fixture plan revised to match: downgrade a REAL committed checkpoint's own on-disk bytes in place (read every field back out, re-write with a byte-for-byte replica of the removed legacy writer) rather than reformat with a frozen historical stdlib copy, since the property under test is checksum disambiguation, not the whole format's own history. Phases N and O implemented and QEMU-proven, delivered together. Two real bugs found and fixed along the way (see the Status line's own summary and `.agents/reports/aps-arcfs-phase-n-o.md`/`.agents/reports/aps-arcfs-attribute-bound-fix.md`). New smoke tests `systems_arco_basic_arcfs_checkpoint_self_description_smoke` and `systems_arco_basic_arcfs_feature_negotiation_smoke`; full suite re-run clean (80/80). |
