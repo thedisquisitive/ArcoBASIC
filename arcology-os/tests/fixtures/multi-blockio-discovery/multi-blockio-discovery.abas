@@ -1,12 +1,33 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' Real multi-handle EFI_BLOCK_IO_PROTOCOL enumeration proof (RFC-0044 Phase 1), closing RFC-0038
+' Section 17.5's own "does not attempt multi-handle enumeration" scope reduction: unlike
+' blockio-disk-discovery.abas (a single LocateProtocol call returning whichever handle firmware
+' hands back first), this fixture uses UefiBlockDevice.DiscoverAll/SelectDiscovered
+' (LocateHandle+HandleProtocol, stdlib/uefi_block_device_policy.abas) to enumerate EVERY real,
+' distinct BlockIo handle QEMU exposes, then proves selection genuinely routes subsequent
+' ReadSectors/WriteSectors calls to the SPECIFICALLY SELECTED device -- not just that discovery
+' finds more than one handle. The QEMU harness (run-uefi-hello-with-blockio-disk.sh) attaches two
+' real block devices: the boot media itself (also a real BlockIo handle once enumerated) and a
+' dedicated virtio-blk disk built by build-blockio-test-disk.py (128 sectors, known magic pattern
+' at sector 5) -- this fixture identifies the test disk among however many handles are discovered
+' by its own known SectorCount (128), not by assuming a fixed index, since discovery order is
+' firmware-determined and not something this binding controls.
+
+' Frozen copy of stdlib/uefi_block_device_policy.abas, inlined below -- this compiler's
+' freestanding target takes one source file, no module/include system (matching every other
+' fixture in this project that needs a stdlib provider, e.g. blockio-fat32.abas's own header
+' note).
+
 ' UEFI-backed BlockDevice Provider (RFC-0038 Section 6.1/6.2), backed by a REAL discovered
 ' EFI_BLOCK_IO_PROTOCOL device -- the hardware-side follow-on to RFC-0038 Section 17.5's stop
 ' condition, closed at the compiler-binding level in
 ' .agents/reports/aps-blockio-discovery-binding.md, and proven against a real attached QEMU disk
 ' in .agents/reports/aps-blockio-disk-provider.md.
 
-#PROFILE UEFI
-#TARGET X86_64
-#RUNTIME NONE
 
 ' --- Documented deviations, stated up front, same spirit as block_device_policy.abas's own
 ' header note. ---
@@ -309,4 +330,192 @@ FUNCTION UefiBlockDevice.WriteSectors(startSector AS U64, count AS U32, source A
     LET bufferSize AS U64 = countAsU64 * 512
     LET status AS U64 = blockIo.WriteBlocks(mediaId, startSector, bufferSize, source)
     RETURN status = 0
+END FUNCTION
+
+FUNCTION BufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(39325696))   ' 0x2581000, this fixture's own scratch buffer
+END FUNCTION
+
+' This dialect has no ELSEIF -- nested IF/ELSE only.
+FUNCTION PrintDigit(systemTable AS UEFI.SystemTable, d AS U64) AS BOOL
+    IF d = 0 THEN
+        systemTable.ConsoleOut.Write("0")
+    ELSE
+        IF d = 1 THEN
+            systemTable.ConsoleOut.Write("1")
+        ELSE
+            IF d = 2 THEN
+                systemTable.ConsoleOut.Write("2")
+            ELSE
+                IF d = 3 THEN
+                    systemTable.ConsoleOut.Write("3")
+                ELSE
+                    IF d = 4 THEN
+                        systemTable.ConsoleOut.Write("4")
+                    ELSE
+                        IF d = 5 THEN
+                            systemTable.ConsoleOut.Write("5")
+                        ELSE
+                            IF d = 6 THEN
+                                systemTable.ConsoleOut.Write("6")
+                            ELSE
+                                IF d = 7 THEN
+                                    systemTable.ConsoleOut.Write("7")
+                                ELSE
+                                    IF d = 8 THEN
+                                        systemTable.ConsoleOut.Write("8")
+                                    ELSE
+                                        systemTable.ConsoleOut.Write("9")
+                                    END IF
+                                END IF
+                            END IF
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION PrintU64(systemTable AS UEFI.SystemTable, value AS U64) AS BOOL
+    IF value >= 10 THEN
+        PrintU64(systemTable, value \ 10)
+    END IF
+    PrintDigit(systemTable, value MOD 10)
+    RETURN 1
+END FUNCTION
+
+' Reads sector 5 of whatever device is currently selected and reports whether the known magic
+' pattern ("ARCO", build-blockio-test-disk.py) is present -- the read-side proof that selection
+' routed I/O to a specific real device.
+FUNCTION CheckMagicOnSelected(systemTable AS UEFI.SystemTable) AS BOOL
+    LET buffer AS MMIOPTR = BufferAddress()
+    MEMORY.Write8(buffer, 0)
+    LET readOk AS BOOL = UefiBlockDevice.ReadSectors(5, 1, buffer)
+    IF readOk = 0 THEN
+        RETURN 0
+    END IF
+    LET b0 AS U8 = MEMORY.Read8(buffer)
+    LET b1 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 1))
+    LET b2 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 2))
+    LET b3 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 3))
+    IF b0 = 65 AND b1 = 82 AND b2 = 67 AND b3 = 79 THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("MULTI BLOCKIO START")
+
+    LET count AS U64 = UefiBlockDevice.DiscoverAll(systemTable)
+    systemTable.ConsoleOut.Write(" COUNT=")
+    PrintU64(systemTable, count)
+    systemTable.ConsoleOut.Write(" END")
+
+    IF count < 2 THEN
+        systemTable.ConsoleOut.Write("MULTI BLOCKIO TOO FEW HANDLES")
+        CPU.HaltForever
+    END IF
+
+    ' Identify the known 128-sector test disk among however many handles were discovered, by its
+    ' own real recorded geometry -- discovery order is firmware-determined, not asserted here.
+    LET testDiskIndex AS U64 = 999
+    LET otherIndex AS U64 = 999
+    LET i AS U64 = 0
+    WHILE i < count
+        LET sectors AS U64 = UefiBlockDevice.DiscoveredSectorCount(i)
+        systemTable.ConsoleOut.Write(" IDX=")
+        PrintU64(systemTable, i)
+        systemTable.ConsoleOut.Write(" SECTORS=")
+        PrintU64(systemTable, sectors)
+        IF sectors = 128 THEN
+            IF testDiskIndex = 999 THEN
+                testDiskIndex = i
+            END IF
+        ELSE
+            IF otherIndex = 999 THEN
+                otherIndex = i
+            END IF
+        END IF
+        i = i + 1
+    WEND
+    systemTable.ConsoleOut.Write(" ENUMEND")
+
+    IF testDiskIndex = 999 THEN
+        systemTable.ConsoleOut.Write("MULTI BLOCKIO NO TEST DISK FOUND")
+        CPU.HaltForever
+    END IF
+    IF otherIndex = 999 THEN
+        systemTable.ConsoleOut.Write("MULTI BLOCKIO NO OTHER DEVICE FOUND")
+        CPU.HaltForever
+    END IF
+
+    ' Real negative proof first: select the OTHER (non-test) device and confirm the magic pattern
+    ' is genuinely absent there -- selection must actually change what gets read, not just what
+    ' DiscoveredCount/DiscoveredSectorCount report.
+    LET selectedOther AS BOOL = UefiBlockDevice.SelectDiscovered(otherIndex)
+    IF selectedOther = 0 THEN
+        systemTable.ConsoleOut.Write("MULTI BLOCKIO SELECT OTHER FAILED")
+        CPU.HaltForever
+    END IF
+    LET otherHasMagic AS BOOL = CheckMagicOnSelected(systemTable)
+    IF otherHasMagic <> 0 THEN
+        systemTable.ConsoleOut.Write("MULTI BLOCKIO OTHER UNEXPECTEDLY HAS MAGIC")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("MULTI BLOCKIO OTHER CORRECTLY NO MAGIC")
+
+    ' Real positive proof: select the test disk specifically and confirm the magic pattern IS
+    ' found there -- the two checks together prove SelectDiscovered genuinely routes I/O to the
+    ' selected device, not the same device regardless of index.
+    LET selectedTest AS BOOL = UefiBlockDevice.SelectDiscovered(testDiskIndex)
+    IF selectedTest = 0 THEN
+        systemTable.ConsoleOut.Write("MULTI BLOCKIO SELECT TEST FAILED")
+        CPU.HaltForever
+    END IF
+    LET testHasMagic AS BOOL = CheckMagicOnSelected(systemTable)
+    IF testHasMagic = 0 THEN
+        systemTable.ConsoleOut.Write("MULTI BLOCKIO TEST MISSING MAGIC")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("MULTI BLOCKIO TEST CORRECTLY HAS MAGIC")
+
+    ' Real write+read-back against the selected test disk, sector 10 (never written at image build
+    ' time), proving WriteSectors also routes to the selected device, not just ReadSectors.
+    LET buffer AS MMIOPTR = BufferAddress()
+    MEMORY.Write8(buffer, 90)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 1), 65)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 2), 80)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 3), 33)
+    LET writeOk AS BOOL = UefiBlockDevice.WriteSectors(10, 1, buffer)
+    IF writeOk = 0 THEN
+        systemTable.ConsoleOut.Write("MULTI BLOCKIO WRITE FAILED")
+        CPU.HaltForever
+    END IF
+
+    MEMORY.Write8(buffer, 0)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 1), 0)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 2), 0)
+    MEMORY.Write8(ADDRESS.Offset(buffer, 3), 0)
+    LET rereadOk AS BOOL = UefiBlockDevice.ReadSectors(10, 1, buffer)
+    IF rereadOk = 0 THEN
+        systemTable.ConsoleOut.Write("MULTI BLOCKIO REREAD FAILED")
+        CPU.HaltForever
+    END IF
+    LET r0 AS U8 = MEMORY.Read8(buffer)
+    LET r1 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 1))
+    LET r2 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 2))
+    LET r3 AS U8 = MEMORY.Read8(ADDRESS.Offset(buffer, 3))
+    IF r0 = 90 AND r1 = 65 AND r2 = 80 AND r3 = 33 THEN
+        systemTable.ConsoleOut.Write("MULTI BLOCKIO WRITE READBACK MATCH")
+    ELSE
+        systemTable.ConsoleOut.Write("MULTI BLOCKIO WRITE READBACK MISMATCH")
+    END IF
+
+    CPU.MemoryBarrier
+    systemTable.ConsoleOut.Write("MULTI BLOCKIO DONE")
+    CPU.HaltForever
 END FUNCTION

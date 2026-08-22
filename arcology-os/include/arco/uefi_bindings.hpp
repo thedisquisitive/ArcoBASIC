@@ -77,6 +77,20 @@ inline std::optional<UefiType> lookup_uefi_type(const std::string& name) {
                 // and an output interface pointer. A typed convenience wrapper remains a
                 // follow-up; this binding records the verified firmware entry point.
                 UefiField{"LocateProtocol", "LocateProtocol", 0x140, "", true, false, "U64"},
+                // EFI_BOOT_SERVICES.HandleProtocol (table index 11, offset 0x98). RFC-0044:
+                // resolves a specific EFI_HANDLE (e.g. one returned by LocateHandle below) to
+                // its real protocol interface pointer -- the counterpart LocateProtocol itself
+                // cannot provide, since LocateProtocol returns at most one implementation-chosen
+                // handle's own interface, never a specific handle among several.
+                UefiField{"HandleProtocol", "HandleProtocol", 0x98, "", true, false, "U64"},
+                // EFI_BOOT_SERVICES.LocateHandle (table index 20, offset 0xB0). RFC-0044: real
+                // multi-handle enumeration, closing RFC-0038 Section 17.5's own "does not attempt
+                // multi-handle enumeration" scope reduction. Takes a caller-provided, fixed-size
+                // buffer (IN/OUT BufferSize, OUT Buffer of EFI_HANDLE) rather than
+                // LocateHandleBuffer's own pool-allocated one -- no heap allocator exists on this
+                // backend, matching the same "fixed scratch buffer, not dynamic allocation"
+                // precedent every other table in this project already uses.
+                UefiField{"LocateHandle", "LocateHandle", 0xB0, "", true, false, "U64"},
                 // EFI_BOOT_SERVICES.ExitBootServices (table index 29, offset 0xE8). The
                 // image handle and memory-map key are explicit UINTN arguments; the service
                 // table pointer is not an implicit C++/protocol `This` parameter.
