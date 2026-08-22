@@ -1,3 +1,275 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' RFC-0043 Phase T, READER half of a genuine two-process cross-boot persistence proof (see
+' aps-arcfs-persist-writer.abas's own header note for the full design). This is a SEPARATE
+' fixture, compiled separately and run in a SEPARATE QEMU launch against the SAME real disk image
+' file the writer wrote to and fully exited from -- there is no shared process, no shared memory,
+' and every expected value below is a literal constant written directly into THIS source file
+' (not read from, or derived from, the writer's own source in any way), the same discipline
+' RFC-0042 Section 9's own backward-compatibility fixture already established for an analogous
+' "prove this really is disambiguated from real on-disk bytes alone" property.
+
+' UEFI-backed BlockDevice Provider (RFC-0038 Section 6.1/6.2), backed by a REAL discovered
+' EFI_BLOCK_IO_PROTOCOL device -- the hardware-side follow-on to RFC-0038 Section 17.5's stop
+' condition, closed at the compiler-binding level in
+' .agents/reports/aps-blockio-discovery-binding.md, and proven against a real attached QEMU disk
+' in .agents/reports/aps-blockio-disk-provider.md.
+
+
+' --- Documented deviations, stated up front, same spirit as block_device_policy.abas's own
+' header note. ---
+'
+' 1. Same "concrete functions instead of an abstract BlockDevice interface value" deviation
+'    RAMDisk.* already documents -- this backend has no runtime-polymorphic dispatch at all.
+'
+' 2. A SECOND, NEW deviation this provider needed that RAMDisk.* did not: the discovered
+'    UEFI.BlockIoProtocol value itself cannot be persisted across calls as a still-typed value the
+'    way mediaId/blockSize/sectorCount can. What CAN be persisted -- and what genuinely works,
+'    confirmed directly against real generated x86-64 before relying on it -- is the raw protocol
+'    pointer as a plain U64, RELOADED and RE-DECLARED with an explicit `AS UEFI.BlockIoProtocol`
+'    type annotation in each function that needs to call a real protocol method. This works
+'    because this compiler's field-chain resolution (src/compiler/fission.cpp) keys off a
+'    variable's DECLARED type (tracked per-function in a name->type map populated by every typed
+'    LET, not only function parameters), not off whether the variable literally is a parameter --
+'    an is_method call on ANY local variable carrying an explicit UEFI.* type annotation resolves
+'    through the same generic CallExternal path a genuine parameter would. Confirmed in generated
+'    x86-64: `call [r11+0x18]`, ReadBlocks's own registered offset, appears identically whether
+'    blockIo arrives as a parameter or is reloaded from memory and re-annotated. (An earlier,
+'    narrower reading of this constraint -- assuming only literal parameters work -- is corrected
+'    here; not a defect in the earlier binding work, just an incomplete first read of the
+'    resolution code before this provider needed the fuller picture.)
+'
+' 3. `UefiBlockDevice.Discover` requires the discovered media's own BlockSize to be exactly 512.
+'    UEFI.BLOCKIO.MediaFlags only exposes the packed RemovableMedia/MediaPresent/LogicalPartition/
+'    ReadOnly word (uefi-bindings.md's own documented scope reduction: no single-byte
+'    displacement-addressed encoder primitive exists, so a whole packed word is read instead of
+'    one bit) -- this provider extracts the bits it needs from that word via ordinary SHR/AND.
+'
+' 4. UEFI.BLOCKIO.DISCOVER is a single LocateProtocol call (matching UEFI.GOP.DISCOVER's own
+'    documented single-handle scope): it returns whichever EFI_BLOCK_IO_PROTOCOL handle firmware
+'    hands back first, not necessarily any particular disk a caller has in mind. This provider
+'    does not attempt multi-handle enumeration/selection -- callers that need a SPECIFIC device
+'    among several need a future, separate enumeration binding, out of scope here.
+
+FUNCTION UefiBlockDeviceStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(37748736))   ' 0x2400000, this provider's own scratch state
+END FUNCTION
+
+' State layout, all within one page: blockIo pointer (U64, +0), mediaId (U32, +8), sectorCount
+' (U64, +16), writable flag (U32, +24), discovered flag (U32, +28).
+FUNCTION UefiBlockDeviceStatePointerAddress() AS MMIOPTR
+    RETURN UefiBlockDeviceStateAddress()
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateMediaIdAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 8)
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateSectorCountAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 16)
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateWritableAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 24)
+END FUNCTION
+
+FUNCTION UefiBlockDeviceStateDiscoveredAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(UefiBlockDeviceStateAddress(), 28)
+END FUNCTION
+
+' Discovers a real EFI_BLOCK_IO_PROTOCOL device and records its identity/geometry into fixed
+' scratch state for every later UefiBlockDevice.* call to use. Requires the discovered media to be
+' present and to use exactly 512-byte sectors (scope reduction #3 above) -- returns FALSE rather
+' than a partially-usable provider otherwise, matching RFC-0038 Requirement 6.1's own fail-closed
+' spirit for RAMDisk.
+FUNCTION UefiBlockDevice.Discover(systemTable AS UEFI.SystemTable) AS BOOL
+    LET blockIo AS UEFI.BlockIoProtocol = UEFI.BLOCKIO.Discover(systemTable)
+    IF blockIo = 0 THEN
+        RETURN 0
+    END IF
+
+    LET mediaFlags AS U32 = UEFI.BLOCKIO.MediaFlags(blockIo)
+    LET mediaPresent AS U32 = (mediaFlags \ 256) AND 255
+    LET readOnly AS U32 = (mediaFlags \ 16777216) AND 255
+    IF mediaPresent = 0 THEN
+        RETURN 0
+    END IF
+
+    LET blockSize AS U32 = UEFI.BLOCKIO.BlockSize(blockIo)
+    IF blockSize <> 512 THEN
+        RETURN 0
+    END IF
+
+    LET lastBlock AS U64 = UEFI.BLOCKIO.LastBlock(blockIo)
+    LET mediaId AS U32 = UEFI.BLOCKIO.MediaId(blockIo)
+
+    MEMORY.Write64(UefiBlockDeviceStatePointerAddress(), blockIo)
+    MEMORY.Write32(UefiBlockDeviceStateMediaIdAddress(), mediaId)
+    MEMORY.Write64(UefiBlockDeviceStateSectorCountAddress(), lastBlock + 1)
+    IF readOnly = 0 THEN
+        MEMORY.Write32(UefiBlockDeviceStateWritableAddress(), 1)
+    ELSE
+        MEMORY.Write32(UefiBlockDeviceStateWritableAddress(), 0)
+    END IF
+    MEMORY.Write32(UefiBlockDeviceStateDiscoveredAddress(), 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION UefiBlockDevice.IsDiscovered() AS BOOL
+    RETURN MEMORY.Read32(UefiBlockDeviceStateDiscoveredAddress())
+END FUNCTION
+
+FUNCTION UefiBlockDevice.SectorSize() AS U32
+    RETURN 512
+END FUNCTION
+
+FUNCTION UefiBlockDevice.SectorCount() AS U64
+    RETURN MEMORY.Read64(UefiBlockDeviceStateSectorCountAddress())
+END FUNCTION
+
+FUNCTION UefiBlockDevice.IsWritable() AS BOOL
+    RETURN MEMORY.Read32(UefiBlockDeviceStateWritableAddress())
+END FUNCTION
+
+' Requirement 6.1: MUST reject (return FALSE, MUST NOT partially transfer) a request whose
+' startSector + count exceeds SectorCount() -- checked BEFORE the real ReadBlocks call, matching
+' RAMDisk.ReadSectors's own bounds-check-first shape.
+FUNCTION UefiBlockDevice.ReadSectors(startSector AS U64, count AS U32, destination AS MMIOPTR) AS BOOL
+    LET total AS U64 = UefiBlockDevice.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET blockIo AS UEFI.BlockIoProtocol = MEMORY.Read64(UefiBlockDeviceStatePointerAddress())
+    LET mediaId AS U32 = MEMORY.Read32(UefiBlockDeviceStateMediaIdAddress())
+    LET bufferSize AS U64 = countAsU64 * 512
+    LET status AS U64 = blockIo.ReadBlocks(mediaId, startSector, bufferSize, destination)
+    RETURN status = 0
+END FUNCTION
+
+' Requirement 6.1: WriteSectors on a device where IsWritable() is FALSE MUST return FALSE without
+' touching the medium -- checked before ever calling the real WriteBlocks method, matching
+' RAMDisk.WriteSectors's own contract, now genuinely reachable (a real EFI_BLOCK_IO_MEDIA can
+' legitimately be read-only, unlike RAMDisk's always-writable fixed region).
+FUNCTION UefiBlockDevice.WriteSectors(startSector AS U64, count AS U32, source AS MMIOPTR) AS BOOL
+    IF UefiBlockDevice.IsWritable() = 0 THEN
+        RETURN 0
+    END IF
+    LET total AS U64 = UefiBlockDevice.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET blockIo AS UEFI.BlockIoProtocol = MEMORY.Read64(UefiBlockDeviceStatePointerAddress())
+    LET mediaId AS U32 = MEMORY.Read32(UefiBlockDeviceStateMediaIdAddress())
+    LET bufferSize AS U64 = countAsU64 * 512
+    LET status AS U64 = blockIo.WriteBlocks(mediaId, startSector, bufferSize, source)
+    RETURN status = 0
+END FUNCTION
+' APS RAM Disk Block Device Provider (RFC-0038: APS Block Storage and Filesystem Provider
+' Substrate, Requirements 6.1/6.2). Backs the Filesystem Provider layer (fat32_policy.abas) with
+' no real storage hardware driver needed -- the RAM disk itself is just a byte range in memory.
+
+
+' --- A documented deviation, stated up front, in the same spirit as loop_policy.abas's own
+' header note. ---
+'
+' RFC-0038 Section 6.1 specifies `RAMDisk.Create(sizeBytes AS U64) AS BlockDevice` -- a value of
+' an abstract `BlockDevice` interface type, so calling code can hold a RAM disk, a future AHCI
+' device, etc. behind one shape. This implementation exposes `RAMDisk.*` as concrete, directly-
+' named functions instead (`RAMDisk.SectorSize()`, `RAMDisk.ReadSectors(...)`, ...), and
+' `RAMDisk.Create` returns `BOOL`, not a `BlockDevice` value. Reason: this compiler's freestanding
+' x86-64 backend has no runtime-polymorphic dispatch mechanism at all -- confirmed the same way
+' RFC-0037's `Loop.RegisterHook` deviation was confirmed (AmirInstruction::Kind::AddressOf is
+' unhandled by generate_x86_64_function; CallValue can only call a compile-time-known function
+' name). There is only one RAM disk in this milestone -- the same "one instance, fixed scratch
+' state" pattern every prior RFC in this chain has used (one timer, one loop, one exception
+' table) -- so the concrete-function shape loses nothing real yet; it becomes a genuine gap only
+' once a second, different BlockDevice implementation (a real AHCI/NVMe/virtio-blk driver, all
+' explicitly Non-Goals/Future Extensions of this RFC) needs to be swapped in behind the same
+' calling code, at which point this needs the same treatment RFC-0027's freestanding callables
+' would need for Loop.RegisterHook.
+'
+' A second deviation, specific to RAMDisk.Create: RFC-0038's own text says the backing memory
+' should be "AllocatePages-sourced." This implementation's RAMDisk.Create does not allocate
+' memory at all -- it records the size of a *fixed, pre-populated* memory region (see
+' RAMDiskBaseAddress below) whose bytes are already correct by the time this program starts,
+' because the QEMU/OVMF test harness places them there before boot (scripts/run/
+' run-uefi-hello-with-preload.sh, a `-device loader,file=...,addr=...` preload -- see that
+' script's own header comment and .agents/reports/aps-block-storage.md for why). This sidesteps
+' RFC-0038 Stop Condition #17.5's anticipated UEFI-Block-IO-binding gap entirely rather than
+' hitting it: no UEFI protocol call populates this RAM disk in this implementation, at any point.
+' A future increment that actually copies bytes from a live UEFI Block IO device into freshly
+' AllocatePages'd memory would change this function's *body*, not its contract --
+' RAMDisk.SectorSize/SectorCount/ReadSectors/WriteSectors/IsWritable are unaffected either way.
+
+FUNCTION RAMDiskBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(67108864))   ' 0x4000000, 64 MiB -- see header note
+END FUNCTION
+
+FUNCTION RAMDiskStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33751040))   ' 0x2030000
+END FUNCTION
+
+FUNCTION RAMDisk.Create(sizeBytes AS U64) AS BOOL
+    MEMORY.Write64(RAMDiskStateAddress(), sizeBytes \ 512)
+    RETURN 1
+END FUNCTION
+
+FUNCTION RAMDisk.SectorSize() AS U32
+    RETURN 512
+END FUNCTION
+
+FUNCTION RAMDisk.SectorCount() AS U64
+    RETURN MEMORY.Read64(RAMDiskStateAddress())
+END FUNCTION
+
+FUNCTION RAMDisk.IsWritable() AS BOOL
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: MUST reject (return FALSE, MUST NOT partially transfer) a request whose
+' startSector + count exceeds SectorCount().
+FUNCTION RAMDisk.ReadSectors(startSector AS U64, count AS U32, destination AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i))
+        MEMORY.Write8(ADDRESS.Offset(destination, i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: WriteSectors on a device where IsWritable() is FALSE MUST return FALSE without
+' touching the medium -- not reachable for the RAM disk itself (always writable), but implemented
+' symmetrically with ReadSectors for contract completeness; unexercised by this RFC's own QEMU
+' proof, which only reads a pre-populated, read-only-in-spirit test image.
+FUNCTION RAMDisk.WriteSectors(startSector AS U64, count AS U32, source AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(source, i))
+        MEMORY.Write8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
 ' ArcologyFS (ArcFS) Phase A: in-memory semantic model (RFC-0039 Section 78, Phase A --
 ' "Implement: OIDs; directory namespace; files/streams; handle semantics; transactions;
 ' rename/delete behavior; capability checks; no persistent disk yet. Purpose: validate the object
@@ -5,9 +277,6 @@
 ' no checkpoints -- this is the object/namespace/handle CONTRACT proven against real memory and a
 ' real CPU before any of RFC-0039's later, much larger disk-format phases exist.
 
-#PROFILE UEFI
-#TARGET X86_64
-#RUNTIME NONE
 
 ' --- Documented Phase A scope reductions, stated up front. ---
 '
@@ -6349,4 +6618,89 @@ FUNCTION ArcFS.ActivateSystemVolume() AS U64
         RETURN 1
     END IF
     RETURN 2
+END FUNCTION
+FUNCTION PersistReaderBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(39321600))   ' 0x2580000, this fixture's own scratch buffer
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("PERSIST READER PRE")
+
+    ' A genuinely SEPARATE process from the writer -- this fixture has no in-memory record of
+    ' anything the writer did. Every expected value below is a literal constant written directly
+    ' into THIS source file, compared against whatever this process reads back off the real disk.
+    LET discovered AS BOOL = UefiBlockDevice.Discover(systemTable)
+    IF discovered = 0 THEN
+        systemTable.ConsoleOut.Write("PERSIST READER DISCOVER FAILED")
+        CPU.HaltForever
+    END IF
+
+    ArcFS.SelectBlockDevice(ArcFS.BlockDeviceProviderUefi())
+    IF ArcFS.ActiveBlockDevice() <> 1 THEN
+        systemTable.ConsoleOut.Write("PERSIST READER SELECT FAILED")
+        CPU.HaltForever
+    END IF
+
+    IF ArcFS.MountImage() = 0 THEN
+        systemTable.ConsoleOut.Write("PERSIST READER MOUNT FAILED")
+        CPU.HaltForever
+    END IF
+
+    LET nameBuf AS MMIOPTR = PersistReaderBufferAddress()
+    MEMORY.Write8(nameBuf, 104)          ' h
+    MEMORY.Write8(ADDRESS.Offset(nameBuf, 1), 105)   ' i
+    MEMORY.Write8(ADDRESS.Offset(nameBuf, 2), 46)    ' .
+    MEMORY.Write8(ADDRESS.Offset(nameBuf, 3), 116)   ' t
+    MEMORY.Write8(ADDRESS.Offset(nameBuf, 4), 120)   ' x
+    MEMORY.Write8(ADDRESS.Offset(nameBuf, 5), 116)   ' t
+    LET oid AS U64 = ArcFS.Lookup(1, nameBuf, 6)
+    IF oid = 0 THEN
+        systemTable.ConsoleOut.Write("PERSIST READER LOOKUP FAILED")
+        CPU.HaltForever
+    END IF
+
+    LET h AS U64 = ArcFS.OpenHandle(oid)
+    IF h = 0 THEN
+        systemTable.ConsoleOut.Write("PERSIST READER OPEN FAILED")
+        CPU.HaltForever
+    END IF
+    LET readBack AS MMIOPTR = ADDRESS.Offset(PersistReaderBufferAddress(), 64)
+    LET readCount AS U64 = ArcFS.HandleRead(h, readBack, 10, 0)
+    ArcFS.CloseHandle(h)
+    IF readCount <> 10 THEN
+        systemTable.ConsoleOut.Write("PERSIST READER READ FAILED")
+        CPU.HaltForever
+    END IF
+
+    ' Literal expected bytes for "Arcology!!" -- baked into this process independently of the
+    ' writer, not derived from it.
+    LET mismatch AS U64 = 0
+    IF MEMORY.Read8(readBack) <> 65 THEN mismatch = mismatch + 1
+    IF MEMORY.Read8(ADDRESS.Offset(readBack, 1)) <> 114 THEN mismatch = mismatch + 1
+    IF MEMORY.Read8(ADDRESS.Offset(readBack, 2)) <> 99 THEN mismatch = mismatch + 1
+    IF MEMORY.Read8(ADDRESS.Offset(readBack, 3)) <> 111 THEN mismatch = mismatch + 1
+    IF MEMORY.Read8(ADDRESS.Offset(readBack, 4)) <> 108 THEN mismatch = mismatch + 1
+    IF MEMORY.Read8(ADDRESS.Offset(readBack, 5)) <> 111 THEN mismatch = mismatch + 1
+    IF MEMORY.Read8(ADDRESS.Offset(readBack, 6)) <> 103 THEN mismatch = mismatch + 1
+    IF MEMORY.Read8(ADDRESS.Offset(readBack, 7)) <> 121 THEN mismatch = mismatch + 1
+    IF MEMORY.Read8(ADDRESS.Offset(readBack, 8)) <> 33 THEN mismatch = mismatch + 1
+    IF MEMORY.Read8(ADDRESS.Offset(readBack, 9)) <> 33 THEN mismatch = mismatch + 1
+    IF mismatch <> 0 THEN
+        systemTable.ConsoleOut.Write("PERSIST READER CONTENT MISMATCH")
+        CPU.HaltForever
+    END IF
+
+    IF ArcFS.GetAttributeType(oid, 1) <> ArcFSAttrTypeUnsigned() THEN
+        systemTable.ConsoleOut.Write("PERSIST READER ATTRIBUTE TYPE MISMATCH")
+        CPU.HaltForever
+    END IF
+    IF ArcFS.GetAttribute(oid, 1) <> 424242 THEN
+        systemTable.ConsoleOut.Write("PERSIST READER ATTRIBUTE VALUE MISMATCH")
+        CPU.HaltForever
+    END IF
+
+    CPU.MemoryBarrier
+    systemTable.ConsoleOut.Write("PERSIST READER DONE")
+    CPU.HaltForever
 END FUNCTION

@@ -13,6 +13,7 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
     echo "#PROFILE UEFI"
     echo "#TARGET X86_64"
     echo "#RUNTIME NONE"
+    grep -v '^#PROFILE\|^#TARGET\|^#RUNTIME' "$ROOT/stdlib/uefi_block_device_policy.abas"
     grep -v '^#PROFILE\|^#TARGET\|^#RUNTIME' "$ROOT/stdlib/block_device_policy.abas"
     grep -v '^#PROFILE\|^#TARGET\|^#RUNTIME' "$ROOT/stdlib/arcfs_policy.abas"
     grep -v '^#PROFILE\|^#TARGET\|^#RUNTIME' "$ROOT/stdlib/system_namespace_policy.abas"
