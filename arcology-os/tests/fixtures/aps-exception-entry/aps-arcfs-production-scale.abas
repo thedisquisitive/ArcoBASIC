@@ -1,3 +1,173 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+' "APS ARCFS PRODUCTION SCALE OK\r\n" -- printed only if every check below passed.
+FUNCTION SerialMarkerArcFSProductionScaleOK() AS U64
+    SerialByte(65)
+    SerialByte(80)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(65)
+    SerialByte(82)
+    SerialByte(67)
+    SerialByte(70)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(79)
+    SerialByte(68)
+    SerialByte(85)
+    SerialByte(67)
+    SerialByte(84)
+    SerialByte(73)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(32)
+    SerialByte(83)
+    SerialByte(67)
+    SerialByte(65)
+    SerialByte(76)
+    SerialByte(69)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+' APS RAM Disk Block Device Provider (RFC-0038: APS Block Storage and Filesystem Provider
+' Substrate, Requirements 6.1/6.2). Backs the Filesystem Provider layer (fat32_policy.abas) with
+' no real storage hardware driver needed -- the RAM disk itself is just a byte range in memory.
+
+
+' --- A documented deviation, stated up front, in the same spirit as loop_policy.abas's own
+' header note. ---
+'
+' RFC-0038 Section 6.1 specifies `RAMDisk.Create(sizeBytes AS U64) AS BlockDevice` -- a value of
+' an abstract `BlockDevice` interface type, so calling code can hold a RAM disk, a future AHCI
+' device, etc. behind one shape. This implementation exposes `RAMDisk.*` as concrete, directly-
+' named functions instead (`RAMDisk.SectorSize()`, `RAMDisk.ReadSectors(...)`, ...), and
+' `RAMDisk.Create` returns `BOOL`, not a `BlockDevice` value. Reason: this compiler's freestanding
+' x86-64 backend has no runtime-polymorphic dispatch mechanism at all -- confirmed the same way
+' RFC-0037's `Loop.RegisterHook` deviation was confirmed (AmirInstruction::Kind::AddressOf is
+' unhandled by generate_x86_64_function; CallValue can only call a compile-time-known function
+' name). There is only one RAM disk in this milestone -- the same "one instance, fixed scratch
+' state" pattern every prior RFC in this chain has used (one timer, one loop, one exception
+' table) -- so the concrete-function shape loses nothing real yet; it becomes a genuine gap only
+' once a second, different BlockDevice implementation (a real AHCI/NVMe/virtio-blk driver, all
+' explicitly Non-Goals/Future Extensions of this RFC) needs to be swapped in behind the same
+' calling code, at which point this needs the same treatment RFC-0027's freestanding callables
+' would need for Loop.RegisterHook.
+'
+' A second deviation, specific to RAMDisk.Create: RFC-0038's own text says the backing memory
+' should be "AllocatePages-sourced." This implementation's RAMDisk.Create does not allocate
+' memory at all -- it records the size of a *fixed, pre-populated* memory region (see
+' RAMDiskBaseAddress below) whose bytes are already correct by the time this program starts,
+' because the QEMU/OVMF test harness places them there before boot (scripts/run/
+' run-uefi-hello-with-preload.sh, a `-device loader,file=...,addr=...` preload -- see that
+' script's own header comment and .agents/reports/aps-block-storage.md for why). This sidesteps
+' RFC-0038 Stop Condition #17.5's anticipated UEFI-Block-IO-binding gap entirely rather than
+' hitting it: no UEFI protocol call populates this RAM disk in this implementation, at any point.
+' A future increment that actually copies bytes from a live UEFI Block IO device into freshly
+' AllocatePages'd memory would change this function's *body*, not its contract --
+' RAMDisk.SectorSize/SectorCount/ReadSectors/WriteSectors/IsWritable are unaffected either way.
+
+FUNCTION RAMDiskBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(67108864))   ' 0x4000000, 64 MiB -- see header note
+END FUNCTION
+
+FUNCTION RAMDiskStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(33751040))   ' 0x2030000
+END FUNCTION
+
+FUNCTION RAMDisk.Create(sizeBytes AS U64) AS BOOL
+    MEMORY.Write64(RAMDiskStateAddress(), sizeBytes \ 512)
+    RETURN 1
+END FUNCTION
+
+FUNCTION RAMDisk.SectorSize() AS U32
+    RETURN 512
+END FUNCTION
+
+FUNCTION RAMDisk.SectorCount() AS U64
+    RETURN MEMORY.Read64(RAMDiskStateAddress())
+END FUNCTION
+
+FUNCTION RAMDisk.IsWritable() AS BOOL
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: MUST reject (return FALSE, MUST NOT partially transfer) a request whose
+' startSector + count exceeds SectorCount().
+FUNCTION RAMDisk.ReadSectors(startSector AS U64, count AS U32, destination AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i))
+        MEMORY.Write8(ADDRESS.Offset(destination, i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Requirement 6.1: WriteSectors on a device where IsWritable() is FALSE MUST return FALSE without
+' touching the medium -- not reachable for the RAM disk itself (always writable), but implemented
+' symmetrically with ReadSectors for contract completeness; unexercised by this RFC's own QEMU
+' proof, which only reads a pre-populated, read-only-in-spirit test image.
+FUNCTION RAMDisk.WriteSectors(startSector AS U64, count AS U32, source AS MMIOPTR) AS BOOL
+    LET total AS U64 = RAMDisk.SectorCount()
+    LET countAsU64 AS U64 = count
+    IF startSector + countAsU64 > total THEN
+        RETURN 0
+    END IF
+    LET byteOffset AS U64 = startSector * 512
+    LET byteCount AS U64 = count * 512
+    LET i AS U64 = 0
+    WHILE i < byteCount
+        LET value AS U8 = MEMORY.Read8(ADDRESS.Offset(source, i))
+        MEMORY.Write8(ADDRESS.Offset(RAMDiskBaseAddress(), byteOffset + i), value)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
 ' ArcologyFS (ArcFS) Phase A: in-memory semantic model (RFC-0039 Section 78, Phase A --
 ' "Implement: OIDs; directory namespace; files/streams; handle semantics; transactions;
 ' rename/delete behavior; capability checks; no persistent disk yet. Purpose: validate the object
@@ -5,9 +175,6 @@
 ' no checkpoints -- this is the object/namespace/handle CONTRACT proven against real memory and a
 ' real CPU before any of RFC-0039's later, much larger disk-format phases exist.
 
-#PROFILE UEFI
-#TARGET X86_64
-#RUNTIME NONE
 
 ' --- Documented Phase A scope reductions, stated up front. ---
 '
@@ -6086,4 +6253,324 @@ FUNCTION ArcFS.ActivateSystemVolume() AS U64
         RETURN 1
     END IF
     RETURN 2
+END FUNCTION
+
+' ==========================================================================================
+' RFC-0042 Section 11: production-scale ArcFS capacities. ArcFSMaxObjects() 64->2048,
+' ArcFSMaxNamespaceRows()/ArcFSMaxAttributes() 128->4096, ArcFSMaxHandles() 8->64,
+' ArcFSMaxFileChunks() 4->8 (32KB max file size).
+'
+' A real, important coupling found while designing this fixture, not assumed away: the Allocation
+' Bitmap's own volume-size ceiling (ArcFSMaxTrackedSectors()=508 sectors, ~254KB) is UNCHANGED this
+' phase (deferred to a future increment, RFC-0042 Section 11.1's own "largest single piece of new
+' mechanism" note) -- and every commit BULK-REBUILDS the whole Object+Namespace trees fresh (this
+' project's own established copy-on-write discipline since Phase C), so real DISK cost per object
+' is dominated by tree-node overhead, not file content. Traced through concretely: persisting
+' anywhere near the new 2048-object LIVE ceiling would need roughly 800KB+ of tree nodes alone,
+' vastly exceeding the current ~254KB volume ceiling regardless of file content strategy. This
+' fixture therefore proves two things SEPARATELY, each within the current volume ceiling's own real
+' budget: (1) a genuinely higher object COUNT than this project's old 64-object ceiling has ever
+' actually persisted to disk in one commit (80 objects, real path resolution after remount), and
+' (2) the new 32KB max file size, on a SEPARATE, freshly-formatted volume so its own budget doesn't
+' compete with (1)'s tree-node overhead. The full practical benefit of ArcFSMaxObjects()=2048
+' remains a LIVE, in-memory capacity until a future increment raises the volume-size ceiling to
+' match -- named honestly, not silently assumed. See .agents/reports/aps-arcfs-phase-q.md.
+' ==========================================================================================
+
+FUNCTION SCTestScratchBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34148352))   ' 0x2091000
+END FUNCTION
+
+FUNCTION SCTestStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(34152448))   ' 0x2092000
+END FUNCTION
+
+FUNCTION SCTestScratch() AS MMIOPTR
+    LET base AS U64 = MEMORY.Read64(SCTestScratchBaseAddress())
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(base))
+END FUNCTION
+
+FUNCTION SCTestFailuresAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(SCTestStateAddress(), 0)
+END FUNCTION
+
+FUNCTION SCTestFail() AS U64
+    LET f AS U64 = MEMORY.Read64(SCTestFailuresAddress())
+    MEMORY.Write64(SCTestFailuresAddress(), f + 1)
+    RETURN 0
+END FUNCTION
+
+FUNCTION LastOidAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(SCTestStateAddress(), 16)
+END FUNCTION
+
+FUNCTION NameBuf() AS MMIOPTR
+    RETURN ADDRESS.Offset(SCTestScratch(), 0)
+END FUNCTION
+
+FUNCTION BigPattern() AS MMIOPTR
+    RETURN ADDRESS.Offset(SCTestScratch(), 64)
+END FUNCTION
+
+FUNCTION ReadBackBuf() AS MMIOPTR
+    RETURN ADDRESS.Offset(SCTestScratch(), 40000)
+END FUNCTION
+
+' Scenario 1: 80 real objects (25% more than this project's own old 64-object ceiling) on one
+' volume, empty (sparse, zero real extents each -- RFC-0040 Section 11.3) so the proof isolates
+' object-COUNT scale from file-content cost, forcing a genuinely deep multi-level Object Tree (node
+' capacity stays 4: 80 leaf entries needs 20 leaf nodes, 5 second-level, 2 third-level, 1 root -- a
+' real 4-level tree). A real commit + remount, then real path resolution for the first, a middle,
+' and the last object -- not just "80 objects exist," but "each individually resolvable by name
+' after a real round trip through the now much deeper tree."
+FUNCTION SCStepOneManyObjectsRealCount() AS U64
+    RAMDisk.Create(524288)
+    IF ArcFS.FormatVolume() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.MountImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+
+    LET i AS U64 = 0
+    WHILE i < 80
+        LET nameBuf AS MMIOPTR = NameBuf()
+        MEMORY.Write8(nameBuf, 102)   ' 'f'
+        LET digits AS U64 = ArcFSWriteDecimal(ADDRESS.Offset(nameBuf, 1), i)
+        LET oid AS U64 = ArcFS.CreateFile(1, nameBuf, 1 + digits)
+        IF oid = 0 THEN
+            SCTestFail()
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+
+    IF ArcFS.CommitImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.MountImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.GetHealthState() <> 0 THEN SCTestFail()
+
+    LET nameBuf AS MMIOPTR = NameBuf()
+    MEMORY.Write8(nameBuf, 102)
+    MEMORY.Write8(ADDRESS.Offset(nameBuf, 1), 48)
+    IF ArcFS.Lookup(1, nameBuf, 2) = 0 THEN SCTestFail()   ' f0
+
+    LET midDigits AS U64 = ArcFSWriteDecimal(ADDRESS.Offset(nameBuf, 1), 40)
+    IF ArcFS.Lookup(1, nameBuf, 1 + midDigits) = 0 THEN SCTestFail()   ' f40
+
+    LET lastDigits AS U64 = ArcFSWriteDecimal(ADDRESS.Offset(nameBuf, 1), 79)
+    IF ArcFS.Lookup(1, nameBuf, 1 + lastDigits) = 0 THEN SCTestFail()   ' f79
+    RETURN 0
+END FUNCTION
+
+' Scenario 2: a SEPARATE, freshly-formatted volume, small object count (root + 1 file), proving
+' the new 32KB max file size (ArcFSMaxFileChunks()=8, up from 4) in isolation, so its own real disk
+' budget (32KB data + a handful of extent/attribute tree nodes) doesn't compete with Scenario 1's
+' own tree-node budget. Full 32768-byte content, byte-for-byte verified after a real commit+
+' remount, plus a real attribute alongside it.
+FUNCTION SCStepTwoMaxFileSizeRealContent() AS U64
+    RAMDisk.Create(262144)
+    IF ArcFS.FormatVolume() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.MountImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+
+    LET nameBuf AS MMIOPTR = NameBuf()
+    MEMORY.Write8(nameBuf, 98)    ' b
+    MEMORY.Write8(ADDRESS.Offset(nameBuf, 1), 105)  ' i
+    MEMORY.Write8(ADDRESS.Offset(nameBuf, 2), 103)  ' g
+    MEMORY.Write8(ADDRESS.Offset(nameBuf, 3), 46)   ' .
+    MEMORY.Write8(ADDRESS.Offset(nameBuf, 4), 116)  ' t
+    LET oid AS U64 = ArcFS.CreateFile(1, nameBuf, 5)
+    IF oid = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    MEMORY.Write64(LastOidAddress(), oid)
+
+    LET pattern AS MMIOPTR = BigPattern()
+    LET p AS U64 = 0
+    WHILE p < 32768
+        LET v AS U64 = 65 + (p MOD 26)
+        LET vb AS U8 = v
+        MEMORY.Write8(ADDRESS.Offset(pattern, p), vb)
+        p = p + 1
+    WEND
+    LET h AS U64 = ArcFS.OpenHandle(oid)
+    IF h = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    LET written AS U64 = ArcFS.HandleWrite(h, pattern, 32768, 0)
+    IF written <> 32768 THEN SCTestFail()
+    ArcFS.CloseHandle(h)
+    IF ArcFS.SetAttribute(oid, 1, ArcFSAttrTypeUnsigned(), 999888777, 0) = 0 THEN SCTestFail()
+
+    IF ArcFS.CommitImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.MountImage() = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    IF ArcFS.GetHealthState() <> 0 THEN SCTestFail()
+
+    LET oid2 AS U64 = MEMORY.Read64(LastOidAddress())
+    LET h2 AS U64 = ArcFS.OpenHandle(oid2)
+    IF h2 = 0 THEN
+        SCTestFail()
+        RETURN 0
+    END IF
+    LET readBack AS MMIOPTR = ReadBackBuf()
+    LET readCount AS U64 = ArcFS.HandleRead(h2, readBack, 32768, 0)
+    ArcFS.CloseHandle(h2)
+    IF readCount <> 32768 THEN SCTestFail()
+    LET mismatch AS U64 = 0
+    LET p2 AS U64 = 0
+    WHILE p2 < 32768
+        IF MEMORY.Read8(ADDRESS.Offset(readBack, p2)) <> MEMORY.Read8(ADDRESS.Offset(pattern, p2)) THEN
+            mismatch = mismatch + 1
+        END IF
+        p2 = p2 + 1
+    WEND
+    IF mismatch <> 0 THEN SCTestFail()
+    IF ArcFS.GetAttribute(oid2, 1) <> 999888777 THEN SCTestFail()
+    RETURN 0
+END FUNCTION
+FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET probe AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 1
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocate AS U64 = systemTable.BootServices.AllocatePool(2, allocationSize, bufferAddress)
+    IF allocate <> 0 THEN
+        RETURN 1
+    END IF
+    mapSize = allocationSize
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("APS PRE")
+
+    LET root AS U64 = 0
+    LET rootAddress AS PTR = ADDRESS.Local(root)
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 3, rootAddress)
+    IF pageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    LET scratchRoot AS U64 = 0
+    LET scratchRootAddress AS PTR = ADDRESS.Local(scratchRoot)
+    LET scratchPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 1, scratchRootAddress)
+    IF scratchPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("APS SCRATCH ALLOC FAIL")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS PAGE")
+    LET pdpt AS U64 = root + 4096
+    LET pageDirectory AS U64 = root + 8192
+
+    LET clearIndex AS U64 = 0
+    WHILE clearIndex < 1536
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(root + (clearIndex * 8)), 0)
+        clearIndex = clearIndex + 1
+    WEND
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(root), pdpt OR 3)
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt), pageDirectory OR 3)
+    LET directoryIndex AS U64 = 0
+    WHILE directoryIndex < 512
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + (directoryIndex * 8)), (directoryIndex * 2097152) OR 131)
+        directoryIndex = directoryIndex + 1
+    WEND
+    LET rootCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(root))
+    LET pdptCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(pdpt))
+    IF rootCheck <> (pdpt OR 3) THEN
+        systemTable.ConsoleOut.Write("APS ROOT BAD")
+        CPU.HaltForever
+    END IF
+    IF pdptCheck <> (pageDirectory OR 3) THEN
+        systemTable.ConsoleOut.Write("APS PDPT BAD")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("APS TABLE OK")
+
+    CPU.DisableInterrupts
+    LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
+    IF exitStatus <> 0 THEN
+        CPU.HaltForever
+    END IF
+
+    CPU.DisableInterrupts
+    CPU.WriteCR3(root)
+    LET activeRoot AS U64 = CPU.ReadCR3()
+    IF activeRoot <> root THEN
+        CPU.HaltForever
+    END IF
+    MEMORY.Write32(ADDRESS.Virtual(1048576), 2779096485)
+
+    SerialInit()
+
+    MEMORY.Write64(SCTestScratchBaseAddress(), scratchRoot)
+    LET stateIndex AS U64 = 0
+    WHILE stateIndex < 64
+        MEMORY.Write8(ADDRESS.Offset(SCTestStateAddress(), stateIndex), 0)
+        stateIndex = stateIndex + 1
+    WEND
+
+    SCStepOneManyObjectsRealCount()
+    SCStepTwoMaxFileSizeRealContent()
+
+    LET failures AS U64 = MEMORY.Read64(SCTestFailuresAddress())
+    IF failures <> 0 THEN
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(32)
+        LET digit AS U64 = failures
+        IF digit > 9 THEN digit = 9
+        LET digitPlus48 AS U64 = digit + 48
+        LET digitByte AS U8 = digitPlus48
+        SerialByte(digitByte)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    SerialMarkerArcFSProductionScaleOK()
+    CPU.HaltForever
 END FUNCTION
