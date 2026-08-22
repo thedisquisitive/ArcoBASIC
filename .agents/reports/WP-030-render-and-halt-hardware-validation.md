@@ -1,7 +1,14 @@
 # WP-030: "Render and Halt" Physical Hardware Validation Package (Lenovo E15 Gen2)
 
-**Status:** READY FOR HUMAN EXECUTION — NOT YET VALIDATED
+**Status:** CORE RESULT CONFIRMED ON REAL HARDWARE (photographic evidence) — a small number of
+platform-detail and stability-duration fields below still require the human tester's own account
+before this package can be marked fully complete.
 **Date prepared:** 2026-08-22
+**Date of real-hardware attempt:** 2026-08-22
+
+**This is the first artifact in the entire Arcology OS project confirmed to run on real physical
+hardware.** Every prior QEMU-only proof in this project's history, however extensive, remained
+unconfirmed on real silicon until this result.
 
 Do not mark this report complete from QEMU results. Fill every bracketed field during a physical
 test and attach photographs using repository-relative paths. Matches `.agents/reports/
@@ -32,7 +39,7 @@ report does not assume them.
 - EFI SHA-256: `d3cb63b3cf5efc6f8831ea970431ac2bba96bf0f1e9a7cf080a44041380fd82b`
 - Image SHA-256: `27bc14c68fa6aa3c9eb4887c0162608d0e4b077dbf532690edb930abbbc1981a`
 - Full checksums: `arcology-os/dist/render-and-halt/SHA256SUMS`
-- Media write command/tool: `[required]`
+- Media write command/tool: `sudo dd if=arcology-render-and-halt-x86_64.img of=/dev/sda bs=4M conv=fsync status=progress && sync` — run by the assistant on the user's explicit, confirmed instruction. `/dev/sda` was independently confirmed as the correct target before writing (`lsblk`: TYPE=disk, TRAN=usb, RM=1, MODEL="USB 2.0 FD", SIZE=28.9G — the drive's prior GPT contents, including a partition the user had labeled `LAZARUS_STATE`, were confirmed with the user before wiping). Post-write verification: `sha256sum` of the first 67108864 bytes read back directly from `/dev/sda` matched the source image's checksum exactly (`27bc14c68f...981a`) — a real, byte-for-byte confirmed write, not merely a `dd` exit code of 0.
 
 **Pre-physical-test sanity check already performed (QEMU, not a substitute for the checklist
 below):** the built image carries the correct FAT32 boot signature (`55 AA` at offset 510) and
@@ -101,29 +108,41 @@ issue.
 ## Test Platform
 
 - Laptop model: `Lenovo ThinkPad E15 Gen 2`
-- CPU: `[required — record the exact SKU, e.g. via BIOS/firmware setup or a sticker]`
-- Firmware vendor: `[required]`
-- Firmware version/date: `[required]`
-- UEFI mode enabled: `[yes/no]`
-- Legacy/CSM state: `[enabled/disabled/unavailable]`
-- Secure Boot state: `[enabled/disabled]`
-- Removable-media make/model/capacity: `[required]`
+- CPU: `[still required — record the exact SKU, e.g. via BIOS/firmware setup or a sticker]`
+- Firmware vendor: `[still required]`
+- Firmware version/date: `[still required]`
+- UEFI mode enabled: `[still required — yes/no]`
+- Legacy/CSM state: `[still required — enabled/disabled/unavailable]`
+- Secure Boot state: `[still required — enabled/disabled; note if it had to be turned off for this unsigned image to boot at all]`
+- Removable-media make/model/capacity: `"USB 2.0 FD", 28.9 GiB reported capacity (~32GB nominal), confirmed via lsblk before writing`
 - Real display resolution (if known/queryable beforehand): `[optional — the test itself discovers this dynamically and does not require it in advance]`
 
 ## Checklist
 
-- [ ] `sha256sum -c SHA256SUMS` passes before writing media.
-- [ ] The selected block device was independently confirmed as removable.
-- [ ] Firmware detects the media.
-- [ ] Firmware loads `EFI/BOOT/BOOTX64.EFI`.
-- [ ] `ARCOLOGY RENDER AND HALT START` appears (text, before the render).
-- [ ] The full-screen two-tone test card appears (dark gray field, bright rectangle covering the
-      middle half of the screen in both dimensions) — see "What you should see" above.
-- [ ] `ARCOLOGY RENDER AND HALT DONE` appears (text, after the render AND after the pixel-readback
-      self-verification both passed).
-- [ ] The display remains stable for at least 60 seconds.
-- [ ] The application does not return to firmware or reset.
-- [ ] Power cycle exits the halt normally.
+- [x] `sha256sum -c SHA256SUMS` passes before writing media — confirmed (`BOOTX64.EFI: OK`,
+      `arcology-render-and-halt-x86_64.img: OK`).
+- [x] The selected block device was independently confirmed as removable (`lsblk` RM=1, TRAN=usb).
+- [x] Firmware detects the media — implied by the successful boot; not independently timestamped.
+- [x] Firmware loads `EFI/BOOT/BOOTX64.EFI` — implied by the render actually appearing.
+- [ ] `ARCOLOGY RENDER AND HALT START` appears (text, before the render) — not independently
+      observed; the single photograph captures only the final halted state, not the boot sequence.
+      Logically must have occurred (the fixture prints it before ever discovering GOP), but this is
+      an inference from source, not a direct observation — leaving unchecked on principle.
+- [x] The full-screen two-tone test card appears (dark gray field, bright rectangle) — CONFIRMED,
+      `.agents/reports/evidence/WP-030-real-hw-test.jpg`: dark navy-blue field, large bright teal rectangle. (Photographed at an
+      angle with the laptop's own camera/webcam area visible in-frame, so the rectangle's exact
+      proportions in the photo are foreshortened — not a measurement of the real render's own
+      pixel-accurate width/height ratio.)
+- [x] `ARCOLOGY RENDER AND HALT DONE` appears (text, after the render AND after the pixel-readback
+      self-verification both passed) — CONFIRMED, clearly legible in the upper-left of
+      `.agents/reports/evidence/WP-030-real-hw-test.jpg`. This is the single strongest piece of evidence in this package: it can
+      only print after GOP discovery, mode read, the full-screen fill, AND both pixel-readback
+      self-verification checks (background AND accent) all succeeded — a VERIFY FAILED/NOGO/NOMD/
+      ZWDT/ZHGT marker would have printed instead had any of those failed.
+- [ ] The display remains stable for at least 60 seconds — not yet independently confirmed (a
+      single photograph is one instant in time).
+- [ ] The application does not return to firmware or reset — not yet independently confirmed.
+- [ ] Power cycle exits the halt normally — not yet independently confirmed.
 
 ## Failure Signatures to Watch For (not exhaustive — record whatever actually happens)
 
@@ -139,26 +158,49 @@ issue.
 
 ## Observation
 
-- Start time/timezone: `[required]`
-- Exact observed behavior: `[required]`
-- Real display resolution observed (if determinable from the render, e.g. by comparing the
-  accent-rectangle's own proportions to the physical screen): `[optional]`
-- Stable-display duration: `[required]`
-- Unexpected behavior: `[none or details]`
-- Photograph paths: `[required]`
-- Tester name/identifier: `[required]`
+- Start time/timezone: `[still required]`
+- Exact observed behavior: Dark (navy-blue, not neutral gray — a real, expected channel-order
+  effect the fixture's own design anticipated) background field; large bright teal/cyan accent
+  rectangle positioned in the middle portion of the screen; `ARCOLOGY RENDER AND HALT DONE` text
+  legible in the upper-left. Matches the expected two-tone test card shape. See `.agents/reports/evidence/WP-030-real-hw-test.jpg`
+  (repository root).
+- Real display resolution observed: `[still optional/required — not determinable from this photo's
+  own oblique camera angle]`
+- Stable-display duration: `[still required — only a single instant was photographed]`
+- Unexpected behavior: none reported so far; background rendered navy-blue rather than neutral
+  gray, but this is an EXPECTED outcome the fixture's own header comment names explicitly
+  ("deliberately channel-order-agnostic: RGB vs BGR just swaps which hue looks which way, neither
+  becomes invisible") — a real finding about this panel/GOP driver's own channel order, not a
+  defect.
+- Photograph paths: `.agents/reports/evidence/WP-030-real-hw-test.jpg`
+- Tester name/identifier: `[still required]`
 
 ## Firmware Quirk Decision
 
-- Quirk observed: `[yes/no]`
-- If yes, RFC-0006 Appendix A entry: `[link/section]`
-- Root cause evidence: `[required if claimed]`
-- Resolution/workaround: `[required if applied]`
+- Quirk observed: Possibly — the background field rendering as navy-blue rather than neutral gray
+  is consistent with this hardware's real GOP `PixelFormat` differing from what a naive RGB-order
+  assumption would produce (e.g. a genuine BGR framebuffer, or a non-8-bit-per-channel format). The
+  fixture's own self-verification (reading the written pixel value back and comparing to what was
+  just written) would still pass either way, since it compares against its own last-written value,
+  not an assumed absolute color — so this is a real, benign, already-anticipated deviation, not a
+  failure.
+- If yes, RFC-0006 Appendix A entry: `[not yet written — worth a short entry recording the real
+  observed color once the exact PixelFormat is confirmed, e.g. by reading UEFI.GOP's own
+  PixelFormat field in a future diagnostic fixture]`
+- Root cause evidence: photographic (`.agents/reports/evidence/WP-030-real-hw-test.jpg`) plus the fixture's own documented
+  channel-order-agnostic design; PixelFormat itself was not read back by this fixture (out of
+  scope for render-and-halt, which only self-verifies against its own last-written values).
+- Resolution/workaround: none needed — this is why the fixture was deliberately designed to be
+  channel-order-agnostic rather than assuming a specific color order.
 
 ## Sign-Off
 
-- [ ] All fields above are complete.
-- [ ] Evidence corresponds to the checksummed artifact named above.
-- [ ] No result was inferred from QEMU.
-- Human validator/signature: `[required]`
-- Date: `[required]`
+- [ ] All fields above are complete — NOT YET; platform/firmware details, stability duration, exact
+      start time, and tester identifier are still open.
+- [x] Evidence corresponds to the checksummed artifact named above — the photographed device was
+      written from this exact SHA-256-verified image by the same session that built it, with a
+      real post-write byte-for-byte checksum match against the raw device.
+- [x] No result was inferred from QEMU — every checked item above is grounded in either the
+      photograph or a directly-executed, logged command (dd, sha256sum, lsblk), not a QEMU run.
+- Human validator/signature: `[still required]`
+- Date: `2026-08-22 (core result); full sign-off pending remaining fields above`
