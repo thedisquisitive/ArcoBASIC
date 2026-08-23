@@ -37,17 +37,27 @@ test both input paths independently) and observe the real, live response on the 
 
 ## Build Identity
 
-- Git commit: `0a42e34` (real hardware fix — the terminal's own font was too illegible to
-  distinguish "hi" from "ni"; now a dedicated 8x14 font — on top of `bb62338`'s RPM zero-init fix,
-  `0cecd37`'s Program Mode increment, `102a051`'s font-scale fix, `02b2762`'s dashboard, and
-  `0cd99c8`'s CR3 fix)
+- Git commit: `b436bd5` (Round 4: a real more-prominent term font ascender, `h` now has a real 2-row
+  lead over `n` instead of 1, plus general Shift support replacing the earlier apostrophe-only
+  override — on top of `0a42e34`'s dedicated 8x14 font, `bb62338`'s RPM zero-init fix, `0cecd37`'s
+  Program Mode increment, `102a051`'s font-scale fix, `02b2762`'s dashboard, and `0cd99c8`'s CR3 fix)
 - Compiler/version: `ArcoFission 0.1.0`
 - Image filename: `aps-arcology-seed-substrate-x86_64.img`
 - Artifact directory: `arcology-os/dist/aps-arcology-seed-substrate/`
-- EFI SHA-256: `03a37937a622904c3d7ccc55ecb753748a577a52f01ebe2aebcf27380a59de43`
-- Image SHA-256: `1bbb69ee165d8664f78598c4630055e18b0aff301ba1546b86a6d6ac34a2ff51`
+- EFI SHA-256: `ec50ad9efca5c88269f84a24339dc22f2e98d1f01fd9dc8734bf7bf6b9744914`
+- Image SHA-256: `aa58b6acf327126171d337a5bfe69d7d7464ee21c94f8b66084c1996064c51f7`
 - Full checksums: `arcology-os/dist/aps-arcology-seed-substrate/SHA256SUMS`
 - Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync` — write performed this session, verified byte-for-byte via a raw-device checksum readback (first 64MiB) immediately after.
+
+## Round 4 result: two more real findings, both now fixed (not yet re-validated)
+
+After Round 3's two fixes (below), the user retested: `RUN`/`GOTO` fully work, but two more real
+issues surfaced. (1) "h still kinda looks more like an n" — the 8x14 font helped overall clarity
+but the ascender was still only 1 row taller than x-height; re-rasterized at size 13pt for a real
+2-row lead. (2) "Can we get shift key support? I keep wanting to type" — the earlier fix only
+disambiguated the apostrophe key; replaced with a real, general `ApplyShift` covering uppercase
+letters and the full shifted digit/punctuation row. See RFC-0007 Section 15's "Round 4" writeup for
+full detail. Commit `b436bd5` — Round 5 is the real test of both.
 
 ## Round 3 result: TWO real bugs found on real hardware, both now fixed (not yet re-validated)
 
