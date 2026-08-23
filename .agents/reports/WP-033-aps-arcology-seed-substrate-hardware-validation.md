@@ -37,18 +37,15 @@ test both input paths independently) and observe the real, live response on the 
 
 ## Build Identity
 
-- Git commit: `[fill in at physical test time — includes the RFC-0045 0.9 font-scale fix, not yet
-  committed as of this artifact build]`
+- Git commit: `102a051` (RFC-0045 0.9 font-scale fix, on top of `02b2762`'s dashboard and `0cd99c8`'s
+  CR3 fix)
 - Compiler/version: `ArcoFission 0.1.0`
 - Image filename: `aps-arcology-seed-substrate-x86_64.img`
 - Artifact directory: `arcology-os/dist/aps-arcology-seed-substrate/`
 - EFI SHA-256: `ae71b2b8e0469f4f44aeafb58d2828ae7e5ad2a581e3a504be4ecc9b8275cea1`
 - Image SHA-256: `cc00be4ce700ffef83e31e11bf620230b23f95cc244af112f7ab74c2b1dca2e0`
 - Full checksums: `arcology-os/dist/aps-arcology-seed-substrate/SHA256SUMS`
-- Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync`
-- **This checksum reflects the font-scale fix (RFC-0045 revision 0.9), on top of Round 1's own
-  confirmed-working dashboard and CR3 fix. Round 1's own write does NOT cover this artifact — media
-  must be re-written before Round 2 can validate the font fix.**
+- Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync` — write performed this session, verified byte-for-byte via a raw-device checksum readback (first 64MiB) immediately after. This checksum reflects the font-scale fix (RFC-0045 revision 0.9), on top of Round 1's own confirmed-working dashboard and CR3 fix — ready for Round 2.
 
 **Pre-physical-test sanity check already performed (QEMU, not a substitute for the checklist
 below):** the exact built `.img` file (not a synthetic vvfat directory) was booted directly under
