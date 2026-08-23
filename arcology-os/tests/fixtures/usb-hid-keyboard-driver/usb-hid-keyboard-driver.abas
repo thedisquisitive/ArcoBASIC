@@ -1,3 +1,21 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' RFC-0045 Phase 3: real USB HID boot-protocol keyboard driver on top of the Phase 2 xHCI
+' controller driver -- real device enumeration (Enable Slot, Address Device, GET_DESCRIPTOR for
+' Device and Configuration, Configure Endpoint for the discovered HID interrupt IN endpoint,
+' SET_CONFIGURATION, SET_PROTOCOL Boot Protocol) followed by real polled HID report reads and
+' boot-protocol keycode-to-character translation. Builds directly on stdlib/usb_xhci_policy.abas's
+' own Phase 2 driver (PCI/MMIO/reset/rings/ports) -- see that file's own header comment for the
+' real, confirmed, worked-around MEMORY.Read16-at-high-address compiler bug this driver inherits
+' the same workaround for (every 16-bit-or-narrower MMIO/context field read goes through
+' MmioReadField32 instead).
+'
+' Frozen copy of stdlib/usb_xhci_policy.abas is inlined below, matching this project's established
+' no-include-system fixture convention.
+
 ' Real xHCI (USB 3 Host Controller) driver (RFC-0045 Phase 2), raw PCI config space + MMIO only --
 ' no UEFI protocol dependency for the controller-programming path itself (PCI discovery uses real
 ' port I/O at 0xCF8/0xCFC, safe both before and after ExitBootServices; ring/DCBAA memory is
@@ -1409,5 +1427,246 @@ FUNCTION UsbHidKeyboard.KeycodeToChar(keycode AS U32) AS U32
     IF keycode = 56 THEN
         RETURN 47
     END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialPrintHexDigit(d AS U8) AS BOOL
+    IF d < 10 THEN
+        SerialByte(48 + d)
+    ELSE
+        SerialByte(55 + d)
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION SerialPrintHex32(value AS U32) AS BOOL
+    LET i AS U32 = 0
+    WHILE i < 8
+        LET shiftAmount AS U32 = (7 - i) * 4
+        LET nibble AS U32 = (value SHR shiftAmount) AND 15
+        LET nibbleByte AS U8 = nibble
+        SerialPrintHexDigit(nibbleByte)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("HIDKBD PRE\r\n")
+    SerialInit()
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET pciFound AS BOOL = UsbXhci.DiscoverPci(systemTable)
+    IF pciFound = 0 THEN
+        systemTable.ConsoleOut.Write("HIDKBD NO PCI\r\n")
+        SerialByte(78)
+        SerialByte(80)
+        SerialByte(67)
+        SerialByte(73)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    UsbXhci.MapMmio()
+    LET maxPorts AS U32 = UsbXhci.MaxPorts()
+
+    LET resetOk AS BOOL = UsbXhci.Reset(systemTable)
+    IF resetOk = 0 THEN
+        systemTable.ConsoleOut.Write("HIDKBD RESET FAILED\r\n")
+        SerialByte(78)
+        SerialByte(82)
+        SerialByte(83)
+        SerialByte(84)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    LET ringsOk AS BOOL = UsbXhci.SetupRings(systemTable)
+    IF ringsOk = 0 THEN
+        systemTable.ConsoleOut.Write("HIDKBD RINGS FAILED\r\n")
+        SerialByte(78)
+        SerialByte(82)
+        SerialByte(78)
+        SerialByte(71)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    LET startOk AS BOOL = UsbXhci.Start()
+    IF startOk = 0 THEN
+        systemTable.ConsoleOut.Write("HIDKBD START FAILED\r\n")
+        SerialByte(78)
+        SerialByte(83)
+        SerialByte(84)
+        SerialByte(82)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+    SerialByte(83)
+    SerialByte(84)
+    SerialByte(82)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET connectedPort AS U32 = 0
+    LET portIndex AS U32 = 1
+    WHILE portIndex <= maxPorts
+        LET raw AS U32 = UsbXhci.PortRaw(portIndex)
+        IF (raw AND 1) <> 0 THEN
+            IF connectedPort = 0 THEN
+                connectedPort = portIndex
+            END IF
+        END IF
+        portIndex = portIndex + 1
+    WEND
+
+    IF connectedPort = 0 THEN
+        systemTable.ConsoleOut.Write("HIDKBD NO DEVICE\r\n")
+        SerialByte(78)
+        SerialByte(68)
+        SerialByte(69)
+        SerialByte(86)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    LET resetOk2 AS BOOL = UsbXhci.ResetPort(connectedPort)
+    IF resetOk2 = 0 THEN
+        systemTable.ConsoleOut.Write("HIDKBD PORT RESET FAILED\r\n")
+        SerialByte(78)
+        SerialByte(80)
+        SerialByte(82)
+        SerialByte(83)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(83)
+    SerialByte(84)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET slotId AS U32 = UsbHidKeyboard.Init(systemTable, connectedPort)
+    IF slotId = 0 THEN
+        systemTable.ConsoleOut.Write("HIDKBD ENUM FAILED\r\n")
+        SerialByte(69)
+        SerialByte(78)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("HIDKBD ENUM OK\r\n")
+    SerialByte(69)
+    SerialByte(78)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET reportBuffer AS MMIOPTR = XhciScratchDmaMmio()
+    LET gotReport AS BOOL = 0
+    LET reportCeiling AS U64 = 2000000
+    LET reportAttempts AS U64 = 0
+    WHILE reportAttempts < reportCeiling
+        LET polledReport AS BOOL = UsbHidKeyboard.PollReport(slotId, reportBuffer)
+        IF polledReport = 1 THEN
+            gotReport = 1
+            reportAttempts = reportCeiling
+        ELSE
+            CPU.Pause
+            reportAttempts = reportAttempts + 1
+        END IF
+    WEND
+    IF gotReport = 0 THEN
+        systemTable.ConsoleOut.Write("HIDKBD NO REPORT\r\n")
+        SerialByte(78)
+        SerialByte(82)
+        SerialByte(80)
+        SerialByte(84)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+
+    LET keycode AS U32 = MmioReadField32(reportBuffer, 2, 0, 8)
+    LET charCode AS U32 = UsbHidKeyboard.KeycodeToChar(keycode)
+    SerialByte(75)
+    SerialByte(69)
+    SerialByte(89)
+    SerialByte(61)
+    SerialPrintHex32(charCode)
+    SerialByte(13)
+    SerialByte(10)
+
+    IF charCode = 0 THEN
+        systemTable.ConsoleOut.Write("HIDKBD BAD KEY\r\n")
+        CPU.HaltForever
+    END IF
+
+    LET charAsByte AS U8 = charCode
+    systemTable.ConsoleOut.Write("HIDKBD KEY OK\r\n")
+    SerialByte(75)
+    SerialByte(69)
+    SerialByte(89)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(32)
+    SerialByte(charAsByte)
+    SerialByte(13)
+    SerialByte(10)
+
+    systemTable.ConsoleOut.Write("HIDKBD DONE\r\n")
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+    CPU.HaltForever
     RETURN 0
 END FUNCTION

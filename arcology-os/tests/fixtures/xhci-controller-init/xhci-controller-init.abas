@@ -129,6 +129,9 @@ END FUNCTION
 FUNCTION XhciEventCycleStateAddress() AS MMIOPTR
     RETURN ADDRESS.Offset(XhciStateAddress(), 148)
 END FUNCTION
+FUNCTION XhciContextSizeAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 152)
+END FUNCTION
 
 FUNCTION PciConfigAddressPort() AS IOPORT
     RETURN PORT.Address(3320)   ' 0xCF8
@@ -259,6 +262,16 @@ FUNCTION UsbXhci.MapMmio() AS BOOL
     LET maxPorts AS U32 = (hcsParams1 SHR 24) AND 255
     MEMORY.Write32(XhciMaxSlotsAddress(), maxSlots)
     MEMORY.Write32(XhciMaxPortsAddress(), maxPorts)
+
+    ' HCCPARAMS1.CSZ (bit 2): real Context Size (32 vs 64 bytes) -- verified from the real
+    ' controller's own report, not assumed, matching this driver's own established discipline.
+    LET hccParams1 AS U32 = MEMORY.Read32(ADDRESS.Offset(mapped, 16))
+    LET csz AS U32 = (hccParams1 SHR 2) AND 1
+    LET contextSize AS U32 = 32
+    IF csz = 1 THEN
+        contextSize = 64
+    END IF
+    MEMORY.Write32(XhciContextSizeAddress(), contextSize)
 
     LET capLengthAsU64 AS U64 = capLength
     LET opBase AS U64 = mappedAsU64 + capLengthAsU64
@@ -460,6 +473,10 @@ FUNCTION UsbXhci.MaxPorts() AS U32
     RETURN MEMORY.Read32(XhciMaxPortsAddress())
 END FUNCTION
 
+FUNCTION UsbXhci.ContextSize() AS U32
+    RETURN MEMORY.Read32(XhciContextSizeAddress())
+END FUNCTION
+
 ' Real port enumeration (RFC-0045 Section 6.1, point 4): PORTSC for port N (1-based) lives at
 ' operational-base + 0x400 + (N-1)*0x10. CCS (Current Connect Status) is bit 0.
 FUNCTION UsbXhci.PortConnected(portIndex AS U32) AS BOOL
@@ -607,6 +624,15 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     SerialByte(79)
     SerialByte(61)
     SerialPrintHex32(maxPorts)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET ctxSize AS U32 = UsbXhci.ContextSize()
+    SerialByte(67)
+    SerialByte(83)
+    SerialByte(90)
+    SerialByte(61)
+    SerialPrintHex32(ctxSize)
     SerialByte(13)
     SerialByte(10)
 
