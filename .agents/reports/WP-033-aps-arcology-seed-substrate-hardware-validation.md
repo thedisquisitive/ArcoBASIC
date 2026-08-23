@@ -37,15 +37,33 @@ test both input paths independently) and observe the real, live response on the 
 
 ## Build Identity
 
-- Git commit: `102a051` (RFC-0045 0.9 font-scale fix, on top of `02b2762`'s dashboard and `0cd99c8`'s
-  CR3 fix)
+- Git commit: `0cecd37` (RFC-0007 Program Mode's first real increment — RPM, PRINT, GOTO, RUN, LIST,
+  NEW/CLEAR, plus real Shift-key tracking so a real `"` is typable — on top of `102a051`'s font-scale
+  fix, `02b2762`'s dashboard, and `0cd99c8`'s CR3 fix)
 - Compiler/version: `ArcoFission 0.1.0`
 - Image filename: `aps-arcology-seed-substrate-x86_64.img`
 - Artifact directory: `arcology-os/dist/aps-arcology-seed-substrate/`
-- EFI SHA-256: `ae71b2b8e0469f4f44aeafb58d2828ae7e5ad2a581e3a504be4ecc9b8275cea1`
-- Image SHA-256: `cc00be4ce700ffef83e31e11bf620230b23f95cc244af112f7ab74c2b1dca2e0`
+- EFI SHA-256: `83ee6270e5d58e9939d7d1ff750219a132bc7dd0857eed1a09bc983b1861dcaf`
+- Image SHA-256: `b5a924e360a705bb20eac86bc68280d7b9ff7f5114382dab17074133882a965e`
 - Full checksums: `arcology-os/dist/aps-arcology-seed-substrate/SHA256SUMS`
-- Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync` — write performed this session, verified byte-for-byte via a raw-device checksum readback (first 64MiB) immediately after. This checksum reflects the font-scale fix (RFC-0045 revision 0.9), on top of Round 1's own confirmed-working dashboard and CR3 fix — ready for Round 2.
+- Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync` — write performed this session, verified byte-for-byte via a raw-device checksum readback (first 64MiB) immediately after. This build adds RFC-0007 Program Mode (RUN/PRINT/GOTO) on top of the font-scale fix — see the Round 3 addendum below for what's newly testable.
+
+## Round 3 addendum: RFC-0007 Program Mode is now on this image
+
+This build adds real `10 PRINT "..."` / `20 GOTO ...` / `RUN` / `LIST` / `NEW` / `CLEAR` — see
+`arcology-os/rfcs/RFC-0007_ArcoBASIC_Interactive_Program_Model.md` Section 15 for the full writeup.
+Not yet covered by this report's own checklist below (written before Program Mode existed), but
+worth trying opportunistically during Round 3:
+
+- Type `10 PRINT "HELLO"` then `RUN` — the double-quote requires a real Shift keystroke
+  (Shift+apostrophe), the first real-hardware test of Shift support in this project at all.
+- Type `10 PRINT "LOOP"`, `20 GOTO 10`, `RUN`, then press `ESC` — should print `LOOP` repeatedly
+  then `BREAK IN 20` and return to `READY.`. Tests the real ESC keystroke on real hardware for the
+  first time too.
+- `LIST` after typing a couple of lines should echo them back.
+
+If Shift or ESC don't work on the real keyboard, that's a genuinely new, valuable finding, not a
+failure of this checklist.
 
 **Pre-physical-test sanity check already performed (QEMU, not a substitute for the checklist
 below):** the exact built `.img` file (not a synthetic vvfat directory) was booted directly under
