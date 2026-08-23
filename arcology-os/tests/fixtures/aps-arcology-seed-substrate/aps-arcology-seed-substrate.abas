@@ -2104,6 +2104,81 @@ END FUNCTION
 ' Draws one real glyph, scaled, at a given PIXEL (not cell) origin -- always draws the full cell
 ' background too (not just the "on" pixels), so this doubles as this terminal's own real per-cell
 ' erase primitive (used directly by TermPutChar's own backspace handling).
+' Real, generic pixel-block primitives -- the boot dashboard's own real drawing vocabulary, matching
+' docs/arcology-boot-screen-concept.md's own explicit "safe early features" list (solid fills,
+' rectangles, borders, lines, bitmap text; no gradients/alpha/animation).
+FUNCTION FillRect(framebuffer AS MMIOPTR, stride AS U32, x AS U32, y AS U32, w AS U32, h AS U32, color AS U32) AS U64
+    LET dy AS U32 = 0
+    WHILE dy < h
+        LET dx AS U32 = 0
+        WHILE dx < w
+            LET pixelOffset AS U32 = ((y + dy) * stride + (x + dx)) * 4
+            LET pixel AS MMIOPTR = ADDRESS.Offset(framebuffer, pixelOffset)
+            MEMORY.Write32(pixel, color)
+            dx = dx + 1
+        WEND
+        dy = dy + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION DrawHLine(framebuffer AS MMIOPTR, stride AS U32, x AS U32, y AS U32, w AS U32, color AS U32) AS U64
+    FillRect(framebuffer, stride, x, y, w, 1, color)
+    RETURN 0
+END FUNCTION
+
+FUNCTION DrawVLine(framebuffer AS MMIOPTR, stride AS U32, x AS U32, y AS U32, h AS U32, color AS U32) AS U64
+    FillRect(framebuffer, stride, x, y, 1, h, color)
+    RETURN 0
+END FUNCTION
+
+FUNCTION DrawRectBorder(framebuffer AS MMIOPTR, stride AS U32, x AS U32, y AS U32, w AS U32, h AS U32, color AS U32) AS U64
+    DrawHLine(framebuffer, stride, x, y, w, color)
+    LET yBottom AS U32 = y + h - 1
+    DrawHLine(framebuffer, stride, x, yBottom, w, color)
+    DrawVLine(framebuffer, stride, x, y, h, color)
+    LET xRight AS U32 = x + w - 1
+    DrawVLine(framebuffer, stride, xRight, y, h, color)
+    RETURN 0
+END FUNCTION
+
+' The dashboard's own real, position-independent glyph draw -- unlike DrawChar below (which always
+' reads its scale/colors from the scrolling terminal's own fixed globals), this takes them
+' explicitly, since dashboard text needs multiple real sizes (a large title, small panel labels)
+' and real state-driven colors (not always the terminal's own fixed white-on-black).
+FUNCTION DrawGlyphAt(framebuffer AS MMIOPTR, stride AS U32, pxX AS U32, pxY AS U32, code AS U32, scale AS U32, fg AS U32, bg AS U32) AS U64
+    LET row AS U32 = 0
+    WHILE row < 8
+        LET rowByte AS U32 = FontGlyphRowByte(code, row)
+        LET col AS U32 = 0
+        WHILE col < 8
+            LET bitIndex AS U32 = 7 - col
+            LET mask AS U32 = 1 SHL bitIndex
+            LET on AS U32 = rowByte AND mask
+            LET color AS U32 = bg
+            IF on <> 0 THEN
+                color = fg
+            END IF
+            LET dy AS U32 = 0
+            WHILE dy < scale
+                LET dx AS U32 = 0
+                WHILE dx < scale
+                    LET px AS U32 = pxX + (col * scale) + dx
+                    LET py AS U32 = pxY + (row * scale) + dy
+                    LET pixelOffset AS U32 = (py * stride + px) * 4
+                    LET pixel AS MMIOPTR = ADDRESS.Offset(framebuffer, pixelOffset)
+                    MEMORY.Write32(pixel, color)
+                    dx = dx + 1
+                WEND
+                dy = dy + 1
+            WEND
+            col = col + 1
+        WEND
+        row = row + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
 FUNCTION DrawChar(framebuffer AS MMIOPTR, stride AS U32, pxX AS U32, pxY AS U32, code AS U32) AS U64
     LET scale AS U32 = TermGlyphScale()
     LET fg AS U32 = TermFgColor()
@@ -2620,12 +2695,58 @@ FUNCTION SetupUsbKeyboard(systemTable AS UEFI.SystemTable) AS U32
     RETURN usbSlotId
 END FUNCTION
 
+' Extracted out of Main for the same real reason SetupUsbKeyboard was: Main's own per-function
+' stack-frame budget. Real GOP discovery, terminal state setup, and the dashboard's own first
+' real paint -- moved to the very start of Main's own execution (ahead of PS/2 + USB HID setup)
+' so the real System Assembly dashboard (docs/arcology-boot-screen-concept.md) can be brought up
+' as early as possible and show every REAL subsequent milestone live, not replayed after the
+' fact. Pre-exit, needs BootServices. Allowed to fail closed (returns 0): a real on-screen
+' dashboard is this fixture's own real goal, but a serial-only session (this project's own prior,
+' already-proven fallback) remains genuinely correct if no GOP device is ever found.
+FUNCTION SetupGopDashboard(systemTable AS UEFI.SystemTable) AS BOOL
+    LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
+    IF gop = 0 THEN
+        systemTable.ConsoleOut.Write("SUBSTRATE GOP NONE\r\n")
+        RETURN 0
+    END IF
+    LET framebuffer AS PHYSICALPTR = UEFI.GOP.FrameBufferBase(gop)
+    LET widthPx AS U32 = UEFI.GOP.Width(gop)
+    LET heightPx AS U32 = UEFI.GOP.Height(gop)
+    LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
+    LET fbBaseAsU64 AS U64 = ADDRESS.Value(framebuffer)
+    MEMORY.Write64(TermFramebufferPhysAddress(), fbBaseAsU64)
+    MEMORY.Write32(TermStrideAddress(), stride)
+    MEMORY.Write32(TermWidthPxAddress(), widthPx)
+    MEMORY.Write32(TermHeightPxAddress(), heightPx)
+    LET cellPx AS U32 = TermCellPx()
+    LET termCols AS U32 = widthPx \ cellPx
+    LET termRows AS U32 = heightPx \ cellPx
+    MEMORY.Write32(TermColsAddress(), termCols)
+    MEMORY.Write32(TermRowsAddress(), termRows)
+    WriteFontData()
+    WriteDashboardLabels()
+    MEMORY.Write32(TermReadyAddress(), 1)
+    systemTable.ConsoleOut.Write("SUBSTRATE GOP READY\r\n")
+    DashDrawStatic()
+    DashSetSubsystem(4, 1)
+    DashAddEvent(LABEL_EV_GOP_OK())
+    DashUpdateAssembly(1, 10)
+    RETURN 1
+END FUNCTION
+
 FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
     systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
     systemTable.ConsoleOut.Write("SUBSTRATE PRE\r\n")
     MEMORY.Write32(TermReadyAddress(), 0)
 
+    LET gopOk AS BOOL = SetupGopDashboard(systemTable)
+
     PS2Keyboard.Init()
+    IF gopOk = 1 THEN
+        DashSetSubsystem(2, 1)
+        DashAddEvent(LABEL_EV_PS2())
+        DashUpdateAssembly(2, 10)
+    END IF
 
     ' Real USB HID keyboard enumeration -- allowed to fail closed (usbSlotId stays 0) if no USB
     ' keyboard is attached; PS/2 alone is a real, correct configuration (RFC-0045's own explicit
@@ -2633,41 +2754,27 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     ' AllocatePages and must happen before ExitBootServices.
     LET usbSlotId AS U32 = SetupUsbKeyboard(systemTable)
     IF usbSlotId <> 0 THEN
-        systemTable.ConsoleOut.Write("SUBSTRATE USB READY\r\n")
+        ' Once the dashboard is live, its own event feed already carries this milestone (labeled,
+        ' not just logged) -- firmware's own ConsoleOut text cursor keeps advancing independently of
+        ' our drawing, and a later write here would land its glyphs directly on top of already-
+        ' painted dashboard pixels (confirmed via a real QEMU screendump: "TABLE OK" bled straight
+        ' across the I/O panel). Gated to serial-only fallback for the no-GOP case.
+        IF gopOk = 0 THEN
+            systemTable.ConsoleOut.Write("SUBSTRATE USB READY\r\n")
+        ELSE
+            DashAddEvent(LABEL_EV_HID_OK())
+        END IF
     ELSE
-        systemTable.ConsoleOut.Write("SUBSTRATE USB NONE\r\n")
+        IF gopOk = 0 THEN
+            systemTable.ConsoleOut.Write("SUBSTRATE USB NONE\r\n")
+        ELSE
+            DashAddEvent(LABEL_EV_HID_NONE())
+        END IF
     END IF
-
-    ' Real GOP discovery -- pre-exit, needs BootServices. Allowed to fail closed too (gopOk stays
-    ' 0): a real on-screen terminal is this fixture's own real goal, but a serial-only session
-    ' (this project's own prior, already-proven fallback) remains genuinely correct if no GOP
-    ' device is ever found, matching this fixture's own established fail-open discipline.
-    LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
-    LET gopOk AS BOOL = 0
-    IF gop <> 0 THEN
-        LET framebuffer AS PHYSICALPTR = UEFI.GOP.FrameBufferBase(gop)
-        LET widthPx AS U32 = UEFI.GOP.Width(gop)
-        LET heightPx AS U32 = UEFI.GOP.Height(gop)
-        LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
-        LET fbBaseAsU64 AS U64 = ADDRESS.Value(framebuffer)
-        MEMORY.Write64(TermFramebufferPhysAddress(), fbBaseAsU64)
-        MEMORY.Write32(TermStrideAddress(), stride)
-        MEMORY.Write32(TermWidthPxAddress(), widthPx)
-        MEMORY.Write32(TermHeightPxAddress(), heightPx)
-        LET cellPx AS U32 = TermCellPx()
-        LET termCols AS U32 = widthPx \ cellPx
-        LET termRows AS U32 = heightPx \ cellPx
-        MEMORY.Write32(TermColsAddress(), termCols)
-        MEMORY.Write32(TermRowsAddress(), termRows)
-        WriteFontData()
-        gopOk = 1
-        systemTable.ConsoleOut.Write("SUBSTRATE GOP READY\r\n")
-        ' Checkpoint 0 (red): GOP itself + a raw pixel write both work at all on this real
-        ' hardware, still fully firmware-hosted -- the real baseline every later checkpoint is
-        ' compared against.
-        DrawDiagBlock(0, 16711680)
-    ELSE
-        systemTable.ConsoleOut.Write("SUBSTRATE GOP NONE\r\n")
+    IF gopOk = 1 THEN
+        DashSetSubsystem(2, 3)
+        DashSetSubsystem(3, 3)
+        DashUpdateAssembly(3, 10)
     END IF
 
     ' 5 pages: root/PDPT0/PD0 (the same low-1GB identity map aps-gdt-reload.abas established) plus
@@ -2753,12 +2860,18 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         systemTable.ConsoleOut.Write("SUBSTRATE PDPT BAD\r\n")
         CPU.HaltForever
     END IF
-    systemTable.ConsoleOut.Write("SUBSTRATE TABLE OK\r\n")
+    IF gopOk = 0 THEN
+        systemTable.ConsoleOut.Write("SUBSTRATE TABLE OK\r\n")
+    END IF
     IF gopOk = 1 THEN
-        ' Checkpoint 1 (orange): the real page-table build above (including MapExtra1GbRegion for
-        ' both the xHCI BAR and the framebuffer) completed and this raw pixel write still works,
-        ' still under FIRMWARE's own original page tables (not our new ones yet).
-        DrawDiagBlock(1, 16753920)
+        ' Real checkpoint (was a raw diagnostic color block during this fixture's own real-
+        ' hardware bring-up; the dashboard's own MEMORY panel now carries the same signal, labeled
+        ' instead of just colored): the real page-table build above (including MapExtra1GbRegion
+        ' for both the xHCI BAR and the framebuffer, and the full 512GB PML4-slot-0 identity map
+        ' this fixture's own real hardware freeze required) completed successfully.
+        DashSetSubsystem(0, 3)
+        DashAddEvent(LABEL_EV_MEM())
+        DashUpdateAssembly(4, 10)
     END IF
 
     CPU.DisableInterrupts
@@ -2767,15 +2880,17 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         CPU.HaltForever
     END IF
     IF gopOk = 1 THEN
-        ' Checkpoint 2 (yellow): a real ExitBootServices call succeeded and a raw pixel write
-        ' STILL works -- confirms ExitBootServices itself isn't the freeze, and (since CR3 hasn't
-        ' been touched yet) that firmware's own page tables are still intact post-exit.
-        DrawDiagBlock(2, 16776960)
+        ' A real ExitBootServices call succeeded and the dashboard (raw framebuffer writes only,
+        ' no ConsoleOut) still works -- confirms ExitBootServices itself isn't the freeze, and
+        ' (since CR3 hasn't been touched yet) that firmware's own page tables are still intact.
+        DashSetSubsystem(1, 1)
+        DashAddEvent(LABEL_EV_BS())
+        DashUpdateAssembly(5, 10)
     END IF
 
     ' Past this point, ConsoleOut is never touched again -- it hangs post-ExitBootServices (RFC-
     ' 0045 Section 4's own real finding). All further output goes through EchoChar (real serial +
-    ' the real on-screen terminal below, once it's brought up).
+    ' the dashboard/on-screen terminal below).
     CPU.DisableInterrupts
     CPU.WriteCR3(root)
     LET activeRoot AS U64 = CPU.ReadCR3()
@@ -2783,11 +2898,16 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         CPU.HaltForever
     END IF
     IF gopOk = 1 THEN
-        ' Checkpoint 3 (green): CR3 now points at THIS fixture's own page tables, and a raw pixel
-        ' write to the SAME framebuffer address still works -- confirms MapExtra1GbRegion's own
-        ' real 1GB mapping for the framebuffer is actually correct on this real hardware, not just
-        ' under QEMU.
-        DrawDiagBlock(3, 65280)
+        ' CR3 now points at THIS fixture's own page tables, and a real dashboard redraw to the
+        ' SAME framebuffer address still works -- confirms MapExtra1GbRegion's own real 1GB
+        ' mapping for the framebuffer, AND the full 512GB low-slot identity map, are both actually
+        ' correct on this real hardware, not just under QEMU. The concept doc's own most important
+        ' symbolic moment: the real UEFI-to-APS authority handoff.
+        DashSetSubsystem(1, 3)
+        DashAddEvent(LABEL_EV_CR3())
+        DashUpdateAssembly(6, 10)
+        DashShowSovereign()
+        DashSetStatus(LABEL_STATUS_TITLE(), DashMagenta())
     END IF
 
     SerialInit()
@@ -2811,21 +2931,26 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         CPU.HaltForever
     END IF
     IF gopOk = 1 THEN
-        ' Checkpoint 4 (cyan): the new GDT/IDT are loaded, CS/SS are reloaded against them, and
-        ' CPU.ReadCS() confirms it live -- a raw pixel write still works. Everything real risk in
-        ' this fixture's own post-exit sequence is now confirmed working; only TermClear/the font
-        ' system remain untested.
-        DrawDiagBlock(4, 65535)
+        ' The new GDT/IDT are loaded, CS/SS are reloaded against them, and CPU.ReadCS() confirms
+        ' it live -- a real dashboard redraw still works. Everything real risk in this fixture's
+        ' own post-exit sequence is now confirmed working.
+        DashAddEvent(LABEL_EV_GDT())
+        DashUpdateAssembly(7, 10)
     END IF
 
-    ' Only NOW is the framebuffer's own identity mapping guaranteed active under the NEW CR3 --
-    ' bring the real on-screen terminal up for the first time here, not before.
     IF gopOk = 1 THEN
-        MEMORY.Write32(TermReadyAddress(), 1)
+        DashSetSubsystem(4, 3)
+        DashAddEvent(LABEL_EV_TERM())
+        DashUpdateAssembly(8, 10)
+        DashSetSubsystem(5, 3)
+        DashUpdateAssembly(10, 10)
+    END IF
+
+    ' Handoff to the "higher system UI" (docs/arcology-boot-screen-concept.md's own last real
+    ' boot-sequence step): the dashboard has done its real job -- clear it and drop into the
+    ' genuine interactive READY. session below.
+    IF gopOk = 1 THEN
         TermClear()
-        ' Checkpoint 5 (white): TermClear (a real, much larger loop touching the WHOLE
-        ' framebuffer, not just one small block) completed without freezing.
-        DrawDiagBlock(5, 16777215)
     END IF
 
     SerialByte(83)
@@ -2911,5 +3036,1217 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     WEND
 
     CPU.HaltForever
+    RETURN 0
+END FUNCTION
+' Real dashboard text labels -- ASCII bytes for every fixed label the boot dashboard draws,
+' written once into a real scratch buffer (each label at its own fixed offset, null-
+' terminated) and drawn via DrawLabel below. Generated from a fixed table, not hand-typed,
+' to keep byte values honest.
+' Real dashboard text labels -- ASCII bytes for every fixed label the boot dashboard draws,
+' written once into a real scratch buffer (each label at its own fixed offset, null-
+' terminated) and drawn via DrawLabel below. Generated from a fixed table, not hand-typed,
+' to keep byte values honest.
+' Real dashboard text labels -- ASCII bytes for every fixed label the boot dashboard draws,
+' written once into a real scratch buffer (each label at its own fixed offset, null-
+' terminated) and drawn via DrawLabel below. Generated from a fixed table, not hand-typed,
+' to keep byte values honest.
+FUNCTION DashboardLabelTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(54525952))   ' 0x3400000, clear of every other fixed scratch region this fixture uses
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart0() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 4), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 5), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 6), 71)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 7), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 8), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 16), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 17), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 18), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 19), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 20), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 21), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 22), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 23), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 24), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 25), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 26), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 27), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 28), 66)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 29), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 30), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 31), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 40), 85)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 41), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 42), 70)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 43), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 44), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 45), 88)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 46), 56)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 47), 54)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 48), 95)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 49), 54)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 50), 52)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 51), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 56), 85)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 57), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 58), 70)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart1() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 59), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 60), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 64), 70)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 65), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 66), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 67), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 68), 87)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 69), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 70), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 71), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 72), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 76), 72)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 77), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 78), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 79), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 80), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 81), 70)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 82), 70)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 83), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 84), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 85), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 86), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 87), 80)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 88), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 89), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 90), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 91), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 92), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 100), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 101), 80)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 102), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 103), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 108), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 109), 85)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 110), 66)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 111), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 112), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 113), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 114), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 115), 84)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart2() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 116), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 117), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 124), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 125), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 126), 86)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 127), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 128), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 129), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 130), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 131), 71)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 132), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 133), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 140), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 141), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 142), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 143), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 144), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 145), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 146), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 156), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 157), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 158), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 159), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 160), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 161), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 162), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 163), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 164), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 165), 80)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 166), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 167), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 168), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 169), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 172), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 173), 47)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 174), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 175), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 188), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 189), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 190), 80)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart3() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 191), 85)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 192), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 193), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 204), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 205), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 206), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 207), 80)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 208), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 209), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 210), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 211), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 220), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 221), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 222), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 223), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 224), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 225), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 226), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 227), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 236), 80)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 237), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 238), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 239), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 240), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 241), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 242), 71)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 243), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 252), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 253), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 254), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 255), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 256), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 257), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 258), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 259), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 260), 90)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 261), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 262), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 263), 71)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 264), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart4() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 268), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 269), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 270), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 271), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 272), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 273), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 284), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 285), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 286), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 287), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 288), 86)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 289), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 290), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 300), 70)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 301), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 302), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 303), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 304), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 305), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 306), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 316), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 317), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 318), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 319), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 320), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 321), 66)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 322), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 323), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 324), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 332), 80)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 333), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 334), 50)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 335), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 336), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 337), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 338), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 339), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 340), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 341), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 342), 114)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart5() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 343), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 344), 118)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 345), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 346), 114)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 347), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 348), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 349), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 350), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 351), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 352), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 353), 97)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 354), 108)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 355), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 356), 122)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 357), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 358), 100)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 359), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 372), 88)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 373), 72)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 374), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 375), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 376), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 377), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 378), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 379), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 380), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 381), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 382), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 383), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 384), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 385), 114)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 386), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 387), 108)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 388), 108)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 389), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 390), 114)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 391), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 392), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 393), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 394), 108)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart6() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 395), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 396), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 397), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 398), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 412), 88)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 413), 72)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 414), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 415), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 416), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 417), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 418), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 419), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 420), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 421), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 422), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 423), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 424), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 425), 112)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 426), 114)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 427), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 428), 115)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 429), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 430), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 431), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 432), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 452), 72)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 453), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 454), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 455), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 456), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 457), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 458), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 459), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 460), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 461), 75)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 462), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 463), 121)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 464), 98)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 465), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 466), 97)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart7() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 467), 114)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 468), 100)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 469), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 470), 98)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 471), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 472), 117)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 473), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 474), 100)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 475), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 492), 72)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 493), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 494), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 495), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 496), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 497), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 498), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 499), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 500), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 501), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 502), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 503), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 504), 100)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 505), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 506), 118)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 507), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 508), 99)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 509), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 510), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 511), 102)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 512), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 513), 117)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 514), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 515), 100)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 516), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 532), 71)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 533), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 534), 80)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 535), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 536), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 537), 32)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart8() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 538), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 539), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 540), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 541), 70)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 542), 114)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 543), 97)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 544), 109)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 545), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 546), 98)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 547), 117)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 548), 102)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 549), 102)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 550), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 551), 114)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 552), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 553), 98)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 554), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 555), 117)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 556), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 557), 100)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 558), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 572), 71)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 573), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 574), 80)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 575), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 576), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 577), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 578), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 579), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 580), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 581), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 582), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 583), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 584), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 585), 112)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 586), 114)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 587), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 588), 115)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 589), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 590), 110)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart9() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 591), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 592), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 612), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 613), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 614), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 615), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 616), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 617), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 618), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 619), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 620), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 621), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 622), 100)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 623), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 624), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 625), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 626), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 627), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 628), 121)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 629), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 630), 109)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 631), 97)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 632), 112)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 633), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 634), 98)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 635), 117)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 636), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 637), 108)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 638), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 639), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 652), 66)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 653), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 654), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 655), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 656), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 657), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 658), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 659), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 660), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 661), 69)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart10() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 662), 120)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 663), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 664), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 665), 66)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 666), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 667), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 668), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 669), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 670), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 671), 114)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 672), 118)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 673), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 674), 99)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 675), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 676), 115)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 677), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 678), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 679), 107)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 680), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 692), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 693), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 694), 51)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 695), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 696), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 697), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 698), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 699), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 700), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 701), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 702), 100)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 703), 100)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 704), 114)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 705), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 706), 115)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 707), 115)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 708), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 709), 115)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 710), 112)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 711), 97)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 712), 99)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart11() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 713), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 714), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 715), 99)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 716), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 717), 109)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 718), 109)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 719), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 720), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 721), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 722), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 723), 100)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 724), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 732), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 733), 80)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 734), 85)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 735), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 736), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 737), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 738), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 739), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 740), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 741), 71)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 742), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 743), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 744), 47)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 745), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 746), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 747), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 748), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 749), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 750), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 751), 115)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 752), 116)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 753), 97)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 754), 108)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 755), 108)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 756), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 757), 100)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 758), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 772), 84)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart12() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 773), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 774), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 775), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 776), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 777), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 778), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 779), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 780), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 781), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 782), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 783), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 784), 115)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 785), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 786), 108)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 787), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 788), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 789), 111)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 790), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 791), 108)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 792), 105)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 793), 110)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 794), 101)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 795), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 812), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 813), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 814), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 815), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 816), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 817), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 818), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 819), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 820), 85)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 821), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 822), 72)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 823), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 824), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 825), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 826), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 827), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 828), 32)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart13() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 829), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 830), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 831), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 832), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 833), 66)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 834), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 835), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 836), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 837), 72)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 838), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 839), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 840), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 852), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 853), 85)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 854), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 855), 72)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 856), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 857), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 858), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 859), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 860), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 861), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 868), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 869), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 870), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 871), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 872), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 873), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 874), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 875), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 876), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 884), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 885), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 886), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 887), 80)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 888), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 889), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 900), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 901), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 902), 65)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart14() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 903), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 904), 85)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 905), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 906), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 916), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 917), 80)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 918), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 919), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 932), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 933), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 934), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 935), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 936), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 937), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 938), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 948), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 949), 86)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 950), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 951), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 952), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 953), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 954), 70)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 955), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 956), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 957), 68)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 958), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 964), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 965), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 966), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 967), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 968), 85)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 969), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 970), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 980), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 981), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 982), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 983), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 984), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 985), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 986), 71)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart15() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 987), 89)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 988), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 989), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 990), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 991), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 992), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 993), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 994), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 995), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 996), 77)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 997), 66)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 998), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 999), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1000), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1001), 71)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1002), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1003), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1004), 85)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1005), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1006), 72)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1007), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1008), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1009), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1010), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1011), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1012), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1013), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1014), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1020), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1021), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1022), 67)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1023), 85)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1024), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1025), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1026), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1027), 45)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1028), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1029), 83)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1030), 79)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1031), 86)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabelsPart16() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1032), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1033), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1034), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1035), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1036), 71)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1037), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1038), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1039), 45)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1040), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1041), 73)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1042), 78)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1043), 84)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1044), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1045), 71)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1046), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1047), 65)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1048), 76)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1049), 0)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1060), 86)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1061), 69)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1062), 82)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1063), 32)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1064), 48)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1065), 46)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1066), 49)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1067), 46)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1068), 48)
+    MEMORY.Write8(ADDRESS.Offset(DashboardLabelTableAddress(), 1069), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteDashboardLabels() AS U64
+    WriteDashboardLabelsPart0()
+    WriteDashboardLabelsPart1()
+    WriteDashboardLabelsPart2()
+    WriteDashboardLabelsPart3()
+    WriteDashboardLabelsPart4()
+    WriteDashboardLabelsPart5()
+    WriteDashboardLabelsPart6()
+    WriteDashboardLabelsPart7()
+    WriteDashboardLabelsPart8()
+    WriteDashboardLabelsPart9()
+    WriteDashboardLabelsPart10()
+    WriteDashboardLabelsPart11()
+    WriteDashboardLabelsPart12()
+    WriteDashboardLabelsPart13()
+    WriteDashboardLabelsPart14()
+    WriteDashboardLabelsPart15()
+    WriteDashboardLabelsPart16()
+    RETURN 0
+END FUNCTION
+
+FUNCTION LABEL_ARCOLOGY() AS U32
+    RETURN 0
+END FUNCTION
+FUNCTION LABEL_SYSTEM_ASSEMBLY() AS U32
+    RETURN 16
+END FUNCTION
+FUNCTION LABEL_PLATFORM() AS U32
+    RETURN 40
+END FUNCTION
+FUNCTION LABEL_UEFI() AS U32
+    RETURN 56
+END FUNCTION
+FUNCTION LABEL_FIRMWARE() AS U32
+    RETURN 64
+END FUNCTION
+FUNCTION LABEL_HANDOFF_COMPLETE() AS U32
+    RETURN 76
+END FUNCTION
+FUNCTION LABEL_APS() AS U32
+    RETURN 100
+END FUNCTION
+FUNCTION LABEL_SUBSTRATE() AS U32
+    RETURN 108
+END FUNCTION
+FUNCTION LABEL_SOVEREIGN() AS U32
+    RETURN 124
+END FUNCTION
+FUNCTION LABEL_LBL_MEMORY() AS U32
+    RETURN 140
+END FUNCTION
+FUNCTION LABEL_LBL_ADDRESS_SPACE() AS U32
+    RETURN 156
+END FUNCTION
+FUNCTION LABEL_LBL_IO() AS U32
+    RETURN 172
+END FUNCTION
+FUNCTION LABEL_LBL_INPUT() AS U32
+    RETURN 188
+END FUNCTION
+FUNCTION LABEL_LBL_DISPLAY() AS U32
+    RETURN 204
+END FUNCTION
+FUNCTION LABEL_LBL_CONSOLE() AS U32
+    RETURN 220
+END FUNCTION
+FUNCTION LABEL_ST_PENDING() AS U32
+    RETURN 236
+END FUNCTION
+FUNCTION LABEL_ST_INIT() AS U32
+    RETURN 252
+END FUNCTION
+FUNCTION LABEL_ST_READY() AS U32
+    RETURN 268
+END FUNCTION
+FUNCTION LABEL_ST_ACTIVE() AS U32
+    RETURN 284
+END FUNCTION
+FUNCTION LABEL_ST_FAILED() AS U32
+    RETURN 300
+END FUNCTION
+FUNCTION LABEL_ASSEMBLY() AS U32
+    RETURN 316
+END FUNCTION
+FUNCTION LABEL_EV_PS2() AS U32
+    RETURN 332
+END FUNCTION
+FUNCTION LABEL_EV_XHCI_OK() AS U32
+    RETURN 372
+END FUNCTION
+FUNCTION LABEL_EV_XHCI_NONE() AS U32
+    RETURN 412
+END FUNCTION
+FUNCTION LABEL_EV_HID_OK() AS U32
+    RETURN 452
+END FUNCTION
+FUNCTION LABEL_EV_HID_NONE() AS U32
+    RETURN 492
+END FUNCTION
+FUNCTION LABEL_EV_GOP_OK() AS U32
+    RETURN 532
+END FUNCTION
+FUNCTION LABEL_EV_GOP_NONE() AS U32
+    RETURN 572
+END FUNCTION
+FUNCTION LABEL_EV_MEM() AS U32
+    RETURN 612
+END FUNCTION
+FUNCTION LABEL_EV_BS() AS U32
+    RETURN 652
+END FUNCTION
+FUNCTION LABEL_EV_CR3() AS U32
+    RETURN 692
+END FUNCTION
+FUNCTION LABEL_EV_GDT() AS U32
+    RETURN 732
+END FUNCTION
+FUNCTION LABEL_EV_TERM() AS U32
+    RETURN 772
+END FUNCTION
+FUNCTION LABEL_STATUS_TITLE() AS U32
+    RETURN 812
+END FUNCTION
+FUNCTION LABEL_F_AUTHORITY() AS U32
+    RETURN 852
+END FUNCTION
+FUNCTION LABEL_F_CONTRACT() AS U32
+    RETURN 868
+END FUNCTION
+FUNCTION LABEL_F_SCOPE() AS U32
+    RETURN 884
+END FUNCTION
+FUNCTION LABEL_F_STATUS() AS U32
+    RETURN 900
+END FUNCTION
+FUNCTION LABEL_V_APS() AS U32
+    RETURN 916
+END FUNCTION
+FUNCTION LABEL_V_SYSTEM() AS U32
+    RETURN 932
+END FUNCTION
+FUNCTION LABEL_EVENT_FEED() AS U32
+    RETURN 948
+END FUNCTION
+FUNCTION LABEL_STATUS_HDR() AS U32
+    RETURN 964
+END FUNCTION
+FUNCTION LABEL_FOOTER_MOTTO() AS U32
+    RETURN 980
+END FUNCTION
+FUNCTION LABEL_FOOTER_TAG() AS U32
+    RETURN 1020
+END FUNCTION
+FUNCTION LABEL_FOOTER_VER() AS U32
+    RETURN 1060
+END FUNCTION
+
+
+
+
+' Draws one real label (by its own fixed table offset) left-to-right at (x,y), returning the total
+' pixel width drawn -- lets callers right-align or center text using a real measured width instead
+' of a guessed one.
+FUNCTION DrawLabel(framebuffer AS MMIOPTR, stride AS U32, x AS U32, y AS U32, labelOffset AS U32, scale AS U32, fg AS U32, bg AS U32) AS U32
+    LET cellW AS U32 = 8 * scale
+    LET i AS U32 = 0
+    LET done AS BOOL = 0
+    WHILE done = 0
+        IF i >= 64 THEN
+            done = 1
+        ELSE
+            LET code AS U32 = MEMORY.Read8(ADDRESS.Offset(DashboardLabelTableAddress(), labelOffset + i))
+            IF code = 0 THEN
+                done = 1
+            ELSE
+                DrawGlyphAt(framebuffer, stride, x + (i * cellW), y, code, scale, fg, bg)
+                i = i + 1
+            END IF
+        END IF
+    WEND
+    RETURN i * cellW
+END FUNCTION
+
+' ==========================================================================================
+' Arcology Boot Screen -- real System Assembly View (docs/arcology-boot-screen-concept.md).
+' Real subsystem states, driven by this fixture's own real boot milestones -- no simulated or
+' fake progress. Palette matches the concept doc's own specified colors exactly.
+' ==========================================================================================
+
+FUNCTION DashBg() AS U32
+    RETURN 2068
+END FUNCTION
+FUNCTION DashPrimary() AS U32
+    RETURN 6742271
+END FUNCTION
+FUNCTION DashDim() AS U32
+    RETURN 3359834
+END FUNCTION
+FUNCTION DashMagenta() AS U32
+    RETURN 16723614
+END FUNCTION
+FUNCTION DashAmber() AS U32
+    RETURN 16755234
+END FUNCTION
+FUNCTION DashRed() AS U32
+    RETURN 16726843
+END FUNCTION
+FUNCTION DashActive() AS U32
+    RETURN 15269887
+END FUNCTION
+
+' Real state codes: 0=PENDING (not yet evaluated), 1=INITIALIZING, 2=READY, 3=ACTIVE, 4=FAILED --
+' matches the concept doc's own State Language section exactly.
+FUNCTION DashStateColor(state AS U32) AS U32
+    IF state = 1 THEN
+        RETURN DashPrimary()
+    END IF
+    IF state = 2 THEN
+        RETURN DashPrimary()
+    END IF
+    IF state = 3 THEN
+        RETURN DashActive()
+    END IF
+    IF state = 4 THEN
+        RETURN DashRed()
+    END IF
+    RETURN DashDim()
+END FUNCTION
+
+FUNCTION DashStateLabel(state AS U32) AS U32
+    IF state = 1 THEN
+        RETURN LABEL_ST_INIT()
+    END IF
+    IF state = 2 THEN
+        RETURN LABEL_ST_READY()
+    END IF
+    IF state = 3 THEN
+        RETURN LABEL_ST_ACTIVE()
+    END IF
+    IF state = 4 THEN
+        RETURN LABEL_ST_FAILED()
+    END IF
+    RETURN LABEL_ST_PENDING()
+END FUNCTION
+
+' Real dashboard layout state: 6 subsystem panel slots, an event-feed write cursor (5 fixed
+' lines, filled top-to-bottom -- no scrolling, matching the concept doc's own "avoid scrolling
+' regions with heavy redraw logic" guidance), and the real milestone counter behind "ASSEMBLY
+' N/10".
+FUNCTION DashStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(55574528))   ' 0x3500000
+END FUNCTION
+FUNCTION DashEventCursorAddress() AS MMIOPTR
+    RETURN DashStateAddress()
+END FUNCTION
+FUNCTION DashAssemblyCountAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(DashStateAddress(), 4)
+END FUNCTION
+
+FUNCTION DashPanelX(index AS U32) AS U32
+    RETURN 20 + (index * 162)
+END FUNCTION
+FUNCTION DashPanelY() AS U32
+    RETURN 210
+END FUNCTION
+FUNCTION DashPanelW() AS U32
+    RETURN 150
+END FUNCTION
+FUNCTION DashPanelH() AS U32
+    RETURN 96
+END FUNCTION
+
+FUNCTION DashSubsystemLabel(index AS U32) AS U32
+    IF index = 0 THEN
+        RETURN LABEL_LBL_MEMORY()
+    END IF
+    IF index = 1 THEN
+        RETURN LABEL_LBL_ADDRESS_SPACE()
+    END IF
+    IF index = 2 THEN
+        RETURN LABEL_LBL_IO()
+    END IF
+    IF index = 3 THEN
+        RETURN LABEL_LBL_INPUT()
+    END IF
+    IF index = 4 THEN
+        RETURN LABEL_LBL_DISPLAY()
+    END IF
+    RETURN LABEL_LBL_CONSOLE()
+END FUNCTION
+
+' Redraws ONE subsystem panel's own border + name + state text -- called every time a real
+' milestone changes that subsystem's own real state, not on a timer or animation loop.
+FUNCTION DashSetSubsystem(index AS U32, state AS U32) AS U64
+    LET ready AS U32 = MEMORY.Read32(TermReadyAddress())
+    IF ready = 0 THEN
+        RETURN 0
+    END IF
+    LET framebuffer AS MMIOPTR = TermFramebufferMmio()
+    LET stride AS U32 = MEMORY.Read32(TermStrideAddress())
+    LET x AS U32 = DashPanelX(index)
+    LET y AS U32 = DashPanelY()
+    LET w AS U32 = DashPanelW()
+    LET h AS U32 = DashPanelH()
+    LET color AS U32 = DashStateColor(state)
+    FillRect(framebuffer, stride, x, y, w, h, DashBg())
+    DrawRectBorder(framebuffer, stride, x, y, w, h, color)
+    DrawLabel(framebuffer, stride, x + 10, y + 14, DashSubsystemLabel(index), 1, DashPrimary(), DashBg())
+    DrawHLine(framebuffer, stride, x + 10, y + 30, w - 20, DashDim())
+    DrawLabel(framebuffer, stride, x + 10, y + 42, DashStateLabel(state), 1, color, DashBg())
+    RETURN 0
+END FUNCTION
+
+' Appends one real event line to the next open feed slot (5 total, top-to-bottom).
+FUNCTION DashAddEvent(labelOffset AS U32) AS U64
+    LET ready AS U32 = MEMORY.Read32(TermReadyAddress())
+    IF ready = 0 THEN
+        RETURN 0
+    END IF
+    LET cursor AS U32 = MEMORY.Read32(DashEventCursorAddress())
+    IF cursor >= 8 THEN
+        RETURN 0
+    END IF
+    LET framebuffer AS MMIOPTR = TermFramebufferMmio()
+    LET stride AS U32 = MEMORY.Read32(TermStrideAddress())
+    LET x AS U32 = 40
+    LET y AS U32 = 400 + (cursor * 20)
+    DrawLabel(framebuffer, stride, x, y, labelOffset, 1, DashPrimary(), DashBg())
+    MEMORY.Write32(DashEventCursorAddress(), cursor + 1)
+    RETURN 0
+END FUNCTION
+
+' Redraws the segmented "ASSEMBLY N/10" bar -- a real milestone counter, not a simulated timer.
+FUNCTION DashUpdateAssembly(current AS U32, total AS U32) AS U64
+    LET ready AS U32 = MEMORY.Read32(TermReadyAddress())
+    IF ready = 0 THEN
+        RETURN 0
+    END IF
+    MEMORY.Write32(DashAssemblyCountAddress(), current)
+    LET framebuffer AS MMIOPTR = TermFramebufferMmio()
+    LET stride AS U32 = MEMORY.Read32(TermStrideAddress())
+    LET barY AS U32 = 330
+    FillRect(framebuffer, stride, 20, barY, 700, 24, DashBg())
+    DrawLabel(framebuffer, stride, 20, barY + 4, LABEL_ASSEMBLY(), 1, DashPrimary(), DashBg())
+    LET segX AS U32 = 140
+    LET seg AS U32 = 0
+    WHILE seg < total
+        LET segColor AS U32 = DashDim()
+        IF seg < current THEN
+            segColor = DashActive()
+        END IF
+        FillRect(framebuffer, stride, segX + (seg * 24), barY, 18, 16, segColor)
+        seg = seg + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' Redraws the status panel's own single title line -- the concept doc's own full AUTHORITY/
+' CONTRACT/SCOPE/POLICY field breakdown is real future work, out of this first increment's own
+' scope; one real, current, milestone-driven headline is what this increment actually delivers.
+FUNCTION DashSetStatus(labelOffset AS U32, color AS U32) AS U64
+    LET ready AS U32 = MEMORY.Read32(TermReadyAddress())
+    IF ready = 0 THEN
+        RETURN 0
+    END IF
+    LET framebuffer AS MMIOPTR = TermFramebufferMmio()
+    LET stride AS U32 = MEMORY.Read32(TermStrideAddress())
+    FillRect(framebuffer, stride, 540, 400, 460, 24, DashBg())
+    DrawLabel(framebuffer, stride, 540, 400, labelOffset, 1, color, DashBg())
+    RETURN 0
+END FUNCTION
+
+' Marks the UEFI-to-APS authority handoff -- the concept doc's own most important symbolic
+' moment. Recolors the APS box to SOVEREIGN/magenta and draws a severed (crossed) link where the
+' UEFI-APS connector used to read as live, matching the doc's own "severed or crossed link ...
+' indicates control has passed" direction.
+FUNCTION DashShowSovereign() AS U64
+    LET ready AS U32 = MEMORY.Read32(TermReadyAddress())
+    IF ready = 0 THEN
+        RETURN 0
+    END IF
+    LET framebuffer AS MMIOPTR = TermFramebufferMmio()
+    LET stride AS U32 = MEMORY.Read32(TermStrideAddress())
+    LET apsX AS U32 = 280
+    LET apsY AS U32 = 80
+    LET apsW AS U32 = 180
+    LET apsH AS U32 = 90
+    DrawRectBorder(framebuffer, stride, apsX, apsY, apsW, apsH, DashMagenta())
+    LET boxLabelY AS U32 = apsY + 58
+    FillRect(framebuffer, stride, apsX + 10, boxLabelY, apsW - 20, 16, DashBg())
+    DrawLabel(framebuffer, stride, apsX + 10, boxLabelY, LABEL_SOVEREIGN(), 1, DashMagenta(), DashBg())
+    LET midY AS U32 = apsY + (apsH \ 2)
+    DrawHLine(framebuffer, stride, 200, midY, 80, DashMagenta())
+    RETURN 0
+END FUNCTION
+
+' Draws every static piece of the dashboard exactly once: background, header, the UEFI/APS
+' transition boxes (UEFI side only -- DashShowSovereign draws the APS side once real sovereignty
+' is established), all 6 subsystem panels at their real starting PENDING state, the empty
+' assembly bar frame, the event feed panel frame, the status panel frame, and the footer.
+FUNCTION DashDrawStatic() AS U64
+    LET ready AS U32 = MEMORY.Read32(TermReadyAddress())
+    IF ready = 0 THEN
+        RETURN 0
+    END IF
+    LET framebuffer AS MMIOPTR = TermFramebufferMmio()
+    LET stride AS U32 = MEMORY.Read32(TermStrideAddress())
+    LET widthPx AS U32 = MEMORY.Read32(TermWidthPxAddress())
+    LET heightPx AS U32 = MEMORY.Read32(TermHeightPxAddress())
+
+    FillRect(framebuffer, stride, 0, 0, widthPx, heightPx, DashBg())
+
+    DrawLabel(framebuffer, stride, 20, 10, LABEL_ARCOLOGY(), 3, DashActive(), DashBg())
+    DrawLabel(framebuffer, stride, 20, 46, LABEL_SYSTEM_ASSEMBLY(), 1, DashPrimary(), DashBg())
+    LET platformW AS U32 = 8 * 1 * 11
+    DrawLabel(framebuffer, stride, widthPx - platformW - 20, 16, LABEL_PLATFORM(), 1, DashDim(), DashBg())
+    DrawHLine(framebuffer, stride, 10, 64, widthPx - 20, DashDim())
+
+    LET uefiX AS U32 = 60
+    LET uefiY AS U32 = 92
+    DrawRectBorder(framebuffer, stride, uefiX, uefiY, 140, 70, DashDim())
+    DrawLabel(framebuffer, stride, uefiX + 10, uefiY + 12, LABEL_UEFI(), 1, DashDim(), DashBg())
+    DrawLabel(framebuffer, stride, uefiX + 10, uefiY + 28, LABEL_FIRMWARE(), 1, DashDim(), DashBg())
+    DrawHLine(framebuffer, stride, uefiX + 10, uefiY + 44, 120, DashDim())
+    DrawLabel(framebuffer, stride, uefiX + 10, uefiY + 50, LABEL_HANDOFF_COMPLETE(), 1, DashDim(), DashBg())
+
+    LET apsX AS U32 = 280
+    LET apsY AS U32 = 80
+    DrawRectBorder(framebuffer, stride, apsX, apsY, 180, 90, DashDim())
+    DrawLabel(framebuffer, stride, apsX + 10, apsY + 12, LABEL_APS(), 2, DashDim(), DashBg())
+    DrawLabel(framebuffer, stride, apsX + 10, apsY + 40, LABEL_SUBSTRATE(), 1, DashDim(), DashBg())
+
+    LET panelIdx AS U32 = 0
+    WHILE panelIdx < 6
+        DashSetSubsystem(panelIdx, 0)
+        panelIdx = panelIdx + 1
+    WEND
+
+    DashUpdateAssembly(0, 10)
+
+    LET feedX AS U32 = 20
+    LET feedY AS U32 = 370
+    DrawRectBorder(framebuffer, stride, feedX, feedY, 480, 190, DashDim())
+    DrawLabel(framebuffer, stride, feedX + 10, feedY + 10, LABEL_EVENT_FEED(), 1, DashPrimary(), DashBg())
+    DrawHLine(framebuffer, stride, feedX + 10, feedY + 26, 460, DashDim())
+
+    LET statusX AS U32 = 520
+    LET statusY AS U32 = 370
+    DrawRectBorder(framebuffer, stride, statusX, statusY, 480, 190, DashDim())
+    DrawLabel(framebuffer, stride, statusX + 10, statusY + 10, LABEL_STATUS_HDR(), 1, DashPrimary(), DashBg())
+    DrawHLine(framebuffer, stride, statusX + 10, statusY + 26, 460, DashDim())
+
+    LET footerY AS U32 = heightPx - 26
+    DrawHLine(framebuffer, stride, 10, footerY, widthPx - 20, DashDim())
+    DrawLabel(framebuffer, stride, 20, footerY + 8, LABEL_FOOTER_VER(), 1, DashDim(), DashBg())
+    DrawLabel(framebuffer, stride, 400, footerY + 8, LABEL_FOOTER_MOTTO(), 1, DashDim(), DashBg())
+
+    MEMORY.Write32(DashEventCursorAddress(), 0)
     RETURN 0
 END FUNCTION
