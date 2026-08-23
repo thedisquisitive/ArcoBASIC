@@ -104,6 +104,30 @@ inline std::optional<UefiType> lookup_uefi_type(const std::string& name) {
                 // image handle and memory-map key are explicit UINTN arguments; the service
                 // table pointer is not an implicit C++/protocol `This` parameter.
                 UefiField{"ExitBootServices", "ExitBootServices", 0xE8, "", true, false, "U64"},
+                // EFI_BOOT_SERVICES.DisconnectController (table index 34, offset 0x110). RFC-0045
+                // Phase 3's own real finding: OVMF's own native XHCI driver stays bound to (and
+                // periodically polls/rings the doorbell of) a controller this project's own raw
+                // PCI/MMIO xHCI driver ALSO drives directly, outside any UEFI protocol -- a real
+                // firmware-vs-guest-driver ownership conflict, confirmed via QEMU's own trace
+                // events showing spurious, unexplained repeated command-doorbell writes with no
+                // corresponding guest call. DisconnectController(ControllerHandle, DriverImage
+                // Handle OPTIONAL, ChildHandle OPTIONAL) forces UEFI's own driver stack off a
+                // specific controller handle before this project's own driver starts touching it.
+                UefiField{"DisconnectController", "DisconnectController", 0x110, "", true, false, "U64"},
+            },
+        };
+    }
+    if (name == "UEFI.PciIoProtocol") {
+        // EFI_PCI_IO_PROTOCOL (MdePkg/Include/Protocol/PciIo.h). Only GetLocation is bound --
+        // RFC-0045 Phase 3's own real need is identifying which EFI_HANDLE corresponds to the
+        // SAME PCI Bus/Device/Function this driver's own raw PCI config-space scan already found,
+        // so it can be passed to DisconnectController; every other real PCI I/O this driver does
+        // (BAR/MMIO access, config space) already goes through raw port I/O, not this protocol.
+        return UefiType{
+            "UEFI.PciIoProtocol",
+            160,
+            {
+                UefiField{"GetLocation", "GetLocation", 0x70, "", true, true, "U64"},
             },
         };
     }

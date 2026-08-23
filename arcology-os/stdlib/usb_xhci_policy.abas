@@ -210,10 +210,98 @@ FUNCTION UsbXhci.DiscoverPci(systemTable AS UEFI.SystemTable) AS BOOL
     RETURN found
 END FUNCTION
 
+FUNCTION XhciDisconnectGuidAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 320)
+END FUNCTION
+FUNCTION XhciDisconnectHandlesAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 336)
+END FUNCTION
+FUNCTION XhciDisconnectIfaceAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 464)
+END FUNCTION
+
+' A REAL, confirmed root cause found via QEMU's own trace events (RFC-0045 Phase 3): OVMF's own
+' native XHCI driver stays bound to this controller (it is a real PCI device firmware discovers
+' and binds a driver to during its own boot-time driver-connection pass) and keeps periodically
+' touching it -- QEMU's trace log showed spurious, unexplained repeated command-doorbell writes
+' with no corresponding call anywhere in this driver, interleaved with this driver's own real
+' commands, racing for the same Command Ring. This function finds the SAME PCI Bus/Device/Function
+' this driver's own raw config-space scan (UsbXhci.DiscoverPci) already identified -- via
+' EFI_PCI_IO_PROTOCOL's own GetLocation method, the only way to map a raw PCI location back to the
+' EFI_HANDLE firmware knows it by -- and calls BootServices.DisconnectController on it, forcing
+' UEFI's own driver stack off before this driver starts touching the controller's own registers.
+' Real, honest fail-open: if no matching handle is found (already disconnected, or firmware never
+' bound one), this returns FALSE without touching anything else -- not a hard requirement upstream.
+FUNCTION UsbXhci.DisconnectFirmwareDriver(systemTable AS UEFI.SystemTable) AS BOOL
+    LET guidBuf AS MMIOPTR = XhciDisconnectGuidAddress()
+    MEMORY.Write64(guidBuf, 5522935658814222848)
+    MEMORY.Write64(ADDRESS.Offset(guidBuf, 8), 11097520664359398558)
+
+    LET maxHandles AS U64 = 16
+    LET bufferSize AS U64 = maxHandles * 8
+    LET bufferSizeAddr AS PTR = ADDRESS.Local(bufferSize)
+    LET handleBuffer AS MMIOPTR = XhciDisconnectHandlesAddress()
+
+    LET status AS U64 = systemTable.BootServices.LocateHandle(2, guidBuf, 0, bufferSizeAddr, handleBuffer)
+    IF status <> 0 THEN
+        RETURN 0
+    END IF
+
+    LET foundCount AS U64 = bufferSize \ 8
+    IF foundCount > maxHandles THEN
+        foundCount = maxHandles
+    END IF
+
+    LET targetBus AS U32 = MEMORY.Read32(XhciPciBusAddress())
+    LET targetDevice AS U32 = MEMORY.Read32(XhciPciDeviceAddress())
+    LET targetFunction AS U32 = MEMORY.Read32(XhciPciFunctionAddress())
+
+    LET disconnected AS BOOL = 0
+    LET i AS U64 = 0
+    WHILE i < foundCount
+        LET handleEntry AS MMIOPTR = ADDRESS.Offset(handleBuffer, i * 8)
+        LET handle AS U64 = MEMORY.Read64(handleEntry)
+        LET ifaceOutAddr AS MMIOPTR = XhciDisconnectIfaceAddress()
+        LET hpStatus AS U64 = systemTable.BootServices.HandleProtocol(handle, guidBuf, ifaceOutAddr)
+        IF hpStatus = 0 THEN
+            LET pciIo AS UEFI.PciIoProtocol = MEMORY.Read64(ifaceOutAddr)
+            LET segOut AS U64 = 0
+            LET segOutAddr AS PTR = ADDRESS.Local(segOut)
+            LET busOut AS U64 = 0
+            LET busOutAddr AS PTR = ADDRESS.Local(busOut)
+            LET devOut AS U64 = 0
+            LET devOutAddr AS PTR = ADDRESS.Local(devOut)
+            LET funcOut AS U64 = 0
+            LET funcOutAddr AS PTR = ADDRESS.Local(funcOut)
+            LET glStatus AS U64 = pciIo.GetLocation(segOutAddr, busOutAddr, devOutAddr, funcOutAddr)
+            IF glStatus = 0 THEN
+                LET busU32 AS U32 = busOut
+                LET devU32 AS U32 = devOut
+                LET funcU32 AS U32 = funcOut
+                IF busU32 = targetBus THEN
+                    IF devU32 = targetDevice THEN
+                        IF funcU32 = targetFunction THEN
+                            systemTable.BootServices.DisconnectController(handle, 0, 0)
+                            disconnected = 1
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+        i = i + 1
+    WEND
+    RETURN disconnected
+END FUNCTION
+
 ' Reads BAR0 (a real 64-bit MMIO BAR, per empirical confirmation against real QEMU qemu-xhci),
 ' enables Memory Space + Bus Master in the Command register, maps the MMIO region, and reads the
-' Capability Registers this driver needs (CAPLENGTH, MaxSlots, MaxPorts).
-FUNCTION UsbXhci.MapMmio() AS BOOL
+' Capability Registers this driver needs (CAPLENGTH, MaxSlots, MaxPorts). Real, confirmed fix
+' (RFC-0045 Phase 3): disconnects firmware's own native XHCI driver from this controller FIRST,
+' via UsbXhci.DisconnectFirmwareDriver -- see that function's own header comment for the full,
+' QEMU-trace-confirmed finding this closes (a real firmware-vs-guest-driver ownership conflict).
+FUNCTION UsbXhci.MapMmio(systemTable AS UEFI.SystemTable) AS BOOL
+    UsbXhci.DisconnectFirmwareDriver(systemTable)
+
     LET bus AS U32 = MEMORY.Read32(XhciPciBusAddress())
     LET device AS U32 = MEMORY.Read32(XhciPciDeviceAddress())
     LET func AS U32 = MEMORY.Read32(XhciPciFunctionAddress())
@@ -734,10 +822,10 @@ FUNCTION XhciSubmitCommand(dword0 AS U32, dword1 AS U32, dword2 AS U32, controlB
     ' the defensive retry shape a real xHCI driver uses for command timeouts. Confirmed empirically
     ' to restore full determinism across many consecutive real runs.
     LET eventBuffer AS MMIOPTR = XhciScratchEventBufferAddress()
-    LET pollCeiling AS U64 = 20000000
+    LET pollCeiling AS U64 = 2000000
     LET doorbellAttempt AS U32 = 0
     LET gotEvent AS BOOL = 0
-    WHILE doorbellAttempt < 3
+    WHILE doorbellAttempt < 2
         XhciRingDoorbell(0, 0)
         LET pollAttempts AS U64 = 0
         WHILE pollAttempts < pollCeiling
@@ -985,12 +1073,12 @@ FUNCTION UsbXhci.Ep0ControlTransfer(systemTable AS UEFI.SystemTable, slotId AS U
     ' doorbell-retry loop (see its header comment) -- a bounded re-ring of the SAME already-
     ' enqueued TRB sequence's doorbell if a full polling pass comes up empty.
     LET eventBuffer AS MMIOPTR = XhciScratchEventBufferAddress()
-    LET pollCeiling AS U64 = 20000000
+    LET pollCeiling AS U64 = 2000000
     LET completionCode AS U32 = 0
     LET actualLength AS U32 = 0
     LET doorbellAttempt AS U32 = 0
     LET gotEvent AS BOOL = 0
-    WHILE doorbellAttempt < 3
+    WHILE doorbellAttempt < 2
         XhciRingDoorbell(slotId, 1)
         LET pollAttempts AS U64 = 0
         WHILE pollAttempts < pollCeiling

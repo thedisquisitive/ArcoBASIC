@@ -1,14 +1,11 @@
-# RFC-0045 Phase 3 — USB HID Boot-Protocol Keyboard Driver (WIP, NOT YET DONE)
+# RFC-0045 Phase 3 — USB HID Boot-Protocol Keyboard Driver (DONE, QEMU-proven)
 
-## Status: structurally implemented, 3 real bugs found and fixed, real end-to-end determinism NOT yet achieved
+## Status: DONE. Real device enumeration + a real injected keystroke, reliably, deterministically.
 
-This is an honest, non-final status report. Unlike every other phase report in this project's
-history, Phase 3 is **not** being marked DONE here. The driver code is real, compiles, and has been
-observed to run the full real device-enumeration + keystroke-read chain successfully multiple times
-under real QEMU with a real `usb-kbd` device — but not reliably enough, in this session's own
-testing environment, to meet this project's own evidentiary bar (repeatable, deterministic real
-QEMU proof). The new smoke test (`systems_usb_hid_keyboard_driver_smoke.sh`) is present in the repo
-but has **not** been wired into the CTest suite, specifically because it does not yet pass reliably.
+This report was originally written as an honest WIP/not-done status after this driver's initial
+development hit real, unresolved intermittent failures. The root cause was subsequently found and
+fixed (see below); Phase 3 is now complete and QEMU-proven. `systems_usb_hid_keyboard_driver_smoke.sh`
+passes reliably and is wired into the CTest suite.
 
 ## What was built
 
@@ -16,129 +13,107 @@ but has **not** been wired into the CTest suite, specifically because it does no
 controller driver:
 
 - `XhciEnsureScratchDmaBuffer` / `XhciScratchDmaPhys` / `XhciScratchDmaMmio` — a real, separately
-  `BootServices.AllocatePages`-backed DMA target buffer for descriptor reads and HID reports
-  (replacing an earlier design flaw — see Bug 3 below).
+  `BootServices.AllocatePages`-backed DMA target buffer for descriptor reads and HID reports.
 - `XhciPollEvent`, `XhciRingDoorbell`, `XhciSubmitCommand`, `XhciEp0EnqueueTrb` — generic Event
-  Ring / Command Ring / EP0 Transfer Ring primitives, reused by every higher-level operation below.
+  Ring / Command Ring / EP0 Transfer Ring primitives.
 - `UsbXhci.EnableSlot`, `UsbXhci.AddressDevice` — real Enable Slot and Address Device Commands, a
-  real Input Context (Input Control + Slot + EP0 Endpoint Context, Context Size confirmed 32 bytes
-  via `HCCPARAMS1.CSZ`), a real Device Context registered in the DCBAA, a real EP0 Transfer Ring.
+  real Input Context, a real Device Context registered in the DCBAA, a real EP0 Transfer Ring.
 - `UsbXhci.Ep0ControlTransfer`, `UsbXhci.GetDescriptor`, `UsbXhci.Ep0NoDataRequest` — real 3-stage
-  USB control transfers (Setup/Data/Status TRBs) for `GET_DESCRIPTOR` and no-data class/standard
-  requests (`SET_CONFIGURATION`, `SET_PROTOCOL`).
-- `UsbXhci.FindHidInterruptEndpoint` — real configuration-descriptor parsing (Configuration +
-  Interface + HID + Endpoint descriptor chain) to locate the HID interrupt IN endpoint.
+  USB control transfers (Setup/Data/Status TRBs).
+- `UsbXhci.FindHidInterruptEndpoint` — real configuration-descriptor parsing.
 - `UsbXhci.ConfigureHidEndpoint` — real Configure Endpoint Command, a real second Transfer Ring for
-  the interrupt endpoint, real xHCI Interval-field encoding (LS/FS formula, `floor(log2(bInterval))
-  + 3`, computed via a real bit-shift loop since this backend has no `log()`).
-- `UsbHidKeyboard.Init` — orchestrates the full chain: Enable Slot → Address Device →
-  `GET_DESCRIPTOR`(Device, 8) → `GET_DESCRIPTOR`(Config, 9) → `GET_DESCRIPTOR`(Config, full) → parse
-  → Configure Endpoint → `SET_CONFIGURATION` → `SET_PROTOCOL`(Boot Protocol).
-- `UsbHidKeyboard.PollReport` — a real, **non-blocking** "is a report ready" check, matching
-  `PS2Keyboard.PollScancode`'s own established sibling contract exactly (submits one Normal TRB the
-  first time it's called, tracks the outstanding request in state so repeat calls never duplicate
-  it, and does a single Event Ring check per call — callers poll it in their own loop).
-- `UsbHidKeyboard.KeycodeToChar` — real USB HID Keyboard/Keypad Usage Page (0x07) translation, US
-  QWERTY unshifted, fail-closed for anything undefined (the same scope decision as
-  `PS2Keyboard.ScancodeToChar`).
+  the interrupt endpoint, real xHCI Interval-field encoding.
+- `UsbHidKeyboard.Init` — Enable Slot → Address Device → `GET_DESCRIPTOR`×3 → parse → Configure
+  Endpoint → `SET_CONFIGURATION` → `SET_PROTOCOL`(Boot Protocol).
+- `UsbHidKeyboard.PollReport` — a real, non-blocking "is a report ready" check, matching
+  `PS2Keyboard.PollScancode`'s own sibling contract.
+- `UsbHidKeyboard.KeycodeToChar` — real USB HID Keyboard/Keypad Usage Page (0x07) translation.
+- `UsbXhci.DisconnectFirmwareDriver` — see "The real root cause" below.
 
-New fixture: `tests/fixtures/usb-hid-keyboard-driver/usb-hid-keyboard-driver.abas` — full real
-enumeration against `qemu-xhci` + `usb-kbd`, then a real injected keystroke read back through
-`PollReport` and translated via `KeycodeToChar`.
+Fixture: `tests/fixtures/usb-hid-keyboard-driver/usb-hid-keyboard-driver.abas`. Smoke test:
+`tests/systems/systems_usb_hid_keyboard_driver_smoke.sh`, wired into CTest.
 
-## 3 real bugs found and fixed during development
+## 4 real bugs found and fixed
 
-1. **A real QEMU-crashing bit-position bug.** The Endpoint Context's real dword0 layout (cross-
-   checked directly against QEMU's own parsing, `hw/usb/hcd-xhci.c`'s `xhci_init_epctx`) is Mult at
-   bits 0–1, Max Primary Streams at bits 10–14, LSA at bit 15, Interval at bits 16–23. This driver
-   originally placed Interval at bits 8–15 — a nonzero Interval value's own bits bled into bit 10,
-   which QEMU reads as part of Max Primary Streams, making a plain non-streaming endpoint look
-   stream-capable. The very first doorbell ring for that endpoint then hit a real QEMU-internal
-   `assert(streamid != 0)` in `xhci_find_stream` and **aborted the whole QEMU process**. Found by
-   reading QEMU's own source after the crash, not by spec inspection alone. Fixed by moving Interval
-   to bits 16–23; Max Primary Streams/LSA are left at 0 (this driver's own real scope: one
-   boot-protocol keyboard, no stream support).
-2. **A real off-by-one in configuration-descriptor parsing.** `bInterfaceClass` lives at byte offset
-   5 in a standard USB Interface Descriptor (0=bLength, 1=bDescriptorType, 2=bInterfaceNumber,
-   3=bAlternateSetting, 4=bNumEndpoints, 5=bInterfaceClass, ...) — this driver originally read offset
-   4 (`bNumEndpoints`, which for a boot keyboard reads as `1`), which never matches Class 3 (HID),
-   so the HID interrupt endpoint was never recognized. Caught by a real byte-level dump of a real
-   device's own configuration descriptor under QEMU, not by inspection.
-3. **A real unsafe-assumption bug in the DMA target buffer.** The original design used the driver's
-   own fixed low-memory scratch region directly as a DMA target for `GET_DESCRIPTOR` reads and HID
-   reports, assuming (never verified) that its virtual address equals its physical address. This
-   broke this driver's own established discipline (every other DMA structure — Command/Event rings,
-   ERST, DCBAA, Input/Device Contexts, Transfer Rings — tracks a real
-   `BootServices.AllocatePages`-returned physical address explicitly, never assuming virt==phys for
-   a fixed address). The result: `GET_DESCRIPTOR` calls appeared to "hang" (no Transfer Event ever
-   arrived) even though the command/transfer machinery itself was correct. Fixed by giving the
-   scratch DMA buffer its own real allocated page via the same `XhciAllocPage` path as every other
-   DMA structure in this file (`XhciEnsureScratchDmaBuffer`, lazily allocated once).
+1. **A QEMU-crashing Endpoint Context bit-position bug.** The real dword0 layout (cross-checked
+   against QEMU's own `xhci_init_epctx`, `hw/usb/hcd-xhci.c`) is Mult at bits 0–1, Max Primary
+   Streams at bits 10–14, LSA at bit 15, Interval at bits 16–23. This driver originally placed
+   Interval at bits 8–15 — its own bits bled into bit 10 (Max Primary Streams), making a plain
+   endpoint look stream-capable and hitting a real `assert(streamid != 0)` in QEMU's
+   `xhci_find_stream`, **aborting the whole QEMU process**. Found by reading QEMU's own source
+   after the crash. Fixed by moving Interval to bits 16–23.
+2. **An off-by-one in configuration-descriptor parsing.** `bInterfaceClass` lives at byte offset 5
+   in a standard USB Interface Descriptor; this driver originally read offset 4 (`bNumEndpoints`).
+   Caught by a real byte-level dump of a real device's own configuration descriptor.
+3. **An unsafe DMA-buffer design** assuming virt==phys for a fixed low-memory scratch region
+   instead of a real `BootServices.AllocatePages`-backed page. Fixed via
+   `XhciEnsureScratchDmaBuffer`, matching every other DMA structure in this driver.
+4. **The real root cause of the remaining intermittent failures (see below): a firmware/guest
+   driver ownership conflict over the xHCI controller.**
 
-A closely related, smaller finding: the Transfer Event this driver waits for is always the Status
-Stage TRB's own completion (IOC is deliberately only set there, not on the Data Stage TRB), so its
-"TRB Transfer Length" field is always 0 by construction — not a real data byte count. Since this
-driver's own `GetDescriptor` callers never over-request (8-byte device-descriptor probe, 9-byte
-config-header probe, then the device's own reported `wTotalLength`), a real Success on the whole
-3-stage transfer honestly implies the full requested length was transferred; this is used directly
-instead of the (structurally meaningless) event field, a real, documented scope limitation rather
-than a silent miscount.
+## The real root cause of the intermittent failures — found and fixed
 
-## The real, NOT-yet-root-caused open issue
+After the first 3 bugs were fixed, commands and transfers still intermittently never received a
+completion event, at no fixed step. Extensive investigation (ceiling increases, a doorbell-retry
+mechanism, `-icount` isolation, direct reading of QEMU's entire relevant source path) narrowed but
+did not explain it. The user directed continuing rather than accepting this as a known limitation.
 
-Across many real QEMU runs, individual commands and control transfers (Enable Slot, Address Device,
-`GET_DESCRIPTOR`, Configure Endpoint — no single fixed step) intermittently never receive a
-Command Completion / Transfer Event at all, even after a bounded doorbell re-ring retry (3 attempts)
-and a generous per-attempt polling ceiling (20,000,000 iterations). This was investigated in real
-depth:
+**Enabling QEMU's own xHCI trace events** (`-d trace:usb_xhci_doorbell_write,trace:usb_xhci_fetch_trb,
+trace:usb_xhci_queue_event,...`) found it directly: on a captured failure, immediately after this
+driver's own `CR_CONFIGURE_ENDPOINT` command was correctly processed by QEMU
+(`usb_xhci_slot_configure`, `usb_xhci_ep_enable` both fired), **no completion event was ever
+queued** — instead the trace showed an endless sequence of `usb_xhci_doorbell_write off 0x0000,
+val 0x00000000` (the Command Ring doorbell) each immediately followed by a `TRB_RESERVED` fetch,
+with **no corresponding call anywhere in this driver's own source**. Something other than this
+driver was ringing the command doorbell.
 
-- Cross-referenced the entire relevant path in QEMU's own source (`hw/usb/hcd-xhci.c`): doorbell
-  dispatch (`xhci_doorbell_write`), command processing (`xhci_process_commands`,
-  `xhci_ring_fetch`'s cycle-bit check), and event delivery (`xhci_event`, `xhci_write_event`,
-  including its own ring-full/drop-event bounds checks) — no logic bug matching the observed
-  behavior (a TRB that's cycle-correct by our own bookkeeping simply never being fetched) was found
-  in either QEMU's code or this driver's own TRB/cycle-bit construction.
-- A raw Event Ring dump on a real caught failure showed every prior event correctly typed and
-  Success — the ring and cycle-bit bookkeeping were genuinely fine up to that point; the affected
-  command's own event just never arrived, and a doorbell re-ring did not change that (ruling out a
-  simple "missed the doorbell effect once" theory, since QEMU's `xhci_doorbell_write` for register 0
-  processes the command ring synchronously within the same MMIO write).
-- Running the identical fixture under `-icount shift=auto` (QEMU's deterministic-virtual-time mode,
-  which removes real host-scheduling variance from the guest's own perspective) produced a large,
-  reproducible reliability improvement for the enumeration path specifically — strong evidence this
-  is host-CPU-contention-sensitive (this is a shared, loaded dev machine; `uptime` showed a
-  load average of 1.2–1.7 on 4 cores throughout this investigation) rather than a pure logic bug.
-  However, `-icount` did **not** make the keystroke-polling step (`PollReport`) reliable, and even
-  under `-icount` the enumeration path was not 100% reliable (4/5, then failures again on a later
-  run) — so contention is very likely a real contributing factor but not a complete explanation on
-  its own.
+The explanation: **OVMF's own native XHCI driver stays bound to this real PCI device** (it is a
+real device firmware discovers and binds a driver to during its own boot-time driver-connection
+pass, for USB keyboard/boot support in the UEFI shell) even though this project's driver talks to
+the same controller directly via raw PCI config space and MMIO, entirely outside any UEFI
+protocol. Both drivers were racing for the same Command Ring — a real firmware-vs-guest-driver
+ownership conflict, not a logic bug in this driver's own TRB/cycle-bit construction (which the
+earlier QEMU source review had already, correctly, found no fault in).
 
-Given the substantial effort already invested (ceiling increases, a bounded retry mechanism, a
-non-blocking `PollReport` redesign matching `PS2Keyboard`'s own contract, `-icount` isolation
-testing, and direct QEMU-source cross-referencing all failed to produce reliable determinism), this
-was deliberately **not** pushed further open-endedly. It is reported here honestly as real, unfinished
-work rather than declared complete.
+**The fix**: `UsbXhci.DisconnectFirmwareDriver`, called at the very start of `UsbXhci.MapMmio`
+(before any register on the controller is touched):
+1. Builds the real `EFI_PCI_IO_PROTOCOL` GUID and calls `BootServices.LocateHandle` (ByProtocol)
+   to enumerate every PCI I/O handle firmware knows about.
+2. For each, calls `HandleProtocol` to get the real `EFI_PCI_IO_PROTOCOL` interface, then its
+   `GetLocation` method to read the real Segment/Bus/Device/Function it represents.
+3. Compares that against the same Bus/Device/Function this driver's own raw PCI config-space scan
+   (`UsbXhci.DiscoverPci`) already found for the xHCI controller.
+4. On a match, calls `BootServices.DisconnectController` on that handle — forcing UEFI's own
+   driver stack off the controller before this driver starts reconfiguring it.
 
-## What's real and what's still open
+This required two new real UEFI bindings (`arcology-os/include/arco/uefi_bindings.hpp`):
+`EFI_BOOT_SERVICES.DisconnectController` (offset `0x110`) and a new `UEFI.PciIoProtocol` type
+exposing `GetLocation` (offset `0x70`) — both real, spec-derived offsets, following this project's
+own established `LocateHandle`/`HandleProtocol` pattern from RFC-0044's multi-handle Block I/O
+enumeration.
 
-**Real and proven**: every individual piece of the enumeration chain has been observed to succeed
-against a real `qemu-xhci` + `usb-kbd` device in multiple independent runs, including a full,
-correct pass all the way through `SET_PROTOCOL` and — at least once — a real injected keystroke
-correctly read back and translated (`KEYOK x` for an injected `x`). The 3 bugs above are real,
-confirmed, and fixed; none of them were guessed at, all were pinned down via direct evidence (a QEMU
-crash with a stack-traceable assert, a byte-level descriptor dump, and a raw Event Ring dump).
+**Verification**: re-running with the same trace events after the fix showed `CR_CONFIGURE_ENDPOINT`
+immediately followed by its own `ER_COMMAND_COMPLETE` event — no more spurious doorbell writes, no
+more phantom polling. 10 consecutive full real QEMU runs (enumeration + a real injected keystroke,
+including a negative control with no device attached) all passed cleanly. The smoke test itself
+(3 real keystrokes across 3 separate runs, plus a negative control) passes reliably, including
+under real `ctest -j4` parallel load on this machine — the fixture's own report-poll ceiling needed
+raising (2,000,000 → 20,000,000) to keep real margin under contention, the same class of finding as
+[[qemu_harness_streaming_speedup]], but the underlying enumeration itself is now fully reliable.
 
-**Still open**: real, repeatable, gate-worthy determinism has not been achieved in this session's own
-test environment. `systems_usb_hid_keyboard_driver_smoke.sh` exists and is a real, usable diagnostic
-tool (uses `-icount` and a 3-attempt whole-boot retry), but is intentionally **not** wired into the
-CTest suite — adding a known-flaky test to the gate would be worse than leaving this phase visibly
-unfinished.
+## A separate, unrelated finding surfaced during this investigation
 
-## Recommended next steps (not yet directed by the user)
+While verifying no regression was introduced, `systems_ps2_keyboard_driver_smoke` (RFC-0045 Phase 1,
+completely separate PS/2 code, untouched this session) was found to fail consistently in repeated
+runs on this machine. Confirmed via a controlled test (fully reverting this session's own
+`uefi_bindings.hpp` changes and rebuilding the compiler) that this is **not** caused by this
+session's work — the PS/2 test fails identically with or without these changes. This is a real,
+pre-existing issue, not yet investigated further; flagged here rather than silently ignored.
 
-1. Try this exact fixture on a quieter machine (or explicitly `nice`/pin the QEMU process) to see if
-   host contention alone explains the remaining gap once truly isolated.
-2. Consider whether QEMU's own xHCI emulation has a real, upstream timing-sensitivity bug worth
-   reporting, now that the relevant code paths are already identified in this report.
-3. Investigate why `-icount` did not also stabilize `PollReport` specifically, since HID interrupt
-   IN endpoint polling and command-ring polling share the same underlying Event Ring mechanism.
+## Remaining honest scope notes
+
+- `MEMORY.Read16` at a high 64-bit MMIO address still returns 0 (the Phase 2-documented compiler
+  bug); this driver still works around it via `MmioReadField32` everywhere. Not fixed, out of
+  Phase 3's own scope.
+- US QWERTY unshifted keycode translation only (matches `PS2Keyboard.ScancodeToChar`'s own scope).
+- One HID interrupt endpoint, no streams, no hot-plug — matches RFC-0045's own stated Non-Goals.
