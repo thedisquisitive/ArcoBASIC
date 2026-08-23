@@ -37,16 +37,28 @@ test both input paths independently) and observe the real, live response on the 
 
 ## Build Identity
 
-- Git commit: `0cecd37` (RFC-0007 Program Mode's first real increment — RPM, PRINT, GOTO, RUN, LIST,
-  NEW/CLEAR, plus real Shift-key tracking so a real `"` is typable — on top of `102a051`'s font-scale
-  fix, `02b2762`'s dashboard, and `0cd99c8`'s CR3 fix)
+- Git commit: `bb62338` (real hardware fix — `RpmCountAddress`/`KeyModifierStateAddress` were never
+  explicitly zeroed, causing Round 3's own real failure below — on top of `0cecd37`'s Program Mode
+  increment, `102a051`'s font-scale fix, `02b2762`'s dashboard, and `0cd99c8`'s CR3 fix)
 - Compiler/version: `ArcoFission 0.1.0`
 - Image filename: `aps-arcology-seed-substrate-x86_64.img`
 - Artifact directory: `arcology-os/dist/aps-arcology-seed-substrate/`
-- EFI SHA-256: `83ee6270e5d58e9939d7d1ff750219a132bc7dd0857eed1a09bc983b1861dcaf`
-- Image SHA-256: `b5a924e360a705bb20eac86bc68280d7b9ff7f5114382dab17074133882a965e`
+- EFI SHA-256: `cdcdd4a5a1b25e27c10762a24988cfbf086b4bef0fc1f48bf7f684920343a61f`
+- Image SHA-256: `b11a92e793c020c0726a81f2018f5bc4ffcba70f542a16d852b761a2a05e715c`
 - Full checksums: `arcology-os/dist/aps-arcology-seed-substrate/SHA256SUMS`
-- Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync` — write performed this session, verified byte-for-byte via a raw-device checksum readback (first 64MiB) immediately after. This build adds RFC-0007 Program Mode (RUN/PRINT/GOTO) on top of the font-scale fix — see the Round 3 addendum below for what's newly testable.
+- Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync` — write performed this session, verified byte-for-byte via a raw-device checksum readback (first 64MiB) immediately after.
+
+## Round 3 result: a real bug found on real hardware, now fixed (not yet re-validated)
+
+The user's own first physical test of Program Mode: `10 PRINT "HELLO"` then `RUN` printed nothing
+and never returned to `READY.` on its own — only a real injected `ESC` broke out, reporting a
+nonsensical `BREAK IN 3206755423`. Root cause: `RpmCountAddress` and `KeyModifierStateAddress` were
+both read before any code path was guaranteed to have written them — invisible under QEMU (whose
+own VM RAM always starts zeroed) but real on the user's physical RAM, which had genuine leftover
+garbage there. Confirmed by direct reproduction (a throwaway build that deliberately poisons
+`RpmCountAddress` under QEMU reproduced the identical symptom shape), then confirmed fixed the same
+way. See RFC-0007 Section 15's own "A real bug found on real hardware, Round 3" for the full
+writeup. This image (commit `bb62338`) is the first build with the fix — Round 4 is the real test.
 
 ## Round 3 addendum: RFC-0007 Program Mode is now on this image
 
