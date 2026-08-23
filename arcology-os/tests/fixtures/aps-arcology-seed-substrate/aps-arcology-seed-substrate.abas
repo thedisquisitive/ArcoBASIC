@@ -3637,6 +3637,21 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     systemTable.ConsoleOut.Write("SUBSTRATE PRE\r\n")
     MEMORY.Write32(TermReadyAddress(), 0)
 
+    ' A REAL bug found on real hardware, never reproduced under QEMU (the exact same class of gap
+    ' as the earlier CR3/identity-map finding): QEMU's own VM RAM starts fully zeroed on every boot,
+    ' a well-known QEMU behavior this fixture was silently relying on for RpmCountAddress and
+    ' KeyModifierStateAddress -- neither was ever explicitly zeroed before first use, only assumed
+    ' zero. Real physical RAM makes no such guarantee at all; on the user's own laptop,
+    ' RpmCountAddress read back as real leftover garbage, so RUN walked a garbage-length "program"
+    ' of uninitialized entries (almost none of which coincidentally matched stmtType 1 or 2, so
+    ' nothing ever printed) until a real injected ESC caught it mid-scan and reported whatever
+    ' garbage happened to be sitting in that entry's own lineNumber field as the break line. Fixed
+    ' by explicitly zeroing both here, matching TermReadyAddress's own existing precedent just above
+    ' -- every piece of this fixture's own persistent state that gets READ before any code path is
+    ' guaranteed to have WRITTEN it first needs the same treatment, not just this one.
+    MEMORY.Write32(RpmCountAddress(), 0)
+    MEMORY.Write32(KeyModifierStateAddress(), 0)
+
     LET gopOk AS BOOL = SetupGopDashboard(systemTable)
 
     PS2Keyboard.Init()

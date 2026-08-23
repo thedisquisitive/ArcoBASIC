@@ -441,9 +441,42 @@ before any array shifting begins) but not yet exercised by an automated test —
 65 real typed program lines, impractical via scripted keystroke injection; verified by code review
 of `RpmCommit`'s own capacity-then-shift ordering instead.
 
+## A real bug found on real hardware, Round 3 (2026-08-23)
+
+The user's own first physical test of this increment: `10 PRINT "HELLO"` then `RUN` printed
+nothing at all and never returned to `READY.` on its own — only a real injected `ESC` broke out of
+it, reporting a nonsensical `BREAK IN 3206755423`. Never reproduced under QEMU.
+
+**Root cause, the exact same class of gap as RFC-0045's own earlier CR3/identity-map finding**:
+QEMU's own VM RAM starts fully zeroed on every boot, a well-known QEMU behavior this fixture was
+silently relying on. `RpmCountAddress` (RPM's own entry count) and `KeyModifierStateAddress`
+(Shift-held state) were both read before any code path was guaranteed to have written them, with
+no explicit zero-init — invisible under QEMU, but real physical RAM makes no such guarantee at
+all. On the user's real laptop, `RpmCountAddress` read back as real leftover garbage, so `RUN`
+walked a garbage-length "program" of uninitialized entries — almost none of which coincidentally
+matched a real statement type, so nothing ever printed — until the real injected `ESC` caught it
+mid-scan and reported whatever garbage happened to sit in that entry's own line-number field.
+
+**Confirmed by direct reproduction, not just code review**: built a throwaway variant that
+deliberately poisons `RpmCountAddress` with the user's own reported garbage value right after boot
+(simulating real uninitialized RAM under QEMU, which otherwise never exhibits this), which
+reproduced the exact same symptom shape (no `PRINT` output, `ESC` required, a nonsense break line —
+`BREAK IN 0` rather than the user's own `3206755423`, since QEMU's RAM backing the entry table
+itself was still zeroed even though the count was deliberately poisoned; the mechanism is
+identical). Re-adding the zero-init on top of that same poisoned build fixed it immediately.
+
+**Fix**: explicit `MEMORY.Write32(RpmCountAddress(), 0)` and `MEMORY.Write32(
+KeyModifierStateAddress(), 0)` at the top of `Main()`, matching `TermReadyAddress`'s own existing
+same-spot precedent. An audit of every other stateful counter/cursor in this fixture
+(`TermCursorCol/RowAddress`, `DashEventCursorAddress`, `DashAssemblyCountAddress`) found each
+already explicitly zeroed before first use — this was a real, isolated gap in the two pieces of
+state this specific increment introduced, not a systemic pattern across the whole fixture. 96/96
+regression suite unaffected (QEMU's own zeroed RAM meant this was always a no-op there).
+
 ## What this does not close
 
-Real hardware validation of Program Mode specifically has not happened — WP-033 (RFC-0045 Phase 5)
+Real hardware validation of Program Mode after this fix has not happened yet (Round 3 found the
+bug above; a Round 4 write is needed to confirm the fix on real silicon). WP-033 (RFC-0045 Phase 5)
 predates this increment and only exercises Immediate Mode (`HELP`/`OT`). A future hardware package
 would need a human to actually type a quoted `PRINT` (proving Shift genuinely works on real
 silicon, not just under QEMU's own `sendkey`) and a `GOTO` loop (proving ESC genuinely interrupts
