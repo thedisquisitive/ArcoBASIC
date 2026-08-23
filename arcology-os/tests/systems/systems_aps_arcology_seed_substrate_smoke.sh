@@ -200,4 +200,12 @@ grep -aqF 'BREAK IN' "$TMP_ROOT/run_break.txt" || { echo "FAIL: ESC did not inte
 LOOP_COUNT=$(grep -acF $'loop\r' "$TMP_ROOT/run_break.txt")
 [ "$LOOP_COUNT" -gt 1 ] || { echo "FAIL: the loop only ran once -- GOTO is not actually looping" >&2; cat "$TMP_ROOT/run_break.txt" >&2; exit 1; }
 
-echo "PASS: RFC-0045 Phase 4/5 substrate unification -- real ExitBootServices + APS's own CR3/GDT/IDT takeover + RFC-0007's genuine HELP/OT/?SYNTAX ERROR/backspace command loop, fed by BOTH the PS/2 and USB HID input paths together and confirmed working via EITHER path alone, output to BOTH real serial AND a real GOP-framebuffer on-screen terminal (confirmed via a real screendump pixel check); negative control confirmed real. PLUS RFC-0007 Program Mode's first real increment (PRINT + GOTO): numbered-line storage, RUN executing stored lines in order (including a real shift-apostrophe -> double-quote keystroke), LIST reconstructing stored source, a real undefined-statement GOTO error, and a real infinite GOTO loop genuinely interrupted by ESC"
+# Real, general Shift support (a real hardware finding -- the user asked for it directly after the
+# narrow apostrophe-only version left them unable to type anything else shifted): uppercase letters
+# via the classic +/-32 ASCII case flip, plus a real shifted-digit symbol, both via real injected
+# `shift-X` keystrokes on both input paths.
+run_once "$TMP_ROOT/run_shift.txt" both \
+    p r i n t spc shift-apostrophe shift-b i g spc shift-t e s t spc 1 shift-1 shift-apostrophe ret
+grep -aqF 'Big Test 1!' "$TMP_ROOT/run_shift.txt" || { echo "FAIL: Shift did not produce real uppercase letters and a real shifted digit symbol" >&2; cat "$TMP_ROOT/run_shift.txt" >&2; exit 1; }
+
+echo "PASS: RFC-0045 Phase 4/5 substrate unification -- real ExitBootServices + APS's own CR3/GDT/IDT takeover + RFC-0007's genuine HELP/OT/?SYNTAX ERROR/backspace command loop, fed by BOTH the PS/2 and USB HID input paths together and confirmed working via EITHER path alone, output to BOTH real serial AND a real GOP-framebuffer on-screen terminal (confirmed via a real screendump pixel check); negative control confirmed real. PLUS RFC-0007 Program Mode's first real increment (PRINT + GOTO): numbered-line storage, RUN executing stored lines in order (including a real shift-apostrophe -> double-quote keystroke), LIST reconstructing stored source, a real undefined-statement GOTO error, a real infinite GOTO loop genuinely interrupted by ESC, and real general Shift support (uppercase letters + shifted digit symbols, not just the apostrophe)"
