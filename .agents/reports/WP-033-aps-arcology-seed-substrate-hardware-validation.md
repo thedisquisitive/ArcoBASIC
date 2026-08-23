@@ -37,18 +37,15 @@ test both input paths independently) and observe the real, live response on the 
 
 ## Build Identity
 
-- Git commit: `[fill in at physical test time]`
+- Git commit: `02b2762` (Arcology Boot Screen dashboard + the earlier 512GB identity-map CR3 fix
+  from `0cd99c8`, both included in this build)
 - Compiler/version: `ArcoFission 0.1.0`
 - Image filename: `aps-arcology-seed-substrate-x86_64.img`
 - Artifact directory: `arcology-os/dist/aps-arcology-seed-substrate/`
 - EFI SHA-256: `683095cf28fe05876c0135f02a1e8103816b47976e8c045581fa832fbb40babd`
 - Image SHA-256: `fe18c0c4f86f28bf3dedd677614a4bc4dbe96f954f649e4cc975dd4968c31816`
 - Full checksums: `arcology-os/dist/aps-arcology-seed-substrate/SHA256SUMS`
-- Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync`
-- **This checksum reflects the Arcology Boot Screen dashboard build (this revision). Earlier
-  sessions wrote and verified a pre-dashboard build to the real USB stick; that write does NOT
-  cover this artifact — media must be re-written from this checksum before the checklist below is
-  valid.**
+- Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync` — write performed this session, verified byte-for-byte via a raw-device checksum readback (first 64MiB) immediately after. **This is the first physical write covering both the dashboard and the CR3 fix — neither has been tested on real hardware yet.**
 
 **Pre-physical-test sanity check already performed (QEMU, not a substitute for the checklist
 below):** the exact built `.img` file (not a synthetic vvfat directory) was booted directly under
