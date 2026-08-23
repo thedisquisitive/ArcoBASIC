@@ -499,11 +499,38 @@ diff review confirming zero lines in the dashboard's own drawing functions chang
 regression suite (the one failure is the same pre-existing, unrelated PS/2 flake noted in RFC-0045
 revision 0.3).
 
+## Round 4: the font fix wasn't enough, plus a real Shift feature request
+
+The user retested the 8x14 font fix: overall clarity improved, but "h still kinda looks more like
+an n" — a real, fair continued complaint. Decoding the actual bitmap confirmed why: the ascender
+was only 1 row taller than x-height before the arch even started, an easy-to-miss difference at
+real viewing distance. Re-rasterized at size 13pt (same 14-row cell budget, confirmed no clipping
+across all 95 glyphs), giving `h` a real 2-row ascender lead over `n`. Confirmed by decoding the
+bitmap before committing, then by a real QEMU screendump of `PRINT "hi there night owl"` —
+unmistakable this time.
+
+Same session, the user also asked directly: "Can we get shift key support? I keep wanting to
+type." The previous fix (RFC-0007 Round 3, part 1 above) only disambiguated the apostrophe key —
+just enough to make quoted `PRINT` strings typable — leaving every other shifted character
+(uppercase letters, `!@#$%^&*()`, etc.) unavailable. A completely reasonable thing to want from any
+real keyboard-driven prompt, and the honest scope limit of the earlier fix.
+
+**Fix**: replaced the narrow apostrophe-only override with a real, general `ApplyShift(ch)`
+function — letters via the classic ASCII case flip (`-32`), plus a real US QWERTY shifted mapping
+for the digit row and common punctuation keys, applied uniformly by both `PollAnyKey` paths (one
+shared function instead of duplicating shift logic per-driver). Verified under QEMU:
+`PRINT "Big Test 1!"` typed via real `shift-b`/`shift-t`/`shift-1` keystrokes produces exactly that
+string. New automated scenario added to `systems_aps_arcology_seed_substrate_smoke` locks in
+coverage. 96/96 full regression suite (two transient CPU-contention flakes under `-j4` — the known
+PS/2 one plus an unrelated ArcFS test that passed clean in isolation).
+
 ## What this does not close
 
-Real hardware validation of Program Mode after either fix above has not happened yet — Round 3
-found and fixed both bugs, but the fixes themselves haven't been re-confirmed on real silicon
-(Round 4). WP-033 (RFC-0045 Phase 5) predates this whole increment and only exercises Immediate
-Mode (`HELP`/`OT`). A future hardware package would need a human to actually type a quoted `PRINT`
-(proving Shift genuinely works on real silicon), read the new 8x14 font back clearly, and run a
-`GOTO` loop (proving ESC genuinely interrupts it) on the real keyboard(s) WP-033 already covers.
+Real hardware validation of Program Mode after any of the fixes above has not happened yet —
+Round 3 and Round 4 found and fixed the RPM zero-init bug, the font legibility bug (twice), and the
+narrow-vs-general Shift gap, but none of the fixes have been re-confirmed on real silicon since
+Round 4's own build was written. WP-033 (RFC-0045 Phase 5) predates this whole increment and only
+exercises Immediate Mode (`HELP`/`OT`). A future hardware package would need a human to actually
+type real uppercase/shifted-symbol text (proving general Shift genuinely works on real silicon,
+not just the apostrophe), read the new 8x14 font back clearly, and run a `GOTO` loop (proving ESC
+genuinely interrupts it) on the real keyboard(s) WP-033 already covers.
