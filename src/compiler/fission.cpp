@@ -990,6 +990,8 @@ private:
             const std::string name = upper_ascii(node.name);
             if (name == "CPU.READCR3") return "U64";
             if (name == "CPU.READCR2") return "U64";
+            if (name == "CPU.READCR0") return "U64";
+            if (name == "CPU.READMSR") return "U64";
             if (name == "CPU.READRSP") return "U64";
             if (name == "CPU.READCS") return "U64";
             if (name == "CPU.EXCEPTIONVECTORTABLEBASE") return "U64";
@@ -1014,6 +1016,8 @@ private:
             const std::string name = upper_ascii(node.name);
             if (name == "CPU.READCR3") return "U64";
             if (name == "CPU.READCR2") return "U64";
+            if (name == "CPU.READCR0") return "U64";
+            if (name == "CPU.READMSR") return "U64";
             if (name == "CPU.READCS") return "U64";
             if (name == "CPU.EXCEPTIONVECTORTABLEBASE") return "U64";
             if (name == "CPU.INTERRUPTPENDINGTABLEBASE") return "U64";
@@ -1301,6 +1305,29 @@ private:
                 if (name == "CPU.READRSP") {
                     const std::string result = temp();
                     current_block(function).instructions.push_back(amir_memory("READRSP", result, {}, "U64", {}));
+                    return result;
+                }
+                // CR0 and MSR access -- real prerequisites for configuring memory type ranges
+                // (write-combining framebuffer performance) without any vendor-specific GPU driver;
+                // MTRRs are a standard x86 feature, not Intel- or AMD-specific.
+                if (name == "CPU.READCR0") {
+                    const std::string result = temp();
+                    current_block(function).instructions.push_back(amir_memory("READCR0", result, {}, "U64", {}));
+                    return result;
+                }
+                if (name == "CPU.WRITECR0") {
+                    const std::string result = temp();
+                    current_block(function).instructions.push_back(amir_memory("WRITECR0", "", std::move(args), "", {"U64"}));
+                    return result;
+                }
+                if (name == "CPU.READMSR") {
+                    const std::string result = temp();
+                    current_block(function).instructions.push_back(amir_memory("READMSR", result, std::move(args), "U64", {"U32"}));
+                    return result;
+                }
+                if (name == "CPU.WRITEMSR") {
+                    const std::string result = temp();
+                    current_block(function).instructions.push_back(amir_memory("WRITEMSR", "", std::move(args), "", {"U32", "U64"}));
                     return result;
                 }
                 if (name == "CPU.READCS") {
@@ -1781,6 +1808,7 @@ private:
                 else if (node.name == "CPU.DisableInterrupts") current_block(function).instructions.push_back(amir_barrier("DISABLEINTERRUPTS"));
                 else if (node.name == "CPU.EnableInterrupts") current_block(function).instructions.push_back(amir_barrier("ENABLEINTERRUPTS"));
                 else if (node.name == "CPU.Breakpoint") current_block(function).instructions.push_back(amir_barrier("BREAKPOINT"));
+                else if (node.name == "CPU.Wbinvd") current_block(function).instructions.push_back(amir_barrier("WBINVD"));
                 else current_block(function).instructions.push_back(amir_cpu_halt());
                 break;
             case AstKind::ExpressionStatement:
@@ -4744,6 +4772,7 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 else if (instruction.target == "DISABLEINTERRUPTS") result.text.cli();
                 else if (instruction.target == "ENABLEINTERRUPTS") result.text.sti();
                 else if (instruction.target == "BREAKPOINT") result.text.int3();
+                else if (instruction.target == "WBINVD") result.text.wbinvd();
                 else if (instruction.target.rfind("INTERRUPT_", 0) == 0) {
                     long long vector = 0;
                     try {
@@ -4810,6 +4839,37 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     if (instruction.operands.size() != 1 || !load_value(instruction.operands[0], "U64", Reg::RAX)) return result;
                     if (op == "WRITECR3") result.text.mov_cr3_rax();
                     else result.text.invlpg_rax();
+                    break;
+                }
+                if (op == "READCR0") {
+                    result.text.mov_rax_cr0();
+                    if (!store_result(instruction.result, "U64")) return result;
+                    break;
+                }
+                if (op == "WRITECR0") {
+                    if (instruction.operands.size() != 1 || !load_value(instruction.operands[0], "U64", Reg::RAX)) return result;
+                    result.text.mov_cr0_rax();
+                    break;
+                }
+                // RDMSR/WRMSR -- fixed-register x86 ABI (ECX selects the MSR, EDX:EAX carries the
+                // 64-bit value split into two 32-bit halves), not a convention this backend invents.
+                // Real prerequisite for MTRR-based write-combining framebuffer performance without
+                // any vendor-specific GPU driver -- MTRRs are architectural, identical on Intel and
+                // AMD, so this is the same real fix either way.
+                if (op == "READMSR") {
+                    if (instruction.operands.size() != 1 || !load_value(instruction.operands[0], "U32", Reg::RCX)) return result;
+                    result.text.rdmsr();
+                    result.text.shl_reg_imm8(Reg::RDX, 32);
+                    result.text.or_reg_reg(Reg::RAX, Reg::RDX);
+                    if (!store_result(instruction.result, "U64")) return result;
+                    break;
+                }
+                if (op == "WRITEMSR") {
+                    if (instruction.operands.size() != 2 || !load_value(instruction.operands[0], "U32", Reg::RCX) ||
+                        !load_value(instruction.operands[1], "U64", Reg::RAX)) return result;
+                    result.text.mov_reg_reg(Reg::RDX, Reg::RAX);
+                    result.text.shr_reg_imm8(Reg::RDX, 32);
+                    result.text.wrmsr();
                     break;
                 }
                 if (op == "LGDT" || op == "LIDT" || op == "LTR") {

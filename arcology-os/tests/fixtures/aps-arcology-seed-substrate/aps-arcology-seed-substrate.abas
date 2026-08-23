@@ -5231,6 +5231,77 @@ END FUNCTION
 ' fact. Pre-exit, needs BootServices. Allowed to fail closed (returns 0): a real on-screen
 ' dashboard is this fixture's own real goal, but a serial-only session (this project's own prior,
 ' already-proven fallback) remains genuinely correct if no GOP device is ever found.
+' Real, vendor-neutral framebuffer performance fix -- MTRRs are a standard x86 architectural
+' feature, identical on Intel and AMD, so this needs no GPU-specific driver at all. Without it,
+' this fixture's own real page tables leave the framebuffer at whatever memory type PAT slot 0
+' selects (effectively Uncacheable once combined with firmware's own MTRR setup for that BAR),
+' meaning every single pixel write via DrawGlyphAt/FillRect is a fully serialized bus transaction
+' -- real, and slow enough to matter for anything beyond a one-shot boot dashboard. Write-Combining
+' lets the CPU buffer/coalesce a run of sequential writes into far fewer real bus transactions,
+' which is the real, standard fix real OSes use for exactly this kind of write-mostly linear
+' framebuffer, with no vendor driver and no accelerated command submission required.
+'
+' Uses variable MTRR 7 (the highest-numbered one) rather than a low-numbered one, to minimize any
+' chance of colliding with a range firmware itself already programmed. A conservative, fixed 36-bit
+' physical-address mask width is used rather than querying the real MAXPHYADDR via CPUID (a real,
+' deliberate scope reduction) -- every MTRR-capable x86 CPU since Pentium Pro implements AT LEAST
+' 36 physical address bits, and a real GPU framebuffer BAR on this class of hardware lives nowhere
+' near that boundary, so the narrower, always-safe floor is sufficient here without needing a new
+' CPUID primitive. Fails open (does nothing) if this CPU doesn't report WC support in IA32_MTRRCAP,
+' rather than risk programming an unsupported memory type.
+'
+' Follows the real MTRR update sequence architecturally required to avoid transient cache
+' incoherency (Intel SDM Vol 3's MTRR update procedure, single-core form since this substrate has
+' no SMP support at all yet -- a real, separate future scope item if this project ever needs
+' multi-core MTRR synchronization): enter no-fill cache mode, flush caches, disable MTRRs via
+' IA32_MTRR_DEF_TYPE, update the PHYSBASE/PHYSMASK pair, flush again, then restore everything.
+FUNCTION EnableFramebufferWriteCombining(fbPhysBase AS U64, fbSizeBytes AS U64) AS U64
+    LET mtrrCap AS U64 = CPU.ReadMSR(254)
+    LET wcSupported AS U64 = mtrrCap AND 1024
+    IF wcSupported = 0 THEN
+        RETURN 0
+    END IF
+
+    LET size AS U64 = 4096
+    WHILE size < fbSizeBytes
+        size = size * 2
+    WEND
+    LET alignedBase AS U64 = fbPhysBase - (fbPhysBase MOD size)
+    WHILE (alignedBase + size) < (fbPhysBase + fbSizeBytes)
+        size = size * 2
+        alignedBase = fbPhysBase - (fbPhysBase MOD size)
+    WEND
+
+    LET allOnes AS U64 = 18446744073709551615
+    LET rawMask AS U64 = allOnes XOR (size - 1)
+    LET mask36 AS U64 = rawMask AND 68719476735
+    LET physMaskValue AS U64 = mask36 OR 2048
+    LET physBaseValue AS U64 = alignedBase OR 1
+
+    CPU.DisableInterrupts
+
+    LET cr0Before AS U64 = CPU.ReadCR0()
+    LET cr0Step1 AS U64 = cr0Before OR 1073741824
+    LET cr0NoFill AS U64 = cr0Step1 AND 18446744073172680703
+    CPU.WriteCR0(cr0NoFill)
+    CPU.Wbinvd
+
+    LET defType AS U64 = CPU.ReadMSR(767)
+    LET defTypeDisabled AS U64 = defType AND 18446744073709549567
+    CPU.WriteMSR(767, defTypeDisabled)
+
+    CPU.WriteMSR(526, physBaseValue)
+    CPU.WriteMSR(527, physMaskValue)
+
+    CPU.WriteMSR(767, defType)
+
+    CPU.Wbinvd
+    CPU.WriteCR0(cr0Before)
+
+    CPU.EnableInterrupts
+    RETURN 1
+END FUNCTION
+
 FUNCTION SetupGopDashboard(systemTable AS UEFI.SystemTable) AS BOOL
     LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
     IF gop = 0 THEN
@@ -5242,6 +5313,8 @@ FUNCTION SetupGopDashboard(systemTable AS UEFI.SystemTable) AS BOOL
     LET heightPx AS U32 = UEFI.GOP.Height(gop)
     LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
     LET fbBaseAsU64 AS U64 = ADDRESS.Value(framebuffer)
+    LET fbSizeBytes AS U64 = UEFI.GOP.FrameBufferSize(gop)
+    LET wcEnabled AS U64 = EnableFramebufferWriteCombining(fbBaseAsU64, fbSizeBytes)
     MEMORY.Write64(TermFramebufferPhysAddress(), fbBaseAsU64)
     MEMORY.Write32(TermStrideAddress(), stride)
     MEMORY.Write32(TermWidthPxAddress(), widthPx)
@@ -5258,6 +5331,11 @@ FUNCTION SetupGopDashboard(systemTable AS UEFI.SystemTable) AS BOOL
     WriteDashboardLabels()
     MEMORY.Write32(TermReadyAddress(), 1)
     systemTable.ConsoleOut.Write("SUBSTRATE GOP READY\r\n")
+    IF wcEnabled = 1 THEN
+        systemTable.ConsoleOut.Write("SUBSTRATE FB WC ON\r\n")
+    ELSE
+        systemTable.ConsoleOut.Write("SUBSTRATE FB WC OFF\r\n")
+    END IF
     DashDrawStatic()
     DashSetSubsystem(4, 1)
     DashAddEvent(LABEL_EV_GOP_OK())

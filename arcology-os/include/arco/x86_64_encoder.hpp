@@ -117,6 +117,14 @@ public:
     void mov_rax_cr3() { emit(0x0F); emit(0x20); emit(0xD8); }
     void mov_cr3_rax() { emit(0x0F); emit(0x22); emit(0xD8); }
     void mov_rax_cr2() { emit(0x0F); emit(0x20); emit(0xD0); }
+    void mov_rax_cr0() { emit(0x0F); emit(0x20); emit(0xC0); }
+    void mov_cr0_rax() { emit(0x0F); emit(0x22); emit(0xC0); }
+    // RDMSR/WRMSR (0F 32 / 0F 30) -- fixed-register ABI per the x86 architecture itself, not a
+    // convention this encoder invents: ECX selects the MSR, EDX:EAX is the 64-bit value split into
+    // two 32-bit halves (RDMSR loads it, WRMSR reads it). No ModRM byte for either.
+    void rdmsr() { emit(0x0F); emit(0x32); }
+    void wrmsr() { emit(0x0F); emit(0x30); }
+    void wbinvd() { emit(0x0F); emit(0x09); }
     void lgdt_rax() { emit(0x0F); emit(0x01); emit(0x10); }
     void lidt_rax() { emit(0x0F); emit(0x01); emit(0x18); }
     void ltr_rax() { emit(0x66); emit(0x0F); emit(0x00); emit(0xD8); }

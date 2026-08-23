@@ -547,7 +547,8 @@ struct CallExpr final : Expr {
         const std::string upper_name = uppercase(name);
         const bool memory = upper_name.rfind("ADDRESS.", 0) == 0 || upper_name.rfind("MEMORY.", 0) == 0 || upper_name.rfind("GRAPHICS.", 0) == 0 || upper_name == "UEFI.GOP.DISCOVER" || upper_name == "UEFI.BLOCKIO.DISCOVER" ||
             upper_name == "CPU.READBARRIER" || upper_name == "CPU.WRITEBARRIER" || upper_name == "CPU.MEMORYBARRIER" ||
-            upper_name == "CPU.READCR3" || upper_name == "CPU.WRITECR3" || upper_name == "CPU.INVALIDATEPAGE" || upper_name == "CPU.READRSP";
+            upper_name == "CPU.READCR3" || upper_name == "CPU.WRITECR3" || upper_name == "CPU.INVALIDATEPAGE" || upper_name == "CPU.READRSP" ||
+            upper_name == "CPU.READCR0" || upper_name == "CPU.WRITECR0" || upper_name == "CPU.READMSR" || upper_name == "CPU.WRITEMSR";
         auto node = canonical_node(upper_name.rfind("PORT.", 0) == 0 ? AstKind::PortOperation : memory ? AstKind::MemoryOperation : AstKind::Call);
         node->name = name;
         for (const auto& arg : args) {
@@ -2543,7 +2544,8 @@ Parser::StmtPtr Parser::statement() {
         const std::string statement_name = uppercase(peek().lexeme);
         if (statement_name == "CPU.HALT" || statement_name == "CPU.HALTFOREVER" || statement_name == "CPU.PAUSE" ||
             statement_name == "CPU.READBARRIER" || statement_name == "CPU.WRITEBARRIER" || statement_name == "CPU.MEMORYBARRIER" ||
-            statement_name == "CPU.DISABLEINTERRUPTS" || statement_name == "CPU.ENABLEINTERRUPTS" || statement_name == "CPU.BREAKPOINT") {
+            statement_name == "CPU.DISABLEINTERRUPTS" || statement_name == "CPU.ENABLEINTERRUPTS" || statement_name == "CPU.BREAKPOINT" ||
+            statement_name == "CPU.WBINVD") {
             parsed = hardware_semantic_statement();
         } else if ((statement_name == "EXIT" || statement_name == "CONTINUE") && current_ + 1 < tokens_.size() &&
             (tokens_[current_ + 1].type == TokenType::For || tokens_[current_ + 1].type == TokenType::While || tokens_[current_ + 1].type == TokenType::Do)) {
@@ -2698,6 +2700,7 @@ Parser::StmtPtr Parser::hardware_semantic_statement() {
     if (name == "CPU.DISABLEINTERRUPTS") return std::make_unique<HardwareSemanticStmt>("CPU.DisableInterrupts");
     if (name == "CPU.ENABLEINTERRUPTS") return std::make_unique<HardwareSemanticStmt>("CPU.EnableInterrupts");
     if (name == "CPU.BREAKPOINT") return std::make_unique<HardwareSemanticStmt>("CPU.Breakpoint");
+    if (name == "CPU.WBINVD") return std::make_unique<HardwareSemanticStmt>("CPU.Wbinvd");
     return std::make_unique<HardwareSemanticStmt>("CPU.HaltForever");
 }
 
