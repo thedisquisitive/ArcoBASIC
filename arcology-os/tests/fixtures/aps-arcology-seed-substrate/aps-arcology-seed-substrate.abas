@@ -2713,6 +2713,27 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         directoryIndex = directoryIndex + 1
     WEND
 
+    ' A REAL bug found on real hardware, never reproduced under QEMU: aps-gdt-reload.abas's own
+    ' minimal identity map (just the low 1GB above) is only enough if the CPU can keep fetching
+    ' its OWN currently-executing code the instant CR3 changes -- which depends on where firmware
+    ' actually loaded this image and its stack. QEMU/OVMF happens to place both within the first
+    ' 1GB, so this was never visible there; nothing guarantees that on real hardware, and a real
+    ' physical run froze at exactly this point (confirmed via a real checkpoint-color diagnostic:
+    ' visible through "ExitBootServices succeeded", never reaching "CR3 switch succeeded"). Rather
+    ' than trying to discover the image's own exact base/stack (LoadedImageProtocol, RSP, etc.) and
+    ' map just that, this identity-maps the WHOLE 512GB range PML4 slot 0 can address, using the
+    ' SAME already-allocated pdpt page: entry 0 keeps the existing 2MB-granularity low-1GB mapping
+    ' above, entries 1-511 become direct 1GB pages covering 1GB-512GB. Free (no extra allocation),
+    ' and makes "is the currently-running code/stack identity-mapped" no longer a real question for
+    ' any real machine's own firmware-chosen load address under 512GB -- every real system this
+    ' project targets.
+    LET extraPdptIndex AS U64 = 1
+    WHILE extraPdptIndex < 512
+        LET gbBase AS U64 = extraPdptIndex * 1073741824
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt + (extraPdptIndex * 8)), gbBase OR 131)
+        extraPdptIndex = extraPdptIndex + 1
+    WEND
+
     LET mmioBasePhys AS U64 = MEMORY.Read64(XhciMmioBasePhysAddress())
     MapExtra1GbRegion(root, pdpt, pdptExtraA, mmioBasePhys)
 
@@ -2737,7 +2758,7 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         ' Checkpoint 1 (orange): the real page-table build above (including MapExtra1GbRegion for
         ' both the xHCI BAR and the framebuffer) completed and this raw pixel write still works,
         ' still under FIRMWARE's own original page tables (not our new ones yet).
-        DrawDiagBlock(1, 16737792)
+        DrawDiagBlock(1, 16753920)
     END IF
 
     CPU.DisableInterrupts
