@@ -37,28 +37,38 @@ test both input paths independently) and observe the real, live response on the 
 
 ## Build Identity
 
-- Git commit: `bb62338` (real hardware fix — `RpmCountAddress`/`KeyModifierStateAddress` were never
-  explicitly zeroed, causing Round 3's own real failure below — on top of `0cecd37`'s Program Mode
-  increment, `102a051`'s font-scale fix, `02b2762`'s dashboard, and `0cd99c8`'s CR3 fix)
+- Git commit: `0a42e34` (real hardware fix — the terminal's own font was too illegible to
+  distinguish "hi" from "ni"; now a dedicated 8x14 font — on top of `bb62338`'s RPM zero-init fix,
+  `0cecd37`'s Program Mode increment, `102a051`'s font-scale fix, `02b2762`'s dashboard, and
+  `0cd99c8`'s CR3 fix)
 - Compiler/version: `ArcoFission 0.1.0`
 - Image filename: `aps-arcology-seed-substrate-x86_64.img`
 - Artifact directory: `arcology-os/dist/aps-arcology-seed-substrate/`
-- EFI SHA-256: `cdcdd4a5a1b25e27c10762a24988cfbf086b4bef0fc1f48bf7f684920343a61f`
-- Image SHA-256: `b11a92e793c020c0726a81f2018f5bc4ffcba70f542a16d852b761a2a05e715c`
+- EFI SHA-256: `03a37937a622904c3d7ccc55ecb753748a577a52f01ebe2aebcf27380a59de43`
+- Image SHA-256: `1bbb69ee165d8664f78598c4630055e18b0aff301ba1546b86a6d6ac34a2ff51`
 - Full checksums: `arcology-os/dist/aps-arcology-seed-substrate/SHA256SUMS`
 - Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync` — write performed this session, verified byte-for-byte via a raw-device checksum readback (first 64MiB) immediately after.
 
-## Round 3 result: a real bug found on real hardware, now fixed (not yet re-validated)
+## Round 3 result: TWO real bugs found on real hardware, both now fixed (not yet re-validated)
 
-The user's own first physical test of Program Mode: `10 PRINT "HELLO"` then `RUN` printed nothing
-and never returned to `READY.` on its own — only a real injected `ESC` broke out, reporting a
-nonsensical `BREAK IN 3206755423`. Root cause: `RpmCountAddress` and `KeyModifierStateAddress` were
-both read before any code path was guaranteed to have written them — invisible under QEMU (whose
-own VM RAM always starts zeroed) but real on the user's physical RAM, which had genuine leftover
-garbage there. Confirmed by direct reproduction (a throwaway build that deliberately poisons
-`RpmCountAddress` under QEMU reproduced the identical symptom shape), then confirmed fixed the same
-way. See RFC-0007 Section 15's own "A real bug found on real hardware, Round 3" for the full
-writeup. This image (commit `bb62338`) is the first build with the fix — Round 4 is the real test.
+**Bug 1**: the user's own first physical test of Program Mode: `10 PRINT "HELLO"` then `RUN`
+printed nothing and never returned to `READY.` on its own — only a real injected `ESC` broke out,
+reporting a nonsensical `BREAK IN 3206755423`. Root cause: `RpmCountAddress` and
+`KeyModifierStateAddress` were both read before any code path was guaranteed to have written
+them — invisible under QEMU (whose own VM RAM always starts zeroed) but real on the user's physical
+RAM, which had genuine leftover garbage there. Confirmed by direct reproduction (a throwaway build
+that deliberately poisons `RpmCountAddress` under QEMU reproduced the identical symptom shape),
+then confirmed fixed the same way. Commit `bb62338`.
+
+**Bug 2**: after Bug 1's fix, `RUN`/`GOTO` worked correctly, but the user reported the font was
+still bad — `PRINT "hi"` rendered indistinguishably from "ni". Root cause: the shared 8x8 dashboard
+font gave lowercase ascenders (h/b/d/k/l) only ONE pixel of headroom, decoded and confirmed directly
+from the stored bitmap. Fixed with a dedicated 8x14 terminal-only font (the dashboard's own 8x8
+font and layout are untouched). Commit `0a42e34`.
+
+See RFC-0007 Section 15's own two "real bug found on real hardware, Round 3" writeups for full
+detail on each. This image (commit `0a42e34`) is the first build with BOTH fixes — Round 4 is the
+real test.
 
 ## Round 3 addendum: RFC-0007 Program Mode is now on this image
 
