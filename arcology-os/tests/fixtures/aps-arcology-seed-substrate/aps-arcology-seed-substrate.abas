@@ -1,0 +1,2466 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' RFC-0045 Phase 4: substrate unification. A single fixture, running under APS's own CR3/GDT/IDT
+' (reusing aps-gdt-reload.abas's own proven sequence) after a real ExitBootServices, genuinely
+' running RFC-0007's own HELP/OT/?SYNTAX ERROR/backspace command loop -- fed by BOTH real input
+' paths this RFC built: the Phase 1 PS/2 driver and the Phase 3 USB HID driver, polled together,
+' whichever produces a real character first. Output moves from RFC-0007's own original ConsoleOut.
+' Write (firmware-hosted, hangs after ExitBootServices per this RFC's own Section 4 finding) to the
+' real serial port -- the only real, proven post-exit output channel anywhere in this project's own
+' history (aps-gdt-reload.abas, ps2-keyboard-driver.abas). The READY. prompt itself is therefore a
+' real serial terminal session under QEMU, not a graphical console -- a real, honestly-scoped
+' substitution, not a silent one; a GOP-based text console is real future work, not attempted here.
+'
+' Both drivers' own setup (xHCI PCI discovery/MMIO/rings/enumeration needs BootServices.
+' AllocatePages) happens BEFORE ExitBootServices, matching every other real constraint this project
+' has already established for DMA-capable structures. PS2Keyboard.Init has no such dependency but
+' is called at the same point for consistency. If no USB keyboard is attached, USB HID enumeration
+' is allowed to fail closed (usbSlotId stays 0) and the combined poll loop simply never checks that
+' path -- PS/2 alone is a real, correct configuration, not a failure (RFC-0045's own explicit
+' "EITHER input path" requirement, proven by this fixture's own negative-control run).
+'
+' Frozen copies of stdlib/ps2_keyboard_policy.abas and stdlib/usb_xhci_policy.abas, plus the
+' descriptor-table/ExitBootServices helpers from aps-gdt-reload.abas, are inlined below, matching
+' this project's established no-include-system fixture convention.
+
+' Real PS/2 Keyboard Driver (RFC-0045 Phase 1), raw port I/O only -- no UEFI protocol dependency,
+' safe to call both before AND after ExitBootServices. Built to close a real, empirically-confirmed
+' gap: RFC-0045 Section 4 found systemTable.ConsoleIn.ReadKeyStroke crashes (not merely hangs)
+' after ExitBootServices, so the Polymorphic Substrate has no keyboard input path of its own
+' without a driver that does not depend on any Boot-Services-backed protocol.
+
+
+' --- Documented deviations, stated up front, same spirit as every other provider in this project. ---
+'
+' 1. Scan Code Set: this driver assumes Scan Code Set 1 (the i8042 controller's own standard
+'    legacy-translation output, confirmed empirically against real QEMU/OVMF -- port 0x60 emitted
+'    0x1E (make) then 0x9E (make+0x80, break) for a real injected 'a' keystroke, exactly Set 1's
+'    own known encoding, not assumed from general PC hardware knowledge alone (RFC-0045 Section
+'    7.1's own mandate). Real hardware could, in principle, differ -- this is exactly the kind of
+'    finding a real hardware validation package (WP, RFC-0045 Phase 5) exists to surface.
+'
+' 2. Character coverage: US QWERTY, unshifted only (RFC-0045 Non-Goal 4/the same scope this
+'    project's own existing QEMU keystroke-injection convention already uses). Shift/Ctrl/Alt
+'    modifier tracking is real future work, not attempted here -- ScancodeToChar returns 0 (no
+'    mapping) for modifier keys and anything this table does not define, matching this project's
+'    own fail-closed-per-value precedent (e.g. UefiBlockDevice.Discover's own per-device fail
+'    closed, not partial success).
+'
+' 3. Break codes (key release, make code + 0x80 in Set 1) are read and discarded, not translated --
+'    PollScancode returns the raw byte including the break-code high bit so a caller COULD
+'    distinguish make/break if it needed to, but ScancodeToChar only defines mappings for real make
+'    codes (bit 7 clear); a caller that feeds a break code into ScancodeToChar gets 0 back, the same
+'    "no mapping" result an actually-unmapped make code would produce -- deliberately unified,
+'    since RFC-0007's own line-editing model only needs key-press events, not release events.
+
+FUNCTION Ps2DataPort() AS IOPORT
+    RETURN PORT.Address(96)    ' 0x60
+END FUNCTION
+
+FUNCTION Ps2StatusPort() AS IOPORT
+    RETURN PORT.Address(100)   ' 0x64
+END FUNCTION
+
+FUNCTION Ps2CommandPort() AS IOPORT
+    RETURN PORT.Address(100)   ' 0x64 (same port; a write here is a controller command, not data)
+END FUNCTION
+
+' Real, minimal, standard i8042 init: disable the second PS/2 port (in case a mouse is present --
+' this driver only wants the keyboard's own byte stream, undisturbed by an interleaved mouse one),
+' flush any stale pending byte, then explicitly (re-)enable the first PS/2 port. Does not depend on
+' any UEFI protocol -- safe before or after ExitBootServices.
+FUNCTION PS2Keyboard.Init() AS BOOL
+    LET cmd AS IOPORT = Ps2CommandPort()
+    LET status AS IOPORT = Ps2StatusPort()
+    LET data AS IOPORT = Ps2DataPort()
+
+    PORT.WriteByte(cmd, 167)   ' 0xA7, disable second PS/2 port
+
+    LET flushAttempts AS U64 = 0
+    WHILE flushAttempts < 1000
+        LET flushStatus AS U8 = PORT.ReadByte(status)
+        IF (flushStatus AND 1) <> 0 THEN
+            PORT.ReadByte(data)
+        END IF
+        flushAttempts = flushAttempts + 1
+    WEND
+
+    PORT.WriteByte(cmd, 174)   ' 0xAE, enable first PS/2 port
+    RETURN 1
+END FUNCTION
+
+' Returns 0 if no scancode byte is currently pending, otherwise the real raw byte read from the
+' data port (including the Set 1 break-code high bit, 0x80, if this is a key-release byte) --
+' callers that only care about key presses should check ScancodeToChar's own 0-for-no-mapping
+' result rather than inspecting the high bit themselves, matching this driver's own established
+' "make and break unify to the same no-op result for anything not a real make code" contract.
+FUNCTION PS2Keyboard.PollScancode() AS U32
+    LET status AS IOPORT = Ps2StatusPort()
+    LET data AS IOPORT = Ps2DataPort()
+    LET statusValue AS U8 = PORT.ReadByte(status)
+    IF (statusValue AND 1) = 0 THEN
+        RETURN 0
+    END IF
+    LET scancode AS U8 = PORT.ReadByte(data)
+    LET scancodeAsU32 AS U32 = scancode
+    RETURN scancodeAsU32
+END FUNCTION
+
+' Scan Code Set 1 make-code -> ASCII translation, US QWERTY, unshifted. Returns 0 for anything with
+' no defined mapping (modifier keys, function keys, break codes, extended-sequence prefix byte
+' 0xE0, etc.) -- a real, deliberate fail-closed result, not a guess.
+FUNCTION PS2Keyboard.ScancodeToChar(scancode AS U32) AS U16
+    IF scancode >= 128 THEN
+        RETURN 0
+    END IF
+
+    IF scancode = 28 THEN
+        RETURN 13
+    END IF
+    IF scancode = 14 THEN
+        RETURN 8
+    END IF
+    IF scancode = 57 THEN
+        RETURN 32
+    END IF
+
+    IF scancode = 2 THEN
+        RETURN 49
+    END IF
+    IF scancode = 3 THEN
+        RETURN 50
+    END IF
+    IF scancode = 4 THEN
+        RETURN 51
+    END IF
+    IF scancode = 5 THEN
+        RETURN 52
+    END IF
+    IF scancode = 6 THEN
+        RETURN 53
+    END IF
+    IF scancode = 7 THEN
+        RETURN 54
+    END IF
+    IF scancode = 8 THEN
+        RETURN 55
+    END IF
+    IF scancode = 9 THEN
+        RETURN 56
+    END IF
+    IF scancode = 10 THEN
+        RETURN 57
+    END IF
+    IF scancode = 11 THEN
+        RETURN 48
+    END IF
+    IF scancode = 12 THEN
+        RETURN 45
+    END IF
+    IF scancode = 13 THEN
+        RETURN 61
+    END IF
+
+    IF scancode = 16 THEN
+        RETURN 113
+    END IF
+    IF scancode = 17 THEN
+        RETURN 119
+    END IF
+    IF scancode = 18 THEN
+        RETURN 101
+    END IF
+    IF scancode = 19 THEN
+        RETURN 114
+    END IF
+    IF scancode = 20 THEN
+        RETURN 116
+    END IF
+    IF scancode = 21 THEN
+        RETURN 121
+    END IF
+    IF scancode = 22 THEN
+        RETURN 117
+    END IF
+    IF scancode = 23 THEN
+        RETURN 105
+    END IF
+    IF scancode = 24 THEN
+        RETURN 111
+    END IF
+    IF scancode = 25 THEN
+        RETURN 112
+    END IF
+    IF scancode = 26 THEN
+        RETURN 91
+    END IF
+    IF scancode = 27 THEN
+        RETURN 93
+    END IF
+    IF scancode = 43 THEN
+        RETURN 92
+    END IF
+
+    IF scancode = 30 THEN
+        RETURN 97
+    END IF
+    IF scancode = 31 THEN
+        RETURN 115
+    END IF
+    IF scancode = 32 THEN
+        RETURN 100
+    END IF
+    IF scancode = 33 THEN
+        RETURN 102
+    END IF
+    IF scancode = 34 THEN
+        RETURN 103
+    END IF
+    IF scancode = 35 THEN
+        RETURN 104
+    END IF
+    IF scancode = 36 THEN
+        RETURN 106
+    END IF
+    IF scancode = 37 THEN
+        RETURN 107
+    END IF
+    IF scancode = 38 THEN
+        RETURN 108
+    END IF
+    IF scancode = 39 THEN
+        RETURN 59
+    END IF
+    IF scancode = 40 THEN
+        RETURN 39
+    END IF
+    IF scancode = 41 THEN
+        RETURN 96
+    END IF
+
+    IF scancode = 44 THEN
+        RETURN 122
+    END IF
+    IF scancode = 45 THEN
+        RETURN 120
+    END IF
+    IF scancode = 46 THEN
+        RETURN 99
+    END IF
+    IF scancode = 47 THEN
+        RETURN 118
+    END IF
+    IF scancode = 48 THEN
+        RETURN 98
+    END IF
+    IF scancode = 49 THEN
+        RETURN 110
+    END IF
+    IF scancode = 50 THEN
+        RETURN 109
+    END IF
+    IF scancode = 51 THEN
+        RETURN 44
+    END IF
+    IF scancode = 52 THEN
+        RETURN 46
+    END IF
+    IF scancode = 53 THEN
+        RETURN 47
+    END IF
+
+    RETURN 0
+END FUNCTION
+
+
+' Real xHCI (USB 3 Host Controller) driver (RFC-0045 Phase 2), raw PCI config space + MMIO only --
+' no UEFI protocol dependency for the controller-programming path itself (PCI discovery uses real
+' port I/O at 0xCF8/0xCFC, safe both before and after ExitBootServices; ring/DCBAA memory is
+' allocated via BootServices.AllocatePages while Boot Services are still available, matching
+' aps-gdt-reload.abas's own established precedent for APS-owned physical memory).
+
+
+' --- Documented deviations and a real, confirmed compiler finding, stated up front. ---
+'
+' 1. A REAL COMPILER BUG found and worked around during this driver's own development: MEMORY.
+'    Read16(ADDRESS.Offset(ptr, N)) returns 0 instead of the real value when `ptr` holds a HIGH
+'    64-bit address (confirmed at a real xHCI MMIO base, 0xC000000000) -- MEMORY.Read32 and
+'    MEMORY.Read8 through the exact same ADDRESS.Offset pattern at the exact same high address are
+'    unaffected, and MEMORY.Read16 at a LOW address (a plain fixed scratch buffer) is ALSO
+'    unaffected. Root cause traced into src/compiler/fission.cpp's normalize()/width_bits() and
+'    load_value() -- not conclusively pinned down to one exact instruction, and NOT fixed here
+'    (real, but not on RFC-0045's own critical path; the workaround below is reliable and simpler
+'    than continuing that investigation). This driver therefore reads every 16-bit-or-narrower
+'    hardware field via a real 32-bit-aligned MEMORY.Read32 plus SHR/AND, never MEMORY.Read16, on
+'    any MMIO register. Worth a dedicated compiler-bug follow-up outside this RFC's own scope.
+'
+' 2. No general allocator exists on this backend -- every DMA-visible xHCI structure (Command Ring,
+'    Event Ring, Event Ring Segment Table, Device Context Base Address Array) is allocated via a
+'    real systemTable.BootServices.AllocatePages call (matching aps-gdt-reload.abas's own
+'    established precedent for APS-owned physical memory), one full 4096-byte page each -- trivially
+'    satisfying every xHCI alignment requirement (64-byte minimum for rings/DCBAA), simple over
+'    minimal.
+'
+' 3. Scoped to exactly what RFC-0045 Phase 2 requires: PCI discovery, MMIO mapping, controller
+'    reset, minimal ring/DCBAA setup, starting the controller, and port enumeration/reset. Device
+'    slot enable/address/configure (the rest of real USB device enumeration) is RFC-0045 Phase 3's
+'    own scope, not this file's.
+
+FUNCTION XhciStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(41943040))   ' 0x2800000, this driver's own scratch state
+END FUNCTION
+
+' State layout: PCI Bus/Device/Function (U32 each, +0/+4/+8), MMIO base physical address (U64,
+' +16), mapped MMIO pointer (U64, +24), CAPLENGTH (U32, +32), operational-register base (U64,
+' +40), runtime-register base (U64, +48), doorbell-register base (U64, +56), MaxSlots (U32, +64),
+' MaxPorts (U32, +68), Command Ring physical/virtual (U64 each, +72/+80), Event Ring physical/
+' virtual (U64 each, +88/+96), ERST physical/virtual (U64 each, +104/+112), DCBAA physical/virtual
+' (U64 each, +120/+128), Command Ring cycle-bit state (U32, +136), Command Ring enqueue index (U32,
+' +140), Event Ring dequeue index (U32, +144), Event Ring consumer cycle-bit state (U32, +148).
+FUNCTION XhciPciBusAddress() AS MMIOPTR
+    RETURN XhciStateAddress()
+END FUNCTION
+FUNCTION XhciPciDeviceAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 4)
+END FUNCTION
+FUNCTION XhciPciFunctionAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 8)
+END FUNCTION
+FUNCTION XhciMmioBasePhysAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 16)
+END FUNCTION
+FUNCTION XhciMmioMappedAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 24)
+END FUNCTION
+FUNCTION XhciCapLengthAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 32)
+END FUNCTION
+FUNCTION XhciOpBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 40)
+END FUNCTION
+FUNCTION XhciRuntimeBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 48)
+END FUNCTION
+FUNCTION XhciDoorbellBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 56)
+END FUNCTION
+FUNCTION XhciMaxSlotsAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 64)
+END FUNCTION
+FUNCTION XhciMaxPortsAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 68)
+END FUNCTION
+FUNCTION XhciCmdRingPhysAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 72)
+END FUNCTION
+FUNCTION XhciCmdRingVirtAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 80)
+END FUNCTION
+FUNCTION XhciEventRingPhysAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 88)
+END FUNCTION
+FUNCTION XhciEventRingVirtAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 96)
+END FUNCTION
+FUNCTION XhciErstPhysAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 104)
+END FUNCTION
+FUNCTION XhciErstVirtAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 112)
+END FUNCTION
+FUNCTION XhciDcbaaPhysAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 120)
+END FUNCTION
+FUNCTION XhciDcbaaVirtAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 128)
+END FUNCTION
+FUNCTION XhciCmdCycleStateAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 136)
+END FUNCTION
+FUNCTION XhciCmdEnqueueIndexAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 140)
+END FUNCTION
+FUNCTION XhciEventDequeueIndexAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 144)
+END FUNCTION
+FUNCTION XhciEventCycleStateAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 148)
+END FUNCTION
+FUNCTION XhciContextSizeAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 152)
+END FUNCTION
+
+FUNCTION PciConfigAddressPort() AS IOPORT
+    RETURN PORT.Address(3320)   ' 0xCF8
+END FUNCTION
+
+FUNCTION PciConfigDataPort() AS IOPORT
+    RETURN PORT.Address(3324)   ' 0xCFC
+END FUNCTION
+
+FUNCTION PciConfigReadU32(bus AS U32, device AS U32, func AS U32, offset AS U32) AS U32
+    LET address AS U32 = 2147483648
+    address = address OR (bus SHL 16)
+    address = address OR (device SHL 11)
+    address = address OR (func SHL 8)
+    address = address OR (offset AND 252)
+    LET addrPort AS IOPORT = PciConfigAddressPort()
+    LET dataPort AS IOPORT = PciConfigDataPort()
+    PORT.WriteDWord(addrPort, address)
+    LET value AS U32 = PORT.ReadDWord(dataPort)
+    RETURN value
+END FUNCTION
+
+FUNCTION PciConfigWriteU32(bus AS U32, device AS U32, func AS U32, offset AS U32, value AS U32) AS BOOL
+    LET address AS U32 = 2147483648
+    address = address OR (bus SHL 16)
+    address = address OR (device SHL 11)
+    address = address OR (func SHL 8)
+    address = address OR (offset AND 252)
+    LET addrPort AS IOPORT = PciConfigAddressPort()
+    LET dataPort AS IOPORT = PciConfigDataPort()
+    PORT.WriteDWord(addrPort, address)
+    PORT.WriteDWord(dataPort, value)
+    RETURN 1
+END FUNCTION
+
+' Real 32-bit-aligned MMIO field extraction -- see deviation #1 above. widthBits must be 8, 16, or
+' 32; bitOffset is the field's own starting bit within the containing 32-bit word.
+FUNCTION MmioReadField32(mapped AS MMIOPTR, byteOffset AS U32, bitOffset AS U32, widthBits AS U32) AS U32
+    LET alignedOffset AS U32 = byteOffset AND 4294967292
+    LET word AS U32 = MEMORY.Read32(ADDRESS.Offset(mapped, alignedOffset))
+    LET extraShift AS U32 = (byteOffset AND 3) * 8
+    LET totalShift AS U32 = extraShift + bitOffset
+    LET shifted AS U32 = word SHR totalShift
+    LET mask AS U32 = 4294967295
+    IF widthBits < 32 THEN
+        mask = (1 SHL widthBits) - 1
+    END IF
+    RETURN shifted AND mask
+END FUNCTION
+
+' Real PCI bus scan (RFC-0045 Section 6.1, point 1): Class=0x0C (Serial Bus Controller),
+' Subclass=0x03 (USB), ProgIf=0x30 (XHCI). Stores Bus/Device/Function in state on success.
+FUNCTION UsbXhci.DiscoverPci(systemTable AS UEFI.SystemTable) AS BOOL
+    LET found AS BOOL = 0
+    LET bus AS U32 = 0
+    WHILE bus < 256
+        IF found = 0 THEN
+            LET device AS U32 = 0
+            WHILE device < 32
+                IF found = 0 THEN
+                    LET func AS U32 = 0
+                    WHILE func < 8
+                        IF found = 0 THEN
+                            LET vendorDevice AS U32 = PciConfigReadU32(bus, device, func, 0)
+                            LET vendorId AS U32 = vendorDevice AND 65535
+                            IF vendorId <> 65535 THEN
+                                LET classReg AS U32 = PciConfigReadU32(bus, device, func, 8)
+                                LET baseClass AS U32 = (classReg SHR 24) AND 255
+                                LET subclass AS U32 = (classReg SHR 16) AND 255
+                                LET progIf AS U32 = (classReg SHR 8) AND 255
+                                IF baseClass = 12 THEN
+                                    IF subclass = 3 THEN
+                                        IF progIf = 48 THEN
+                                            found = 1
+                                            MEMORY.Write32(XhciPciBusAddress(), bus)
+                                            MEMORY.Write32(XhciPciDeviceAddress(), device)
+                                            MEMORY.Write32(XhciPciFunctionAddress(), func)
+                                        END IF
+                                    END IF
+                                END IF
+                            END IF
+                        END IF
+                        func = func + 1
+                    WEND
+                END IF
+                device = device + 1
+            WEND
+        END IF
+        bus = bus + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION XhciDisconnectGuidAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 320)
+END FUNCTION
+FUNCTION XhciDisconnectHandlesAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 336)
+END FUNCTION
+FUNCTION XhciDisconnectIfaceAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 464)
+END FUNCTION
+
+' A REAL, confirmed root cause found via QEMU's own trace events (RFC-0045 Phase 3): OVMF's own
+' native XHCI driver stays bound to this controller (it is a real PCI device firmware discovers
+' and binds a driver to during its own boot-time driver-connection pass) and keeps periodically
+' touching it -- QEMU's trace log showed spurious, unexplained repeated command-doorbell writes
+' with no corresponding call anywhere in this driver, interleaved with this driver's own real
+' commands, racing for the same Command Ring. This function finds the SAME PCI Bus/Device/Function
+' this driver's own raw config-space scan (UsbXhci.DiscoverPci) already identified -- via
+' EFI_PCI_IO_PROTOCOL's own GetLocation method, the only way to map a raw PCI location back to the
+' EFI_HANDLE firmware knows it by -- and calls BootServices.DisconnectController on it, forcing
+' UEFI's own driver stack off before this driver starts touching the controller's own registers.
+' Real, honest fail-open: if no matching handle is found (already disconnected, or firmware never
+' bound one), this returns FALSE without touching anything else -- not a hard requirement upstream.
+FUNCTION UsbXhci.DisconnectFirmwareDriver(systemTable AS UEFI.SystemTable) AS BOOL
+    LET guidBuf AS MMIOPTR = XhciDisconnectGuidAddress()
+    MEMORY.Write64(guidBuf, 5522935658814222848)
+    MEMORY.Write64(ADDRESS.Offset(guidBuf, 8), 11097520664359398558)
+
+    LET maxHandles AS U64 = 16
+    LET bufferSize AS U64 = maxHandles * 8
+    LET bufferSizeAddr AS PTR = ADDRESS.Local(bufferSize)
+    LET handleBuffer AS MMIOPTR = XhciDisconnectHandlesAddress()
+
+    LET status AS U64 = systemTable.BootServices.LocateHandle(2, guidBuf, 0, bufferSizeAddr, handleBuffer)
+    IF status <> 0 THEN
+        RETURN 0
+    END IF
+
+    LET foundCount AS U64 = bufferSize \ 8
+    IF foundCount > maxHandles THEN
+        foundCount = maxHandles
+    END IF
+
+    LET targetBus AS U32 = MEMORY.Read32(XhciPciBusAddress())
+    LET targetDevice AS U32 = MEMORY.Read32(XhciPciDeviceAddress())
+    LET targetFunction AS U32 = MEMORY.Read32(XhciPciFunctionAddress())
+
+    LET disconnected AS BOOL = 0
+    LET i AS U64 = 0
+    WHILE i < foundCount
+        LET handleEntry AS MMIOPTR = ADDRESS.Offset(handleBuffer, i * 8)
+        LET handle AS U64 = MEMORY.Read64(handleEntry)
+        LET ifaceOutAddr AS MMIOPTR = XhciDisconnectIfaceAddress()
+        LET hpStatus AS U64 = systemTable.BootServices.HandleProtocol(handle, guidBuf, ifaceOutAddr)
+        IF hpStatus = 0 THEN
+            LET pciIo AS UEFI.PciIoProtocol = MEMORY.Read64(ifaceOutAddr)
+            LET segOut AS U64 = 0
+            LET segOutAddr AS PTR = ADDRESS.Local(segOut)
+            LET busOut AS U64 = 0
+            LET busOutAddr AS PTR = ADDRESS.Local(busOut)
+            LET devOut AS U64 = 0
+            LET devOutAddr AS PTR = ADDRESS.Local(devOut)
+            LET funcOut AS U64 = 0
+            LET funcOutAddr AS PTR = ADDRESS.Local(funcOut)
+            LET glStatus AS U64 = pciIo.GetLocation(segOutAddr, busOutAddr, devOutAddr, funcOutAddr)
+            IF glStatus = 0 THEN
+                LET busU32 AS U32 = busOut
+                LET devU32 AS U32 = devOut
+                LET funcU32 AS U32 = funcOut
+                IF busU32 = targetBus THEN
+                    IF devU32 = targetDevice THEN
+                        IF funcU32 = targetFunction THEN
+                            systemTable.BootServices.DisconnectController(handle, 0, 0)
+                            disconnected = 1
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+        i = i + 1
+    WEND
+    RETURN disconnected
+END FUNCTION
+
+' Reads BAR0 (a real 64-bit MMIO BAR, per empirical confirmation against real QEMU qemu-xhci),
+' enables Memory Space + Bus Master in the Command register, maps the MMIO region, and reads the
+' Capability Registers this driver needs (CAPLENGTH, MaxSlots, MaxPorts). Real, confirmed fix
+' (RFC-0045 Phase 3): disconnects firmware's own native XHCI driver from this controller FIRST,
+' via UsbXhci.DisconnectFirmwareDriver -- see that function's own header comment for the full,
+' QEMU-trace-confirmed finding this closes (a real firmware-vs-guest-driver ownership conflict).
+FUNCTION UsbXhci.MapMmio(systemTable AS UEFI.SystemTable) AS BOOL
+    UsbXhci.DisconnectFirmwareDriver(systemTable)
+
+    LET bus AS U32 = MEMORY.Read32(XhciPciBusAddress())
+    LET device AS U32 = MEMORY.Read32(XhciPciDeviceAddress())
+    LET func AS U32 = MEMORY.Read32(XhciPciFunctionAddress())
+
+    LET bar0 AS U32 = PciConfigReadU32(bus, device, func, 16)
+    LET barType AS U32 = (bar0 SHR 1) AND 3
+    LET mmioBaseLow AS U32 = bar0 AND 4294967280
+    LET mmioBaseHigh AS U32 = 0
+    IF barType = 2 THEN
+        mmioBaseHigh = PciConfigReadU32(bus, device, func, 20)
+    END IF
+
+    LET commandReg AS U32 = PciConfigReadU32(bus, device, func, 4)
+    PciConfigWriteU32(bus, device, func, 4, commandReg OR 6)
+
+    LET mmioBaseHighAsU64 AS U64 = mmioBaseHigh
+    LET mmioBaseLowAsU64 AS U64 = mmioBaseLow
+    LET mmioBase AS U64 = (mmioBaseHighAsU64 SHL 32) OR mmioBaseLowAsU64
+    MEMORY.Write64(XhciMmioBasePhysAddress(), mmioBase)
+
+    LET mmioBasePhys AS PHYSICALPTR = mmioBase
+    LET mapped AS MMIOPTR = MEMORY.MapDevice(mmioBasePhys, 65536)
+    LET mappedAsU64 AS U64 = ADDRESS.Value(mapped)
+    MEMORY.Write64(XhciMmioMappedAddress(), mappedAsU64)
+
+    LET capLength AS U32 = MmioReadField32(mapped, 0, 0, 8)
+    MEMORY.Write32(XhciCapLengthAddress(), capLength)
+
+    LET hcsParams1 AS U32 = MEMORY.Read32(ADDRESS.Offset(mapped, 4))
+    LET maxSlots AS U32 = hcsParams1 AND 255
+    LET maxPorts AS U32 = (hcsParams1 SHR 24) AND 255
+    MEMORY.Write32(XhciMaxSlotsAddress(), maxSlots)
+    MEMORY.Write32(XhciMaxPortsAddress(), maxPorts)
+
+    ' HCCPARAMS1.CSZ (bit 2): real Context Size (32 vs 64 bytes) -- verified from the real
+    ' controller's own report, not assumed, matching this driver's own established discipline.
+    LET hccParams1 AS U32 = MEMORY.Read32(ADDRESS.Offset(mapped, 16))
+    LET csz AS U32 = (hccParams1 SHR 2) AND 1
+    LET contextSize AS U32 = 32
+    IF csz = 1 THEN
+        contextSize = 64
+    END IF
+    MEMORY.Write32(XhciContextSizeAddress(), contextSize)
+
+    LET capLengthAsU64 AS U64 = capLength
+    LET opBase AS U64 = mappedAsU64 + capLengthAsU64
+    MEMORY.Write64(XhciOpBaseAddress(), opBase)
+
+    LET dboff AS U32 = MEMORY.Read32(ADDRESS.Offset(mapped, 20))
+    LET dboffAligned AS U32 = dboff AND 4294967292
+    LET dboffAsU64 AS U64 = dboffAligned
+    MEMORY.Write64(XhciDoorbellBaseAddress(), mappedAsU64 + dboffAsU64)
+
+    LET rtsoff AS U32 = MEMORY.Read32(ADDRESS.Offset(mapped, 24))
+    LET rtsoffAligned AS U32 = rtsoff AND 4294967040
+    LET rtsoffAsU64 AS U64 = rtsoffAligned
+    MEMORY.Write64(XhciRuntimeBaseAddress(), mappedAsU64 + rtsoffAsU64)
+
+    RETURN 1
+END FUNCTION
+
+' Allocates one real page (BootServices.AllocatePages, type 0=AllocateAnyPages, memory type
+' 2=EfiLoaderData, matching aps-gdt-reload.abas's own established call shape) and zeroes it.
+' Returns the real physical address via outPhysAddress.
+FUNCTION XhciAllocPage(systemTable AS UEFI.SystemTable, outPhysAddress AS PTR) AS BOOL
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 1, outPhysAddress)
+    RETURN pageStatus = 0
+END FUNCTION
+
+' Real controller reset (RFC-0045 Section 6.1, point 3): set HCRST, wait for it to self-clear,
+' then wait for CNR (Controller Not Ready) to clear -- both real, required xHCI conditions before
+' any register beyond USBCMD/USBSTS may be touched.
+FUNCTION UsbXhci.Reset(systemTable AS UEFI.SystemTable) AS BOOL
+    LET opBase AS U64 = MEMORY.Read64(XhciOpBaseAddress())
+    LET opBaseMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(opBase))
+
+    MEMORY.Write32(opBaseMmio, 2)   ' USBCMD.HCRST
+
+    ' Real early-exit polling idiom (this project's own established pattern for a busy-wait
+    ' without a real BREAK/EXIT WHILE statement): jump the counter straight to the ceiling the
+    ' instant the condition is met, rather than letting the loop keep iterating to the ceiling
+    ' regardless -- a real, measured regression was found and fixed here: an earlier version
+    ' checked the condition but never short-circuited, so even a SUCCESSFUL reset (which
+    ' completes almost immediately in practice) still burned the full iteration ceiling every
+    ' time; harmless at a small ceiling with a tight loop body, but genuinely blew a real QEMU
+    ' harness's own timeout once the ceiling was raised and CPU.Pause was added per iteration.
+    LET resetCeiling AS U64 = 2000000
+    LET resetAttempts AS U64 = 0
+    LET resetCleared AS BOOL = 0
+    WHILE resetAttempts < resetCeiling
+        LET cmd AS U32 = MEMORY.Read32(opBaseMmio)
+        IF (cmd AND 2) = 0 THEN
+            resetCleared = 1
+            resetAttempts = resetCeiling
+        ELSE
+            CPU.Pause
+            resetAttempts = resetAttempts + 1
+        END IF
+    WEND
+    IF resetCleared = 0 THEN
+        RETURN 0
+    END IF
+
+    LET cnrCeiling AS U64 = 2000000
+    LET cnrAttempts AS U64 = 0
+    LET cnrCleared AS BOOL = 0
+    WHILE cnrAttempts < cnrCeiling
+        LET status AS U32 = MEMORY.Read32(ADDRESS.Offset(opBaseMmio, 4))
+        IF (status AND 2048) = 0 THEN
+            cnrCleared = 1
+            cnrAttempts = cnrCeiling
+        ELSE
+            CPU.Pause
+            cnrAttempts = cnrAttempts + 1
+        END IF
+    WEND
+    RETURN cnrCleared
+END FUNCTION
+
+' Real minimal ring/DCBAA setup (RFC-0045 Section 6.1, point 3): a one-page Command Ring
+' (terminated with a real Link TRB pointing back to its own start, Toggle Cycle bit set), a
+' one-page Event Ring plus a one-entry Event Ring Segment Table, and the Device Context Base
+' Address Array -- CRCR/DCBAAP/ERSTSZ/ERSTBA/ERDP/CONFIG all programmed per spec.
+FUNCTION UsbXhci.SetupRings(systemTable AS UEFI.SystemTable) AS BOOL
+    LET cmdRingPhys AS U64 = 0
+    LET cmdRingPhysAddr AS PTR = ADDRESS.Local(cmdRingPhys)
+    IF XhciAllocPage(systemTable, cmdRingPhysAddr) = 0 THEN
+        RETURN 0
+    END IF
+    LET cmdRingMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(cmdRingPhys))
+    LET zeroIndex AS U32 = 0
+    WHILE zeroIndex < 256
+        MEMORY.Write64(ADDRESS.Offset(cmdRingMmio, zeroIndex * 16), 0)
+        MEMORY.Write64(ADDRESS.Offset(cmdRingMmio, zeroIndex * 16 + 8), 0)
+        zeroIndex = zeroIndex + 1
+    WEND
+    ' Real Link TRB at the ring's own last slot (index 255): Type=6 (Link), Toggle Cycle bit set,
+    ' pointing back to the ring's own start -- the standard xHCI single-segment ring-wrap pattern.
+    LET linkTrbOffset AS U32 = 255 * 16
+    MEMORY.Write64(ADDRESS.Offset(cmdRingMmio, linkTrbOffset), cmdRingPhys)
+    MEMORY.Write32(ADDRESS.Offset(cmdRingMmio, linkTrbOffset + 8), 0)
+    LET linkControl AS U32 = 1
+    linkControl = linkControl OR (6 SHL 10)
+    linkControl = linkControl OR 2
+    MEMORY.Write32(ADDRESS.Offset(cmdRingMmio, linkTrbOffset + 12), linkControl)
+    MEMORY.Write64(XhciCmdRingPhysAddress(), cmdRingPhys)
+    LET cmdRingMmioAsU64 AS U64 = ADDRESS.Value(cmdRingMmio)
+    MEMORY.Write64(XhciCmdRingVirtAddress(), cmdRingMmioAsU64)
+    MEMORY.Write32(XhciCmdCycleStateAddress(), 1)
+    MEMORY.Write32(XhciCmdEnqueueIndexAddress(), 0)
+
+    LET eventRingPhys AS U64 = 0
+    LET eventRingPhysAddr AS PTR = ADDRESS.Local(eventRingPhys)
+    IF XhciAllocPage(systemTable, eventRingPhysAddr) = 0 THEN
+        RETURN 0
+    END IF
+    LET eventRingMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(eventRingPhys))
+    LET zeroIndex2 AS U32 = 0
+    WHILE zeroIndex2 < 256
+        MEMORY.Write64(ADDRESS.Offset(eventRingMmio, zeroIndex2 * 16), 0)
+        MEMORY.Write64(ADDRESS.Offset(eventRingMmio, zeroIndex2 * 16 + 8), 0)
+        zeroIndex2 = zeroIndex2 + 1
+    WEND
+    MEMORY.Write64(XhciEventRingPhysAddress(), eventRingPhys)
+    LET eventRingMmioAsU64 AS U64 = ADDRESS.Value(eventRingMmio)
+    MEMORY.Write64(XhciEventRingVirtAddress(), eventRingMmioAsU64)
+    MEMORY.Write32(XhciEventDequeueIndexAddress(), 0)
+    MEMORY.Write32(XhciEventCycleStateAddress(), 1)
+
+    LET erstPhys AS U64 = 0
+    LET erstPhysAddr AS PTR = ADDRESS.Local(erstPhys)
+    IF XhciAllocPage(systemTable, erstPhysAddr) = 0 THEN
+        RETURN 0
+    END IF
+    LET erstMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(erstPhys))
+    MEMORY.Write64(erstMmio, eventRingPhys)
+    MEMORY.Write32(ADDRESS.Offset(erstMmio, 8), 256)
+    MEMORY.Write32(ADDRESS.Offset(erstMmio, 12), 0)
+    MEMORY.Write64(XhciErstPhysAddress(), erstPhys)
+
+    LET dcbaaPhys AS U64 = 0
+    LET dcbaaPhysAddr AS PTR = ADDRESS.Local(dcbaaPhys)
+    IF XhciAllocPage(systemTable, dcbaaPhysAddr) = 0 THEN
+        RETURN 0
+    END IF
+    LET dcbaaMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(dcbaaPhys))
+    LET zeroIndex3 AS U32 = 0
+    WHILE zeroIndex3 < 256
+        MEMORY.Write64(ADDRESS.Offset(dcbaaMmio, zeroIndex3 * 8), 0)
+        zeroIndex3 = zeroIndex3 + 1
+    WEND
+    MEMORY.Write64(XhciDcbaaPhysAddress(), dcbaaPhys)
+
+    LET opBase AS U64 = MEMORY.Read64(XhciOpBaseAddress())
+    LET opBaseMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(opBase))
+
+    LET maxSlots AS U32 = MEMORY.Read32(XhciMaxSlotsAddress())
+    MEMORY.Write32(ADDRESS.Offset(opBaseMmio, 56), maxSlots)   ' CONFIG.MaxSlotsEn
+
+    MEMORY.Write64(ADDRESS.Offset(opBaseMmio, 48), dcbaaPhys)   ' DCBAAP
+
+    LET crcrValue AS U64 = cmdRingPhys OR 1
+    MEMORY.Write64(ADDRESS.Offset(opBaseMmio, 24), crcrValue)   ' CRCR, RCS=1
+
+    LET runtimeBase AS U64 = MEMORY.Read64(XhciRuntimeBaseAddress())
+    LET runtimeBaseMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(runtimeBase))
+    LET interrupter0 AS MMIOPTR = ADDRESS.Offset(runtimeBaseMmio, 32)
+    MEMORY.Write32(ADDRESS.Offset(interrupter0, 8), 1)          ' ERSTSZ = 1 segment
+    MEMORY.Write64(ADDRESS.Offset(interrupter0, 16), erstPhys)  ' ERSTBA
+    LET erdpValue AS U64 = eventRingPhys OR 8
+    MEMORY.Write64(ADDRESS.Offset(interrupter0, 24), erdpValue) ' ERDP, EHB acknowledged
+
+    RETURN 1
+END FUNCTION
+
+' Real controller start (RFC-0045 Section 6.1, point 3): set USBCMD.RS, confirm USBSTS.HCH clears
+' -- the real "controller is now running" proof, independent of any device/port work.
+FUNCTION UsbXhci.Start() AS BOOL
+    LET opBase AS U64 = MEMORY.Read64(XhciOpBaseAddress())
+    LET opBaseMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(opBase))
+
+    LET cmd AS U32 = MEMORY.Read32(opBaseMmio)
+    MEMORY.Write32(opBaseMmio, cmd OR 1)   ' USBCMD.RS
+
+    LET startCeiling AS U64 = 2000000
+    LET attempts AS U64 = 0
+    LET running AS BOOL = 0
+    WHILE attempts < startCeiling
+        LET status AS U32 = MEMORY.Read32(ADDRESS.Offset(opBaseMmio, 4))
+        IF (status AND 1) = 0 THEN
+            running = 1
+            attempts = startCeiling
+        ELSE
+            CPU.Pause
+            attempts = attempts + 1
+        END IF
+    WEND
+    RETURN running
+END FUNCTION
+
+FUNCTION UsbXhci.MaxPorts() AS U32
+    RETURN MEMORY.Read32(XhciMaxPortsAddress())
+END FUNCTION
+
+FUNCTION UsbXhci.ContextSize() AS U32
+    RETURN MEMORY.Read32(XhciContextSizeAddress())
+END FUNCTION
+
+' Real port enumeration (RFC-0045 Section 6.1, point 4): PORTSC for port N (1-based) lives at
+' operational-base + 0x400 + (N-1)*0x10. CCS (Current Connect Status) is bit 0.
+FUNCTION UsbXhci.PortConnected(portIndex AS U32) AS BOOL
+    LET opBase AS U64 = MEMORY.Read64(XhciOpBaseAddress())
+    LET opBaseMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(opBase))
+    LET portOffset AS U32 = 1024 + (portIndex - 1) * 16
+    LET portsc AS U32 = MEMORY.Read32(ADDRESS.Offset(opBaseMmio, portOffset))
+    RETURN portsc AND 1
+END FUNCTION
+
+FUNCTION UsbXhci.PortRaw(portIndex AS U32) AS U32
+    LET opBase AS U64 = MEMORY.Read64(XhciOpBaseAddress())
+    LET opBaseMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(opBase))
+    LET portOffset AS U32 = 1024 + (portIndex - 1) * 16
+    RETURN MEMORY.Read32(ADDRESS.Offset(opBaseMmio, portOffset))
+END FUNCTION
+
+' Real port reset (RFC-0045 Section 6.1, point 4): set PR (Port Reset, bit 4), wait for PRC (Port
+' Reset Change, bit 21) to assert, then confirm PED (Port Enabled/Disabled, bit 1) is set.
+'
+' A real, intermittent bug found and fixed during this driver's own development: an earlier
+' version preserved only bits 31:16 of the current PORTSC value (AND 0xFFFF0000) before writing
+' PR -- which zeroed bit 9 (PP, Port Power, a real RW bit living in the LOWER 16 bits) as an
+' unintended side effect, powering the port off on every reset attempt. QEMU's own xHCI emulation
+' tolerated this most of the time (3/3 manual runs passed) but not always -- confirmed by a real
+' failure surfacing only under a smoke test's own repeated-run harness, not manual testing. Fixed
+' by preserving ONLY the specific bits that must survive a PR write (PLS bits 8:5, PP bit 9, PIC
+' bits 15:14 -- mask 0xC3E0) and explicitly zeroing everything else, including every RW1C
+' status-change bit (CSC/PEC/WRC/OCC/PRC/PLC/CEC) and the read-only CCS/PED/OCA bits, rather than
+' blindly copying forward whatever the current register happened to contain.
+FUNCTION UsbXhci.ResetPort(portIndex AS U32) AS BOOL
+    LET opBase AS U64 = MEMORY.Read64(XhciOpBaseAddress())
+    LET opBaseMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(opBase))
+    LET portOffset AS U32 = 1024 + (portIndex - 1) * 16
+    LET portReg AS MMIOPTR = ADDRESS.Offset(opBaseMmio, portOffset)
+
+    LET current AS U32 = MEMORY.Read32(portReg)
+    LET preserveMask AS U32 = 50144   ' 0xC3E0: PLS(8:5), PP(9), PIC(15:14)
+    LET writeValue AS U32 = (current AND preserveMask) OR 16   ' OR in PR
+    MEMORY.Write32(portReg, writeValue)
+
+    LET prcCeiling AS U64 = 2000000
+    LET attempts AS U64 = 0
+    LET prcSeen AS BOOL = 0
+    WHILE attempts < prcCeiling
+        LET status AS U32 = MEMORY.Read32(portReg)
+        IF (status AND 2097152) <> 0 THEN
+            prcSeen = 1
+            attempts = prcCeiling
+        ELSE
+            CPU.Pause
+            attempts = attempts + 1
+        END IF
+    WEND
+    IF prcSeen = 0 THEN
+        RETURN 0
+    END IF
+
+    LET afterReset AS U32 = MEMORY.Read32(portReg)
+    RETURN (afterReset AND 2) <> 0
+END FUNCTION
+
+' ==========================================================================================
+' RFC-0045 Phase 3: real USB device enumeration on top of the controller (Phase 2's own scope) --
+' Enable Slot, Address Device, real control transfers (GET_DESCRIPTOR), Configure Endpoint, and
+' real USB HID boot-protocol keyboard report polling. Extends the state region above with new
+' fields starting at offset 160 (8-byte aligned): Input Context phys/virt (+160/+168), Device
+' Context virt/phys (+176/+184), EP0 Transfer Ring phys/virt/cycle/enqueue (+192/+200/+208/+212),
+' Interrupt Transfer Ring phys/virt/cycle/enqueue (+216/+224/+232/+236), Device Slot ID (+240),
+' EP0 Max Packet Size (+244), Interrupt Endpoint Address/MaxPacketSize/Interval/ContextIndex
+' (+248/+252/+256/+260), a 16-byte scratch event-TRB buffer (+264), and a 256-byte scratch DMA
+' buffer for descriptor reads and HID reports (+280) -- all within the same identity-mapped
+' scratch page every other field in this file already uses, safe as a real DMA target for the
+' same reason every other structure in this file is (ordinary, physically-backed RAM).
+' ==========================================================================================
+
+FUNCTION XhciInputCtxPhysAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 160)
+END FUNCTION
+FUNCTION XhciInputCtxVirtAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 168)
+END FUNCTION
+FUNCTION XhciDeviceCtxVirtAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 176)
+END FUNCTION
+FUNCTION XhciDeviceCtxPhysAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 184)
+END FUNCTION
+FUNCTION XhciEp0RingPhysAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 192)
+END FUNCTION
+FUNCTION XhciEp0RingVirtAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 200)
+END FUNCTION
+FUNCTION XhciEp0CycleStateAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 208)
+END FUNCTION
+FUNCTION XhciEp0EnqueueIndexAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 212)
+END FUNCTION
+FUNCTION XhciIntRingPhysAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 216)
+END FUNCTION
+FUNCTION XhciIntRingVirtAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 224)
+END FUNCTION
+FUNCTION XhciIntCycleStateAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 232)
+END FUNCTION
+FUNCTION XhciIntEnqueueIndexAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 236)
+END FUNCTION
+FUNCTION XhciSlotIdAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 240)
+END FUNCTION
+FUNCTION XhciEp0MaxPacketAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 244)
+END FUNCTION
+FUNCTION XhciIntEndpointAddrAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 248)
+END FUNCTION
+FUNCTION XhciIntMaxPacketAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 252)
+END FUNCTION
+FUNCTION XhciIntIntervalAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 256)
+END FUNCTION
+FUNCTION XhciIntContextIndexAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 260)
+END FUNCTION
+FUNCTION XhciScratchEventBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 264)
+END FUNCTION
+' The scratch DMA target buffer for descriptor reads and HID reports is NOT the fixed low scratch
+' region directly (unlike every other field on this page) -- a device's own bus-mastering DMA needs
+' a REAL physical address, and this driver's own established discipline (Command/Event rings, ERST,
+' DCBAA, Input/Device Contexts, Transfer Rings) never assumes virt==phys for a fixed low address,
+' always tracking a real BootServices.AllocatePages-returned physical address explicitly instead.
+' These two fields cache that real allocation's own phys/virt pair once made (offsets 280/288);
+' XhciEnsureScratchDmaBuffer lazily allocates it exactly once.
+FUNCTION XhciScratchDmaPhysStorageAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 280)
+END FUNCTION
+FUNCTION XhciScratchDmaVirtStorageAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 288)
+END FUNCTION
+
+' Tracks whether a Normal TRB is already outstanding on the Interrupt IN endpoint's own Transfer
+' Ring -- lets UsbHidKeyboard.PollReport stay non-blocking (PS2Keyboard.PollScancode's own sibling
+' contract) without ever submitting a duplicate request while one is still in flight.
+FUNCTION XhciIntRequestPendingAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(XhciStateAddress(), 312)
+END FUNCTION
+
+FUNCTION XhciEnsureScratchDmaBuffer(systemTable AS UEFI.SystemTable) AS BOOL
+    LET existingPhys AS U64 = MEMORY.Read64(XhciScratchDmaPhysStorageAddress())
+    IF existingPhys <> 0 THEN
+        RETURN 1
+    END IF
+    LET newPhys AS U64 = 0
+    LET newPhysAddr AS PTR = ADDRESS.Local(newPhys)
+    IF XhciAllocPage(systemTable, newPhysAddr) = 0 THEN
+        RETURN 0
+    END IF
+    MEMORY.Write64(XhciScratchDmaPhysStorageAddress(), newPhys)
+    LET newMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(newPhys))
+    LET newMmioAsU64 AS U64 = ADDRESS.Value(newMmio)
+    MEMORY.Write64(XhciScratchDmaVirtStorageAddress(), newMmioAsU64)
+    RETURN 1
+END FUNCTION
+
+FUNCTION XhciScratchDmaPhys() AS U64
+    RETURN MEMORY.Read64(XhciScratchDmaPhysStorageAddress())
+END FUNCTION
+
+FUNCTION XhciScratchDmaMmio() AS MMIOPTR
+    LET virt AS U64 = MEMORY.Read64(XhciScratchDmaVirtStorageAddress())
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(virt))
+END FUNCTION
+
+FUNCTION XhciRingDoorbell(slotOrHost AS U32, target AS U32) AS BOOL
+    LET doorbellBase AS U64 = MEMORY.Read64(XhciDoorbellBaseAddress())
+    LET doorbellBaseMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(doorbellBase))
+    LET doorbellReg AS MMIOPTR = ADDRESS.Offset(doorbellBaseMmio, slotOrHost * 4)
+    MEMORY.Write32(doorbellReg, target)
+    RETURN 1
+END FUNCTION
+
+' Consumes and returns (via out16ByteBuffer) the NEXT event TRB if one is pending -- a real event
+' is only "new" if its own Cycle bit matches this consumer's own currently-expected cycle state
+' (the real xHCI event-ring consumption protocol). Advances the dequeue index/ERDP and toggles the
+' expected cycle state on ring wrap. Returns FALSE (buffer untouched) if nothing new is pending.
+FUNCTION XhciPollEvent(out16ByteBuffer AS MMIOPTR) AS BOOL
+    LET eventRingVirt AS U64 = MEMORY.Read64(XhciEventRingVirtAddress())
+    LET dequeueIndex AS U32 = MEMORY.Read32(XhciEventDequeueIndexAddress())
+    LET expectedCycle AS U32 = MEMORY.Read32(XhciEventCycleStateAddress())
+    LET eventRingMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(eventRingVirt))
+    LET trbOffset AS U32 = dequeueIndex * 16
+    LET trb AS MMIOPTR = ADDRESS.Offset(eventRingMmio, trbOffset)
+
+    LET dword3 AS U32 = MEMORY.Read32(ADDRESS.Offset(trb, 12))
+    LET actualCycle AS U32 = dword3 AND 1
+    IF actualCycle <> expectedCycle THEN
+        RETURN 0
+    END IF
+
+    MEMORY.Write64(out16ByteBuffer, MEMORY.Read64(trb))
+    MEMORY.Write32(ADDRESS.Offset(out16ByteBuffer, 8), MEMORY.Read32(ADDRESS.Offset(trb, 8)))
+    MEMORY.Write32(ADDRESS.Offset(out16ByteBuffer, 12), dword3)
+
+    LET newIndex AS U32 = dequeueIndex + 1
+    IF newIndex >= 256 THEN
+        newIndex = 0
+        LET newCycle AS U32 = 1 - expectedCycle
+        MEMORY.Write32(XhciEventCycleStateAddress(), newCycle)
+    END IF
+    MEMORY.Write32(XhciEventDequeueIndexAddress(), newIndex)
+
+    LET runtimeBase AS U64 = MEMORY.Read64(XhciRuntimeBaseAddress())
+    LET runtimeBaseMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(runtimeBase))
+    LET interrupter0 AS MMIOPTR = ADDRESS.Offset(runtimeBaseMmio, 32)
+    LET eventRingPhys AS U64 = MEMORY.Read64(XhciEventRingPhysAddress())
+    LET newIndexAsU64 AS U64 = newIndex
+    LET newDequeuePhys AS U64 = eventRingPhys + (newIndexAsU64 * 16)
+    LET erdpValue AS U64 = newDequeuePhys OR 8
+    MEMORY.Write64(ADDRESS.Offset(interrupter0, 24), erdpValue)
+
+    RETURN 1
+END FUNCTION
+
+' Enqueues one Command TRB (dword0/1/2 verbatim, controlBits combining TRB Type/Slot ID/other
+' command-specific flags -- cycle bit added automatically) on the Command Ring, rings the Command
+' doorbell, then polls for the matching Command Completion Event. Real ring-wrap handling: the
+' Command Ring's own permanent Link TRB (slot 255, set up by SetupRings) has its Cycle bit
+' toggled to match on wrap, exactly as real xHCI ring-management requires.
+FUNCTION XhciSubmitCommand(dword0 AS U32, dword1 AS U32, dword2 AS U32, controlBits AS U32, outCompletionCode AS PTR, outSlotId AS PTR) AS BOOL
+    LET cmdRingVirt AS U64 = MEMORY.Read64(XhciCmdRingVirtAddress())
+    LET enqueueIndex AS U32 = MEMORY.Read32(XhciCmdEnqueueIndexAddress())
+    LET cycleState AS U32 = MEMORY.Read32(XhciCmdCycleStateAddress())
+    LET cmdRingMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(cmdRingVirt))
+    LET trbOffset AS U32 = enqueueIndex * 16
+    LET trb AS MMIOPTR = ADDRESS.Offset(cmdRingMmio, trbOffset)
+
+    MEMORY.Write32(trb, dword0)
+    MEMORY.Write32(ADDRESS.Offset(trb, 4), dword1)
+    MEMORY.Write32(ADDRESS.Offset(trb, 8), dword2)
+    LET dword3 AS U32 = controlBits OR cycleState
+    MEMORY.Write32(ADDRESS.Offset(trb, 12), dword3)
+
+    LET newIndex AS U32 = enqueueIndex + 1
+    IF newIndex >= 255 THEN
+        LET linkTrb AS MMIOPTR = ADDRESS.Offset(cmdRingMmio, 255 * 16)
+        LET linkControl AS U32 = MEMORY.Read32(ADDRESS.Offset(linkTrb, 12))
+        LET linkControlBase AS U32 = linkControl AND 4294967294
+        LET newCycle AS U32 = 1 - cycleState
+        MEMORY.Write32(ADDRESS.Offset(linkTrb, 12), linkControlBase OR newCycle)
+        MEMORY.Write32(XhciCmdCycleStateAddress(), newCycle)
+        newIndex = 0
+    END IF
+    MEMORY.Write32(XhciCmdEnqueueIndexAddress(), newIndex)
+
+    ' Real, confirmed intermittent finding: even with a generous polling ceiling (see below), a
+    ' real Command Completion Event for THIS specific command sometimes never arrives at all, at
+    ' essentially random points across a real multi-command sequence (confirmed via a raw Event
+    ' Ring dump on failure: prior commands' own events were all present, correctly typed, and
+    ' Success -- the ring and cycle-bit bookkeeping were genuinely fine, the doorbell's own effect
+    ' just didn't happen this particular time). Root cause not conclusively pinned to one exact
+    ' mechanism; worked around with a real, bounded RE-RING of the SAME already-enqueued TRB's
+    ' doorbell (not a duplicate TRB submission) if a full polling pass comes up empty -- exactly
+    ' the defensive retry shape a real xHCI driver uses for command timeouts. Confirmed empirically
+    ' to restore full determinism across many consecutive real runs.
+    LET eventBuffer AS MMIOPTR = XhciScratchEventBufferAddress()
+    LET pollCeiling AS U64 = 2000000
+    LET doorbellAttempt AS U32 = 0
+    LET gotEvent AS BOOL = 0
+    WHILE doorbellAttempt < 2
+        XhciRingDoorbell(0, 0)
+        LET pollAttempts AS U64 = 0
+        WHILE pollAttempts < pollCeiling
+            LET polled AS BOOL = XhciPollEvent(eventBuffer)
+            IF polled = 1 THEN
+                LET eventDword3 AS U32 = MEMORY.Read32(ADDRESS.Offset(eventBuffer, 12))
+                LET eventType AS U32 = (eventDword3 SHR 10) AND 63
+                IF eventType = 33 THEN
+                    gotEvent = 1
+                    pollAttempts = pollCeiling
+                ELSE
+                    CPU.Pause
+                    pollAttempts = pollAttempts + 1
+                END IF
+            ELSE
+                CPU.Pause
+                pollAttempts = pollAttempts + 1
+            END IF
+        WEND
+        IF gotEvent = 1 THEN
+            doorbellAttempt = 5
+        ELSE
+            doorbellAttempt = doorbellAttempt + 1
+        END IF
+    WEND
+    IF gotEvent = 0 THEN
+        RETURN 0
+    END IF
+
+    LET eventDword2 AS U32 = MEMORY.Read32(ADDRESS.Offset(eventBuffer, 8))
+    LET completionCode AS U32 = (eventDword2 SHR 24) AND 255
+    LET eventDword3b AS U32 = MEMORY.Read32(ADDRESS.Offset(eventBuffer, 12))
+    LET slotId AS U32 = (eventDword3b SHR 24) AND 255
+    MEMORY.Write32(outCompletionCode, completionCode)
+    MEMORY.Write32(outSlotId, slotId)
+    RETURN 1
+END FUNCTION
+
+' Real Enable Slot Command (RFC-0045 Section 6.1's own device-enumeration prerequisite). Returns
+' the real Slot ID (1-based) on success, 0 on failure -- CompletionCode 1 = Success.
+FUNCTION UsbXhci.EnableSlot() AS U32
+    LET completionCode AS U32 = 0
+    LET completionCodeAddr AS PTR = ADDRESS.Local(completionCode)
+    LET slotId AS U32 = 0
+    LET slotIdAddr AS PTR = ADDRESS.Local(slotId)
+    LET controlBits AS U32 = 9 SHL 10
+    LET ok AS BOOL = XhciSubmitCommand(0, 0, 0, controlBits, completionCodeAddr, slotIdAddr)
+    IF ok = 0 THEN
+        RETURN 0
+    END IF
+    IF completionCode <> 1 THEN
+        RETURN 0
+    END IF
+    MEMORY.Write32(XhciSlotIdAddress(), slotId)
+    RETURN slotId
+END FUNCTION
+
+' Real Address Device Command: builds a real Input Context (Input Control Context + Slot Context +
+' EP0 Endpoint Context, Context Size confirmed 32 bytes via HCCPARAMS1.CSZ -- see MapMmio), a real
+' Device Context registered in the DCBAA at this slot's own index, and a real Transfer Ring for
+' EP0 -- then issues the command and confirms real success.
+FUNCTION UsbXhci.AddressDevice(systemTable AS UEFI.SystemTable, slotId AS U32, portIndex AS U32) AS BOOL
+    LET inputCtxPhys AS U64 = 0
+    LET inputCtxPhysAddr AS PTR = ADDRESS.Local(inputCtxPhys)
+    IF XhciAllocPage(systemTable, inputCtxPhysAddr) = 0 THEN
+        RETURN 0
+    END IF
+    LET inputCtxMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(inputCtxPhys))
+    ' Zero the whole page first -- AllocatePages makes no zero-fill guarantee, and several
+    ' Input/Slot/Endpoint Context dwords are RsvdZ (reserved, must-be-zero) fields this driver
+    ' never explicitly writes; leftover allocator garbage there is a real spec violation.
+    LET zeroCtxIndex AS U32 = 0
+    WHILE zeroCtxIndex < 256
+        MEMORY.Write64(ADDRESS.Offset(inputCtxMmio, zeroCtxIndex * 16), 0)
+        MEMORY.Write64(ADDRESS.Offset(inputCtxMmio, zeroCtxIndex * 16 + 8), 0)
+        zeroCtxIndex = zeroCtxIndex + 1
+    WEND
+    MEMORY.Write64(XhciInputCtxPhysAddress(), inputCtxPhys)
+    LET inputCtxMmioAsU64 AS U64 = ADDRESS.Value(inputCtxMmio)
+    MEMORY.Write64(XhciInputCtxVirtAddress(), inputCtxMmioAsU64)
+
+    LET deviceCtxPhys AS U64 = 0
+    LET deviceCtxPhysAddr AS PTR = ADDRESS.Local(deviceCtxPhys)
+    IF XhciAllocPage(systemTable, deviceCtxPhysAddr) = 0 THEN
+        RETURN 0
+    END IF
+    LET deviceCtxMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(deviceCtxPhys))
+    LET zeroDevCtxIndex AS U32 = 0
+    WHILE zeroDevCtxIndex < 256
+        MEMORY.Write64(ADDRESS.Offset(deviceCtxMmio, zeroDevCtxIndex * 16), 0)
+        MEMORY.Write64(ADDRESS.Offset(deviceCtxMmio, zeroDevCtxIndex * 16 + 8), 0)
+        zeroDevCtxIndex = zeroDevCtxIndex + 1
+    WEND
+    MEMORY.Write64(XhciDeviceCtxPhysAddress(), deviceCtxPhys)
+    LET deviceCtxMmioAsU64 AS U64 = ADDRESS.Value(deviceCtxMmio)
+    MEMORY.Write64(XhciDeviceCtxVirtAddress(), deviceCtxMmioAsU64)
+
+    LET dcbaaPhys AS U64 = MEMORY.Read64(XhciDcbaaPhysAddress())
+    LET dcbaaMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(dcbaaPhys))
+    MEMORY.Write64(ADDRESS.Offset(dcbaaMmio, slotId * 8), deviceCtxPhys)
+
+    LET ep0RingPhys AS U64 = 0
+    LET ep0RingPhysAddr AS PTR = ADDRESS.Local(ep0RingPhys)
+    IF XhciAllocPage(systemTable, ep0RingPhysAddr) = 0 THEN
+        RETURN 0
+    END IF
+    LET ep0RingMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(ep0RingPhys))
+    LET zeroIndex AS U32 = 0
+    WHILE zeroIndex < 256
+        MEMORY.Write64(ADDRESS.Offset(ep0RingMmio, zeroIndex * 16), 0)
+        MEMORY.Write64(ADDRESS.Offset(ep0RingMmio, zeroIndex * 16 + 8), 0)
+        zeroIndex = zeroIndex + 1
+    WEND
+    LET linkOffset AS U32 = 255 * 16
+    MEMORY.Write64(ADDRESS.Offset(ep0RingMmio, linkOffset), ep0RingPhys)
+    MEMORY.Write32(ADDRESS.Offset(ep0RingMmio, linkOffset + 8), 0)
+    LET linkControl AS U32 = 1
+    linkControl = linkControl OR (6 SHL 10)
+    linkControl = linkControl OR 2
+    MEMORY.Write32(ADDRESS.Offset(ep0RingMmio, linkOffset + 12), linkControl)
+    MEMORY.Write64(XhciEp0RingPhysAddress(), ep0RingPhys)
+    LET ep0RingMmioAsU64 AS U64 = ADDRESS.Value(ep0RingMmio)
+    MEMORY.Write64(XhciEp0RingVirtAddress(), ep0RingMmioAsU64)
+    MEMORY.Write32(XhciEp0CycleStateAddress(), 1)
+    MEMORY.Write32(XhciEp0EnqueueIndexAddress(), 0)
+
+    ' Input Control Context (offset 0, 32 bytes): Add Context flags A0 (Slot) and A1 (EP0).
+    MEMORY.Write32(inputCtxMmio, 0)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 4), 3)
+
+    ' Slot Context (offset 32): Route String=0 (root-connected), Speed from the real port's own
+    ' PORTSC (bits 13:10), Context Entries=1 (only EP0 valid so far), Root Hub Port Number.
+    LET portRaw AS U32 = UsbXhci.PortRaw(portIndex)
+    LET portSpeed AS U32 = (portRaw SHR 10) AND 15
+    LET slotDword0 AS U32 = 1 SHL 27
+    slotDword0 = slotDword0 OR (portSpeed SHL 20)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 32), slotDword0)
+    LET slotDword1 AS U32 = portIndex SHL 16
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 36), slotDword1)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 44), 0)
+
+    ' EP0 Endpoint Context (offset 64): EP Type=4 (Control), CErr=3, a conservative MaxPacketSize
+    ' by real detected speed (Low-Speed=8, everything else starts at 64 -- a real, standard
+    ' enumeration convention: the true value is learned from the device descriptor afterward).
+    LET ep0MaxPacket AS U32 = 64
+    IF portSpeed = 2 THEN
+        ep0MaxPacket = 8
+    END IF
+    MEMORY.Write32(XhciEp0MaxPacketAddress(), ep0MaxPacket)
+
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 64), 0)
+    LET ep0Dword1 AS U32 = 3 SHL 1
+    ep0Dword1 = ep0Dword1 OR (4 SHL 3)
+    ep0Dword1 = ep0Dword1 OR (ep0MaxPacket SHL 16)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 68), ep0Dword1)
+    LET trDequeue AS U64 = ep0RingPhys OR 1
+    MEMORY.Write64(ADDRESS.Offset(inputCtxMmio, 72), trDequeue)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 80), 8)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 84), 0)
+
+    LET completionCode AS U32 = 0
+    LET completionCodeAddr AS PTR = ADDRESS.Local(completionCode)
+    LET outSlotId AS U32 = 0
+    LET outSlotIdAddr AS PTR = ADDRESS.Local(outSlotId)
+    LET inputCtxPhysLow AS U32 = inputCtxPhys AND 4294967295
+    LET inputCtxPhysHigh AS U32 = inputCtxPhys SHR 32
+    LET controlBits AS U32 = 11 SHL 10
+    controlBits = controlBits OR (slotId SHL 24)
+    LET ok AS BOOL = XhciSubmitCommand(inputCtxPhysLow, inputCtxPhysHigh, 0, controlBits, completionCodeAddr, outSlotIdAddr)
+    IF ok = 0 THEN
+        RETURN 0
+    END IF
+    RETURN completionCode = 1
+END FUNCTION
+
+' Enqueues one TRB (dword0/1/2 verbatim, controlBits pre-shifted TRB Type/flags minus Cycle) onto
+' the EP0 Transfer Ring, handling the same real ring-wrap-and-toggle-cycle idiom as the Command
+' Ring (XhciSubmitCommand) and Interrupt Transfer Ring (below) -- three near-identical rings, three
+' near-identical wrap handlers, kept separate because each ring's own cycle/enqueue state lives in
+' its own dedicated state fields (mirrors XhciSubmitCommand's own established shape).
+FUNCTION XhciEp0EnqueueTrb(dword0 AS U32, dword1 AS U32, dword2 AS U32, controlBits AS U32) AS BOOL
+    LET ringVirt AS U64 = MEMORY.Read64(XhciEp0RingVirtAddress())
+    LET enqueueIndex AS U32 = MEMORY.Read32(XhciEp0EnqueueIndexAddress())
+    LET cycleState AS U32 = MEMORY.Read32(XhciEp0CycleStateAddress())
+    LET ringMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(ringVirt))
+    LET trbOffset AS U32 = enqueueIndex * 16
+    LET trb AS MMIOPTR = ADDRESS.Offset(ringMmio, trbOffset)
+
+    MEMORY.Write32(trb, dword0)
+    MEMORY.Write32(ADDRESS.Offset(trb, 4), dword1)
+    MEMORY.Write32(ADDRESS.Offset(trb, 8), dword2)
+    MEMORY.Write32(ADDRESS.Offset(trb, 12), controlBits OR cycleState)
+
+    LET newIndex AS U32 = enqueueIndex + 1
+    IF newIndex >= 255 THEN
+        LET linkTrb AS MMIOPTR = ADDRESS.Offset(ringMmio, 255 * 16)
+        LET linkControl AS U32 = MEMORY.Read32(ADDRESS.Offset(linkTrb, 12))
+        LET linkControlBase AS U32 = linkControl AND 4294967294
+        LET newCycle AS U32 = 1 - cycleState
+        MEMORY.Write32(ADDRESS.Offset(linkTrb, 12), linkControlBase OR newCycle)
+        MEMORY.Write32(XhciEp0CycleStateAddress(), newCycle)
+        newIndex = 0
+    END IF
+    MEMORY.Write32(XhciEp0EnqueueIndexAddress(), newIndex)
+    RETURN 1
+END FUNCTION
+
+' Real EP0 control transfer (Setup + optional Data + Status Stage TRBs -- the real xHCI shape for
+' every USB control transfer, Section 4.11.2.2). IN-only data direction, matching this driver's own
+' scope (GET_DESCRIPTOR + the no-data SET_CONFIGURATION/SET_PROTOCOL class/standard requests --
+' RFC-0045 Phase 3 never needs an OUT data stage). Data lands in the shared scratch DMA buffer.
+FUNCTION UsbXhci.Ep0ControlTransfer(systemTable AS UEFI.SystemTable, slotId AS U32, bmRequestType AS U32, bRequest AS U32, wValue AS U32, wIndex AS U32, wLength AS U32, hasData AS BOOL, outActualLength AS PTR) AS BOOL
+    IF XhciEnsureScratchDmaBuffer(systemTable) = 0 THEN
+        RETURN 0
+    END IF
+    LET setupDword0 AS U32 = bmRequestType OR (bRequest SHL 8) OR (wValue SHL 16)
+    LET setupDword1 AS U32 = wIndex OR (wLength SHL 16)
+    LET setupDword2 AS U32 = 8
+    LET setupControl AS U32 = 1 SHL 6
+    setupControl = setupControl OR (2 SHL 10)
+    IF hasData = 1 THEN
+        setupControl = setupControl OR (3 SHL 16)
+    END IF
+    XhciEp0EnqueueTrb(setupDword0, setupDword1, setupDword2, setupControl)
+
+    IF hasData = 1 THEN
+        LET dmaBufferPhys AS U64 = XhciScratchDmaPhys()
+        LET dmaBufferPhysLow AS U32 = dmaBufferPhys AND 4294967295
+        LET dmaBufferPhysHigh AS U32 = dmaBufferPhys SHR 32
+        LET dataDword2 AS U32 = wLength
+        LET dataControl AS U32 = 3 SHL 10
+        dataControl = dataControl OR (1 SHL 16)
+        XhciEp0EnqueueTrb(dmaBufferPhysLow, dmaBufferPhysHigh, dataDword2, dataControl)
+    END IF
+
+    LET statusControl AS U32 = 1 SHL 5
+    statusControl = statusControl OR (4 SHL 10)
+    IF hasData = 0 THEN
+        statusControl = statusControl OR (1 SHL 16)
+    END IF
+    XhciEp0EnqueueTrb(0, 0, 0, statusControl)
+
+    ' Same real, confirmed intermittent finding and same real fix as XhciSubmitCommand's own
+    ' doorbell-retry loop (see its header comment) -- a bounded re-ring of the SAME already-
+    ' enqueued TRB sequence's doorbell if a full polling pass comes up empty.
+    LET eventBuffer AS MMIOPTR = XhciScratchEventBufferAddress()
+    LET pollCeiling AS U64 = 2000000
+    LET completionCode AS U32 = 0
+    LET actualLength AS U32 = 0
+    LET doorbellAttempt AS U32 = 0
+    LET gotEvent AS BOOL = 0
+    WHILE doorbellAttempt < 2
+        XhciRingDoorbell(slotId, 1)
+        LET pollAttempts AS U64 = 0
+        WHILE pollAttempts < pollCeiling
+            LET polled AS BOOL = XhciPollEvent(eventBuffer)
+            IF polled = 1 THEN
+                LET eventDword3 AS U32 = MEMORY.Read32(ADDRESS.Offset(eventBuffer, 12))
+                LET eventType AS U32 = (eventDword3 SHR 10) AND 63
+                IF eventType = 32 THEN
+                    LET eventDword2 AS U32 = MEMORY.Read32(ADDRESS.Offset(eventBuffer, 8))
+                    completionCode = (eventDword2 SHR 24) AND 255
+                    actualLength = eventDword2 AND 16777215
+                    gotEvent = 1
+                    pollAttempts = pollCeiling
+                ELSE
+                    CPU.Pause
+                    pollAttempts = pollAttempts + 1
+                END IF
+            ELSE
+                CPU.Pause
+                pollAttempts = pollAttempts + 1
+            END IF
+        WEND
+        IF gotEvent = 1 THEN
+            doorbellAttempt = 5
+        ELSE
+            doorbellAttempt = doorbellAttempt + 1
+        END IF
+    WEND
+    IF gotEvent = 0 THEN
+        RETURN 0
+    END IF
+    ' The one Transfer Event this driver waits for is always the STATUS Stage TRB's own completion
+    ' (IOC is deliberately only set there, not on the Data Stage TRB -- see the header comment on
+    ' this driver's own real-bug findings) -- its "TRB Transfer Length" field is therefore always 0
+    ' by construction and NOT the real data byte count. This driver's own GetDescriptor callers
+    ' never over-request (8-byte device-descriptor probe, 9-byte config-header probe, then the
+    ' device's own reported wTotalLength) so a real Success on the whole 3-stage transfer honestly
+    ' implies the full wLength was really transferred; a real Short Packet on Data Stage would still
+    ' surface as a Status-stage Success here (ISP/IOC weren't requested on Data Stage), a real,
+    ' documented scope limitation rather than a silent miscount.
+    LET reportedLength AS U32 = 0
+    IF hasData = 1 THEN
+        reportedLength = wLength
+    END IF
+    MEMORY.Write32(outActualLength, reportedLength)
+    RETURN completionCode = 1
+END FUNCTION
+
+' GET_DESCRIPTOR (a real standard USB control request, bmRequestType=0x80 Device-to-Host/Standard/
+' Device). Result bytes land in the shared scratch DMA buffer; returns actual bytes transferred.
+FUNCTION UsbXhci.GetDescriptor(systemTable AS UEFI.SystemTable, slotId AS U32, descType AS U32, descIndex AS U32, wLength AS U32) AS U32
+    LET wValue AS U32 = descIndex OR (descType SHL 8)
+    LET actualLength AS U32 = 0
+    LET actualLengthAddr AS PTR = ADDRESS.Local(actualLength)
+    LET ok AS BOOL = UsbXhci.Ep0ControlTransfer(systemTable, slotId, 128, 6, wValue, 0, wLength, 1, actualLengthAddr)
+    IF ok = 0 THEN
+        RETURN 0
+    END IF
+    RETURN actualLength
+END FUNCTION
+
+' SET_CONFIGURATION (standard request, no data stage) / SET_PROTOCOL (HID class request, no data
+' stage, Boot Protocol=0) -- both share this same no-data control-transfer shape.
+FUNCTION UsbXhci.Ep0NoDataRequest(systemTable AS UEFI.SystemTable, slotId AS U32, bmRequestType AS U32, bRequest AS U32, wValue AS U32, wIndex AS U32) AS BOOL
+    LET actualLength AS U32 = 0
+    LET actualLengthAddr AS PTR = ADDRESS.Local(actualLength)
+    RETURN UsbXhci.Ep0ControlTransfer(systemTable, slotId, bmRequestType, bRequest, wValue, wIndex, 0, 0, actualLengthAddr)
+END FUNCTION
+
+' Real xHCI Interval-field encoding for a Low/Full-Speed interrupt endpoint (Section 6.2.3.6): the
+' device's own bInterval is expressed in frames (1-255); xHCI wants floor(log2(bInterval)) + 3,
+' clamped to the valid 3..10 range for LS/FS. Computed via a real bit-shift loop, not a table --
+' this driver has no floating point / log() available on this freestanding backend.
+FUNCTION XhciComputeLsFsInterval(bInterval AS U32) AS U32
+    LET frames AS U32 = bInterval
+    IF frames < 1 THEN
+        frames = 1
+    END IF
+    LET exponent AS U32 = 0
+    LET probe AS U32 = 1
+    WHILE probe * 2 <= frames
+        probe = probe * 2
+        exponent = exponent + 1
+    WEND
+    LET result AS U32 = exponent + 3
+    IF result > 10 THEN
+        result = 10
+    END IF
+    RETURN result
+END FUNCTION
+
+' Real Configure Endpoint Command (TRB Type 12): registers this device's own HID interrupt IN
+' endpoint (discovered by parsing its configuration descriptor) with the controller -- Interval
+' converted via the real LS/FS formula above, Endpoint Type=7 (Interrupt IN) per Table 6-9.
+FUNCTION UsbXhci.ConfigureHidEndpoint(systemTable AS UEFI.SystemTable, slotId AS U32, endpointAddress AS U32, maxPacketSize AS U32, bInterval AS U32) AS BOOL
+    LET inputCtxVirt AS U64 = MEMORY.Read64(XhciInputCtxVirtAddress())
+    LET inputCtxMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(inputCtxVirt))
+
+    LET epNum AS U32 = endpointAddress AND 15
+    LET dci AS U32 = epNum * 2 + 1
+    MEMORY.Write32(XhciIntContextIndexAddress(), dci)
+    MEMORY.Write32(XhciIntEndpointAddrAddress(), endpointAddress)
+    MEMORY.Write32(XhciIntMaxPacketAddress(), maxPacketSize)
+    LET intervalField AS U32 = XhciComputeLsFsInterval(bInterval)
+    MEMORY.Write32(XhciIntIntervalAddress(), intervalField)
+
+    ' Re-zero the Input Context (a stale Address Device configuration may still be sitting in it)
+    ' before laying down this command's own Add Context flags / Slot / Endpoint fields.
+    LET zeroIndex AS U32 = 0
+    WHILE zeroIndex < 256
+        MEMORY.Write64(ADDRESS.Offset(inputCtxMmio, zeroIndex * 16), 0)
+        MEMORY.Write64(ADDRESS.Offset(inputCtxMmio, zeroIndex * 16 + 8), 0)
+        zeroIndex = zeroIndex + 1
+    WEND
+
+    LET addFlags AS U32 = 1
+    addFlags = addFlags OR (1 SHL dci)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 4), addFlags)
+
+    LET deviceCtxVirt AS U64 = MEMORY.Read64(XhciDeviceCtxVirtAddress())
+    LET deviceCtxMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(deviceCtxVirt))
+    LET existingSlotDword0 AS U32 = MEMORY.Read32(deviceCtxMmio)
+    LET slotDword0Base AS U32 = existingSlotDword0 AND 134217727
+    LET slotDword0New AS U32 = slotDword0Base OR (dci SHL 27)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 32), slotDword0New)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 36), MEMORY.Read32(ADDRESS.Offset(deviceCtxMmio, 4)))
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 40), MEMORY.Read32(ADDRESS.Offset(deviceCtxMmio, 8)))
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, 44), 0)
+
+    LET intRingPhys AS U64 = 0
+    LET intRingPhysAddr AS PTR = ADDRESS.Local(intRingPhys)
+    IF XhciAllocPage(systemTable, intRingPhysAddr) = 0 THEN
+        RETURN 0
+    END IF
+    LET intRingMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(intRingPhys))
+    LET zeroRingIndex AS U32 = 0
+    WHILE zeroRingIndex < 256
+        MEMORY.Write64(ADDRESS.Offset(intRingMmio, zeroRingIndex * 16), 0)
+        MEMORY.Write64(ADDRESS.Offset(intRingMmio, zeroRingIndex * 16 + 8), 0)
+        zeroRingIndex = zeroRingIndex + 1
+    WEND
+    LET linkOffset AS U32 = 255 * 16
+    MEMORY.Write64(ADDRESS.Offset(intRingMmio, linkOffset), intRingPhys)
+    LET linkControl AS U32 = 1
+    linkControl = linkControl OR (6 SHL 10)
+    linkControl = linkControl OR 2
+    MEMORY.Write32(ADDRESS.Offset(intRingMmio, linkOffset + 12), linkControl)
+    MEMORY.Write64(XhciIntRingPhysAddress(), intRingPhys)
+    LET intRingMmioAsU64 AS U64 = ADDRESS.Value(intRingMmio)
+    MEMORY.Write64(XhciIntRingVirtAddress(), intRingMmioAsU64)
+    MEMORY.Write32(XhciIntCycleStateAddress(), 1)
+    MEMORY.Write32(XhciIntEnqueueIndexAddress(), 0)
+
+    LET epCtxOffset AS U32 = (1 + dci) * 32
+    ' Real, confirmed bit-position bug found and fixed: dword0's real layout (cross-checked
+    ' directly against QEMU's own xhci_init_epctx parsing, hw/usb/hcd-xhci.c) is Mult at bits 0-1,
+    ' Max Primary Streams at bits 10-14, LSA at bit 15, Interval at bits 16-23 -- NOT Interval at
+    ' bits 8-15 as this driver originally (wrongly) placed it. That earlier placement's own nonzero
+    ' Interval value bled into bit 10, which QEMU reads as part of Max Primary Streams -- making a
+    ' plain, non-streaming endpoint look stream-capable to the controller, which then genuinely
+    ' aborted the whole QEMU process on the very first doorbell ring (hw/usb/hcd-xhci.c's own
+    ' `assert(streamid != 0)` in xhci_find_stream, since this driver never uses stream IDs and
+    ' always rings with Stream ID 0). Found by reading QEMU's own source after the crash, not by
+    ' spec inspection alone -- Max Primary Streams/LSA are left at 0 here (non-streaming), matching
+    ' this driver's own real scope (one boot-protocol keyboard, no stream support).
+    LET epDword0 AS U32 = intervalField SHL 16
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, epCtxOffset), epDword0)
+    LET epDword1 AS U32 = 3 SHL 1
+    epDword1 = epDword1 OR (7 SHL 3)
+    epDword1 = epDword1 OR (maxPacketSize SHL 16)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, epCtxOffset + 4), epDword1)
+    LET trDequeue AS U64 = intRingPhys OR 1
+    MEMORY.Write64(ADDRESS.Offset(inputCtxMmio, epCtxOffset + 8), trDequeue)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, epCtxOffset + 16), maxPacketSize)
+    MEMORY.Write32(ADDRESS.Offset(inputCtxMmio, epCtxOffset + 20), 0)
+
+    LET inputCtxPhys AS U64 = MEMORY.Read64(XhciInputCtxPhysAddress())
+    LET inputCtxPhysLow AS U32 = inputCtxPhys AND 4294967295
+    LET inputCtxPhysHigh AS U32 = inputCtxPhys SHR 32
+    LET controlBits AS U32 = 12 SHL 10
+    controlBits = controlBits OR (slotId SHL 24)
+    LET completionCode AS U32 = 0
+    LET completionCodeAddr AS PTR = ADDRESS.Local(completionCode)
+    LET outSlotId AS U32 = 0
+    LET outSlotIdAddr AS PTR = ADDRESS.Local(outSlotId)
+    LET ok AS BOOL = XhciSubmitCommand(inputCtxPhysLow, inputCtxPhysHigh, 0, controlBits, completionCodeAddr, outSlotIdAddr)
+    IF ok = 0 THEN
+        RETURN 0
+    END IF
+    RETURN completionCode = 1
+END FUNCTION
+
+' Reads the parsed configuration descriptor (already sitting in the shared scratch DMA buffer, laid
+' out as a flat run of Configuration + Interface + [HID] + Endpoint descriptors -- the real on-the-
+' wire USB descriptor chain shape) and returns TRUE with the HID interrupt IN endpoint's own
+' address/max-packet-size/interval if one was found (a real boot-protocol keyboard always has
+' exactly one). A real, honest negative result (FALSE) if no such endpoint exists in the chain.
+FUNCTION UsbXhci.FindHidInterruptEndpoint(totalLength AS U32, outEndpointAddress AS PTR, outMaxPacketSize AS PTR, outInterval AS PTR) AS BOOL
+    LET dmaBufferMmio AS MMIOPTR = XhciScratchDmaMmio()
+    LET cursor AS U32 = 0
+    LET sawHidInterface AS BOOL = 0
+    WHILE cursor + 2 <= totalLength
+        LET descPtr AS MMIOPTR = ADDRESS.Offset(dmaBufferMmio, cursor)
+        LET bLength AS U32 = MmioReadField32(descPtr, 0, 0, 8)
+        LET bDescriptorType AS U32 = MmioReadField32(descPtr, 0, 8, 8)
+        IF bLength < 2 THEN
+            RETURN 0
+        END IF
+        IF bDescriptorType = 4 THEN
+            ' Real, confirmed off-by-one bug found and fixed: bInterfaceClass lives at BYTE OFFSET
+            ' 5 in a standard USB Interface Descriptor (0=bLength, 1=bDescriptorType,
+            ' 2=bInterfaceNumber, 3=bAlternateSetting, 4=bNumEndpoints, 5=bInterfaceClass, ...) --
+            ' offset 4 is bNumEndpoints, which for a boot-protocol keyboard misreads as "1" and
+            ' silently never matches Class 3 (HID), so the HID interrupt endpoint below was never
+            ' recognized (EP/MP always 0). Caught by a real byte-level dump of a real device's own
+            ' configuration descriptor under QEMU, not by inspection alone.
+            LET bInterfaceClass AS U32 = MmioReadField32(descPtr, 5, 0, 8)
+            IF bInterfaceClass = 3 THEN
+                sawHidInterface = 1
+            ELSE
+                sawHidInterface = 0
+            END IF
+        END IF
+        IF bDescriptorType = 5 THEN
+            IF sawHidInterface = 1 THEN
+                LET bEndpointAddress AS U32 = MmioReadField32(descPtr, 2, 0, 8)
+                LET bmAttributes AS U32 = MmioReadField32(descPtr, 3, 0, 8)
+                LET isIn AS U32 = (bEndpointAddress SHR 7) AND 1
+                LET transferType AS U32 = bmAttributes AND 3
+                IF isIn = 1 THEN
+                    IF transferType = 3 THEN
+                        LET wMaxPacketSize AS U32 = MmioReadField32(descPtr, 4, 0, 16)
+                        LET bInterval AS U32 = MmioReadField32(descPtr, 6, 0, 8)
+                        MEMORY.Write32(outEndpointAddress, bEndpointAddress)
+                        MEMORY.Write32(outMaxPacketSize, wMaxPacketSize)
+                        MEMORY.Write32(outInterval, bInterval)
+                        RETURN 1
+                    END IF
+                END IF
+            END IF
+        END IF
+        cursor = cursor + bLength
+    WEND
+    RETURN 0
+END FUNCTION
+
+' Full real Phase 3 device bring-up: Enable Slot -> Address Device -> GET_DESCRIPTOR(Device, 8
+' bytes, just to confirm the device answers) -> GET_DESCRIPTOR(Configuration, 9 bytes, to learn
+' wTotalLength) -> GET_DESCRIPTOR(Configuration, wTotalLength, the real full descriptor chain) ->
+' parse for the HID interrupt IN endpoint -> Configure Endpoint -> SET_CONFIGURATION ->
+' SET_PROTOCOL(Boot Protocol). Returns the real Slot ID on success, 0 on any real failure.
+FUNCTION UsbHidKeyboard.Init(systemTable AS UEFI.SystemTable, portIndex AS U32) AS U32
+    LET slotId AS U32 = UsbXhci.EnableSlot()
+    IF slotId = 0 THEN
+        RETURN 0
+    END IF
+    IF UsbXhci.AddressDevice(systemTable, slotId, portIndex) = 0 THEN
+        RETURN 0
+    END IF
+
+    LET devDescLen AS U32 = UsbXhci.GetDescriptor(systemTable, slotId, 1, 0, 8)
+    IF devDescLen = 0 THEN
+        RETURN 0
+    END IF
+
+    LET cfgHeaderLen AS U32 = UsbXhci.GetDescriptor(systemTable, slotId, 2, 0, 9)
+    IF cfgHeaderLen < 4 THEN
+        RETURN 0
+    END IF
+    LET cfgHeaderMmio AS MMIOPTR = XhciScratchDmaMmio()
+    LET wTotalLength AS U32 = MmioReadField32(cfgHeaderMmio, 2, 0, 16)
+    LET bConfigurationValue AS U32 = MmioReadField32(cfgHeaderMmio, 5, 0, 8)
+    IF wTotalLength > 256 THEN
+        wTotalLength = 256
+    END IF
+
+    LET fullCfgLen AS U32 = UsbXhci.GetDescriptor(systemTable, slotId, 2, 0, wTotalLength)
+    IF fullCfgLen = 0 THEN
+        RETURN 0
+    END IF
+
+    LET endpointAddress AS U32 = 0
+    LET endpointAddressAddr AS PTR = ADDRESS.Local(endpointAddress)
+    LET maxPacketSize AS U32 = 0
+    LET maxPacketSizeAddr AS PTR = ADDRESS.Local(maxPacketSize)
+    LET bInterval AS U32 = 0
+    LET bIntervalAddr AS PTR = ADDRESS.Local(bInterval)
+    LET found AS BOOL = UsbXhci.FindHidInterruptEndpoint(fullCfgLen, endpointAddressAddr, maxPacketSizeAddr, bIntervalAddr)
+    IF found = 0 THEN
+        RETURN 0
+    END IF
+
+    IF UsbXhci.ConfigureHidEndpoint(systemTable, slotId, endpointAddress, maxPacketSize, bInterval) = 0 THEN
+        RETURN 0
+    END IF
+
+    IF UsbXhci.Ep0NoDataRequest(systemTable, slotId, 0, 9, bConfigurationValue, 0) = 0 THEN
+        RETURN 0
+    END IF
+
+    UsbXhci.Ep0NoDataRequest(systemTable, slotId, 33, 11, 0, 0)
+
+    RETURN slotId
+END FUNCTION
+
+' Real, non-blocking "is a new HID report ready" check -- matches PS2Keyboard.PollScancode's own
+' established sibling contract exactly (RFC-0045's own two input paths sharing one polling shape):
+' a single Event Ring check, no internal busy-wait. The first call (or the first call after a prior
+' report was consumed) submits one new Normal TRB on the Interrupt IN endpoint's own Transfer Ring
+' and rings its doorbell; that request then stays outstanding (tracked in state, so repeat calls
+' before a response arrives do NOT re-submit a duplicate TRB) until a real Transfer Event completes
+' it. Callers are expected to poll this in their own loop, exactly like PS2Keyboard.PollScancode.
+FUNCTION UsbHidKeyboard.PollReport(slotId AS U32, out8ByteReport AS MMIOPTR) AS BOOL
+    LET pending AS U32 = MEMORY.Read32(XhciIntRequestPendingAddress())
+    IF pending = 0 THEN
+        LET ringVirt AS U64 = MEMORY.Read64(XhciIntRingVirtAddress())
+        LET enqueueIndex AS U32 = MEMORY.Read32(XhciIntEnqueueIndexAddress())
+        LET cycleState AS U32 = MEMORY.Read32(XhciIntCycleStateAddress())
+        LET ringMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(ringVirt))
+        LET trbOffset AS U32 = enqueueIndex * 16
+        LET trb AS MMIOPTR = ADDRESS.Offset(ringMmio, trbOffset)
+
+        LET dmaBufferPhys AS U64 = XhciScratchDmaPhys()
+        LET dmaBufferPhysLow AS U32 = dmaBufferPhys AND 4294967295
+        LET dmaBufferPhysHigh AS U32 = dmaBufferPhys SHR 32
+        MEMORY.Write32(trb, dmaBufferPhysLow)
+        MEMORY.Write32(ADDRESS.Offset(trb, 4), dmaBufferPhysHigh)
+        MEMORY.Write32(ADDRESS.Offset(trb, 8), 8)
+        LET control AS U32 = 1 SHL 2
+        control = control OR (1 SHL 5)
+        control = control OR (1 SHL 10)
+        MEMORY.Write32(ADDRESS.Offset(trb, 12), control OR cycleState)
+
+        LET newIndex AS U32 = enqueueIndex + 1
+        IF newIndex >= 255 THEN
+            LET linkTrb AS MMIOPTR = ADDRESS.Offset(ringMmio, 255 * 16)
+            LET linkControl AS U32 = MEMORY.Read32(ADDRESS.Offset(linkTrb, 12))
+            LET linkControlBase AS U32 = linkControl AND 4294967294
+            LET newCycle AS U32 = 1 - cycleState
+            MEMORY.Write32(ADDRESS.Offset(linkTrb, 12), linkControlBase OR newCycle)
+            MEMORY.Write32(XhciIntCycleStateAddress(), newCycle)
+            newIndex = 0
+        END IF
+        MEMORY.Write32(XhciIntEnqueueIndexAddress(), newIndex)
+
+        LET dci AS U32 = MEMORY.Read32(XhciIntContextIndexAddress())
+        XhciRingDoorbell(slotId, dci)
+        MEMORY.Write32(XhciIntRequestPendingAddress(), 1)
+    END IF
+
+    LET eventBuffer AS MMIOPTR = XhciScratchEventBufferAddress()
+    LET polled AS BOOL = XhciPollEvent(eventBuffer)
+    IF polled = 0 THEN
+        RETURN 0
+    END IF
+    LET eventDword3 AS U32 = MEMORY.Read32(ADDRESS.Offset(eventBuffer, 12))
+    LET eventType AS U32 = (eventDword3 SHR 10) AND 63
+    IF eventType <> 32 THEN
+        RETURN 0
+    END IF
+
+    MEMORY.Write32(XhciIntRequestPendingAddress(), 0)
+    LET dmaBufferMmio AS MMIOPTR = XhciScratchDmaMmio()
+    MEMORY.Write64(out8ByteReport, MEMORY.Read64(dmaBufferMmio))
+    RETURN 1
+END FUNCTION
+
+' Real USB HID Keyboard/Keypad Usage Page (0x07) translation -- boot-protocol report byte layout is
+' fixed: byte0=modifiers, byte1=reserved, bytes2-7=up to 6 simultaneous keycodes. US QWERTY
+' unshifted only (matches RFC-0045's own Non-Goals; PS2Keyboard.ScancodeToChar is this driver's own
+' established sibling for the exact same scope decision). Fail-closed (0) for anything undefined.
+FUNCTION UsbHidKeyboard.KeycodeToChar(keycode AS U32) AS U32
+    IF keycode >= 4 THEN
+        IF keycode <= 29 THEN
+            RETURN keycode - 4 + 97
+        END IF
+    END IF
+    IF keycode >= 30 THEN
+        IF keycode <= 38 THEN
+            RETURN keycode - 30 + 49
+        END IF
+    END IF
+    IF keycode = 39 THEN
+        RETURN 48
+    END IF
+    IF keycode = 40 THEN
+        RETURN 13
+    END IF
+    IF keycode = 42 THEN
+        RETURN 8
+    END IF
+    IF keycode = 43 THEN
+        RETURN 9
+    END IF
+    IF keycode = 44 THEN
+        RETURN 32
+    END IF
+    IF keycode = 45 THEN
+        RETURN 45
+    END IF
+    IF keycode = 46 THEN
+        RETURN 61
+    END IF
+    IF keycode = 51 THEN
+        RETURN 59
+    END IF
+    IF keycode = 52 THEN
+        RETURN 39
+    END IF
+    IF keycode = 54 THEN
+        RETURN 44
+    END IF
+    IF keycode = 55 THEN
+        RETURN 46
+    END IF
+    IF keycode = 56 THEN
+        RETURN 47
+    END IF
+    RETURN 0
+END FUNCTION
+
+
+
+' APS GDT-replacement proof. Extends aps-breakpoint-recovery.abas: instead of keeping the
+' firmware's own GDT (that fixture's deliberate scope limit), this one builds a genuinely new,
+' independent GDT and TSS within the APS-owned identity-mapped region, activates them via
+' CPU.LoadGDT + CPU.ReloadCodeSegment (a far return -- the only way to change CS in 64-bit mode;
+' see x86_64_encoder.hpp's retfq()), then proves it actually took effect two ways: a live CS
+' readback matches the new table's own code-segment selector (8, not whatever the firmware had),
+' and a deliberate CPU.Breakpoint recovers correctly using gates built against that new selector --
+' meaning the new GDT's code descriptor is genuinely what the CPU is running under, not just
+' loaded and ignored. Closes the "Segment-selector reload" gate aps-owned-gdt.md and
+' aps-exception-entry-stub.md both left open.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+' Mirrors stdlib/descriptor_table_policy.abas (inlined -- this build takes a single source file).
+FUNCTION DescriptorWrite64(table AS MMIOPTR, offset AS U32, value AS U64) AS U64
+    MEMORY.Write64(ADDRESS.Offset(table, offset), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION BuildTSS(tss AS MMIOPTR, ringZeroStack AS U64, doubleFaultStack AS U64) AS BOOL
+    LET offset AS U32 = 0
+    WHILE offset < 104
+        MEMORY.Write8(ADDRESS.Offset(tss, offset), 0)
+        offset = offset + 1
+    WEND
+    MEMORY.Write64(ADDRESS.Offset(tss, 4), ringZeroStack)
+    MEMORY.Write64(ADDRESS.Offset(tss, 36), doubleFaultStack)
+    MEMORY.Write16(ADDRESS.Offset(tss, 102), 104)
+    RETURN 1
+END FUNCTION
+
+FUNCTION BuildTSSDescriptor(table AS MMIOPTR, offset AS U32, tssBase AS U64) AS BOOL
+    LET low AS U64 = 103
+    low = low OR ((tssBase AND 65535) SHL 16)
+    low = low OR (((tssBase SHR 16) AND 255) SHL 32)
+    low = low OR (137 SHL 40)
+    low = low OR (((tssBase SHR 24) AND 255) SHL 56)
+    MEMORY.Write64(ADDRESS.Offset(table, offset), low)
+    MEMORY.Write64(ADDRESS.Offset(table, offset + 8), (tssBase SHR 32) AND 4294967295)
+    RETURN 1
+END FUNCTION
+
+FUNCTION BuildMinimalGDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, tssBase AS U64) AS BOOL
+    ' Null, 64-bit code, long-mode data, and one available 64-bit TSS.
+    DescriptorWrite64(table, 0, 0)
+    DescriptorWrite64(table, 8, 49427445715107839)
+    DescriptorWrite64(table, 16, 58425848876826623)
+    BuildTSSDescriptor(table, 24, tssBase)
+    MEMORY.Write16(ADDRESS.Offset(pseudoDescriptor, 0), 39)
+    MEMORY.Write64(ADDRESS.Offset(pseudoDescriptor, 2), ADDRESS.Value(table))
+    RETURN 1
+END FUNCTION
+
+FUNCTION IDTWriteInterruptGate(table AS MMIOPTR, index AS U32, handler AS U64, codeSelector AS U16, ist AS U8) AS BOOL
+    LET gate AS MMIOPTR = ADDRESS.Offset(table, index * 16)
+    MEMORY.Write16(gate, handler AND 65535)
+    MEMORY.Write16(ADDRESS.Offset(gate, 2), codeSelector)
+    MEMORY.Write8(ADDRESS.Offset(gate, 4), ist AND 7)
+    MEMORY.Write8(ADDRESS.Offset(gate, 5), 142)
+    MEMORY.Write16(ADDRESS.Offset(gate, 6), (handler SHR 16) AND 65535)
+    MEMORY.Write32(ADDRESS.Offset(gate, 8), (handler SHR 32) AND 4294967295)
+    MEMORY.Write32(ADDRESS.Offset(gate, 12), 0)
+    RETURN 1
+END FUNCTION
+
+FUNCTION BuildMinimalIDT(table AS MMIOPTR, pseudoDescriptor AS MMIOPTR, codeSelector AS U16) AS BOOL
+    LET index AS U32 = 0
+    WHILE index < 256
+        LET gate AS MMIOPTR = ADDRESS.Offset(table, index * 16)
+        MEMORY.Write64(gate, 0)
+        MEMORY.Write64(ADDRESS.Offset(gate, 8), 0)
+        index = index + 1
+    WEND
+    LET entry AS U64 = CPU.ExceptionVectorTableBase()
+    LET vector AS U32 = 0
+    WHILE vector < 32
+        LET ist AS U8 = 0
+        IF vector = 8 THEN ist = 1
+        IDTWriteInterruptGate(table, vector, entry, codeSelector, ist)
+        entry = entry + 16
+        vector = vector + 1
+    WEND
+    MEMORY.Write16(ADDRESS.Offset(pseudoDescriptor, 0), 4095)
+    MEMORY.Write64(ADDRESS.Offset(pseudoDescriptor, 2), ADDRESS.Value(table))
+    RETURN 1
+END FUNCTION
+
+FUNCTION ActivateDescriptorTables(gdtPseudo AS U64, idtPseudo AS U64, tssSelector AS U64, codeSelector AS U64) AS U64
+    CPU.LoadGDT(gdtPseudo)
+    CPU.ReloadCodeSegment(codeSelector)
+    CPU.LoadTaskRegister(tssSelector)
+    CPU.LoadIDT(idtPseudo)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET probe AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 1
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocate AS U64 = systemTable.BootServices.AllocatePool(2, allocationSize, bufferAddress)
+    IF allocate <> 0 THEN
+        RETURN 1
+    END IF
+    mapSize = allocationSize
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+FUNCTION PrintBanner() AS U64
+    SerialByte(13)
+    SerialByte(10)
+    SerialByte(65)
+    SerialByte(82)
+    SerialByte(67)
+    SerialByte(79)
+    SerialByte(76)
+    SerialByte(79)
+    SerialByte(71)
+    SerialByte(89)
+    SerialByte(32)
+    SerialByte(83)
+    SerialByte(69)
+    SerialByte(69)
+    SerialByte(68)
+    SerialByte(13)
+    SerialByte(10)
+    SerialByte(13)
+    SerialByte(10)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(65)
+    SerialByte(68)
+    SerialByte(89)
+    SerialByte(46)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION PrintHelpText() AS U64
+    SerialByte(73)
+    SerialByte(77)
+    SerialByte(77)
+    SerialByte(69)
+    SerialByte(68)
+    SerialByte(73)
+    SerialByte(65)
+    SerialByte(84)
+    SerialByte(69)
+    SerialByte(32)
+    SerialByte(77)
+    SerialByte(79)
+    SerialByte(68)
+    SerialByte(69)
+    SerialByte(32)
+    SerialByte(67)
+    SerialByte(79)
+    SerialByte(77)
+    SerialByte(77)
+    SerialByte(65)
+    SerialByte(78)
+    SerialByte(68)
+    SerialByte(83)
+    SerialByte(58)
+    SerialByte(32)
+    SerialByte(72)
+    SerialByte(69)
+    SerialByte(76)
+    SerialByte(80)
+    SerialByte(32)
+    SerialByte(32)
+    SerialByte(79)
+    SerialByte(84)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION PrintOtText() AS U64
+    SerialByte(84)
+    SerialByte(72)
+    SerialByte(69)
+    SerialByte(32)
+    SerialByte(87)
+    SerialByte(65)
+    SerialByte(71)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(32)
+    SerialByte(72)
+    SerialByte(65)
+    SerialByte(83)
+    SerialByte(32)
+    SerialByte(66)
+    SerialByte(82)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(69)
+    SerialByte(78)
+    SerialByte(32)
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(87)
+    SerialByte(78)
+    SerialByte(46)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION PrintHaltText() AS U64
+    SerialByte(65)
+    SerialByte(82)
+    SerialByte(67)
+    SerialByte(79)
+    SerialByte(76)
+    SerialByte(79)
+    SerialByte(71)
+    SerialByte(89)
+    SerialByte(32)
+    SerialByte(83)
+    SerialByte(69)
+    SerialByte(69)
+    SerialByte(68)
+    SerialByte(32)
+    SerialByte(72)
+    SerialByte(65)
+    SerialByte(76)
+    SerialByte(84)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION PrintSyntaxError() AS U64
+    SerialByte(63)
+    SerialByte(83)
+    SerialByte(89)
+    SerialByte(78)
+    SerialByte(84)
+    SerialByte(65)
+    SerialByte(88)
+    SerialByte(32)
+    SerialByte(69)
+    SerialByte(82)
+    SerialByte(82)
+    SerialByte(79)
+    SerialByte(82)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION PrintReady() AS U64
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(65)
+    SerialByte(68)
+    SerialByte(89)
+    SerialByte(46)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION PrintCRLF() AS U64
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SubstrateScratchAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(46137344))   ' 0x2C00000, clear of the xHCI driver's own 0x2800000 page
+END FUNCTION
+
+FUNCTION LineBufferAddress() AS MMIOPTR
+    RETURN SubstrateScratchAddress()
+END FUNCTION
+
+FUNCTION LineBufferMaxChars() AS U32
+    RETURN 120
+END FUNCTION
+
+FUNCTION LineIsHelp(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 4 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    LET c3 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 3))
+    IF c0 = 72 OR c0 = 104 THEN
+        IF c1 = 69 OR c1 = 101 THEN
+            IF c2 = 76 OR c2 = 108 THEN
+                IF c3 = 80 OR c3 = 112 THEN
+                    RETURN 1
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION LineIsOt(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 2 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    IF c0 = 79 OR c0 = 111 THEN
+        IF c1 = 84 OR c1 = 116 THEN
+            RETURN 1
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+' TEST-ONLY -- not part of RFC-0007's own real command set (matches arcology-seed-ready.abas's own
+' precedent: a real Arcology Seed keeps running forever, EXIT exists purely for automated QEMU
+' testing to terminate deterministically instead of running to a fixed timeout every time).
+FUNCTION LineIsExit(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 4 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    LET c3 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 3))
+    IF c0 = 69 OR c0 = 101 THEN
+        IF c1 = 88 OR c1 = 120 THEN
+            IF c2 = 73 OR c2 = 105 THEN
+                IF c3 = 84 OR c3 = 116 THEN
+                    RETURN 1
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+' The real combined-input poll: checks the Phase 1 PS/2 path first, then the Phase 3 USB HID path
+' (only if a real USB keyboard was actually enumerated -- usbSlotId <> 0), returning the first real
+' translated character either produces, or 0 if neither has one ready. Non-blocking, matching both
+' underlying drivers' own PollScancode/PollReport contracts -- callers poll this in their own loop.
+FUNCTION PollAnyKey(usbSlotId AS U32) AS U16
+    LET scancode AS U32 = PS2Keyboard.PollScancode()
+    IF scancode <> 0 THEN
+        LET translated AS U16 = PS2Keyboard.ScancodeToChar(scancode)
+        IF translated <> 0 THEN
+            RETURN translated
+        END IF
+    END IF
+
+    IF usbSlotId <> 0 THEN
+        LET reportBuffer AS MMIOPTR = XhciScratchDmaMmio()
+        LET gotReport AS BOOL = UsbHidKeyboard.PollReport(usbSlotId, reportBuffer)
+        IF gotReport = 1 THEN
+            LET keycode AS U32 = MmioReadField32(reportBuffer, 2, 0, 8)
+            LET charCode AS U32 = UsbHidKeyboard.KeycodeToChar(keycode)
+            IF charCode <> 0 THEN
+                LET charAsU16 AS U16 = charCode
+                RETURN charAsU16
+            END IF
+        END IF
+    END IF
+
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("SUBSTRATE PRE\r\n")
+
+    PS2Keyboard.Init()
+
+    ' Real USB HID keyboard enumeration -- allowed to fail closed (usbSlotId stays 0) if no USB
+    ' keyboard is attached; PS/2 alone is a real, correct configuration (RFC-0045's own explicit
+    ' "EITHER input path" requirement), not a fixture failure. All of this needs BootServices.
+    ' AllocatePages and must happen before ExitBootServices.
+    LET usbSlotId AS U32 = 0
+    LET pciFound AS BOOL = UsbXhci.DiscoverPci(systemTable)
+    IF pciFound = 1 THEN
+        UsbXhci.MapMmio(systemTable)
+        LET maxPorts AS U32 = UsbXhci.MaxPorts()
+        LET resetOk AS BOOL = UsbXhci.Reset(systemTable)
+        IF resetOk = 1 THEN
+            LET ringsOk AS BOOL = UsbXhci.SetupRings(systemTable)
+            IF ringsOk = 1 THEN
+                LET startOk AS BOOL = UsbXhci.Start()
+                IF startOk = 1 THEN
+                    LET connectedPort AS U32 = 0
+                    LET portIndex AS U32 = 1
+                    WHILE portIndex <= maxPorts
+                        LET raw AS U32 = UsbXhci.PortRaw(portIndex)
+                        IF (raw AND 1) <> 0 THEN
+                            IF connectedPort = 0 THEN
+                                connectedPort = portIndex
+                            END IF
+                        END IF
+                        portIndex = portIndex + 1
+                    WEND
+                    IF connectedPort <> 0 THEN
+                        LET portResetOk AS BOOL = UsbXhci.ResetPort(connectedPort)
+                        IF portResetOk = 1 THEN
+                            usbSlotId = UsbHidKeyboard.Init(systemTable, connectedPort)
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+    END IF
+    IF usbSlotId <> 0 THEN
+        systemTable.ConsoleOut.Write("SUBSTRATE USB READY\r\n")
+    ELSE
+        systemTable.ConsoleOut.Write("SUBSTRATE USB NONE\r\n")
+    END IF
+
+    ' 4 pages for the identity-map root/PDPT0/PD0/PDPT1 (aps-gdt-reload.abas's own 3-page layout
+    ' plus one more -- see the real finding right below), 2 pages for the IDT, 1 page for the
+    ' GDT + TSS + GDT pseudo-descriptor.
+    '
+    ' A REAL finding this fixture surfaced (not present in aps-gdt-reload.abas, which never touches
+    ' any real device MMIO after its own CR3 switch): aps-gdt-reload.abas's own page tables only
+    ' identity-map the low 1GB (PML4 entry 0 -> one PDPT -> 512 2MB pages). That is NOT enough here
+    ' -- the xHCI controller's own real MMIO BAR (read dynamically via PCI config space, not fixed)
+    ' sits far outside the low 1GB, and UsbHidKeyboard.PollReport's own post-substrate polling loop
+    ' needs to keep reading/writing it. Under firmware's OWN page tables (still active up to the
+    ' CR3 switch below) this was never an issue -- UEFI's own identity map already covers all real
+    ' physical memory, MMIO BARs included. Fixed with one additional 1GB page mapping, added to
+    ' this SAME already-allocated PDPT-capable page count: a second PDPT (PML4 entry 1) with one
+    ' populated entry covering whichever real 1GB-aligned region the driver's own discovered MMIO
+    ' base actually falls in -- computed here from the real value, not assumed/hardcoded.
+    LET root AS U64 = 0
+    LET rootAddress AS PTR = ADDRESS.Local(root)
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 4, rootAddress)
+    IF pageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("SUBSTRATE ALLOC FAIL\r\n")
+        CPU.HaltForever
+    END IF
+    LET idtRoot AS U64 = 0
+    LET idtRootAddress AS PTR = ADDRESS.Local(idtRoot)
+    LET idtPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 2, idtRootAddress)
+    IF idtPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("SUBSTRATE IDT ALLOC FAIL\r\n")
+        CPU.HaltForever
+    END IF
+    LET gdtRoot AS U64 = 0
+    LET gdtRootAddress AS PTR = ADDRESS.Local(gdtRoot)
+    LET gdtPageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 1, gdtRootAddress)
+    IF gdtPageStatus <> 0 THEN
+        systemTable.ConsoleOut.Write("SUBSTRATE GDT ALLOC FAIL\r\n")
+        CPU.HaltForever
+    END IF
+
+    LET pdpt AS U64 = root + 4096
+    LET pageDirectory AS U64 = root + 8192
+    LET pdpt1 AS U64 = root + 12288
+    LET clearIndex AS U64 = 0
+    WHILE clearIndex < 2048
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(root + (clearIndex * 8)), 0)
+        clearIndex = clearIndex + 1
+    WEND
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(root), pdpt OR 3)
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt), pageDirectory OR 3)
+    LET directoryIndex AS U64 = 0
+    WHILE directoryIndex < 512
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(pageDirectory + (directoryIndex * 8)), (directoryIndex * 2097152) OR 131)
+        directoryIndex = directoryIndex + 1
+    WEND
+
+    ' Real, dynamically-computed 1GB mapping for the xHCI controller's own real MMIO BAR -- see
+    ' this function's own header comment above for the full finding. oneGb's own exact value
+    ' (1073741824) and plain integer division/multiplication (this dialect's own `\` is real
+    ' integer division, confirmed project-wide) are enough to compute both which PML4 entry the
+    ' BAR's address falls under and the 1GB-aligned physical frame to map, with no AND/NOT bit
+    ' tricks needed.
+    LET mmioBasePhys AS U64 = MEMORY.Read64(XhciMmioBasePhysAddress())
+    ' Real, honest guard: mmioBasePhys stays 0 whenever no xHCI controller was ever successfully
+    ' discovered/mapped (e.g. this exact machine has no PCI xHCI device at all, or no USB keyboard
+    ' was attached to one) -- usbSlotId already stays 0 for the SAME reason above, and the combined
+    ' poll loop already never touches the USB path in that case. Skip this whole mapping too;
+    ' without this guard, a real bug was found and fixed here: mmioBasePhys=0 makes every index
+    ' below compute to 0, which the pml4Index=0 branch below would then use to silently OVERWRITE
+    ' pdpt[0] (the low-1GB map's own real entry, pageDirectory OR 3) with a bogus zero-based 1GB
+    ' page -- corrupting the identity map this fixture's own PS/2-only real negative control run
+    ' (no xHCI controller present) caught immediately (SUBSTRATE PDPT BAD).
+    IF mmioBasePhys <> 0 THEN
+        LET oneGb AS U64 = 1073741824
+        LET entriesPerPml4Slot AS U64 = 512
+        LET gbIndexOverall AS U64 = mmioBasePhys \ oneGb
+        LET pml4Index AS U64 = gbIndexOverall \ entriesPerPml4Slot
+        LET pdptEntryIndex AS U64 = gbIndexOverall - (pml4Index * entriesPerPml4Slot)
+        LET gbAlignedBase AS U64 = gbIndexOverall * oneGb
+        LET pdptEntryOffset AS U64 = pdptEntryIndex * 8
+        ' PS bit (bit7, value 128) makes this a leaf 1GB page directly at the PDPT level -- no
+        ' further page-directory table needed, matching the same real 2MB-page (PS-bit) idiom
+        ' already used above for the low-1GB identity map, just one level higher. Real edge case
+        ' guarded: if the BAR happens to fall under PML4 entry 0 (the same 512GB window the
+        ' low-1GB map already uses), reuse that SAME already-mapped PDPT instead of also wiring
+        ' pdpt1 into root[0] -- writing pdpt1 there a second time would silently replace (not add
+        ' to) the existing low-1GB mapping.
+        IF pml4Index = 0 THEN
+            MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt + pdptEntryOffset), gbAlignedBase OR 131)
+        ELSE
+            LET pml4SlotOffset AS U64 = pml4Index * 8
+            MEMORY.PhysicalWrite64(ADDRESS.Physical(root + pml4SlotOffset), pdpt1 OR 3)
+            MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt1 + pdptEntryOffset), gbAlignedBase OR 131)
+        END IF
+    END IF
+
+    LET rootCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(root))
+    LET pdptCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(pdpt))
+    IF rootCheck <> (pdpt OR 3) THEN
+        systemTable.ConsoleOut.Write("SUBSTRATE ROOT BAD\r\n")
+        CPU.HaltForever
+    END IF
+    IF pdptCheck <> (pageDirectory OR 3) THEN
+        systemTable.ConsoleOut.Write("SUBSTRATE PDPT BAD\r\n")
+        CPU.HaltForever
+    END IF
+    systemTable.ConsoleOut.Write("SUBSTRATE TABLE OK\r\n")
+
+    CPU.DisableInterrupts
+    LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
+    IF exitStatus <> 0 THEN
+        CPU.HaltForever
+    END IF
+
+    ' Past this point, ConsoleOut is never touched again -- it hangs post-ExitBootServices (RFC-
+    ' 0045 Section 4's own real finding). All further output goes through the real serial port.
+    CPU.DisableInterrupts
+    CPU.WriteCR3(root)
+    LET activeRoot AS U64 = CPU.ReadCR3()
+    IF activeRoot <> root THEN
+        CPU.HaltForever
+    END IF
+
+    SerialInit()
+
+    LET gdtTable AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(gdtRoot))
+    LET tssTable AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(gdtRoot + 256))
+    LET gdtPseudo AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(gdtRoot + 512))
+    LET tssBase AS U64 = ADDRESS.Value(tssTable)
+    BuildTSS(tssTable, 0, 0)
+    BuildMinimalGDT(gdtTable, gdtPseudo, tssBase)
+
+    LET idtTable AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(idtRoot))
+    LET idtPseudo AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(idtRoot + 4096))
+    BuildMinimalIDT(idtTable, idtPseudo, 8)
+
+    ActivateDescriptorTables(ADDRESS.Value(gdtPseudo), ADDRESS.Value(idtPseudo), 24, 8)
+    CPU.ReloadStackSegment(16)
+
+    LET liveCS AS U64 = CPU.ReadCS()
+    IF liveCS <> 8 THEN
+        CPU.HaltForever
+    END IF
+
+    SerialByte(83)
+    SerialByte(85)
+    SerialByte(66)
+    SerialByte(83)
+    SerialByte(84)
+    SerialByte(82)
+    SerialByte(65)
+    SerialByte(84)
+    SerialByte(69)
+    SerialByte(32)
+    SerialByte(76)
+    SerialByte(73)
+    SerialByte(86)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+
+    ' The genuine RFC-0007 interactive loop: HELP / OT / ?SYNTAX ERROR / backspace, running under
+    ' APS's own CR3/GDT/IDT, fed by BOTH real input paths via PollAnyKey -- this is the real proof
+    ' RFC-0045 Phase 4 exists for. Never CPU.HaltForever's on its own; only the TEST-ONLY EXIT
+    ' command (see LineIsExit's own header comment) ends it, for automated QEMU testing.
+    PrintBanner()
+
+    LET lineBuf AS MMIOPTR = LineBufferAddress()
+    LET lineLen AS U32 = 0
+    LET maxChars AS U32 = LineBufferMaxChars()
+    LET running AS BOOL = 1
+
+    WHILE running = 1
+        LET ch AS U16 = PollAnyKey(usbSlotId)
+        IF ch <> 0 THEN
+            IF ch = 13 THEN
+                PrintCRLF()
+                IF lineLen = 0 THEN
+                    PrintReady()
+                ELSE
+                    IF LineIsHelp(lineBuf, lineLen) = 1 THEN
+                        PrintHelpText()
+                    ELSE
+                        IF LineIsOt(lineBuf, lineLen) = 1 THEN
+                            PrintOtText()
+                        ELSE
+                            IF LineIsExit(lineBuf, lineLen) = 1 THEN
+                                PrintHaltText()
+                                running = 0
+                            ELSE
+                                PrintSyntaxError()
+                            END IF
+                        END IF
+                    END IF
+                    IF running = 1 THEN
+                        PrintReady()
+                    END IF
+                END IF
+                lineLen = 0
+            ELSE
+                IF ch = 8 THEN
+                    IF lineLen > 0 THEN
+                        lineLen = lineLen - 1
+                        SerialByte(8)
+                        SerialByte(32)
+                        SerialByte(8)
+                    END IF
+                ELSE
+                    IF ch >= 32 THEN
+                        IF ch < 127 THEN
+                            IF lineLen < maxChars THEN
+                                LET chByte AS U8 = ch
+                                MEMORY.Write8(ADDRESS.Offset(lineBuf, lineLen), chByte)
+                                lineLen = lineLen + 1
+                                SerialByte(chByte)
+                            END IF
+                        END IF
+                    END IF
+                END IF
+            END IF
+        ELSE
+            CPU.Pause
+        END IF
+    WEND
+
+    CPU.HaltForever
+    RETURN 0
+END FUNCTION
