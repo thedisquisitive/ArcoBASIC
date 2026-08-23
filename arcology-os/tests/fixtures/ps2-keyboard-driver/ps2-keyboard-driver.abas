@@ -1,0 +1,418 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+
+' RFC-0045 Phase 1: real PS/2 keyboard driver proof. Reads one real injected keystroke via raw
+' port I/O BEFORE ExitBootServices (fast iteration, ConsoleOut still usable for a dual-report), then
+' calls the SAME proven AcquireMapAndExit sequence aps-gdt-reload.abas already established, then
+' reads a SECOND real injected keystroke via the SAME driver AFTER ExitBootServices -- proving this
+' driver has no dependency on any Boot-Services-backed protocol at all, closing the real gap
+' RFC-0045 Section 4 found (ConsoleIn.ReadKeyStroke crashes post-exit; this driver never calls it).
+'
+' Frozen copy of stdlib/ps2_keyboard_policy.abas is inlined below, matching this project's
+' established no-include-system fixture convention.
+
+' Real PS/2 Keyboard Driver (RFC-0045 Phase 1), raw port I/O only -- no UEFI protocol dependency,
+' safe to call both before AND after ExitBootServices. Built to close a real, empirically-confirmed
+' gap: RFC-0045 Section 4 found systemTable.ConsoleIn.ReadKeyStroke crashes (not merely hangs)
+' after ExitBootServices, so the Polymorphic Substrate has no keyboard input path of its own
+' without a driver that does not depend on any Boot-Services-backed protocol.
+
+
+' --- Documented deviations, stated up front, same spirit as every other provider in this project. ---
+'
+' 1. Scan Code Set: this driver assumes Scan Code Set 1 (the i8042 controller's own standard
+'    legacy-translation output, confirmed empirically against real QEMU/OVMF -- port 0x60 emitted
+'    0x1E (make) then 0x9E (make+0x80, break) for a real injected 'a' keystroke, exactly Set 1's
+'    own known encoding, not assumed from general PC hardware knowledge alone (RFC-0045 Section
+'    7.1's own mandate). Real hardware could, in principle, differ -- this is exactly the kind of
+'    finding a real hardware validation package (WP, RFC-0045 Phase 5) exists to surface.
+'
+' 2. Character coverage: US QWERTY, unshifted only (RFC-0045 Non-Goal 4/the same scope this
+'    project's own existing QEMU keystroke-injection convention already uses). Shift/Ctrl/Alt
+'    modifier tracking is real future work, not attempted here -- ScancodeToChar returns 0 (no
+'    mapping) for modifier keys and anything this table does not define, matching this project's
+'    own fail-closed-per-value precedent (e.g. UefiBlockDevice.Discover's own per-device fail
+'    closed, not partial success).
+'
+' 3. Break codes (key release, make code + 0x80 in Set 1) are read and discarded, not translated --
+'    PollScancode returns the raw byte including the break-code high bit so a caller COULD
+'    distinguish make/break if it needed to, but ScancodeToChar only defines mappings for real make
+'    codes (bit 7 clear); a caller that feeds a break code into ScancodeToChar gets 0 back, the same
+'    "no mapping" result an actually-unmapped make code would produce -- deliberately unified,
+'    since RFC-0007's own line-editing model only needs key-press events, not release events.
+
+FUNCTION Ps2DataPort() AS IOPORT
+    RETURN PORT.Address(96)    ' 0x60
+END FUNCTION
+
+FUNCTION Ps2StatusPort() AS IOPORT
+    RETURN PORT.Address(100)   ' 0x64
+END FUNCTION
+
+FUNCTION Ps2CommandPort() AS IOPORT
+    RETURN PORT.Address(100)   ' 0x64 (same port; a write here is a controller command, not data)
+END FUNCTION
+
+' Real, minimal, standard i8042 init: disable the second PS/2 port (in case a mouse is present --
+' this driver only wants the keyboard's own byte stream, undisturbed by an interleaved mouse one),
+' flush any stale pending byte, then explicitly (re-)enable the first PS/2 port. Does not depend on
+' any UEFI protocol -- safe before or after ExitBootServices.
+FUNCTION PS2Keyboard.Init() AS BOOL
+    LET cmd AS IOPORT = Ps2CommandPort()
+    LET status AS IOPORT = Ps2StatusPort()
+    LET data AS IOPORT = Ps2DataPort()
+
+    PORT.WriteByte(cmd, 167)   ' 0xA7, disable second PS/2 port
+
+    LET flushAttempts AS U64 = 0
+    WHILE flushAttempts < 1000
+        LET flushStatus AS U8 = PORT.ReadByte(status)
+        IF (flushStatus AND 1) <> 0 THEN
+            PORT.ReadByte(data)
+        END IF
+        flushAttempts = flushAttempts + 1
+    WEND
+
+    PORT.WriteByte(cmd, 174)   ' 0xAE, enable first PS/2 port
+    RETURN 1
+END FUNCTION
+
+' Returns 0 if no scancode byte is currently pending, otherwise the real raw byte read from the
+' data port (including the Set 1 break-code high bit, 0x80, if this is a key-release byte) --
+' callers that only care about key presses should check ScancodeToChar's own 0-for-no-mapping
+' result rather than inspecting the high bit themselves, matching this driver's own established
+' "make and break unify to the same no-op result for anything not a real make code" contract.
+FUNCTION PS2Keyboard.PollScancode() AS U32
+    LET status AS IOPORT = Ps2StatusPort()
+    LET data AS IOPORT = Ps2DataPort()
+    LET statusValue AS U8 = PORT.ReadByte(status)
+    IF (statusValue AND 1) = 0 THEN
+        RETURN 0
+    END IF
+    LET scancode AS U8 = PORT.ReadByte(data)
+    LET scancodeAsU32 AS U32 = scancode
+    RETURN scancodeAsU32
+END FUNCTION
+
+' Scan Code Set 1 make-code -> ASCII translation, US QWERTY, unshifted. Returns 0 for anything with
+' no defined mapping (modifier keys, function keys, break codes, extended-sequence prefix byte
+' 0xE0, etc.) -- a real, deliberate fail-closed result, not a guess.
+FUNCTION PS2Keyboard.ScancodeToChar(scancode AS U32) AS U16
+    IF scancode >= 128 THEN
+        RETURN 0
+    END IF
+
+    IF scancode = 28 THEN
+        RETURN 13
+    END IF
+    IF scancode = 14 THEN
+        RETURN 8
+    END IF
+    IF scancode = 57 THEN
+        RETURN 32
+    END IF
+
+    IF scancode = 2 THEN
+        RETURN 49
+    END IF
+    IF scancode = 3 THEN
+        RETURN 50
+    END IF
+    IF scancode = 4 THEN
+        RETURN 51
+    END IF
+    IF scancode = 5 THEN
+        RETURN 52
+    END IF
+    IF scancode = 6 THEN
+        RETURN 53
+    END IF
+    IF scancode = 7 THEN
+        RETURN 54
+    END IF
+    IF scancode = 8 THEN
+        RETURN 55
+    END IF
+    IF scancode = 9 THEN
+        RETURN 56
+    END IF
+    IF scancode = 10 THEN
+        RETURN 57
+    END IF
+    IF scancode = 11 THEN
+        RETURN 48
+    END IF
+    IF scancode = 12 THEN
+        RETURN 45
+    END IF
+    IF scancode = 13 THEN
+        RETURN 61
+    END IF
+
+    IF scancode = 16 THEN
+        RETURN 113
+    END IF
+    IF scancode = 17 THEN
+        RETURN 119
+    END IF
+    IF scancode = 18 THEN
+        RETURN 101
+    END IF
+    IF scancode = 19 THEN
+        RETURN 114
+    END IF
+    IF scancode = 20 THEN
+        RETURN 116
+    END IF
+    IF scancode = 21 THEN
+        RETURN 121
+    END IF
+    IF scancode = 22 THEN
+        RETURN 117
+    END IF
+    IF scancode = 23 THEN
+        RETURN 105
+    END IF
+    IF scancode = 24 THEN
+        RETURN 111
+    END IF
+    IF scancode = 25 THEN
+        RETURN 112
+    END IF
+    IF scancode = 26 THEN
+        RETURN 91
+    END IF
+    IF scancode = 27 THEN
+        RETURN 93
+    END IF
+    IF scancode = 43 THEN
+        RETURN 92
+    END IF
+
+    IF scancode = 30 THEN
+        RETURN 97
+    END IF
+    IF scancode = 31 THEN
+        RETURN 115
+    END IF
+    IF scancode = 32 THEN
+        RETURN 100
+    END IF
+    IF scancode = 33 THEN
+        RETURN 102
+    END IF
+    IF scancode = 34 THEN
+        RETURN 103
+    END IF
+    IF scancode = 35 THEN
+        RETURN 104
+    END IF
+    IF scancode = 36 THEN
+        RETURN 106
+    END IF
+    IF scancode = 37 THEN
+        RETURN 107
+    END IF
+    IF scancode = 38 THEN
+        RETURN 108
+    END IF
+    IF scancode = 39 THEN
+        RETURN 59
+    END IF
+    IF scancode = 40 THEN
+        RETURN 39
+    END IF
+    IF scancode = 41 THEN
+        RETURN 96
+    END IF
+
+    IF scancode = 44 THEN
+        RETURN 122
+    END IF
+    IF scancode = 45 THEN
+        RETURN 120
+    END IF
+    IF scancode = 46 THEN
+        RETURN 99
+    END IF
+    IF scancode = 47 THEN
+        RETURN 118
+    END IF
+    IF scancode = 48 THEN
+        RETURN 98
+    END IF
+    IF scancode = 49 THEN
+        RETURN 110
+    END IF
+    IF scancode = 50 THEN
+        RETURN 109
+    END IF
+    IF scancode = 51 THEN
+        RETURN 44
+    END IF
+    IF scancode = 52 THEN
+        RETURN 46
+    END IF
+    IF scancode = 53 THEN
+        RETURN 47
+    END IF
+
+    RETURN 0
+END FUNCTION
+
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    LET statusPort AS IOPORT = PORT.Offset(port, 5)
+    LET attempts AS U32 = 0
+    WHILE (PORT.ReadByte(statusPort) AND 32) = 0
+        CPU.Pause
+        attempts = attempts + 1
+        IF attempts >= 10000 THEN
+            RETURN 1
+        END IF
+    WEND
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialInit() AS U64
+    LET base AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 128)
+    PORT.WriteByte(base, 1)
+    PORT.WriteByte(PORT.Offset(base, 1), 0)
+    PORT.WriteByte(PORT.Offset(base, 3), 3)
+    PORT.WriteByte(PORT.Offset(base, 2), 199)
+    PORT.WriteByte(PORT.Offset(base, 4), 11)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    LET mapSize AS U64 = 0
+    LET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)
+    LET probe AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)
+    IF mapSize = 0 THEN
+        RETURN 1
+    END IF
+    LET allocationSize AS U64 = mapSize + 65536
+    LET buffer AS U64 = 0
+    LET bufferAddress AS PTR = ADDRESS.Local(buffer)
+    LET allocate AS U64 = systemTable.BootServices.AllocatePool(2, allocationSize, bufferAddress)
+    IF allocate <> 0 THEN
+        RETURN 1
+    END IF
+    mapSize = allocationSize
+    LET mapKey AS U64 = 0
+    LET mapKeyAddress AS PTR = ADDRESS.Local(mapKey)
+    LET descriptorSize AS U64 = 0
+    LET descriptorSizeAddress AS PTR = ADDRESS.Local(descriptorSize)
+    LET descriptorVersion AS U32 = 0
+    LET descriptorVersionAddress AS PTR = ADDRESS.Local(descriptorVersion)
+    LET status AS U64 = systemTable.BootServices.GetMemoryMap(mapSizeAddress, buffer, mapKeyAddress, descriptorSizeAddress, descriptorVersionAddress)
+    IF status <> 0 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    IF descriptorSize < 48 THEN
+        systemTable.BootServices.FreePool(buffer)
+        RETURN 1
+    END IF
+    RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
+END FUNCTION
+
+' Polls the real PS/2 driver for one real make-code keystroke, up to a generous attempt ceiling.
+' Returns the translated character, or 0 if the ceiling was reached with no key seen.
+FUNCTION WaitForOneChar() AS U16
+    LET attempts AS U64 = 0
+    WHILE attempts < 20000000
+        LET scancode AS U32 = PS2Keyboard.PollScancode()
+        IF scancode <> 0 THEN
+            LET translated AS U16 = PS2Keyboard.ScancodeToChar(scancode)
+            IF translated <> 0 THEN
+                RETURN translated
+            END IF
+        END IF
+        attempts = attempts + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("PS2DRIVER PRE\r\n")
+    SerialInit()
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+
+    PS2Keyboard.Init()
+
+    ' Real keystroke #1, read BEFORE ExitBootServices -- ConsoleOut still safe to use here.
+    LET char1 AS U16 = WaitForOneChar()
+    IF char1 = 0 THEN
+        systemTable.ConsoleOut.Write("PS2DRIVER PRE-EXIT NO KEY\r\n")
+        SerialByte(80)
+        SerialByte(78)
+        SerialByte(75)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+    LET char1Byte AS U8 = char1
+    systemTable.ConsoleOut.Write("PS2DRIVER PRE-EXIT GOT KEY\r\n")
+    SerialByte(80)
+    SerialByte(49)
+    SerialByte(61)
+    SerialByte(char1Byte)
+    SerialByte(13)
+    SerialByte(10)
+
+    CPU.DisableInterrupts
+    LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
+    IF exitStatus <> 0 THEN
+        SerialByte(69)
+        SerialByte(88)
+        SerialByte(70)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+    SerialByte(69)
+    SerialByte(88)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(13)
+    SerialByte(10)
+
+    ' Real keystroke #2, read AFTER ExitBootServices -- via the SAME driver, no ConsoleOut/ConsoleIn
+    ' involved at all. This is the real proof RFC-0045 Phase 1 requires.
+    LET char2 AS U16 = WaitForOneChar()
+    IF char2 = 0 THEN
+        SerialByte(80)
+        SerialByte(50)
+        SerialByte(78)
+        SerialByte(75)
+        SerialByte(13)
+        SerialByte(10)
+        CPU.HaltForever
+    END IF
+    LET char2Byte AS U8 = char2
+    SerialByte(80)
+    SerialByte(50)
+    SerialByte(61)
+    SerialByte(char2Byte)
+    SerialByte(13)
+    SerialByte(10)
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+    CPU.HaltForever
+END FUNCTION
