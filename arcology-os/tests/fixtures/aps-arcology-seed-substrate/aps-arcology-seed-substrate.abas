@@ -1930,166 +1930,475 @@ FUNCTION AcquireMapAndExit(imageHandle AS UEFI.Handle, systemTable AS UEFI.Syste
     RETURN systemTable.BootServices.ExitBootServices(imageHandle, mapKey)
 END FUNCTION
 
+' Real 8x8 bitmap font (ASCII 32-126, 95 glyphs), rendered offline from a real monospace
+' TrueType font (FreeMonoBold) and embedded here as 95 packed U64 constants (one write per
+' glyph, byte[row]=8-bit row pattern, bit7=leftmost pixel) -- RFC-0045 Phase 5's own real
+' need: a genuinely on-screen READY. terminal, since the substrate's own post-ExitBootServices
+' output (serial only, see aps-gdt-reload.abas/ps2-keyboard-driver.abas) isn't observable on
+' real hardware without a serial capture setup most laptops don't expose.
+FUNCTION FontTableAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(50331648))   ' 0x3000000, clear of every other fixed scratch region this fixture uses
+END FUNCTION
+
+FUNCTION WriteFontData() AS U64
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 0), 0)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 8), 137441058848)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 16), 2631720)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 24), 22597421480573992)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 32), 4565206779848720)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 40), 26562098909264)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 48), 136736459989048)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 56), 1052688)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 64), 2260664895672336)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 72), 18084905231589408)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 80), 2625660)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 88), 17662986948608)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 96), 4629735601308958720)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 104), 4227858432)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 112), 35184372088832)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 120), 18084905230536712)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 128), 53087008475184)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 136), 61641640136752)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 144), 132079103264816)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 152), 123179797317752)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 160), 26905024663552)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 168), 123179803623536)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 176), 53087011102776)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 184), 35253361576056)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 192), 53087006902328)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 200), 123249325787184)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 208), 35184372097024)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 216), 18049582881579008)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 224), 408956936)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 232), 1082348273664)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 240), 412722675712)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 248), 35184373680240)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 256), 4055562367517870128)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 264), 224886505633904)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 272), 272990005119216)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 280), 137166231487612)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 288), 264193241008368)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 296), 272989470869752)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 304), 246566563633400)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 312), 136908768330876)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 320), 224610825554124)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 328), 61641640120376)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 336), 264467040962588)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 344), 259829690028280)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 352), 136494666752112)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 360), 167574205143192)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 368), 220281765914828)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 376), 132819791957112)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 384), 246567366314224)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 392), 35035716904078456)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 400), 259864585062640)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 408), 123180071012408)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 416), 123283288925436)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 424), 53087008475340)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 432), 52984466131148)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 440), 97136464667864)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 448), 237838647972056)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 456), 123283285493964)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 464), 132251170920568)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 472), 6773060616065048)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 480), 2260664896725056)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 488), 27056920114241632)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 496), 4730912)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 504), 18158513697557839872)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 512), 32)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 520), 277663059556352)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 528), 132234598447168)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 536), 66263833917440)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 544), 136925852235784)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 552), 132220438736896)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 560), 132079373285432)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 568), 4037609593739181056)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 576), 224610822420544)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 584), 132010384306192)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 592), 4037485896525166608)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 600), 97102238603328)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 608), 132010384298032)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 616), 181027043866624)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 624), 237804961984512)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 632), 132544914552832)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 640), 16159047697603819520)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 648), 2019996960677198848)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 656), 132079374334976)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 664), 132183933089792)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 672), 132251710976064)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 680), 136649892190208)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 688), 35666755901440)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 696), 79682254457856)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 704), 237838651152384)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 712), 16149961522557799424)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 720), 132354518579200)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 728), 3467807035962171440)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 736), 4521260802379792)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 744), 3463285774488703024)
+    MEMORY.Write64(ADDRESS.Offset(FontTableAddress(), 752), 408944640)
+    RETURN 0
+END FUNCTION
+
+
+FUNCTION FontGlyphRowByte(code AS U32, row AS U32) AS U32
+    IF code < 32 THEN
+        RETURN 0
+    END IF
+    IF code > 126 THEN
+        RETURN 0
+    END IF
+    LET glyphIndex AS U32 = code - 32
+    LET glyphOffset AS U32 = glyphIndex * 8
+    LET rowByte AS U32 = MEMORY.Read8(ADDRESS.Offset(FontTableAddress(), glyphOffset + row))
+    RETURN rowByte
+END FUNCTION
+
+FUNCTION TermStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(51380224))   ' 0x3100000
+END FUNCTION
+FUNCTION TermFramebufferPhysAddress() AS MMIOPTR
+    RETURN TermStateAddress()
+END FUNCTION
+FUNCTION TermStrideAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(TermStateAddress(), 8)
+END FUNCTION
+FUNCTION TermWidthPxAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(TermStateAddress(), 12)
+END FUNCTION
+FUNCTION TermHeightPxAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(TermStateAddress(), 16)
+END FUNCTION
+FUNCTION TermColsAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(TermStateAddress(), 20)
+END FUNCTION
+FUNCTION TermRowsAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(TermStateAddress(), 24)
+END FUNCTION
+FUNCTION TermCursorColAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(TermStateAddress(), 28)
+END FUNCTION
+FUNCTION TermCursorRowAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(TermStateAddress(), 32)
+END FUNCTION
+FUNCTION TermReadyAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(TermStateAddress(), 36)
+END FUNCTION
+
+' The one real, fixed choice this whole terminal renderer makes: an 8x8 glyph cell drawn at 2x
+' scale (16x16 real screen pixels per character) -- legible on a real laptop panel without the
+' extra complexity of a runtime-configurable scale.
+FUNCTION TermCellPx() AS U32
+    RETURN 16
+END FUNCTION
+FUNCTION TermGlyphScale() AS U32
+    RETURN 2
+END FUNCTION
+FUNCTION TermFgColor() AS U32
+    RETURN 16777215   ' white on every real 32bpp GOP pixel format this project has ever seen (equal
+                       ' RGB components render the same regardless of channel order)
+END FUNCTION
+FUNCTION TermBgColor() AS U32
+    RETURN 0           ' black
+END FUNCTION
+
+' Draws one real glyph, scaled, at a given PIXEL (not cell) origin -- always draws the full cell
+' background too (not just the "on" pixels), so this doubles as this terminal's own real per-cell
+' erase primitive (used directly by TermPutChar's own backspace handling).
+FUNCTION DrawChar(framebuffer AS MMIOPTR, stride AS U32, pxX AS U32, pxY AS U32, code AS U32) AS U64
+    LET scale AS U32 = TermGlyphScale()
+    LET fg AS U32 = TermFgColor()
+    LET bg AS U32 = TermBgColor()
+    LET row AS U32 = 0
+    WHILE row < 8
+        LET rowByte AS U32 = FontGlyphRowByte(code, row)
+        LET col AS U32 = 0
+        WHILE col < 8
+            LET bitIndex AS U32 = 7 - col
+            LET mask AS U32 = 1 SHL bitIndex
+            LET on AS U32 = rowByte AND mask
+            LET color AS U32 = bg
+            IF on <> 0 THEN
+                color = fg
+            END IF
+            LET dy AS U32 = 0
+            WHILE dy < scale
+                LET dx AS U32 = 0
+                WHILE dx < scale
+                    LET px AS U32 = pxX + (col * scale) + dx
+                    LET py AS U32 = pxY + (row * scale) + dy
+                    LET pixelOffset AS U32 = (py * stride + px) * 4
+                    LET pixel AS MMIOPTR = ADDRESS.Offset(framebuffer, pixelOffset)
+                    MEMORY.Write32(pixel, color)
+                    dx = dx + 1
+                WEND
+                dy = dy + 1
+            WEND
+            col = col + 1
+        WEND
+        row = row + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION TermFramebufferMmio() AS MMIOPTR
+    LET phys AS U64 = MEMORY.Read64(TermFramebufferPhysAddress())
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(phys))
+END FUNCTION
+
+FUNCTION TermClear() AS U64
+    LET ready AS U32 = MEMORY.Read32(TermReadyAddress())
+    IF ready = 0 THEN
+        RETURN 0
+    END IF
+    LET framebuffer AS MMIOPTR = TermFramebufferMmio()
+    LET stride AS U32 = MEMORY.Read32(TermStrideAddress())
+    LET widthPx AS U32 = MEMORY.Read32(TermWidthPxAddress())
+    LET heightPx AS U32 = MEMORY.Read32(TermHeightPxAddress())
+    LET bg AS U32 = TermBgColor()
+    LET y AS U32 = 0
+    WHILE y < heightPx
+        LET x AS U32 = 0
+        WHILE x < widthPx
+            LET pixelOffset AS U32 = (y * stride + x) * 4
+            LET pixel AS MMIOPTR = ADDRESS.Offset(framebuffer, pixelOffset)
+            MEMORY.Write32(pixel, bg)
+            x = x + 1
+        WEND
+        y = y + 1
+    WEND
+    MEMORY.Write32(TermCursorColAddress(), 0)
+    MEMORY.Write32(TermCursorRowAddress(), 0)
+    RETURN 0
+END FUNCTION
+
+' The real on-screen terminal's own character sink -- called for EVERY byte this fixture ever
+' echoes to serial, so the real interactive session is genuinely visible on a real laptop screen,
+' not just over a wire nothing in this project can currently read back from real hardware. A
+' real, deliberately simple terminal: newline advances a row and wraps to the top (clearing) once
+' past the bottom; backspace moves back one cell and redraws it as blank; anything else outside
+' the real embedded font's own 32-126 range is silently dropped (fail-closed, matching this
+' project's own established discipline for undefined input).
+FUNCTION TermPutChar(code AS U32) AS U64
+    LET ready AS U32 = MEMORY.Read32(TermReadyAddress())
+    IF ready = 0 THEN
+        RETURN 0
+    END IF
+    IF code = 13 THEN
+        RETURN 0
+    END IF
+    LET cellPx AS U32 = TermCellPx()
+    LET cols AS U32 = MEMORY.Read32(TermColsAddress())
+    LET rows AS U32 = MEMORY.Read32(TermRowsAddress())
+    LET col AS U32 = MEMORY.Read32(TermCursorColAddress())
+    LET row AS U32 = MEMORY.Read32(TermCursorRowAddress())
+
+    IF code = 10 THEN
+        col = 0
+        row = row + 1
+    ELSE
+        IF code = 8 THEN
+            IF col > 0 THEN
+                col = col - 1
+            END IF
+            LET framebuffer AS MMIOPTR = TermFramebufferMmio()
+            LET stride AS U32 = MEMORY.Read32(TermStrideAddress())
+            DrawChar(framebuffer, stride, col * cellPx, row * cellPx, 32)
+        ELSE
+            IF code >= 32 THEN
+                IF code <= 126 THEN
+                    LET framebuffer AS MMIOPTR = TermFramebufferMmio()
+                    LET stride AS U32 = MEMORY.Read32(TermStrideAddress())
+                    DrawChar(framebuffer, stride, col * cellPx, row * cellPx, code)
+                    col = col + 1
+                    IF col >= cols THEN
+                        col = 0
+                        row = row + 1
+                    END IF
+                END IF
+            END IF
+        END IF
+    END IF
+
+    IF row >= rows THEN
+        TermClear()
+        RETURN 0
+    END IF
+
+    MEMORY.Write32(TermCursorColAddress(), col)
+    MEMORY.Write32(TermCursorRowAddress(), row)
+    RETURN 0
+END FUNCTION
+
+' The real combined sink this fixture uses everywhere it used to call SerialByte directly --
+' writes to BOTH the real serial port (this project's own established, QEMU-testable output
+' channel) and the real on-screen terminal above, so the exact same interactive session is
+' observable both ways, from the same call sites, with no special-casing at each site.
+FUNCTION EchoChar(code AS U8) AS U64
+    SerialByte(code)
+    TermPutChar(code)
+    RETURN 0
+END FUNCTION
+
 FUNCTION PrintBanner() AS U64
-    SerialByte(13)
-    SerialByte(10)
-    SerialByte(65)
-    SerialByte(82)
-    SerialByte(67)
-    SerialByte(79)
-    SerialByte(76)
-    SerialByte(79)
-    SerialByte(71)
-    SerialByte(89)
-    SerialByte(32)
-    SerialByte(83)
-    SerialByte(69)
-    SerialByte(69)
-    SerialByte(68)
-    SerialByte(13)
-    SerialByte(10)
-    SerialByte(13)
-    SerialByte(10)
-    SerialByte(82)
-    SerialByte(69)
-    SerialByte(65)
-    SerialByte(68)
-    SerialByte(89)
-    SerialByte(46)
-    SerialByte(13)
-    SerialByte(10)
+    EchoChar(13)
+    EchoChar(10)
+    EchoChar(65)
+    EchoChar(82)
+    EchoChar(67)
+    EchoChar(79)
+    EchoChar(76)
+    EchoChar(79)
+    EchoChar(71)
+    EchoChar(89)
+    EchoChar(32)
+    EchoChar(83)
+    EchoChar(69)
+    EchoChar(69)
+    EchoChar(68)
+    EchoChar(13)
+    EchoChar(10)
+    EchoChar(13)
+    EchoChar(10)
+    EchoChar(82)
+    EchoChar(69)
+    EchoChar(65)
+    EchoChar(68)
+    EchoChar(89)
+    EchoChar(46)
+    EchoChar(13)
+    EchoChar(10)
     RETURN 0
 END FUNCTION
 
 FUNCTION PrintHelpText() AS U64
-    SerialByte(73)
-    SerialByte(77)
-    SerialByte(77)
-    SerialByte(69)
-    SerialByte(68)
-    SerialByte(73)
-    SerialByte(65)
-    SerialByte(84)
-    SerialByte(69)
-    SerialByte(32)
-    SerialByte(77)
-    SerialByte(79)
-    SerialByte(68)
-    SerialByte(69)
-    SerialByte(32)
-    SerialByte(67)
-    SerialByte(79)
-    SerialByte(77)
-    SerialByte(77)
-    SerialByte(65)
-    SerialByte(78)
-    SerialByte(68)
-    SerialByte(83)
-    SerialByte(58)
-    SerialByte(32)
-    SerialByte(72)
-    SerialByte(69)
-    SerialByte(76)
-    SerialByte(80)
-    SerialByte(32)
-    SerialByte(32)
-    SerialByte(79)
-    SerialByte(84)
-    SerialByte(13)
-    SerialByte(10)
+    EchoChar(73)
+    EchoChar(77)
+    EchoChar(77)
+    EchoChar(69)
+    EchoChar(68)
+    EchoChar(73)
+    EchoChar(65)
+    EchoChar(84)
+    EchoChar(69)
+    EchoChar(32)
+    EchoChar(77)
+    EchoChar(79)
+    EchoChar(68)
+    EchoChar(69)
+    EchoChar(32)
+    EchoChar(67)
+    EchoChar(79)
+    EchoChar(77)
+    EchoChar(77)
+    EchoChar(65)
+    EchoChar(78)
+    EchoChar(68)
+    EchoChar(83)
+    EchoChar(58)
+    EchoChar(32)
+    EchoChar(72)
+    EchoChar(69)
+    EchoChar(76)
+    EchoChar(80)
+    EchoChar(32)
+    EchoChar(32)
+    EchoChar(79)
+    EchoChar(84)
+    EchoChar(13)
+    EchoChar(10)
     RETURN 0
 END FUNCTION
 
 FUNCTION PrintOtText() AS U64
-    SerialByte(84)
-    SerialByte(72)
-    SerialByte(69)
-    SerialByte(32)
-    SerialByte(87)
-    SerialByte(65)
-    SerialByte(71)
-    SerialByte(79)
-    SerialByte(78)
-    SerialByte(32)
-    SerialByte(72)
-    SerialByte(65)
-    SerialByte(83)
-    SerialByte(32)
-    SerialByte(66)
-    SerialByte(82)
-    SerialByte(79)
-    SerialByte(75)
-    SerialByte(69)
-    SerialByte(78)
-    SerialByte(32)
-    SerialByte(68)
-    SerialByte(79)
-    SerialByte(87)
-    SerialByte(78)
-    SerialByte(46)
-    SerialByte(13)
-    SerialByte(10)
+    EchoChar(84)
+    EchoChar(72)
+    EchoChar(69)
+    EchoChar(32)
+    EchoChar(87)
+    EchoChar(65)
+    EchoChar(71)
+    EchoChar(79)
+    EchoChar(78)
+    EchoChar(32)
+    EchoChar(72)
+    EchoChar(65)
+    EchoChar(83)
+    EchoChar(32)
+    EchoChar(66)
+    EchoChar(82)
+    EchoChar(79)
+    EchoChar(75)
+    EchoChar(69)
+    EchoChar(78)
+    EchoChar(32)
+    EchoChar(68)
+    EchoChar(79)
+    EchoChar(87)
+    EchoChar(78)
+    EchoChar(46)
+    EchoChar(13)
+    EchoChar(10)
     RETURN 0
 END FUNCTION
 
 FUNCTION PrintHaltText() AS U64
-    SerialByte(65)
-    SerialByte(82)
-    SerialByte(67)
-    SerialByte(79)
-    SerialByte(76)
-    SerialByte(79)
-    SerialByte(71)
-    SerialByte(89)
-    SerialByte(32)
-    SerialByte(83)
-    SerialByte(69)
-    SerialByte(69)
-    SerialByte(68)
-    SerialByte(32)
-    SerialByte(72)
-    SerialByte(65)
-    SerialByte(76)
-    SerialByte(84)
-    SerialByte(13)
-    SerialByte(10)
+    EchoChar(65)
+    EchoChar(82)
+    EchoChar(67)
+    EchoChar(79)
+    EchoChar(76)
+    EchoChar(79)
+    EchoChar(71)
+    EchoChar(89)
+    EchoChar(32)
+    EchoChar(83)
+    EchoChar(69)
+    EchoChar(69)
+    EchoChar(68)
+    EchoChar(32)
+    EchoChar(72)
+    EchoChar(65)
+    EchoChar(76)
+    EchoChar(84)
+    EchoChar(13)
+    EchoChar(10)
     RETURN 0
 END FUNCTION
 
 FUNCTION PrintSyntaxError() AS U64
-    SerialByte(63)
-    SerialByte(83)
-    SerialByte(89)
-    SerialByte(78)
-    SerialByte(84)
-    SerialByte(65)
-    SerialByte(88)
-    SerialByte(32)
-    SerialByte(69)
-    SerialByte(82)
-    SerialByte(82)
-    SerialByte(79)
-    SerialByte(82)
-    SerialByte(13)
-    SerialByte(10)
+    EchoChar(63)
+    EchoChar(83)
+    EchoChar(89)
+    EchoChar(78)
+    EchoChar(84)
+    EchoChar(65)
+    EchoChar(88)
+    EchoChar(32)
+    EchoChar(69)
+    EchoChar(82)
+    EchoChar(82)
+    EchoChar(79)
+    EchoChar(82)
+    EchoChar(13)
+    EchoChar(10)
     RETURN 0
 END FUNCTION
 
 FUNCTION PrintReady() AS U64
-    SerialByte(82)
-    SerialByte(69)
-    SerialByte(65)
-    SerialByte(68)
-    SerialByte(89)
-    SerialByte(46)
-    SerialByte(13)
-    SerialByte(10)
+    EchoChar(82)
+    EchoChar(69)
+    EchoChar(65)
+    EchoChar(68)
+    EchoChar(89)
+    EchoChar(46)
+    EchoChar(13)
+    EchoChar(10)
     RETURN 0
 END FUNCTION
 
 FUNCTION PrintCRLF() AS U64
-    SerialByte(13)
-    SerialByte(10)
+    EchoChar(13)
+    EchoChar(10)
     RETURN 0
 END FUNCTION
 
@@ -2191,9 +2500,58 @@ FUNCTION PollAnyKey(usbSlotId AS U32) AS U16
     RETURN 0
 END FUNCTION
 
+' Real, dynamically-computed 1GB identity-map extension -- reusable for ANY real physical MMIO/
+' framebuffer region this fixture needs to keep reading/writing after its own CR3 switch, given
+' just that region's own real base address (never hardcoded, always read back from whichever real
+' driver/protocol discovered it) and one spare, already-allocated page to use as a second PDPT if a
+' genuinely new PML4 slot is needed. See this fixture's own header comment (added when the xHCI
+' MMIO BAR was the first real region found needing this) for the full finding.
+'
+' Real, honest fail-open: if physAddr is 0 (the region was never actually discovered/mapped, e.g.
+' no xHCI controller present at all), this is a deliberate no-op -- an earlier version of this
+' logic, before this guard existed, silently corrupted the existing low-1GB mapping in exactly
+' that case, caught immediately by a real PS/2-only negative-control run (SUBSTRATE PDPT BAD).
+FUNCTION MapExtra1GbRegion(root AS U64, lowPdpt AS U64, sparePdptPage AS U64, physAddr AS U64) AS U64
+    IF physAddr = 0 THEN
+        RETURN 0
+    END IF
+    LET oneGb AS U64 = 1073741824
+    LET entriesPerPml4Slot AS U64 = 512
+    LET gbIndexOverall AS U64 = physAddr \ oneGb
+    LET pml4Index AS U64 = gbIndexOverall \ entriesPerPml4Slot
+    LET pdptEntryIndex AS U64 = gbIndexOverall - (pml4Index * entriesPerPml4Slot)
+    LET gbAlignedBase AS U64 = gbIndexOverall * oneGb
+    LET pdptEntryOffset AS U64 = pdptEntryIndex * 8
+
+    IF pml4Index = 0 THEN
+        ' Same 512GB window the low-1GB map's own PDPT already covers -- reuse it directly rather
+        ' than also wiring a spare PDPT into root[0], which would silently replace (not add to)
+        ' the existing low-1GB mapping.
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(lowPdpt + pdptEntryOffset), gbAlignedBase OR 131)
+        RETURN 0
+    END IF
+
+    LET pml4SlotOffset AS U64 = pml4Index * 8
+    LET existingEntry AS U64 = MEMORY.Read64(ADDRESS.Virtual(root + pml4SlotOffset))
+    IF existingEntry <> 0 THEN
+        ' This PML4 slot was already wired up by an earlier real region (e.g. both the xHCI BAR
+        ' and the GOP framebuffer happening to share the same 512GB window) -- reuse that SAME
+        ' already-mapped PDPT instead of the caller's own spare page, so the earlier region's own
+        ' mapping isn't orphaned.
+        LET existingPdpt AS U64 = (existingEntry \ 4096) * 4096
+        MEMORY.PhysicalWrite64(ADDRESS.Physical(existingPdpt + pdptEntryOffset), gbAlignedBase OR 131)
+        RETURN 0
+    END IF
+
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(root + pml4SlotOffset), sparePdptPage OR 3)
+    MEMORY.PhysicalWrite64(ADDRESS.Physical(sparePdptPage + pdptEntryOffset), gbAlignedBase OR 131)
+    RETURN sparePdptPage
+END FUNCTION
+
 FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
     systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
     systemTable.ConsoleOut.Write("SUBSTRATE PRE\r\n")
+    MEMORY.Write32(TermReadyAddress(), 0)
 
     PS2Keyboard.Init()
 
@@ -2239,24 +2597,41 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         systemTable.ConsoleOut.Write("SUBSTRATE USB NONE\r\n")
     END IF
 
-    ' 4 pages for the identity-map root/PDPT0/PD0/PDPT1 (aps-gdt-reload.abas's own 3-page layout
-    ' plus one more -- see the real finding right below), 2 pages for the IDT, 1 page for the
-    ' GDT + TSS + GDT pseudo-descriptor.
-    '
-    ' A REAL finding this fixture surfaced (not present in aps-gdt-reload.abas, which never touches
-    ' any real device MMIO after its own CR3 switch): aps-gdt-reload.abas's own page tables only
-    ' identity-map the low 1GB (PML4 entry 0 -> one PDPT -> 512 2MB pages). That is NOT enough here
-    ' -- the xHCI controller's own real MMIO BAR (read dynamically via PCI config space, not fixed)
-    ' sits far outside the low 1GB, and UsbHidKeyboard.PollReport's own post-substrate polling loop
-    ' needs to keep reading/writing it. Under firmware's OWN page tables (still active up to the
-    ' CR3 switch below) this was never an issue -- UEFI's own identity map already covers all real
-    ' physical memory, MMIO BARs included. Fixed with one additional 1GB page mapping, added to
-    ' this SAME already-allocated PDPT-capable page count: a second PDPT (PML4 entry 1) with one
-    ' populated entry covering whichever real 1GB-aligned region the driver's own discovered MMIO
-    ' base actually falls in -- computed here from the real value, not assumed/hardcoded.
+    ' Real GOP discovery -- pre-exit, needs BootServices. Allowed to fail closed too (gopOk stays
+    ' 0): a real on-screen terminal is this fixture's own real goal, but a serial-only session
+    ' (this project's own prior, already-proven fallback) remains genuinely correct if no GOP
+    ' device is ever found, matching this fixture's own established fail-open discipline.
+    LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
+    LET gopOk AS BOOL = 0
+    IF gop <> 0 THEN
+        LET framebuffer AS PHYSICALPTR = UEFI.GOP.FrameBufferBase(gop)
+        LET widthPx AS U32 = UEFI.GOP.Width(gop)
+        LET heightPx AS U32 = UEFI.GOP.Height(gop)
+        LET stride AS U32 = UEFI.GOP.PixelsPerScanLine(gop)
+        LET fbBaseAsU64 AS U64 = ADDRESS.Value(framebuffer)
+        MEMORY.Write64(TermFramebufferPhysAddress(), fbBaseAsU64)
+        MEMORY.Write32(TermStrideAddress(), stride)
+        MEMORY.Write32(TermWidthPxAddress(), widthPx)
+        MEMORY.Write32(TermHeightPxAddress(), heightPx)
+        LET cellPx AS U32 = TermCellPx()
+        LET termCols AS U32 = widthPx \ cellPx
+        LET termRows AS U32 = heightPx \ cellPx
+        MEMORY.Write32(TermColsAddress(), termCols)
+        MEMORY.Write32(TermRowsAddress(), termRows)
+        WriteFontData()
+        gopOk = 1
+        systemTable.ConsoleOut.Write("SUBSTRATE GOP READY\r\n")
+    ELSE
+        systemTable.ConsoleOut.Write("SUBSTRATE GOP NONE\r\n")
+    END IF
+
+    ' 5 pages: root/PDPT0/PD0 (the same low-1GB identity map aps-gdt-reload.abas established) plus
+    ' two spare PDPT pages for MapExtra1GbRegion -- one for the xHCI controller's own real MMIO
+    ' BAR, one for the GOP framebuffer's own real base, whichever real PML4 slots they each land
+    ' in (see MapExtra1GbRegion's own header comment for the full finding this closes).
     LET root AS U64 = 0
     LET rootAddress AS PTR = ADDRESS.Local(root)
-    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 4, rootAddress)
+    LET pageStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 5, rootAddress)
     IF pageStatus <> 0 THEN
         systemTable.ConsoleOut.Write("SUBSTRATE ALLOC FAIL\r\n")
         CPU.HaltForever
@@ -2278,9 +2653,10 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
 
     LET pdpt AS U64 = root + 4096
     LET pageDirectory AS U64 = root + 8192
-    LET pdpt1 AS U64 = root + 12288
+    LET pdptExtraA AS U64 = root + 12288
+    LET pdptExtraB AS U64 = root + 16384
     LET clearIndex AS U64 = 0
-    WHILE clearIndex < 2048
+    WHILE clearIndex < 2560
         MEMORY.PhysicalWrite64(ADDRESS.Physical(root + (clearIndex * 8)), 0)
         clearIndex = clearIndex + 1
     WEND
@@ -2292,45 +2668,14 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         directoryIndex = directoryIndex + 1
     WEND
 
-    ' Real, dynamically-computed 1GB mapping for the xHCI controller's own real MMIO BAR -- see
-    ' this function's own header comment above for the full finding. oneGb's own exact value
-    ' (1073741824) and plain integer division/multiplication (this dialect's own `\` is real
-    ' integer division, confirmed project-wide) are enough to compute both which PML4 entry the
-    ' BAR's address falls under and the 1GB-aligned physical frame to map, with no AND/NOT bit
-    ' tricks needed.
     LET mmioBasePhys AS U64 = MEMORY.Read64(XhciMmioBasePhysAddress())
-    ' Real, honest guard: mmioBasePhys stays 0 whenever no xHCI controller was ever successfully
-    ' discovered/mapped (e.g. this exact machine has no PCI xHCI device at all, or no USB keyboard
-    ' was attached to one) -- usbSlotId already stays 0 for the SAME reason above, and the combined
-    ' poll loop already never touches the USB path in that case. Skip this whole mapping too;
-    ' without this guard, a real bug was found and fixed here: mmioBasePhys=0 makes every index
-    ' below compute to 0, which the pml4Index=0 branch below would then use to silently OVERWRITE
-    ' pdpt[0] (the low-1GB map's own real entry, pageDirectory OR 3) with a bogus zero-based 1GB
-    ' page -- corrupting the identity map this fixture's own PS/2-only real negative control run
-    ' (no xHCI controller present) caught immediately (SUBSTRATE PDPT BAD).
-    IF mmioBasePhys <> 0 THEN
-        LET oneGb AS U64 = 1073741824
-        LET entriesPerPml4Slot AS U64 = 512
-        LET gbIndexOverall AS U64 = mmioBasePhys \ oneGb
-        LET pml4Index AS U64 = gbIndexOverall \ entriesPerPml4Slot
-        LET pdptEntryIndex AS U64 = gbIndexOverall - (pml4Index * entriesPerPml4Slot)
-        LET gbAlignedBase AS U64 = gbIndexOverall * oneGb
-        LET pdptEntryOffset AS U64 = pdptEntryIndex * 8
-        ' PS bit (bit7, value 128) makes this a leaf 1GB page directly at the PDPT level -- no
-        ' further page-directory table needed, matching the same real 2MB-page (PS-bit) idiom
-        ' already used above for the low-1GB identity map, just one level higher. Real edge case
-        ' guarded: if the BAR happens to fall under PML4 entry 0 (the same 512GB window the
-        ' low-1GB map already uses), reuse that SAME already-mapped PDPT instead of also wiring
-        ' pdpt1 into root[0] -- writing pdpt1 there a second time would silently replace (not add
-        ' to) the existing low-1GB mapping.
-        IF pml4Index = 0 THEN
-            MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt + pdptEntryOffset), gbAlignedBase OR 131)
-        ELSE
-            LET pml4SlotOffset AS U64 = pml4Index * 8
-            MEMORY.PhysicalWrite64(ADDRESS.Physical(root + pml4SlotOffset), pdpt1 OR 3)
-            MEMORY.PhysicalWrite64(ADDRESS.Physical(pdpt1 + pdptEntryOffset), gbAlignedBase OR 131)
-        END IF
+    MapExtra1GbRegion(root, pdpt, pdptExtraA, mmioBasePhys)
+
+    LET fbBasePhysForMap AS U64 = 0
+    IF gopOk = 1 THEN
+        fbBasePhysForMap = MEMORY.Read64(TermFramebufferPhysAddress())
     END IF
+    MapExtra1GbRegion(root, pdpt, pdptExtraB, fbBasePhysForMap)
 
     LET rootCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(root))
     LET pdptCheck AS U64 = MEMORY.Read64(ADDRESS.Virtual(pdpt))
@@ -2351,7 +2696,8 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     END IF
 
     ' Past this point, ConsoleOut is never touched again -- it hangs post-ExitBootServices (RFC-
-    ' 0045 Section 4's own real finding). All further output goes through the real serial port.
+    ' 0045 Section 4's own real finding). All further output goes through EchoChar (real serial +
+    ' the real on-screen terminal below, once it's brought up).
     CPU.DisableInterrupts
     CPU.WriteCR3(root)
     LET activeRoot AS U64 = CPU.ReadCR3()
@@ -2380,6 +2726,13 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         CPU.HaltForever
     END IF
 
+    ' Only NOW is the framebuffer's own identity mapping guaranteed active under the NEW CR3 --
+    ' bring the real on-screen terminal up for the first time here, not before.
+    IF gopOk = 1 THEN
+        MEMORY.Write32(TermReadyAddress(), 1)
+        TermClear()
+    END IF
+
     SerialByte(83)
     SerialByte(85)
     SerialByte(66)
@@ -2398,8 +2751,9 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     SerialByte(10)
 
     ' The genuine RFC-0007 interactive loop: HELP / OT / ?SYNTAX ERROR / backspace, running under
-    ' APS's own CR3/GDT/IDT, fed by BOTH real input paths via PollAnyKey -- this is the real proof
-    ' RFC-0045 Phase 4 exists for. Never CPU.HaltForever's on its own; only the TEST-ONLY EXIT
+    ' APS's own CR3/GDT/IDT, fed by BOTH real input paths via PollAnyKey, and now genuinely
+    ' visible on a real screen (not just over a wire) -- this is the real proof RFC-0045 Phase 4
+    ' AND Phase 5 both exist for. Never CPU.HaltForever's on its own; only the TEST-ONLY EXIT
     ' command (see LineIsExit's own header comment) ends it, for automated QEMU testing.
     PrintBanner()
 
@@ -2439,9 +2793,9 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
                 IF ch = 8 THEN
                     IF lineLen > 0 THEN
                         lineLen = lineLen - 1
-                        SerialByte(8)
-                        SerialByte(32)
-                        SerialByte(8)
+                        EchoChar(8)
+                        EchoChar(32)
+                        EchoChar(8)
                     END IF
                 ELSE
                     IF ch >= 32 THEN
@@ -2450,7 +2804,7 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
                                 LET chByte AS U8 = ch
                                 MEMORY.Write8(ADDRESS.Offset(lineBuf, lineLen), chByte)
                                 lineLen = lineLen + 1
-                                SerialByte(chByte)
+                                EchoChar(chByte)
                             END IF
                         END IF
                     END IF

@@ -6,20 +6,24 @@ TMP_ROOT="${TMPDIR:-/tmp}/aps-arcology-seed-substrate-smoke-$$"
 mkdir -p "$TMP_ROOT"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
-# RFC-0045 Phase 4: substrate unification. A single fixture, running under APS's own CR3/GDT/IDT
-# (reusing aps-gdt-reload.abas's own proven sequence) after a real ExitBootServices, genuinely
-# running RFC-0007's own HELP/OT/?SYNTAX ERROR/backspace command loop -- fed by BOTH real input
-# paths this RFC built (Phase 1 PS/2, Phase 3 USB HID), polled together, whichever produces a real
-# character first. Output moves to the real serial port (the only real, proven post-exit output
-# channel in this project's history); this is a real serial terminal session, not a graphical one.
+# RFC-0045 Phase 4/5: substrate unification + a real on-screen terminal. A single fixture, running
+# under APS's own CR3/GDT/IDT (reusing aps-gdt-reload.abas's own proven sequence) after a real
+# ExitBootServices, genuinely running RFC-0007's own HELP/OT/?SYNTAX ERROR/backspace command loop --
+# fed by BOTH real input paths this RFC built (Phase 1 PS/2, Phase 3 USB HID), polled together,
+# whichever produces a real character first. Output goes to BOTH the real serial port (this
+# project's own established, QEMU-testable channel) AND a real GOP-framebuffer text terminal (an
+# embedded 8x8 bitmap font, rasterized offline from a real monospace TrueType font) -- the second
+# one exists specifically because real hardware doesn't expose the serial channel without extra
+# equipment most laptops don't have; this makes the READY. session genuinely visible on a real
+# screen too.
 #
-# A real finding surfaced by this fixture's own development, not present in aps-gdt-reload.abas
+# Two real findings surfaced by this fixture's own development, not present in aps-gdt-reload.abas
 # (which never touches device MMIO after its own CR3 switch): the minimal identity-mapped page
-# tables that fixture established only cover the low 1GB -- not enough here, since the xHCI
-# controller's own real MMIO BAR sits far outside that range and UsbHidKeyboard.PollReport's own
-# post-substrate polling loop needs to keep reading/writing it. Fixed with one additional,
-# dynamically-computed 1GB page mapping covering whichever real 1GB-aligned region the driver's
-# own discovered MMIO base actually falls in.
+# tables that fixture established only cover the low 1GB -- not enough here, since BOTH the xHCI
+# controller's own real MMIO BAR and the GOP framebuffer's own real base sit far outside that
+# range, and both need to stay reachable post-substrate. Fixed with a reusable, dynamically-
+# computed 1GB page mapping (MapExtra1GbRegion) applied to each real region's own discovered base
+# address, never hardcoded.
 
 FIXTURE="$SOURCE_DIR/arcology-os/tests/fixtures/aps-arcology-seed-substrate/aps-arcology-seed-substrate.abas"
 "$ARCOFISSION" reveal "$FIXTURE" at X86_64 --entry Main > "$TMP_ROOT/x86.txt" 2>&1
@@ -86,6 +90,14 @@ run_once() {
                 -monitor unix:"$TMP_ROOT/mon.sock",server,nowait \
                 > "$outfile" 2>&1 &
             ;;
+        gop)
+            timeout 40 "$QEMU_BIN" -bios "$OVMF_FD" -m 512 \
+                -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -vga std \
+                -drive file="fat:rw:$boot_dir",format=raw \
+                -net none -display none -serial stdio -no-reboot \
+                -monitor unix:"$TMP_ROOT/mon.sock",server,nowait \
+                > "$outfile" 2>&1 &
+            ;;
     esac
     local qemu_pid=$!
     if [ "$mode" != "none" ]; then
@@ -97,6 +109,10 @@ run_once() {
         sleep 1
         inject_keys "$TMP_ROOT/mon.sock" "$@"
         sleep 1
+        if [ -n "${SCREENSHOT_PATH:-}" ]; then
+            printf 'screendump %s\n' "$SCREENSHOT_PATH" | socat - UNIX-CONNECT:"$TMP_ROOT/mon.sock" > /dev/null 2>&1 || true
+            sleep 1
+        fi
     else
         sleep 15
     fi
@@ -137,4 +153,15 @@ if grep -aqi "BAD\|FAIL" "$TMP_ROOT/negative.txt"; then
     exit 1
 fi
 
-echo "PASS: RFC-0045 Phase 4 substrate unification -- real ExitBootServices + APS's own CR3/GDT/IDT takeover + RFC-0007's genuine HELP/OT/?SYNTAX ERROR/backspace command loop, fed by BOTH the PS/2 and USB HID input paths together, and confirmed working via EITHER path alone; negative control confirmed real"
+# Real proof the on-screen terminal actually rendered something -- not just that the fixture
+# reported "GOP READY" without ever touching the framebuffer. A real qemu-xhci+usb-kbd device plus
+# a real GOP-capable display (-vga std), a real injected HELP, a real QEMU screendump (a genuine
+# P6 PPM capture of the actual framebuffer, not a synthetic one), and a dependency-free pixel
+# count confirming real text is lit in the top-left region where "ARCOLOGY SEED"/"READY." are
+# always drawn first.
+SCREENSHOT_PATH="$TMP_ROOT/screen.ppm" run_once "$TMP_ROOT/gop.txt" gop h e l p ret
+grep -aqF "SUBSTRATE GOP READY" "$TMP_ROOT/gop.txt" || { echo "FAIL: GOP was not discovered" >&2; cat "$TMP_ROOT/gop.txt" >&2; exit 1; }
+[ -s "$TMP_ROOT/screen.ppm" ] || { echo "FAIL: no screendump was captured" >&2; exit 1; }
+python3 "$SOURCE_DIR/arcology-os/scripts/run/check_ppm_text_region.py" "$TMP_ROOT/screen.ppm" 0 0 300 100 0.02 || { echo "FAIL: the on-screen terminal's own text region has no real rendered pixels" >&2; exit 1; }
+
+echo "PASS: RFC-0045 Phase 4/5 substrate unification -- real ExitBootServices + APS's own CR3/GDT/IDT takeover + RFC-0007's genuine HELP/OT/?SYNTAX ERROR/backspace command loop, fed by BOTH the PS/2 and USB HID input paths together and confirmed working via EITHER path alone, output to BOTH real serial AND a real GOP-framebuffer on-screen terminal (confirmed via a real screendump pixel check); negative control confirmed real"
