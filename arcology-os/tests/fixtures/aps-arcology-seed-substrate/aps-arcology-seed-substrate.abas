@@ -2548,17 +2548,43 @@ FUNCTION MapExtra1GbRegion(root AS U64, lowPdpt AS U64, sparePdptPage AS U64, ph
     RETURN sparePdptPage
 END FUNCTION
 
-FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
-    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
-    systemTable.ConsoleOut.Write("SUBSTRATE PRE\r\n")
-    MEMORY.Write32(TermReadyAddress(), 0)
+' TEMPORARY real-hardware diagnostic (RFC-0045 Phase 5): a real physical run froze visibly at
+' "SUBSTRATE TABLE OK", the last ConsoleOut marker before ExitBootServices -- everything after that
+' point (ExitBootServices itself, the CR3 switch, GDT/IDT/CS reload, the new framebuffer identity
+' mapping) is genuinely untested on real silicon, since aps-gdt-reload.abas's own proof of this
+' exact sequence was QEMU-only. With no real serial capture available on this hardware, the ONLY
+' observable channel left is the screen itself -- this draws one small, distinctly-colored raw
+' pixel block per real risk point, each in its own fixed screen position, so whichever block is
+' the LAST one drawn before a real freeze tells us exactly how far execution actually got. Bypasses
+' the font/terminal system entirely (direct MEMORY.Write32 only) so it can't itself be broken by
+' whatever this is diagnosing.
+FUNCTION DrawDiagBlock(index AS U32, color AS U32) AS U64
+    LET phys AS U64 = MEMORY.Read64(TermFramebufferPhysAddress())
+    LET stride AS U32 = MEMORY.Read32(TermStrideAddress())
+    LET mmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(phys))
+    LET blockX AS U32 = index * 60
+    LET blockY AS U32 = 300   ' well below where the terminal's own text ever reaches, so PrintBanner/TermClear never overwrite these
+    LET dy AS U32 = 0
+    WHILE dy < 50
+        LET dx AS U32 = 0
+        WHILE dx < 50
+            LET px AS U32 = blockX + dx
+            LET py AS U32 = blockY + dy
+            LET pixelOffset AS U32 = (py * stride + px) * 4
+            LET pixel AS MMIOPTR = ADDRESS.Offset(mmio, pixelOffset)
+            MEMORY.Write32(pixel, color)
+            dx = dx + 1
+        WEND
+        dy = dy + 1
+    WEND
+    RETURN 0
+END FUNCTION
 
-    PS2Keyboard.Init()
-
-    ' Real USB HID keyboard enumeration -- allowed to fail closed (usbSlotId stays 0) if no USB
-    ' keyboard is attached; PS/2 alone is a real, correct configuration (RFC-0045's own explicit
-    ' "EITHER input path" requirement), not a fixture failure. All of this needs BootServices.
-    ' AllocatePages and must happen before ExitBootServices.
+' Extracted out of Main (its own function, its own stack frame) purely to keep Main itself under
+' this backend's own real per-function stack-frame budget -- Main was already close to that limit
+' before this real-hardware diagnostic session even started; this real USB enumeration block alone
+' accounted for ~9 of Main's own locals.
+FUNCTION SetupUsbKeyboard(systemTable AS UEFI.SystemTable) AS U32
     LET usbSlotId AS U32 = 0
     LET pciFound AS BOOL = UsbXhci.DiscoverPci(systemTable)
     IF pciFound = 1 THEN
@@ -2591,6 +2617,21 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
             END IF
         END IF
     END IF
+    RETURN usbSlotId
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("SUBSTRATE PRE\r\n")
+    MEMORY.Write32(TermReadyAddress(), 0)
+
+    PS2Keyboard.Init()
+
+    ' Real USB HID keyboard enumeration -- allowed to fail closed (usbSlotId stays 0) if no USB
+    ' keyboard is attached; PS/2 alone is a real, correct configuration (RFC-0045's own explicit
+    ' "EITHER input path" requirement), not a fixture failure. All of this needs BootServices.
+    ' AllocatePages and must happen before ExitBootServices.
+    LET usbSlotId AS U32 = SetupUsbKeyboard(systemTable)
     IF usbSlotId <> 0 THEN
         systemTable.ConsoleOut.Write("SUBSTRATE USB READY\r\n")
     ELSE
@@ -2621,6 +2662,10 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         WriteFontData()
         gopOk = 1
         systemTable.ConsoleOut.Write("SUBSTRATE GOP READY\r\n")
+        ' Checkpoint 0 (red): GOP itself + a raw pixel write both work at all on this real
+        ' hardware, still fully firmware-hosted -- the real baseline every later checkpoint is
+        ' compared against.
+        DrawDiagBlock(0, 16711680)
     ELSE
         systemTable.ConsoleOut.Write("SUBSTRATE GOP NONE\r\n")
     END IF
@@ -2688,11 +2733,23 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         CPU.HaltForever
     END IF
     systemTable.ConsoleOut.Write("SUBSTRATE TABLE OK\r\n")
+    IF gopOk = 1 THEN
+        ' Checkpoint 1 (orange): the real page-table build above (including MapExtra1GbRegion for
+        ' both the xHCI BAR and the framebuffer) completed and this raw pixel write still works,
+        ' still under FIRMWARE's own original page tables (not our new ones yet).
+        DrawDiagBlock(1, 16737792)
+    END IF
 
     CPU.DisableInterrupts
     LET exitStatus AS U64 = AcquireMapAndExit(imageHandle, systemTable)
     IF exitStatus <> 0 THEN
         CPU.HaltForever
+    END IF
+    IF gopOk = 1 THEN
+        ' Checkpoint 2 (yellow): a real ExitBootServices call succeeded and a raw pixel write
+        ' STILL works -- confirms ExitBootServices itself isn't the freeze, and (since CR3 hasn't
+        ' been touched yet) that firmware's own page tables are still intact post-exit.
+        DrawDiagBlock(2, 16776960)
     END IF
 
     ' Past this point, ConsoleOut is never touched again -- it hangs post-ExitBootServices (RFC-
@@ -2703,6 +2760,13 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     LET activeRoot AS U64 = CPU.ReadCR3()
     IF activeRoot <> root THEN
         CPU.HaltForever
+    END IF
+    IF gopOk = 1 THEN
+        ' Checkpoint 3 (green): CR3 now points at THIS fixture's own page tables, and a raw pixel
+        ' write to the SAME framebuffer address still works -- confirms MapExtra1GbRegion's own
+        ' real 1GB mapping for the framebuffer is actually correct on this real hardware, not just
+        ' under QEMU.
+        DrawDiagBlock(3, 65280)
     END IF
 
     SerialInit()
@@ -2725,12 +2789,22 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     IF liveCS <> 8 THEN
         CPU.HaltForever
     END IF
+    IF gopOk = 1 THEN
+        ' Checkpoint 4 (cyan): the new GDT/IDT are loaded, CS/SS are reloaded against them, and
+        ' CPU.ReadCS() confirms it live -- a raw pixel write still works. Everything real risk in
+        ' this fixture's own post-exit sequence is now confirmed working; only TermClear/the font
+        ' system remain untested.
+        DrawDiagBlock(4, 65535)
+    END IF
 
     ' Only NOW is the framebuffer's own identity mapping guaranteed active under the NEW CR3 --
     ' bring the real on-screen terminal up for the first time here, not before.
     IF gopOk = 1 THEN
         MEMORY.Write32(TermReadyAddress(), 1)
         TermClear()
+        ' Checkpoint 5 (white): TermClear (a real, much larger loop touching the WHOLE
+        ' framebuffer, not just one small block) completed without freezing.
+        DrawDiagBlock(5, 16777215)
     END IF
 
     SerialByte(83)
