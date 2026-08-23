@@ -37,15 +37,18 @@ test both input paths independently) and observe the real, live response on the 
 
 ## Build Identity
 
-- Git commit: `02b2762` (Arcology Boot Screen dashboard + the earlier 512GB identity-map CR3 fix
-  from `0cd99c8`, both included in this build)
+- Git commit: `[fill in at physical test time — includes the RFC-0045 0.9 font-scale fix, not yet
+  committed as of this artifact build]`
 - Compiler/version: `ArcoFission 0.1.0`
 - Image filename: `aps-arcology-seed-substrate-x86_64.img`
 - Artifact directory: `arcology-os/dist/aps-arcology-seed-substrate/`
-- EFI SHA-256: `683095cf28fe05876c0135f02a1e8103816b47976e8c045581fa832fbb40babd`
-- Image SHA-256: `fe18c0c4f86f28bf3dedd677614a4bc4dbe96f954f649e4cc975dd4968c31816`
+- EFI SHA-256: `ae71b2b8e0469f4f44aeafb58d2828ae7e5ad2a581e3a504be4ecc9b8275cea1`
+- Image SHA-256: `cc00be4ce700ffef83e31e11bf620230b23f95cc244af112f7ab74c2b1dca2e0`
 - Full checksums: `arcology-os/dist/aps-arcology-seed-substrate/SHA256SUMS`
-- Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync` — write performed this session, verified byte-for-byte via a raw-device checksum readback (first 64MiB) immediately after. **This is the first physical write covering both the dashboard and the CR3 fix — neither has been tested on real hardware yet.**
+- Media write command/tool: `sudo dd if=aps-arcology-seed-substrate-x86_64.img of=/dev/sda bs=4M status=progress conv=fsync && sync`
+- **This checksum reflects the font-scale fix (RFC-0045 revision 0.9), on top of Round 1's own
+  confirmed-working dashboard and CR3 fix. Round 1's own write does NOT cover this artifact — media
+  must be re-written before Round 2 can validate the font fix.**
 
 **Pre-physical-test sanity check already performed (QEMU, not a substitute for the checklist
 below):** the exact built `.img` file (not a synthetic vvfat directory) was booted directly under
@@ -192,7 +195,11 @@ sha256sum BOOTX64.EFI aps-arcology-seed-substrate-x86_64.img > SHA256SUMS
   freeze recurs, it's a genuinely new finding, not a repeat of the known one.
 - The banner appears but garbled, or at the wrong screen position/scale — a real finding about
   this laptop's own actual GOP resolution/stride differing from QEMU's assumptions in a way this
-  fixture's own dynamic `Width \ TermCellPx()` sizing doesn't handle correctly.
+  fixture's own dynamic `Width \ TermCellPx()` sizing doesn't handle correctly. **This exact
+  category of finding already happened once**, though not "garbled" — the terminal's text rendered
+  correctly positioned but at a fixed, too-small pixel size ("nearly impossible to read") on this
+  real panel. Fixed by computing the glyph scale from the real detected GOP width instead of a
+  hardcoded constant (see RFC-0045 revision 0.9). Not yet re-validated on real hardware.
 - Typed characters do not echo, or echo incorrectly — check which input path is actually in use
   (built-in keyboard could be PS/2 OR USB HID on this hardware, unlike QEMU where it's always
   known); a real, novel finding either way.
@@ -203,14 +210,20 @@ sha256sum BOOTX64.EFI aps-arcology-seed-substrate-x86_64.img > SHA256SUMS
 
 ## Observation
 
-- Start time/timezone: `[required]`
-- Exact observed behavior: `[required]`
-- How long the interactive session was tested for: `[required]`
-- Which input path(s) actually worked (built-in keyboard, external USB keyboard, both, neither):
-  `[required]`
-- Unexpected behavior: `[none or details]`
-- Photograph paths: `[required]`
-- Tester name/identifier: `[required]`
+**Round 1 (commit `02b2762`, before the font-scale fix) — partial, real, physical:**
+- Exact observed behavior: reached `ARCOLOGY SEED` / `READY.`; `HELP` and `OT` both accepted and
+  produced correct responses. The boot dashboard rendered and was described as looking "nice and
+  unique," visible for roughly 4 seconds. The terminal's own text (the `READY.` prompt and command
+  output, a separate rendering path from the dashboard) was reported "nearly impossible to read" —
+  the real finding fixed in RFC-0045 revision 0.9 (font-scale fix), not yet re-validated.
+- Start time/timezone, exact session duration, backspace-editing check, external USB keyboard
+  check, and photograph paths: not yet recorded — `[still required]`.
+- Which input path(s) actually worked: not yet distinguished (built-in keyboard was used; whether
+  this laptop presents it as PS/2 or USB HID is still an open question) — `[still required]`.
+- Tester name/identifier: `[still required]`.
+
+A full Round 2 (this artifact, after the font-scale fix) is needed to complete the checklist below
+and this section's remaining required fields.
 
 ## Firmware Quirk Decision
 

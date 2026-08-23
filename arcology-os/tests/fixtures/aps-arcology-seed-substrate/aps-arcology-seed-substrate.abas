@@ -2083,15 +2083,48 @@ END FUNCTION
 FUNCTION TermReadyAddress() AS MMIOPTR
     RETURN ADDRESS.Offset(TermStateAddress(), 36)
 END FUNCTION
+FUNCTION TermScaleAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(TermStateAddress(), 40)
+END FUNCTION
 
-' The one real, fixed choice this whole terminal renderer makes: an 8x8 glyph cell drawn at 2x
-' scale (16x16 real screen pixels per character) -- legible on a real laptop panel without the
-' extra complexity of a runtime-configurable scale.
+' A REAL finding from this fixture's own first physical hardware run: a fixed 8x8-at-2x (16px)
+' glyph cell, legible on QEMU's own 1280x800 virtual display, was "nearly impossible to read" on
+' the user's real laptop panel -- a fixed pixel size doesn't track a real panel's own actual
+' resolution/density the way a virtual display's did. TermGlyphScale now reads a real value
+' computed once in SetupGopDashboard from the real detected GOP width (never hardcoded), targeting
+' roughly the same ~80-column line width regardless of the real panel's own resolution, clamped to
+' [2,6] so this never regresses below the original known-legible size nor grows absurd on a very
+' high-resolution panel. TermCellPx derives from it, not the other way around.
 FUNCTION TermCellPx() AS U32
-    RETURN 16
+    RETURN 8 * TermGlyphScale()
 END FUNCTION
 FUNCTION TermGlyphScale() AS U32
-    RETURN 2
+    RETURN MEMORY.Read32(TermScaleAddress())
+END FUNCTION
+
+' Explicit breakpoints rather than a divide-and-floor formula -- an earlier version of this fixture
+' derived scale from a target column count via integer division, and at a real common laptop width
+' (1920) it silently floored right back down to the same "illegible" scale=2 it was meant to fix
+' (1920 \ 90 \ 8 = 2, the exact same result as 1280 \ 90 \ 8). Explicit thresholds are easy to reason
+' about and verify against real GOP widths directly, with no rounding surprises. 1280 (QEMU's own
+' `-vga std` default) deliberately stays at the original known-legible scale=2, so the existing
+' pixel-region smoke test's own expectations don't shift; 1920 (this project's own real hardware,
+' and the single most common real laptop panel width) steps up to scale=3.
+FUNCTION ComputeTermScale(widthPx AS U32) AS U32
+    LET scale AS U32 = 2
+    IF widthPx >= 1600 THEN
+        scale = 3
+    END IF
+    IF widthPx >= 2200 THEN
+        scale = 4
+    END IF
+    IF widthPx >= 3000 THEN
+        scale = 5
+    END IF
+    IF widthPx >= 3800 THEN
+        scale = 6
+    END IF
+    RETURN scale
 END FUNCTION
 FUNCTION TermFgColor() AS U32
     RETURN 16777215   ' white on every real 32bpp GOP pixel format this project has ever seen (equal
@@ -2718,6 +2751,9 @@ FUNCTION SetupGopDashboard(systemTable AS UEFI.SystemTable) AS BOOL
     MEMORY.Write32(TermStrideAddress(), stride)
     MEMORY.Write32(TermWidthPxAddress(), widthPx)
     MEMORY.Write32(TermHeightPxAddress(), heightPx)
+
+    MEMORY.Write32(TermScaleAddress(), ComputeTermScale(widthPx))
+
     LET cellPx AS U32 = TermCellPx()
     LET termCols AS U32 = widthPx \ cellPx
     LET termRows AS U32 = heightPx \ cellPx
