@@ -126,6 +126,9 @@ FUNCTION PS2Keyboard.ScancodeToChar(scancode AS U32) AS U16
     IF scancode = 57 THEN
         RETURN 32
     END IF
+    IF scancode = 1 THEN
+        RETURN 27
+    END IF
 
     IF scancode = 2 THEN
         RETURN 49
@@ -1742,6 +1745,9 @@ FUNCTION UsbHidKeyboard.KeycodeToChar(keycode AS U32) AS U32
     IF keycode = 40 THEN
         RETURN 13
     END IF
+    IF keycode = 41 THEN
+        RETURN 27
+    END IF
     IF keycode = 42 THEN
         RETURN 8
     END IF
@@ -2412,6 +2418,29 @@ FUNCTION PrintHelpText() AS U64
     EchoChar(32)
     EchoChar(79)
     EchoChar(84)
+    EchoChar(32)
+    EchoChar(32)
+    EchoChar(82)
+    EchoChar(85)
+    EchoChar(78)
+    EchoChar(32)
+    EchoChar(32)
+    EchoChar(76)
+    EchoChar(73)
+    EchoChar(83)
+    EchoChar(84)
+    EchoChar(32)
+    EchoChar(32)
+    EchoChar(78)
+    EchoChar(69)
+    EchoChar(87)
+    EchoChar(32)
+    EchoChar(32)
+    EchoChar(67)
+    EchoChar(76)
+    EchoChar(69)
+    EchoChar(65)
+    EchoChar(82)
     EchoChar(13)
     EchoChar(10)
     RETURN 0
@@ -2579,6 +2608,24 @@ FUNCTION LineIsExit(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
     RETURN 0
 END FUNCTION
 
+' Real, minimal Shift tracking -- RFC-0045's own PS/2 and USB HID drivers are both explicitly
+' "unshifted only" (a named Non-Goal; full modifier tracking is real future work). Real Program
+' Mode PRINT statements need a typable string delimiter, and on a real US QWERTY layout the double
+' quote is Shift+apostrophe -- with no shift support at all, `"` could never actually be typed on
+' real hardware, which would make this whole feature real but unusable. Rather than pick a
+' different (less conventional) delimiter to dodge the gap, this closes it directly but narrowly:
+' only enough Shift state to disambiguate the apostrophe key, not a general modifier system.
+FUNCTION KeyModifierStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(57737216))   ' 0x3710000, clear of RpmStateAddress's own 0x3700000 region
+END FUNCTION
+FUNCTION ShiftHeld() AS U32
+    RETURN MEMORY.Read32(KeyModifierStateAddress())
+END FUNCTION
+FUNCTION SetShiftHeld(value AS U32) AS U64
+    MEMORY.Write32(KeyModifierStateAddress(), value)
+    RETURN 0
+END FUNCTION
+
 ' The real combined-input poll: checks the Phase 1 PS/2 path first, then the Phase 3 USB HID path
 ' (only if a real USB keyboard was actually enumerated -- usbSlotId <> 0), returning the first real
 ' translated character either produces, or 0 if neither has one ready. Non-blocking, matching both
@@ -2586,9 +2633,30 @@ END FUNCTION
 FUNCTION PollAnyKey(usbSlotId AS U32) AS U16
     LET scancode AS U32 = PS2Keyboard.PollScancode()
     IF scancode <> 0 THEN
-        LET translated AS U16 = PS2Keyboard.ScancodeToChar(scancode)
-        IF translated <> 0 THEN
-            RETURN translated
+        IF scancode = 42 THEN
+            SetShiftHeld(1)
+        ELSE
+            IF scancode = 54 THEN
+                SetShiftHeld(1)
+            ELSE
+                IF scancode = 170 THEN
+                    SetShiftHeld(0)
+                ELSE
+                    IF scancode = 182 THEN
+                        SetShiftHeld(0)
+                    ELSE
+                        LET translated AS U16 = PS2Keyboard.ScancodeToChar(scancode)
+                        IF translated = 39 THEN
+                            IF ShiftHeld() = 1 THEN
+                                translated = 34
+                            END IF
+                        END IF
+                        IF translated <> 0 THEN
+                            RETURN translated
+                        END IF
+                    END IF
+                END IF
+            END IF
         END IF
     END IF
 
@@ -2596,8 +2664,19 @@ FUNCTION PollAnyKey(usbSlotId AS U32) AS U16
         LET reportBuffer AS MMIOPTR = XhciScratchDmaMmio()
         LET gotReport AS BOOL = UsbHidKeyboard.PollReport(usbSlotId, reportBuffer)
         IF gotReport = 1 THEN
+            LET modifierByte AS U32 = MmioReadField32(reportBuffer, 0, 0, 8)
+            IF (modifierByte AND 34) <> 0 THEN
+                SetShiftHeld(1)
+            ELSE
+                SetShiftHeld(0)
+            END IF
             LET keycode AS U32 = MmioReadField32(reportBuffer, 2, 0, 8)
             LET charCode AS U32 = UsbHidKeyboard.KeycodeToChar(keycode)
+            IF charCode = 39 THEN
+                IF ShiftHeld() = 1 THEN
+                    charCode = 34
+                END IF
+            END IF
             IF charCode <> 0 THEN
                 LET charAsU16 AS U16 = charCode
                 RETURN charAsU16
@@ -2606,6 +2685,789 @@ FUNCTION PollAnyKey(usbSlotId AS U32) AS U16
     END IF
 
     RETURN 0
+END FUNCTION
+
+' ==========================================================================================
+' RFC-0007 Program Mode -- Resident Program Memory (RPM), first real increment: PRINT and GOTO
+' only (a deliberate, named scope reduction; LET/variables, IF, and FOR/NEXT are real, separate
+' follow-on increments). No dynamic allocator exists on this backend, so RPM is a fixed-size
+' sorted array in a dedicated scratch region -- the same "fixed scratch buffer, not a heap" idiom
+' this fixture already uses for its line buffer, font table, and dashboard label table.
+'
+' Record layout (80 bytes/entry, RpmMaxLines() entries, always kept sorted+compacted so entries
+' [0, count) are the whole live program with no gaps -- insert/delete do a real in-place shift
+' rather than tombstoning, keeping RUN/LIST simple straight-line scans):
+'   +0  lineNumber (U32)
+'   +4  stmtType   (U32): 1 = PRINT, 2 = GOTO
+'   +8  auxU32     (U32): GOTO's own target line number; unused (left 0) for PRINT
+'   +12 text       (68 bytes, ASCII, null-terminated): PRINT's own literal payload; unused for GOTO
+' ==========================================================================================
+
+FUNCTION RpmStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(57671680))   ' 0x3700000, clear of DashStateAddress's own 0x3500000 region
+END FUNCTION
+FUNCTION RpmCountAddress() AS MMIOPTR
+    RETURN RpmStateAddress()
+END FUNCTION
+FUNCTION RpmMaxLines() AS U32
+    RETURN 64
+END FUNCTION
+FUNCTION RpmEntryStride() AS U32
+    RETURN 80
+END FUNCTION
+FUNCTION RpmMaxTextChars() AS U32
+    RETURN 67
+END FUNCTION
+FUNCTION RpmEntriesBase() AS MMIOPTR
+    RETURN ADDRESS.Offset(RpmStateAddress(), 8)
+END FUNCTION
+FUNCTION RpmEntryAddress(index AS U32) AS MMIOPTR
+    RETURN ADDRESS.Offset(RpmEntriesBase(), index * RpmEntryStride())
+END FUNCTION
+' One staged PRINT payload (parsed but not yet committed to a sorted slot) plus its own real
+' length, since this dialect has no multi-value return -- the same "stage into fixed memory, read
+' it back" idiom MID's own shared scratch buffer already established.
+FUNCTION RpmStagingTextAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(RpmStateAddress(), 5128)   ' 8 + 64*80
+END FUNCTION
+FUNCTION RpmStagedTextLenAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(RpmStateAddress(), 5196)
+END FUNCTION
+FUNCTION RpmDecimalScratchAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(RpmStateAddress(), 5204)
+END FUNCTION
+
+FUNCTION IsDigit(ch AS U8) AS BOOL
+    IF ch >= 48 THEN
+        IF ch <= 57 THEN
+            RETURN 1
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION CountLeadingDigits(lineBuf AS MMIOPTR, lineLen AS U32, startIdx AS U32) AS U32
+    LET i AS U32 = startIdx
+    LET done AS BOOL = 0
+    WHILE done = 0
+        IF i >= lineLen THEN
+            done = 1
+        ELSE
+            LET ch AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, i))
+            IF IsDigit(ch) = 1 THEN
+                i = i + 1
+            ELSE
+                done = 1
+            END IF
+        END IF
+    WEND
+    RETURN i - startIdx
+END FUNCTION
+
+' No overflow protection -- callers are required to bound digitCount (<= 5) themselves first, the
+' same discipline RpmHandleNumberedLine and its GOTO-target parsing both follow, since a U32 line
+' number/target has no business exceeding RFC-0007 Section 6's own 65535 ceiling anyway.
+FUNCTION ParseDecimalRange(lineBuf AS MMIOPTR, startIdx AS U32, digitCount AS U32) AS U32
+    LET value AS U32 = 0
+    LET i AS U32 = 0
+    WHILE i < digitCount
+        LET ch AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, startIdx + i))
+        LET chVal AS U32 = ch
+        value = (value * 10) + (chVal - 48)
+        i = i + 1
+    WEND
+    RETURN value
+END FUNCTION
+
+FUNCTION SkipSpaces(lineBuf AS MMIOPTR, lineLen AS U32, startIdx AS U32) AS U32
+    LET i AS U32 = startIdx
+    LET done AS BOOL = 0
+    WHILE done = 0
+        IF i >= lineLen THEN
+            done = 1
+        ELSE
+            LET ch AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, i))
+            IF ch = 32 THEN
+                i = i + 1
+            ELSE
+                done = 1
+            END IF
+        END IF
+    WEND
+    RETURN i
+END FUNCTION
+
+' Returns lineLen itself (never a real index) as the "no closing quote found" sentinel -- safe and
+' unambiguous since every real index is strictly less than lineLen.
+FUNCTION FindClosingQuote(lineBuf AS MMIOPTR, lineLen AS U32, startIdx AS U32) AS U32
+    LET i AS U32 = startIdx
+    LET done AS BOOL = 0
+    WHILE done = 0
+        IF i >= lineLen THEN
+            done = 1
+        ELSE
+            LET ch AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, i))
+            IF ch = 34 THEN
+                done = 1
+            ELSE
+                i = i + 1
+            END IF
+        END IF
+    WEND
+    RETURN i
+END FUNCTION
+
+FUNCTION MatchPrintKeyword(lineBuf AS MMIOPTR, lineLen AS U32, idx AS U32) AS BOOL
+    IF idx + 5 > lineLen THEN
+        RETURN 0
+    END IF
+    LET c0 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, idx))
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, idx + 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, idx + 2))
+    LET c3 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, idx + 3))
+    LET c4 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, idx + 4))
+    IF c0 = 80 OR c0 = 112 THEN
+        IF c1 = 82 OR c1 = 114 THEN
+            IF c2 = 73 OR c2 = 105 THEN
+                IF c3 = 78 OR c3 = 110 THEN
+                    IF c4 = 84 OR c4 = 116 THEN
+                        RETURN 1
+                    END IF
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION MatchGotoKeyword(lineBuf AS MMIOPTR, lineLen AS U32, idx AS U32) AS BOOL
+    IF idx + 4 > lineLen THEN
+        RETURN 0
+    END IF
+    LET c0 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, idx))
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, idx + 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, idx + 2))
+    LET c3 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, idx + 3))
+    IF c0 = 71 OR c0 = 103 THEN
+        IF c1 = 79 OR c1 = 111 THEN
+            IF c2 = 84 OR c2 = 116 THEN
+                IF c3 = 79 OR c3 = 111 THEN
+                    RETURN 1
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION LineIsRun(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 3 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    IF c0 = 82 OR c0 = 114 THEN
+        IF c1 = 85 OR c1 = 117 THEN
+            IF c2 = 78 OR c2 = 110 THEN
+                RETURN 1
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION LineIsList(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 4 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    LET c3 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 3))
+    IF c0 = 76 OR c0 = 108 THEN
+        IF c1 = 73 OR c1 = 105 THEN
+            IF c2 = 83 OR c2 = 115 THEN
+                IF c3 = 84 OR c3 = 116 THEN
+                    RETURN 1
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION LineIsNew(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 3 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    IF c0 = 78 OR c0 = 110 THEN
+        IF c1 = 69 OR c1 = 101 THEN
+            IF c2 = 87 OR c2 = 119 THEN
+                RETURN 1
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Section 8 lists CLEAR alongside NEW as a real, required command, but with no variables yet (a
+' real, separate future increment) CLEAR has nothing distinct from NEW to actually do -- rather
+' than leave it unrecognized (a real RFC compliance gap) or silently wrong, it aliases NEW verbatim
+' until real variable storage exists to give it its own honest behavior.
+FUNCTION LineIsClear(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 5 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    LET c3 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 3))
+    LET c4 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 4))
+    IF c0 = 67 OR c0 = 99 THEN
+        IF c1 = 76 OR c1 = 108 THEN
+            IF c2 = 69 OR c2 = 101 THEN
+                IF c3 = 65 OR c3 = 97 THEN
+                    IF c4 = 82 OR c4 = 114 THEN
+                        RETURN 1
+                    END IF
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Real PRINT-statement parser shared by BOTH Immediate Mode (`PRINT "HI"`, RFC-0007 Section 4's own
+' example, executed right away and never stored) and Program Mode (`10 PRINT "HI"`, staged then
+' committed into RPM by the caller). Stages the extracted literal text into RpmStagingTextAddress
+' and its real length into RpmStagedTextLenAddress on success; leaves both untouched on failure.
+FUNCTION TryParsePrintStatement(lineBuf AS MMIOPTR, lineLen AS U32, startIdx AS U32) AS BOOL
+    LET matched AS BOOL = MatchPrintKeyword(lineBuf, lineLen, startIdx)
+    IF matched = 0 THEN
+        RETURN 0
+    END IF
+    LET afterKw AS U32 = startIdx + 5
+    LET afterSpace AS U32 = SkipSpaces(lineBuf, lineLen, afterKw)
+    IF afterSpace >= lineLen THEN
+        RETURN 0
+    END IF
+    LET quoteCh AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, afterSpace))
+    IF quoteCh <> 34 THEN
+        RETURN 0
+    END IF
+    LET textStart AS U32 = afterSpace + 1
+    LET closeIdx AS U32 = FindClosingQuote(lineBuf, lineLen, textStart)
+    IF closeIdx >= lineLen THEN
+        RETURN 0
+    END IF
+    LET textLen AS U32 = closeIdx - textStart
+    IF textLen > RpmMaxTextChars() THEN
+        RETURN 0
+    END IF
+    LET i AS U32 = 0
+    WHILE i < textLen
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, textStart + i))
+        MEMORY.Write8(ADDRESS.Offset(RpmStagingTextAddress(), i), b)
+        i = i + 1
+    WEND
+    MEMORY.Write32(RpmStagedTextLenAddress(), textLen)
+    RETURN 1
+END FUNCTION
+
+FUNCTION RpmCopyEntry(srcIdx AS U32, dstIdx AS U32) AS U64
+    LET srcAddr AS MMIOPTR = RpmEntryAddress(srcIdx)
+    LET dstAddr AS MMIOPTR = RpmEntryAddress(dstIdx)
+    MEMORY.Write32(dstAddr, MEMORY.Read32(srcAddr))
+    MEMORY.Write32(ADDRESS.Offset(dstAddr, 4), MEMORY.Read32(ADDRESS.Offset(srcAddr, 4)))
+    MEMORY.Write32(ADDRESS.Offset(dstAddr, 8), MEMORY.Read32(ADDRESS.Offset(srcAddr, 8)))
+    LET i AS U32 = 0
+    WHILE i < 68
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(srcAddr, 12 + i))
+        MEMORY.Write8(ADDRESS.Offset(dstAddr, 12 + i), b)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION RpmWriteEntry(idx AS U32, lineNumber AS U32, stmtType AS U32, auxU32 AS U32, textLen AS U32) AS U64
+    LET addr AS MMIOPTR = RpmEntryAddress(idx)
+    MEMORY.Write32(addr, lineNumber)
+    MEMORY.Write32(ADDRESS.Offset(addr, 4), stmtType)
+    MEMORY.Write32(ADDRESS.Offset(addr, 8), auxU32)
+    LET i AS U32 = 0
+    WHILE i < textLen
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(RpmStagingTextAddress(), i))
+        MEMORY.Write8(ADDRESS.Offset(addr, 12 + i), b)
+        i = i + 1
+    WEND
+    MEMORY.Write8(ADDRESS.Offset(addr, 12 + textLen), 0)
+    RETURN 0
+END FUNCTION
+
+' RpmMaxLines() itself doubles as the "not found" sentinel for both of the next two functions --
+' unambiguous, since a real index is always strictly less than RpmMaxLines().
+FUNCTION RpmFindIndex(lineNumber AS U32) AS U32
+    LET count AS U32 = MEMORY.Read32(RpmCountAddress())
+    LET i AS U32 = 0
+    LET found AS U32 = RpmMaxLines()
+    LET done AS BOOL = 0
+    WHILE done = 0
+        IF i >= count THEN
+            done = 1
+        ELSE
+            LET entryLineNumber AS U32 = MEMORY.Read32(RpmEntryAddress(i))
+            IF entryLineNumber = lineNumber THEN
+                found = i
+                done = 1
+            ELSE
+                i = i + 1
+            END IF
+        END IF
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION RpmFindInsertPosition(lineNumber AS U32, count AS U32) AS U32
+    LET i AS U32 = 0
+    LET done AS BOOL = 0
+    WHILE done = 0
+        IF i >= count THEN
+            done = 1
+        ELSE
+            LET entryLineNumber AS U32 = MEMORY.Read32(RpmEntryAddress(i))
+            IF entryLineNumber > lineNumber THEN
+                done = 1
+            ELSE
+                i = i + 1
+            END IF
+        END IF
+    WEND
+    RETURN i
+END FUNCTION
+
+' RFC-0007 Section 5's own edit rules (new line number -> insert, existing -> replace) plus
+' Section 6's own "no partial modification" requirement on a full table -- capacity is checked
+' BEFORE any shifting begins, so a failed insert never corrupts the existing sorted program.
+FUNCTION RpmCommit(lineNumber AS U32, stmtType AS U32, auxU32 AS U32, textLen AS U32) AS BOOL
+    LET count AS U32 = MEMORY.Read32(RpmCountAddress())
+    LET foundIdx AS U32 = RpmFindIndex(lineNumber)
+
+    IF foundIdx <> RpmMaxLines() THEN
+        RpmWriteEntry(foundIdx, lineNumber, stmtType, auxU32, textLen)
+        RETURN 1
+    END IF
+
+    IF count >= RpmMaxLines() THEN
+        RETURN 0
+    END IF
+
+    LET insertAt AS U32 = RpmFindInsertPosition(lineNumber, count)
+    LET i AS U32 = count
+    WHILE i > insertAt
+        RpmCopyEntry(i - 1, i)
+        i = i - 1
+    WEND
+
+    RpmWriteEntry(insertAt, lineNumber, stmtType, auxU32, textLen)
+    MEMORY.Write32(RpmCountAddress(), count + 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION RpmDelete(lineNumber AS U32) AS U64
+    LET count AS U32 = MEMORY.Read32(RpmCountAddress())
+    LET foundIdx AS U32 = RpmFindIndex(lineNumber)
+    IF foundIdx = RpmMaxLines() THEN
+        RETURN 0
+    END IF
+    LET i AS U32 = foundIdx
+    WHILE i < count - 1
+        RpmCopyEntry(i + 1, i)
+        i = i + 1
+    WEND
+    MEMORY.Write32(RpmCountAddress(), count - 1)
+    RETURN 0
+END FUNCTION
+
+FUNCTION RpmNew() AS U64
+    MEMORY.Write32(RpmCountAddress(), 0)
+    RETURN 0
+END FUNCTION
+
+' Same digit-string-reversal pattern this project already established (ArcFSWriteDecimal), scoped
+' to U32 since RFC-0007 line numbers top out at 65535.
+FUNCTION RpmWriteDecimal(dest AS MMIOPTR, value AS U32) AS U32
+    IF value = 0 THEN
+        MEMORY.Write8(dest, 48)
+        RETURN 1
+    END IF
+    LET v AS U32 = value
+    LET count AS U32 = 0
+    WHILE v > 0
+        LET digit AS U32 = v MOD 10
+        LET digitByte AS U8 = digit + 48
+        MEMORY.Write8(ADDRESS.Offset(dest, count), digitByte)
+        v = v \ 10
+        count = count + 1
+    WEND
+    LET lo AS U32 = 0
+    LET hi AS U32 = count - 1
+    WHILE lo < hi
+        LET a AS U8 = MEMORY.Read8(ADDRESS.Offset(dest, lo))
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(dest, hi))
+        MEMORY.Write8(ADDRESS.Offset(dest, lo), b)
+        MEMORY.Write8(ADDRESS.Offset(dest, hi), a)
+        lo = lo + 1
+        hi = hi - 1
+    WEND
+    RETURN count
+END FUNCTION
+
+FUNCTION EchoDecimal(value AS U32) AS U64
+    LET buf AS MMIOPTR = RpmDecimalScratchAddress()
+    LET count AS U32 = RpmWriteDecimal(buf, value)
+    LET i AS U32 = 0
+    WHILE i < count
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(buf, i))
+        EchoChar(b)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION RpmEchoEntryText(addr AS MMIOPTR) AS U64
+    LET textAddr AS MMIOPTR = ADDRESS.Offset(addr, 12)
+    LET j AS U32 = 0
+    LET done AS BOOL = 0
+    WHILE done = 0
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(textAddr, j))
+        IF b = 0 THEN
+            done = 1
+        ELSE
+            EchoChar(b)
+            j = j + 1
+        END IF
+    WEND
+    PrintCRLF()
+    RETURN 0
+END FUNCTION
+
+FUNCTION PrintOutOfMemoryError() AS U64
+    EchoChar(63)
+    EchoChar(79)
+    EchoChar(85)
+    EchoChar(84)
+    EchoChar(32)
+    EchoChar(79)
+    EchoChar(70)
+    EchoChar(32)
+    EchoChar(80)
+    EchoChar(82)
+    EchoChar(79)
+    EchoChar(71)
+    EchoChar(82)
+    EchoChar(65)
+    EchoChar(77)
+    EchoChar(32)
+    EchoChar(77)
+    EchoChar(69)
+    EchoChar(77)
+    EchoChar(79)
+    EchoChar(82)
+    EchoChar(89)
+    PrintCRLF()
+    RETURN 0
+END FUNCTION
+
+FUNCTION PrintBreakMessage(lineNumber AS U32) AS U64
+    EchoChar(66)
+    EchoChar(82)
+    EchoChar(69)
+    EchoChar(65)
+    EchoChar(75)
+    EchoChar(32)
+    EchoChar(73)
+    EchoChar(78)
+    EchoChar(32)
+    EchoDecimal(lineNumber)
+    PrintCRLF()
+    RETURN 0
+END FUNCTION
+
+FUNCTION PrintUndefinedStatementError(lineNumber AS U32) AS U64
+    EchoChar(63)
+    EchoChar(85)
+    EchoChar(78)
+    EchoChar(68)
+    EchoChar(69)
+    EchoChar(70)
+    EchoChar(73)
+    EchoChar(78)
+    EchoChar(69)
+    EchoChar(68)
+    EchoChar(32)
+    EchoChar(83)
+    EchoChar(84)
+    EchoChar(65)
+    EchoChar(84)
+    EchoChar(69)
+    EchoChar(77)
+    EchoChar(69)
+    EchoChar(78)
+    EchoChar(84)
+    EchoChar(32)
+    EchoChar(73)
+    EchoChar(78)
+    EchoChar(32)
+    EchoDecimal(lineNumber)
+    PrintCRLF()
+    RETURN 0
+END FUNCTION
+
+' RFC-0007 Section 5's edit rules: a bare line number deletes; `<N> PRINT "..."` or `<N> GOTO <M>`
+' insert-or-replace via RpmCommit. digitCount is the caller's own already-bounded (<= 5) leading
+' digit count, avoiding a second, unbounded scan here.
+FUNCTION RpmHandleNumberedLine(lineBuf AS MMIOPTR, lineLen AS U32, digitCount AS U32) AS U64
+    LET lineNumber AS U32 = ParseDecimalRange(lineBuf, 0, digitCount)
+    IF lineNumber = 0 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    IF lineNumber > 65535 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+
+    LET idx AS U32 = SkipSpaces(lineBuf, lineLen, digitCount)
+    IF idx >= lineLen THEN
+        RpmDelete(lineNumber)
+        RETURN 0
+    END IF
+
+    LET okPrint AS BOOL = TryParsePrintStatement(lineBuf, lineLen, idx)
+    IF okPrint = 1 THEN
+        LET textLen AS U32 = MEMORY.Read32(RpmStagedTextLenAddress())
+        LET stored AS BOOL = RpmCommit(lineNumber, 1, 0, textLen)
+        IF stored = 0 THEN
+            PrintOutOfMemoryError()
+        END IF
+        RETURN 0
+    END IF
+
+    LET okGoto AS BOOL = MatchGotoKeyword(lineBuf, lineLen, idx)
+    IF okGoto = 1 THEN
+        LET afterKw AS U32 = idx + 4
+        LET afterSpace AS U32 = SkipSpaces(lineBuf, lineLen, afterKw)
+        LET targetDigits AS U32 = CountLeadingDigits(lineBuf, lineLen, afterSpace)
+        IF targetDigits = 0 THEN
+            PrintSyntaxError()
+            RETURN 0
+        END IF
+        IF targetDigits > 5 THEN
+            PrintSyntaxError()
+            RETURN 0
+        END IF
+        LET target AS U32 = ParseDecimalRange(lineBuf, afterSpace, targetDigits)
+        LET stored AS BOOL = RpmCommit(lineNumber, 2, target, 0)
+        IF stored = 0 THEN
+            PrintOutOfMemoryError()
+        END IF
+        RETURN 0
+    END IF
+
+    PrintSyntaxError()
+    RETURN 0
+END FUNCTION
+
+FUNCTION RpmList() AS U64
+    LET count AS U32 = MEMORY.Read32(RpmCountAddress())
+    LET i AS U32 = 0
+    WHILE i < count
+        LET addr AS MMIOPTR = RpmEntryAddress(i)
+        LET lineNumber AS U32 = MEMORY.Read32(addr)
+        LET stmtType AS U32 = MEMORY.Read32(ADDRESS.Offset(addr, 4))
+        EchoDecimal(lineNumber)
+        EchoChar(32)
+        IF stmtType = 1 THEN
+            EchoChar(80)
+            EchoChar(82)
+            EchoChar(73)
+            EchoChar(78)
+            EchoChar(84)
+            EchoChar(32)
+            EchoChar(34)
+            LET textAddr AS MMIOPTR = ADDRESS.Offset(addr, 12)
+            LET j AS U32 = 0
+            LET done AS BOOL = 0
+            WHILE done = 0
+                LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(textAddr, j))
+                IF b = 0 THEN
+                    done = 1
+                ELSE
+                    EchoChar(b)
+                    j = j + 1
+                END IF
+            WEND
+            EchoChar(34)
+        ELSE
+            IF stmtType = 2 THEN
+                EchoChar(71)
+                EchoChar(79)
+                EchoChar(84)
+                EchoChar(79)
+                EchoChar(32)
+                LET target AS U32 = MEMORY.Read32(ADDRESS.Offset(addr, 8))
+                EchoDecimal(target)
+            END IF
+        END IF
+        PrintCRLF()
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' The real interpreter: walks RPM in sorted order, GOTO re-seeks by real line number (not array
+' index -- the table is sparse), PRINT echoes its own staged literal. A cooperative ESC check runs
+' once per statement (this backend has no keyboard IRQ yet, only polling) so a genuine `10 PRINT
+' "HI" / 20 GOTO 10` infinite loop can still be broken out of -- the real, necessary answer to
+' "how do you stop a running program" that choosing to support GOTO at all requires.
+FUNCTION RpmRun(usbSlotId AS U32) AS U64
+    LET count AS U32 = MEMORY.Read32(RpmCountAddress())
+    LET idx AS U32 = 0
+    LET exitReason AS U32 = 0
+    LET stopLineNumber AS U32 = 0
+    LET looping AS BOOL = 1
+
+    WHILE looping = 1
+        IF idx >= count THEN
+            looping = 0
+        ELSE
+            LET addr AS MMIOPTR = RpmEntryAddress(idx)
+            LET curLineNumber AS U32 = MEMORY.Read32(addr)
+            LET key AS U16 = PollAnyKey(usbSlotId)
+            IF key = 27 THEN
+                exitReason = 1
+                stopLineNumber = curLineNumber
+                looping = 0
+            ELSE
+                LET stmtType AS U32 = MEMORY.Read32(ADDRESS.Offset(addr, 4))
+                IF stmtType = 1 THEN
+                    RpmEchoEntryText(addr)
+                    idx = idx + 1
+                ELSE
+                    IF stmtType = 2 THEN
+                        LET target AS U32 = MEMORY.Read32(ADDRESS.Offset(addr, 8))
+                        LET targetIdx AS U32 = RpmFindIndex(target)
+                        IF targetIdx = RpmMaxLines() THEN
+                            exitReason = 2
+                            stopLineNumber = curLineNumber
+                            looping = 0
+                        ELSE
+                            idx = targetIdx
+                        END IF
+                    ELSE
+                        idx = idx + 1
+                    END IF
+                END IF
+            END IF
+        END IF
+    WEND
+
+    IF exitReason = 1 THEN
+        PrintBreakMessage(stopLineNumber)
+    END IF
+    IF exitReason = 2 THEN
+        PrintUndefinedStatementError(stopLineNumber)
+    END IF
+    RETURN 0
+END FUNCTION
+
+' The real Enter-key dispatcher, factored out of Main() entirely -- Main() has already needed two
+' other extractions this project (SetupUsbKeyboard, SetupGopDashboard) purely to stay under this
+' backend's own real stack-frame budget, and this dispatch alone needed several new locals across
+' 8 real command branches. Returns 0 to stop the whole READY. loop (the TEST-ONLY EXIT command),
+' 1 otherwise.
+FUNCTION HandleEnteredLine(lineBuf AS MMIOPTR, lineLen AS U32, usbSlotId AS U32) AS BOOL
+    LET dispatched AS BOOL = 0
+    LET running AS BOOL = 1
+
+    IF dispatched = 0 THEN
+        IF LineIsHelp(lineBuf, lineLen) = 1 THEN
+            PrintHelpText()
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF LineIsOt(lineBuf, lineLen) = 1 THEN
+            PrintOtText()
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF LineIsExit(lineBuf, lineLen) = 1 THEN
+            PrintHaltText()
+            running = 0
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF LineIsRun(lineBuf, lineLen) = 1 THEN
+            RpmRun(usbSlotId)
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF LineIsList(lineBuf, lineLen) = 1 THEN
+            RpmList()
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF LineIsNew(lineBuf, lineLen) = 1 THEN
+            RpmNew()
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF LineIsClear(lineBuf, lineLen) = 1 THEN
+            RpmNew()
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        LET firstCh AS U8 = MEMORY.Read8(lineBuf)
+        IF IsDigit(firstCh) = 1 THEN
+            LET leadDigits AS U32 = CountLeadingDigits(lineBuf, lineLen, 0)
+            IF leadDigits > 5 THEN
+                PrintSyntaxError()
+            ELSE
+                RpmHandleNumberedLine(lineBuf, lineLen, leadDigits)
+            END IF
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        LET immediateOk AS BOOL = TryParsePrintStatement(lineBuf, lineLen, 0)
+        IF immediateOk = 1 THEN
+            LET textLen AS U32 = MEMORY.Read32(RpmStagedTextLenAddress())
+            LET k AS U32 = 0
+            WHILE k < textLen
+                LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(RpmStagingTextAddress(), k))
+                EchoChar(b)
+                k = k + 1
+            WEND
+            PrintCRLF()
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        PrintSyntaxError()
+    END IF
+
+    RETURN running
 END FUNCTION
 
 ' Real, dynamically-computed 1GB identity-map extension -- reusable for ANY real physical MMIO/
@@ -3026,20 +3888,7 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
                 IF lineLen = 0 THEN
                     PrintReady()
                 ELSE
-                    IF LineIsHelp(lineBuf, lineLen) = 1 THEN
-                        PrintHelpText()
-                    ELSE
-                        IF LineIsOt(lineBuf, lineLen) = 1 THEN
-                            PrintOtText()
-                        ELSE
-                            IF LineIsExit(lineBuf, lineLen) = 1 THEN
-                                PrintHaltText()
-                                running = 0
-                            ELSE
-                                PrintSyntaxError()
-                            END IF
-                        END IF
-                    END IF
+                    running = HandleEnteredLine(lineBuf, lineLen, usbSlotId)
                     IF running = 1 THEN
                         PrintReady()
                     END IF

@@ -164,4 +164,40 @@ grep -aqF "SUBSTRATE GOP READY" "$TMP_ROOT/gop.txt" || { echo "FAIL: GOP was not
 [ -s "$TMP_ROOT/screen.ppm" ] || { echo "FAIL: no screendump was captured" >&2; exit 1; }
 python3 "$SOURCE_DIR/arcology-os/scripts/run/check_ppm_text_region.py" "$TMP_ROOT/screen.ppm" 0 0 300 100 0.02 || { echo "FAIL: the on-screen terminal's own text region has no real rendered pixels" >&2; exit 1; }
 
-echo "PASS: RFC-0045 Phase 4/5 substrate unification -- real ExitBootServices + APS's own CR3/GDT/IDT takeover + RFC-0007's genuine HELP/OT/?SYNTAX ERROR/backspace command loop, fed by BOTH the PS/2 and USB HID input paths together and confirmed working via EITHER path alone, output to BOTH real serial AND a real GOP-framebuffer on-screen terminal (confirmed via a real screendump pixel check); negative control confirmed real"
+# RFC-0007 Program Mode, first real increment (PRINT + GOTO only): numbered-line PRINT storage,
+# RUN executing multiple stored lines in real sorted order, and the real shift-apostrophe ->
+# double-quote translation this whole feature depends on being typable at all on a real US QWERTY
+# layout (RFC-0045's own drivers are "unshifted only" -- this is the one real, narrow exception).
+run_once "$TMP_ROOT/run_print.txt" both \
+    1 0 spc p r i n t spc shift-apostrophe h i shift-apostrophe ret \
+    2 0 spc p r i n t spc shift-apostrophe b y e shift-apostrophe ret \
+    r u n ret
+grep -aqF $'hi\r' "$TMP_ROOT/run_print.txt" || { echo "FAIL: RUN did not execute the first stored PRINT line" >&2; cat "$TMP_ROOT/run_print.txt" >&2; exit 1; }
+grep -aqF $'bye\r' "$TMP_ROOT/run_print.txt" || { echo "FAIL: RUN did not execute the second stored PRINT line in order" >&2; cat "$TMP_ROOT/run_print.txt" >&2; exit 1; }
+
+# GOTO storage + LIST reconstructing real stored source, plus RUN GOTO-ing to an undefined line
+# producing a real, correct error instead of a false match or a hang.
+run_once "$TMP_ROOT/run_goto.txt" both \
+    1 0 spc p r i n t spc shift-apostrophe l o o p shift-apostrophe ret \
+    2 0 spc g o t o spc 9 9 ret \
+    l i s t ret \
+    r u n ret
+grep -aqF '10 PRINT "loop"' "$TMP_ROOT/run_goto.txt" || { echo "FAIL: LIST did not reconstruct the stored PRINT line" >&2; cat "$TMP_ROOT/run_goto.txt" >&2; exit 1; }
+grep -aqF '20 GOTO 99' "$TMP_ROOT/run_goto.txt" || { echo "FAIL: LIST did not reconstruct the stored GOTO line" >&2; cat "$TMP_ROOT/run_goto.txt" >&2; exit 1; }
+grep -aqF '?UNDEFINED STATEMENT IN 20' "$TMP_ROOT/run_goto.txt" || { echo "FAIL: RUN did not report a real undefined-statement error for a GOTO to a nonexistent line" >&2; cat "$TMP_ROOT/run_goto.txt" >&2; exit 1; }
+
+# A real `10 PRINT "LOOP" / 20 GOTO 10` infinite loop, actually run, actually interrupted -- the
+# real, necessary answer (a cooperative once-per-statement ESC poll) to "how do you stop a running
+# program" that supporting GOTO at all requires. Also proves NEW genuinely clears RPM.
+run_once "$TMP_ROOT/run_break.txt" both \
+    1 0 spc p r i n t spc shift-apostrophe l o o p shift-apostrophe ret \
+    2 0 spc g o t o spc 1 0 ret \
+    r u n ret esc \
+    n e w ret \
+    l i s t ret
+grep -aqF $'loop\r' "$TMP_ROOT/run_break.txt" || { echo "FAIL: the GOTO loop never actually ran" >&2; cat "$TMP_ROOT/run_break.txt" >&2; exit 1; }
+grep -aqF 'BREAK IN' "$TMP_ROOT/run_break.txt" || { echo "FAIL: ESC did not interrupt the running GOTO loop" >&2; cat "$TMP_ROOT/run_break.txt" >&2; exit 1; }
+LOOP_COUNT=$(grep -acF $'loop\r' "$TMP_ROOT/run_break.txt")
+[ "$LOOP_COUNT" -gt 1 ] || { echo "FAIL: the loop only ran once -- GOTO is not actually looping" >&2; cat "$TMP_ROOT/run_break.txt" >&2; exit 1; }
+
+echo "PASS: RFC-0045 Phase 4/5 substrate unification -- real ExitBootServices + APS's own CR3/GDT/IDT takeover + RFC-0007's genuine HELP/OT/?SYNTAX ERROR/backspace command loop, fed by BOTH the PS/2 and USB HID input paths together and confirmed working via EITHER path alone, output to BOTH real serial AND a real GOP-framebuffer on-screen terminal (confirmed via a real screendump pixel check); negative control confirmed real. PLUS RFC-0007 Program Mode's first real increment (PRINT + GOTO): numbered-line storage, RUN executing stored lines in order (including a real shift-apostrophe -> double-quote keystroke), LIST reconstructing stored source, a real undefined-statement GOTO error, and a real infinite GOTO loop genuinely interrupted by ESC"

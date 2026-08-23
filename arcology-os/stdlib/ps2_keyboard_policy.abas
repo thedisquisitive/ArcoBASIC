@@ -101,6 +101,9 @@ FUNCTION PS2Keyboard.ScancodeToChar(scancode AS U32) AS U16
     IF scancode = 57 THEN
         RETURN 32
     END IF
+    IF scancode = 1 THEN
+        RETURN 27
+    END IF
 
     IF scancode = 2 THEN
         RETURN 49

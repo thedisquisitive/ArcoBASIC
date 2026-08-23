@@ -1467,6 +1467,9 @@ FUNCTION UsbHidKeyboard.KeycodeToChar(keycode AS U32) AS U32
     IF keycode = 40 THEN
         RETURN 13
     END IF
+    IF keycode = 41 THEN
+        RETURN 27
+    END IF
     IF keycode = 42 THEN
         RETURN 8
     END IF

@@ -3,8 +3,9 @@
 
 **RFC Number:** RFC-0007
 **Title:** ArcoBASIC Interactive Program Model
-**Status:** Draft (first real increment implemented and QEMU-proven, see Section 14 — Immediate
-Mode command dispatch for HELP/OT only; Program Mode, RPM, PEEK/POKE, and INSPECT remain
+**Status:** Draft (two real increments implemented and QEMU-proven, see Section 14/15 — Immediate
+Mode HELP/OT, and now Program Mode's own first real increment: RPM storage plus PRINT and GOTO
+only, a deliberate scope reduction. LET/variables, IF, FOR/NEXT, PEEK/POKE, and INSPECT remain
 unimplemented)
 **Category:** Language / User Experience
 
@@ -370,3 +371,80 @@ this increment).
 Nothing in this project has ever been confirmed on real hardware for keyboard input specifically —
 this is a new, additional real-hardware validation surface beyond WP-026/029/030/031's own GOP/
 ArcFS/USB-boot proofs. See `.agents/reports/WP-032-arcology-seed-ready-hardware-validation.md`.
+
+---
+
+# 15. Implementation Status — Program Mode, First Real Increment (2026-08-23)
+
+**Real Program Mode, scoped to PRINT and GOTO only** — a deliberate, named reduction from Section
+4's full vision (LET/variables, IF, FOR/NEXT are real, separate follow-on increments), implemented
+directly in `aps-arcology-seed-substrate.abas`. This is a genuine embedded interpreter running
+under APS's own CR3/GDT/IDT after `ExitBootServices`, not a host-compiled program — no ArcoFission
+compiler involved once booted, matching classic BASIC's own immediacy.
+
+## What's real
+
+- **Resident Program Memory (RPM)**: a fixed-size (64 lines), always-sorted, always-compacted array
+  in a dedicated scratch region — no dynamic allocator exists on this backend, the same "fixed
+  scratch buffer, not a heap" idiom the fixture's line buffer, font table, and dashboard label
+  table already established. Insert/replace/delete (Section 5's own edit rules) do a real in-place
+  shift, not tombstoning, so RUN/LIST stay simple straight-line scans.
+- **`RUN`**: walks RPM in real sorted order; `GOTO` re-seeks by real line number (the table is
+  sparse, not by array index); `PRINT` echoes its own stored literal. A GOTO to a line number that
+  doesn't exist produces a real `?UNDEFINED STATEMENT IN <N>` error, not a silent no-op or a hang.
+- **`LIST`**: reconstructs real stored source (`10 PRINT "..."`, `20 GOTO 30`) from the binary
+  record, not a cached copy of what was typed.
+- **`NEW`**: real clear. **`CLEAR`**: Section 8 lists it as a required, separate command, but with
+  no variables yet (a real, separate future increment) it has nothing distinct from `NEW` to
+  actually do — aliases `NEW` verbatim rather than being left unrecognized (a real RFC compliance
+  gap) or silently wrong, a named, honest scope reduction.
+- **Immediate Mode `PRINT`**: Section 4's own explicit example (`PRINT "HELLO"`, no line number)
+  executes right away and is never stored, sharing its parser with Program Mode's own `PRINT`.
+- **A real, necessary answer to "how do you stop a running program"**: choosing to support `GOTO`
+  at all means a `10 PRINT "X" / 20 GOTO 10` infinite loop is a real, reachable program state. This
+  backend has no keyboard IRQ yet (only polling), so `RUN` does a cooperative ESC check once per
+  statement — cheap, since a real loop iterates far faster than a human can react — and a real
+  `BREAK IN <line>` message on interrupt, matching classic BASIC's own convention.
+- **A real, blocking finding closed as part of this increment, not deferred**: RFC-0045's own PS/2
+  and USB HID drivers are explicitly "unshifted only" (a named Non-Goal). A real double-quote is
+  Shift+apostrophe on US QWERTY — with zero Shift support, `"` could never actually be typed on
+  real hardware, which would have made a quoted-string `PRINT` design real but genuinely unusable.
+  Rather than pick a different, unconventional string delimiter to dodge the gap, added real,
+  narrowly-scoped Shift tracking to both drivers: PS/2 tracks Left/Right Shift make/break codes as
+  persistent state (scan codes are discrete press/release events); USB HID reads the boot-report
+  modifier byte fresh on every poll (already a live, level-triggered snapshot, no state needed). In
+  both cases, only the apostrophe key's own translation is disambiguated by it (`'` unshifted, `"`
+  shifted) — this is not a general modifier system, just enough to make quoted strings real.
+
+## Validation
+
+New scenarios added to the existing `systems_aps_arcology_seed_substrate_smoke` (not a separate
+test): numbered-line `PRINT` storage plus `RUN` executing multiple stored lines in real order
+(including a real injected `shift-apostrophe` keystroke producing a real `"`), `GOTO` storage
+reconstructed correctly by `LIST`, a real undefined-statement `GOTO` error, and a real infinite
+`GOTO` loop actually run and actually interrupted by a real injected `ESC`. All via real QEMU
+`sendkey` injection over the same monitor-socket path this fixture's other scenarios already use.
+96/96 full regression suite.
+
+Also manually verified under QEMU (not yet promoted to the automated suite): malformed Program Mode
+lines (garbage after the line number, an unterminated string) both produce a clean `?SYNTAX ERROR`
+with no partial modification to RPM; `CLEAR` aliasing `NEW`; a 6-digit line number (exceeding
+Section 6's own 65535 ceiling) correctly rejected rather than silently overflowing.
+
+## Explicitly NOT in scope for this increment
+
+`LET`/variables, `IF`, `FOR`/`NEXT`, `PEEK`/`POKE`, `INSPECT`, and RPM's own free-memory reporting
+(Section 6). Each is a real, separate, substantial undertaking — variables alone need real typed
+runtime storage and an expression evaluator, neither of which exists yet. Out-of-memory (RPM full)
+is implemented per Section 6's own "no partial modification" requirement (capacity is checked
+before any array shifting begins) but not yet exercised by an automated test — reaching it requires
+65 real typed program lines, impractical via scripted keystroke injection; verified by code review
+of `RpmCommit`'s own capacity-then-shift ordering instead.
+
+## What this does not close
+
+Real hardware validation of Program Mode specifically has not happened — WP-033 (RFC-0045 Phase 5)
+predates this increment and only exercises Immediate Mode (`HELP`/`OT`). A future hardware package
+would need a human to actually type a quoted `PRINT` (proving Shift genuinely works on real
+silicon, not just under QEMU's own `sendkey`) and a `GOTO` loop (proving ESC genuinely interrupts
+it) on the real keyboard(s) WP-033 already covers.
