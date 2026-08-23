@@ -473,11 +473,37 @@ already explicitly zeroed before first use — this was a real, isolated gap in 
 state this specific increment introduced, not a systemic pattern across the whole fixture. 96/96
 regression suite unaffected (QEMU's own zeroed RAM meant this was always a no-op there).
 
+## A second real bug found on real hardware, same Round 3 session
+
+After the zero-init fix above, the user retested: the freeze/blank-output bug was gone and `RUN`
+worked correctly, including `GOTO`, but real typed output was still hard to read — specifically,
+`PRINT "hi"` rendered indistinguishably from "ni". Not a scale problem (RFC-0045 revision 0.9
+already fixed that); a real font-quality problem the scale fix couldn't touch.
+
+**Root cause**: the terminal shared its font with the boot dashboard — an 8x8 bitmap rasterized
+offline from FreeMonoBold.ttf. Decoding the actual stored bitmap confirmed it directly: lowercase
+`h`'s own glyph had only ONE pixel distinguishing it from `n` (a single dot in the top row for the
+ascender), because 8 total rows isn't enough to give ascenders (b/d/h/k/l), x-height letters, AND
+descenders (g/j/p/q/y) each real headroom — the offline rasterizer had silently squeezed the
+ascender down to almost nothing to fit everything into 8 rows.
+
+**Fix**: gave the terminal its own dedicated 8x14 font (`TermFontTableAddress`/
+`TermFontGlyphRowByte`/`WriteTermFontData`), re-rasterized from the same FreeMonoBold.ttf but at
+the classic CGA/EGA "8x14" text-mode cell size, with real ascender/x-height/descender headroom.
+Confirmed by decoding and visually inspecting the new bitmaps for h/n/i/b/d/g/p/y/m before
+committing, then by a real QEMU screendump of `PRINT "hi there night owl"` after — clearly
+legible, `h`'s ascender and `g`'s descender both visibly distinct from x-height letters.
+Deliberately scoped to the terminal ONLY: the dashboard keeps its own original 8x8 font and
+untouched pixel layout (the user had already confirmed it "looks nice and unique"), verified by a
+diff review confirming zero lines in the dashboard's own drawing functions changed. 95/96
+regression suite (the one failure is the same pre-existing, unrelated PS/2 flake noted in RFC-0045
+revision 0.3).
+
 ## What this does not close
 
-Real hardware validation of Program Mode after this fix has not happened yet (Round 3 found the
-bug above; a Round 4 write is needed to confirm the fix on real silicon). WP-033 (RFC-0045 Phase 5)
-predates this increment and only exercises Immediate Mode (`HELP`/`OT`). A future hardware package
-would need a human to actually type a quoted `PRINT` (proving Shift genuinely works on real
-silicon, not just under QEMU's own `sendkey`) and a `GOTO` loop (proving ESC genuinely interrupts
-it) on the real keyboard(s) WP-033 already covers.
+Real hardware validation of Program Mode after either fix above has not happened yet — Round 3
+found and fixed both bugs, but the fixes themselves haven't been re-confirmed on real silicon
+(Round 4). WP-033 (RFC-0045 Phase 5) predates this whole increment and only exercises Immediate
+Mode (`HELP`/`OT`). A future hardware package would need a human to actually type a quoted `PRINT`
+(proving Shift genuinely works on real silicon), read the new 8x14 font back clearly, and run a
+`GOTO` loop (proving ESC genuinely interrupts it) on the real keyboard(s) WP-033 already covers.
