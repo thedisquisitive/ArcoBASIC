@@ -2,7 +2,8 @@
 
 **RFC Number:** RFC-0046
 **Title:** Arcology Executable Assembly (AEX)  
-**Status:** Draft  
+**Status:** Draft -- Section 61 Phases 1-3 of 15 implemented and QEMU-proven (binary constants,
+bootstrap header validation, chunk directory validation); Phases 4-15 not started  
 **Category:** Executable Format / Runtime ABI / Application Model  
 **Authors:** Arcology Project  
 **Created:** 2026-08-22  
@@ -2363,3 +2364,4 @@ The following rules are intentionally restated because future implementation sho
 | Version | Date | Summary |
 |---------|------|---------|
 |0.1|2026-08-22|Initial Arcology Executable Assembly specification. Defines the AEX container, component and implementation model, interface-oriented dependency resolution, capability requests, explicit memory semantics, ArcoBASIC Binding Table, lifecycle metadata, diagnostics, integrity, signatures, extensibility rules, ArcoFISSION target requirements, validation fixtures, QEMU testing, and real-hardware Definition of Done.|
+|0.2|2026-08-24|Implementation begun -- Section 61 Phases 1-3 (binary constants, bootstrap header validation, chunk directory validation) real and QEMU-proven, commit `1585ccd`. Concrete 64-byte bootstrap header and 96-byte chunk directory entry layouts fixed (Section 9/10's own deliberate implementation-defined widths), including a real, reproducible UUIDv5 namespace for Section 11's 17 standard chunk type identifiers rather than an arbitrary enum. `AEX.ValidateHeader`/`AEX.ValidateDirectory` (`stdlib/aex_format_policy.abas`) implement Section 9.1/10.2/10.3's real requirements: overflow-safe bounds checking, alignment validation, and the real REQUIRED-vs-OPTIONAL unknown-chunk-type distinction. Proven against 8 real byte-exact fixtures under QEMU (`tests/fixtures/aex-format-probe/`), matching Section 56's own fixture-list spirit; a real bug was found and fixed in the fixture generator itself, not the validator, during that work. Phases 4-15 (manifest/component parsing, capability evaluation, ArcFS-backed loading, native ABI lifecycle invocation, integrity, real hardware validation) remain real, separate, later increments.|
