@@ -863,3 +863,244 @@ FUNCTION AEX.ValidateManifest(buffer AS MMIOPTR, fileLength AS U64) AS U32
 
     RETURN AexErrorOk()
 END FUNCTION
+
+' -----------------------------------------------------------------------------------------------
+' Phase 5: Native x86-64 implementation record (Section 15 / Section 15.1 / Section 16).
+'
+' A component MAY declare one or more IMPLEMENTATION chunks (Phase 4's own ImplementationIDs list
+' already carries their chunk IDs -- this phase is what makes that list meaningful). Each
+' IMPLEMENTATION chunk identifies its owning component, an implementation type, a target
+' architecture, an ABI version, required CPU features, a loader-preference priority, and
+' references to its CODE/DATA chunks. Concrete byte layout fixed here (Section 15's own
+' deliberate implementation-defined shape, same discipline as the header/directory/manifest
+' layouts before it):
+'
+' IMPLEMENTATION chunk content (40-byte fixed, no variable regions in this scope):
+'   +0  OwningComponentID       U32
+'   +4  ImplementationType      U32  (1=NATIVE, 2=ARCO_IR, 3=ARCOBASIC_CAPSULE)
+'   +8  Architecture            U32  (1=X86_64, 2=ARM64)
+'   +12 AbiMajor                U32
+'   +16 AbiMinor                U32
+'   +20 RequiredCpuFeatures     U64  (reserved bitmask; 0 = none required, unevaluated this phase)
+'   +28 Priority                U32  (higher wins among compatible candidates)
+'   +32 CodeChunkID             U32  (0 = none; resolved by Phase 6's ArcFS-backed code mapping)
+'   +36 DataChunkID             U32  (0 = none; resolved by Phase 6's ArcFS-backed data mapping)
+'
+' Deliberately deferred: Section 15's own "compatibility constraints" field. The RFC gives it no
+' concrete shape (unlike the other required fields, which map onto a clear scalar), and nothing in
+' this phase or the next needs it yet -- same "don't invent structure a real consumer hasn't
+' demanded" discipline the manifest/component layouts already followed for optional metadata.
+' RequiredCpuFeatures is recorded and readable but not yet evaluated against real CPUID state;
+' real CPU-feature-gated selection is future work once a first native implementation actually
+' needs it.
+
+FUNCTION AexImplTypeNative() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexImplTypeArcoIr() AS U32
+    RETURN 2
+END FUNCTION
+FUNCTION AexImplTypeArcoBasicCapsule() AS U32
+    RETURN 3
+END FUNCTION
+
+FUNCTION AexArchX86_64() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexArchArm64() AS U32
+    RETURN 2
+END FUNCTION
+
+' Matches Section 15's own worked example ("ABI = Arcology.Native.1") -- the native Arcology ABI
+' this loader currently supports is major version 1, minor version 0.
+FUNCTION AexAbiNativeMajorCurrent() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexAbiNativeMinorCurrent() AS U32
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexErrorImplementationInvalid() AS U32
+    RETURN 14
+END FUNCTION
+FUNCTION AexErrorImplementationOutOfBounds() AS U32
+    RETURN 15
+END FUNCTION
+FUNCTION AexErrorNoCompatibleImplementation() AS U32
+    RETURN 16
+END FUNCTION
+FUNCTION AexErrorImplementationOwnerMismatch() AS U32
+    RETURN 17
+END FUNCTION
+
+FUNCTION AexImplementationFixedSize() AS U32
+    RETURN 40
+END FUNCTION
+
+FUNCTION AexReadImplementationOwningComponentID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 0))
+END FUNCTION
+FUNCTION AexReadImplementationType(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 4))
+END FUNCTION
+FUNCTION AexReadImplementationArchitecture(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 8))
+END FUNCTION
+FUNCTION AexReadImplementationAbiMajor(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 12))
+END FUNCTION
+FUNCTION AexReadImplementationAbiMinor(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 16))
+END FUNCTION
+FUNCTION AexReadImplementationRequiredCpuFeatures(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 20))
+END FUNCTION
+FUNCTION AexReadImplementationPriority(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 28))
+END FUNCTION
+FUNCTION AexReadImplementationCodeChunkID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 32))
+END FUNCTION
+FUNCTION AexReadImplementationDataChunkID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 36))
+END FUNCTION
+
+' Companion accessor to AexManifestDeclaredComponentIDAt, for a component's own ImplementationIDs
+' list -- the first of Component's three variable ID regions, starting immediately after its
+' 44-byte fixed region (Phase 4's own AexComponentFixedSize/AexValidateOneComponent already
+' establish that layout; this phase is the first real reader of that specific list).
+FUNCTION AexComponentImplementationIDAt(data AS MMIOPTR, index AS U32) AS U32
+    LET indexAsU64 AS U64 = index
+    LET byteOffset AS U64 = AexComponentFixedSize() + (indexAsU64 * 4)
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, byteOffset))
+END FUNCTION
+
+' Real, per-implementation validation: resolves implID through the same chunk directory (an
+' implementation is just another chunk, same as a component or manifest), confirms its real type,
+' bounds-checks its fixed content against its own real LogicalLength, and confirms its own
+' recorded OwningComponentID actually matches the component that declared it -- the same
+' identity-is-a-checked-invariant discipline Phase 4 already established for component-to-
+' assembly ownership.
+FUNCTION AexValidateOneImplementation(buffer AS MMIOPTR, implID AS U32, expectComponentID AS U32, fileLength AS U64) AS U32
+    LET implEntry AS MMIOPTR = AexFindChunkByID(buffer, implID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorImplementationInvalid()
+    END IF
+    LET typeHigh AS U64 = AexReadEntryTypeHigh(implEntry)
+    LET typeLow AS U64 = AexReadEntryTypeLow(implEntry)
+    IF typeHigh <> AexTypeImplementationHigh() THEN
+        RETURN AexErrorImplementationInvalid()
+    END IF
+    IF typeLow <> AexTypeImplementationLow() THEN
+        RETURN AexErrorImplementationInvalid()
+    END IF
+
+    LET implOffset AS U64 = AexReadEntryOffset(implEntry)
+    LET implLogicalLength AS U64 = AexReadEntryLogicalLength(implEntry)
+    LET implData AS MMIOPTR = ADDRESS.Offset(buffer, implOffset)
+
+    LET fixedSize AS U64 = AexImplementationFixedSize()
+    IF implLogicalLength < fixedSize THEN
+        RETURN AexErrorImplementationOutOfBounds()
+    END IF
+
+    LET ownerID AS U32 = AexReadImplementationOwningComponentID(implData)
+    IF ownerID <> expectComponentID THEN
+        RETURN AexErrorImplementationOwnerMismatch()
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AexSelectedImplementationIDAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61079552))
+END FUNCTION
+
+' Phase 5's own real entry point -- Section 15.1's Loader Selection, made real. Walks every
+' implementation a component declares, validates each in turn (a malformed implementation record
+' fails the whole selection closed immediately, matching this format's existing fail-closed
+' discipline rather than silently skipping it), and among the implementations that are actually
+' compatible with this loader (Type=NATIVE, Architecture=X86_64, and an ABI the loader can
+' satisfy -- exact major version match, minor version no newer than what the loader supports)
+' picks the one with the highest declared Priority. If no declared implementation is compatible,
+' materialization fails with the specific implementation-resolution error Section 15.1 itself
+' requires, not a generic bounds or not-found code. The winning chunk ID is left in a scratch MMIO
+' cell for the caller to read, the same convention AexFindChunkByID already established -- this
+' backend has no tuple-return type to hand two results back directly.
+FUNCTION AEX.SelectImplementation(buffer AS MMIOPTR, componentID AS U32, fileLength AS U64) AS U32
+    LET componentEntry AS MMIOPTR = AexFindChunkByID(buffer, componentID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingRequiredComponent()
+    END IF
+    LET componentTypeHigh AS U64 = AexReadEntryTypeHigh(componentEntry)
+    LET componentTypeLow AS U64 = AexReadEntryTypeLow(componentEntry)
+    IF componentTypeHigh <> AexTypeComponentHigh() THEN
+        RETURN AexErrorMissingRequiredComponent()
+    END IF
+    IF componentTypeLow <> AexTypeComponentLow() THEN
+        RETURN AexErrorMissingRequiredComponent()
+    END IF
+
+    LET componentOffset AS U64 = AexReadEntryOffset(componentEntry)
+    LET componentData AS MMIOPTR = ADDRESS.Offset(buffer, componentOffset)
+    LET implCount AS U32 = AexReadComponentImplementationCount(componentData)
+
+    LET bestFound AS BOOL = 0
+    LET bestPriority AS U32 = 0
+    LET bestImplID AS U32 = 0
+
+    LET i AS U32 = 0
+    WHILE i < implCount
+        LET implID AS U32 = AexComponentImplementationIDAt(componentData, i)
+        LET validateResult AS U32 = AexValidateOneImplementation(buffer, implID, componentID, fileLength)
+        IF validateResult <> AexErrorOk() THEN
+            RETURN validateResult
+        END IF
+
+        LET implEntry AS MMIOPTR = AexFindChunkByID(buffer, implID)
+        LET implOffset AS U64 = AexReadEntryOffset(implEntry)
+        LET implData AS MMIOPTR = ADDRESS.Offset(buffer, implOffset)
+
+        LET implType AS U32 = AexReadImplementationType(implData)
+        LET implArch AS U32 = AexReadImplementationArchitecture(implData)
+        LET implAbiMajor AS U32 = AexReadImplementationAbiMajor(implData)
+        LET implAbiMinor AS U32 = AexReadImplementationAbiMinor(implData)
+
+        LET compatible AS BOOL = 1
+        IF implType <> AexImplTypeNative() THEN
+            compatible = 0
+        END IF
+        IF implArch <> AexArchX86_64() THEN
+            compatible = 0
+        END IF
+        IF implAbiMajor <> AexAbiNativeMajorCurrent() THEN
+            compatible = 0
+        END IF
+        IF implAbiMinor > AexAbiNativeMinorCurrent() THEN
+            compatible = 0
+        END IF
+
+        IF compatible = 1 THEN
+            LET priority AS U32 = AexReadImplementationPriority(implData)
+            IF bestFound = 0 THEN
+                bestFound = 1
+                bestPriority = priority
+                bestImplID = implID
+            ELSE
+                IF priority > bestPriority THEN
+                    bestPriority = priority
+                    bestImplID = implID
+                END IF
+            END IF
+        END IF
+
+        i = i + 1
+    WEND
+
+    IF bestFound = 0 THEN
+        RETURN AexErrorNoCompatibleImplementation()
+    END IF
+
+    MEMORY.Write32(AexSelectedImplementationIDAddress(), bestImplID)
+    RETURN AexErrorOk()
+END FUNCTION
