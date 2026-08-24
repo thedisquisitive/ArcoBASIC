@@ -533,3 +533,333 @@ FUNCTION AexFindChunkByID(buffer AS MMIOPTR, wantChunkID AS U32) AS MMIOPTR
 
     RETURN buffer
 END FUNCTION
+
+' ==========================================================================================
+' Phase 4: Manifest and component graph (Section 61). Real content layout for the two chunk
+' types Phase 4 actually interprets -- MANIFEST (Section 12/13) and COMPONENT (Section 14) --
+' scoped to assembly-level identity and topology plus per-component identity/role/lifecycle and
+' its own real graph edges (which chunk IDs it names as implementations/interfaces). What those
+' referenced IMPLEMENTATION/INTERFACE/CAPABILITY_REQUEST chunks actually CONTAIN is real,
+' separate work for Phases 5/8/9 -- Phase 4 only confirms the graph itself is well-formed.
+'
+' MANIFEST chunk content (76-byte fixed portion, then three variable regions in this order):
+'   +0  AssemblyIDHigh          U64
+'   +8  AssemblyIDLow           U64
+'   +16 VersionMajor            U32
+'   +20 VersionMinor            U32
+'   +24 VersionPatch            U32
+'   +28 BuildIDHigh             U64
+'   +36 BuildIDLow              U64
+'   +44 RequiredFormatMajor     U32
+'   +48 RequiredFormatMinor     U32
+'   +52 RequiredAbiMajor        U32
+'   +56 RequiredAbiMinor        U32
+'   +60 RootComponentID         U32
+'   +64 DeclaredComponentCount  U32
+'   +68 DisplayNameLength       U32
+'   +72 CanonicalNameLength     U32
+'   +76 DeclaredComponentIDs    DeclaredComponentCount x U32
+'   ..  DisplayName             DisplayNameLength bytes
+'   ..  CanonicalName           CanonicalNameLength bytes
+'
+' COMPONENT chunk content (44-byte fixed portion, then three variable ID lists then a name):
+'   +0  ComponentID              U32
+'   +4  OwningAssemblyIDHigh     U64
+'   +12 OwningAssemblyIDLow      U64
+'   +20 ComponentRole            U32
+'   +24 LifecyclePolicy          U32  (0=EAGER 1=LAZY 2=ON_DEMAND 3=SERVICE_BOUND 4=OPTIONAL)
+'   +28 ImplementationCount      U32
+'   +32 ProvidedInterfaceCount   U32
+'   +36 RequiredInterfaceCount   U32
+'   +40 NameLength               U32
+'   +44 ImplementationIDs        ImplementationCount x U32
+'   ..  ProvidedInterfaceIDs     ProvidedInterfaceCount x U32
+'   ..  RequiredInterfaceIDs     RequiredInterfaceCount x U32
+'   ..  Name                     NameLength bytes
+' ==========================================================================================
+
+FUNCTION AexErrorMissingManifest() AS U32
+    RETURN 8
+END FUNCTION
+FUNCTION AexErrorManifestOutOfBounds() AS U32
+    RETURN 9
+END FUNCTION
+FUNCTION AexErrorRootComponentNotDeclared() AS U32
+    RETURN 10
+END FUNCTION
+FUNCTION AexErrorMissingRequiredComponent() AS U32
+    RETURN 11
+END FUNCTION
+FUNCTION AexErrorComponentAssemblyMismatch() AS U32
+    RETURN 12
+END FUNCTION
+FUNCTION AexErrorComponentOutOfBounds() AS U32
+    RETURN 13
+END FUNCTION
+
+FUNCTION AexManifestFixedSize() AS U32
+    RETURN 76
+END FUNCTION
+FUNCTION AexReadManifestAssemblyIDHigh(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(data)
+END FUNCTION
+FUNCTION AexReadManifestAssemblyIDLow(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 8))
+END FUNCTION
+FUNCTION AexReadManifestVersionMajor(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 16))
+END FUNCTION
+FUNCTION AexReadManifestVersionMinor(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 20))
+END FUNCTION
+FUNCTION AexReadManifestVersionPatch(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 24))
+END FUNCTION
+FUNCTION AexReadManifestBuildIDHigh(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 28))
+END FUNCTION
+FUNCTION AexReadManifestBuildIDLow(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 36))
+END FUNCTION
+FUNCTION AexReadManifestRequiredFormatMajor(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 44))
+END FUNCTION
+FUNCTION AexReadManifestRequiredFormatMinor(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 48))
+END FUNCTION
+FUNCTION AexReadManifestRequiredAbiMajor(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 52))
+END FUNCTION
+FUNCTION AexReadManifestRequiredAbiMinor(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 56))
+END FUNCTION
+FUNCTION AexReadManifestRootComponentID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 60))
+END FUNCTION
+FUNCTION AexReadManifestDeclaredComponentCount(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 64))
+END FUNCTION
+FUNCTION AexReadManifestDisplayNameLength(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 68))
+END FUNCTION
+FUNCTION AexReadManifestCanonicalNameLength(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 72))
+END FUNCTION
+FUNCTION AexManifestDeclaredComponentIDAt(data AS MMIOPTR, index AS U32) AS U32
+    LET indexAsU64 AS U64 = index
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 76 + (indexAsU64 * 4)))
+END FUNCTION
+
+FUNCTION AexComponentFixedSize() AS U32
+    RETURN 44
+END FUNCTION
+FUNCTION AexReadComponentID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(data)
+END FUNCTION
+FUNCTION AexReadComponentAssemblyIDHigh(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 4))
+END FUNCTION
+FUNCTION AexReadComponentAssemblyIDLow(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 12))
+END FUNCTION
+FUNCTION AexReadComponentRole(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 20))
+END FUNCTION
+FUNCTION AexReadComponentLifecycle(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 24))
+END FUNCTION
+FUNCTION AexReadComponentImplementationCount(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 28))
+END FUNCTION
+FUNCTION AexReadComponentProvidedInterfaceCount(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 32))
+END FUNCTION
+FUNCTION AexReadComponentRequiredInterfaceCount(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 36))
+END FUNCTION
+FUNCTION AexReadComponentNameLength(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 40))
+END FUNCTION
+
+' Real, per-component validation: resolves componentID through the SAME chunk directory (a
+' component is just another chunk), confirms its real type, bounds-checks its own three variable
+' ID lists plus name against its own real LogicalLength (identical overflow-safe discipline to
+' AEX.ValidateDirectory), and confirms the component's own recorded owning assembly actually
+' matches the manifest that declared it -- Section 14.2's "canonical identity SHALL combine
+' assembly identity and component identity" made a real, checked invariant instead of a
+' documentation-only promise.
+FUNCTION AexValidateOneComponent(buffer AS MMIOPTR, componentID AS U32, expectAssemblyHigh AS U64, expectAssemblyLow AS U64, fileLength AS U64) AS U32
+    LET componentEntry AS MMIOPTR = AexFindChunkByID(buffer, componentID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingRequiredComponent()
+    END IF
+    LET typeHigh AS U64 = AexReadEntryTypeHigh(componentEntry)
+    LET typeLow AS U64 = AexReadEntryTypeLow(componentEntry)
+    IF typeHigh <> AexTypeComponentHigh() THEN
+        RETURN AexErrorMissingRequiredComponent()
+    END IF
+    IF typeLow <> AexTypeComponentLow() THEN
+        RETURN AexErrorMissingRequiredComponent()
+    END IF
+
+    LET componentOffset AS U64 = AexReadEntryOffset(componentEntry)
+    LET componentLogicalLength AS U64 = AexReadEntryLogicalLength(componentEntry)
+    LET componentData AS MMIOPTR = ADDRESS.Offset(buffer, componentOffset)
+
+    LET fixedSize AS U64 = AexComponentFixedSize()
+    IF componentLogicalLength < fixedSize THEN
+        RETURN AexErrorComponentOutOfBounds()
+    END IF
+
+    LET implCount AS U32 = AexReadComponentImplementationCount(componentData)
+    LET providedCount AS U32 = AexReadComponentProvidedInterfaceCount(componentData)
+    LET requiredCount AS U32 = AexReadComponentRequiredInterfaceCount(componentData)
+    LET nameLen AS U32 = AexReadComponentNameLength(componentData)
+
+    LET implCountAsU64 AS U64 = implCount
+    LET providedCountAsU64 AS U64 = providedCount
+    LET requiredCountAsU64 AS U64 = requiredCount
+    LET nameLenAsU64 AS U64 = nameLen
+
+    LET totalNeeded AS U64 = fixedSize
+
+    IF implCountAsU64 > (AexU64Max() \ 4) THEN
+        RETURN AexErrorComponentOutOfBounds()
+    END IF
+    LET implBytes AS U64 = implCountAsU64 * 4
+    IF totalNeeded > AexU64Max() - implBytes THEN
+        RETURN AexErrorComponentOutOfBounds()
+    END IF
+    totalNeeded = totalNeeded + implBytes
+
+    IF providedCountAsU64 > (AexU64Max() \ 4) THEN
+        RETURN AexErrorComponentOutOfBounds()
+    END IF
+    LET providedBytes AS U64 = providedCountAsU64 * 4
+    IF totalNeeded > AexU64Max() - providedBytes THEN
+        RETURN AexErrorComponentOutOfBounds()
+    END IF
+    totalNeeded = totalNeeded + providedBytes
+
+    IF requiredCountAsU64 > (AexU64Max() \ 4) THEN
+        RETURN AexErrorComponentOutOfBounds()
+    END IF
+    LET requiredBytes AS U64 = requiredCountAsU64 * 4
+    IF totalNeeded > AexU64Max() - requiredBytes THEN
+        RETURN AexErrorComponentOutOfBounds()
+    END IF
+    totalNeeded = totalNeeded + requiredBytes
+
+    IF totalNeeded > AexU64Max() - nameLenAsU64 THEN
+        RETURN AexErrorComponentOutOfBounds()
+    END IF
+    totalNeeded = totalNeeded + nameLenAsU64
+
+    IF totalNeeded > componentLogicalLength THEN
+        RETURN AexErrorComponentOutOfBounds()
+    END IF
+
+    LET ownAssemblyHigh AS U64 = AexReadComponentAssemblyIDHigh(componentData)
+    LET ownAssemblyLow AS U64 = AexReadComponentAssemblyIDLow(componentData)
+    IF ownAssemblyHigh <> expectAssemblyHigh THEN
+        RETURN AexErrorComponentAssemblyMismatch()
+    END IF
+    IF ownAssemblyLow <> expectAssemblyLow THEN
+        RETURN AexErrorComponentAssemblyMismatch()
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+' Phase 4's own real entry point: resolves the header's RootManifestID through the chunk
+' directory, confirms it is genuinely a MANIFEST chunk, bounds-checks the manifest's own three
+' variable regions against its real LogicalLength, confirms the declared root component is
+' actually among the declared components (a real graph-consistency check, not assumed), then
+' validates every declared component in turn. Assumes AEX.ValidateHeader and
+' AEX.ValidateDirectory already passed -- this function trusts the directory only because that
+' already happened.
+FUNCTION AEX.ValidateManifest(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    LET rootManifestID AS U32 = AexReadRootManifestID(buffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(buffer, rootManifestID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingManifest()
+    END IF
+    LET manifestTypeHigh AS U64 = AexReadEntryTypeHigh(manifestEntry)
+    LET manifestTypeLow AS U64 = AexReadEntryTypeLow(manifestEntry)
+    IF manifestTypeHigh <> AexTypeManifestHigh() THEN
+        RETURN AexErrorMissingManifest()
+    END IF
+    IF manifestTypeLow <> AexTypeManifestLow() THEN
+        RETURN AexErrorMissingManifest()
+    END IF
+
+    LET manifestOffset AS U64 = AexReadEntryOffset(manifestEntry)
+    LET manifestLogicalLength AS U64 = AexReadEntryLogicalLength(manifestEntry)
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(buffer, manifestOffset)
+
+    LET fixedSize AS U64 = AexManifestFixedSize()
+    IF manifestLogicalLength < fixedSize THEN
+        RETURN AexErrorManifestOutOfBounds()
+    END IF
+
+    LET declaredCount AS U32 = AexReadManifestDeclaredComponentCount(manifestData)
+    LET displayLen AS U32 = AexReadManifestDisplayNameLength(manifestData)
+    LET canonicalLen AS U32 = AexReadManifestCanonicalNameLength(manifestData)
+
+    LET declaredCountAsU64 AS U64 = declaredCount
+    LET displayLenAsU64 AS U64 = displayLen
+    LET canonicalLenAsU64 AS U64 = canonicalLen
+
+    IF declaredCountAsU64 > (AexU64Max() \ 4) THEN
+        RETURN AexErrorManifestOutOfBounds()
+    END IF
+    LET declaredBytes AS U64 = declaredCountAsU64 * 4
+    LET totalNeeded AS U64 = fixedSize
+    IF totalNeeded > AexU64Max() - declaredBytes THEN
+        RETURN AexErrorManifestOutOfBounds()
+    END IF
+    totalNeeded = totalNeeded + declaredBytes
+
+    IF totalNeeded > AexU64Max() - displayLenAsU64 THEN
+        RETURN AexErrorManifestOutOfBounds()
+    END IF
+    totalNeeded = totalNeeded + displayLenAsU64
+
+    IF totalNeeded > AexU64Max() - canonicalLenAsU64 THEN
+        RETURN AexErrorManifestOutOfBounds()
+    END IF
+    totalNeeded = totalNeeded + canonicalLenAsU64
+
+    IF totalNeeded > manifestLogicalLength THEN
+        RETURN AexErrorManifestOutOfBounds()
+    END IF
+
+    LET rootComponentID AS U32 = AexReadManifestRootComponentID(manifestData)
+    LET foundRoot AS BOOL = 0
+    LET i AS U32 = 0
+    WHILE i < declaredCount
+        LET candidateID AS U32 = AexManifestDeclaredComponentIDAt(manifestData, i)
+        IF candidateID = rootComponentID THEN
+            foundRoot = 1
+        END IF
+        i = i + 1
+    WEND
+    IF foundRoot = 0 THEN
+        RETURN AexErrorRootComponentNotDeclared()
+    END IF
+
+    LET assemblyHigh AS U64 = AexReadManifestAssemblyIDHigh(manifestData)
+    LET assemblyLow AS U64 = AexReadManifestAssemblyIDLow(manifestData)
+
+    LET j AS U32 = 0
+    WHILE j < declaredCount
+        LET componentID AS U32 = AexManifestDeclaredComponentIDAt(manifestData, j)
+        LET componentResult AS U32 = AexValidateOneComponent(buffer, componentID, assemblyHigh, assemblyLow, fileLength)
+        IF componentResult <> AexErrorOk() THEN
+            RETURN componentResult
+        END IF
+        j = j + 1
+    WEND
+
+    RETURN AexErrorOk()
+END FUNCTION
