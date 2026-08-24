@@ -1,0 +1,2982 @@
+' RFC-0046 AEX Phase 1-3 real test fixture -- loads real, byte-exact .aex test files
+' (built offline by gen_aex_fixtures.py, matching Section 56's own fixture-list spirit)
+' directly into scratch memory and runs AEX.ValidateHeader / AEX.ValidateDirectory
+' against each, comparing the real returned error code to what each fixture is
+' deliberately malformed (or not) to produce. In-memory only for Phase 1-3's own real
+' scope -- ArcFS-backed loading is Phase 6, a real, separate, later increment.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION AexHeaderSize() AS U32
+    RETURN 64
+END FUNCTION
+FUNCTION AexDirectoryEntryStride() AS U32
+    RETURN 96
+END FUNCTION
+FUNCTION AexFormatMajorCurrent() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexFormatMinorCurrent() AS U32
+    RETURN 0
+END FUNCTION
+FUNCTION AexU64Max() AS U64
+    RETURN 18446744073709551615
+END FUNCTION
+
+' ==========================================================================================
+' Bootstrap header: magic check and field readers
+' ==========================================================================================
+
+FUNCTION AexCheckMagic(buffer AS MMIOPTR) AS BOOL
+    ' "ARCOAEX\0"
+    IF MEMORY.Read8(buffer) <> 65 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 1)) <> 82 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 2)) <> 67 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 3)) <> 79 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 4)) <> 65 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 5)) <> 69 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 6)) <> 88 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 7)) <> 0 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION AexReadFormatVersion(buffer AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(buffer, 8))
+END FUNCTION
+FUNCTION AexFormatMajorOf(version AS U32) AS U32
+    RETURN version SHR 16
+END FUNCTION
+FUNCTION AexFormatMinorOf(version AS U32) AS U32
+    RETURN version AND 65535
+END FUNCTION
+FUNCTION AexReadHeaderSize(buffer AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(buffer, 12))
+END FUNCTION
+FUNCTION AexReadAssemblyIDHigh(buffer AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(buffer, 16))
+END FUNCTION
+FUNCTION AexReadAssemblyIDLow(buffer AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(buffer, 24))
+END FUNCTION
+FUNCTION AexReadDirectoryOffset(buffer AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(buffer, 32))
+END FUNCTION
+FUNCTION AexReadDirectoryCount(buffer AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(buffer, 40))
+END FUNCTION
+FUNCTION AexReadRootManifestID(buffer AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(buffer, 44))
+END FUNCTION
+FUNCTION AexReadHeaderFlags(buffer AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(buffer, 48))
+END FUNCTION
+
+' ==========================================================================================
+' Real loader error classes (Section 38's own spirit: deterministic, specific, not a bare
+' boolean). 0 always means success.
+' ==========================================================================================
+
+FUNCTION AexErrorOk() AS U32
+    RETURN 0
+END FUNCTION
+FUNCTION AexErrorBadMagic() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexErrorUnsupportedFormatVersion() AS U32
+    RETURN 2
+END FUNCTION
+FUNCTION AexErrorBadHeaderSize() AS U32
+    RETURN 3
+END FUNCTION
+FUNCTION AexErrorDirectoryOutOfBounds() AS U32
+    RETURN 4
+END FUNCTION
+FUNCTION AexErrorChunkOutOfBounds() AS U32
+    RETURN 5
+END FUNCTION
+FUNCTION AexErrorUnknownRequiredChunkType() AS U32
+    RETURN 6
+END FUNCTION
+FUNCTION AexErrorBadAlignment() AS U32
+    RETURN 7
+END FUNCTION
+
+' Phase 2: Bootstrap header validation. Checks magic, format compatibility, declared header
+' size, and that the chunk directory itself (offset + count*stride) fits within the real file
+' length -- all before a single byte of the directory or any chunk is trusted. fileLength is the
+' real, independently-known size of the loaded buffer (never taken from inside the file itself).
+FUNCTION AEX.ValidateHeader(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    IF AexCheckMagic(buffer) = 0 THEN
+        RETURN AexErrorBadMagic()
+    END IF
+
+    LET version AS U32 = AexReadFormatVersion(buffer)
+    IF AexFormatMajorOf(version) <> AexFormatMajorCurrent() THEN
+        RETURN AexErrorUnsupportedFormatVersion()
+    END IF
+
+    LET headerSize AS U32 = AexReadHeaderSize(buffer)
+    IF headerSize <> AexHeaderSize() THEN
+        RETURN AexErrorBadHeaderSize()
+    END IF
+    LET headerSizeAsU64 AS U64 = headerSize
+    IF fileLength < headerSizeAsU64 THEN
+        RETURN AexErrorBadHeaderSize()
+    END IF
+
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET dirCountAsU64 AS U64 = dirCount
+    LET strideAsU64 AS U64 = AexDirectoryEntryStride()
+
+    ' Real overflow-safe bounds check: dirOffset + dirCount*stride must not wrap, and must fit
+    ' within fileLength -- the same "check before adding" discipline this project's own Physical
+    ' Region Database allocator already established (RegionEnd's own overflow guard).
+    IF dirCountAsU64 > 0 THEN
+        IF strideAsU64 > (AexU64Max() \ dirCountAsU64) THEN
+            RETURN AexErrorDirectoryOutOfBounds()
+        END IF
+    END IF
+    LET dirByteLength AS U64 = dirCountAsU64 * strideAsU64
+    IF dirOffset > AexU64Max() - dirByteLength THEN
+        RETURN AexErrorDirectoryOutOfBounds()
+    END IF
+    LET dirEnd AS U64 = dirOffset + dirByteLength
+    IF dirEnd > fileLength THEN
+        RETURN AexErrorDirectoryOutOfBounds()
+    END IF
+    IF dirOffset < headerSizeAsU64 THEN
+        RETURN AexErrorDirectoryOutOfBounds()
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+' ==========================================================================================
+' Chunk directory entries
+' ==========================================================================================
+
+FUNCTION AexDirectoryEntryAddress(buffer AS MMIOPTR, dirOffset AS U64, index AS U32) AS MMIOPTR
+    LET indexAsU64 AS U64 = index
+    LET strideAsU64 AS U64 = AexDirectoryEntryStride()
+    RETURN ADDRESS.Offset(buffer, dirOffset + (indexAsU64 * strideAsU64))
+END FUNCTION
+
+FUNCTION AexReadEntryChunkID(entry AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(entry)
+END FUNCTION
+FUNCTION AexReadEntryTypeHigh(entry AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(entry, 4))
+END FUNCTION
+FUNCTION AexReadEntryTypeLow(entry AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(entry, 12))
+END FUNCTION
+FUNCTION AexReadEntryFlags(entry AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(entry, 20))
+END FUNCTION
+FUNCTION AexReadEntryOffset(entry AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(entry, 24))
+END FUNCTION
+FUNCTION AexReadEntryStoredLength(entry AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(entry, 32))
+END FUNCTION
+FUNCTION AexReadEntryLogicalLength(entry AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(entry, 40))
+END FUNCTION
+FUNCTION AexReadEntryAlignment(entry AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(entry, 48))
+END FUNCTION
+FUNCTION AexReadEntryEncoding(entry AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(entry, 52))
+END FUNCTION
+FUNCTION AexEntryIsRequired(entry AS MMIOPTR) AS BOOL
+    LET entryFlags AS U32 = AexReadEntryFlags(entry)
+    IF (entryFlags AND 1) <> 0 THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+' ==========================================================================================
+' Standard AEX v1 chunk type identifiers (Section 11), real name-based UUIDv5 values --
+' reproducible, not arbitrary: uuid.uuid5(NAMESPACE, "<TYPE NAME>") against a fixed, documented
+' namespace UUID (6f5a2b3c-6e91-4f7a-9b3d-1a2c4e5f6081), computed once offline. Section 10.1
+' explicitly requires a "large, collision-resistant namespace" and rules out a small enum as the
+' sole mechanism -- this is that namespace, not a placeholder.
+' ==========================================================================================
+
+FUNCTION AexTypeManifestHigh() AS U64
+    RETURN 14719843082355629295
+END FUNCTION
+FUNCTION AexTypeManifestLow() AS U64
+    RETURN 9271930309043522079
+END FUNCTION
+FUNCTION AexTypeComponentHigh() AS U64
+    RETURN 17360645306394565346
+END FUNCTION
+FUNCTION AexTypeComponentLow() AS U64
+    RETURN 10985166509681775976
+END FUNCTION
+FUNCTION AexTypeImplementationHigh() AS U64
+    RETURN 7866732109378180226
+END FUNCTION
+FUNCTION AexTypeImplementationLow() AS U64
+    RETURN 11707123199072077656
+END FUNCTION
+FUNCTION AexTypeCodeHigh() AS U64
+    RETURN 859404424522585693
+END FUNCTION
+FUNCTION AexTypeCodeLow() AS U64
+    RETURN 12635621945936320080
+END FUNCTION
+FUNCTION AexTypeDataHigh() AS U64
+    RETURN 3615471906802654651
+END FUNCTION
+FUNCTION AexTypeDataLow() AS U64
+    RETURN 10345390336377140389
+END FUNCTION
+FUNCTION AexTypeResourceHigh() AS U64
+    RETURN 5222799288954347266
+END FUNCTION
+FUNCTION AexTypeResourceLow() AS U64
+    RETURN 13099566529540005749
+END FUNCTION
+FUNCTION AexTypeInterfaceHigh() AS U64
+    RETURN 5188981897502022009
+END FUNCTION
+FUNCTION AexTypeInterfaceLow() AS U64
+    RETURN 9356764828807109312
+END FUNCTION
+FUNCTION AexTypeRequirementHigh() AS U64
+    RETURN 16336843977330678789
+END FUNCTION
+FUNCTION AexTypeRequirementLow() AS U64
+    RETURN 12837214165910454027
+END FUNCTION
+FUNCTION AexTypeCapabilityRequestHigh() AS U64
+    RETURN 12856951402654093542
+END FUNCTION
+FUNCTION AexTypeCapabilityRequestLow() AS U64
+    RETURN 9717357363546278734
+END FUNCTION
+FUNCTION AexTypeArcoBindingHigh() AS U64
+    RETURN 3383338636804706761
+END FUNCTION
+FUNCTION AexTypeArcoBindingLow() AS U64
+    RETURN 10373826175911607214
+END FUNCTION
+FUNCTION AexTypeLifecycleHigh() AS U64
+    RETURN 11836149854792734762
+END FUNCTION
+FUNCTION AexTypeLifecycleLow() AS U64
+    RETURN 12071940426696027757
+END FUNCTION
+FUNCTION AexTypeMemoryPolicyHigh() AS U64
+    RETURN 8487650950097361309
+END FUNCTION
+FUNCTION AexTypeMemoryPolicyLow() AS U64
+    RETURN 10360956938434793214
+END FUNCTION
+FUNCTION AexTypeDiagnosticHigh() AS U64
+    RETURN 17590739986515580581
+END FUNCTION
+FUNCTION AexTypeDiagnosticLow() AS U64
+    RETURN 13035724507959637328
+END FUNCTION
+FUNCTION AexTypeSymbolHigh() AS U64
+    RETURN 7765587605643352733
+END FUNCTION
+FUNCTION AexTypeSymbolLow() AS U64
+    RETURN 12686448849480363835
+END FUNCTION
+FUNCTION AexTypeRecoveryHigh() AS U64
+    RETURN 7906943963867533620
+END FUNCTION
+FUNCTION AexTypeRecoveryLow() AS U64
+    RETURN 12296157333266628153
+END FUNCTION
+FUNCTION AexTypeIntegrityHigh() AS U64
+    RETURN 5265016724168201421
+END FUNCTION
+FUNCTION AexTypeIntegrityLow() AS U64
+    RETURN 11438856236987991108
+END FUNCTION
+FUNCTION AexTypeSignatureHigh() AS U64
+    RETURN 2858157070238898764
+END FUNCTION
+FUNCTION AexTypeSignatureLow() AS U64
+    RETURN 11055745981261010592
+END FUNCTION
+
+' Real membership test against every standard v1 chunk type. Deliberately a flat, repetitive
+' chain of comparisons rather than a lookup table -- there is no array-of-records primitive on
+' this backend cheap enough to justify one for a fixed 17-entry constant set, and a flat chain
+' is trivially auditable against Section 11's own list, one line per type.
+FUNCTION AexIsKnownChunkType(typeHigh AS U64, typeLow AS U64) AS BOOL
+    IF typeHigh = AexTypeManifestHigh() THEN
+        IF typeLow = AexTypeManifestLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeComponentHigh() THEN
+        IF typeLow = AexTypeComponentLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeImplementationHigh() THEN
+        IF typeLow = AexTypeImplementationLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeCodeHigh() THEN
+        IF typeLow = AexTypeCodeLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeDataHigh() THEN
+        IF typeLow = AexTypeDataLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeResourceHigh() THEN
+        IF typeLow = AexTypeResourceLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeInterfaceHigh() THEN
+        IF typeLow = AexTypeInterfaceLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeRequirementHigh() THEN
+        IF typeLow = AexTypeRequirementLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeCapabilityRequestHigh() THEN
+        IF typeLow = AexTypeCapabilityRequestLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeArcoBindingHigh() THEN
+        IF typeLow = AexTypeArcoBindingLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeLifecycleHigh() THEN
+        IF typeLow = AexTypeLifecycleLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeMemoryPolicyHigh() THEN
+        IF typeLow = AexTypeMemoryPolicyLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeDiagnosticHigh() THEN
+        IF typeLow = AexTypeDiagnosticLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeSymbolHigh() THEN
+        IF typeLow = AexTypeSymbolLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeRecoveryHigh() THEN
+        IF typeLow = AexTypeRecoveryLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeIntegrityHigh() THEN
+        IF typeLow = AexTypeIntegrityLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    IF typeHigh = AexTypeSignatureHigh() THEN
+        IF typeLow = AexTypeSignatureLow() THEN
+            RETURN 1
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Phase 3: Chunk directory validation (Section 10.3). For every entry: offset/storedLength must
+' not overflow, offset+storedLength must fit within the file, alignment must be a real power of
+' two the offset actually satisfies, and an unknown REQUIRED chunk type fails closed while an
+' unknown OPTIONAL one is a real, deliberate no-op (Section 10.2). Assumes AEX.ValidateHeader
+' already passed -- this function trusts dirOffset/dirCount only because that already happened.
+FUNCTION AEX.ValidateDirectory(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+
+    WHILE index < dirCount
+        LET entry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        LET chunkOffset AS U64 = AexReadEntryOffset(entry)
+        LET storedLength AS U64 = AexReadEntryStoredLength(entry)
+        LET alignment AS U32 = AexReadEntryAlignment(entry)
+
+        IF chunkOffset > AexU64Max() - storedLength THEN
+            RETURN AexErrorChunkOutOfBounds()
+        END IF
+        LET chunkEnd AS U64 = chunkOffset + storedLength
+        IF chunkEnd > fileLength THEN
+            RETURN AexErrorChunkOutOfBounds()
+        END IF
+
+        ' Alignment must be a real power of two (0 is treated as "no requirement", matching
+        ' bytewise-anything storage) and the chunk's own offset must actually satisfy it.
+        IF alignment > 1 THEN
+            IF (alignment AND (alignment - 1)) <> 0 THEN
+                RETURN AexErrorBadAlignment()
+            END IF
+            LET alignmentAsU64 AS U64 = alignment
+            IF (chunkOffset MOD alignmentAsU64) <> 0 THEN
+                RETURN AexErrorBadAlignment()
+            END IF
+        END IF
+
+        LET required AS BOOL = AexEntryIsRequired(entry)
+        IF required = 1 THEN
+            LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+            LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+            IF AexIsKnownChunkType(typeHigh, typeLow) = 0 THEN
+                RETURN AexErrorUnknownRequiredChunkType()
+            END IF
+        END IF
+
+        index = index + 1
+    WEND
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+' Real chunk lookup by ChunkID (used to resolve RootManifestID from the header into an actual
+' directory entry). Returns AexDirectoryEntryStride()-sentinel... no -- returns the real found
+' entry address, or the buffer's own base address is never a valid "not found" sentinel, so a
+' separate BOOL out-of-band signal is needed. Matches this project's own established "staged
+' result, caller checks a companion flag" idiom (RFC-0007's own RPM staging pattern) rather than
+' inventing a fragile sentinel address.
+FUNCTION AexFindChunkFoundAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(60817408))   ' 0x3A00000, a tiny 4-byte scratch flag
+END FUNCTION
+
+FUNCTION AexFindChunkByID(buffer AS MMIOPTR, wantChunkID AS U32) AS MMIOPTR
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+    MEMORY.Write32(AexFindChunkFoundAddress(), 0)
+
+    WHILE index < dirCount
+        LET entry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        IF AexReadEntryChunkID(entry) = wantChunkID THEN
+            MEMORY.Write32(AexFindChunkFoundAddress(), 1)
+            RETURN entry
+        END IF
+        index = index + 1
+    WEND
+
+    RETURN buffer
+END FUNCTION
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText(a AS U32, b AS U32, c AS U32, d AS U32, e AS U32) AS U64
+    LET aByte AS U8 = a
+    LET bByte AS U8 = b
+    LET cByte AS U8 = c
+    LET dByte AS U8 = d
+    LET eByte AS U8 = e
+    SerialByte(aByte)
+    SerialByte(bByte)
+    SerialByte(cByte)
+    SerialByte(dByte)
+    SerialByte(eByte)
+    RETURN 0
+END FUNCTION
+
+FUNCTION ValidMinimalBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61865984))
+END FUNCTION
+FUNCTION ValidMinimalFileLength() AS U64
+    RETURN 212
+END FUNCTION
+FUNCTION WriteValidMinimalPart0() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 7), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 8), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 9), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 10), 1)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 11), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 12), 64)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 13), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 14), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 15), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 16), 17)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 17), 17)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 18), 17)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 19), 17)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 20), 17)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 21), 17)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 22), 17)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 23), 17)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 24), 34)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 25), 34)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 26), 34)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 27), 34)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 28), 34)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 29), 34)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 30), 34)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 31), 34)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 32), 64)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 33), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 34), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 35), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 36), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 37), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 38), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 39), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteValidMinimalPart1() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 40), 1)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 41), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 42), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 43), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 44), 1)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 45), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 46), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 47), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 48), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 49), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 50), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 51), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 52), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 53), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 54), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 55), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 56), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 57), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 58), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 59), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 60), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 61), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 62), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 63), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 64), 1)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 65), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 66), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 67), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 68), 239)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 69), 92)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 70), 76)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 71), 89)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 72), 75)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 73), 99)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 74), 71)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 75), 204)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 76), 31)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 77), 138)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 78), 183)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 79), 196)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteValidMinimalPart2() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 80), 125)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 81), 131)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 82), 172)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 83), 128)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 84), 1)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 85), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 86), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 87), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 88), 160)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 89), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 90), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 91), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 92), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 93), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 94), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 95), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 96), 52)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 97), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 98), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 99), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 100), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 101), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 102), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 103), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 104), 52)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 105), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 106), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 107), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 108), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 109), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 110), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 111), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 112), 1)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 113), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 114), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 115), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 116), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 117), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 118), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 119), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteValidMinimalPart3() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 120), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 121), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 122), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 123), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 124), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 125), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 126), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 127), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 128), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 129), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 130), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 131), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 132), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 133), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 134), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 135), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 136), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 137), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 138), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 139), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 140), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 141), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 142), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 143), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 144), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 145), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 146), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 147), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 148), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 149), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 150), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 151), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 152), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 153), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 154), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 155), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 156), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 157), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 158), 0)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 159), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteValidMinimalPart4() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 160), 77)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 161), 65)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 162), 78)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 163), 73)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 164), 70)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 165), 69)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 166), 83)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 167), 84)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 168), 45)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 169), 80)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 170), 76)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 171), 65)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 172), 67)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 173), 69)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 174), 72)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 175), 79)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 176), 76)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 177), 68)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 178), 69)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 179), 82)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 180), 45)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 181), 80)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 182), 72)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 183), 65)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 184), 83)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 185), 69)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 186), 49)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 187), 45)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 188), 51)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 189), 45)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 190), 68)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 191), 79)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 192), 69)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 193), 83)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 194), 45)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 195), 78)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 196), 79)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 197), 84)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 198), 45)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 199), 80)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteValidMinimalPart5() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 200), 65)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 201), 82)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 202), 83)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 203), 69)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 204), 45)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 205), 67)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 206), 79)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 207), 78)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 208), 84)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 209), 69)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 210), 78)
+    MEMORY.Write8(ADDRESS.Offset(ValidMinimalBufferAddress(), 211), 84)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteValidMinimal() AS U64
+    WriteValidMinimalPart0()
+    WriteValidMinimalPart1()
+    WriteValidMinimalPart2()
+    WriteValidMinimalPart3()
+    WriteValidMinimalPart4()
+    WriteValidMinimalPart5()
+    RETURN 0
+END FUNCTION
+
+FUNCTION InvalidMagicBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61931520))
+END FUNCTION
+FUNCTION InvalidMagicFileLength() AS U64
+    RETURN 212
+END FUNCTION
+FUNCTION WriteInvalidMagicPart0() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 0), 88)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 7), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 8), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 9), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 10), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 11), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 12), 64)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 13), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 14), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 15), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 16), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 17), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 18), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 19), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 20), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 21), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 22), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 23), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 24), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 25), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 26), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 27), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 28), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 29), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 30), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 31), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 32), 64)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 33), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 34), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 35), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 36), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 37), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 38), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 39), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidMagicPart1() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 40), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 41), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 42), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 43), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 44), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 45), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 46), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 47), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 48), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 49), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 50), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 51), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 52), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 53), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 54), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 55), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 56), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 57), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 58), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 59), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 60), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 61), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 62), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 63), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 64), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 65), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 66), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 67), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 68), 239)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 69), 92)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 70), 76)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 71), 89)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 72), 75)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 73), 99)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 74), 71)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 75), 204)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 76), 31)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 77), 138)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 78), 183)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 79), 196)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidMagicPart2() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 80), 125)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 81), 131)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 82), 172)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 83), 128)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 84), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 85), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 86), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 87), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 88), 160)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 89), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 90), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 91), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 92), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 93), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 94), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 95), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 96), 52)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 97), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 98), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 99), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 100), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 101), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 102), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 103), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 104), 52)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 105), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 106), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 107), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 108), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 109), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 110), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 111), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 112), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 113), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 114), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 115), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 116), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 117), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 118), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 119), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidMagicPart3() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 120), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 121), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 122), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 123), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 124), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 125), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 126), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 127), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 128), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 129), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 130), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 131), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 132), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 133), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 134), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 135), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 136), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 137), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 138), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 139), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 140), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 141), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 142), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 143), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 144), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 145), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 146), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 147), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 148), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 149), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 150), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 151), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 152), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 153), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 154), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 155), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 156), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 157), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 158), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 159), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidMagicPart4() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 160), 77)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 161), 65)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 162), 78)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 163), 73)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 164), 70)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 165), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 166), 83)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 167), 84)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 168), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 169), 80)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 170), 76)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 171), 65)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 172), 67)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 173), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 174), 72)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 175), 79)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 176), 76)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 177), 68)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 178), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 179), 82)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 180), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 181), 80)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 182), 72)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 183), 65)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 184), 83)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 185), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 186), 49)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 187), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 188), 51)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 189), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 190), 68)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 191), 79)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 192), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 193), 83)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 194), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 195), 78)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 196), 79)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 197), 84)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 198), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 199), 80)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidMagicPart5() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 200), 65)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 201), 82)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 202), 83)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 203), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 204), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 205), 67)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 206), 79)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 207), 78)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 208), 84)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 209), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 210), 78)
+    MEMORY.Write8(ADDRESS.Offset(InvalidMagicBufferAddress(), 211), 84)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidMagic() AS U64
+    WriteInvalidMagicPart0()
+    WriteInvalidMagicPart1()
+    WriteInvalidMagicPart2()
+    WriteInvalidMagicPart3()
+    WriteInvalidMagicPart4()
+    WriteInvalidMagicPart5()
+    RETURN 0
+END FUNCTION
+
+FUNCTION InvalidHeaderSizeBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61997056))
+END FUNCTION
+FUNCTION InvalidHeaderSizeFileLength() AS U64
+    RETURN 212
+END FUNCTION
+FUNCTION WriteInvalidHeaderSizePart0() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 7), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 8), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 9), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 10), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 11), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 12), 32)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 13), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 14), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 15), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 16), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 17), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 18), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 19), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 20), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 21), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 22), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 23), 17)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 24), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 25), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 26), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 27), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 28), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 29), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 30), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 31), 34)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 32), 64)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 33), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 34), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 35), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 36), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 37), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 38), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 39), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidHeaderSizePart1() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 40), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 41), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 42), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 43), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 44), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 45), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 46), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 47), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 48), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 49), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 50), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 51), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 52), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 53), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 54), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 55), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 56), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 57), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 58), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 59), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 60), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 61), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 62), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 63), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 64), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 65), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 66), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 67), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 68), 239)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 69), 92)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 70), 76)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 71), 89)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 72), 75)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 73), 99)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 74), 71)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 75), 204)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 76), 31)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 77), 138)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 78), 183)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 79), 196)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidHeaderSizePart2() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 80), 125)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 81), 131)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 82), 172)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 83), 128)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 84), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 85), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 86), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 87), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 88), 160)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 89), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 90), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 91), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 92), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 93), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 94), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 95), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 96), 52)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 97), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 98), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 99), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 100), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 101), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 102), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 103), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 104), 52)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 105), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 106), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 107), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 108), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 109), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 110), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 111), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 112), 1)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 113), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 114), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 115), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 116), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 117), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 118), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 119), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidHeaderSizePart3() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 120), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 121), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 122), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 123), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 124), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 125), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 126), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 127), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 128), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 129), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 130), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 131), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 132), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 133), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 134), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 135), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 136), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 137), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 138), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 139), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 140), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 141), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 142), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 143), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 144), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 145), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 146), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 147), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 148), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 149), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 150), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 151), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 152), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 153), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 154), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 155), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 156), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 157), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 158), 0)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 159), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidHeaderSizePart4() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 160), 77)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 161), 65)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 162), 78)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 163), 73)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 164), 70)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 165), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 166), 83)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 167), 84)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 168), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 169), 80)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 170), 76)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 171), 65)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 172), 67)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 173), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 174), 72)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 175), 79)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 176), 76)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 177), 68)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 178), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 179), 82)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 180), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 181), 80)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 182), 72)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 183), 65)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 184), 83)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 185), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 186), 49)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 187), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 188), 51)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 189), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 190), 68)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 191), 79)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 192), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 193), 83)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 194), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 195), 78)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 196), 79)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 197), 84)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 198), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 199), 80)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidHeaderSizePart5() AS U64
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 200), 65)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 201), 82)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 202), 83)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 203), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 204), 45)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 205), 67)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 206), 79)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 207), 78)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 208), 84)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 209), 69)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 210), 78)
+    MEMORY.Write8(ADDRESS.Offset(InvalidHeaderSizeBufferAddress(), 211), 84)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteInvalidHeaderSize() AS U64
+    WriteInvalidHeaderSizePart0()
+    WriteInvalidHeaderSizePart1()
+    WriteInvalidHeaderSizePart2()
+    WriteInvalidHeaderSizePart3()
+    WriteInvalidHeaderSizePart4()
+    WriteInvalidHeaderSizePart5()
+    RETURN 0
+END FUNCTION
+
+FUNCTION DirectoryOutOfBoundsBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62062592))
+END FUNCTION
+FUNCTION DirectoryOutOfBoundsFileLength() AS U64
+    RETURN 212
+END FUNCTION
+FUNCTION WriteDirectoryOutOfBoundsPart0() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 7), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 8), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 9), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 10), 1)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 11), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 12), 64)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 13), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 14), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 15), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 16), 17)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 17), 17)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 18), 17)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 19), 17)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 20), 17)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 21), 17)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 22), 17)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 23), 17)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 24), 34)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 25), 34)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 26), 34)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 27), 34)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 28), 34)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 29), 34)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 30), 34)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 31), 34)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 32), 64)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 33), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 34), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 35), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 36), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 37), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 38), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 39), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteDirectoryOutOfBoundsPart1() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 40), 5)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 41), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 42), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 43), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 44), 1)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 45), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 46), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 47), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 48), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 49), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 50), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 51), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 52), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 53), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 54), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 55), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 56), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 57), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 58), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 59), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 60), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 61), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 62), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 63), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 64), 1)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 65), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 66), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 67), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 68), 239)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 69), 92)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 70), 76)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 71), 89)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 72), 75)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 73), 99)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 74), 71)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 75), 204)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 76), 31)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 77), 138)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 78), 183)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 79), 196)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteDirectoryOutOfBoundsPart2() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 80), 125)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 81), 131)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 82), 172)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 83), 128)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 84), 1)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 85), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 86), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 87), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 88), 160)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 89), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 90), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 91), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 92), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 93), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 94), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 95), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 96), 52)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 97), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 98), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 99), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 100), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 101), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 102), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 103), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 104), 52)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 105), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 106), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 107), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 108), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 109), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 110), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 111), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 112), 1)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 113), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 114), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 115), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 116), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 117), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 118), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 119), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteDirectoryOutOfBoundsPart3() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 120), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 121), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 122), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 123), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 124), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 125), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 126), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 127), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 128), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 129), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 130), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 131), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 132), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 133), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 134), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 135), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 136), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 137), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 138), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 139), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 140), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 141), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 142), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 143), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 144), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 145), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 146), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 147), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 148), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 149), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 150), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 151), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 152), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 153), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 154), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 155), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 156), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 157), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 158), 0)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 159), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteDirectoryOutOfBoundsPart4() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 160), 77)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 161), 65)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 162), 78)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 163), 73)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 164), 70)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 165), 69)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 166), 83)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 167), 84)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 168), 45)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 169), 80)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 170), 76)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 171), 65)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 172), 67)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 173), 69)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 174), 72)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 175), 79)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 176), 76)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 177), 68)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 178), 69)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 179), 82)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 180), 45)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 181), 80)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 182), 72)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 183), 65)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 184), 83)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 185), 69)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 186), 49)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 187), 45)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 188), 51)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 189), 45)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 190), 68)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 191), 79)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 192), 69)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 193), 83)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 194), 45)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 195), 78)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 196), 79)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 197), 84)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 198), 45)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 199), 80)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteDirectoryOutOfBoundsPart5() AS U64
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 200), 65)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 201), 82)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 202), 83)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 203), 69)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 204), 45)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 205), 67)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 206), 79)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 207), 78)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 208), 84)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 209), 69)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 210), 78)
+    MEMORY.Write8(ADDRESS.Offset(DirectoryOutOfBoundsBufferAddress(), 211), 84)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteDirectoryOutOfBounds() AS U64
+    WriteDirectoryOutOfBoundsPart0()
+    WriteDirectoryOutOfBoundsPart1()
+    WriteDirectoryOutOfBoundsPart2()
+    WriteDirectoryOutOfBoundsPart3()
+    WriteDirectoryOutOfBoundsPart4()
+    WriteDirectoryOutOfBoundsPart5()
+    RETURN 0
+END FUNCTION
+
+FUNCTION ChunkOutOfBoundsBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62128128))
+END FUNCTION
+FUNCTION ChunkOutOfBoundsFileLength() AS U64
+    RETURN 212
+END FUNCTION
+FUNCTION WriteChunkOutOfBoundsPart0() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 7), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 8), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 9), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 10), 1)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 11), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 12), 64)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 13), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 14), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 15), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 16), 17)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 17), 17)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 18), 17)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 19), 17)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 20), 17)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 21), 17)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 22), 17)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 23), 17)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 24), 34)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 25), 34)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 26), 34)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 27), 34)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 28), 34)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 29), 34)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 30), 34)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 31), 34)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 32), 64)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 33), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 34), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 35), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 36), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 37), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 38), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 39), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteChunkOutOfBoundsPart1() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 40), 1)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 41), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 42), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 43), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 44), 1)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 45), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 46), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 47), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 48), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 49), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 50), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 51), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 52), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 53), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 54), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 55), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 56), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 57), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 58), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 59), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 60), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 61), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 62), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 63), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 64), 1)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 65), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 66), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 67), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 68), 239)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 69), 92)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 70), 76)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 71), 89)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 72), 75)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 73), 99)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 74), 71)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 75), 204)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 76), 31)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 77), 138)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 78), 183)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 79), 196)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteChunkOutOfBoundsPart2() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 80), 125)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 81), 131)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 82), 172)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 83), 128)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 84), 1)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 85), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 86), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 87), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 88), 160)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 89), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 90), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 91), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 92), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 93), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 94), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 95), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 96), 68)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 97), 39)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 98), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 99), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 100), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 101), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 102), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 103), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 104), 68)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 105), 39)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 106), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 107), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 108), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 109), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 110), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 111), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 112), 1)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 113), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 114), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 115), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 116), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 117), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 118), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 119), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteChunkOutOfBoundsPart3() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 120), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 121), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 122), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 123), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 124), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 125), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 126), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 127), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 128), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 129), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 130), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 131), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 132), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 133), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 134), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 135), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 136), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 137), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 138), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 139), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 140), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 141), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 142), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 143), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 144), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 145), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 146), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 147), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 148), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 149), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 150), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 151), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 152), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 153), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 154), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 155), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 156), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 157), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 158), 0)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 159), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteChunkOutOfBoundsPart4() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 160), 77)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 161), 65)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 162), 78)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 163), 73)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 164), 70)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 165), 69)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 166), 83)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 167), 84)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 168), 45)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 169), 80)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 170), 76)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 171), 65)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 172), 67)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 173), 69)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 174), 72)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 175), 79)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 176), 76)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 177), 68)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 178), 69)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 179), 82)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 180), 45)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 181), 80)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 182), 72)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 183), 65)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 184), 83)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 185), 69)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 186), 49)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 187), 45)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 188), 51)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 189), 45)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 190), 68)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 191), 79)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 192), 69)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 193), 83)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 194), 45)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 195), 78)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 196), 79)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 197), 84)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 198), 45)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 199), 80)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteChunkOutOfBoundsPart5() AS U64
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 200), 65)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 201), 82)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 202), 83)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 203), 69)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 204), 45)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 205), 67)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 206), 79)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 207), 78)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 208), 84)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 209), 69)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 210), 78)
+    MEMORY.Write8(ADDRESS.Offset(ChunkOutOfBoundsBufferAddress(), 211), 84)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteChunkOutOfBounds() AS U64
+    WriteChunkOutOfBoundsPart0()
+    WriteChunkOutOfBoundsPart1()
+    WriteChunkOutOfBoundsPart2()
+    WriteChunkOutOfBoundsPart3()
+    WriteChunkOutOfBoundsPart4()
+    WriteChunkOutOfBoundsPart5()
+    RETURN 0
+END FUNCTION
+
+FUNCTION UnknownOptionalChunkBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62193664))
+END FUNCTION
+FUNCTION UnknownOptionalChunkFileLength() AS U64
+    RETURN 338
+END FUNCTION
+FUNCTION WriteUnknownOptionalChunkPart0() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 7), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 8), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 9), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 10), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 11), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 12), 64)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 13), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 14), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 15), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 16), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 17), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 18), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 19), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 20), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 21), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 22), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 23), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 24), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 25), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 26), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 27), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 28), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 29), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 30), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 31), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 32), 64)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 33), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 34), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 35), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 36), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 37), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 38), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 39), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownOptionalChunkPart1() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 40), 2)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 41), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 42), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 43), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 44), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 45), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 46), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 47), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 48), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 49), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 50), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 51), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 52), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 53), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 54), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 55), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 56), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 57), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 58), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 59), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 60), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 61), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 62), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 63), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 64), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 65), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 66), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 67), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 68), 239)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 69), 92)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 70), 76)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 71), 89)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 72), 75)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 73), 99)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 74), 71)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 75), 204)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 76), 31)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 77), 138)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 78), 183)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 79), 196)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownOptionalChunkPart2() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 80), 125)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 81), 131)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 82), 172)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 83), 128)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 84), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 85), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 86), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 87), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 88), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 89), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 90), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 91), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 92), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 93), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 94), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 95), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 96), 52)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 97), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 98), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 99), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 100), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 101), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 102), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 103), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 104), 52)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 105), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 106), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 107), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 108), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 109), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 110), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 111), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 112), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 113), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 114), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 115), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 116), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 117), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 118), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 119), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownOptionalChunkPart3() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 120), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 121), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 122), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 123), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 124), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 125), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 126), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 127), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 128), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 129), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 130), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 131), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 132), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 133), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 134), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 135), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 136), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 137), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 138), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 139), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 140), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 141), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 142), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 143), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 144), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 145), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 146), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 147), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 148), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 149), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 150), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 151), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 152), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 153), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 154), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 155), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 156), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 157), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 158), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 159), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownOptionalChunkPart4() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 160), 2)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 161), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 162), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 163), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 164), 13)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 165), 240)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 166), 254)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 167), 202)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 168), 239)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 169), 190)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 170), 173)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 171), 222)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 172), 8)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 173), 7)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 174), 6)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 175), 5)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 176), 4)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 177), 3)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 178), 2)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 179), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 180), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 181), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 182), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 183), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 184), 52)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 185), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 186), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 187), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 188), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 189), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 190), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 191), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 192), 30)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 193), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 194), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 195), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 196), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 197), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 198), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 199), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownOptionalChunkPart5() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 200), 30)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 201), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 202), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 203), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 204), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 205), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 206), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 207), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 208), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 209), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 210), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 211), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 212), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 213), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 214), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 215), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 216), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 217), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 218), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 219), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 220), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 221), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 222), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 223), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 224), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 225), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 226), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 227), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 228), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 229), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 230), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 231), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 232), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 233), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 234), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 235), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 236), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 237), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 238), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 239), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownOptionalChunkPart6() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 240), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 241), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 242), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 243), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 244), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 245), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 246), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 247), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 248), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 249), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 250), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 251), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 252), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 253), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 254), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 255), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 256), 77)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 257), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 258), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 259), 73)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 260), 70)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 261), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 262), 83)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 263), 84)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 264), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 265), 80)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 266), 76)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 267), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 268), 67)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 269), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 270), 72)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 271), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 272), 76)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 273), 68)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 274), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 275), 82)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 276), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 277), 80)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 278), 72)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 279), 65)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownOptionalChunkPart7() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 280), 83)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 281), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 282), 49)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 283), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 284), 51)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 285), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 286), 68)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 287), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 288), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 289), 83)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 290), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 291), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 292), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 293), 84)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 294), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 295), 80)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 296), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 297), 82)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 298), 83)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 299), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 300), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 301), 67)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 302), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 303), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 304), 84)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 305), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 306), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 307), 84)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 308), 85)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 309), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 310), 75)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 311), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 312), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 313), 87)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 314), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 315), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 316), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 317), 80)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 318), 84)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 319), 73)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownOptionalChunkPart8() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 320), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 321), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 322), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 323), 76)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 324), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 325), 67)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 326), 72)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 327), 85)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 328), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 329), 75)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 330), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 331), 80)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 332), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 333), 89)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 334), 76)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 335), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 336), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownOptionalChunkBufferAddress(), 337), 68)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownOptionalChunk() AS U64
+    WriteUnknownOptionalChunkPart0()
+    WriteUnknownOptionalChunkPart1()
+    WriteUnknownOptionalChunkPart2()
+    WriteUnknownOptionalChunkPart3()
+    WriteUnknownOptionalChunkPart4()
+    WriteUnknownOptionalChunkPart5()
+    WriteUnknownOptionalChunkPart6()
+    WriteUnknownOptionalChunkPart7()
+    WriteUnknownOptionalChunkPart8()
+    RETURN 0
+END FUNCTION
+
+FUNCTION UnknownRequiredChunkBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62259200))
+END FUNCTION
+FUNCTION UnknownRequiredChunkFileLength() AS U64
+    RETURN 338
+END FUNCTION
+FUNCTION WriteUnknownRequiredChunkPart0() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 7), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 8), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 9), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 10), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 11), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 12), 64)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 13), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 14), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 15), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 16), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 17), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 18), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 19), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 20), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 21), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 22), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 23), 17)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 24), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 25), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 26), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 27), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 28), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 29), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 30), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 31), 34)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 32), 64)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 33), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 34), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 35), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 36), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 37), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 38), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 39), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownRequiredChunkPart1() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 40), 2)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 41), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 42), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 43), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 44), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 45), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 46), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 47), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 48), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 49), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 50), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 51), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 52), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 53), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 54), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 55), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 56), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 57), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 58), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 59), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 60), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 61), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 62), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 63), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 64), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 65), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 66), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 67), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 68), 239)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 69), 92)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 70), 76)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 71), 89)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 72), 75)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 73), 99)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 74), 71)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 75), 204)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 76), 31)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 77), 138)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 78), 183)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 79), 196)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownRequiredChunkPart2() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 80), 125)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 81), 131)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 82), 172)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 83), 128)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 84), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 85), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 86), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 87), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 88), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 89), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 90), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 91), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 92), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 93), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 94), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 95), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 96), 52)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 97), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 98), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 99), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 100), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 101), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 102), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 103), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 104), 52)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 105), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 106), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 107), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 108), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 109), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 110), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 111), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 112), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 113), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 114), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 115), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 116), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 117), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 118), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 119), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownRequiredChunkPart3() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 120), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 121), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 122), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 123), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 124), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 125), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 126), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 127), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 128), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 129), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 130), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 131), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 132), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 133), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 134), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 135), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 136), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 137), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 138), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 139), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 140), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 141), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 142), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 143), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 144), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 145), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 146), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 147), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 148), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 149), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 150), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 151), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 152), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 153), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 154), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 155), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 156), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 157), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 158), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 159), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownRequiredChunkPart4() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 160), 2)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 161), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 162), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 163), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 164), 13)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 165), 240)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 166), 254)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 167), 202)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 168), 239)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 169), 190)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 170), 173)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 171), 222)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 172), 8)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 173), 7)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 174), 6)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 175), 5)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 176), 4)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 177), 3)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 178), 2)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 179), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 180), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 181), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 182), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 183), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 184), 52)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 185), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 186), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 187), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 188), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 189), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 190), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 191), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 192), 30)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 193), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 194), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 195), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 196), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 197), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 198), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 199), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownRequiredChunkPart5() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 200), 30)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 201), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 202), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 203), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 204), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 205), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 206), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 207), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 208), 1)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 209), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 210), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 211), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 212), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 213), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 214), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 215), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 216), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 217), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 218), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 219), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 220), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 221), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 222), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 223), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 224), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 225), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 226), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 227), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 228), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 229), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 230), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 231), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 232), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 233), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 234), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 235), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 236), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 237), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 238), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 239), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownRequiredChunkPart6() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 240), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 241), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 242), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 243), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 244), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 245), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 246), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 247), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 248), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 249), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 250), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 251), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 252), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 253), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 254), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 255), 0)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 256), 77)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 257), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 258), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 259), 73)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 260), 70)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 261), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 262), 83)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 263), 84)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 264), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 265), 80)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 266), 76)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 267), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 268), 67)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 269), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 270), 72)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 271), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 272), 76)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 273), 68)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 274), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 275), 82)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 276), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 277), 80)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 278), 72)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 279), 65)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownRequiredChunkPart7() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 280), 83)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 281), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 282), 49)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 283), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 284), 51)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 285), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 286), 68)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 287), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 288), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 289), 83)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 290), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 291), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 292), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 293), 84)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 294), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 295), 80)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 296), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 297), 82)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 298), 83)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 299), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 300), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 301), 67)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 302), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 303), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 304), 84)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 305), 69)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 306), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 307), 84)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 308), 85)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 309), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 310), 75)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 311), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 312), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 313), 87)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 314), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 315), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 316), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 317), 80)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 318), 84)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 319), 73)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownRequiredChunkPart8() AS U64
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 320), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 321), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 322), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 323), 76)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 324), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 325), 67)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 326), 72)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 327), 85)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 328), 78)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 329), 75)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 330), 45)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 331), 80)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 332), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 333), 89)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 334), 76)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 335), 79)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 336), 65)
+    MEMORY.Write8(ADDRESS.Offset(UnknownRequiredChunkBufferAddress(), 337), 68)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteUnknownRequiredChunk() AS U64
+    WriteUnknownRequiredChunkPart0()
+    WriteUnknownRequiredChunkPart1()
+    WriteUnknownRequiredChunkPart2()
+    WriteUnknownRequiredChunkPart3()
+    WriteUnknownRequiredChunkPart4()
+    WriteUnknownRequiredChunkPart5()
+    WriteUnknownRequiredChunkPart6()
+    WriteUnknownRequiredChunkPart7()
+    WriteUnknownRequiredChunkPart8()
+    RETURN 0
+END FUNCTION
+
+FUNCTION BadAlignmentBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62324736))
+END FUNCTION
+FUNCTION BadAlignmentFileLength() AS U64
+    RETURN 212
+END FUNCTION
+FUNCTION WriteBadAlignmentPart0() AS U64
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 7), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 8), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 9), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 10), 1)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 11), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 12), 64)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 13), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 14), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 15), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 16), 17)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 17), 17)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 18), 17)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 19), 17)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 20), 17)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 21), 17)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 22), 17)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 23), 17)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 24), 34)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 25), 34)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 26), 34)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 27), 34)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 28), 34)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 29), 34)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 30), 34)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 31), 34)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 32), 64)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 33), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 34), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 35), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 36), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 37), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 38), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 39), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteBadAlignmentPart1() AS U64
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 40), 1)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 41), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 42), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 43), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 44), 1)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 45), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 46), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 47), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 48), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 49), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 50), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 51), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 52), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 53), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 54), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 55), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 56), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 57), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 58), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 59), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 60), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 61), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 62), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 63), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 64), 1)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 65), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 66), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 67), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 68), 239)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 69), 92)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 70), 76)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 71), 89)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 72), 75)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 73), 99)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 74), 71)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 75), 204)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 76), 31)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 77), 138)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 78), 183)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 79), 196)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteBadAlignmentPart2() AS U64
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 80), 125)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 81), 131)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 82), 172)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 83), 128)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 84), 1)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 85), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 86), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 87), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 88), 160)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 89), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 90), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 91), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 92), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 93), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 94), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 95), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 96), 52)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 97), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 98), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 99), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 100), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 101), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 102), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 103), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 104), 52)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 105), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 106), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 107), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 108), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 109), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 110), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 111), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 112), 64)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 113), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 114), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 115), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 116), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 117), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 118), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 119), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteBadAlignmentPart3() AS U64
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 120), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 121), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 122), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 123), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 124), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 125), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 126), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 127), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 128), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 129), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 130), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 131), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 132), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 133), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 134), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 135), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 136), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 137), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 138), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 139), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 140), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 141), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 142), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 143), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 144), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 145), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 146), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 147), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 148), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 149), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 150), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 151), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 152), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 153), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 154), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 155), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 156), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 157), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 158), 0)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 159), 0)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteBadAlignmentPart4() AS U64
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 160), 77)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 161), 65)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 162), 78)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 163), 73)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 164), 70)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 165), 69)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 166), 83)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 167), 84)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 168), 45)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 169), 80)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 170), 76)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 171), 65)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 172), 67)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 173), 69)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 174), 72)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 175), 79)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 176), 76)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 177), 68)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 178), 69)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 179), 82)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 180), 45)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 181), 80)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 182), 72)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 183), 65)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 184), 83)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 185), 69)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 186), 49)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 187), 45)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 188), 51)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 189), 45)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 190), 68)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 191), 79)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 192), 69)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 193), 83)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 194), 45)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 195), 78)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 196), 79)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 197), 84)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 198), 45)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 199), 80)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteBadAlignmentPart5() AS U64
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 200), 65)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 201), 82)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 202), 83)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 203), 69)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 204), 45)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 205), 67)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 206), 79)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 207), 78)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 208), 84)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 209), 69)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 210), 78)
+    MEMORY.Write8(ADDRESS.Offset(BadAlignmentBufferAddress(), 211), 84)
+    RETURN 0
+END FUNCTION
+FUNCTION WriteBadAlignment() AS U64
+    WriteBadAlignmentPart0()
+    WriteBadAlignmentPart1()
+    WriteBadAlignmentPart2()
+    WriteBadAlignmentPart3()
+    WriteBadAlignmentPart4()
+    WriteBadAlignmentPart5()
+    RETURN 0
+END FUNCTION
+
+FUNCTION RunValidMinimal() AS BOOL
+    WriteValidMinimal()
+    LET hdrResult AS U32 = AEX.ValidateHeader(ValidMinimalBufferAddress(), ValidMinimalFileLength())
+    IF hdrResult <> 0 THEN
+        RETURN 0
+    END IF
+    LET dirResult AS U32 = AEX.ValidateDirectory(ValidMinimalBufferAddress(), ValidMinimalFileLength())
+    IF dirResult <> 0 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunInvalidMagic() AS BOOL
+    WriteInvalidMagic()
+    LET hdrResult AS U32 = AEX.ValidateHeader(InvalidMagicBufferAddress(), InvalidMagicFileLength())
+    IF hdrResult <> 1 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunInvalidHeaderSize() AS BOOL
+    WriteInvalidHeaderSize()
+    LET hdrResult AS U32 = AEX.ValidateHeader(InvalidHeaderSizeBufferAddress(), InvalidHeaderSizeFileLength())
+    IF hdrResult <> 3 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDirectoryOutOfBounds() AS BOOL
+    WriteDirectoryOutOfBounds()
+    LET hdrResult AS U32 = AEX.ValidateHeader(DirectoryOutOfBoundsBufferAddress(), DirectoryOutOfBoundsFileLength())
+    IF hdrResult <> 4 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunChunkOutOfBounds() AS BOOL
+    WriteChunkOutOfBounds()
+    LET hdrResult AS U32 = AEX.ValidateHeader(ChunkOutOfBoundsBufferAddress(), ChunkOutOfBoundsFileLength())
+    IF hdrResult <> 0 THEN
+        RETURN 0
+    END IF
+    LET dirResult AS U32 = AEX.ValidateDirectory(ChunkOutOfBoundsBufferAddress(), ChunkOutOfBoundsFileLength())
+    IF dirResult <> 5 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunUnknownOptionalChunk() AS BOOL
+    WriteUnknownOptionalChunk()
+    LET hdrResult AS U32 = AEX.ValidateHeader(UnknownOptionalChunkBufferAddress(), UnknownOptionalChunkFileLength())
+    IF hdrResult <> 0 THEN
+        RETURN 0
+    END IF
+    LET dirResult AS U32 = AEX.ValidateDirectory(UnknownOptionalChunkBufferAddress(), UnknownOptionalChunkFileLength())
+    IF dirResult <> 0 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunUnknownRequiredChunk() AS BOOL
+    WriteUnknownRequiredChunk()
+    LET hdrResult AS U32 = AEX.ValidateHeader(UnknownRequiredChunkBufferAddress(), UnknownRequiredChunkFileLength())
+    IF hdrResult <> 0 THEN
+        RETURN 0
+    END IF
+    LET dirResult AS U32 = AEX.ValidateDirectory(UnknownRequiredChunkBufferAddress(), UnknownRequiredChunkFileLength())
+    IF dirResult <> 6 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunBadAlignment() AS BOOL
+    WriteBadAlignment()
+    LET hdrResult AS U32 = AEX.ValidateHeader(BadAlignmentBufferAddress(), BadAlignmentFileLength())
+    IF hdrResult <> 0 THEN
+        RETURN 0
+    END IF
+    LET dirResult AS U32 = AEX.ValidateDirectory(BadAlignmentBufferAddress(), BadAlignmentFileLength())
+    IF dirResult <> 7 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION ReportCase(label0 AS U32, label1 AS U32, label2 AS U32, label3 AS U32, label4 AS U32, ok AS BOOL) AS U64
+    SerialText(label0, label1, label2, label3, label4)
+    IF ok = 1 THEN
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET testsPassed AS U32 = 0
+    LET testsFailed AS U32 = 0
+
+    LET ValidMinimalOk AS BOOL = RunValidMinimal()
+    ReportCase(86, 65, 76, 73, 68, ValidMinimalOk)
+    IF ValidMinimalOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET InvalidMagicOk AS BOOL = RunInvalidMagic()
+    ReportCase(77, 65, 71, 73, 67, InvalidMagicOk)
+    IF InvalidMagicOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET InvalidHeaderSizeOk AS BOOL = RunInvalidHeaderSize()
+    ReportCase(72, 83, 73, 90, 69, InvalidHeaderSizeOk)
+    IF InvalidHeaderSizeOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET DirectoryOutOfBoundsOk AS BOOL = RunDirectoryOutOfBounds()
+    ReportCase(68, 73, 82, 79, 66, DirectoryOutOfBoundsOk)
+    IF DirectoryOutOfBoundsOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET ChunkOutOfBoundsOk AS BOOL = RunChunkOutOfBounds()
+    ReportCase(67, 72, 75, 79, 66, ChunkOutOfBoundsOk)
+    IF ChunkOutOfBoundsOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET UnknownOptionalChunkOk AS BOOL = RunUnknownOptionalChunk()
+    ReportCase(85, 78, 75, 79, 80, UnknownOptionalChunkOk)
+    IF UnknownOptionalChunkOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET UnknownRequiredChunkOk AS BOOL = RunUnknownRequiredChunk()
+    ReportCase(85, 78, 75, 82, 81, UnknownRequiredChunkOk)
+    IF UnknownRequiredChunkOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET BadAlignmentOk AS BOOL = RunBadAlignment()
+    ReportCase(65, 76, 73, 71, 78, BadAlignmentOk)
+    IF BadAlignmentOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(32)
+    IF testsFailed = 0 THEN
+        SerialByte(65)
+        SerialByte(76)
+        SerialByte(76)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(83)
+        SerialByte(79)
+        SerialByte(77)
+        SerialByte(69)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+
+    CPU.HaltForever
+    RETURN 0
+END FUNCTION
