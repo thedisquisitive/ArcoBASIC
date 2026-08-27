@@ -1,0 +1,519 @@
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+#CALLCONV UEFI
+#EXPORT "efi_main"
+
+FUNCTION SerialByte(value AS U8) AS U64
+    PORT.Write8(PORT.Address(1016), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText5(a AS U32, b AS U32, c AS U32, d AS U32, e AS U32) AS U64
+    LET aByte AS U8 = a
+    LET bByte AS U8 = b
+    LET cByte AS U8 = c
+    LET dByte AS U8 = d
+    LET eByte AS U8 = e
+    SerialByte(aByte)
+    SerialByte(bByte)
+    SerialByte(cByte)
+    SerialByte(dByte)
+    SerialByte(eByte)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialLineDone() AS U64
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialDigit(value AS U32) AS U64
+    LET digit AS U8 = value + 48
+    SerialByte(digit)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialSmallNumber(value AS U32) AS U64
+    IF value >= 10 THEN
+        SerialDigit(value \ 10)
+        SerialDigit(value MOD 10)
+        RETURN 0
+    END IF
+    SerialDigit(value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION PreloadedAexAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(117440512))  ' 0x7000000
+END FUNCTION
+
+FUNCTION PreloadedAexLength() AS U64
+    RETURN 864
+END FUNCTION
+
+FUNCTION PopulatePreloadedAexForHardware() AS U64
+    RETURN 0
+END FUNCTION
+
+FUNCTION LoadedAexAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(63963136))   ' 0x3D00000
+END FUNCTION
+
+FUNCTION CodeDestAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64028672))   ' 0x3D10000
+END FUNCTION
+
+FUNCTION DataDestAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64094208))   ' 0x3D20000
+END FUNCTION
+
+FUNCTION NameAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64159744))   ' 0x3D30000
+END FUNCTION
+
+FUNCTION AppsNameAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64159808))
+END FUNCTION
+
+FUNCTION FileNameAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64159872))
+END FUNCTION
+
+FUNCTION ShellPathAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64159936))
+END FUNCTION
+
+FUNCTION SyscallFrameAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64160000))
+END FUNCTION
+
+FUNCTION SyscallTextAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64160064))
+END FUNCTION
+
+FUNCTION ScratchReadAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64160128))
+END FUNCTION
+
+FUNCTION UserFileNameAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64160192))
+END FUNCTION
+
+FUNCTION UserTextAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64160256))
+END FUNCTION
+
+FUNCTION WriteArcFsNames() AS U64
+    LET name AS MMIOPTR = NameAddress()
+    MEMORY.Write8(ADDRESS.Offset(name, 0), 115)
+    MEMORY.Write8(ADDRESS.Offset(name, 1), 121)
+    MEMORY.Write8(ADDRESS.Offset(name, 2), 115)
+    MEMORY.Write8(ADDRESS.Offset(name, 3), 116)
+    MEMORY.Write8(ADDRESS.Offset(name, 4), 101)
+    MEMORY.Write8(ADDRESS.Offset(name, 5), 109)
+
+    LET apps AS MMIOPTR = AppsNameAddress()
+    MEMORY.Write8(ADDRESS.Offset(apps, 0), 97)
+    MEMORY.Write8(ADDRESS.Offset(apps, 1), 112)
+    MEMORY.Write8(ADDRESS.Offset(apps, 2), 112)
+    MEMORY.Write8(ADDRESS.Offset(apps, 3), 115)
+
+    LET file AS MMIOPTR = FileNameAddress()
+    MEMORY.Write8(ADDRESS.Offset(file, 0), 116)
+    MEMORY.Write8(ADDRESS.Offset(file, 1), 101)
+    MEMORY.Write8(ADDRESS.Offset(file, 2), 115)
+    MEMORY.Write8(ADDRESS.Offset(file, 3), 116)
+    MEMORY.Write8(ADDRESS.Offset(file, 4), 46)
+    MEMORY.Write8(ADDRESS.Offset(file, 5), 97)
+    MEMORY.Write8(ADDRESS.Offset(file, 6), 101)
+    MEMORY.Write8(ADDRESS.Offset(file, 7), 120)
+
+    LET path AS MMIOPTR = ShellPathAddress()
+    MEMORY.Write8(ADDRESS.Offset(path, 0), 58)
+    MEMORY.Write8(ADDRESS.Offset(path, 1), 115)
+    MEMORY.Write8(ADDRESS.Offset(path, 2), 121)
+    MEMORY.Write8(ADDRESS.Offset(path, 3), 115)
+    MEMORY.Write8(ADDRESS.Offset(path, 4), 116)
+    MEMORY.Write8(ADDRESS.Offset(path, 5), 101)
+    MEMORY.Write8(ADDRESS.Offset(path, 6), 109)
+    MEMORY.Write8(ADDRESS.Offset(path, 7), 58)
+    MEMORY.Write8(ADDRESS.Offset(path, 8), 97)
+    MEMORY.Write8(ADDRESS.Offset(path, 9), 112)
+    MEMORY.Write8(ADDRESS.Offset(path, 10), 112)
+    MEMORY.Write8(ADDRESS.Offset(path, 11), 115)
+    MEMORY.Write8(ADDRESS.Offset(path, 12), 58)
+    MEMORY.Write8(ADDRESS.Offset(path, 13), 116)
+    MEMORY.Write8(ADDRESS.Offset(path, 14), 101)
+    MEMORY.Write8(ADDRESS.Offset(path, 15), 115)
+    MEMORY.Write8(ADDRESS.Offset(path, 16), 116)
+    MEMORY.Write8(ADDRESS.Offset(path, 17), 46)
+    MEMORY.Write8(ADDRESS.Offset(path, 18), 97)
+    MEMORY.Write8(ADDRESS.Offset(path, 19), 101)
+    MEMORY.Write8(ADDRESS.Offset(path, 20), 120)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteUserFileData() AS U64
+    LET name AS MMIOPTR = UserFileNameAddress()
+    MEMORY.Write8(ADDRESS.Offset(name, 0), 117)
+    MEMORY.Write8(ADDRESS.Offset(name, 1), 115)
+    MEMORY.Write8(ADDRESS.Offset(name, 2), 101)
+    MEMORY.Write8(ADDRESS.Offset(name, 3), 114)
+    MEMORY.Write8(ADDRESS.Offset(name, 4), 46)
+    MEMORY.Write8(ADDRESS.Offset(name, 5), 100)
+    MEMORY.Write8(ADDRESS.Offset(name, 6), 97)
+    MEMORY.Write8(ADDRESS.Offset(name, 7), 116)
+
+    LET text AS MMIOPTR = UserTextAddress()
+    MEMORY.Write8(ADDRESS.Offset(text, 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(text, 1), 69)
+    MEMORY.Write8(ADDRESS.Offset(text, 2), 88)
+    MEMORY.Write8(ADDRESS.Offset(text, 3), 70)
+    MEMORY.Write8(ADDRESS.Offset(text, 4), 83)
+    RETURN 0
+END FUNCTION
+
+FUNCTION WriteSyscallText() AS U64
+    LET text AS MMIOPTR = SyscallTextAddress()
+    MEMORY.Write8(ADDRESS.Offset(text, 0), 85)
+    MEMORY.Write8(ADDRESS.Offset(text, 1), 83)
+    MEMORY.Write8(ADDRESS.Offset(text, 2), 82)
+    MEMORY.Write8(ADDRESS.Offset(text, 3), 13)
+    MEMORY.Write8(ADDRESS.Offset(text, 4), 10)
+
+    LET frame AS MMIOPTR = SyscallFrameAddress()
+    MEMORY.Write64(ADDRESS.Offset(frame, 0), 64160064)
+    MEMORY.Write64(ADDRESS.Offset(frame, 8), 5)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SetFrameResolvePath() AS U64
+    LET frame AS MMIOPTR = SyscallFrameAddress()
+    MEMORY.Write64(ADDRESS.Offset(frame, 0), 64159936)
+    MEMORY.Write64(ADDRESS.Offset(frame, 8), 21)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SetFrameOpen(oid AS U64) AS U64
+    LET frame AS MMIOPTR = SyscallFrameAddress()
+    MEMORY.Write64(ADDRESS.Offset(frame, 0), oid)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SetFrameRead(handle AS U64, bufferAddress AS U64, byteCount AS U64, offset AS U64) AS U64
+    LET frame AS MMIOPTR = SyscallFrameAddress()
+    MEMORY.Write64(ADDRESS.Offset(frame, 0), handle)
+    MEMORY.Write64(ADDRESS.Offset(frame, 8), bufferAddress)
+    MEMORY.Write64(ADDRESS.Offset(frame, 16), byteCount)
+    MEMORY.Write64(ADDRESS.Offset(frame, 24), offset)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SetFrameWrite(handle AS U64, bufferAddress AS U64, byteCount AS U64, offset AS U64) AS U64
+    LET frame AS MMIOPTR = SyscallFrameAddress()
+    MEMORY.Write64(ADDRESS.Offset(frame, 0), handle)
+    MEMORY.Write64(ADDRESS.Offset(frame, 8), bufferAddress)
+    MEMORY.Write64(ADDRESS.Offset(frame, 16), byteCount)
+    MEMORY.Write64(ADDRESS.Offset(frame, 24), offset)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SetFrameClose(handle AS U64) AS U64
+    LET frame AS MMIOPTR = SyscallFrameAddress()
+    MEMORY.Write64(ADDRESS.Offset(frame, 0), handle)
+    RETURN 0
+END FUNCTION
+
+FUNCTION RunArcFsServiceChecks(programHandle AS U32, expectedOid AS U64) AS BOOL
+    SetFrameResolvePath()
+    LET resolvedOid AS U64 = AEX.DispatchSubstrateBinding1(programHandle, 1002, 64160000)
+    IF resolvedOid <> expectedOid THEN RETURN 0
+
+    SetFrameOpen(resolvedOid)
+    LET fileHandle AS U64 = AEX.DispatchSubstrateBinding1(programHandle, 1003, 64160000)
+    IF fileHandle = 0 THEN RETURN 0
+
+    SetFrameRead(fileHandle, 64160128, 8, 0)
+    IF AEX.DispatchSubstrateBinding1(programHandle, 1004, 64160000) <> 8 THEN RETURN 0
+    IF MEMORY.Read8(ScratchReadAddress()) <> 65 THEN RETURN 0
+
+    SetFrameClose(fileHandle)
+    IF AEX.DispatchSubstrateBinding1(programHandle, 1006, 64160000) <> 1 THEN RETURN 0
+
+    WriteUserFileData()
+    LET userOid AS U64 = ArcFS.CreateFile(1, UserFileNameAddress(), 8)
+    IF userOid = 0 THEN RETURN 0
+
+    SetFrameOpen(userOid)
+    LET userHandle AS U64 = AEX.DispatchSubstrateBinding1(programHandle, 1003, 64160000)
+    IF userHandle = 0 THEN RETURN 0
+
+    SetFrameWrite(userHandle, 64160256, 5, 0)
+    IF AEX.DispatchSubstrateBinding1(programHandle, 1005, 64160000) <> 5 THEN RETURN 0
+    SetFrameRead(userHandle, 64160128, 5, 0)
+    IF AEX.DispatchSubstrateBinding1(programHandle, 1004, 64160000) <> 5 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(ScratchReadAddress(), 4)) <> 83 THEN RETURN 0
+
+    SetFrameClose(userHandle)
+    IF AEX.DispatchSubstrateBinding1(programHandle, 1006, 64160000) <> 1 THEN RETURN 0
+    RETURN 1
+END FUNCTION
+
+FUNCTION PreloadMagicOk() AS BOOL
+    LET base AS MMIOPTR = PreloadedAexAddress()
+    IF MEMORY.Read8(ADDRESS.Offset(base, 0)) <> 65 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 1)) <> 82 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 2)) <> 67 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 3)) <> 79 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 4)) <> 65 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 5)) <> 69 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(base, 6)) <> 88 THEN RETURN 0
+    RETURN 1
+END FUNCTION
+
+FUNCTION PreloadDirectoryBoundsOk() AS BOOL
+    LET base AS MMIOPTR = PreloadedAexAddress()
+    LET index AS U32 = 0
+    WHILE index < 6
+        LET index64 AS U64 = index
+        LET entry AS MMIOPTR = ADDRESS.Offset(base, 64 + (index64 * 96))
+        LET chunkOffset AS U64 = MEMORY.Read64(ADDRESS.Offset(entry, 24))
+        LET storedLength AS U64 = MEMORY.Read64(ADDRESS.Offset(entry, 32))
+        IF chunkOffset + storedLength > PreloadedAexLength() THEN
+            SerialText5(69, 78, 84, 82, 89)
+            SerialByte(32)
+            SerialSmallNumber(index)
+            SerialLineDone()
+            RETURN 0
+        END IF
+        index = index + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION StorePreloadedAex() AS U64
+    WriteArcFsNames()
+    IF ArcFS.Initialize() = 0 THEN
+        RETURN 0
+    END IF
+    LET systemOid AS U64 = ArcFS.CreateDirectory(1, NameAddress(), 6)
+    IF systemOid = 0 THEN
+        RETURN 0
+    END IF
+    LET appsOid AS U64 = ArcFS.CreateDirectory(systemOid, AppsNameAddress(), 4)
+    IF appsOid = 0 THEN
+        RETURN 0
+    END IF
+    LET oid AS U64 = ArcFS.CreateFile(appsOid, FileNameAddress(), 8)
+    IF oid = 0 THEN
+        RETURN 0
+    END IF
+    LET handle AS U64 = ArcFS.OpenHandle(oid)
+    IF handle = 0 THEN
+        RETURN 0
+    END IF
+    LET wrote AS U64 = ArcFS.HandleWrite(handle, PreloadedAexAddress(), PreloadedAexLength(), 0)
+    ArcFS.CloseHandle(handle)
+    IF wrote <> PreloadedAexLength() THEN
+        RETURN 0
+    END IF
+    RETURN oid
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    systemTable.ConsoleOut.Write("ARCOLOGY AEX USERSPACE TEST\r\n")
+    PopulatePreloadedAexForHardware()
+    SerialText5(65, 82, 67, 79, 32)
+    SerialLineDone()
+
+    IF PreloadMagicOk() = 0 THEN
+        SerialText5(80, 82, 69, 76, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.ValidateHeader(PreloadedAexAddress(), PreloadedAexLength()) <> 0 THEN
+        SerialText5(80, 72, 68, 82, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AexReadDirectoryOffset(PreloadedAexAddress()) <> 64 THEN
+        SerialText5(68, 79, 70, 70, 32)
+        SerialSmallNumber(AexReadDirectoryOffset(PreloadedAexAddress()))
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AexReadDirectoryCount(PreloadedAexAddress()) <> 6 THEN
+        SerialText5(68, 67, 78, 84, 32)
+        SerialSmallNumber(AexReadDirectoryCount(PreloadedAexAddress()))
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF PreloadDirectoryBoundsOk() = 0 THEN
+        CPU.HaltForever
+    END IF
+    LET preloadDirResult AS U32 = AEX.ValidateDirectory(PreloadedAexAddress(), PreloadedAexLength())
+    IF preloadDirResult <> 0 THEN
+        SerialText5(80, 68, 73, 82, 32)
+        SerialByte(70)
+        SerialByte(32)
+        SerialSmallNumber(preloadDirResult)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+
+    LET oid AS U64 = StorePreloadedAex()
+    IF oid = 0 THEN
+        SerialText5(83, 84, 79, 82, 69)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+
+    AEX.ClearLoadedPrograms()
+    AEX.ClearSubstrateServices()
+    IF AEX.RegisterSubstrateService(1000, AexSubstrateServiceKindConsoleWrite()) <> 0 THEN
+        SerialText5(83, 86, 67, 87, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.RegisterSubstrateService(1001, AexSubstrateServiceKindExit()) <> 0 THEN
+        SerialText5(83, 86, 67, 88, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.RegisterSubstrateService(1002, AexSubstrateServiceKindArcFSResolve()) <> 0 THEN
+        SerialText5(83, 86, 67, 82, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.RegisterSubstrateService(1003, AexSubstrateServiceKindArcFSOpen()) <> 0 THEN
+        SerialText5(83, 86, 67, 79, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.RegisterSubstrateService(1004, AexSubstrateServiceKindArcFSRead()) <> 0 THEN
+        SerialText5(83, 86, 67, 68, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.RegisterSubstrateService(1005, AexSubstrateServiceKindArcFSWrite()) <> 0 THEN
+        SerialText5(83, 86, 67, 70, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.RegisterSubstrateService(1006, AexSubstrateServiceKindArcFSClose()) <> 0 THEN
+        SerialText5(83, 86, 67, 67, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+
+    LET handle AS U32 = AEX.LoadProgramFromPath0(systemTable, ShellPathAddress(), 21, LoadedAexAddress())
+    IF handle = 0 THEN
+        SerialText5(65, 69, 88, 69, 82)
+        SerialByte(70)
+        SerialByte(32)
+        SerialSmallNumber(MEMORY.Read32(AexLoadLastStageAddress()))
+        SerialByte(32)
+        SerialSmallNumber(MEMORY.Read32(AexLoadLastErrorAddress()))
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.LoadedProgramCount() <> 1 THEN
+        SerialText5(67, 78, 84, 32, 70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.LoadedProgramHandleAt(0) <> handle THEN
+        SerialText5(72, 78, 68, 76, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.ProcessContextAddress(handle) = 0 THEN
+        SerialText5(67, 84, 88, 32, 70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    LET result AS U32 = AEX.ActivateProgramWithContext0(handle)
+    IF result <> 0 THEN
+        SerialText5(65, 67, 84, 88, 32)
+        SerialSmallNumber(result)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.LoadedProgramState(handle) <> 2 THEN
+        SerialText5(83, 84, 65, 84, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.LoadedProgramCodeBase(handle) = 0 THEN
+        SerialText5(67, 79, 68, 69, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF MEMORY.Read64(AexLoadLastReturnValueAddress()) <> handle THEN
+        SerialText5(82, 69, 84, 86, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.LoadedProgramLastReturn(handle) <> handle THEN
+        SerialText5(72, 82, 69, 84, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    WriteSyscallText()
+    IF AEX.DispatchSubstrateBinding1(handle, 1000, 64160000) <> 5 THEN
+        SerialText5(83, 89, 83, 87, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF RunArcFsServiceChecks(handle, oid) = 0 THEN
+        SerialText5(70, 83, 82, 83, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.DispatchSubstrateBinding1(handle, 1001, 42) <> 42 THEN
+        SerialText5(83, 89, 83, 88, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.LoadedProgramState(handle) <> 3 THEN
+        SerialText5(69, 88, 73, 84, 32)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+    IF AEX.ProcessExitCode(handle) <> 42 THEN
+        SerialText5(69, 67, 79, 68, 69)
+        SerialByte(70)
+        SerialLineDone()
+        CPU.HaltForever
+    END IF
+
+    SerialText5(65, 69, 88, 32, 80)
+    SerialByte(65)
+    SerialByte(83)
+    SerialByte(83)
+    SerialLineDone()
+    systemTable.ConsoleOut.Write("AEX USERSPACE PASS\r\nSystem halted intentionally.\r\n")
+    CPU.HaltForever
+END FUNCTION

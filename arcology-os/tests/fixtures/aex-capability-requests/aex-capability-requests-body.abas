@@ -1,0 +1,376 @@
+' RFC-0046 AEX Phase 9 test body. This validates CAPABILITY_REQUEST chunks as policy input:
+' optional declarations are accepted, required declarations fail deterministically until a real
+' authority/grant database exists.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    PORT.Write8(PORT.Address(1016), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText(a AS U32, b AS U32, c AS U32, d AS U32, e AS U32) AS U64
+    LET aByte AS U8 = a
+    LET bByte AS U8 = b
+    LET cByte AS U8 = c
+    LET dByte AS U8 = d
+    LET eByte AS U8 = e
+    SerialByte(aByte)
+    SerialByte(bByte)
+    SerialByte(cByte)
+    SerialByte(dByte)
+    SerialByte(eByte)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase9SourceAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62390272))   ' 0x3B80000
+END FUNCTION
+
+FUNCTION AexPhase9FileLength() AS U64
+    RETURN 620
+END FUNCTION
+
+FUNCTION AexPhase9Clear(base AS MMIOPTR, count AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        MEMORY.Write8(ADDRESS.Offset(base, i), 0)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase9WriteMagic(base AS MMIOPTR) AS U64
+    MEMORY.Write8(ADDRESS.Offset(base, 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(base, 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(base, 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(base, 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 7), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase9WriteEntry(index AS U32, chunkID AS U32, typeHigh AS U64, typeLow AS U64, offset AS U64, length AS U64) AS U64
+    LET index64 AS U64 = index
+    LET entry AS MMIOPTR = ADDRESS.Offset(AexPhase9SourceAddress(), 64 + (index64 * 96))
+    MEMORY.Write32(ADDRESS.Offset(entry, 0), chunkID)
+    MEMORY.Write64(ADDRESS.Offset(entry, 4), typeHigh)
+    MEMORY.Write64(ADDRESS.Offset(entry, 12), typeLow)
+    MEMORY.Write32(ADDRESS.Offset(entry, 20), 1)
+    MEMORY.Write64(ADDRESS.Offset(entry, 24), offset)
+    MEMORY.Write64(ADDRESS.Offset(entry, 32), length)
+    MEMORY.Write64(ADDRESS.Offset(entry, 40), length)
+    MEMORY.Write32(ADDRESS.Offset(entry, 48), 8)
+    MEMORY.Write32(ADDRESS.Offset(entry, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase9WriteHeaderAndDirectory() AS U64
+    LET base AS MMIOPTR = AexPhase9SourceAddress()
+    AexPhase9Clear(base, 1024)
+
+    AexPhase9WriteMagic(base)
+    MEMORY.Write32(ADDRESS.Offset(base, 8), 65536)
+    MEMORY.Write32(ADDRESS.Offset(base, 12), 64)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), 2459565876494606882)
+    MEMORY.Write64(ADDRESS.Offset(base, 32), 64)
+    MEMORY.Write32(ADDRESS.Offset(base, 40), 4)
+    MEMORY.Write32(ADDRESS.Offset(base, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(base, 48), 0)
+
+    AexPhase9WriteEntry(0, 1, AexTypeManifestHigh(), AexTypeManifestLow(), 448, 80)
+    AexPhase9WriteEntry(1, 2, AexTypeComponentHigh(), AexTypeComponentLow(), 528, 44)
+    AexPhase9WriteEntry(2, 50, AexTypeCapabilityRequestHigh(), AexTypeCapabilityRequestLow(), 576, 36)
+    AexPhase9WriteEntry(3, 60, AexTypeDataHigh(), AexTypeDataLow(), 616, 4)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase9WriteCapability(offset AS U64, requestID AS U32, ownerID AS U32, requirement AS U32) AS U64
+    LET data AS MMIOPTR = ADDRESS.Offset(AexPhase9SourceAddress(), offset)
+    MEMORY.Write32(ADDRESS.Offset(data, 0), requestID)
+    MEMORY.Write32(ADDRESS.Offset(data, 4), ownerID)
+    MEMORY.Write32(ADDRESS.Offset(data, 8), requirement)
+    MEMORY.Write64(ADDRESS.Offset(data, 12), 8608480567731124087)
+    MEMORY.Write64(ADDRESS.Offset(data, 20), 9838263505978427528)
+    MEMORY.Write32(ADDRESS.Offset(data, 28), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 32), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase9WriteFixture() AS U64
+    AexPhase9WriteHeaderAndDirectory()
+    LET base AS MMIOPTR = AexPhase9SourceAddress()
+
+    LET manifest AS MMIOPTR = ADDRESS.Offset(base, 448)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 0), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 8), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 16), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 24), 0)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 28), 3689348814741910323)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 36), 4919131752989213764)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 52), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 56), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 60), 2)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 64), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 68), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 72), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 76), 2)
+
+    LET component AS MMIOPTR = ADDRESS.Offset(base, 528)
+    MEMORY.Write32(ADDRESS.Offset(component, 0), 2)
+    MEMORY.Write64(ADDRESS.Offset(component, 4), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(component, 12), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(component, 20), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 28), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 32), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 36), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 40), 0)
+
+    AexPhase9WriteCapability(576, 50, 2, AexCapabilityRequirementOptional())
+    MEMORY.Write8(ADDRESS.Offset(base, 616), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 617), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 618), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 619), 67)
+    RETURN 0
+END FUNCTION
+
+FUNCTION RunOptionalCapability() AS BOOL
+    AexPhase9WriteFixture()
+    IF AEX.ValidateHeader(AexPhase9SourceAddress(), AexPhase9FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateDirectory(AexPhase9SourceAddress(), AexPhase9FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateManifest(AexPhase9SourceAddress(), AexPhase9FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.EvaluateCapabilityRequests(AexPhase9SourceAddress(), AexPhase9FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunRequiredDenied() AS BOOL
+    AexPhase9WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase9SourceAddress(), 584), AexCapabilityRequirementRequired())
+    IF AEX.EvaluateCapabilityRequests(AexPhase9SourceAddress(), AexPhase9FileLength()) <> AexErrorRequiredCapabilityDenied() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunRequiredGranted() AS BOOL
+    AexPhase9WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase9SourceAddress(), 584), AexCapabilityRequirementRequired())
+    AEX.ClearCapabilityGrants()
+    IF AEX.AllowCapability(8608480567731124087, 9838263505978427528) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.CapabilityGrantCount() <> 1 THEN
+        RETURN 0
+    END IF
+    IF AEX.CapabilityIsGranted(8608480567731124087, 9838263505978427528) = 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.EvaluateCapabilityRequestsWithGrants(AexPhase9SourceAddress(), AexPhase9FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunRequiredWrongGrantDenied() AS BOOL
+    AexPhase9WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase9SourceAddress(), 584), AexCapabilityRequirementRequired())
+    AEX.ClearCapabilityGrants()
+    IF AEX.AllowCapability(8608480567731124087, 1) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.EvaluateCapabilityRequestsWithGrants(AexPhase9SourceAddress(), AexPhase9FileLength()) <> AexErrorRequiredCapabilityDenied() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunCapabilityTooShort() AS BOOL
+    AexPhase9WriteFixture()
+    AexPhase9WriteEntry(2, 50, AexTypeCapabilityRequestHigh(), AexTypeCapabilityRequestLow(), 576, 32)
+    IF AEX.EvaluateCapabilityRequests(AexPhase9SourceAddress(), AexPhase9FileLength()) <> AexErrorCapabilityOutOfBounds() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunCapabilityOwnerInvalid() AS BOOL
+    AexPhase9WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase9SourceAddress(), 580), 99)
+    IF AEX.EvaluateCapabilityRequests(AexPhase9SourceAddress(), AexPhase9FileLength()) <> AexErrorCapabilityOwnerInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunCapabilityBadRequirement() AS BOOL
+    AexPhase9WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase9SourceAddress(), 584), 99)
+    IF AEX.EvaluateCapabilityRequests(AexPhase9SourceAddress(), AexPhase9FileLength()) <> AexErrorCapabilityInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunCapabilityIDMismatch() AS BOOL
+    AexPhase9WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase9SourceAddress(), 576), 51)
+    IF AEX.EvaluateCapabilityRequests(AexPhase9SourceAddress(), AexPhase9FileLength()) <> AexErrorCapabilityInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunCapabilityReservedNonzero() AS BOOL
+    AexPhase9WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase9SourceAddress(), 608), 1)
+    IF AEX.EvaluateCapabilityRequests(AexPhase9SourceAddress(), AexPhase9FileLength()) <> AexErrorCapabilityInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION ReportCase(label0 AS U32, label1 AS U32, label2 AS U32, label3 AS U32, label4 AS U32, ok AS BOOL) AS U64
+    SerialText(label0, label1, label2, label3, label4)
+    IF ok = 1 THEN
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET testsPassed AS U32 = 0
+    LET testsFailed AS U32 = 0
+
+    LET OptionalOk AS BOOL = RunOptionalCapability()
+    ReportCase(79, 80, 84, 78, 32, OptionalOk)
+    IF OptionalOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET RequiredOk AS BOOL = RunRequiredDenied()
+    ReportCase(82, 69, 81, 68, 32, RequiredOk)
+    IF RequiredOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET GrantedOk AS BOOL = RunRequiredGranted()
+    ReportCase(71, 82, 78, 84, 32, GrantedOk)
+    IF GrantedOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET WrongGrantOk AS BOOL = RunRequiredWrongGrantDenied()
+    ReportCase(87, 82, 78, 71, 32, WrongGrantOk)
+    IF WrongGrantOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET BoundsOk AS BOOL = RunCapabilityTooShort()
+    ReportCase(66, 78, 68, 83, 32, BoundsOk)
+    IF BoundsOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET OwnerOk AS BOOL = RunCapabilityOwnerInvalid()
+    ReportCase(79, 87, 78, 82, 32, OwnerOk)
+    IF OwnerOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET RequirementOk AS BOOL = RunCapabilityBadRequirement()
+    ReportCase(82, 69, 81, 84, 32, RequirementOk)
+    IF RequirementOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET IdOk AS BOOL = RunCapabilityIDMismatch()
+    ReportCase(73, 68, 77, 77, 32, IdOk)
+    IF IdOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET ReservedOk AS BOOL = RunCapabilityReservedNonzero()
+    ReportCase(82, 83, 86, 68, 32, ReservedOk)
+    IF ReservedOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(32)
+    IF testsFailed = 0 THEN
+        SerialByte(65)
+        SerialByte(76)
+        SerialByte(76)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(83)
+        SerialByte(79)
+        SerialByte(77)
+        SerialByte(69)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN testsFailed
+END FUNCTION

@@ -309,6 +309,16 @@ int main() {
         }
         {
             Assembler asm_;
+            asm_.call_reg(Reg::RAX);
+            require(bytes_equal(asm_.bytes(), {0xFF, 0xD0}), "call rax matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.call_reg(Reg::R8);
+            require(bytes_equal(asm_.bytes(), {0x41, 0xFF, 0xD0}), "call r8 matches nasm");
+        }
+        {
+            Assembler asm_;
             const std::size_t disp_offset = asm_.call_rel32_placeholder();
             require(disp_offset == 1 && bytes_equal(asm_.bytes(), {0xE8, 0x00, 0x00, 0x00, 0x00}),
                     "call rel32 emits a patchable near-call placeholder");

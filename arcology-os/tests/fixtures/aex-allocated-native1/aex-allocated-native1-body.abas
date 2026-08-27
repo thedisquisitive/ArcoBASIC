@@ -1,0 +1,274 @@
+' AEX allocator-backed mapping and native one-argument ABI smoke.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    PORT.Write8(PORT.Address(1016), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText(a AS U32, b AS U32, c AS U32, d AS U32, e AS U32) AS U64
+    LET aByte AS U8 = a
+    LET bByte AS U8 = b
+    LET cByte AS U8 = c
+    LET dByte AS U8 = d
+    LET eByte AS U8 = e
+    SerialByte(aByte)
+    SerialByte(bByte)
+    SerialByte(cByte)
+    SerialByte(dByte)
+    SerialByte(eByte)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexAllocSourceAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(63635456))   ' 0x3CB0000
+END FUNCTION
+
+FUNCTION AexAllocFileLength() AS U64
+    RETURN 837
+END FUNCTION
+
+FUNCTION AexAllocScratchEntryAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(63637504))
+END FUNCTION
+
+FUNCTION AexAllocScratchDataAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(63637568))
+END FUNCTION
+
+FUNCTION AexAllocClear(base AS MMIOPTR, count AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        MEMORY.Write8(ADDRESS.Offset(base, i), 0)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexAllocWriteMagic(base AS MMIOPTR) AS U64
+    MEMORY.Write8(ADDRESS.Offset(base, 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(base, 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(base, 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(base, 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 7), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexAllocWriteEntry(index AS U32, chunkID AS U32, typeHigh AS U64, typeLow AS U64, offset AS U64, length AS U64) AS U64
+    LET index64 AS U64 = index
+    LET entry AS MMIOPTR = ADDRESS.Offset(AexAllocSourceAddress(), 64 + (index64 * 96))
+    MEMORY.Write32(ADDRESS.Offset(entry, 0), chunkID)
+    MEMORY.Write64(ADDRESS.Offset(entry, 4), typeHigh)
+    MEMORY.Write64(ADDRESS.Offset(entry, 12), typeLow)
+    MEMORY.Write32(ADDRESS.Offset(entry, 20), 1)
+    MEMORY.Write64(ADDRESS.Offset(entry, 24), offset)
+    MEMORY.Write64(ADDRESS.Offset(entry, 32), length)
+    MEMORY.Write64(ADDRESS.Offset(entry, 40), length)
+    MEMORY.Write32(ADDRESS.Offset(entry, 48), 8)
+    MEMORY.Write32(ADDRESS.Offset(entry, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexAllocWriteFixture() AS U64
+    LET base AS MMIOPTR = AexAllocSourceAddress()
+    AexAllocClear(base, 1024)
+    AexAllocWriteMagic(base)
+    MEMORY.Write32(ADDRESS.Offset(base, 8), 65536)
+    MEMORY.Write32(ADDRESS.Offset(base, 12), 64)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), 2459565876494606882)
+    MEMORY.Write64(ADDRESS.Offset(base, 32), 64)
+    MEMORY.Write32(ADDRESS.Offset(base, 40), 6)
+    MEMORY.Write32(ADDRESS.Offset(base, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(base, 48), 0)
+
+    AexAllocWriteEntry(0, 1, AexTypeManifestHigh(), AexTypeManifestLow(), 640, 80)
+    AexAllocWriteEntry(1, 2, AexTypeComponentHigh(), AexTypeComponentLow(), 720, 48)
+    AexAllocWriteEntry(2, 10, AexTypeImplementationHigh(), AexTypeImplementationLow(), 768, 40)
+    AexAllocWriteEntry(3, 22, AexTypeLifecycleHigh(), AexTypeLifecycleLow(), 808, 16)
+    AexAllocWriteEntry(4, 30, AexTypeCodeHigh(), AexTypeCodeLow(), 824, 8)
+    AexAllocWriteEntry(5, 31, AexTypeDataHigh(), AexTypeDataLow(), 832, 5)
+
+    LET manifest AS MMIOPTR = ADDRESS.Offset(base, 640)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 0), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 8), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 16), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 24), 0)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 28), 3689348814741910323)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 36), 4919131752989213764)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 52), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 56), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 60), 2)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 64), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 68), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 72), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 76), 2)
+
+    LET component AS MMIOPTR = ADDRESS.Offset(base, 720)
+    MEMORY.Write32(ADDRESS.Offset(component, 0), 2)
+    MEMORY.Write64(ADDRESS.Offset(component, 4), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(component, 12), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(component, 20), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 28), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 32), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 36), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 44), 10)
+
+    LET impl AS MMIOPTR = ADDRESS.Offset(base, 768)
+    MEMORY.Write32(ADDRESS.Offset(impl, 0), 2)
+    MEMORY.Write32(ADDRESS.Offset(impl, 4), AexImplTypeNative())
+    MEMORY.Write32(ADDRESS.Offset(impl, 8), AexArchX86_64())
+    MEMORY.Write32(ADDRESS.Offset(impl, 12), AexAbiNativeMajorCurrent())
+    MEMORY.Write32(ADDRESS.Offset(impl, 16), AexAbiNativeMinorCurrent())
+    MEMORY.Write64(ADDRESS.Offset(impl, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(impl, 28), 7)
+    MEMORY.Write32(ADDRESS.Offset(impl, 32), 30)
+    MEMORY.Write32(ADDRESS.Offset(impl, 36), 31)
+
+    LET lifecycle AS MMIOPTR = ADDRESS.Offset(base, 808)
+    MEMORY.Write32(ADDRESS.Offset(lifecycle, 0), 2)
+    MEMORY.Write32(ADDRESS.Offset(lifecycle, 4), 10)
+    MEMORY.Write64(ADDRESS.Offset(lifecycle, 8), 0)
+
+    ' mov rax, rcx; add rax, 7; ret
+    MEMORY.Write8(ADDRESS.Offset(base, 824), 72)
+    MEMORY.Write8(ADDRESS.Offset(base, 825), 137)
+    MEMORY.Write8(ADDRESS.Offset(base, 826), 200)
+    MEMORY.Write8(ADDRESS.Offset(base, 827), 72)
+    MEMORY.Write8(ADDRESS.Offset(base, 828), 131)
+    MEMORY.Write8(ADDRESS.Offset(base, 829), 192)
+    MEMORY.Write8(ADDRESS.Offset(base, 830), 7)
+    MEMORY.Write8(ADDRESS.Offset(base, 831), 195)
+
+    MEMORY.Write8(ADDRESS.Offset(base, 832), 68)
+    MEMORY.Write8(ADDRESS.Offset(base, 833), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 834), 84)
+    MEMORY.Write8(ADDRESS.Offset(base, 835), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 836), 49)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexAllocRegisterDispatchMetadata() AS U32
+    LET bindingEntry AS MMIOPTR = AexAllocScratchEntryAddress()
+    LET bindingData AS MMIOPTR = AexAllocScratchDataAddress()
+    MEMORY.Write32(ADDRESS.Offset(bindingEntry, 0), 70)
+    MEMORY.Write32(ADDRESS.Offset(bindingData, 0), 70)
+    MEMORY.Write32(ADDRESS.Offset(bindingData, 4), 2)
+    MEMORY.Write32(ADDRESS.Offset(bindingData, 8), AexBindingKindMethod())
+    MEMORY.Write32(ADDRESS.Offset(bindingData, 12), 10)
+    MEMORY.Write64(ADDRESS.Offset(bindingData, 16), 1229801703532086340)
+    MEMORY.Write64(ADDRESS.Offset(bindingData, 24), 6148933456521300104)
+    MEMORY.Write64(ADDRESS.Offset(bindingData, 32), 0)
+    MEMORY.Write64(ADDRESS.Offset(bindingData, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(bindingData, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(bindingData, 52), 0)
+
+    LET diagnosticEntry AS MMIOPTR = ADDRESS.Offset(AexAllocScratchEntryAddress(), 96)
+    LET diagnosticData AS MMIOPTR = ADDRESS.Offset(AexAllocScratchDataAddress(), 96)
+    MEMORY.Write32(ADDRESS.Offset(diagnosticEntry, 0), 100)
+    MEMORY.Write32(ADDRESS.Offset(diagnosticData, 0), 100)
+    MEMORY.Write32(ADDRESS.Offset(diagnosticData, 4), 2)
+    MEMORY.Write32(ADDRESS.Offset(diagnosticData, 8), AexDiagnosticKindOperation())
+    MEMORY.Write32(ADDRESS.Offset(diagnosticData, 12), 10)
+    MEMORY.Write32(ADDRESS.Offset(diagnosticData, 16), 30)
+    MEMORY.Write64(ADDRESS.Offset(diagnosticData, 20), 0)
+    MEMORY.Write64(ADDRESS.Offset(diagnosticData, 28), 8)
+    MEMORY.Write64(ADDRESS.Offset(diagnosticData, 36), 1229801703532086340)
+    MEMORY.Write64(ADDRESS.Offset(diagnosticData, 44), 6148933456521300104)
+
+    MEMORY.Write32(AexBindingRegistryCountAddress(), 0)
+    MEMORY.Write32(AexDiagnosticRegistryCountAddress(), 0)
+    LET bindingResult AS U32 = AexRegisterOneArcoBinding(bindingEntry, bindingData)
+    IF bindingResult <> 0 THEN
+        RETURN bindingResult
+    END IF
+    RETURN AexRegisterOneDiagnostic(diagnosticEntry, diagnosticData)
+END FUNCTION
+
+FUNCTION RunAllocatedNative1(systemTable AS UEFI.SystemTable) AS BOOL
+    AexAllocWriteFixture()
+    IF AEX.ValidateHeader(AexAllocSourceAddress(), AexAllocFileLength()) <> AexErrorOk() THEN RETURN 0
+    IF AEX.ValidateDirectory(AexAllocSourceAddress(), AexAllocFileLength()) <> AexErrorOk() THEN RETURN 0
+    IF AEX.ValidateManifest(AexAllocSourceAddress(), AexAllocFileLength()) <> AexErrorOk() THEN RETURN 0
+    IF AEX.SelectImplementation(AexAllocSourceAddress(), 2, AexAllocFileLength()) <> AexErrorOk() THEN RETURN 0
+    IF AEX.ResolveLifecycleEntry(AexAllocSourceAddress(), 10, AexAllocFileLength()) <> AexErrorOk() THEN RETURN 0
+    IF AEX.AllocateAndMapSelectedCode(systemTable, AexAllocSourceAddress()) <> AexErrorOk() THEN RETURN 0
+    IF AEX.AllocateAndMapSelectedData(systemTable, AexAllocSourceAddress()) <> AexErrorOk() THEN RETURN 0
+
+    LET codeBase AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(MEMORY.Read64(AexAllocatedCodeAddressCell())))
+    LET dataBase AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(MEMORY.Read64(AexAllocatedDataAddressCell())))
+    IF MEMORY.Read64(AexAllocatedCodeCapacityCell()) < 4096 THEN RETURN 0
+    IF MEMORY.Read64(AexAllocatedDataCapacityCell()) < 4096 THEN RETURN 0
+    IF MEMORY.Read8(dataBase) <> 68 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(dataBase, 4)) <> 49 THEN RETURN 0
+    CPU.MemoryBarrier
+    LET result AS U64 = AEX.InvokeResolvedLifecycle1(codeBase, 35)
+    IF result <> 42 THEN RETURN 0
+    IF AexAllocRegisterDispatchMetadata() <> 0 THEN RETURN 0
+    LET dispatchResult AS U64 = AEX.InvokeBindingDispatch1(70, codeBase, 40)
+    IF dispatchResult <> 47 THEN RETURN 0
+    RETURN 1
+END FUNCTION
+
+FUNCTION ReportCase(label0 AS U32, label1 AS U32, label2 AS U32, label3 AS U32, label4 AS U32, ok AS BOOL) AS U64
+    SerialText(label0, label1, label2, label3, label4)
+    IF ok = 1 THEN
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    LET ok AS BOOL = RunAllocatedNative1(systemTable)
+    ReportCase(65, 76, 67, 49, 32, ok)
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(32)
+    IF ok = 1 THEN
+        SerialByte(65)
+        SerialByte(76)
+        SerialByte(76)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+        SerialByte(13)
+        SerialByte(10)
+        RETURN 0
+    END IF
+    SerialByte(83)
+    SerialByte(79)
+    SerialByte(77)
+    SerialByte(69)
+    SerialByte(70)
+    SerialByte(65)
+    SerialByte(73)
+    SerialByte(76)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 1
+END FUNCTION

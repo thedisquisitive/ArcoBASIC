@@ -1,0 +1,484 @@
+' RFC-0046 AEX Phase 12 test body. This validates DIAGNOSTIC chunks and proves accepted
+' attribution metadata is copied into the bounded loader diagnostics registry.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    PORT.Write8(PORT.Address(1016), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText(a AS U32, b AS U32, c AS U32, d AS U32, e AS U32) AS U64
+    LET aByte AS U8 = a
+    LET bByte AS U8 = b
+    LET cByte AS U8 = c
+    LET dByte AS U8 = d
+    LET eByte AS U8 = e
+    SerialByte(aByte)
+    SerialByte(bByte)
+    SerialByte(cByte)
+    SerialByte(dByte)
+    SerialByte(eByte)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase12SourceAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62529536))   ' 0x3BC0000
+END FUNCTION
+
+FUNCTION AexPhase12FileLength() AS U64
+    RETURN 924
+END FUNCTION
+
+FUNCTION AexPhase12Clear(base AS MMIOPTR, count AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        MEMORY.Write8(ADDRESS.Offset(base, i), 0)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase12WriteMagic(base AS MMIOPTR) AS U64
+    MEMORY.Write8(ADDRESS.Offset(base, 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(base, 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(base, 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(base, 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 7), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase12WriteEntry(index AS U32, chunkID AS U32, typeHigh AS U64, typeLow AS U64, offset AS U64, length AS U64) AS U64
+    LET index64 AS U64 = index
+    LET entry AS MMIOPTR = ADDRESS.Offset(AexPhase12SourceAddress(), 64 + (index64 * 96))
+    MEMORY.Write32(ADDRESS.Offset(entry, 0), chunkID)
+    MEMORY.Write64(ADDRESS.Offset(entry, 4), typeHigh)
+    MEMORY.Write64(ADDRESS.Offset(entry, 12), typeLow)
+    MEMORY.Write32(ADDRESS.Offset(entry, 20), 1)
+    MEMORY.Write64(ADDRESS.Offset(entry, 24), offset)
+    MEMORY.Write64(ADDRESS.Offset(entry, 32), length)
+    MEMORY.Write64(ADDRESS.Offset(entry, 40), length)
+    MEMORY.Write32(ADDRESS.Offset(entry, 48), 8)
+    MEMORY.Write32(ADDRESS.Offset(entry, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase12WriteHeaderAndDirectory() AS U64
+    LET base AS MMIOPTR = AexPhase12SourceAddress()
+    AexPhase12Clear(base, 1280)
+
+    AexPhase12WriteMagic(base)
+    MEMORY.Write32(ADDRESS.Offset(base, 8), 65536)
+    MEMORY.Write32(ADDRESS.Offset(base, 12), 64)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), 2459565876494606882)
+    MEMORY.Write64(ADDRESS.Offset(base, 32), 64)
+    MEMORY.Write32(ADDRESS.Offset(base, 40), 6)
+    MEMORY.Write32(ADDRESS.Offset(base, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(base, 48), 0)
+
+    AexPhase12WriteEntry(0, 1, AexTypeManifestHigh(), AexTypeManifestLow(), 640, 80)
+    AexPhase12WriteEntry(1, 2, AexTypeComponentHigh(), AexTypeComponentLow(), 720, 48)
+    AexPhase12WriteEntry(2, 10, AexTypeImplementationHigh(), AexTypeImplementationLow(), 768, 40)
+    AexPhase12WriteEntry(3, 20, AexTypeCodeHigh(), AexTypeCodeLow(), 808, 8)
+    AexPhase12WriteEntry(4, 90, AexTypeIntegrityHigh(), AexTypeIntegrityLow(), 816, 32)
+    AexPhase12WriteEntry(5, 100, AexTypeDiagnosticHigh(), AexTypeDiagnosticLow(), 848, 76)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase12WriteIntegrity(offset AS U64, integrityID AS U32, coveredID AS U32, expected AS U32, coveredLength AS U64) AS U64
+    LET data AS MMIOPTR = ADDRESS.Offset(AexPhase12SourceAddress(), offset)
+    MEMORY.Write32(ADDRESS.Offset(data, 0), integrityID)
+    MEMORY.Write32(ADDRESS.Offset(data, 4), AexIntegrityAlgorithmChecksum32())
+    MEMORY.Write32(ADDRESS.Offset(data, 8), coveredID)
+    MEMORY.Write32(ADDRESS.Offset(data, 12), expected)
+    MEMORY.Write64(ADDRESS.Offset(data, 16), coveredLength)
+    MEMORY.Write32(ADDRESS.Offset(data, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 28), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase12WriteDiagnostic(offset AS U64, diagnosticID AS U32, ownerID AS U32, kind AS U32, targetID AS U32, codeID AS U32, codeOffset AS U64, codeLength AS U64) AS U64
+    LET data AS MMIOPTR = ADDRESS.Offset(AexPhase12SourceAddress(), offset)
+    MEMORY.Write32(ADDRESS.Offset(data, 0), diagnosticID)
+    MEMORY.Write32(ADDRESS.Offset(data, 4), ownerID)
+    MEMORY.Write32(ADDRESS.Offset(data, 8), kind)
+    MEMORY.Write32(ADDRESS.Offset(data, 12), targetID)
+    MEMORY.Write32(ADDRESS.Offset(data, 16), codeID)
+    MEMORY.Write64(ADDRESS.Offset(data, 20), codeOffset)
+    MEMORY.Write64(ADDRESS.Offset(data, 28), codeLength)
+    MEMORY.Write64(ADDRESS.Offset(data, 36), 1229801703532086340)
+    MEMORY.Write64(ADDRESS.Offset(data, 44), 6148933456521300104)
+    MEMORY.Write64(ADDRESS.Offset(data, 52), 0)
+    MEMORY.Write64(ADDRESS.Offset(data, 60), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 68), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 72), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase12WriteFixture() AS U64
+    AexPhase12WriteHeaderAndDirectory()
+    LET base AS MMIOPTR = AexPhase12SourceAddress()
+
+    LET manifest AS MMIOPTR = ADDRESS.Offset(base, 640)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 0), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 8), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 16), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 24), 0)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 28), 3689348814741910323)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 36), 4919131752989213764)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 52), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 56), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 60), 2)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 64), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 68), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 72), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 76), 2)
+
+    LET component AS MMIOPTR = ADDRESS.Offset(base, 720)
+    MEMORY.Write32(ADDRESS.Offset(component, 0), 2)
+    MEMORY.Write64(ADDRESS.Offset(component, 4), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(component, 12), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(component, 20), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 28), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 32), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 36), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 44), 10)
+
+    LET impl AS MMIOPTR = ADDRESS.Offset(base, 768)
+    MEMORY.Write32(ADDRESS.Offset(impl, 0), 2)
+    MEMORY.Write32(ADDRESS.Offset(impl, 4), AexImplTypeNative())
+    MEMORY.Write32(ADDRESS.Offset(impl, 8), AexArchX86_64())
+    MEMORY.Write32(ADDRESS.Offset(impl, 12), AexAbiNativeMajorCurrent())
+    MEMORY.Write32(ADDRESS.Offset(impl, 16), AexAbiNativeMinorCurrent())
+    MEMORY.Write64(ADDRESS.Offset(impl, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(impl, 28), 7)
+    MEMORY.Write32(ADDRESS.Offset(impl, 32), 20)
+    MEMORY.Write32(ADDRESS.Offset(impl, 36), 0)
+
+    MEMORY.Write8(ADDRESS.Offset(base, 808), 1)
+    MEMORY.Write8(ADDRESS.Offset(base, 809), 2)
+    MEMORY.Write8(ADDRESS.Offset(base, 810), 3)
+    MEMORY.Write8(ADDRESS.Offset(base, 811), 4)
+    MEMORY.Write8(ADDRESS.Offset(base, 812), 5)
+    MEMORY.Write8(ADDRESS.Offset(base, 813), 6)
+    MEMORY.Write8(ADDRESS.Offset(base, 814), 7)
+    MEMORY.Write8(ADDRESS.Offset(base, 815), 8)
+
+    AexPhase12WriteIntegrity(816, 90, 20, 36, 8)
+    AexPhase12WriteDiagnostic(848, 100, 2, AexDiagnosticKindOperation(), 10, 20, 2, 4)
+    RETURN 0
+END FUNCTION
+
+FUNCTION RunValidDiagnostics() AS BOOL
+    AexPhase12WriteFixture()
+    IF AEX.ValidateHeader(AexPhase12SourceAddress(), AexPhase12FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateDirectory(AexPhase12SourceAddress(), AexPhase12FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateManifest(AexPhase12SourceAddress(), AexPhase12FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.VerifyIntegrity(AexPhase12SourceAddress(), AexPhase12FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.RegisterDiagnostics(AexPhase12SourceAddress(), AexPhase12FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(AexDiagnosticRegistryCountAddress()) <> 1 THEN
+        RETURN 0
+    END IF
+    LET entry AS MMIOPTR = AexDiagnosticRegistryEntryAddress(0)
+    IF MEMORY.Read32(ADDRESS.Offset(entry, 0)) <> 100 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(ADDRESS.Offset(entry, 4)) <> 2 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(ADDRESS.Offset(entry, 8)) <> AexDiagnosticKindOperation() THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(ADDRESS.Offset(entry, 12)) <> 10 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(ADDRESS.Offset(entry, 16)) <> 20 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read64(ADDRESS.Offset(entry, 20)) <> 2 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read64(ADDRESS.Offset(entry, 28)) <> 4 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION AexPhase12WriteDispatchBinding(entry AS MMIOPTR, data AS MMIOPTR) AS U64
+    MEMORY.Write32(ADDRESS.Offset(entry, 0), 70)
+    MEMORY.Write32(ADDRESS.Offset(data, 0), 70)
+    MEMORY.Write32(ADDRESS.Offset(data, 4), 2)
+    MEMORY.Write32(ADDRESS.Offset(data, 8), AexBindingKindMethod())
+    MEMORY.Write32(ADDRESS.Offset(data, 12), 10)
+    MEMORY.Write64(ADDRESS.Offset(data, 16), 1229801703532086340)
+    MEMORY.Write64(ADDRESS.Offset(data, 24), 6148933456521300104)
+    MEMORY.Write64(ADDRESS.Offset(data, 32), 0)
+    MEMORY.Write64(ADDRESS.Offset(data, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION RunBindingDispatchLookup() AS BOOL
+    AexPhase12WriteFixture()
+    IF AEX.RegisterDiagnostics(AexPhase12SourceAddress(), AexPhase12FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    LET fakeEntry AS MMIOPTR = ADDRESS.Offset(AexPhase12SourceAddress(), 1000)
+    LET fakeData AS MMIOPTR = ADDRESS.Offset(AexPhase12SourceAddress(), 1040)
+    AexPhase12WriteDispatchBinding(fakeEntry, fakeData)
+    MEMORY.Write32(AexBindingRegistryCountAddress(), 0)
+    IF AexRegisterOneArcoBinding(fakeEntry, fakeData) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.BindingRegistryCount() <> 1 THEN
+        RETURN 0
+    END IF
+    IF AEX.BindingRegistryIDAt(0) <> 70 THEN
+        RETURN 0
+    END IF
+    IF AEX.BindingRegistryOwnerAt(0) <> 2 THEN
+        RETURN 0
+    END IF
+    IF AEX.BindingRegistryTargetImplementationAt(0) <> 10 THEN
+        RETURN 0
+    END IF
+    IF AEX.BindingRegistryNameHighAt(0) <> 1229801703532086340 THEN
+        RETURN 0
+    END IF
+    IF AEX.DiagnosticRegistryCount() <> 1 THEN
+        RETURN 0
+    END IF
+    IF AEX.DiagnosticRegistryOwnerAt(0) <> 2 THEN
+        RETURN 0
+    END IF
+    IF AEX.DiagnosticRegistryTargetImplementationAt(0) <> 10 THEN
+        RETURN 0
+    END IF
+    IF AEX.DiagnosticRegistryNameHighAt(0) <> 1229801703532086340 THEN
+        RETURN 0
+    END IF
+    IF AEX.FindBindingDispatchDiagnostic(70) <> 100 THEN
+        RETURN 0
+    END IF
+    IF AEX.FindBindingDispatchCodeChunk(70) <> 20 THEN
+        RETURN 0
+    END IF
+    IF AEX.FindBindingDispatchCodeOffset(70) <> 2 THEN
+        RETURN 0
+    END IF
+    IF AEX.FindBindingDispatchDiagnostic(71) <> 0 THEN
+        RETURN 0
+    END IF
+    MEMORY.Write32(ADDRESS.Offset(AexBindingRegistryEntryAddress(0), 8), AexBindingKindEvent())
+    IF AEX.FindBindingDispatchDiagnostic(70) <> 0 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDiagnosticTooShort() AS BOOL
+    AexPhase12WriteFixture()
+    AexPhase12WriteEntry(5, 100, AexTypeDiagnosticHigh(), AexTypeDiagnosticLow(), 848, 72)
+    IF AEX.RegisterDiagnostics(AexPhase12SourceAddress(), AexPhase12FileLength()) <> AexErrorDiagnosticOutOfBounds() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDiagnosticIDMismatch() AS BOOL
+    AexPhase12WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase12SourceAddress(), 848), 101)
+    IF AEX.RegisterDiagnostics(AexPhase12SourceAddress(), AexPhase12FileLength()) <> AexErrorDiagnosticInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDiagnosticOwnerInvalid() AS BOOL
+    AexPhase12WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase12SourceAddress(), 852), 99)
+    IF AEX.RegisterDiagnostics(AexPhase12SourceAddress(), AexPhase12FileLength()) <> AexErrorDiagnosticOwnerInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDiagnosticKindInvalid() AS BOOL
+    AexPhase12WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase12SourceAddress(), 856), 99)
+    IF AEX.RegisterDiagnostics(AexPhase12SourceAddress(), AexPhase12FileLength()) <> AexErrorDiagnosticInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDiagnosticTargetMissing() AS BOOL
+    AexPhase12WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase12SourceAddress(), 860), 99)
+    IF AEX.RegisterDiagnostics(AexPhase12SourceAddress(), AexPhase12FileLength()) <> AexErrorDiagnosticInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDiagnosticCodeRangeInvalid() AS BOOL
+    AexPhase12WriteFixture()
+    MEMORY.Write64(ADDRESS.Offset(AexPhase12SourceAddress(), 876), 9)
+    IF AEX.RegisterDiagnostics(AexPhase12SourceAddress(), AexPhase12FileLength()) <> AexErrorDiagnosticOutOfBounds() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDiagnosticRegistryFull() AS BOOL
+    AexPhase12WriteFixture()
+    MEMORY.Write32(AexDiagnosticRegistryCountAddress(), AexDiagnosticRegistryMaxEntries())
+    IF AexRegisterOneDiagnostic(ADDRESS.Offset(AexPhase12SourceAddress(), 64 + (5 * 96)), ADDRESS.Offset(AexPhase12SourceAddress(), 848)) <> AexErrorDiagnosticRegistryFull() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION ReportCase(label0 AS U32, label1 AS U32, label2 AS U32, label3 AS U32, label4 AS U32, ok AS BOOL) AS U64
+    SerialText(label0, label1, label2, label3, label4)
+    IF ok = 1 THEN
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main() AS U64
+    LET testsPassed AS U32 = 0
+    LET testsFailed AS U32 = 0
+
+    LET ValidOk AS BOOL = RunValidDiagnostics()
+    ReportCase(68, 73, 65, 71, 32, ValidOk)
+    IF ValidOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET DispatchOk AS BOOL = RunBindingDispatchLookup()
+    ReportCase(68, 83, 80, 84, 32, DispatchOk)
+    IF DispatchOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET BoundsOk AS BOOL = RunDiagnosticTooShort()
+    ReportCase(66, 78, 68, 83, 32, BoundsOk)
+    IF BoundsOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET IdOk AS BOOL = RunDiagnosticIDMismatch()
+    ReportCase(73, 68, 77, 77, 32, IdOk)
+    IF IdOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET OwnerOk AS BOOL = RunDiagnosticOwnerInvalid()
+    ReportCase(79, 87, 78, 82, 32, OwnerOk)
+    IF OwnerOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET KindOk AS BOOL = RunDiagnosticKindInvalid()
+    ReportCase(75, 73, 78, 68, 32, KindOk)
+    IF KindOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET TargetOk AS BOOL = RunDiagnosticTargetMissing()
+    ReportCase(84, 65, 82, 71, 32, TargetOk)
+    IF TargetOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET RangeOk AS BOOL = RunDiagnosticCodeRangeInvalid()
+    ReportCase(82, 78, 71, 69, 32, RangeOk)
+    IF RangeOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET FullOk AS BOOL = RunDiagnosticRegistryFull()
+    ReportCase(70, 85, 76, 76, 32, FullOk)
+    IF FullOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(32)
+    IF testsFailed = 0 THEN
+        SerialByte(65)
+        SerialByte(76)
+        SerialByte(76)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(83)
+        SerialByte(79)
+        SerialByte(77)
+        SerialByte(69)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN testsFailed
+END FUNCTION

@@ -1,0 +1,369 @@
+' RFC-0046 AEX Phase 7 test body. The smoke test prepends the real stdlib/arcfs_policy.abas and
+' stdlib/aex_format_policy.abas. This fixture builds one minimal AEX with a LIFECYCLE chunk,
+' resolves the selected implementation's activation entry, maps its CODE chunk, and invokes the
+' native no-argument lifecycle entry through the active compiler/backend intrinsic.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    PORT.Write8(PORT.Address(1016), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText(a AS U32, b AS U32, c AS U32, d AS U32, e AS U32) AS U64
+    LET aByte AS U8 = a
+    LET bByte AS U8 = b
+    LET cByte AS U8 = c
+    LET dByte AS U8 = d
+    LET eByte AS U8 = e
+    SerialByte(aByte)
+    SerialByte(bByte)
+    SerialByte(cByte)
+    SerialByte(dByte)
+    SerialByte(eByte)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase7SourceAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62193664))   ' 0x3B50000
+END FUNCTION
+
+FUNCTION AexPhase7CodeDestAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62259200))   ' 0x3B60000
+END FUNCTION
+
+FUNCTION AexPhase7FileLength() AS U64
+    RETURN 853
+END FUNCTION
+
+FUNCTION AexPhase7Clear(base AS MMIOPTR, count AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        MEMORY.Write8(ADDRESS.Offset(base, i), 0)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase7WriteMagic(base AS MMIOPTR) AS U64
+    MEMORY.Write8(ADDRESS.Offset(base, 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(base, 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(base, 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(base, 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 7), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase7WriteEntry(index AS U32, chunkID AS U32, typeHigh AS U64, typeLow AS U64, offset AS U64, length AS U64) AS U64
+    LET index64 AS U64 = index
+    LET entry AS MMIOPTR = ADDRESS.Offset(AexPhase7SourceAddress(), 64 + (index64 * 96))
+    MEMORY.Write32(ADDRESS.Offset(entry, 0), chunkID)
+    MEMORY.Write64(ADDRESS.Offset(entry, 4), typeHigh)
+    MEMORY.Write64(ADDRESS.Offset(entry, 12), typeLow)
+    MEMORY.Write32(ADDRESS.Offset(entry, 20), 1)
+    MEMORY.Write64(ADDRESS.Offset(entry, 24), offset)
+    MEMORY.Write64(ADDRESS.Offset(entry, 32), length)
+    MEMORY.Write64(ADDRESS.Offset(entry, 40), length)
+    MEMORY.Write32(ADDRESS.Offset(entry, 48), 8)
+    MEMORY.Write32(ADDRESS.Offset(entry, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase7WriteHeaderAndDirectory() AS U64
+    LET base AS MMIOPTR = AexPhase7SourceAddress()
+    AexPhase7Clear(base, 1024)
+
+    AexPhase7WriteMagic(base)
+    MEMORY.Write32(ADDRESS.Offset(base, 8), 65536)
+    MEMORY.Write32(ADDRESS.Offset(base, 12), 64)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), 2459565876494606882)
+    MEMORY.Write64(ADDRESS.Offset(base, 32), 64)
+    MEMORY.Write32(ADDRESS.Offset(base, 40), 6)
+    MEMORY.Write32(ADDRESS.Offset(base, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(base, 48), 0)
+
+    AexPhase7WriteEntry(0, 1, AexTypeManifestHigh(), AexTypeManifestLow(), 640, 80)
+    AexPhase7WriteEntry(1, 2, AexTypeComponentHigh(), AexTypeComponentLow(), 720, 48)
+    AexPhase7WriteEntry(2, 10, AexTypeImplementationHigh(), AexTypeImplementationLow(), 768, 40)
+    AexPhase7WriteEntry(3, 22, AexTypeLifecycleHigh(), AexTypeLifecycleLow(), 808, 24)
+    AexPhase7WriteEntry(4, 30, AexTypeCodeHigh(), AexTypeCodeLow(), 832, 12)
+    AexPhase7WriteEntry(5, 31, AexTypeDataHigh(), AexTypeDataLow(), 848, 5)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase7WriteFixture() AS U64
+    AexPhase7WriteHeaderAndDirectory()
+    LET base AS MMIOPTR = AexPhase7SourceAddress()
+
+    LET manifest AS MMIOPTR = ADDRESS.Offset(base, 640)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 0), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 8), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 16), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 24), 0)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 28), 3689348814741910323)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 36), 4919131752989213764)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 52), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 56), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 60), 2)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 64), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 68), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 72), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 76), 2)
+
+    LET component AS MMIOPTR = ADDRESS.Offset(base, 720)
+    MEMORY.Write32(ADDRESS.Offset(component, 0), 2)
+    MEMORY.Write64(ADDRESS.Offset(component, 4), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(component, 12), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(component, 20), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 28), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 32), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 36), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 44), 10)
+
+    LET impl AS MMIOPTR = ADDRESS.Offset(base, 768)
+    MEMORY.Write32(ADDRESS.Offset(impl, 0), 2)
+    MEMORY.Write32(ADDRESS.Offset(impl, 4), AexImplTypeNative())
+    MEMORY.Write32(ADDRESS.Offset(impl, 8), AexArchX86_64())
+    MEMORY.Write32(ADDRESS.Offset(impl, 12), AexAbiNativeMajorCurrent())
+    MEMORY.Write32(ADDRESS.Offset(impl, 16), AexAbiNativeMinorCurrent())
+    MEMORY.Write64(ADDRESS.Offset(impl, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(impl, 28), 7)
+    MEMORY.Write32(ADDRESS.Offset(impl, 32), 30)
+    MEMORY.Write32(ADDRESS.Offset(impl, 36), 31)
+
+    LET lifecycle AS MMIOPTR = ADDRESS.Offset(base, 808)
+    MEMORY.Write32(ADDRESS.Offset(lifecycle, 0), 2)
+    MEMORY.Write32(ADDRESS.Offset(lifecycle, 4), 10)
+    MEMORY.Write64(ADDRESS.Offset(lifecycle, 8), 0)
+    MEMORY.Write64(ADDRESS.Offset(lifecycle, 16), 6)
+
+    ' mov eax, 42; ret; int3; int3
+    MEMORY.Write8(ADDRESS.Offset(base, 832), 184)
+    MEMORY.Write8(ADDRESS.Offset(base, 833), 42)
+    MEMORY.Write8(ADDRESS.Offset(base, 834), 0)
+    MEMORY.Write8(ADDRESS.Offset(base, 835), 0)
+    MEMORY.Write8(ADDRESS.Offset(base, 836), 0)
+    MEMORY.Write8(ADDRESS.Offset(base, 837), 195)
+    MEMORY.Write8(ADDRESS.Offset(base, 838), 184)
+    MEMORY.Write8(ADDRESS.Offset(base, 839), 7)
+    MEMORY.Write8(ADDRESS.Offset(base, 840), 0)
+    MEMORY.Write8(ADDRESS.Offset(base, 841), 0)
+    MEMORY.Write8(ADDRESS.Offset(base, 842), 0)
+    MEMORY.Write8(ADDRESS.Offset(base, 843), 195)
+
+    MEMORY.Write8(ADDRESS.Offset(base, 848), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 849), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 850), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 851), 68)
+    MEMORY.Write8(ADDRESS.Offset(base, 852), 55)
+    RETURN 0
+END FUNCTION
+
+FUNCTION RunLifecycleResolve() AS BOOL
+    AexPhase7WriteFixture()
+    IF AEX.ValidateHeader(AexPhase7SourceAddress(), AexPhase7FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateDirectory(AexPhase7SourceAddress(), AexPhase7FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateManifest(AexPhase7SourceAddress(), AexPhase7FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.SelectImplementation(AexPhase7SourceAddress(), 2, AexPhase7FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    LET implID AS U32 = MEMORY.Read32(AexSelectedImplementationIDAddress())
+    IF AEX.ResolveLifecycleEntry(AexPhase7SourceAddress(), implID, AexPhase7FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read64(AexResolvedLifecycleEntryOffsetAddress()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read64(AexResolvedLifecycleDeactivateOffsetAddress()) <> 6 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunNativeCall() AS BOOL
+    AexPhase7WriteFixture()
+    IF AEX.SelectImplementation(AexPhase7SourceAddress(), 2, AexPhase7FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    LET implID AS U32 = MEMORY.Read32(AexSelectedImplementationIDAddress())
+    IF AEX.ResolveLifecycleEntry(AexPhase7SourceAddress(), implID, AexPhase7FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.MapCodeChunk(AexPhase7SourceAddress(), 30, AexPhase7CodeDestAddress(), 16) <> 0 THEN
+        RETURN 0
+    END IF
+    CPU.MemoryBarrier
+    LET result AS U64 = AEX.InvokeResolvedLifecycle0(AexPhase7CodeDestAddress())
+    IF result <> 42 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDeactivateCall() AS BOOL
+    AexPhase7WriteFixture()
+    IF AEX.SelectImplementation(AexPhase7SourceAddress(), 2, AexPhase7FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ResolveLifecycleEntry(AexPhase7SourceAddress(), 10, AexPhase7FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.MapCodeChunk(AexPhase7SourceAddress(), 30, AexPhase7CodeDestAddress(), 16) <> 0 THEN
+        RETURN 0
+    END IF
+    CPU.MemoryBarrier
+    LET result AS U64 = AEX.InvokeResolvedLifecycleDeactivate0(AexPhase7CodeDestAddress())
+    IF result <> 7 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunLifecycleOffsetInvalid() AS BOOL
+    AexPhase7WriteFixture()
+    MEMORY.Write64(ADDRESS.Offset(AexPhase7SourceAddress(), 816), 12)
+    IF AEX.ResolveLifecycleEntry(AexPhase7SourceAddress(), 10, AexPhase7FileLength()) <> AexErrorLifecycleEntryOutOfBounds() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunLifecycleMissing() AS BOOL
+    AexPhase7WriteFixture()
+    AexPhase7WriteEntry(3, 22, AexTypeDataHigh(), AexTypeDataLow(), 808, 16)
+    IF AEX.ResolveLifecycleEntry(AexPhase7SourceAddress(), 10, AexPhase7FileLength()) <> AexErrorLifecycleInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunLifecycleOwnerMismatch() AS BOOL
+    AexPhase7WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase7SourceAddress(), 808), 99)
+    IF AEX.ResolveLifecycleEntry(AexPhase7SourceAddress(), 10, AexPhase7FileLength()) <> AexErrorLifecycleInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION ReportCase(label0 AS U32, label1 AS U32, label2 AS U32, label3 AS U32, label4 AS U32, ok AS BOOL) AS U64
+    SerialText(label0, label1, label2, label3, label4)
+    IF ok = 1 THEN
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET testsPassed AS U32 = 0
+    LET testsFailed AS U32 = 0
+
+    LET ResolveOk AS BOOL = RunLifecycleResolve()
+    ReportCase(76, 73, 70, 69, 32, ResolveOk)
+    IF ResolveOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET CallOk AS BOOL = RunNativeCall()
+    ReportCase(67, 65, 76, 76, 32, CallOk)
+    IF CallOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET DeactOk AS BOOL = RunDeactivateCall()
+    ReportCase(68, 69, 65, 67, 32, DeactOk)
+    IF DeactOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET OffsetOk AS BOOL = RunLifecycleOffsetInvalid()
+    ReportCase(79, 70, 70, 83, 32, OffsetOk)
+    IF OffsetOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET MissingOk AS BOOL = RunLifecycleMissing()
+    ReportCase(77, 73, 83, 83, 32, MissingOk)
+    IF MissingOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET OwnerOk AS BOOL = RunLifecycleOwnerMismatch()
+    ReportCase(79, 87, 78, 82, 32, OwnerOk)
+    IF OwnerOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(32)
+    IF testsFailed = 0 THEN
+        SerialByte(65)
+        SerialByte(76)
+        SerialByte(76)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(83)
+        SerialByte(79)
+        SerialByte(77)
+        SerialByte(69)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN testsFailed
+END FUNCTION

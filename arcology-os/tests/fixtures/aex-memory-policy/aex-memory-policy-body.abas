@@ -1,0 +1,329 @@
+' RFC-0046 AEX memory-policy test body. Validates MEMORY_POLICY chunks and W^X rejection.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    PORT.Write8(PORT.Address(1016), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText(a AS U32, b AS U32, c AS U32, d AS U32, e AS U32) AS U64
+    LET aByte AS U8 = a
+    LET bByte AS U8 = b
+    LET cByte AS U8 = c
+    LET dByte AS U8 = d
+    LET eByte AS U8 = e
+    SerialByte(aByte)
+    SerialByte(bByte)
+    SerialByte(cByte)
+    SerialByte(dByte)
+    SerialByte(eByte)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexMemSourceAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(63569920))   ' 0x3CA0000
+END FUNCTION
+
+FUNCTION AexMemFileLength() AS U64
+    RETURN 980
+END FUNCTION
+
+FUNCTION AexMemClear(base AS MMIOPTR, count AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        MEMORY.Write8(ADDRESS.Offset(base, i), 0)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexMemWriteMagic(base AS MMIOPTR) AS U64
+    MEMORY.Write8(ADDRESS.Offset(base, 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(base, 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(base, 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(base, 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 7), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexMemWriteEntry(index AS U32, chunkID AS U32, typeHigh AS U64, typeLow AS U64, offset AS U64, length AS U64) AS U64
+    LET index64 AS U64 = index
+    LET entry AS MMIOPTR = ADDRESS.Offset(AexMemSourceAddress(), 64 + (index64 * 96))
+    MEMORY.Write32(ADDRESS.Offset(entry, 0), chunkID)
+    MEMORY.Write64(ADDRESS.Offset(entry, 4), typeHigh)
+    MEMORY.Write64(ADDRESS.Offset(entry, 12), typeLow)
+    MEMORY.Write32(ADDRESS.Offset(entry, 20), 1)
+    MEMORY.Write64(ADDRESS.Offset(entry, 24), offset)
+    MEMORY.Write64(ADDRESS.Offset(entry, 32), length)
+    MEMORY.Write64(ADDRESS.Offset(entry, 40), length)
+    MEMORY.Write32(ADDRESS.Offset(entry, 48), 8)
+    MEMORY.Write32(ADDRESS.Offset(entry, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexMemWritePolicy(offset AS U64, policyID AS U32, ownerID AS U32, targetID AS U32, chunkID AS U32, perms AS U32, semantics AS U32) AS U64
+    LET data AS MMIOPTR = ADDRESS.Offset(AexMemSourceAddress(), offset)
+    MEMORY.Write32(ADDRESS.Offset(data, 0), policyID)
+    MEMORY.Write32(ADDRESS.Offset(data, 4), ownerID)
+    MEMORY.Write32(ADDRESS.Offset(data, 8), targetID)
+    MEMORY.Write32(ADDRESS.Offset(data, 12), chunkID)
+    MEMORY.Write32(ADDRESS.Offset(data, 16), perms)
+    MEMORY.Write32(ADDRESS.Offset(data, 20), semantics)
+    MEMORY.Write32(ADDRESS.Offset(data, 24), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexMemWriteFixture() AS U64
+    LET base AS MMIOPTR = AexMemSourceAddress()
+    AexMemClear(base, 1280)
+    AexMemWriteMagic(base)
+    MEMORY.Write32(ADDRESS.Offset(base, 8), 65536)
+    MEMORY.Write32(ADDRESS.Offset(base, 12), 64)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), 2459565876494606882)
+    MEMORY.Write64(ADDRESS.Offset(base, 32), 64)
+    MEMORY.Write32(ADDRESS.Offset(base, 40), 7)
+    MEMORY.Write32(ADDRESS.Offset(base, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(base, 48), 0)
+
+    AexMemWriteEntry(0, 1, AexTypeManifestHigh(), AexTypeManifestLow(), 736, 80)
+    AexMemWriteEntry(1, 2, AexTypeComponentHigh(), AexTypeComponentLow(), 816, 48)
+    AexMemWriteEntry(2, 10, AexTypeImplementationHigh(), AexTypeImplementationLow(), 864, 40)
+    AexMemWriteEntry(3, 20, AexTypeCodeHigh(), AexTypeCodeLow(), 904, 8)
+    AexMemWriteEntry(4, 21, AexTypeDataHigh(), AexTypeDataLow(), 912, 4)
+    AexMemWriteEntry(5, 80, AexTypeMemoryPolicyHigh(), AexTypeMemoryPolicyLow(), 920, 28)
+    AexMemWriteEntry(6, 81, AexTypeMemoryPolicyHigh(), AexTypeMemoryPolicyLow(), 952, 24)
+
+    LET manifest AS MMIOPTR = ADDRESS.Offset(base, 736)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 0), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 8), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 16), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 24), 0)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 28), 3689348814741910323)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 36), 4919131752989213764)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 52), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 56), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 60), 2)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 64), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 68), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 72), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 76), 2)
+
+    LET component AS MMIOPTR = ADDRESS.Offset(base, 816)
+    MEMORY.Write32(ADDRESS.Offset(component, 0), 2)
+    MEMORY.Write64(ADDRESS.Offset(component, 4), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(component, 12), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(component, 20), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 28), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 32), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 36), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 44), 10)
+
+    LET impl AS MMIOPTR = ADDRESS.Offset(base, 864)
+    MEMORY.Write32(ADDRESS.Offset(impl, 0), 2)
+    MEMORY.Write32(ADDRESS.Offset(impl, 4), AexImplTypeNative())
+    MEMORY.Write32(ADDRESS.Offset(impl, 8), AexArchX86_64())
+    MEMORY.Write32(ADDRESS.Offset(impl, 12), AexAbiNativeMajorCurrent())
+    MEMORY.Write32(ADDRESS.Offset(impl, 16), AexAbiNativeMinorCurrent())
+    MEMORY.Write64(ADDRESS.Offset(impl, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(impl, 28), 7)
+    MEMORY.Write32(ADDRESS.Offset(impl, 32), 20)
+    MEMORY.Write32(ADDRESS.Offset(impl, 36), 21)
+
+    MEMORY.Write8(ADDRESS.Offset(base, 904), 1)
+    MEMORY.Write8(ADDRESS.Offset(base, 905), 2)
+    MEMORY.Write8(ADDRESS.Offset(base, 906), 3)
+    MEMORY.Write8(ADDRESS.Offset(base, 907), 4)
+    MEMORY.Write8(ADDRESS.Offset(base, 908), 5)
+    MEMORY.Write8(ADDRESS.Offset(base, 909), 6)
+    MEMORY.Write8(ADDRESS.Offset(base, 910), 7)
+    MEMORY.Write8(ADDRESS.Offset(base, 911), 8)
+    MEMORY.Write8(ADDRESS.Offset(base, 912), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 913), 66)
+    MEMORY.Write8(ADDRESS.Offset(base, 914), 67)
+    MEMORY.Write8(ADDRESS.Offset(base, 915), 68)
+
+    AexMemWritePolicy(920, 80, 2, 10, 20, AexMemoryPermissionRead() + AexMemoryPermissionExecute(), AexMemorySemanticImmutable() + AexMemorySemanticShared())
+    AexMemWritePolicy(952, 81, 2, 10, 21, AexMemoryPermissionRead() + AexMemoryPermissionWrite(), AexMemorySemanticPrivate() + AexMemorySemanticCopyOnWrite())
+    RETURN 0
+END FUNCTION
+
+FUNCTION RunValidMemoryPolicies() AS BOOL
+    AexMemWriteFixture()
+    AexMemWriteEntry(6, 81, AexTypeMemoryPolicyHigh(), AexTypeMemoryPolicyLow(), 952, 28)
+    IF AEX.ValidateHeader(AexMemSourceAddress(), AexMemFileLength()) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateDirectory(AexMemSourceAddress(), AexMemFileLength()) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateManifest(AexMemSourceAddress(), AexMemFileLength()) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateMemoryPolicies(AexMemSourceAddress(), AexMemFileLength()) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunPolicyTooShort() AS BOOL
+    AexMemWriteFixture()
+    IF AEX.ValidateMemoryPolicies(AexMemSourceAddress(), AexMemFileLength()) <> AexErrorMemoryPolicyOutOfBounds() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunPolicyIDMismatch() AS BOOL
+    AexMemWriteFixture()
+    AexMemWriteEntry(6, 81, AexTypeMemoryPolicyHigh(), AexTypeMemoryPolicyLow(), 952, 28)
+    MEMORY.Write32(ADDRESS.Offset(AexMemSourceAddress(), 952), 82)
+    IF AEX.ValidateMemoryPolicies(AexMemSourceAddress(), AexMemFileLength()) <> AexErrorMemoryPolicyInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunPolicyOwnerInvalid() AS BOOL
+    AexMemWriteFixture()
+    AexMemWriteEntry(6, 81, AexTypeMemoryPolicyHigh(), AexTypeMemoryPolicyLow(), 952, 28)
+    MEMORY.Write32(ADDRESS.Offset(AexMemSourceAddress(), 924), 99)
+    IF AEX.ValidateMemoryPolicies(AexMemSourceAddress(), AexMemFileLength()) <> AexErrorMemoryPolicyOwnerInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunPolicyWXDenied() AS BOOL
+    AexMemWriteFixture()
+    AexMemWriteEntry(6, 81, AexTypeMemoryPolicyHigh(), AexTypeMemoryPolicyLow(), 952, 28)
+    MEMORY.Write32(ADDRESS.Offset(AexMemSourceAddress(), 936), AexMemoryPermissionRead() + AexMemoryPermissionWrite() + AexMemoryPermissionExecute())
+    IF AEX.ValidateMemoryPolicies(AexMemSourceAddress(), AexMemFileLength()) <> AexErrorMemoryPolicyWXDenied() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunPolicyTargetInvalid() AS BOOL
+    AexMemWriteFixture()
+    AexMemWriteEntry(6, 81, AexTypeMemoryPolicyHigh(), AexTypeMemoryPolicyLow(), 952, 28)
+    MEMORY.Write32(ADDRESS.Offset(AexMemSourceAddress(), 932), 1)
+    IF AEX.ValidateMemoryPolicies(AexMemSourceAddress(), AexMemFileLength()) <> AexErrorMemoryPolicyInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunPolicyImmutableWrite() AS BOOL
+    AexMemWriteFixture()
+    AexMemWriteEntry(6, 81, AexTypeMemoryPolicyHigh(), AexTypeMemoryPolicyLow(), 952, 28)
+    MEMORY.Write32(ADDRESS.Offset(AexMemSourceAddress(), 936), AexMemoryPermissionRead() + AexMemoryPermissionWrite())
+    MEMORY.Write32(ADDRESS.Offset(AexMemSourceAddress(), 940), AexMemorySemanticImmutable())
+    IF AEX.ValidateMemoryPolicies(AexMemSourceAddress(), AexMemFileLength()) <> AexErrorMemoryPolicyInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION ReportCase(label0 AS U32, label1 AS U32, label2 AS U32, label3 AS U32, label4 AS U32, ok AS BOOL) AS U64
+    SerialText(label0, label1, label2, label3, label4)
+    IF ok = 1 THEN
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    LET testsFailed AS U32 = 0
+
+    LET ValidOk AS BOOL = RunValidMemoryPolicies()
+    ReportCase(77, 69, 77, 80, 32, ValidOk)
+    IF ValidOk = 0 THEN
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET BoundsOk AS BOOL = RunPolicyTooShort()
+    ReportCase(66, 78, 68, 83, 32, BoundsOk)
+    IF BoundsOk = 0 THEN
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET IdOk AS BOOL = RunPolicyIDMismatch()
+    ReportCase(73, 68, 77, 77, 32, IdOk)
+    IF IdOk = 0 THEN
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET OwnerOk AS BOOL = RunPolicyOwnerInvalid()
+    ReportCase(79, 87, 78, 82, 32, OwnerOk)
+    IF OwnerOk = 0 THEN
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET WXOk AS BOOL = RunPolicyWXDenied()
+    ReportCase(87, 88, 68, 78, 32, WXOk)
+    IF WXOk = 0 THEN
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET TargetOk AS BOOL = RunPolicyTargetInvalid()
+    ReportCase(84, 65, 82, 71, 32, TargetOk)
+    IF TargetOk = 0 THEN
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET ImmOk AS BOOL = RunPolicyImmutableWrite()
+    ReportCase(73, 77, 77, 87, 32, ImmOk)
+    IF ImmOk = 0 THEN
+        testsFailed = testsFailed + 1
+    END IF
+
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(32)
+    IF testsFailed = 0 THEN
+        SerialByte(65)
+        SerialByte(76)
+        SerialByte(76)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(83)
+        SerialByte(79)
+        SerialByte(77)
+        SerialByte(69)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN testsFailed
+END FUNCTION

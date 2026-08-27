@@ -201,6 +201,16 @@ public:
         emit(static_cast<std::uint8_t>((disp32 >> 24) & 0xFF));
     }
 
+    // call reg -- FF /2, register-direct. Used for AEX native lifecycle activation once the
+    // loader has resolved a CODE chunk base plus lifecycle entry offset into a concrete address.
+    void call_reg(Reg target) {
+        if (reg_needs_rex_extension(target)) {
+            emit(0x41);  // REX.B only
+        }
+        emit(0xFF);
+        emit(static_cast<std::uint8_t>(0xD0 | reg_low3(target))); // mod=11 reg=010(/2)
+    }
+
     void cli() { emit(0xFA); }
     void sti() { emit(0xFB); }
     void hlt() { emit(0xF4); }

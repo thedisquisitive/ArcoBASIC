@@ -1,0 +1,426 @@
+' RFC-0046 AEX Phase 10 test body. This validates ARCO_BINDING chunks and proves the loader copies
+' accepted bindings into its bounded ABT registry scratch table.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    PORT.Write8(PORT.Address(1016), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText(a AS U32, b AS U32, c AS U32, d AS U32, e AS U32) AS U64
+    LET aByte AS U8 = a
+    LET bByte AS U8 = b
+    LET cByte AS U8 = c
+    LET dByte AS U8 = d
+    LET eByte AS U8 = e
+    SerialByte(aByte)
+    SerialByte(bByte)
+    SerialByte(cByte)
+    SerialByte(dByte)
+    SerialByte(eByte)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase10SourceAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62455808))   ' 0x3B90000
+END FUNCTION
+
+FUNCTION AexPhase10FileLength() AS U64
+    RETURN 772
+END FUNCTION
+
+FUNCTION AexPhase10Clear(base AS MMIOPTR, count AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        MEMORY.Write8(ADDRESS.Offset(base, i), 0)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase10WriteMagic(base AS MMIOPTR) AS U64
+    MEMORY.Write8(ADDRESS.Offset(base, 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(base, 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(base, 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(base, 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 7), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase10WriteEntry(index AS U32, chunkID AS U32, typeHigh AS U64, typeLow AS U64, offset AS U64, length AS U64) AS U64
+    LET index64 AS U64 = index
+    LET entry AS MMIOPTR = ADDRESS.Offset(AexPhase10SourceAddress(), 64 + (index64 * 96))
+    MEMORY.Write32(ADDRESS.Offset(entry, 0), chunkID)
+    MEMORY.Write64(ADDRESS.Offset(entry, 4), typeHigh)
+    MEMORY.Write64(ADDRESS.Offset(entry, 12), typeLow)
+    MEMORY.Write32(ADDRESS.Offset(entry, 20), 1)
+    MEMORY.Write64(ADDRESS.Offset(entry, 24), offset)
+    MEMORY.Write64(ADDRESS.Offset(entry, 32), length)
+    MEMORY.Write64(ADDRESS.Offset(entry, 40), length)
+    MEMORY.Write32(ADDRESS.Offset(entry, 48), 8)
+    MEMORY.Write32(ADDRESS.Offset(entry, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase10WriteHeaderAndDirectory() AS U64
+    LET base AS MMIOPTR = AexPhase10SourceAddress()
+    AexPhase10Clear(base, 1024)
+
+    AexPhase10WriteMagic(base)
+    MEMORY.Write32(ADDRESS.Offset(base, 8), 65536)
+    MEMORY.Write32(ADDRESS.Offset(base, 12), 64)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), 2459565876494606882)
+    MEMORY.Write64(ADDRESS.Offset(base, 32), 64)
+    MEMORY.Write32(ADDRESS.Offset(base, 40), 5)
+    MEMORY.Write32(ADDRESS.Offset(base, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(base, 48), 0)
+
+    AexPhase10WriteEntry(0, 1, AexTypeManifestHigh(), AexTypeManifestLow(), 544, 80)
+    AexPhase10WriteEntry(1, 2, AexTypeComponentHigh(), AexTypeComponentLow(), 624, 48)
+    AexPhase10WriteEntry(2, 10, AexTypeImplementationHigh(), AexTypeImplementationLow(), 672, 40)
+    AexPhase10WriteEntry(3, 70, AexTypeArcoBindingHigh(), AexTypeArcoBindingLow(), 712, 56)
+    AexPhase10WriteEntry(4, 80, AexTypeDataHigh(), AexTypeDataLow(), 768, 4)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase10WriteBinding(offset AS U64, bindingID AS U32, ownerID AS U32, kind AS U32, targetID AS U32) AS U64
+    LET data AS MMIOPTR = ADDRESS.Offset(AexPhase10SourceAddress(), offset)
+    MEMORY.Write32(ADDRESS.Offset(data, 0), bindingID)
+    MEMORY.Write32(ADDRESS.Offset(data, 4), ownerID)
+    MEMORY.Write32(ADDRESS.Offset(data, 8), kind)
+    MEMORY.Write32(ADDRESS.Offset(data, 12), targetID)
+    MEMORY.Write64(ADDRESS.Offset(data, 16), 11068046444225730969)
+    MEMORY.Write64(ADDRESS.Offset(data, 24), 12370169555311111083)
+    MEMORY.Write64(ADDRESS.Offset(data, 32), 0)
+    MEMORY.Write64(ADDRESS.Offset(data, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase10WriteFixture() AS U64
+    AexPhase10WriteHeaderAndDirectory()
+    LET base AS MMIOPTR = AexPhase10SourceAddress()
+
+    LET manifest AS MMIOPTR = ADDRESS.Offset(base, 544)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 0), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 8), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 16), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 24), 0)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 28), 3689348814741910323)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 36), 4919131752989213764)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 52), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 56), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 60), 2)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 64), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 68), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 72), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 76), 2)
+
+    LET component AS MMIOPTR = ADDRESS.Offset(base, 624)
+    MEMORY.Write32(ADDRESS.Offset(component, 0), 2)
+    MEMORY.Write64(ADDRESS.Offset(component, 4), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(component, 12), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(component, 20), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 28), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 32), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 36), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 44), 10)
+
+    LET impl AS MMIOPTR = ADDRESS.Offset(base, 672)
+    MEMORY.Write32(ADDRESS.Offset(impl, 0), 2)
+    MEMORY.Write32(ADDRESS.Offset(impl, 4), AexImplTypeNative())
+    MEMORY.Write32(ADDRESS.Offset(impl, 8), AexArchX86_64())
+    MEMORY.Write32(ADDRESS.Offset(impl, 12), AexAbiNativeMajorCurrent())
+    MEMORY.Write32(ADDRESS.Offset(impl, 16), AexAbiNativeMinorCurrent())
+    MEMORY.Write64(ADDRESS.Offset(impl, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(impl, 28), 7)
+    MEMORY.Write32(ADDRESS.Offset(impl, 32), 0)
+    MEMORY.Write32(ADDRESS.Offset(impl, 36), 0)
+
+    AexPhase10WriteBinding(712, 70, 2, AexBindingKindMethod(), 10)
+    MEMORY.Write8(ADDRESS.Offset(base, 768), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 769), 66)
+    MEMORY.Write8(ADDRESS.Offset(base, 770), 84)
+    MEMORY.Write8(ADDRESS.Offset(base, 771), 49)
+    RETURN 0
+END FUNCTION
+
+FUNCTION RunRegisterBinding() AS BOOL
+    AexPhase10WriteFixture()
+    IF AEX.ValidateHeader(AexPhase10SourceAddress(), AexPhase10FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateDirectory(AexPhase10SourceAddress(), AexPhase10FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateManifest(AexPhase10SourceAddress(), AexPhase10FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.RegisterArcoBindings(AexPhase10SourceAddress(), AexPhase10FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(AexBindingRegistryCountAddress()) <> 1 THEN
+        RETURN 0
+    END IF
+    LET entry AS MMIOPTR = AexBindingRegistryEntryAddress(0)
+    IF MEMORY.Read32(ADDRESS.Offset(entry, 0)) <> 70 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(ADDRESS.Offset(entry, 4)) <> 2 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(ADDRESS.Offset(entry, 8)) <> AexBindingKindMethod() THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(ADDRESS.Offset(entry, 12)) <> 10 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunBindingAuthorityDenied() AS BOOL
+    AexPhase10WriteFixture()
+    MEMORY.Write64(ADDRESS.Offset(AexPhase10SourceAddress(), 744), 8608480567731124087)
+    MEMORY.Write64(ADDRESS.Offset(AexPhase10SourceAddress(), 752), 9838263505978427528)
+    AEX.ClearCapabilityGrants()
+    IF AEX.RegisterArcoBindingsWithAuthority(AexPhase10SourceAddress(), AexPhase10FileLength()) <> AexErrorBindingAuthorityDenied() THEN
+        RETURN 0
+    END IF
+    IF AEX.BindingRegistryCount() <> 0 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunBindingAuthorityGranted() AS BOOL
+    AexPhase10WriteFixture()
+    MEMORY.Write64(ADDRESS.Offset(AexPhase10SourceAddress(), 744), 8608480567731124087)
+    MEMORY.Write64(ADDRESS.Offset(AexPhase10SourceAddress(), 752), 9838263505978427528)
+    AEX.ClearCapabilityGrants()
+    IF AEX.AllowCapability(8608480567731124087, 9838263505978427528) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.RegisterArcoBindingsWithAuthority(AexPhase10SourceAddress(), AexPhase10FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.BindingRegistryCount() <> 1 THEN
+        RETURN 0
+    END IF
+    IF AEX.BindingRegistryIDAt(0) <> 70 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunBindingTooShort() AS BOOL
+    AexPhase10WriteFixture()
+    AexPhase10WriteEntry(3, 70, AexTypeArcoBindingHigh(), AexTypeArcoBindingLow(), 712, 52)
+    IF AEX.RegisterArcoBindings(AexPhase10SourceAddress(), AexPhase10FileLength()) <> AexErrorBindingOutOfBounds() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunBindingOwnerInvalid() AS BOOL
+    AexPhase10WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase10SourceAddress(), 716), 99)
+    IF AEX.RegisterArcoBindings(AexPhase10SourceAddress(), AexPhase10FileLength()) <> AexErrorBindingOwnerInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunBindingBadKind() AS BOOL
+    AexPhase10WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase10SourceAddress(), 720), 99)
+    IF AEX.RegisterArcoBindings(AexPhase10SourceAddress(), AexPhase10FileLength()) <> AexErrorBindingInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunBindingIDMismatch() AS BOOL
+    AexPhase10WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase10SourceAddress(), 712), 71)
+    IF AEX.RegisterArcoBindings(AexPhase10SourceAddress(), AexPhase10FileLength()) <> AexErrorBindingInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunBindingTargetMissing() AS BOOL
+    AexPhase10WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase10SourceAddress(), 724), 99)
+    IF AEX.RegisterArcoBindings(AexPhase10SourceAddress(), AexPhase10FileLength()) <> AexErrorBindingInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunBindingTargetOwnerMismatch() AS BOOL
+    AexPhase10WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase10SourceAddress(), 672), 99)
+    IF AEX.RegisterArcoBindings(AexPhase10SourceAddress(), AexPhase10FileLength()) <> AexErrorBindingOwnerInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunBindingReservedNonzero() AS BOOL
+    AexPhase10WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase10SourceAddress(), 764), 1)
+    IF AEX.RegisterArcoBindings(AexPhase10SourceAddress(), AexPhase10FileLength()) <> AexErrorBindingInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION ReportCase(label0 AS U32, label1 AS U32, label2 AS U32, label3 AS U32, label4 AS U32, ok AS BOOL) AS U64
+    SerialText(label0, label1, label2, label3, label4)
+    IF ok = 1 THEN
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET testsPassed AS U32 = 0
+    LET testsFailed AS U32 = 0
+
+    LET RegisterOk AS BOOL = RunRegisterBinding()
+    ReportCase(82, 69, 71, 83, 32, RegisterOk)
+    IF RegisterOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET AuthDenyOk AS BOOL = RunBindingAuthorityDenied()
+    ReportCase(65, 68, 69, 78, 32, AuthDenyOk)
+    IF AuthDenyOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET AuthGrantOk AS BOOL = RunBindingAuthorityGranted()
+    ReportCase(65, 71, 82, 78, 32, AuthGrantOk)
+    IF AuthGrantOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET BoundsOk AS BOOL = RunBindingTooShort()
+    ReportCase(66, 78, 68, 83, 32, BoundsOk)
+    IF BoundsOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET OwnerOk AS BOOL = RunBindingOwnerInvalid()
+    ReportCase(79, 87, 78, 82, 32, OwnerOk)
+    IF OwnerOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET KindOk AS BOOL = RunBindingBadKind()
+    ReportCase(75, 73, 78, 68, 32, KindOk)
+    IF KindOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET IdOk AS BOOL = RunBindingIDMismatch()
+    ReportCase(73, 68, 77, 77, 32, IdOk)
+    IF IdOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET TargetOk AS BOOL = RunBindingTargetMissing()
+    ReportCase(84, 65, 82, 71, 32, TargetOk)
+    IF TargetOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET TargetOwnerOk AS BOOL = RunBindingTargetOwnerMismatch()
+    ReportCase(84, 79, 87, 78, 32, TargetOwnerOk)
+    IF TargetOwnerOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET ReservedOk AS BOOL = RunBindingReservedNonzero()
+    ReportCase(82, 83, 86, 68, 32, ReservedOk)
+    IF ReservedOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(32)
+    IF testsFailed = 0 THEN
+        SerialByte(65)
+        SerialByte(76)
+        SerialByte(76)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(83)
+        SerialByte(79)
+        SerialByte(77)
+        SerialByte(69)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN testsFailed
+END FUNCTION

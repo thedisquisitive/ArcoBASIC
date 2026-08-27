@@ -72,6 +72,18 @@ arco_add_script_test(
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 arco_add_script_test(
+    systems_aex_preloaded_boot_smoke
+    arcology-os/tests/systems/systems_aex_preloaded_boot_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_userspace_hardware_artifact_smoke
+    arcology-os/tests/systems/systems_aex_userspace_hardware_artifact_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
     systems_integer_core_smoke
     arcology-os/tests/systems/systems_integer_core_smoke.sh
     $<TARGET_FILE:ArcoFission>
@@ -309,6 +321,78 @@ arco_add_script_test(
 arco_add_script_test(
     systems_aex_implementation_probe_smoke
     arcology-os/tests/systems/systems_aex_implementation_probe_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_code_data_mapping_smoke
+    arcology-os/tests/systems/systems_aex_code_data_mapping_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_native_lifecycle_smoke
+    arcology-os/tests/systems/systems_aex_native_lifecycle_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_interface_metadata_smoke
+    arcology-os/tests/systems/systems_aex_interface_metadata_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_capability_requests_smoke
+    arcology-os/tests/systems/systems_aex_capability_requests_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_arco_binding_smoke
+    arcology-os/tests/systems/systems_aex_arco_binding_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_integrity_verification_smoke
+    arcology-os/tests/systems/systems_aex_integrity_verification_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_diagnostics_metadata_smoke
+    arcology-os/tests/systems/systems_aex_diagnostics_metadata_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_negative_matrix_smoke
+    arcology-os/tests/systems/systems_aex_negative_matrix_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_qemu_load_path_smoke
+    arcology-os/tests/systems/systems_aex_qemu_load_path_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_load_and_activate_smoke
+    arcology-os/tests/systems/systems_aex_load_and_activate_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_memory_policy_smoke
+    arcology-os/tests/systems/systems_aex_memory_policy_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
+    systems_aex_allocated_native1_smoke
+    arcology-os/tests/systems/systems_aex_allocated_native1_smoke.sh
     $<TARGET_FILE:ArcoFission>
     ${CMAKE_CURRENT_SOURCE_DIR}
 )

@@ -10,9 +10,9 @@
 ' whichever produces a real character first. Output moves from RFC-0007's own original ConsoleOut.
 ' Write (firmware-hosted, hangs after ExitBootServices per this RFC's own Section 4 finding) to the
 ' real serial port -- the only real, proven post-exit output channel anywhere in this project's own
-' history (aps-gdt-reload.abas, ps2-keyboard-driver.abas). The READY. prompt itself is therefore a
+' history (aps-gdt-reload.abas, ps2-keyboard-driver.abas). The substrate prompt itself is therefore a
 ' real serial terminal session under QEMU, not a graphical console -- a real, honestly-scoped
-' substitution, not a silent one; a GOP-based text console is real future work, not attempted here.
+' substitution, not a silent one; a GOP-based text console now mirrors the same shell.
 '
 ' Both drivers' own setup (xHCI PCI discovery/MMIO/rings/enumeration needs BootServices.
 ' AllocatePages) happens BEFORE ExitBootServices, matching every other real constraint this project
@@ -102,6 +102,10 @@ FUNCTION PS2Keyboard.PollScancode() AS U32
     LET data AS IOPORT = Ps2DataPort()
     LET statusValue AS U8 = PORT.ReadByte(status)
     IF (statusValue AND 1) = 0 THEN
+        RETURN 0
+    END IF
+    IF (statusValue AND 32) <> 0 THEN
+        PORT.ReadByte(data)
         RETURN 0
     END IF
     LET scancode AS U8 = PORT.ReadByte(data)
@@ -1557,7 +1561,7 @@ END FUNCTION
 FUNCTION UsbXhci.FindHidInterruptEndpoint(totalLength AS U32, outEndpointAddress AS PTR, outMaxPacketSize AS PTR, outInterval AS PTR) AS BOOL
     LET dmaBufferMmio AS MMIOPTR = XhciScratchDmaMmio()
     LET cursor AS U32 = 0
-    LET sawHidInterface AS BOOL = 0
+    LET sawBootKeyboardInterface AS BOOL = 0
     WHILE cursor + 2 <= totalLength
         LET descPtr AS MMIOPTR = ADDRESS.Offset(dmaBufferMmio, cursor)
         LET bLength AS U32 = MmioReadField32(descPtr, 0, 0, 8)
@@ -1574,14 +1578,24 @@ FUNCTION UsbXhci.FindHidInterruptEndpoint(totalLength AS U32, outEndpointAddress
             ' recognized (EP/MP always 0). Caught by a real byte-level dump of a real device's own
             ' configuration descriptor under QEMU, not by inspection alone.
             LET bInterfaceClass AS U32 = MmioReadField32(descPtr, 5, 0, 8)
+            LET bInterfaceSubClass AS U32 = MmioReadField32(descPtr, 6, 0, 8)
+            LET bInterfaceProtocol AS U32 = MmioReadField32(descPtr, 7, 0, 8)
             IF bInterfaceClass = 3 THEN
-                sawHidInterface = 1
+                IF bInterfaceSubClass = 1 THEN
+                    IF bInterfaceProtocol = 1 THEN
+                        sawBootKeyboardInterface = 1
+                    ELSE
+                        sawBootKeyboardInterface = 0
+                    END IF
+                ELSE
+                    sawBootKeyboardInterface = 0
+                END IF
             ELSE
-                sawHidInterface = 0
+                sawBootKeyboardInterface = 0
             END IF
         END IF
         IF bDescriptorType = 5 THEN
-            IF sawHidInterface = 1 THEN
+            IF sawBootKeyboardInterface = 1 THEN
                 LET bEndpointAddress AS U32 = MmioReadField32(descPtr, 2, 0, 8)
                 LET bmAttributes AS U32 = MmioReadField32(descPtr, 3, 0, 8)
                 LET isIn AS U32 = (bEndpointAddress SHR 7) AND 1
@@ -1939,7 +1953,7 @@ END FUNCTION
 ' Real 8x8 bitmap font (ASCII 32-126, 95 glyphs), rendered offline from a real monospace
 ' TrueType font (FreeMonoBold) and embedded here as 95 packed U64 constants (one write per
 ' glyph, byte[row]=8-bit row pattern, bit7=leftmost pixel) -- RFC-0045 Phase 5's own real
-' need: a genuinely on-screen READY. terminal, since the substrate's own post-ExitBootServices
+' need: a genuinely on-screen substrate terminal, since the substrate's own post-ExitBootServices
 ' output (serial only, see aps-gdt-reload.abas/ps2-keyboard-driver.abas) isn't observable on
 ' real hardware without a serial capture setup most laptops don't expose.
 FUNCTION FontTableAddress() AS MMIOPTR
@@ -3635,6 +3649,9 @@ END FUNCTION
 FUNCTION TermScaleAddress() AS MMIOPTR
     RETURN ADDRESS.Offset(TermStateAddress(), 40)
 END FUNCTION
+FUNCTION TermCurrentFgAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(TermStateAddress(), 44)
+END FUNCTION
 
 ' A REAL finding from this fixture's own first physical hardware run: a fixed 8x8-at-2x (16px)
 ' glyph cell, legible on QEMU's own 1280x800 virtual display, was "nearly impossible to read" on
@@ -3690,11 +3707,42 @@ FUNCTION ComputeTermScale(widthPx AS U32) AS U32
     RETURN scale
 END FUNCTION
 FUNCTION TermFgColor() AS U32
-    RETURN 16777215   ' white on every real 32bpp GOP pixel format this project has ever seen (equal
-                       ' RGB components render the same regardless of channel order)
+    LET fg AS U32 = MEMORY.Read32(TermCurrentFgAddress())
+    IF fg = 0 THEN
+        RETURN 16777215   ' white on every real 32bpp GOP pixel format this project has ever seen
+    END IF
+    RETURN fg
 END FUNCTION
 FUNCTION TermBgColor() AS U32
     RETURN 0           ' black
+END FUNCTION
+FUNCTION TermSetFg(color AS U32) AS U64
+    MEMORY.Write32(TermCurrentFgAddress(), color)
+    RETURN 0
+END FUNCTION
+FUNCTION TermDefaultFg() AS U64
+    TermSetFg(16777215)
+    RETURN 0
+END FUNCTION
+FUNCTION TermArcologyBlue() AS U64
+    TermSetFg(DashPrimary())
+    RETURN 0
+END FUNCTION
+FUNCTION TermTranshumanistRed() AS U64
+    TermSetFg(DashRed())
+    RETURN 0
+END FUNCTION
+FUNCTION TermAmber() AS U64
+    TermSetFg(DashAmber())
+    RETURN 0
+END FUNCTION
+FUNCTION TermActiveGreen() AS U64
+    TermSetFg(DashActive())
+    RETURN 0
+END FUNCTION
+FUNCTION TermDim() AS U64
+    TermSetFg(DashDim())
+    RETURN 0
 END FUNCTION
 
 ' Draws one real glyph, scaled, at a given PIXEL (not cell) origin -- always draws the full cell
@@ -3839,6 +3887,21 @@ FUNCTION TermClear() AS U64
     WEND
     MEMORY.Write32(TermCursorColAddress(), 0)
     MEMORY.Write32(TermCursorRowAddress(), 0)
+    TermDefaultFg()
+    RETURN 0
+END FUNCTION
+
+FUNCTION TermClearRow(row AS U32) AS U64
+    LET ready AS U32 = MEMORY.Read32(TermReadyAddress())
+    IF ready = 0 THEN
+        RETURN 0
+    END IF
+    LET framebuffer AS MMIOPTR = TermFramebufferMmio()
+    LET stride AS U32 = MEMORY.Read32(TermStrideAddress())
+    LET widthPx AS U32 = MEMORY.Read32(TermWidthPxAddress())
+    LET cellH AS U32 = TermCellH()
+    LET y AS U32 = row * cellH
+    FillRect(framebuffer, stride, 0, y, widthPx, cellH, TermBgColor())
     RETURN 0
 END FUNCTION
 
@@ -3892,8 +3955,8 @@ FUNCTION TermPutChar(code AS U32) AS U64
     END IF
 
     IF row >= rows THEN
-        TermClear()
-        RETURN 0
+        row = 0
+        TermClearRow(row)
     END IF
 
     MEMORY.Write32(TermCursorColAddress(), col)
@@ -3914,6 +3977,7 @@ END FUNCTION
 FUNCTION PrintBanner() AS U64
     EchoChar(13)
     EchoChar(10)
+    TermArcologyBlue()
     EchoChar(65)
     EchoChar(82)
     EchoChar(67)
@@ -3923,41 +3987,21 @@ FUNCTION PrintBanner() AS U64
     EchoChar(71)
     EchoChar(89)
     EchoChar(32)
+    TermTranshumanistRed()
     EchoChar(83)
     EchoChar(69)
     EchoChar(69)
     EchoChar(68)
+    TermDefaultFg()
     EchoChar(13)
     EchoChar(10)
     EchoChar(13)
     EchoChar(10)
-    EchoChar(82)
-    EchoChar(69)
-    EchoChar(65)
-    EchoChar(68)
-    EchoChar(89)
-    EchoChar(46)
-    EchoChar(13)
-    EchoChar(10)
+    AexShellPrintPrompt()
     RETURN 0
 END FUNCTION
 
 FUNCTION PrintHelpText() AS U64
-    EchoChar(73)
-    EchoChar(77)
-    EchoChar(77)
-    EchoChar(69)
-    EchoChar(68)
-    EchoChar(73)
-    EchoChar(65)
-    EchoChar(84)
-    EchoChar(69)
-    EchoChar(32)
-    EchoChar(77)
-    EchoChar(79)
-    EchoChar(68)
-    EchoChar(69)
-    EchoChar(32)
     EchoChar(67)
     EchoChar(79)
     EchoChar(77)
@@ -3973,26 +4017,62 @@ FUNCTION PrintHelpText() AS U64
     EchoChar(76)
     EchoChar(80)
     EchoChar(32)
-    EchoChar(32)
     EchoChar(79)
     EchoChar(84)
     EchoChar(32)
+    EchoChar(80)
+    EchoChar(87)
+    EchoChar(68)
+    EchoChar(32)
+    EchoChar(68)
+    EchoChar(73)
+    EchoChar(82)
+    EchoChar(32)
+    EchoChar(84)
+    EchoChar(89)
+    EchoChar(80)
+    EchoChar(69)
+    EchoChar(32)
+    EchoChar(72)
+    EchoChar(69)
+    EchoChar(88)
+    EchoChar(32)
+    EchoChar(83)
+    EchoChar(84)
+    EchoChar(65)
+    EchoChar(84)
+    EchoChar(32)
+    EchoChar(83)
+    EchoChar(69)
+    EchoChar(82)
+    EchoChar(86)
+    EchoChar(73)
+    EchoChar(67)
+    EchoChar(69)
+    EchoChar(83)
+    EchoChar(32)
+    EchoChar(67)
+    EchoChar(79)
+    EchoChar(78)
+    EchoChar(84)
+    EchoChar(82)
+    EchoChar(65)
+    EchoChar(67)
+    EchoChar(84)
+    EchoChar(83)
     EchoChar(32)
     EchoChar(82)
     EchoChar(85)
     EchoChar(78)
-    EchoChar(32)
     EchoChar(32)
     EchoChar(76)
     EchoChar(73)
     EchoChar(83)
     EchoChar(84)
     EchoChar(32)
-    EchoChar(32)
     EchoChar(78)
     EchoChar(69)
     EchoChar(87)
-    EchoChar(32)
     EchoChar(32)
     EchoChar(67)
     EchoChar(76)
@@ -4080,14 +4160,1123 @@ FUNCTION PrintSyntaxError() AS U64
 END FUNCTION
 
 FUNCTION PrintReady() AS U64
+    AexShellPrintPrompt()
+    RETURN 0
+END FUNCTION
+
+FUNCTION PopulatePreloadedAexForHardware() AS U64
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPreloadedAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(117440512))
+END FUNCTION
+FUNCTION PreloadedAexAddress() AS MMIOPTR
+    RETURN AexShellPreloadedAddress()
+END FUNCTION
+FUNCTION AexShellPreloadedLength() AS U64
+    RETURN 864
+END FUNCTION
+FUNCTION AexShellLoadBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(63963136))
+END FUNCTION
+FUNCTION AexShellNameSystemAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64159744))
+END FUNCTION
+FUNCTION AexShellNameAppsAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64159808))
+END FUNCTION
+FUNCTION AexShellNameFileAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64159872))
+END FUNCTION
+FUNCTION AexShellPathAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64159936))
+END FUNCTION
+FUNCTION AexShellNameDevicesAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64160000))
+END FUNCTION
+FUNCTION AexShellNameServicesAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64160064))
+END FUNCTION
+FUNCTION AexShellNameSubstrateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64160128))
+END FUNCTION
+FUNCTION AexShellHandleAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64160320))
+END FUNCTION
+FUNCTION AexShellTypeBufferAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(64160384))
+END FUNCTION
+
+FUNCTION AexShellWriteNames() AS U64
+    LET systemName AS MMIOPTR = AexShellNameSystemAddress()
+    MEMORY.Write8(ADDRESS.Offset(systemName, 0), 115)
+    MEMORY.Write8(ADDRESS.Offset(systemName, 1), 121)
+    MEMORY.Write8(ADDRESS.Offset(systemName, 2), 115)
+    MEMORY.Write8(ADDRESS.Offset(systemName, 3), 116)
+    MEMORY.Write8(ADDRESS.Offset(systemName, 4), 101)
+    MEMORY.Write8(ADDRESS.Offset(systemName, 5), 109)
+    LET appsName AS MMIOPTR = AexShellNameAppsAddress()
+    MEMORY.Write8(ADDRESS.Offset(appsName, 0), 97)
+    MEMORY.Write8(ADDRESS.Offset(appsName, 1), 112)
+    MEMORY.Write8(ADDRESS.Offset(appsName, 2), 112)
+    MEMORY.Write8(ADDRESS.Offset(appsName, 3), 115)
+    LET devicesName AS MMIOPTR = AexShellNameDevicesAddress()
+    MEMORY.Write8(ADDRESS.Offset(devicesName, 0), 100)
+    MEMORY.Write8(ADDRESS.Offset(devicesName, 1), 101)
+    MEMORY.Write8(ADDRESS.Offset(devicesName, 2), 118)
+    MEMORY.Write8(ADDRESS.Offset(devicesName, 3), 105)
+    MEMORY.Write8(ADDRESS.Offset(devicesName, 4), 99)
+    MEMORY.Write8(ADDRESS.Offset(devicesName, 5), 101)
+    MEMORY.Write8(ADDRESS.Offset(devicesName, 6), 115)
+    LET servicesName AS MMIOPTR = AexShellNameServicesAddress()
+    MEMORY.Write8(ADDRESS.Offset(servicesName, 0), 115)
+    MEMORY.Write8(ADDRESS.Offset(servicesName, 1), 101)
+    MEMORY.Write8(ADDRESS.Offset(servicesName, 2), 114)
+    MEMORY.Write8(ADDRESS.Offset(servicesName, 3), 118)
+    MEMORY.Write8(ADDRESS.Offset(servicesName, 4), 105)
+    MEMORY.Write8(ADDRESS.Offset(servicesName, 5), 99)
+    MEMORY.Write8(ADDRESS.Offset(servicesName, 6), 101)
+    MEMORY.Write8(ADDRESS.Offset(servicesName, 7), 115)
+    LET substrateName AS MMIOPTR = AexShellNameSubstrateAddress()
+    MEMORY.Write8(ADDRESS.Offset(substrateName, 0), 115)
+    MEMORY.Write8(ADDRESS.Offset(substrateName, 1), 117)
+    MEMORY.Write8(ADDRESS.Offset(substrateName, 2), 98)
+    MEMORY.Write8(ADDRESS.Offset(substrateName, 3), 115)
+    MEMORY.Write8(ADDRESS.Offset(substrateName, 4), 116)
+    MEMORY.Write8(ADDRESS.Offset(substrateName, 5), 114)
+    MEMORY.Write8(ADDRESS.Offset(substrateName, 6), 97)
+    MEMORY.Write8(ADDRESS.Offset(substrateName, 7), 116)
+    MEMORY.Write8(ADDRESS.Offset(substrateName, 8), 101)
+    LET fileName AS MMIOPTR = AexShellNameFileAddress()
+    MEMORY.Write8(ADDRESS.Offset(fileName, 0), 116)
+    MEMORY.Write8(ADDRESS.Offset(fileName, 1), 101)
+    MEMORY.Write8(ADDRESS.Offset(fileName, 2), 115)
+    MEMORY.Write8(ADDRESS.Offset(fileName, 3), 116)
+    MEMORY.Write8(ADDRESS.Offset(fileName, 4), 46)
+    MEMORY.Write8(ADDRESS.Offset(fileName, 5), 97)
+    MEMORY.Write8(ADDRESS.Offset(fileName, 6), 101)
+    MEMORY.Write8(ADDRESS.Offset(fileName, 7), 120)
+    LET path AS MMIOPTR = AexShellPathAddress()
+    MEMORY.Write8(ADDRESS.Offset(path, 0), 58)
+    MEMORY.Write8(ADDRESS.Offset(path, 1), 115)
+    MEMORY.Write8(ADDRESS.Offset(path, 2), 121)
+    MEMORY.Write8(ADDRESS.Offset(path, 3), 115)
+    MEMORY.Write8(ADDRESS.Offset(path, 4), 116)
+    MEMORY.Write8(ADDRESS.Offset(path, 5), 101)
+    MEMORY.Write8(ADDRESS.Offset(path, 6), 109)
+    MEMORY.Write8(ADDRESS.Offset(path, 7), 58)
+    MEMORY.Write8(ADDRESS.Offset(path, 8), 97)
+    MEMORY.Write8(ADDRESS.Offset(path, 9), 112)
+    MEMORY.Write8(ADDRESS.Offset(path, 10), 112)
+    MEMORY.Write8(ADDRESS.Offset(path, 11), 115)
+    MEMORY.Write8(ADDRESS.Offset(path, 12), 58)
+    MEMORY.Write8(ADDRESS.Offset(path, 13), 116)
+    MEMORY.Write8(ADDRESS.Offset(path, 14), 101)
+    MEMORY.Write8(ADDRESS.Offset(path, 15), 115)
+    MEMORY.Write8(ADDRESS.Offset(path, 16), 116)
+    MEMORY.Write8(ADDRESS.Offset(path, 17), 46)
+    MEMORY.Write8(ADDRESS.Offset(path, 18), 97)
+    MEMORY.Write8(ADDRESS.Offset(path, 19), 101)
+    MEMORY.Write8(ADDRESS.Offset(path, 20), 120)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellStorePreloadedAex() AS U64
+    AexShellWriteNames()
+    IF ArcFS.Initialize() = 0 THEN RETURN 0
+    LET systemOid AS U64 = ArcFS.CreateDirectory(1, AexShellNameSystemAddress(), 6)
+    IF systemOid = 0 THEN RETURN 0
+    LET appsOid AS U64 = ArcFS.CreateDirectory(systemOid, AexShellNameAppsAddress(), 4)
+    IF appsOid = 0 THEN RETURN 0
+    IF ArcFS.CreateDirectory(systemOid, AexShellNameDevicesAddress(), 7) = 0 THEN RETURN 0
+    IF ArcFS.CreateDirectory(systemOid, AexShellNameServicesAddress(), 8) = 0 THEN RETURN 0
+    IF ArcFS.CreateDirectory(systemOid, AexShellNameSubstrateAddress(), 9) = 0 THEN RETURN 0
+    LET oid AS U64 = ArcFS.CreateFile(appsOid, AexShellNameFileAddress(), 8)
+    IF oid = 0 THEN RETURN 0
+    LET fsHandle AS U64 = ArcFS.OpenHandle(oid)
+    IF fsHandle = 0 THEN RETURN 0
+    LET wrote AS U64 = ArcFS.HandleWrite(fsHandle, AexShellPreloadedAddress(), AexShellPreloadedLength(), 0)
+    ArcFS.CloseHandle(fsHandle)
+    IF wrote <> AexShellPreloadedLength() THEN RETURN 0
+    RETURN oid
+END FUNCTION
+
+FUNCTION AexShellPrepare(systemTable AS UEFI.SystemTable) AS U64
+    PopulatePreloadedAexForHardware()
+    MEMORY.Write32(AexShellHandleAddress(), 0)
+    LET oid AS U64 = AexShellStorePreloadedAex()
+    IF oid = 0 THEN RETURN 0
+    AEX.ClearLoadedPrograms()
+    AEX.ClearSubstrateServices()
+    IF AEX.RegisterSubstrateService(1000, AexSubstrateServiceKindConsoleWrite()) <> 0 THEN RETURN 0
+    IF AEX.RegisterSubstrateService(1001, AexSubstrateServiceKindExit()) <> 0 THEN RETURN 0
+    IF AEX.RegisterSubstrateService(1002, AexSubstrateServiceKindArcFSResolve()) <> 0 THEN RETURN 0
+    IF AEX.RegisterSubstrateService(1003, AexSubstrateServiceKindArcFSOpen()) <> 0 THEN RETURN 0
+    IF AEX.RegisterSubstrateService(1004, AexSubstrateServiceKindArcFSRead()) <> 0 THEN RETURN 0
+    IF AEX.RegisterSubstrateService(1005, AexSubstrateServiceKindArcFSWrite()) <> 0 THEN RETURN 0
+    IF AEX.RegisterSubstrateService(1006, AexSubstrateServiceKindArcFSClose()) <> 0 THEN RETURN 0
+    LET handle AS U32 = AEX.LoadProgramFromPath0(systemTable, AexShellPathAddress(), 21, AexShellLoadBufferAddress())
+    MEMORY.Write32(AexShellHandleAddress(), handle)
+    IF handle = 0 THEN RETURN 0
+    RETURN 1
+END FUNCTION
+
+FUNCTION AexShellLineIsDir(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen < 3 THEN RETURN 0
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    IF c0 = 68 OR c0 = 100 THEN
+        IF c1 = 73 OR c1 = 105 THEN
+            IF c2 = 82 OR c2 = 114 THEN
+                IF lineLen = 3 THEN RETURN 1
+                IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 3)) = 32 THEN RETURN 1
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellLineIsType(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen < 4 THEN RETURN 0
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    LET c3 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 3))
+    IF c0 = 84 OR c0 = 116 THEN
+        IF c1 = 89 OR c1 = 121 THEN
+            IF c2 = 80 OR c2 = 112 THEN
+                IF c3 = 69 OR c3 = 101 THEN
+                    IF lineLen = 4 THEN RETURN 1
+                    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 4)) = 32 THEN RETURN 1
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellLineIsPwd(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 3 THEN RETURN 0
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    IF c0 = 80 OR c0 = 112 THEN
+        IF c1 = 87 OR c1 = 119 THEN
+            IF c2 = 68 OR c2 = 100 THEN RETURN 1
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellLineIsHex(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen < 3 THEN RETURN 0
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    IF c0 = 72 OR c0 = 104 THEN
+        IF c1 = 69 OR c1 = 101 THEN
+            IF c2 = 88 OR c2 = 120 THEN
+                IF lineLen = 3 THEN RETURN 1
+                IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 3)) = 32 THEN RETURN 1
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellLineIsStat(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen < 4 THEN RETURN 0
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    LET c3 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 3))
+    IF c0 = 83 OR c0 = 115 THEN
+        IF c1 = 84 OR c1 = 116 THEN
+            IF c2 = 65 OR c2 = 97 THEN
+                IF c3 = 84 OR c3 = 116 THEN
+                    IF lineLen = 4 THEN RETURN 1
+                    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 4)) = 32 THEN RETURN 1
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellLineIsServices(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 8 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 0)) <> 83 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 0)) <> 115 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 1)) <> 69 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 1)) <> 101 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 2)) <> 82 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 2)) <> 114 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 3)) <> 86 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 3)) <> 118 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 4)) <> 73 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 4)) <> 105 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 5)) <> 67 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 5)) <> 99 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 6)) <> 69 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 6)) <> 101 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 7)) <> 83 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 7)) <> 115 THEN RETURN 0
+    RETURN 1
+END FUNCTION
+
+FUNCTION AexShellLineIsContracts(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 9 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 0)) <> 67 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 0)) <> 99 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 1)) <> 79 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 1)) <> 111 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 2)) <> 78 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 2)) <> 110 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 3)) <> 84 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 3)) <> 116 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 4)) <> 82 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 4)) <> 114 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 5)) <> 65 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 5)) <> 97 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 6)) <> 67 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 6)) <> 99 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 7)) <> 84 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 7)) <> 116 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 8)) <> 83 AND MEMORY.Read8(ADDRESS.Offset(lineBuf, 8)) <> 115 THEN RETURN 0
+    RETURN 1
+END FUNCTION
+
+FUNCTION AexShellLineIsRunPath(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 25 THEN RETURN 0
+    IF LineIsRun(lineBuf, 3) = 0 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 3)) <> 32 THEN RETURN 0
+    LET i AS U32 = 0
+    WHILE i < 21
+        IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 4 + i)) <> MEMORY.Read8(ADDRESS.Offset(AexShellPathAddress(), i)) THEN
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION AexShellEchoRange(buffer AS MMIOPTR, count AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        EchoChar(MEMORY.Read8(ADDRESS.Offset(buffer, i)))
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellEchoNamespaceName(row AS U64) AS U64
+    LET nsBase AS MMIOPTR = ArcFSNamespaceRowAddress(row)
+    LET nameLen AS U64 = MEMORY.Read64(ADDRESS.Offset(nsBase, 40))
+    AexShellEchoRange(ADDRESS.Offset(nsBase, 8), nameLen)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellObjectType(oid AS U64) AS U64
+    LET objRow AS U64 = ArcFSFindObjectRow(oid)
+    IF objRow = ArcFSMaxObjects() THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(ArcFSObjectRowAddress(objRow), 8))
+END FUNCTION
+
+FUNCTION AexShellDirParentOid(lineBuf AS MMIOPTR, lineLen AS U32) AS U64
+    IF lineLen = 3 THEN RETURN ArcFS.Resolve(AexShellPathAddress(), 7)
+    IF lineLen < 5 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 3)) <> 32 THEN RETURN 0
+    LET pathLen AS U64 = lineLen - 4
+    RETURN ArcFS.Resolve(ADDRESS.Offset(lineBuf, 4), pathLen)
+END FUNCTION
+
+FUNCTION AexShellPrintPrompt() AS U64
+    TermArcologyBlue()
+    EchoChar(58)
+    EchoChar(115)
+    EchoChar(121)
+    EchoChar(115)
+    EchoChar(116)
+    EchoChar(101)
+    EchoChar(109)
+    EchoChar(58)
+    TermDefaultFg()
+    EchoChar(32)
+    TermTranshumanistRed()
+    EchoChar(62)
+    TermDefaultFg()
+    EchoChar(32)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintCurrentDomain() AS U64
+    TermArcologyBlue()
+    EchoChar(58)
+    EchoChar(115)
+    EchoChar(121)
+    EchoChar(115)
+    EchoChar(116)
+    EchoChar(101)
+    EchoChar(109)
+    EchoChar(58)
+    TermDefaultFg()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintDirHeader(lineBuf AS MMIOPTR, lineLen AS U32) AS U64
+    IF lineLen = 3 THEN
+        AexShellPrintCurrentDomain()
+    ELSE
+        TermArcologyBlue()
+        AexShellEchoRange(ADDRESS.Offset(lineBuf, 4), lineLen - 4)
+        TermDefaultFg()
+    END IF
+    PrintCRLF()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintDir(lineBuf AS MMIOPTR, lineLen AS U32) AS U64
+    LET parentOid AS U64 = AexShellDirParentOid(lineBuf, lineLen)
+    IF parentOid = 0 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    AexShellPrintDirHeader(lineBuf, lineLen)
+    LET row AS U64 = 0
+    LET entryCount AS U32 = 0
+    LET fileCount AS U32 = 0
+    WHILE row < ArcFSMaxNamespaceRows()
+        LET nsBase AS MMIOPTR = ArcFSNamespaceRowAddress(row)
+        IF MEMORY.Read64(ADDRESS.Offset(nsBase, 56)) = 1 THEN
+            IF MEMORY.Read64(nsBase) = parentOid THEN
+                LET childOid AS U64 = MEMORY.Read64(ADDRESS.Offset(nsBase, 48))
+                LET childType AS U64 = AexShellObjectType(childOid)
+                TermDim()
+                EchoChar(124)
+                EchoChar(45)
+                EchoChar(45)
+                EchoChar(32)
+                IF childType = 2 THEN
+                    TermArcologyBlue()
+                ELSE
+                    TermAmber()
+                END IF
+                AexShellEchoNamespaceName(row)
+                TermDefaultFg()
+                IF childType <> 2 THEN
+                    fileCount = fileCount + 1
+                END IF
+                PrintCRLF()
+                entryCount = entryCount + 1
+            END IF
+        END IF
+        row = row + 1
+    WEND
+    IF entryCount = 0 THEN
+        EchoChar(40)
+        EchoChar(101)
+        EchoChar(109)
+        EchoChar(112)
+        EchoChar(116)
+        EchoChar(121)
+        EchoChar(41)
+        PrintCRLF()
+    END IF
+    PrintCRLF()
+    TermDim()
+    EchoDecimal(entryCount)
+    EchoChar(32)
+    EchoChar(101)
+    EchoChar(110)
+    EchoChar(116)
+    EchoChar(114)
+    EchoChar(105)
+    EchoChar(101)
+    EchoChar(115)
+    EchoChar(32)
+    EchoDecimal(fileCount)
+    EchoChar(32)
+    EchoChar(102)
+    EchoChar(105)
+    EchoChar(108)
+    EchoChar(101)
+    EchoChar(115)
+    EchoChar(32)
+    EchoChar(48)
+    EchoChar(32)
+    EchoChar(108)
+    EchoChar(105)
+    EchoChar(110)
+    EchoChar(107)
+    EchoChar(115)
+    PrintCRLF()
+    TermDefaultFg()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellBufferIsAex(buffer AS MMIOPTR, count AS U64) AS BOOL
+    IF count < 8 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 0)) <> 65 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 1)) <> 82 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 2)) <> 67 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 3)) <> 79 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 4)) <> 65 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 5)) <> 69 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 6)) <> 88 THEN RETURN 0
+    IF MEMORY.Read8(ADDRESS.Offset(buffer, 7)) <> 0 THEN RETURN 0
+    RETURN 1
+END FUNCTION
+
+FUNCTION AexShellPrintAexTypePanel(lineBuf AS MMIOPTR, lineLen AS U32) AS U64
+    TermArcologyBlue()
+    EchoChar(43)
+    EchoChar(45)
+    EchoChar(45)
+    EchoChar(32)
+    EchoChar(69)
+    EchoChar(88)
+    EchoChar(69)
+    EchoChar(67)
+    EchoChar(85)
+    EchoChar(84)
+    EchoChar(73)
+    EchoChar(79)
+    EchoChar(78)
+    EchoChar(32)
+    EchoChar(67)
+    EchoChar(79)
+    EchoChar(78)
+    EchoChar(84)
+    EchoChar(82)
+    EchoChar(65)
+    EchoChar(67)
+    EchoChar(84)
+    EchoChar(32)
+    EchoChar(47)
+    EchoChar(47)
+    EchoChar(32)
+    TermAmber()
+    EchoChar(91)
+    EchoChar(65)
+    EchoChar(69)
+    EchoChar(88)
+    EchoChar(93)
+    TermDefaultFg()
+    PrintCRLF()
+    TermDim()
+    EchoChar(80)
+    EchoChar(65)
+    EchoChar(84)
+    EchoChar(72)
+    EchoChar(32)
+    EchoChar(58)
+    EchoChar(32)
+    TermArcologyBlue()
+    AexShellEchoRange(ADDRESS.Offset(lineBuf, 5), lineLen - 5)
+    TermDefaultFg()
+    PrintCRLF()
+    TermDim()
+    EchoChar(70)
+    EchoChar(79)
+    EchoChar(82)
+    EchoChar(77)
+    EchoChar(65)
+    EchoChar(84)
+    EchoChar(32)
+    EchoChar(58)
+    EchoChar(32)
+    TermAmber()
+    EchoChar(65)
+    EchoChar(69)
+    EchoChar(88)
+    TermDefaultFg()
+    PrintCRLF()
+    TermDim()
+    EchoChar(68)
+    EchoChar(79)
+    EchoChar(77)
+    EchoChar(65)
+    EchoChar(73)
+    EchoChar(78)
+    EchoChar(32)
+    EchoChar(58)
+    EchoChar(32)
+    TermTranshumanistRed()
+    EchoChar(85)
+    EchoChar(83)
+    EchoChar(69)
+    EchoChar(82)
+    EchoChar(83)
+    EchoChar(80)
+    EchoChar(65)
+    EchoChar(67)
+    EchoChar(69)
+    TermDefaultFg()
+    PrintCRLF()
+    TermDim()
+    EchoChar(67)
+    EchoChar(79)
+    EchoChar(78)
+    EchoChar(84)
+    EchoChar(82)
+    EchoChar(65)
+    EchoChar(67)
+    EchoChar(84)
+    EchoChar(32)
+    EchoChar(58)
+    EchoChar(32)
+    TermActiveGreen()
+    EchoChar(86)
+    EchoChar(65)
+    EchoChar(76)
+    EchoChar(73)
+    EchoChar(68)
+    TermDefaultFg()
+    PrintCRLF()
+    TermDim()
+    EchoChar(69)
+    EchoChar(78)
+    EchoChar(84)
+    EchoChar(82)
+    EchoChar(89)
+    EchoChar(32)
+    EchoChar(58)
+    EchoChar(32)
+    TermActiveGreen()
+    EchoChar(82)
+    EchoChar(69)
+    EchoChar(83)
+    EchoChar(79)
+    EchoChar(76)
+    EchoChar(86)
+    EchoChar(69)
+    EchoChar(68)
+    TermDefaultFg()
+    PrintCRLF()
+    TermDim()
+    EchoChar(83)
+    EchoChar(84)
+    EchoChar(65)
+    EchoChar(84)
+    EchoChar(69)
+    EchoChar(32)
+    EchoChar(58)
+    EchoChar(32)
+    TermArcologyBlue()
     EchoChar(82)
     EchoChar(69)
     EchoChar(65)
     EchoChar(68)
     EchoChar(89)
-    EchoChar(46)
-    EchoChar(13)
-    EchoChar(10)
+    TermDefaultFg()
+    PrintCRLF()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellTypePath(lineBuf AS MMIOPTR, lineLen AS U32) AS U64
+    IF lineLen < 6 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 4)) <> 32 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    LET oid AS U64 = ArcFS.Resolve(ADDRESS.Offset(lineBuf, 5), lineLen - 5)
+    IF oid = 0 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    LET fsHandle AS U64 = ArcFS.OpenHandle(oid)
+    IF fsHandle = 0 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    LET copied AS U64 = ArcFS.HandleRead(fsHandle, AexShellTypeBufferAddress(), 64, 0)
+    ArcFS.CloseHandle(fsHandle)
+    IF AexShellBufferIsAex(AexShellTypeBufferAddress(), copied) = 1 THEN
+        AexShellPrintAexTypePanel(lineBuf, lineLen)
+    ELSE
+        AexShellEchoRange(AexShellTypeBufferAddress(), copied)
+        PrintCRLF()
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintRunPass() AS U64
+    EchoChar(65)
+    EchoChar(69)
+    EchoChar(88)
+    EchoChar(32)
+    EchoChar(85)
+    EchoChar(83)
+    EchoChar(69)
+    EchoChar(82)
+    EchoChar(83)
+    EchoChar(80)
+    EchoChar(65)
+    EchoChar(67)
+    EchoChar(69)
+    EchoChar(32)
+    EchoChar(80)
+    EchoChar(65)
+    EchoChar(83)
+    EchoChar(83)
+    PrintCRLF()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellRunPath() AS U64
+    LET handle AS U32 = MEMORY.Read32(AexShellHandleAddress())
+    IF handle = 0 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    IF AEX.ActivateProgramWithContext0(handle) <> 0 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    AexShellPrintRunPass()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintPwd() AS U64
+    AexShellPrintCurrentDomain()
+    PrintCRLF()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintStatLabelPath() AS U64
+    TermDim()
+    EchoChar(80)
+    EchoChar(65)
+    EchoChar(84)
+    EchoChar(72)
+    EchoChar(32)
+    EchoChar(58)
+    EchoChar(32)
+    TermDefaultFg()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintStatLabelType() AS U64
+    TermDim()
+    EchoChar(84)
+    EchoChar(89)
+    EchoChar(80)
+    EchoChar(69)
+    EchoChar(32)
+    EchoChar(58)
+    EchoChar(32)
+    TermDefaultFg()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintStatLabelSize() AS U64
+    TermDim()
+    EchoChar(83)
+    EchoChar(73)
+    EchoChar(90)
+    EchoChar(69)
+    EchoChar(32)
+    EchoChar(58)
+    EchoChar(32)
+    TermDefaultFg()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintDirectoryWord() AS U64
+    TermArcologyBlue()
+    EchoChar(68)
+    EchoChar(73)
+    EchoChar(82)
+    EchoChar(69)
+    EchoChar(67)
+    EchoChar(84)
+    EchoChar(79)
+    EchoChar(82)
+    EchoChar(89)
+    TermDefaultFg()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintFileWord() AS U64
+    TermAmber()
+    EchoChar(70)
+    EchoChar(73)
+    EchoChar(76)
+    EchoChar(69)
+    TermDefaultFg()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellResolveStatTarget(lineBuf AS MMIOPTR, lineLen AS U32) AS U64
+    IF lineLen = 4 THEN RETURN ArcFS.Resolve(AexShellPathAddress(), 7)
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 4)) <> 32 THEN RETURN 0
+    RETURN ArcFS.Resolve(ADDRESS.Offset(lineBuf, 5), lineLen - 5)
+END FUNCTION
+
+FUNCTION AexShellPrintStat(lineBuf AS MMIOPTR, lineLen AS U32) AS U64
+    LET oid AS U64 = AexShellResolveStatTarget(lineBuf, lineLen)
+    IF oid = 0 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    LET objRow AS U64 = ArcFSFindObjectRow(oid)
+    IF objRow = ArcFSMaxObjects() THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    LET objBase AS MMIOPTR = ArcFSObjectRowAddress(objRow)
+    LET objType AS U64 = MEMORY.Read64(ADDRESS.Offset(objBase, 8))
+    LET objSize AS U64 = MEMORY.Read64(ADDRESS.Offset(objBase, 16))
+    AexShellPrintStatLabelPath()
+    IF lineLen = 4 THEN
+        AexShellPrintCurrentDomain()
+    ELSE
+        TermArcologyBlue()
+        AexShellEchoRange(ADDRESS.Offset(lineBuf, 5), lineLen - 5)
+        TermDefaultFg()
+    END IF
+    PrintCRLF()
+    AexShellPrintStatLabelType()
+    IF objType = 2 THEN
+        AexShellPrintDirectoryWord()
+    ELSE
+        AexShellPrintFileWord()
+    END IF
+    PrintCRLF()
+    AexShellPrintStatLabelSize()
+    EchoDecimal(objSize)
+    PrintCRLF()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellHexDigit(value AS U8) AS U8
+    IF value < 10 THEN RETURN 48 + value
+    RETURN 55 + value
+END FUNCTION
+
+FUNCTION AexShellEchoHexByte(value AS U8) AS U64
+    LET hi AS U8 = value SHR 4
+    LET lo AS U8 = value AND 15
+    EchoChar(AexShellHexDigit(hi))
+    EchoChar(AexShellHexDigit(lo))
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellHexPath(lineBuf AS MMIOPTR, lineLen AS U32) AS U64
+    IF lineLen < 5 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(lineBuf, 3)) <> 32 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    LET oid AS U64 = ArcFS.Resolve(ADDRESS.Offset(lineBuf, 4), lineLen - 4)
+    IF oid = 0 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    LET fsHandle AS U64 = ArcFS.OpenHandle(oid)
+    IF fsHandle = 0 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    LET copied AS U64 = ArcFS.HandleRead(fsHandle, AexShellTypeBufferAddress(), 32, 0)
+    ArcFS.CloseHandle(fsHandle)
+    LET i AS U64 = 0
+    TermAmber()
+    WHILE i < copied
+        AexShellEchoHexByte(MEMORY.Read8(ADDRESS.Offset(AexShellTypeBufferAddress(), i)))
+        EchoChar(32)
+        i = i + 1
+    WEND
+    TermDefaultFg()
+    PrintCRLF()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintServiceRoot() AS U64
+    TermArcologyBlue()
+    EchoChar(58)
+    EchoChar(115)
+    EchoChar(121)
+    EchoChar(115)
+    EchoChar(116)
+    EchoChar(101)
+    EchoChar(109)
+    EchoChar(58)
+    EchoChar(115)
+    EchoChar(101)
+    EchoChar(114)
+    EchoChar(118)
+    EchoChar(105)
+    EchoChar(99)
+    EchoChar(101)
+    EchoChar(115)
+    TermDefaultFg()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintServicePathPrefix() AS U64
+    TermArcologyBlue()
+    EchoChar(58)
+    EchoChar(115)
+    EchoChar(121)
+    EchoChar(115)
+    EchoChar(116)
+    EchoChar(101)
+    EchoChar(109)
+    EchoChar(58)
+    EchoChar(115)
+    EchoChar(101)
+    EchoChar(114)
+    EchoChar(118)
+    EchoChar(105)
+    EchoChar(99)
+    EchoChar(101)
+    EchoChar(115)
+    EchoChar(58)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintServiceName(kind AS U32) AS U64
+    IF kind = AexSubstrateServiceKindConsoleWrite() THEN
+        EchoChar(99)
+        EchoChar(111)
+        EchoChar(110)
+        EchoChar(115)
+        EchoChar(111)
+        EchoChar(108)
+        EchoChar(101)
+        EchoChar(58)
+        EchoChar(119)
+        EchoChar(114)
+        EchoChar(105)
+        EchoChar(116)
+        EchoChar(101)
+        RETURN 0
+    END IF
+    IF kind = AexSubstrateServiceKindExit() THEN
+        EchoChar(112)
+        EchoChar(114)
+        EchoChar(111)
+        EchoChar(99)
+        EchoChar(101)
+        EchoChar(115)
+        EchoChar(115)
+        EchoChar(58)
+        EchoChar(101)
+        EchoChar(120)
+        EchoChar(105)
+        EchoChar(116)
+        RETURN 0
+    END IF
+    IF kind = AexSubstrateServiceKindArcFSResolve() THEN
+        EchoChar(97)
+        EchoChar(114)
+        EchoChar(99)
+        EchoChar(102)
+        EchoChar(115)
+        EchoChar(58)
+        EchoChar(114)
+        EchoChar(101)
+        EchoChar(115)
+        EchoChar(111)
+        EchoChar(108)
+        EchoChar(118)
+        EchoChar(101)
+        RETURN 0
+    END IF
+    IF kind = AexSubstrateServiceKindArcFSOpen() THEN
+        EchoChar(97)
+        EchoChar(114)
+        EchoChar(99)
+        EchoChar(102)
+        EchoChar(115)
+        EchoChar(58)
+        EchoChar(111)
+        EchoChar(112)
+        EchoChar(101)
+        EchoChar(110)
+        RETURN 0
+    END IF
+    IF kind = AexSubstrateServiceKindArcFSRead() THEN
+        EchoChar(97)
+        EchoChar(114)
+        EchoChar(99)
+        EchoChar(102)
+        EchoChar(115)
+        EchoChar(58)
+        EchoChar(114)
+        EchoChar(101)
+        EchoChar(97)
+        EchoChar(100)
+        RETURN 0
+    END IF
+    IF kind = AexSubstrateServiceKindArcFSWrite() THEN
+        EchoChar(97)
+        EchoChar(114)
+        EchoChar(99)
+        EchoChar(102)
+        EchoChar(115)
+        EchoChar(58)
+        EchoChar(119)
+        EchoChar(114)
+        EchoChar(105)
+        EchoChar(116)
+        EchoChar(101)
+        RETURN 0
+    END IF
+    IF kind = AexSubstrateServiceKindArcFSClose() THEN
+        EchoChar(97)
+        EchoChar(114)
+        EchoChar(99)
+        EchoChar(102)
+        EchoChar(115)
+        EchoChar(58)
+        EchoChar(99)
+        EchoChar(108)
+        EchoChar(111)
+        EchoChar(115)
+        EchoChar(101)
+        RETURN 0
+    END IF
+    EchoChar(117)
+    EchoChar(110)
+    EchoChar(107)
+    EchoChar(110)
+    EchoChar(111)
+    EchoChar(119)
+    EchoChar(110)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintServiceMeta(bindingID AS U32) AS U64
+    TermDim()
+    EchoChar(32)
+    EchoChar(84)
+    EchoChar(89)
+    EchoChar(80)
+    EchoChar(69)
+    EchoChar(32)
+    EchoChar(83)
+    EchoChar(69)
+    EchoChar(82)
+    EchoChar(86)
+    EchoChar(73)
+    EchoChar(67)
+    EchoChar(69)
+    EchoChar(32)
+    EchoChar(83)
+    EchoChar(84)
+    EchoChar(65)
+    EchoChar(84)
+    EchoChar(69)
+    EchoChar(32)
+    TermActiveGreen()
+    EchoChar(82)
+    EchoChar(69)
+    EchoChar(65)
+    EchoChar(68)
+    EchoChar(89)
+    TermDim()
+    EchoChar(32)
+    EchoChar(67)
+    EchoChar(79)
+    EchoChar(78)
+    EchoChar(84)
+    EchoChar(82)
+    EchoChar(65)
+    EchoChar(67)
+    EchoChar(84)
+    EchoChar(32)
+    TermAmber()
+    EchoChar(58)
+    EchoChar(97)
+    EchoChar(101)
+    EchoChar(120)
+    EchoChar(58)
+    EchoChar(98)
+    EchoChar(105)
+    EchoChar(110)
+    EchoChar(100)
+    EchoChar(105)
+    EchoChar(110)
+    EchoChar(103)
+    EchoChar(115)
+    EchoChar(58)
+    EchoDecimal(bindingID)
+    TermDefaultFg()
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintServices() AS U64
+    AexShellPrintServiceRoot()
+    EchoChar(32)
+    EchoDecimal(AEX.SubstrateServiceCount())
+    EchoChar(32)
+    EchoChar(101)
+    EchoChar(110)
+    EchoChar(116)
+    EchoChar(114)
+    EchoChar(105)
+    EchoChar(101)
+    EchoChar(115)
+    PrintCRLF()
+    LET i AS U32 = 0
+    WHILE i < AEX.SubstrateServiceCount()
+        LET entry AS MMIOPTR = AexSubstrateServiceRegistryEntryAddress(i)
+        LET bindingID AS U32 = MEMORY.Read32(entry)
+        LET kind AS U32 = MEMORY.Read32(ADDRESS.Offset(entry, 4))
+        TermDim()
+        EchoChar(124)
+        EchoChar(45)
+        EchoChar(45)
+        EchoChar(32)
+        AexShellPrintServicePathPrefix()
+        AexShellPrintServiceName(kind)
+        AexShellPrintServiceMeta(bindingID)
+        PrintCRLF()
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexShellPrintContracts() AS U64
+    TermArcologyBlue()
+    EchoChar(67)
+    EchoChar(79)
+    EchoChar(78)
+    EchoChar(84)
+    EchoChar(82)
+    EchoChar(65)
+    EchoChar(67)
+    EchoChar(84)
+    EchoChar(83)
+    TermDefaultFg()
+    EchoChar(32)
+    EchoDecimal(AEX.LoadedProgramCount())
+    PrintCRLF()
+    LET i AS U32 = 0
+    WHILE i < AEX.LoadedProgramCount()
+        LET handle AS U32 = AEX.LoadedProgramHandleAt(i)
+        EchoChar(35)
+        EchoDecimal(i)
+        EchoChar(32)
+        EchoChar(72)
+        EchoChar(65)
+        EchoChar(78)
+        EchoChar(68)
+        EchoChar(76)
+        EchoChar(69)
+        EchoChar(32)
+        EchoDecimal(handle)
+        EchoChar(32)
+        EchoChar(83)
+        EchoChar(84)
+        EchoChar(65)
+        EchoChar(84)
+        EchoChar(69)
+        EchoChar(32)
+        EchoDecimal(AEX.LoadedProgramState(handle))
+        EchoChar(32)
+        TermArcologyBlue()
+        AexShellEchoRange(AexShellPathAddress(), 21)
+        TermDefaultFg()
+        PrintCRLF()
+        i = i + 1
+    WEND
     RETURN 0
 END FUNCTION
 
@@ -4177,11 +5366,26 @@ END FUNCTION
 FUNCTION KeyModifierStateAddress() AS MMIOPTR
     RETURN ADDRESS.MMIO(ADDRESS.Virtual(57737216))   ' 0x3710000, clear of RpmStateAddress's own 0x3700000 region
 END FUNCTION
+FUNCTION UsbLastKeycodeAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(KeyModifierStateAddress(), 4)
+END FUNCTION
+FUNCTION UsbLastModifierAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(KeyModifierStateAddress(), 8)
+END FUNCTION
+FUNCTION UsbQuietPollsAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(KeyModifierStateAddress(), 12)
+END FUNCTION
 FUNCTION ShiftHeld() AS U32
     RETURN MEMORY.Read32(KeyModifierStateAddress())
 END FUNCTION
 FUNCTION SetShiftHeld(value AS U32) AS U64
     MEMORY.Write32(KeyModifierStateAddress(), value)
+    RETURN 0
+END FUNCTION
+FUNCTION ClearUsbLastKey() AS U64
+    MEMORY.Write32(UsbLastKeycodeAddress(), 0)
+    MEMORY.Write32(UsbLastModifierAddress(), 0)
+    MEMORY.Write32(UsbQuietPollsAddress(), 0)
     RETURN 0
 END FUNCTION
 
@@ -4263,11 +5467,7 @@ FUNCTION ApplyShift(ch AS U16) AS U16
     RETURN ch
 END FUNCTION
 
-' The real combined-input poll: checks the Phase 1 PS/2 path first, then the Phase 3 USB HID path
-' (only if a real USB keyboard was actually enumerated -- usbSlotId <> 0), returning the first real
-' translated character either produces, or 0 if neither has one ready. Non-blocking, matching both
-' underlying drivers' own PollScancode/PollReport contracts -- callers poll this in their own loop.
-FUNCTION PollAnyKey(usbSlotId AS U32) AS U16
+FUNCTION PollPs2Key() AS U16
     LET scancode AS U32 = PS2Keyboard.PollScancode()
     IF scancode <> 0 THEN
         IF scancode = 42 THEN
@@ -4295,29 +5495,63 @@ FUNCTION PollAnyKey(usbSlotId AS U32) AS U16
         END IF
     END IF
 
-    IF usbSlotId <> 0 THEN
-        LET reportBuffer AS MMIOPTR = XhciScratchDmaMmio()
-        LET gotReport AS BOOL = UsbHidKeyboard.PollReport(usbSlotId, reportBuffer)
-        IF gotReport = 1 THEN
-            LET modifierByte AS U32 = MmioReadField32(reportBuffer, 0, 0, 8)
-            IF (modifierByte AND 34) <> 0 THEN
-                SetShiftHeld(1)
-            ELSE
-                SetShiftHeld(0)
-            END IF
-            LET keycode AS U32 = MmioReadField32(reportBuffer, 2, 0, 8)
-            LET charCode AS U32 = UsbHidKeyboard.KeycodeToChar(keycode)
-            LET charCode16 AS U16 = charCode
-            IF ShiftHeld() = 1 THEN
-                charCode16 = ApplyShift(charCode16)
-            END IF
-            IF charCode16 <> 0 THEN
-                RETURN charCode16
-            END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION PollUsbKey(usbSlotId AS U32) AS U16
+    LET reportBuffer AS MMIOPTR = XhciScratchDmaMmio()
+    LET gotReport AS BOOL = UsbHidKeyboard.PollReport(usbSlotId, reportBuffer)
+    IF gotReport = 0 THEN
+        LET quiet AS U32 = MEMORY.Read32(UsbQuietPollsAddress())
+        IF quiet < 1000 THEN
+            MEMORY.Write32(UsbQuietPollsAddress(), quiet + 1)
+        END IF
+        RETURN 0
+    END IF
+    MEMORY.Write32(UsbQuietPollsAddress(), 0)
+    LET modifierByte AS U32 = MmioReadField32(reportBuffer, 0, 0, 8)
+    LET keycode AS U32 = MmioReadField32(reportBuffer, 2, 0, 8)
+    IF keycode = 0 THEN
+        ClearUsbLastKey()
+        IF (modifierByte AND 34) = 0 THEN
+            SetShiftHeld(0)
+        END IF
+        RETURN 0
+    END IF
+    IF keycode = MEMORY.Read32(UsbLastKeycodeAddress()) THEN
+        IF modifierByte = MEMORY.Read32(UsbLastModifierAddress()) THEN
+            RETURN 0
         END IF
     END IF
+    MEMORY.Write32(UsbLastKeycodeAddress(), keycode)
+    MEMORY.Write32(UsbLastModifierAddress(), modifierByte)
+    IF (modifierByte AND 34) <> 0 THEN
+        SetShiftHeld(1)
+    ELSE
+        SetShiftHeld(0)
+    END IF
+    LET charCode AS U32 = UsbHidKeyboard.KeycodeToChar(keycode)
+    LET charCode16 AS U16 = charCode
+    IF ShiftHeld() = 1 THEN
+        charCode16 = ApplyShift(charCode16)
+    END IF
+    RETURN charCode16
+END FUNCTION
 
-    RETURN 0
+' The real combined-input poll: USB HID is preferred while it is actively producing reports, but
+' PS/2 remains a fallback after USB has been quiet. This covers machines or QEMU paths that
+' enumerate USB successfully but later deliver keyboard events through i8042.
+FUNCTION PollAnyKey(usbSlotId AS U32) AS U16
+    IF usbSlotId <> 0 THEN
+        LET usbChar AS U16 = PollUsbKey(usbSlotId)
+        IF usbChar <> 0 THEN
+            RETURN usbChar
+        END IF
+        IF MEMORY.Read32(UsbQuietPollsAddress()) < 8 THEN
+            RETURN 0
+        END IF
+    END IF
+    RETURN PollPs2Key()
 END FUNCTION
 
 ' ==========================================================================================
@@ -5021,7 +6255,7 @@ END FUNCTION
 ' The real Enter-key dispatcher, factored out of Main() entirely -- Main() has already needed two
 ' other extractions this project (SetupUsbKeyboard, SetupGopDashboard) purely to stay under this
 ' backend's own real stack-frame budget, and this dispatch alone needed several new locals across
-' 8 real command branches. Returns 0 to stop the whole READY. loop (the TEST-ONLY EXIT command),
+' 8 real command branches. Returns 0 to stop the whole substrate shell loop (the TEST-ONLY EXIT command),
 ' 1 otherwise.
 FUNCTION HandleEnteredLine(lineBuf AS MMIOPTR, lineLen AS U32, usbSlotId AS U32) AS BOOL
     LET dispatched AS BOOL = 0
@@ -5043,6 +6277,54 @@ FUNCTION HandleEnteredLine(lineBuf AS MMIOPTR, lineLen AS U32, usbSlotId AS U32)
         IF LineIsExit(lineBuf, lineLen) = 1 THEN
             PrintHaltText()
             running = 0
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF AexShellLineIsPwd(lineBuf, lineLen) = 1 THEN
+            AexShellPrintPwd()
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF AexShellLineIsDir(lineBuf, lineLen) = 1 THEN
+            AexShellPrintDir(lineBuf, lineLen)
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF AexShellLineIsType(lineBuf, lineLen) = 1 THEN
+            AexShellTypePath(lineBuf, lineLen)
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF AexShellLineIsHex(lineBuf, lineLen) = 1 THEN
+            AexShellHexPath(lineBuf, lineLen)
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF AexShellLineIsStat(lineBuf, lineLen) = 1 THEN
+            AexShellPrintStat(lineBuf, lineLen)
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF AexShellLineIsServices(lineBuf, lineLen) = 1 THEN
+            AexShellPrintServices()
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF AexShellLineIsContracts(lineBuf, lineLen) = 1 THEN
+            AexShellPrintContracts()
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF AexShellLineIsRunPath(lineBuf, lineLen) = 1 THEN
+            AexShellRunPath()
             dispatched = 1
         END IF
     END IF
@@ -5362,6 +6644,7 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     ' guaranteed to have WRITTEN it first needs the same treatment, not just this one.
     MEMORY.Write32(RpmCountAddress(), 0)
     MEMORY.Write32(KeyModifierStateAddress(), 0)
+    ClearUsbLastKey()
 
     LET gopOk AS BOOL = SetupGopDashboard(systemTable)
 
@@ -5399,6 +6682,15 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         DashSetSubsystem(2, 3)
         DashSetSubsystem(3, 3)
         DashUpdateAssembly(3, 10)
+    END IF
+
+    LET aexShellReady AS U64 = AexShellPrepare(systemTable)
+    IF gopOk = 0 THEN
+        IF aexShellReady = 1 THEN
+            systemTable.ConsoleOut.Write("SUBSTRATE AEX READY\r\n")
+        ELSE
+            systemTable.ConsoleOut.Write("SUBSTRATE AEX FAIL\r\n")
+        END IF
     END IF
 
     ' 5 pages: root/PDPT0/PD0 (the same low-1GB identity map aps-gdt-reload.abas established) plus
@@ -5572,7 +6864,7 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
 
     ' Handoff to the "higher system UI" (docs/arcology-boot-screen-concept.md's own last real
     ' boot-sequence step): the dashboard has done its real job -- clear it and drop into the
-    ' genuine interactive READY. session below.
+    ' genuine interactive substrate shell session below.
     IF gopOk = 1 THEN
         TermClear()
     END IF

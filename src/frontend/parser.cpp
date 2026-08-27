@@ -537,7 +537,7 @@ struct CallExpr final : Expr {
     void dump_ast(std::ostream& output, int indent) const override {
         const std::string upper_name = uppercase(name);
         ast_line(output, indent, upper_name.rfind("PORT.", 0) == 0 ? "PortOperation " + name :
-            (upper_name.rfind("ADDRESS.", 0) == 0 || upper_name.rfind("MEMORY.", 0) == 0 || upper_name.rfind("CPU.", 0) == 0 || upper_name.rfind("GRAPHICS.", 0) == 0 || upper_name == "UEFI.GOP.DISCOVER" || upper_name == "UEFI.BLOCKIO.DISCOVER")
+            (upper_name.rfind("ADDRESS.", 0) == 0 || upper_name.rfind("MEMORY.", 0) == 0 || upper_name.rfind("CPU.", 0) == 0 || upper_name.rfind("GRAPHICS.", 0) == 0 || upper_name == "UEFI.GOP.DISCOVER" || upper_name == "UEFI.BLOCKIO.DISCOVER" || upper_name == "AEX.INVOKENATIVE0" || upper_name == "AEX.INVOKENATIVE1")
                 ? "MemoryOperation " + name : "Call " + name);
         for (const auto& arg : args) {
             arg->dump_ast(output, indent + 1);
@@ -548,7 +548,8 @@ struct CallExpr final : Expr {
         const bool memory = upper_name.rfind("ADDRESS.", 0) == 0 || upper_name.rfind("MEMORY.", 0) == 0 || upper_name.rfind("GRAPHICS.", 0) == 0 || upper_name == "UEFI.GOP.DISCOVER" || upper_name == "UEFI.BLOCKIO.DISCOVER" ||
             upper_name == "CPU.READBARRIER" || upper_name == "CPU.WRITEBARRIER" || upper_name == "CPU.MEMORYBARRIER" ||
             upper_name == "CPU.READCR3" || upper_name == "CPU.WRITECR3" || upper_name == "CPU.INVALIDATEPAGE" || upper_name == "CPU.READRSP" ||
-            upper_name == "CPU.READCR0" || upper_name == "CPU.WRITECR0" || upper_name == "CPU.READMSR" || upper_name == "CPU.WRITEMSR";
+            upper_name == "CPU.READCR0" || upper_name == "CPU.WRITECR0" || upper_name == "CPU.READMSR" || upper_name == "CPU.WRITEMSR" ||
+            upper_name == "AEX.INVOKENATIVE0" || upper_name == "AEX.INVOKENATIVE1";
         auto node = canonical_node(upper_name.rfind("PORT.", 0) == 0 ? AstKind::PortOperation : memory ? AstKind::MemoryOperation : AstKind::Call);
         node->name = name;
         for (const auto& arg : args) {
@@ -593,7 +594,7 @@ struct MethodCallExpr final : Expr {
     void dump_ast(std::ostream& output, int indent) const override {
         const std::string upper_receiver = uppercase(receiver);
         ast_line(output, indent, upper_receiver == "PORT" ? "PortOperation " + full_name :
-            (upper_receiver == "ADDRESS" || upper_receiver == "MEMORY" || upper_receiver == "CPU" || upper_receiver == "GRAPHICS" || upper_receiver == "UEFI.GOP" || upper_receiver == "UEFI.BLOCKIO" || (upper_receiver == "UEFI" && (uppercase(method).rfind("GOP.", 0) == 0 || uppercase(method).rfind("BLOCKIO.", 0) == 0)))
+            (upper_receiver == "ADDRESS" || upper_receiver == "MEMORY" || upper_receiver == "CPU" || upper_receiver == "GRAPHICS" || (upper_receiver == "AEX" && uppercase(method) == "INVOKENATIVE0") || upper_receiver == "UEFI.GOP" || upper_receiver == "UEFI.BLOCKIO" || (upper_receiver == "UEFI" && (uppercase(method).rfind("GOP.", 0) == 0 || uppercase(method).rfind("BLOCKIO.", 0) == 0)))
                 ? "MemoryOperation " + full_name : "MethodCall " + receiver + "." + method);
         for (const auto& arg : args) {
             arg->dump_ast(output, indent + 1);
@@ -602,7 +603,7 @@ struct MethodCallExpr final : Expr {
     CanonicalAstNodePtr canonical_ast() const override {
         const std::string upper_receiver = uppercase(receiver);
         auto node = canonical_node(upper_receiver == "PORT" ? AstKind::PortOperation :
-            (upper_receiver == "ADDRESS" || upper_receiver == "MEMORY" || upper_receiver == "CPU" || upper_receiver == "GRAPHICS" || upper_receiver == "UEFI.GOP" || upper_receiver == "UEFI.BLOCKIO" || (upper_receiver == "UEFI" && (uppercase(method).rfind("GOP.", 0) == 0 || uppercase(method).rfind("BLOCKIO.", 0) == 0))) ? AstKind::MemoryOperation : AstKind::MethodCall);
+            (upper_receiver == "ADDRESS" || upper_receiver == "MEMORY" || upper_receiver == "CPU" || upper_receiver == "GRAPHICS" || (upper_receiver == "AEX" && (uppercase(method) == "INVOKENATIVE0" || uppercase(method) == "INVOKENATIVE1")) || upper_receiver == "UEFI.GOP" || upper_receiver == "UEFI.BLOCKIO" || (upper_receiver == "UEFI" && (uppercase(method).rfind("GOP.", 0) == 0 || uppercase(method).rfind("BLOCKIO.", 0) == 0))) ? AstKind::MemoryOperation : AstKind::MethodCall);
         node->name = full_name;
         node->secondary_name = receiver;
         node->text = method;

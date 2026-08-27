@@ -1,0 +1,442 @@
+' RFC-0046 AEX Phase 6 test body. The smoke test prepends the real stdlib/arcfs_policy.abas and
+' stdlib/aex_format_policy.abas, so this body exercises the active ArcFS and AEX policy code
+' directly instead of carrying another stale inlined copy.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    PORT.Write8(PORT.Address(1016), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText(a AS U32, b AS U32, c AS U32, d AS U32, e AS U32) AS U64
+    LET aByte AS U8 = a
+    LET bByte AS U8 = b
+    LET cByte AS U8 = c
+    LET dByte AS U8 = d
+    LET eByte AS U8 = e
+    SerialByte(aByte)
+    SerialByte(bByte)
+    SerialByte(cByte)
+    SerialByte(dByte)
+    SerialByte(eByte)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase6SourceAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61865984))   ' 0x3B00000
+END FUNCTION
+
+FUNCTION AexPhase6LoadedAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61931520))   ' 0x3B10000
+END FUNCTION
+
+FUNCTION AexPhase6CodeDestAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61997056))   ' 0x3B20000
+END FUNCTION
+
+FUNCTION AexPhase6DataDestAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62062592))   ' 0x3B30000
+END FUNCTION
+
+FUNCTION AexPhase6NameAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62128128))   ' 0x3B40000
+END FUNCTION
+
+FUNCTION AexPhase6FileLength() AS U64
+    RETURN 725
+END FUNCTION
+
+FUNCTION AexPhase6Clear(base AS MMIOPTR, count AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        MEMORY.Write8(ADDRESS.Offset(base, i), 0)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase6Fill(base AS MMIOPTR, count AS U64, value AS U8) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        MEMORY.Write8(ADDRESS.Offset(base, i), value)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase6WriteMagic(base AS MMIOPTR) AS U64
+    MEMORY.Write8(ADDRESS.Offset(base, 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(base, 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(base, 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(base, 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 7), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase6WriteEntry(index AS U32, chunkID AS U32, typeHigh AS U64, typeLow AS U64, offset AS U64, length AS U64) AS U64
+    LET index64 AS U64 = index
+    LET entry AS MMIOPTR = ADDRESS.Offset(AexPhase6SourceAddress(), 64 + (index64 * 96))
+    MEMORY.Write32(ADDRESS.Offset(entry, 0), chunkID)
+    MEMORY.Write64(ADDRESS.Offset(entry, 4), typeHigh)
+    MEMORY.Write64(ADDRESS.Offset(entry, 12), typeLow)
+    MEMORY.Write32(ADDRESS.Offset(entry, 20), 1)
+    MEMORY.Write64(ADDRESS.Offset(entry, 24), offset)
+    MEMORY.Write64(ADDRESS.Offset(entry, 32), length)
+    MEMORY.Write64(ADDRESS.Offset(entry, 40), length)
+    MEMORY.Write32(ADDRESS.Offset(entry, 48), 8)
+    MEMORY.Write32(ADDRESS.Offset(entry, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase6WriteFixture() AS U64
+    LET base AS MMIOPTR = AexPhase6SourceAddress()
+    AexPhase6Clear(base, 1024)
+
+    AexPhase6WriteMagic(base)
+    MEMORY.Write32(ADDRESS.Offset(base, 8), 65536)
+    MEMORY.Write32(ADDRESS.Offset(base, 12), 64)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), 2459565876494606882)
+    MEMORY.Write64(ADDRESS.Offset(base, 32), 64)
+    MEMORY.Write32(ADDRESS.Offset(base, 40), 5)
+    MEMORY.Write32(ADDRESS.Offset(base, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(base, 48), 0)
+
+    AexPhase6WriteEntry(0, 1, AexTypeManifestHigh(), AexTypeManifestLow(), 544, 80)
+    AexPhase6WriteEntry(1, 2, AexTypeComponentHigh(), AexTypeComponentLow(), 624, 48)
+    AexPhase6WriteEntry(2, 10, AexTypeImplementationHigh(), AexTypeImplementationLow(), 672, 40)
+    AexPhase6WriteEntry(3, 20, AexTypeCodeHigh(), AexTypeCodeLow(), 712, 8)
+    AexPhase6WriteEntry(4, 21, AexTypeDataHigh(), AexTypeDataLow(), 720, 5)
+
+    LET manifest AS MMIOPTR = ADDRESS.Offset(base, 544)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 0), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 8), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 16), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 24), 0)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 28), 3689348814741910323)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 36), 4919131752989213764)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 52), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 56), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 60), 2)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 64), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 68), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 72), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 76), 2)
+
+    LET component AS MMIOPTR = ADDRESS.Offset(base, 624)
+    MEMORY.Write32(ADDRESS.Offset(component, 0), 2)
+    MEMORY.Write64(ADDRESS.Offset(component, 4), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(component, 12), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(component, 20), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 28), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 32), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 36), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 44), 10)
+
+    LET impl AS MMIOPTR = ADDRESS.Offset(base, 672)
+    MEMORY.Write32(ADDRESS.Offset(impl, 0), 2)
+    MEMORY.Write32(ADDRESS.Offset(impl, 4), AexImplTypeNative())
+    MEMORY.Write32(ADDRESS.Offset(impl, 8), AexArchX86_64())
+    MEMORY.Write32(ADDRESS.Offset(impl, 12), AexAbiNativeMajorCurrent())
+    MEMORY.Write32(ADDRESS.Offset(impl, 16), AexAbiNativeMinorCurrent())
+    MEMORY.Write64(ADDRESS.Offset(impl, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(impl, 28), 7)
+    MEMORY.Write32(ADDRESS.Offset(impl, 32), 20)
+    MEMORY.Write32(ADDRESS.Offset(impl, 36), 21)
+
+    MEMORY.Write8(ADDRESS.Offset(base, 712), 72)
+    MEMORY.Write8(ADDRESS.Offset(base, 713), 49)
+    MEMORY.Write8(ADDRESS.Offset(base, 714), 192)
+    MEMORY.Write8(ADDRESS.Offset(base, 715), 195)
+    MEMORY.Write8(ADDRESS.Offset(base, 716), 144)
+    MEMORY.Write8(ADDRESS.Offset(base, 717), 144)
+    MEMORY.Write8(ADDRESS.Offset(base, 718), 204)
+    MEMORY.Write8(ADDRESS.Offset(base, 719), 204)
+
+    MEMORY.Write8(ADDRESS.Offset(base, 720), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 721), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 722), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 723), 68)
+    MEMORY.Write8(ADDRESS.Offset(base, 724), 54)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase6WriteName() AS U64
+    LET name AS MMIOPTR = AexPhase6NameAddress()
+    MEMORY.Write8(ADDRESS.Offset(name, 0), 97)
+    MEMORY.Write8(ADDRESS.Offset(name, 1), 112)
+    MEMORY.Write8(ADDRESS.Offset(name, 2), 112)
+    MEMORY.Write8(ADDRESS.Offset(name, 3), 46)
+    MEMORY.Write8(ADDRESS.Offset(name, 4), 97)
+    MEMORY.Write8(ADDRESS.Offset(name, 5), 101)
+    MEMORY.Write8(ADDRESS.Offset(name, 6), 120)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase6ValidateLoaded(buffer AS MMIOPTR) AS BOOL
+    IF AEX.ValidateHeader(buffer, AexPhase6FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateDirectory(buffer, AexPhase6FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateManifest(buffer, AexPhase6FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.SelectImplementation(buffer, 2, AexPhase6FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(AexSelectedImplementationIDAddress()) <> 10 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunArcFSLoad() AS BOOL
+    AexPhase6WriteFixture()
+    AexPhase6WriteName()
+    IF ArcFS.Initialize() = 0 THEN
+        RETURN 0
+    END IF
+    LET oid AS U64 = ArcFS.CreateFile(1, AexPhase6NameAddress(), 7)
+    IF oid = 0 THEN
+        RETURN 0
+    END IF
+    LET handle AS U64 = ArcFS.OpenHandle(oid)
+    IF handle = 0 THEN
+        RETURN 0
+    END IF
+    LET wrote AS U64 = ArcFS.HandleWrite(handle, AexPhase6SourceAddress(), AexPhase6FileLength(), 0)
+    ArcFS.CloseHandle(handle)
+    IF wrote <> AexPhase6FileLength() THEN
+        RETURN 0
+    END IF
+    AexPhase6Clear(AexPhase6LoadedAddress(), 1024)
+    LET loaded AS U64 = AEX.LoadFromArcFS(oid, AexPhase6LoadedAddress())
+    IF loaded <> AexPhase6FileLength() THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(AexPhase6LoadedAddress()) <> 65 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(AexPhase6LoadedAddress(), 724)) <> 54 THEN
+        RETURN 0
+    END IF
+    RETURN AexPhase6ValidateLoaded(AexPhase6LoadedAddress())
+END FUNCTION
+
+FUNCTION RunCodeMap() AS BOOL
+    AexPhase6WriteFixture()
+    IF AEX.MapCodeChunk(AexPhase6SourceAddress(), 20, AexPhase6CodeDestAddress(), 16) <> 0 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(AexPhase6CodeDestAddress()) <> 72 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(AexPhase6CodeDestAddress(), 3)) <> 195 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(AexPhase6CodeDestAddress(), 7)) <> 204 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunCodeTooLarge() AS BOOL
+    AexPhase6WriteFixture()
+    IF AEX.MapCodeChunk(AexPhase6SourceAddress(), 20, AexPhase6CodeDestAddress(), 4) <> AexErrorCodeChunkTooLarge() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunCodeInvalid() AS BOOL
+    AexPhase6WriteFixture()
+    IF AEX.MapCodeChunk(AexPhase6SourceAddress(), 21, AexPhase6CodeDestAddress(), 16) <> AexErrorCodeChunkInvalid() THEN
+        RETURN 0
+    END IF
+    IF AEX.MapCodeChunk(AexPhase6SourceAddress(), 99, AexPhase6CodeDestAddress(), 16) <> AexErrorCodeChunkInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDataMap() AS BOOL
+    AexPhase6WriteFixture()
+    IF AEX.MapDataChunk(AexPhase6SourceAddress(), 21, AexPhase6DataDestAddress(), 16) <> 0 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(AexPhase6DataDestAddress()) <> 65 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(AexPhase6DataDestAddress(), 4)) <> 54 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDataZeroFill() AS BOOL
+    AexPhase6Fill(AexPhase6DataDestAddress(), 16, 255)
+    IF AEX.MapDataChunk(AexPhase6SourceAddress(), 0, AexPhase6DataDestAddress(), 16) <> 0 THEN
+        RETURN 0
+    END IF
+    LET i AS U64 = 0
+    WHILE i < 16
+        IF MEMORY.Read8(ADDRESS.Offset(AexPhase6DataDestAddress(), i)) <> 0 THEN
+            RETURN 0
+        END IF
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDataTooLarge() AS BOOL
+    AexPhase6WriteFixture()
+    IF AEX.MapDataChunk(AexPhase6SourceAddress(), 21, AexPhase6DataDestAddress(), 4) <> AexErrorDataChunkTooLarge() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunDataInvalid() AS BOOL
+    AexPhase6WriteFixture()
+    IF AEX.MapDataChunk(AexPhase6SourceAddress(), 20, AexPhase6DataDestAddress(), 16) <> AexErrorDataChunkInvalid() THEN
+        RETURN 0
+    END IF
+    IF AEX.MapDataChunk(AexPhase6SourceAddress(), 99, AexPhase6DataDestAddress(), 16) <> AexErrorDataChunkInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION ReportCase(label0 AS U32, label1 AS U32, label2 AS U32, label3 AS U32, label4 AS U32, ok AS BOOL) AS U64
+    SerialText(label0, label1, label2, label3, label4)
+    IF ok = 1 THEN
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET testsPassed AS U32 = 0
+    LET testsFailed AS U32 = 0
+
+    LET LoadOk AS BOOL = RunArcFSLoad()
+    ReportCase(76, 79, 65, 68, 32, LoadOk)
+    IF LoadOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET CodeOk AS BOOL = RunCodeMap()
+    ReportCase(67, 79, 68, 69, 32, CodeOk)
+    IF CodeOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET CodeTooLargeOk AS BOOL = RunCodeTooLarge()
+    ReportCase(67, 79, 86, 82, 32, CodeTooLargeOk)
+    IF CodeTooLargeOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET CodeInvalidOk AS BOOL = RunCodeInvalid()
+    ReportCase(67, 66, 65, 68, 32, CodeInvalidOk)
+    IF CodeInvalidOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET DataOk AS BOOL = RunDataMap()
+    ReportCase(68, 65, 84, 65, 32, DataOk)
+    IF DataOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET ZeroOk AS BOOL = RunDataZeroFill()
+    ReportCase(90, 69, 82, 79, 32, ZeroOk)
+    IF ZeroOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET DataTooLargeOk AS BOOL = RunDataTooLarge()
+    ReportCase(68, 79, 86, 82, 32, DataTooLargeOk)
+    IF DataTooLargeOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET DataInvalidOk AS BOOL = RunDataInvalid()
+    ReportCase(68, 66, 65, 68, 32, DataInvalidOk)
+    IF DataInvalidOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(32)
+    IF testsFailed = 0 THEN
+        SerialByte(65)
+        SerialByte(76)
+        SerialByte(76)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(83)
+        SerialByte(79)
+        SerialByte(77)
+        SerialByte(69)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN testsFailed
+END FUNCTION

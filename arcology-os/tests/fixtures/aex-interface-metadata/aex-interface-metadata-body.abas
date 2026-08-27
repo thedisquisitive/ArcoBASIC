@@ -1,0 +1,422 @@
+' RFC-0046 AEX Phase 8 test body. The smoke test prepends the real stdlib/arcfs_policy.abas and
+' stdlib/aex_format_policy.abas, so this fixture exercises the active interface metadata
+' validator directly.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    PORT.Write8(PORT.Address(1016), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText(a AS U32, b AS U32, c AS U32, d AS U32, e AS U32) AS U64
+    LET aByte AS U8 = a
+    LET bByte AS U8 = b
+    LET cByte AS U8 = c
+    LET dByte AS U8 = d
+    LET eByte AS U8 = e
+    SerialByte(aByte)
+    SerialByte(bByte)
+    SerialByte(cByte)
+    SerialByte(dByte)
+    SerialByte(eByte)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase8SourceAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62324736))   ' 0x3B70000
+END FUNCTION
+
+FUNCTION AexPhase8FileLength() AS U64
+    RETURN 832
+END FUNCTION
+
+FUNCTION AexPhase8Clear(base AS MMIOPTR, count AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        MEMORY.Write8(ADDRESS.Offset(base, i), 0)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase8WriteMagic(base AS MMIOPTR) AS U64
+    MEMORY.Write8(ADDRESS.Offset(base, 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(base, 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(base, 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(base, 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 7), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase8WriteEntry(index AS U32, chunkID AS U32, typeHigh AS U64, typeLow AS U64, offset AS U64, length AS U64) AS U64
+    LET index64 AS U64 = index
+    LET entry AS MMIOPTR = ADDRESS.Offset(AexPhase8SourceAddress(), 64 + (index64 * 96))
+    MEMORY.Write32(ADDRESS.Offset(entry, 0), chunkID)
+    MEMORY.Write64(ADDRESS.Offset(entry, 4), typeHigh)
+    MEMORY.Write64(ADDRESS.Offset(entry, 12), typeLow)
+    MEMORY.Write32(ADDRESS.Offset(entry, 20), 1)
+    MEMORY.Write64(ADDRESS.Offset(entry, 24), offset)
+    MEMORY.Write64(ADDRESS.Offset(entry, 32), length)
+    MEMORY.Write64(ADDRESS.Offset(entry, 40), length)
+    MEMORY.Write32(ADDRESS.Offset(entry, 48), 8)
+    MEMORY.Write32(ADDRESS.Offset(entry, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase8WriteHeaderAndDirectory() AS U64
+    LET base AS MMIOPTR = AexPhase8SourceAddress()
+    AexPhase8Clear(base, 1024)
+
+    AexPhase8WriteMagic(base)
+    MEMORY.Write32(ADDRESS.Offset(base, 8), 65536)
+    MEMORY.Write32(ADDRESS.Offset(base, 12), 64)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), 2459565876494606882)
+    MEMORY.Write64(ADDRESS.Offset(base, 32), 64)
+    MEMORY.Write32(ADDRESS.Offset(base, 40), 5)
+    MEMORY.Write32(ADDRESS.Offset(base, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(base, 48), 0)
+
+    AexPhase8WriteEntry(0, 1, AexTypeManifestHigh(), AexTypeManifestLow(), 544, 80)
+    AexPhase8WriteEntry(1, 2, AexTypeComponentHigh(), AexTypeComponentLow(), 624, 52)
+    AexPhase8WriteEntry(2, 40, AexTypeInterfaceHigh(), AexTypeInterfaceLow(), 680, 44)
+    AexPhase8WriteEntry(3, 41, AexTypeInterfaceHigh(), AexTypeInterfaceLow(), 728, 44)
+    AexPhase8WriteEntry(4, 70, AexTypeArcoBindingHigh(), AexTypeArcoBindingLow(), 776, 56)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase8WriteInterface(offset AS U64, interfaceID AS U32, ownerID AS U32, direction AS U32, major AS U32, minor AS U32) AS U64
+    LET data AS MMIOPTR = ADDRESS.Offset(AexPhase8SourceAddress(), offset)
+    MEMORY.Write32(ADDRESS.Offset(data, 0), interfaceID)
+    MEMORY.Write32(ADDRESS.Offset(data, 4), ownerID)
+    MEMORY.Write32(ADDRESS.Offset(data, 8), direction)
+    MEMORY.Write32(ADDRESS.Offset(data, 12), major)
+    MEMORY.Write32(ADDRESS.Offset(data, 16), minor)
+    MEMORY.Write64(ADDRESS.Offset(data, 20), 6148914691236517205)
+    MEMORY.Write64(ADDRESS.Offset(data, 28), 7378697629483820646)
+    MEMORY.Write32(ADDRESS.Offset(data, 36), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 40), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase8WriteBinding(offset AS U64) AS U64
+    LET data AS MMIOPTR = ADDRESS.Offset(AexPhase8SourceAddress(), offset)
+    MEMORY.Write32(ADDRESS.Offset(data, 0), 70)
+    MEMORY.Write32(ADDRESS.Offset(data, 4), 2)
+    MEMORY.Write32(ADDRESS.Offset(data, 8), AexBindingKindMethod())
+    MEMORY.Write32(ADDRESS.Offset(data, 12), 0)
+    MEMORY.Write64(ADDRESS.Offset(data, 16), 11068046444225730969)
+    MEMORY.Write64(ADDRESS.Offset(data, 24), 12370169555311111083)
+    MEMORY.Write64(ADDRESS.Offset(data, 32), 0)
+    MEMORY.Write64(ADDRESS.Offset(data, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase8WriteFixture() AS U64
+    AexPhase8WriteHeaderAndDirectory()
+    LET base AS MMIOPTR = AexPhase8SourceAddress()
+
+    LET manifest AS MMIOPTR = ADDRESS.Offset(base, 544)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 0), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 8), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 16), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 24), 0)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 28), 3689348814741910323)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 36), 4919131752989213764)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 52), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 56), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 60), 2)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 64), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 68), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 72), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 76), 2)
+
+    LET component AS MMIOPTR = ADDRESS.Offset(base, 624)
+    MEMORY.Write32(ADDRESS.Offset(component, 0), 2)
+    MEMORY.Write64(ADDRESS.Offset(component, 4), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(component, 12), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(component, 20), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 28), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 32), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 36), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 44), 40)
+    MEMORY.Write32(ADDRESS.Offset(component, 48), 41)
+
+    AexPhase8WriteInterface(680, 40, 2, AexInterfaceDirectionProvided(), AexInterfaceVersionMajorCurrent(), AexInterfaceVersionMinorCurrent())
+    AexPhase8WriteInterface(728, 41, 2, AexInterfaceDirectionRequired(), AexInterfaceVersionMajorCurrent(), AexInterfaceVersionMinorCurrent())
+    AexPhase8WriteBinding(776)
+    RETURN 0
+END FUNCTION
+
+FUNCTION RunValidInterfaces() AS BOOL
+    AexPhase8WriteFixture()
+    IF AEX.ValidateHeader(AexPhase8SourceAddress(), AexPhase8FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateDirectory(AexPhase8SourceAddress(), AexPhase8FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateManifest(AexPhase8SourceAddress(), AexPhase8FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateInterfaces(AexPhase8SourceAddress(), AexPhase8FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunResolvedInterface() AS BOOL
+    AexPhase8WriteFixture()
+    IF AEX.ResolveInterfaces(AexPhase8SourceAddress(), AexPhase8FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.InterfaceResolutionCount() <> 1 THEN
+        RETURN 0
+    END IF
+    IF AEX.InterfaceResolutionRequiredIDAt(0) <> 41 THEN
+        RETURN 0
+    END IF
+    IF AEX.InterfaceResolutionRequiredOwnerAt(0) <> 2 THEN
+        RETURN 0
+    END IF
+    IF AEX.InterfaceResolutionProviderIDAt(0) <> 40 THEN
+        RETURN 0
+    END IF
+    IF AEX.InterfaceResolutionProviderOwnerAt(0) <> 2 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunResolvedBindingLookup() AS BOOL
+    AexPhase8WriteFixture()
+    IF AEX.ResolveInterfaces(AexPhase8SourceAddress(), AexPhase8FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.RegisterArcoBindings(AexPhase8SourceAddress(), AexPhase8FileLength()) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.FindResolvedProviderBinding(41, AexBindingKindMethod(), 11068046444225730969, 12370169555311111083) <> 70 THEN
+        RETURN 0
+    END IF
+    IF AEX.FindResolvedProviderBinding(41, AexBindingKindEvent(), 11068046444225730969, 12370169555311111083) <> 0 THEN
+        RETURN 0
+    END IF
+    IF AEX.FindResolvedProviderBinding(99, AexBindingKindMethod(), 11068046444225730969, 12370169555311111083) <> 0 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunResolutionMissingProvider() AS BOOL
+    AexPhase8WriteFixture()
+    MEMORY.Write64(ADDRESS.Offset(AexPhase8SourceAddress(), 700), 1229782938247303441)
+    IF AEX.ResolveInterfaces(AexPhase8SourceAddress(), AexPhase8FileLength()) <> AexErrorInterfaceResolutionMissingProvider() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunInterfaceMissing() AS BOOL
+    AexPhase8WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase8SourceAddress(), 668), 99)
+    IF AEX.ValidateInterfaces(AexPhase8SourceAddress(), AexPhase8FileLength()) <> AexErrorInterfaceInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunInterfaceWrongType() AS BOOL
+    AexPhase8WriteFixture()
+    AexPhase8WriteEntry(2, 40, AexTypeDataHigh(), AexTypeDataLow(), 584, 44)
+    IF AEX.ValidateInterfaces(AexPhase8SourceAddress(), AexPhase8FileLength()) <> AexErrorInterfaceInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunInterfaceOwnerMismatch() AS BOOL
+    AexPhase8WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase8SourceAddress(), 684), 99)
+    IF AEX.ValidateInterfaces(AexPhase8SourceAddress(), AexPhase8FileLength()) <> AexErrorInterfaceOwnerMismatch() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunInterfaceTooShort() AS BOOL
+    AexPhase8WriteFixture()
+    AexPhase8WriteEntry(2, 40, AexTypeInterfaceHigh(), AexTypeInterfaceLow(), 680, 40)
+    IF AEX.ValidateInterfaces(AexPhase8SourceAddress(), AexPhase8FileLength()) <> AexErrorInterfaceOutOfBounds() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunInterfaceWrongDirection() AS BOOL
+    AexPhase8WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase8SourceAddress(), 688), AexInterfaceDirectionRequired())
+    IF AEX.ValidateInterfaces(AexPhase8SourceAddress(), AexPhase8FileLength()) <> AexErrorInterfaceInvalid() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION RunInterfaceVersionTooNew() AS BOOL
+    AexPhase8WriteFixture()
+    MEMORY.Write32(ADDRESS.Offset(AexPhase8SourceAddress(), 692), AexInterfaceVersionMajorCurrent() + 1)
+    IF AEX.ValidateInterfaces(AexPhase8SourceAddress(), AexPhase8FileLength()) <> AexErrorInterfaceUnsupportedVersion() THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION ReportCase(label0 AS U32, label1 AS U32, label2 AS U32, label3 AS U32, label4 AS U32, ok AS BOOL) AS U64
+    SerialText(label0, label1, label2, label3, label4)
+    IF ok = 1 THEN
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET testsPassed AS U32 = 0
+    LET testsFailed AS U32 = 0
+
+    LET ValidOk AS BOOL = RunValidInterfaces()
+    ReportCase(73, 78, 84, 70, 32, ValidOk)
+    IF ValidOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET ResolveOk AS BOOL = RunResolvedInterface()
+    ReportCase(82, 83, 76, 86, 32, ResolveOk)
+    IF ResolveOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET NoProviderOk AS BOOL = RunResolutionMissingProvider()
+    ReportCase(78, 80, 82, 79, 32, NoProviderOk)
+    IF NoProviderOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET LookupOk AS BOOL = RunResolvedBindingLookup()
+    ReportCase(76, 79, 79, 75, 32, LookupOk)
+    IF LookupOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET MissingOk AS BOOL = RunInterfaceMissing()
+    ReportCase(77, 73, 83, 83, 32, MissingOk)
+    IF MissingOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET TypeOk AS BOOL = RunInterfaceWrongType()
+    ReportCase(84, 89, 80, 69, 32, TypeOk)
+    IF TypeOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET OwnerOk AS BOOL = RunInterfaceOwnerMismatch()
+    ReportCase(79, 87, 78, 82, 32, OwnerOk)
+    IF OwnerOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET BoundsOk AS BOOL = RunInterfaceTooShort()
+    ReportCase(66, 78, 68, 83, 32, BoundsOk)
+    IF BoundsOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET DirectionOk AS BOOL = RunInterfaceWrongDirection()
+    ReportCase(68, 73, 82, 78, 32, DirectionOk)
+    IF DirectionOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    LET VersionOk AS BOOL = RunInterfaceVersionTooNew()
+    ReportCase(86, 69, 82, 83, 32, VersionOk)
+    IF VersionOk = 1 THEN
+        testsPassed = testsPassed + 1
+    ELSE
+        testsFailed = testsFailed + 1
+    END IF
+
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(32)
+    IF testsFailed = 0 THEN
+        SerialByte(65)
+        SerialByte(76)
+        SerialByte(76)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(83)
+        SerialByte(79)
+        SerialByte(77)
+        SerialByte(69)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN testsFailed
+END FUNCTION

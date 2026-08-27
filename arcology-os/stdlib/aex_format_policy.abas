@@ -1,9 +1,13 @@
-' RFC-0046 AEX Phase 1-3: real binary constants, bootstrap header validation, and chunk
-' directory validation for the Arcology Executable Assembly format. Scoped exactly to Section
-' 61's own Phases 1-3 ("AEX binary constants and parser structures" / "Bootstrap header
-' validation" / "Chunk directory validation") -- manifest/component/capability interpretation
-' (Phase 4+) and ArcFS-backed loading (Phase 6) are real, separate, later increments, not
-' attempted here.
+' RFC-0046 AEX Phase 1-14: real binary constants, bootstrap header validation, chunk directory
+' validation, manifest/component graph validation, native implementation selection, and
+' ArcFS-backed code/data mapping plus native ABI lifecycle invocation for the Arcology Executable
+' Assembly format, interface metadata validation, capability request evaluation, and ArcoBASIC
+' Binding Table registration, plus first-stage integrity verification and diagnostic metadata
+' registration, deterministic negative mutation coverage, combined QEMU load-path validation, and
+' MEMORY_POLICY metadata validation, allocator-backed CODE/DATA mapping, and native1 ABI
+' invocation. Scoped exactly to Section 61's own Phases 1-14 plus the first post-checklist
+' loader-hardening slices -- signatures, page-table permission programming, and physical hardware
+' validation remain real, separate, later increments.
 '
 ' Byte layout (both widths fixed here, per Section 9/10's own explicit invitation: "The final
 ' binary field widths SHALL be fixed by implementation").
@@ -38,7 +42,7 @@
 '   +40 LogicalLength        U64
 '   +48 Alignment            U32
 '   +52 EncodingOrCompress   U32, 0 = raw/uncompressed for Phase 1-3
-'   +56 Hash                 32 bytes, reserved -- unused/unchecked until Phase 11 (integrity)
+'   +56 Hash                 32 bytes, reserved -- unused by the Phase 11 INTEGRITY-chunk bootstrap gate
 '   +88 Reserved             8 bytes
 
 #PROFILE UEFI
@@ -47,6 +51,250 @@
 
 FUNCTION AexHeaderSize() AS U32
     RETURN 64
+END FUNCTION
+
+' -----------------------------------------------------------------------------------------------
+' Phase 12: Diagnostic metadata registration (Section 29 / Section 38 / Section 61 Phase 12).
+'
+' Concrete DIAGNOSTIC chunk content for this first attribution slice:
+'   +0  DiagnosticID           U32  (must equal the chunk ID that contains this record)
+'   +4  OwningComponentID      U32  (must name a component declared by the root manifest)
+'   +8  DiagnosticKind         U32  (1=COMPONENT, 2=OPERATION, 3=ERROR_DOMAIN, 4=LIFECYCLE)
+'   +12 TargetImplementationID U32  (0 = component/interface metadata; nonzero must be this owner)
+'   +16 CodeChunkID            U32  (0 = no native-code range; nonzero must name a CODE chunk)
+'   +20 CodeOffset             U64
+'   +28 CodeLength             U64  (CodeOffset + CodeLength must fit the CODE chunk)
+'   +36 NameIDHigh             U64  (stable 128-bit public operation/component/domain name)
+'   +44 NameIDLow              U64
+'   +52 DomainIDHigh           U64  (stable 128-bit error/fault domain identity; zero allowed)
+'   +60 DomainIDLow            U64
+'   +68 Flags                  U32  (reserved for source/private/public symbol policy)
+'   +72 Reserved               U32  (must be zero in this phase's fixed layout)
+'
+' Registration copies validated records into a bounded loader diagnostics table so later trap,
+' loader, and shell fault reporting can attribute failures without executing application code.
+
+FUNCTION AexDiagnosticKindComponent() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexDiagnosticKindOperation() AS U32
+    RETURN 2
+END FUNCTION
+FUNCTION AexDiagnosticKindErrorDomain() AS U32
+    RETURN 3
+END FUNCTION
+FUNCTION AexDiagnosticKindLifecycle() AS U32
+    RETURN 4
+END FUNCTION
+
+FUNCTION AexErrorDiagnosticInvalid() AS U32
+    RETURN 41
+END FUNCTION
+FUNCTION AexErrorDiagnosticOutOfBounds() AS U32
+    RETURN 42
+END FUNCTION
+FUNCTION AexErrorDiagnosticOwnerInvalid() AS U32
+    RETURN 43
+END FUNCTION
+FUNCTION AexErrorDiagnosticRegistryFull() AS U32
+    RETURN 44
+END FUNCTION
+
+FUNCTION AexDiagnosticFixedSize() AS U32
+    RETURN 76
+END FUNCTION
+FUNCTION AexDiagnosticRegistryMaxEntries() AS U32
+    RETURN 16
+END FUNCTION
+FUNCTION AexDiagnosticRegistryEntryStride() AS U32
+    RETURN 56
+END FUNCTION
+FUNCTION AexDiagnosticRegistryBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61214720))
+END FUNCTION
+FUNCTION AexDiagnosticRegistryCountAddress() AS MMIOPTR
+    RETURN AexDiagnosticRegistryBaseAddress()
+END FUNCTION
+FUNCTION AexDiagnosticRegistryEntryAddress(index AS U32) AS MMIOPTR
+    LET indexAsU64 AS U64 = index
+    RETURN ADDRESS.Offset(AexDiagnosticRegistryBaseAddress(), 8 + (indexAsU64 * AexDiagnosticRegistryEntryStride()))
+END FUNCTION
+
+FUNCTION AexReadDiagnosticID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 0))
+END FUNCTION
+FUNCTION AexReadDiagnosticOwningComponentID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 4))
+END FUNCTION
+FUNCTION AexReadDiagnosticKind(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 8))
+END FUNCTION
+FUNCTION AexReadDiagnosticTargetImplementationID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 12))
+END FUNCTION
+FUNCTION AexReadDiagnosticCodeChunkID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 16))
+END FUNCTION
+FUNCTION AexReadDiagnosticCodeOffset(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 20))
+END FUNCTION
+FUNCTION AexReadDiagnosticCodeLength(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 28))
+END FUNCTION
+FUNCTION AexReadDiagnosticNameIDHigh(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 36))
+END FUNCTION
+FUNCTION AexReadDiagnosticNameIDLow(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 44))
+END FUNCTION
+FUNCTION AexReadDiagnosticDomainIDHigh(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 52))
+END FUNCTION
+FUNCTION AexReadDiagnosticDomainIDLow(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 60))
+END FUNCTION
+FUNCTION AexReadDiagnosticFlags(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 68))
+END FUNCTION
+FUNCTION AexReadDiagnosticReserved(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 72))
+END FUNCTION
+
+FUNCTION AexValidateDiagnosticCodeRange(buffer AS MMIOPTR, codeChunkID AS U32, codeOffset AS U64, codeLength AS U64) AS U32
+    IF codeChunkID = 0 THEN
+        IF codeOffset <> 0 THEN
+            RETURN AexErrorDiagnosticInvalid()
+        END IF
+        IF codeLength <> 0 THEN
+            RETURN AexErrorDiagnosticInvalid()
+        END IF
+        RETURN AexErrorOk()
+    END IF
+
+    LET codeEntry AS MMIOPTR = AexFindChunkByID(buffer, codeChunkID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorDiagnosticInvalid()
+    END IF
+    IF AexReadEntryTypeHigh(codeEntry) <> AexTypeCodeHigh() THEN
+        RETURN AexErrorDiagnosticInvalid()
+    END IF
+    IF AexReadEntryTypeLow(codeEntry) <> AexTypeCodeLow() THEN
+        RETURN AexErrorDiagnosticInvalid()
+    END IF
+    LET storedLength AS U64 = AexReadEntryStoredLength(codeEntry)
+    IF codeOffset > storedLength THEN
+        RETURN AexErrorDiagnosticOutOfBounds()
+    END IF
+    IF codeLength > storedLength - codeOffset THEN
+        RETURN AexErrorDiagnosticOutOfBounds()
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AexValidateOneDiagnostic(buffer AS MMIOPTR, manifestData AS MMIOPTR, diagnosticEntry AS MMIOPTR, fileLength AS U64) AS U32
+    LET diagnosticID AS U32 = AexReadEntryChunkID(diagnosticEntry)
+    LET diagnosticLogicalLength AS U64 = AexReadEntryLogicalLength(diagnosticEntry)
+    LET fixedSize AS U64 = AexDiagnosticFixedSize()
+    IF diagnosticLogicalLength < fixedSize THEN
+        RETURN AexErrorDiagnosticOutOfBounds()
+    END IF
+
+    LET diagnosticOffset AS U64 = AexReadEntryOffset(diagnosticEntry)
+    LET diagnosticData AS MMIOPTR = ADDRESS.Offset(buffer, diagnosticOffset)
+    IF AexReadDiagnosticID(diagnosticData) <> diagnosticID THEN
+        RETURN AexErrorDiagnosticInvalid()
+    END IF
+
+    LET ownerID AS U32 = AexReadDiagnosticOwningComponentID(diagnosticData)
+    IF AexManifestDeclaresComponentID(manifestData, ownerID) = 0 THEN
+        RETURN AexErrorDiagnosticOwnerInvalid()
+    END IF
+
+    LET kind AS U32 = AexReadDiagnosticKind(diagnosticData)
+    IF kind < AexDiagnosticKindComponent() THEN
+        RETURN AexErrorDiagnosticInvalid()
+    END IF
+    IF kind > AexDiagnosticKindLifecycle() THEN
+        RETURN AexErrorDiagnosticInvalid()
+    END IF
+    IF AexReadDiagnosticReserved(diagnosticData) <> 0 THEN
+        RETURN AexErrorDiagnosticInvalid()
+    END IF
+
+    LET targetID AS U32 = AexReadDiagnosticTargetImplementationID(diagnosticData)
+    LET targetResult AS U32 = AexValidateBindingTargetImplementation(buffer, targetID, ownerID)
+    IF targetResult = AexErrorBindingOwnerInvalid() THEN
+        RETURN AexErrorDiagnosticOwnerInvalid()
+    END IF
+    IF targetResult <> AexErrorOk() THEN
+        RETURN AexErrorDiagnosticInvalid()
+    END IF
+
+    LET codeResult AS U32 = AexValidateDiagnosticCodeRange(buffer, AexReadDiagnosticCodeChunkID(diagnosticData), AexReadDiagnosticCodeOffset(diagnosticData), AexReadDiagnosticCodeLength(diagnosticData))
+    IF codeResult <> AexErrorOk() THEN
+        RETURN codeResult
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AexRegisterOneDiagnostic(diagnosticEntry AS MMIOPTR, diagnosticData AS MMIOPTR) AS U32
+    LET count AS U32 = MEMORY.Read32(AexDiagnosticRegistryCountAddress())
+    IF count >= AexDiagnosticRegistryMaxEntries() THEN
+        RETURN AexErrorDiagnosticRegistryFull()
+    END IF
+
+    LET dest AS MMIOPTR = AexDiagnosticRegistryEntryAddress(count)
+    MEMORY.Write32(ADDRESS.Offset(dest, 0), AexReadEntryChunkID(diagnosticEntry))
+    MEMORY.Write32(ADDRESS.Offset(dest, 4), AexReadDiagnosticOwningComponentID(diagnosticData))
+    MEMORY.Write32(ADDRESS.Offset(dest, 8), AexReadDiagnosticKind(diagnosticData))
+    MEMORY.Write32(ADDRESS.Offset(dest, 12), AexReadDiagnosticTargetImplementationID(diagnosticData))
+    MEMORY.Write32(ADDRESS.Offset(dest, 16), AexReadDiagnosticCodeChunkID(diagnosticData))
+    MEMORY.Write64(ADDRESS.Offset(dest, 20), AexReadDiagnosticCodeOffset(diagnosticData))
+    MEMORY.Write64(ADDRESS.Offset(dest, 28), AexReadDiagnosticCodeLength(diagnosticData))
+    MEMORY.Write64(ADDRESS.Offset(dest, 36), AexReadDiagnosticNameIDHigh(diagnosticData))
+    MEMORY.Write64(ADDRESS.Offset(dest, 44), AexReadDiagnosticNameIDLow(diagnosticData))
+    MEMORY.Write32(AexDiagnosticRegistryCountAddress(), count + 1)
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.RegisterDiagnostics(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    MEMORY.Write32(AexDiagnosticRegistryCountAddress(), 0)
+
+    LET rootManifestID AS U32 = AexReadRootManifestID(buffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(buffer, rootManifestID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingManifest()
+    END IF
+    LET manifestOffset AS U64 = AexReadEntryOffset(manifestEntry)
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(buffer, manifestOffset)
+
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+    WHILE index < dirCount
+        LET entry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+        LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+        IF typeHigh = AexTypeDiagnosticHigh() THEN
+            IF typeLow = AexTypeDiagnosticLow() THEN
+                LET validateResult AS U32 = AexValidateOneDiagnostic(buffer, manifestData, entry, fileLength)
+                IF validateResult <> AexErrorOk() THEN
+                    RETURN validateResult
+                END IF
+                LET diagnosticOffset AS U64 = AexReadEntryOffset(entry)
+                LET diagnosticData AS MMIOPTR = ADDRESS.Offset(buffer, diagnosticOffset)
+                LET registerResult AS U32 = AexRegisterOneDiagnostic(entry, diagnosticData)
+                IF registerResult <> AexErrorOk() THEN
+                    RETURN registerResult
+                END IF
+            END IF
+        END IF
+        index = index + 1
+    WEND
+
+    RETURN AexErrorOk()
 END FUNCTION
 FUNCTION AexDirectoryEntryStride() AS U32
     RETURN 96
@@ -975,6 +1223,21 @@ FUNCTION AexComponentImplementationIDAt(data AS MMIOPTR, index AS U32) AS U32
     RETURN MEMORY.Read32(ADDRESS.Offset(data, byteOffset))
 END FUNCTION
 
+FUNCTION AexComponentProvidedInterfaceIDAt(data AS MMIOPTR, index AS U32) AS U32
+    LET implCountAsU64 AS U64 = AexReadComponentImplementationCount(data)
+    LET indexAsU64 AS U64 = index
+    LET byteOffset AS U64 = AexComponentFixedSize() + (implCountAsU64 * 4) + (indexAsU64 * 4)
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, byteOffset))
+END FUNCTION
+
+FUNCTION AexComponentRequiredInterfaceIDAt(data AS MMIOPTR, index AS U32) AS U32
+    LET implCountAsU64 AS U64 = AexReadComponentImplementationCount(data)
+    LET providedCountAsU64 AS U64 = AexReadComponentProvidedInterfaceCount(data)
+    LET indexAsU64 AS U64 = index
+    LET byteOffset AS U64 = AexComponentFixedSize() + (implCountAsU64 * 4) + (providedCountAsU64 * 4) + (indexAsU64 * 4)
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, byteOffset))
+END FUNCTION
+
 ' Real, per-implementation validation: resolves implID through the same chunk directory (an
 ' implementation is just another chunk, same as a component or manifest), confirms its real type,
 ' bounds-checks its fixed content against its own real LogicalLength, and confirms its own
@@ -1102,5 +1365,2644 @@ FUNCTION AEX.SelectImplementation(buffer AS MMIOPTR, componentID AS U32, fileLen
     END IF
 
     MEMORY.Write32(AexSelectedImplementationIDAddress(), bestImplID)
+    RETURN AexErrorOk()
+END FUNCTION
+
+' -----------------------------------------------------------------------------------------------
+' Phase 6: ArcFS-backed code/data mapping (Section 34 / Section 61 Phase 6). Two real, separate
+' halves of Loader Stages 1 and 13 (Section 37): opening the AEX assembly as a real ArcFS object
+' rather than a hand-poked scratch buffer, and copying a selected implementation's own CODE/DATA
+' chunk bytes into a caller-supplied destination.
+'
+' NOTE: unlike Phase 1-5's own functions, AEX.LoadFromArcFS depends on `stdlib/arcfs_policy.abas`
+' symbols (ArcFS.OpenHandle/HandleRead/CloseHandle) being inlined alongside this file -- this
+' module has no #INCLUDE, so any fixture calling AEX.LoadFromArcFS must inline arcfs_policy.abas
+' too. AEX.MapCodeChunk/AEX.MapDataChunk have no such dependency.
+'
+' Deliberately scoped down, matching this format's established discipline of narrow, honestly-
+' documented slices: this phase proves a real byte round trip through ArcFS's own object/data-pool
+' machinery (AEX.LoadFromArcFS) and a real, correct copy of the right chunk bytes to the right
+' destination (AEX.MapCodeChunk/AEX.MapDataChunk) -- it does NOT yet allocate that destination from
+' the real region allocator or mark it with real page-table permissions (Section 17's W^X memory
+' semantics). That is real, separate, later work once Phase 7's native ABI lifecycle invocation
+' gives this loader an actual reason to jump into the mapped code, at which point the destination's
+' real memory-policy enforcement stops being optional. This phase also does not exercise ArcFS's
+' own FormatVolume/CommitImage/MountImage block-device round trip -- that persistence path is
+' already proven by ArcFS's own existing test suite, and re-proving it here would test ArcFS, not
+' AEX.
+
+' A real, intentional resource limit (Section 40) rather than an unbounded read -- this loader
+' will not attempt to pull more than this many bytes off ArcFS for a single AEX assembly in this
+' phase's own scope.
+FUNCTION AexMaxSupportedFileBytes() AS U64
+    RETURN 65536
+END FUNCTION
+
+' Loader Stage 1, "Open ArcFS object," made real: opens the given OID, reads up to
+' AexMaxSupportedFileBytes() bytes into destBuffer, closes the handle, and returns the real byte
+' count actually read (0 on any open failure, matching ArcFS.OpenHandle's own zero-means-failure
+' convention). The caller uses that return value as fileLength for every Phase 1-5 validator that
+' follows -- the same parameter, now sourced from a real filesystem object instead of a fixture's
+' own hardcoded length.
+FUNCTION AEX.LoadFromArcFS(oid AS U64, destBuffer AS MMIOPTR) AS U64
+    LET handle AS U64 = ArcFS.OpenHandle(oid)
+    IF handle = 0 THEN
+        RETURN 0
+    END IF
+    LET bytesRead AS U64 = ArcFS.HandleRead(handle, destBuffer, AexMaxSupportedFileBytes(), 0)
+    ArcFS.CloseHandle(handle)
+    RETURN bytesRead
+END FUNCTION
+
+FUNCTION AexErrorCodeChunkInvalid() AS U32
+    RETURN 18
+END FUNCTION
+FUNCTION AexErrorCodeChunkTooLarge() AS U32
+    RETURN 19
+END FUNCTION
+FUNCTION AexErrorDataChunkInvalid() AS U32
+    RETURN 20
+END FUNCTION
+FUNCTION AexErrorDataChunkTooLarge() AS U32
+    RETURN 21
+END FUNCTION
+
+' Real, per-chunk copy: resolves chunkID through the same chunk directory, confirms it is really
+' typed CODE, confirms its StoredLength actually fits the caller-supplied destination, then copies
+' it byte-for-byte. Trusts AEX.ValidateDirectory to have already proven offset+storedLength fits
+' within the file itself -- this function's own new check is the ADDITIONAL constraint that it
+' also fits the destination the caller is about to copy it into, which the directory validator has
+' no way to know about.
+FUNCTION AEX.MapCodeChunk(buffer AS MMIOPTR, codeChunkID AS U32, destAddress AS MMIOPTR, destCapacity AS U64) AS U32
+    LET entry AS MMIOPTR = AexFindChunkByID(buffer, codeChunkID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorCodeChunkInvalid()
+    END IF
+    LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+    LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+    IF typeHigh <> AexTypeCodeHigh() THEN
+        RETURN AexErrorCodeChunkInvalid()
+    END IF
+    IF typeLow <> AexTypeCodeLow() THEN
+        RETURN AexErrorCodeChunkInvalid()
+    END IF
+
+    LET storedLength AS U64 = AexReadEntryStoredLength(entry)
+    IF storedLength > destCapacity THEN
+        RETURN AexErrorCodeChunkTooLarge()
+    END IF
+
+    LET chunkOffset AS U64 = AexReadEntryOffset(entry)
+    LET chunkData AS MMIOPTR = ADDRESS.Offset(buffer, chunkOffset)
+    LET i AS U64 = 0
+    WHILE i < storedLength
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(chunkData, i))
+        MEMORY.Write8(ADDRESS.Offset(destAddress, i), v)
+        i = i + 1
+    WEND
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+' Same shape as AEX.MapCodeChunk for a DATA chunk, plus Section 17's own ZERO_INITIALIZED policy
+' for the common "no private data segment" case: a dataChunkID of 0 means the implementation
+' declared none, so this zero-fills the destination instead of resolving anything, matching what a
+' fresh COPY_ON_WRITE/ZERO_INITIALIZED region is defined to read as before anything is ever
+' written to it.
+FUNCTION AEX.MapDataChunk(buffer AS MMIOPTR, dataChunkID AS U32, destAddress AS MMIOPTR, destCapacity AS U64) AS U32
+    IF dataChunkID = 0 THEN
+        LET z AS U64 = 0
+        WHILE z < destCapacity
+            MEMORY.Write8(ADDRESS.Offset(destAddress, z), 0)
+            z = z + 1
+        WEND
+        RETURN AexErrorOk()
+    END IF
+
+    LET entry AS MMIOPTR = AexFindChunkByID(buffer, dataChunkID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorDataChunkInvalid()
+    END IF
+    LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+    LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+    IF typeHigh <> AexTypeDataHigh() THEN
+        RETURN AexErrorDataChunkInvalid()
+    END IF
+    IF typeLow <> AexTypeDataLow() THEN
+        RETURN AexErrorDataChunkInvalid()
+    END IF
+
+    LET storedLength AS U64 = AexReadEntryStoredLength(entry)
+    IF storedLength > destCapacity THEN
+        RETURN AexErrorDataChunkTooLarge()
+    END IF
+
+    LET chunkOffset AS U64 = AexReadEntryOffset(entry)
+    LET chunkData AS MMIOPTR = ADDRESS.Offset(buffer, chunkOffset)
+    LET i AS U64 = 0
+    WHILE i < storedLength
+        LET v AS U8 = MEMORY.Read8(ADDRESS.Offset(chunkData, i))
+        MEMORY.Write8(ADDRESS.Offset(destAddress, i), v)
+        i = i + 1
+    WEND
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+' -----------------------------------------------------------------------------------------------
+' Phase 7: Native ABI lifecycle invocation (Section 24 / Section 37 / Section 61 Phase 7).
+'
+' Concrete LIFECYCLE chunk content for this first native ABI slice:
+'   +0  OwningComponentID       U32
+'   +4  ImplementationID        U32
+'   +8  ActivateCodeOffset      U64  (offset within the selected implementation's CODE chunk)
+'   +16 DeactivateCodeOffset    U64  (optional; present when LogicalLength >= 24)
+'
+' This phase deliberately proves only the first lifecycle ABI gate: resolving a selected native
+' implementation's activation entry from real AEX metadata, then invoking a no-argument native
+' entry that returns U64 in RAX under the existing Microsoft x64 calling convention frame
+' discipline. It does not yet pass component/data/context arguments, allocate code through the
+' real region allocator, enforce W^X page attributes, install unload hooks, or register ABT
+' bindings. Those all become meaningful after this first end-to-end "metadata -> mapped code ->
+' native call -> returned value" path exists and is QEMU-proven.
+
+FUNCTION AexErrorLifecycleInvalid() AS U32
+    RETURN 22
+END FUNCTION
+FUNCTION AexErrorLifecycleOutOfBounds() AS U32
+    RETURN 23
+END FUNCTION
+FUNCTION AexErrorLifecycleEntryOutOfBounds() AS U32
+    RETURN 24
+END FUNCTION
+
+FUNCTION AexLifecycleFixedSize() AS U32
+    RETURN 16
+END FUNCTION
+FUNCTION AexLifecycleWithDeactivateSize() AS U32
+    RETURN 24
+END FUNCTION
+FUNCTION AexReadLifecycleOwningComponentID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 0))
+END FUNCTION
+FUNCTION AexReadLifecycleImplementationID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 4))
+END FUNCTION
+FUNCTION AexReadLifecycleActivateCodeOffset(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 8))
+END FUNCTION
+FUNCTION AexReadLifecycleDeactivateCodeOffset(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 16))
+END FUNCTION
+
+FUNCTION AexResolvedLifecycleEntryOffsetAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61145088))
+END FUNCTION
+FUNCTION AexResolvedLifecycleDeactivateOffsetAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61145096))
+END FUNCTION
+
+FUNCTION AEX.ResolveLifecycleEntry(buffer AS MMIOPTR, implID AS U32, fileLength AS U64) AS U32
+    LET implEntry AS MMIOPTR = AexFindChunkByID(buffer, implID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorImplementationInvalid()
+    END IF
+    LET implTypeHigh AS U64 = AexReadEntryTypeHigh(implEntry)
+    LET implTypeLow AS U64 = AexReadEntryTypeLow(implEntry)
+    IF implTypeHigh <> AexTypeImplementationHigh() THEN
+        RETURN AexErrorImplementationInvalid()
+    END IF
+    IF implTypeLow <> AexTypeImplementationLow() THEN
+        RETURN AexErrorImplementationInvalid()
+    END IF
+    LET implLogicalLength AS U64 = AexReadEntryLogicalLength(implEntry)
+    LET implFixedSize AS U64 = AexImplementationFixedSize()
+    IF implLogicalLength < implFixedSize THEN
+        RETURN AexErrorImplementationOutOfBounds()
+    END IF
+
+    LET implOffset AS U64 = AexReadEntryOffset(implEntry)
+    LET implData AS MMIOPTR = ADDRESS.Offset(buffer, implOffset)
+    LET ownerID AS U32 = AexReadImplementationOwningComponentID(implData)
+    LET codeChunkID AS U32 = AexReadImplementationCodeChunkID(implData)
+
+    LET codeEntry AS MMIOPTR = AexFindChunkByID(buffer, codeChunkID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorCodeChunkInvalid()
+    END IF
+    LET codeTypeHigh AS U64 = AexReadEntryTypeHigh(codeEntry)
+    LET codeTypeLow AS U64 = AexReadEntryTypeLow(codeEntry)
+    IF codeTypeHigh <> AexTypeCodeHigh() THEN
+        RETURN AexErrorCodeChunkInvalid()
+    END IF
+    IF codeTypeLow <> AexTypeCodeLow() THEN
+        RETURN AexErrorCodeChunkInvalid()
+    END IF
+    LET codeStoredLength AS U64 = AexReadEntryStoredLength(codeEntry)
+
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+    WHILE index < dirCount
+        LET lifecycleEntry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        LET typeHigh AS U64 = AexReadEntryTypeHigh(lifecycleEntry)
+        LET typeLow AS U64 = AexReadEntryTypeLow(lifecycleEntry)
+        IF typeHigh = AexTypeLifecycleHigh() THEN
+            IF typeLow = AexTypeLifecycleLow() THEN
+                LET lifecycleLogicalLength AS U64 = AexReadEntryLogicalLength(lifecycleEntry)
+                LET lifecycleFixedSize AS U64 = AexLifecycleFixedSize()
+                IF lifecycleLogicalLength < lifecycleFixedSize THEN
+                    RETURN AexErrorLifecycleOutOfBounds()
+                END IF
+                LET lifecycleOffset AS U64 = AexReadEntryOffset(lifecycleEntry)
+                LET lifecycleData AS MMIOPTR = ADDRESS.Offset(buffer, lifecycleOffset)
+                IF AexReadLifecycleImplementationID(lifecycleData) = implID THEN
+                    IF AexReadLifecycleOwningComponentID(lifecycleData) <> ownerID THEN
+                        RETURN AexErrorLifecycleInvalid()
+                    END IF
+                    LET activateOffset AS U64 = AexReadLifecycleActivateCodeOffset(lifecycleData)
+                    IF activateOffset >= codeStoredLength THEN
+                        RETURN AexErrorLifecycleEntryOutOfBounds()
+                    END IF
+                    MEMORY.Write64(AexResolvedLifecycleEntryOffsetAddress(), activateOffset)
+                    MEMORY.Write64(AexResolvedLifecycleDeactivateOffsetAddress(), 0)
+                    IF lifecycleLogicalLength >= AexLifecycleWithDeactivateSize() THEN
+                        LET deactivateOffset AS U64 = AexReadLifecycleDeactivateCodeOffset(lifecycleData)
+                        IF deactivateOffset >= codeStoredLength THEN
+                            RETURN AexErrorLifecycleEntryOutOfBounds()
+                        END IF
+                        MEMORY.Write64(AexResolvedLifecycleDeactivateOffsetAddress(), deactivateOffset)
+                    END IF
+                    RETURN AexErrorOk()
+                END IF
+            END IF
+        END IF
+        index = index + 1
+    WEND
+
+    RETURN AexErrorLifecycleInvalid()
+END FUNCTION
+
+' Compiler-backed intrinsic: AEX.InvokeNative0(entryAddress AS MMIOPTR) AS U64. It is intentionally
+' not implemented as ordinary ArcoBASIC source; the freestanding x86-64 backend lowers this exact
+' call name to `call rax` after loading the entry address into RAX.
+FUNCTION AEX.InvokeResolvedLifecycle0(codeBase AS MMIOPTR) AS U64
+    LET entryOffset AS U64 = MEMORY.Read64(AexResolvedLifecycleEntryOffsetAddress())
+    RETURN AEX.InvokeNative0(ADDRESS.Offset(codeBase, entryOffset))
+END FUNCTION
+
+FUNCTION AEX.InvokeResolvedLifecycle1(codeBase AS MMIOPTR, arg0 AS U64) AS U64
+    LET entryOffset AS U64 = MEMORY.Read64(AexResolvedLifecycleEntryOffsetAddress())
+    RETURN AEX.InvokeNative1(ADDRESS.Offset(codeBase, entryOffset), arg0)
+END FUNCTION
+
+FUNCTION AEX.InvokeResolvedLifecycleDeactivate0(codeBase AS MMIOPTR) AS U64
+    LET entryOffset AS U64 = MEMORY.Read64(AexResolvedLifecycleDeactivateOffsetAddress())
+    RETURN AEX.InvokeNative0(ADDRESS.Offset(codeBase, entryOffset))
+END FUNCTION
+
+' -----------------------------------------------------------------------------------------------
+' Post-Phase 14: one-shot loader orchestration for the currently implemented no-argument native
+' activation path. This intentionally composes the already proven primitives and records the stage
+' and error that stopped the load so callers do not have to hand-wire the same pipeline.
+
+FUNCTION AexLoadStageNone() AS U32
+    RETURN 0
+END FUNCTION
+FUNCTION AexLoadStageArcFSLoad() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexLoadStageHeader() AS U32
+    RETURN 2
+END FUNCTION
+FUNCTION AexLoadStageDirectory() AS U32
+    RETURN 3
+END FUNCTION
+FUNCTION AexLoadStageManifest() AS U32
+    RETURN 4
+END FUNCTION
+FUNCTION AexLoadStageInterfaces() AS U32
+    RETURN 5
+END FUNCTION
+FUNCTION AexLoadStageCapabilities() AS U32
+    RETURN 6
+END FUNCTION
+FUNCTION AexLoadStageImplementation() AS U32
+    RETURN 7
+END FUNCTION
+FUNCTION AexLoadStageMemoryPolicy() AS U32
+    RETURN 8
+END FUNCTION
+FUNCTION AexLoadStageIntegrity() AS U32
+    RETURN 9
+END FUNCTION
+FUNCTION AexLoadStageBindings() AS U32
+    RETURN 10
+END FUNCTION
+FUNCTION AexLoadStageDiagnostics() AS U32
+    RETURN 11
+END FUNCTION
+FUNCTION AexLoadStageCodeMap() AS U32
+    RETURN 12
+END FUNCTION
+FUNCTION AexLoadStageDataMap() AS U32
+    RETURN 13
+END FUNCTION
+FUNCTION AexLoadStageLifecycle() AS U32
+    RETURN 14
+END FUNCTION
+FUNCTION AexLoadStageNativeInvoke() AS U32
+    RETURN 15
+END FUNCTION
+FUNCTION AexLoadStageProgramRegistry() AS U32
+    RETURN 16
+END FUNCTION
+
+FUNCTION AexErrorLoadFromArcFSFailed() AS U32
+    RETURN 45
+END FUNCTION
+FUNCTION AexErrorAllocationFailed() AS U32
+    RETURN 50
+END FUNCTION
+FUNCTION AexErrorProgramPathNotFound() AS U32
+    RETURN 55
+END FUNCTION
+FUNCTION AexErrorProgramRegistryFull() AS U32
+    RETURN 57
+END FUNCTION
+FUNCTION AexErrorProgramInvalidHandle() AS U32
+    RETURN 58
+END FUNCTION
+FUNCTION AexErrorSubstrateServiceMissing() AS U32
+    RETURN 59
+END FUNCTION
+FUNCTION AexErrorSubstrateServiceInvalid() AS U32
+    RETURN 60
+END FUNCTION
+
+FUNCTION AexLoadLastStageAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61218816))
+END FUNCTION
+FUNCTION AexLoadLastErrorAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61218820))
+END FUNCTION
+FUNCTION AexLoadLastReturnValueAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61218824))
+END FUNCTION
+FUNCTION AexLoadLastFileLengthAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61218832))
+END FUNCTION
+FUNCTION AexAllocatedCodeAddressCell() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61218840))
+END FUNCTION
+FUNCTION AexAllocatedDataAddressCell() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61218848))
+END FUNCTION
+FUNCTION AexAllocatedCodeCapacityCell() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61218856))
+END FUNCTION
+FUNCTION AexAllocatedDataCapacityCell() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61218864))
+END FUNCTION
+
+FUNCTION AexRecordLoadFailure(stage AS U32, errorCode AS U32) AS U32
+    MEMORY.Write32(AexLoadLastStageAddress(), stage)
+    MEMORY.Write32(AexLoadLastErrorAddress(), errorCode)
+    RETURN errorCode
+END FUNCTION
+
+FUNCTION AexRecordProgramLoadFailure(stage AS U32, errorCode AS U32) AS U32
+    MEMORY.Write32(AexLoadLastStageAddress(), stage)
+    MEMORY.Write32(AexLoadLastErrorAddress(), errorCode)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexClearLoadScratch() AS U64
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNone())
+    MEMORY.Write32(AexLoadLastErrorAddress(), AexErrorOk())
+    MEMORY.Write64(AexLoadLastReturnValueAddress(), 0)
+    MEMORY.Write64(AexLoadLastFileLengthAddress(), 0)
+    MEMORY.Write64(AexAllocatedCodeAddressCell(), 0)
+    MEMORY.Write64(AexAllocatedDataAddressCell(), 0)
+    MEMORY.Write64(AexAllocatedCodeCapacityCell(), 0)
+    MEMORY.Write64(AexAllocatedDataCapacityCell(), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexProgramRegistryMaxEntries() AS U32
+    RETURN 16
+END FUNCTION
+FUNCTION AexProgramRegistryEntryStride() AS U32
+    RETURN 128
+END FUNCTION
+FUNCTION AexProgramRegistryBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61231104))
+END FUNCTION
+FUNCTION AexProgramRegistryCountAddress() AS MMIOPTR
+    RETURN AexProgramRegistryBaseAddress()
+END FUNCTION
+FUNCTION AexProgramRegistryNextHandleAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(AexProgramRegistryBaseAddress(), 4)
+END FUNCTION
+FUNCTION AexProgramRegistryEntryAddress(index AS U32) AS MMIOPTR
+    LET indexAsU64 AS U64 = index
+    RETURN ADDRESS.Offset(AexProgramRegistryBaseAddress(), 8 + (indexAsU64 * AexProgramRegistryEntryStride()))
+END FUNCTION
+
+FUNCTION AexProgramStateEmpty() AS U32
+    RETURN 0
+END FUNCTION
+FUNCTION AexProgramStateLoaded() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexProgramStateActivated() AS U32
+    RETURN 2
+END FUNCTION
+FUNCTION AexProgramStateExited() AS U32
+    RETURN 3
+END FUNCTION
+FUNCTION AexProgramStateFaulted() AS U32
+    RETURN 4
+END FUNCTION
+
+FUNCTION AexProcessContextEntryStride() AS U32
+    RETURN 128
+END FUNCTION
+FUNCTION AexProcessContextBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61235200))
+END FUNCTION
+FUNCTION AexProcessContextBaseValue() AS U64
+    RETURN 61235200
+END FUNCTION
+FUNCTION AexProcessContextAddressValue(index AS U32) AS U64
+    LET indexAsU64 AS U64 = index
+    RETURN AexProcessContextBaseValue() + (indexAsU64 * AexProcessContextEntryStride())
+END FUNCTION
+FUNCTION AexProcessContextAddress(index AS U32) AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(AexProcessContextAddressValue(index)))
+END FUNCTION
+
+FUNCTION AexSubstrateServiceKindConsoleWrite() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexSubstrateServiceKindExit() AS U32
+    RETURN 2
+END FUNCTION
+FUNCTION AexSubstrateServiceKindArcFSResolve() AS U32
+    RETURN 3
+END FUNCTION
+FUNCTION AexSubstrateServiceKindArcFSOpen() AS U32
+    RETURN 4
+END FUNCTION
+FUNCTION AexSubstrateServiceKindArcFSRead() AS U32
+    RETURN 5
+END FUNCTION
+FUNCTION AexSubstrateServiceKindArcFSWrite() AS U32
+    RETURN 6
+END FUNCTION
+FUNCTION AexSubstrateServiceKindArcFSClose() AS U32
+    RETURN 7
+END FUNCTION
+FUNCTION AexSubstrateServiceRegistryMaxEntries() AS U32
+    RETURN 16
+END FUNCTION
+FUNCTION AexSubstrateServiceRegistryEntryStride() AS U32
+    RETURN 24
+END FUNCTION
+FUNCTION AexSubstrateServiceRegistryBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61237248))
+END FUNCTION
+FUNCTION AexSubstrateServiceRegistryBaseValue() AS U64
+    RETURN 61237248
+END FUNCTION
+FUNCTION AexSubstrateServiceRegistryCountAddress() AS MMIOPTR
+    RETURN AexSubstrateServiceRegistryBaseAddress()
+END FUNCTION
+FUNCTION AexSubstrateServiceRegistryEntryAddress(index AS U32) AS MMIOPTR
+    LET indexAsU64 AS U64 = index
+    RETURN ADDRESS.Offset(AexSubstrateServiceRegistryBaseAddress(), 8 + (indexAsU64 * AexSubstrateServiceRegistryEntryStride()))
+END FUNCTION
+
+FUNCTION AEX.ClearLoadedPrograms() AS U64
+    MEMORY.Write32(AexProgramRegistryCountAddress(), 0)
+    MEMORY.Write32(AexProgramRegistryNextHandleAddress(), 1)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AEX.LoadedProgramCount() AS U32
+    RETURN MEMORY.Read32(AexProgramRegistryCountAddress())
+END FUNCTION
+
+FUNCTION AexProgramRegistryFindIndex(handle AS U32) AS U32
+    LET count AS U32 = MEMORY.Read32(AexProgramRegistryCountAddress())
+    LET index AS U32 = 0
+    WHILE index < count
+        LET entry AS MMIOPTR = AexProgramRegistryEntryAddress(index)
+        IF MEMORY.Read32(entry) = handle THEN
+            RETURN index
+        END IF
+        index = index + 1
+    WEND
+    RETURN AexProgramRegistryMaxEntries()
+END FUNCTION
+
+FUNCTION AexProgramRegistryRegister(oid AS U64, fileLength AS U64, rootComponentID AS U32, implID AS U32, codePhys AS U64, codeCapacity AS U64, dataPhys AS U64, dataCapacity AS U64, activateOffset AS U64, deactivateOffset AS U64) AS U32
+    LET count AS U32 = MEMORY.Read32(AexProgramRegistryCountAddress())
+    IF count >= AexProgramRegistryMaxEntries() THEN
+        RETURN 0
+    END IF
+    LET nextHandle AS U32 = MEMORY.Read32(AexProgramRegistryNextHandleAddress())
+    IF nextHandle = 0 THEN
+        nextHandle = 1
+    END IF
+    MEMORY.Write32(AexProgramRegistryNextHandleAddress(), nextHandle + 1)
+
+    LET entry AS MMIOPTR = AexProgramRegistryEntryAddress(count)
+    MEMORY.Write32(entry, nextHandle)
+    MEMORY.Write32(ADDRESS.Offset(entry, 4), AexProgramStateLoaded())
+    MEMORY.Write64(ADDRESS.Offset(entry, 8), oid)
+    MEMORY.Write64(ADDRESS.Offset(entry, 16), fileLength)
+    MEMORY.Write32(ADDRESS.Offset(entry, 24), rootComponentID)
+    MEMORY.Write32(ADDRESS.Offset(entry, 28), implID)
+    MEMORY.Write64(ADDRESS.Offset(entry, 32), codePhys)
+    MEMORY.Write64(ADDRESS.Offset(entry, 40), codeCapacity)
+    MEMORY.Write64(ADDRESS.Offset(entry, 48), dataPhys)
+    MEMORY.Write64(ADDRESS.Offset(entry, 56), dataCapacity)
+    MEMORY.Write64(ADDRESS.Offset(entry, 64), 0)
+    MEMORY.Write64(ADDRESS.Offset(entry, 72), activateOffset)
+    MEMORY.Write64(ADDRESS.Offset(entry, 80), deactivateOffset)
+    MEMORY.Write64(ADDRESS.Offset(entry, 88), 0)
+    MEMORY.Write64(ADDRESS.Offset(entry, 96), 0)
+    MEMORY.Write64(ADDRESS.Offset(entry, 104), 0)
+    MEMORY.Write64(ADDRESS.Offset(entry, 112), AexProcessContextAddressValue(count))
+    MEMORY.Write64(ADDRESS.Offset(entry, 120), 0)
+
+    LET context AS MMIOPTR = AexProcessContextAddress(count)
+    MEMORY.Write32(ADDRESS.Offset(context, 0), nextHandle)
+    MEMORY.Write32(ADDRESS.Offset(context, 4), AexProgramStateLoaded())
+    MEMORY.Write32(ADDRESS.Offset(context, 8), rootComponentID)
+    MEMORY.Write32(ADDRESS.Offset(context, 12), implID)
+    MEMORY.Write64(ADDRESS.Offset(context, 16), codePhys)
+    MEMORY.Write64(ADDRESS.Offset(context, 24), codeCapacity)
+    MEMORY.Write64(ADDRESS.Offset(context, 32), dataPhys)
+    MEMORY.Write64(ADDRESS.Offset(context, 40), dataCapacity)
+    MEMORY.Write64(ADDRESS.Offset(context, 48), 0)
+    MEMORY.Write64(ADDRESS.Offset(context, 56), 0)
+    MEMORY.Write64(ADDRESS.Offset(context, 64), AexSubstrateServiceRegistryBaseValue())
+    MEMORY.Write32(ADDRESS.Offset(context, 72), MEMORY.Read32(AexSubstrateServiceRegistryCountAddress()))
+    MEMORY.Write32(ADDRESS.Offset(context, 76), 0)
+    MEMORY.Write64(ADDRESS.Offset(context, 80), oid)
+    MEMORY.Write64(ADDRESS.Offset(context, 88), fileLength)
+    MEMORY.Write64(ADDRESS.Offset(context, 96), activateOffset)
+    MEMORY.Write64(ADDRESS.Offset(context, 104), deactivateOffset)
+    MEMORY.Write64(ADDRESS.Offset(context, 112), 0)
+    MEMORY.Write64(ADDRESS.Offset(context, 120), 0)
+
+    MEMORY.Write32(AexProgramRegistryCountAddress(), count + 1)
+    RETURN nextHandle
+END FUNCTION
+
+FUNCTION AEX.LoadedProgramHandleAt(index AS U32) AS U32
+    IF index >= MEMORY.Read32(AexProgramRegistryCountAddress()) THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read32(AexProgramRegistryEntryAddress(index))
+END FUNCTION
+
+FUNCTION AEX.LoadedProgramState(handle AS U32) AS U32
+    LET index AS U32 = AexProgramRegistryFindIndex(handle)
+    IF index = AexProgramRegistryMaxEntries() THEN
+        RETURN AexProgramStateEmpty()
+    END IF
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexProgramRegistryEntryAddress(index), 4))
+END FUNCTION
+
+FUNCTION AEX.LoadedProgramCodeBase(handle AS U32) AS U64
+    LET index AS U32 = AexProgramRegistryFindIndex(handle)
+    IF index = AexProgramRegistryMaxEntries() THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexProgramRegistryEntryAddress(index), 32))
+END FUNCTION
+
+FUNCTION AEX.LoadedProgramDataBase(handle AS U32) AS U64
+    LET index AS U32 = AexProgramRegistryFindIndex(handle)
+    IF index = AexProgramRegistryMaxEntries() THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexProgramRegistryEntryAddress(index), 48))
+END FUNCTION
+
+FUNCTION AEX.LoadedProgramLastReturn(handle AS U32) AS U64
+    LET index AS U32 = AexProgramRegistryFindIndex(handle)
+    IF index = AexProgramRegistryMaxEntries() THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexProgramRegistryEntryAddress(index), 64))
+END FUNCTION
+
+FUNCTION AEX.ProcessContextAddress(handle AS U32) AS U64
+    LET index AS U32 = AexProgramRegistryFindIndex(handle)
+    IF index = AexProgramRegistryMaxEntries() THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexProgramRegistryEntryAddress(index), 112))
+END FUNCTION
+
+FUNCTION AEX.ProcessExitCode(handle AS U32) AS U64
+    LET index AS U32 = AexProgramRegistryFindIndex(handle)
+    IF index = AexProgramRegistryMaxEntries() THEN
+        RETURN 0
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexProgramRegistryEntryAddress(index), 88))
+END FUNCTION
+
+FUNCTION AEX.ProcessFaultState(handle AS U32) AS U64
+    LET index AS U32 = AexProgramRegistryFindIndex(handle)
+    IF index = AexProgramRegistryMaxEntries() THEN
+        RETURN AexErrorProgramInvalidHandle()
+    END IF
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexProgramRegistryEntryAddress(index), 96))
+END FUNCTION
+
+FUNCTION AEX.ClearSubstrateServices() AS U32
+    MEMORY.Write32(AexSubstrateServiceRegistryCountAddress(), 0)
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.SubstrateServiceCount() AS U32
+    RETURN MEMORY.Read32(AexSubstrateServiceRegistryCountAddress())
+END FUNCTION
+
+FUNCTION AEX.RegisterSubstrateService(bindingID AS U32, serviceKind AS U32) AS U32
+    IF serviceKind < AexSubstrateServiceKindConsoleWrite() THEN
+        RETURN AexErrorSubstrateServiceInvalid()
+    END IF
+    IF serviceKind > AexSubstrateServiceKindArcFSClose() THEN
+        RETURN AexErrorSubstrateServiceInvalid()
+    END IF
+    LET count AS U32 = MEMORY.Read32(AexSubstrateServiceRegistryCountAddress())
+    IF count >= AexSubstrateServiceRegistryMaxEntries() THEN
+        RETURN AexErrorBindingRegistryFull()
+    END IF
+    LET dest AS MMIOPTR = AexSubstrateServiceRegistryEntryAddress(count)
+    MEMORY.Write32(ADDRESS.Offset(dest, 0), bindingID)
+    MEMORY.Write32(ADDRESS.Offset(dest, 4), serviceKind)
+    MEMORY.Write64(ADDRESS.Offset(dest, 8), 0)
+    MEMORY.Write64(ADDRESS.Offset(dest, 16), 0)
+    MEMORY.Write32(AexSubstrateServiceRegistryCountAddress(), count + 1)
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AexFindSubstrateServiceKind(bindingID AS U32) AS U32
+    LET count AS U32 = MEMORY.Read32(AexSubstrateServiceRegistryCountAddress())
+    LET index AS U32 = 0
+    WHILE index < count
+        LET entry AS MMIOPTR = AexSubstrateServiceRegistryEntryAddress(index)
+        IF MEMORY.Read32(ADDRESS.Offset(entry, 0)) = bindingID THEN
+            RETURN MEMORY.Read32(ADDRESS.Offset(entry, 4))
+        END IF
+        index = index + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexSubstrateConsoleWrite(frameAddress AS U64) AS U64
+    LET frame AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(frameAddress))
+    LET bufferAddress AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 0))
+    LET byteCount AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 8))
+    LET buffer AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(bufferAddress))
+    LET index AS U64 = 0
+    WHILE index < byteCount
+        PORT.Write8(PORT.Address(1016), MEMORY.Read8(ADDRESS.Offset(buffer, index)))
+        index = index + 1
+    WEND
+    RETURN byteCount
+END FUNCTION
+
+FUNCTION AexSubstrateArcFSResolve(frameAddress AS U64) AS U64
+    LET frame AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(frameAddress))
+    LET pathAddress AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 0))
+    LET pathLength AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 8))
+    LET path AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(pathAddress))
+    RETURN ArcFS.Resolve(path, pathLength)
+END FUNCTION
+
+FUNCTION AexSubstrateArcFSOpen(frameAddress AS U64) AS U64
+    LET frame AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(frameAddress))
+    LET oid AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 0))
+    RETURN ArcFS.OpenHandle(oid)
+END FUNCTION
+
+FUNCTION AexSubstrateArcFSRead(frameAddress AS U64) AS U64
+    LET frame AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(frameAddress))
+    LET handle AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 0))
+    LET bufferAddress AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 8))
+    LET byteCount AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 16))
+    LET offset AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 24))
+    LET buffer AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(bufferAddress))
+    RETURN ArcFS.HandleRead(handle, buffer, byteCount, offset)
+END FUNCTION
+
+FUNCTION AexSubstrateArcFSWrite(frameAddress AS U64) AS U64
+    LET frame AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(frameAddress))
+    LET handle AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 0))
+    LET bufferAddress AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 8))
+    LET byteCount AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 16))
+    LET offset AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 24))
+    LET buffer AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(bufferAddress))
+    RETURN ArcFS.HandleWrite(handle, buffer, byteCount, offset)
+END FUNCTION
+
+FUNCTION AexSubstrateArcFSClose(frameAddress AS U64) AS U64
+    LET frame AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(frameAddress))
+    LET handle AS U64 = MEMORY.Read64(ADDRESS.Offset(frame, 0))
+    IF ArcFS.CloseHandle(handle) = 1 THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION AEX.DispatchSubstrateBinding1(handle AS U32, bindingID AS U32, arg0 AS U64) AS U64
+    LET programIndex AS U32 = AexProgramRegistryFindIndex(handle)
+    IF programIndex = AexProgramRegistryMaxEntries() THEN
+        AexRecordLoadFailure(AexLoadStageBindings(), AexErrorProgramInvalidHandle())
+        RETURN 0
+    END IF
+    LET serviceKind AS U32 = AexFindSubstrateServiceKind(bindingID)
+    IF serviceKind = 0 THEN
+        AexRecordLoadFailure(AexLoadStageBindings(), AexErrorSubstrateServiceMissing())
+        RETURN 0
+    END IF
+    LET entry AS MMIOPTR = AexProgramRegistryEntryAddress(programIndex)
+    LET context AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(MEMORY.Read64(ADDRESS.Offset(entry, 112))))
+    MEMORY.Write32(ADDRESS.Offset(context, 72), MEMORY.Read32(AexSubstrateServiceRegistryCountAddress()))
+    IF serviceKind = AexSubstrateServiceKindConsoleWrite() THEN
+        LET wrote AS U64 = AexSubstrateConsoleWrite(arg0)
+        MEMORY.Write64(ADDRESS.Offset(context, 112), wrote)
+        RETURN wrote
+    END IF
+    IF serviceKind = AexSubstrateServiceKindExit() THEN
+        MEMORY.Write64(ADDRESS.Offset(entry, 88), arg0)
+        MEMORY.Write64(ADDRESS.Offset(context, 48), arg0)
+        MEMORY.Write32(ADDRESS.Offset(entry, 4), AexProgramStateExited())
+        MEMORY.Write32(ADDRESS.Offset(context, 4), AexProgramStateExited())
+        RETURN arg0
+    END IF
+    IF serviceKind = AexSubstrateServiceKindArcFSResolve() THEN
+        LET resolved AS U64 = AexSubstrateArcFSResolve(arg0)
+        MEMORY.Write64(ADDRESS.Offset(context, 112), resolved)
+        RETURN resolved
+    END IF
+    IF serviceKind = AexSubstrateServiceKindArcFSOpen() THEN
+        LET opened AS U64 = AexSubstrateArcFSOpen(arg0)
+        MEMORY.Write64(ADDRESS.Offset(context, 112), opened)
+        RETURN opened
+    END IF
+    IF serviceKind = AexSubstrateServiceKindArcFSRead() THEN
+        LET readBytes AS U64 = AexSubstrateArcFSRead(arg0)
+        MEMORY.Write64(ADDRESS.Offset(context, 112), readBytes)
+        RETURN readBytes
+    END IF
+    IF serviceKind = AexSubstrateServiceKindArcFSWrite() THEN
+        LET wroteBytes AS U64 = AexSubstrateArcFSWrite(arg0)
+        MEMORY.Write64(ADDRESS.Offset(context, 112), wroteBytes)
+        RETURN wroteBytes
+    END IF
+    IF serviceKind = AexSubstrateServiceKindArcFSClose() THEN
+        LET closed AS U64 = AexSubstrateArcFSClose(arg0)
+        MEMORY.Write64(ADDRESS.Offset(context, 112), closed)
+        RETURN closed
+    END IF
+    AexRecordLoadFailure(AexLoadStageBindings(), AexErrorSubstrateServiceInvalid())
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexReadSelectedImplementationCodeChunkID(buffer AS MMIOPTR) AS U32
+    LET implID AS U32 = MEMORY.Read32(AexSelectedImplementationIDAddress())
+    LET implEntry AS MMIOPTR = AexFindChunkByID(buffer, implID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN 0
+    END IF
+    LET implOffset AS U64 = AexReadEntryOffset(implEntry)
+    LET implData AS MMIOPTR = ADDRESS.Offset(buffer, implOffset)
+    RETURN AexReadImplementationCodeChunkID(implData)
+END FUNCTION
+
+FUNCTION AexReadSelectedImplementationDataChunkID(buffer AS MMIOPTR) AS U32
+    LET implID AS U32 = MEMORY.Read32(AexSelectedImplementationIDAddress())
+    LET implEntry AS MMIOPTR = AexFindChunkByID(buffer, implID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN 0
+    END IF
+    LET implOffset AS U64 = AexReadEntryOffset(implEntry)
+    LET implData AS MMIOPTR = ADDRESS.Offset(buffer, implOffset)
+    RETURN AexReadImplementationDataChunkID(implData)
+END FUNCTION
+
+FUNCTION AexPagesForBytes(byteCount AS U64) AS U64
+    IF byteCount = 0 THEN
+        RETURN 1
+    END IF
+    RETURN (byteCount + 4095) \ 4096
+END FUNCTION
+
+FUNCTION AexEntryStoredLengthByChunkID(buffer AS MMIOPTR, chunkID AS U32) AS U64
+    IF chunkID = 0 THEN
+        RETURN 4096
+    END IF
+    LET entry AS MMIOPTR = AexFindChunkByID(buffer, chunkID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN 0
+    END IF
+    RETURN AexReadEntryStoredLength(entry)
+END FUNCTION
+
+FUNCTION AEX.AllocateAndMapSelectedCode(systemTable AS UEFI.SystemTable, buffer AS MMIOPTR) AS U32
+    LET codeChunkID AS U32 = AexReadSelectedImplementationCodeChunkID(buffer)
+    LET codeBytes AS U64 = AexEntryStoredLengthByChunkID(buffer, codeChunkID)
+    IF codeBytes = 0 THEN
+        RETURN AexErrorCodeChunkInvalid()
+    END IF
+    LET codePages AS U64 = AexPagesForBytes(codeBytes)
+    LET codePhys AS U64 = 0
+    LET codePhysAddress AS PTR = ADDRESS.Local(codePhys)
+    LET status AS U64 = systemTable.BootServices.AllocatePages(0, 2, codePages, codePhysAddress)
+    IF status <> 0 THEN
+        RETURN AexErrorAllocationFailed()
+    END IF
+    LET codeMapped AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(codePhys))
+    LET codeCapacity AS U64 = codePages * 4096
+    LET result AS U32 = AEX.MapCodeChunk(buffer, codeChunkID, codeMapped, codeCapacity)
+    IF result <> AexErrorOk() THEN
+        RETURN result
+    END IF
+    MEMORY.Write64(AexAllocatedCodeAddressCell(), codePhys)
+    MEMORY.Write64(AexAllocatedCodeCapacityCell(), codeCapacity)
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.AllocateAndMapSelectedData(systemTable AS UEFI.SystemTable, buffer AS MMIOPTR) AS U32
+    LET dataChunkID AS U32 = AexReadSelectedImplementationDataChunkID(buffer)
+    LET dataBytes AS U64 = AexEntryStoredLengthByChunkID(buffer, dataChunkID)
+    LET dataPages AS U64 = AexPagesForBytes(dataBytes)
+    LET dataPhys AS U64 = 0
+    LET dataPhysAddress AS PTR = ADDRESS.Local(dataPhys)
+    LET status AS U64 = systemTable.BootServices.AllocatePages(0, 2, dataPages, dataPhysAddress)
+    IF status <> 0 THEN
+        RETURN AexErrorAllocationFailed()
+    END IF
+    LET dataMapped AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(dataPhys))
+    LET dataCapacity AS U64 = dataPages * 4096
+    LET result AS U32 = AEX.MapDataChunk(buffer, dataChunkID, dataMapped, dataCapacity)
+    IF result <> AexErrorOk() THEN
+        RETURN result
+    END IF
+    MEMORY.Write64(AexAllocatedDataAddressCell(), dataPhys)
+    MEMORY.Write64(AexAllocatedDataCapacityCell(), dataCapacity)
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.LoadProgram0(systemTable AS UEFI.SystemTable, oid AS U64, loadBuffer AS MMIOPTR) AS U32
+    AexClearLoadScratch()
+
+    LET loaded AS U64 = AEX.LoadFromArcFS(oid, loadBuffer)
+    MEMORY.Write64(AexLoadLastFileLengthAddress(), loaded)
+    IF loaded = 0 THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageArcFSLoad(), AexErrorLoadFromArcFSFailed())
+    END IF
+
+    LET result AS U32 = AEX.ValidateHeader(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageHeader(), result)
+    END IF
+    result = AEX.ValidateDirectory(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageDirectory(), result)
+    END IF
+    result = AEX.ValidateManifest(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageManifest(), result)
+    END IF
+
+    LET rootManifestID AS U32 = AexReadRootManifestID(loadBuffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(loadBuffer, rootManifestID)
+    LET manifestOffset AS U64 = AexReadEntryOffset(manifestEntry)
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(loadBuffer, manifestOffset)
+    LET rootComponentID AS U32 = AexReadManifestRootComponentID(manifestData)
+
+    result = AEX.ResolveInterfaces(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageInterfaces(), result)
+    END IF
+    result = AEX.EvaluateCapabilityRequestsWithGrants(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageCapabilities(), result)
+    END IF
+    result = AEX.SelectImplementation(loadBuffer, rootComponentID, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageImplementation(), result)
+    END IF
+    result = AEX.ValidateMemoryPolicies(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageMemoryPolicy(), result)
+    END IF
+    result = AEX.VerifyIntegrity(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageIntegrity(), result)
+    END IF
+    result = AEX.RegisterArcoBindingsWithAuthority(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageBindings(), result)
+    END IF
+    result = AEX.RegisterDiagnostics(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageDiagnostics(), result)
+    END IF
+    result = AEX.AllocateAndMapSelectedCode(systemTable, loadBuffer)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageCodeMap(), result)
+    END IF
+    result = AEX.AllocateAndMapSelectedData(systemTable, loadBuffer)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageDataMap(), result)
+    END IF
+
+    LET implID AS U32 = MEMORY.Read32(AexSelectedImplementationIDAddress())
+    result = AEX.ResolveLifecycleEntry(loadBuffer, implID, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageLifecycle(), result)
+    END IF
+
+    LET handle AS U32 = AexProgramRegistryRegister(oid, loaded, rootComponentID, implID, MEMORY.Read64(AexAllocatedCodeAddressCell()), MEMORY.Read64(AexAllocatedCodeCapacityCell()), MEMORY.Read64(AexAllocatedDataAddressCell()), MEMORY.Read64(AexAllocatedDataCapacityCell()), MEMORY.Read64(AexResolvedLifecycleEntryOffsetAddress()), MEMORY.Read64(AexResolvedLifecycleDeactivateOffsetAddress()))
+    IF handle = 0 THEN
+        RETURN AexRecordProgramLoadFailure(AexLoadStageProgramRegistry(), AexErrorProgramRegistryFull())
+    END IF
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNone())
+    MEMORY.Write32(AexLoadLastErrorAddress(), AexErrorOk())
+    RETURN handle
+END FUNCTION
+
+FUNCTION AEX.LoadProgramFromPath0(systemTable AS UEFI.SystemTable, pathBuffer AS MMIOPTR, pathLength AS U64, loadBuffer AS MMIOPTR) AS U32
+    LET oid AS U64 = ArcFS.Resolve(pathBuffer, pathLength)
+    IF oid = 0 THEN
+        AexClearLoadScratch()
+        RETURN AexRecordProgramLoadFailure(AexLoadStageArcFSLoad(), AexErrorProgramPathNotFound())
+    END IF
+    RETURN AEX.LoadProgram0(systemTable, oid, loadBuffer)
+END FUNCTION
+
+FUNCTION AEX.ActivateProgram0(handle AS U32) AS U32
+    LET index AS U32 = AexProgramRegistryFindIndex(handle)
+    IF index = AexProgramRegistryMaxEntries() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageNativeInvoke(), AexErrorProgramInvalidHandle())
+    END IF
+    LET entry AS MMIOPTR = AexProgramRegistryEntryAddress(index)
+    LET codeBase AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(MEMORY.Read64(ADDRESS.Offset(entry, 32))))
+    MEMORY.Write64(AexResolvedLifecycleEntryOffsetAddress(), MEMORY.Read64(ADDRESS.Offset(entry, 72)))
+    MEMORY.Write64(AexResolvedLifecycleDeactivateOffsetAddress(), MEMORY.Read64(ADDRESS.Offset(entry, 80)))
+    CPU.MemoryBarrier
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNativeInvoke())
+    LET nativeResult AS U64 = AEX.InvokeResolvedLifecycle0(codeBase)
+    MEMORY.Write64(ADDRESS.Offset(entry, 64), nativeResult)
+    MEMORY.Write64(AexLoadLastReturnValueAddress(), nativeResult)
+    MEMORY.Write32(ADDRESS.Offset(entry, 4), AexProgramStateActivated())
+    LET context AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(MEMORY.Read64(ADDRESS.Offset(entry, 112))))
+    MEMORY.Write32(ADDRESS.Offset(context, 4), AexProgramStateActivated())
+    MEMORY.Write64(ADDRESS.Offset(context, 112), nativeResult)
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNone())
+    MEMORY.Write32(AexLoadLastErrorAddress(), AexErrorOk())
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.ActivateProgramWithContext0(handle AS U32) AS U32
+    LET index AS U32 = AexProgramRegistryFindIndex(handle)
+    IF index = AexProgramRegistryMaxEntries() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageNativeInvoke(), AexErrorProgramInvalidHandle())
+    END IF
+    LET entry AS MMIOPTR = AexProgramRegistryEntryAddress(index)
+    LET contextValue AS U64 = MEMORY.Read64(ADDRESS.Offset(entry, 112))
+    LET context AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(contextValue))
+    LET codeBase AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(MEMORY.Read64(ADDRESS.Offset(entry, 32))))
+    MEMORY.Write64(AexResolvedLifecycleEntryOffsetAddress(), MEMORY.Read64(ADDRESS.Offset(entry, 72)))
+    MEMORY.Write64(AexResolvedLifecycleDeactivateOffsetAddress(), MEMORY.Read64(ADDRESS.Offset(entry, 80)))
+    MEMORY.Write32(ADDRESS.Offset(context, 72), MEMORY.Read32(AexSubstrateServiceRegistryCountAddress()))
+    CPU.MemoryBarrier
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNativeInvoke())
+    LET nativeResult AS U64 = AEX.InvokeResolvedLifecycle1(codeBase, contextValue)
+    MEMORY.Write64(ADDRESS.Offset(entry, 64), nativeResult)
+    MEMORY.Write64(AexLoadLastReturnValueAddress(), nativeResult)
+    MEMORY.Write32(ADDRESS.Offset(entry, 4), AexProgramStateActivated())
+    MEMORY.Write32(ADDRESS.Offset(context, 4), AexProgramStateActivated())
+    MEMORY.Write64(ADDRESS.Offset(context, 112), nativeResult)
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNone())
+    MEMORY.Write32(AexLoadLastErrorAddress(), AexErrorOk())
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.ShellRunPath0(systemTable AS UEFI.SystemTable, pathBuffer AS MMIOPTR, pathLength AS U64, loadBuffer AS MMIOPTR) AS U32
+    LET handle AS U32 = AEX.LoadProgramFromPath0(systemTable, pathBuffer, pathLength, loadBuffer)
+    IF handle = 0 THEN
+        RETURN MEMORY.Read32(AexLoadLastErrorAddress())
+    END IF
+    RETURN AEX.ActivateProgram0(handle)
+END FUNCTION
+
+FUNCTION AEX.LoadAndActivate0(oid AS U64, loadBuffer AS MMIOPTR, codeDest AS MMIOPTR, codeCapacity AS U64, dataDest AS MMIOPTR, dataCapacity AS U64) AS U32
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNone())
+    MEMORY.Write32(AexLoadLastErrorAddress(), AexErrorOk())
+    MEMORY.Write64(AexLoadLastReturnValueAddress(), 0)
+    MEMORY.Write64(AexLoadLastFileLengthAddress(), 0)
+
+    LET loaded AS U64 = AEX.LoadFromArcFS(oid, loadBuffer)
+    MEMORY.Write64(AexLoadLastFileLengthAddress(), loaded)
+    IF loaded = 0 THEN
+        RETURN AexRecordLoadFailure(AexLoadStageArcFSLoad(), AexErrorLoadFromArcFSFailed())
+    END IF
+
+    LET result AS U32 = AEX.ValidateHeader(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageHeader(), result)
+    END IF
+    result = AEX.ValidateDirectory(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageDirectory(), result)
+    END IF
+    result = AEX.ValidateManifest(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageManifest(), result)
+    END IF
+
+    LET rootManifestID AS U32 = AexReadRootManifestID(loadBuffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(loadBuffer, rootManifestID)
+    LET manifestOffset AS U64 = AexReadEntryOffset(manifestEntry)
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(loadBuffer, manifestOffset)
+    LET rootComponentID AS U32 = AexReadManifestRootComponentID(manifestData)
+
+    result = AEX.ResolveInterfaces(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageInterfaces(), result)
+    END IF
+    result = AEX.EvaluateCapabilityRequestsWithGrants(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageCapabilities(), result)
+    END IF
+    result = AEX.SelectImplementation(loadBuffer, rootComponentID, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageImplementation(), result)
+    END IF
+    result = AEX.ValidateMemoryPolicies(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageMemoryPolicy(), result)
+    END IF
+    result = AEX.VerifyIntegrity(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageIntegrity(), result)
+    END IF
+    result = AEX.RegisterArcoBindingsWithAuthority(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageBindings(), result)
+    END IF
+    result = AEX.RegisterDiagnostics(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageDiagnostics(), result)
+    END IF
+
+    LET codeChunkID AS U32 = AexReadSelectedImplementationCodeChunkID(loadBuffer)
+    result = AEX.MapCodeChunk(loadBuffer, codeChunkID, codeDest, codeCapacity)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageCodeMap(), result)
+    END IF
+
+    LET dataChunkID AS U32 = AexReadSelectedImplementationDataChunkID(loadBuffer)
+    result = AEX.MapDataChunk(loadBuffer, dataChunkID, dataDest, dataCapacity)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageDataMap(), result)
+    END IF
+
+    LET implID AS U32 = MEMORY.Read32(AexSelectedImplementationIDAddress())
+    result = AEX.ResolveLifecycleEntry(loadBuffer, implID, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageLifecycle(), result)
+    END IF
+
+    CPU.MemoryBarrier
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNativeInvoke())
+    LET nativeResult AS U64 = AEX.InvokeResolvedLifecycle0(codeDest)
+    MEMORY.Write64(AexLoadLastReturnValueAddress(), nativeResult)
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNone())
+    MEMORY.Write32(AexLoadLastErrorAddress(), AexErrorOk())
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.LoadAndActivateAllocated1(systemTable AS UEFI.SystemTable, oid AS U64, loadBuffer AS MMIOPTR, arg0 AS U64) AS U32
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNone())
+    MEMORY.Write32(AexLoadLastErrorAddress(), AexErrorOk())
+    MEMORY.Write64(AexLoadLastReturnValueAddress(), 0)
+    MEMORY.Write64(AexLoadLastFileLengthAddress(), 0)
+    MEMORY.Write64(AexAllocatedCodeAddressCell(), 0)
+    MEMORY.Write64(AexAllocatedDataAddressCell(), 0)
+    MEMORY.Write64(AexAllocatedCodeCapacityCell(), 0)
+    MEMORY.Write64(AexAllocatedDataCapacityCell(), 0)
+
+    LET loaded AS U64 = AEX.LoadFromArcFS(oid, loadBuffer)
+    MEMORY.Write64(AexLoadLastFileLengthAddress(), loaded)
+    IF loaded = 0 THEN
+        RETURN AexRecordLoadFailure(AexLoadStageArcFSLoad(), AexErrorLoadFromArcFSFailed())
+    END IF
+
+    LET result AS U32 = AEX.ValidateHeader(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageHeader(), result)
+    END IF
+    result = AEX.ValidateDirectory(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageDirectory(), result)
+    END IF
+    result = AEX.ValidateManifest(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageManifest(), result)
+    END IF
+
+    LET rootManifestID AS U32 = AexReadRootManifestID(loadBuffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(loadBuffer, rootManifestID)
+    LET manifestOffset AS U64 = AexReadEntryOffset(manifestEntry)
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(loadBuffer, manifestOffset)
+    LET rootComponentID AS U32 = AexReadManifestRootComponentID(manifestData)
+
+    result = AEX.ResolveInterfaces(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageInterfaces(), result)
+    END IF
+    result = AEX.EvaluateCapabilityRequestsWithGrants(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageCapabilities(), result)
+    END IF
+    result = AEX.SelectImplementation(loadBuffer, rootComponentID, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageImplementation(), result)
+    END IF
+    result = AEX.ValidateMemoryPolicies(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageMemoryPolicy(), result)
+    END IF
+    result = AEX.VerifyIntegrity(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageIntegrity(), result)
+    END IF
+    result = AEX.RegisterArcoBindingsWithAuthority(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageBindings(), result)
+    END IF
+    result = AEX.RegisterDiagnostics(loadBuffer, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageDiagnostics(), result)
+    END IF
+    result = AEX.AllocateAndMapSelectedCode(systemTable, loadBuffer)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageCodeMap(), result)
+    END IF
+    result = AEX.AllocateAndMapSelectedData(systemTable, loadBuffer)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageDataMap(), result)
+    END IF
+
+    LET implID AS U32 = MEMORY.Read32(AexSelectedImplementationIDAddress())
+    result = AEX.ResolveLifecycleEntry(loadBuffer, implID, loaded)
+    IF result <> AexErrorOk() THEN
+        RETURN AexRecordLoadFailure(AexLoadStageLifecycle(), result)
+    END IF
+
+    LET codeBase AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(MEMORY.Read64(AexAllocatedCodeAddressCell())))
+    CPU.MemoryBarrier
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNativeInvoke())
+    LET nativeResult AS U64 = AEX.InvokeResolvedLifecycle1(codeBase, arg0)
+    MEMORY.Write64(AexLoadLastReturnValueAddress(), nativeResult)
+    MEMORY.Write32(AexLoadLastStageAddress(), AexLoadStageNone())
+    MEMORY.Write32(AexLoadLastErrorAddress(), AexErrorOk())
+    RETURN AexErrorOk()
+END FUNCTION
+
+' -----------------------------------------------------------------------------------------------
+' Post-Phase 14: MEMORY_POLICY metadata validation (Section 17). This does not yet program page
+' tables; it validates the executable's declared memory intent before mapping/activation code can
+' consume it.
+'
+' Concrete MEMORY_POLICY chunk content for this first slice:
+'   +0  MemoryPolicyID         U32  (must equal the chunk ID that contains this record)
+'   +4  OwningComponentID      U32  (must name a component declared by the root manifest)
+'   +8  TargetImplementationID U32  (0 = component default; nonzero must be this owner)
+'   +12 TargetChunkID          U32  (0 = default; nonzero must be CODE or DATA)
+'   +16 PermissionFlags        U32  (bit0 READ, bit1 WRITE, bit2 EXECUTE)
+'   +20 SemanticsFlags         U32  (bit0 IMMUTABLE, bit1 PRIVATE, bit2 SHARED, bit3 COW,
+'                                    bit4 ZERO_INITIALIZED)
+'   +24 Reserved               U32  (must be zero)
+
+FUNCTION AexMemoryPermissionRead() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexMemoryPermissionWrite() AS U32
+    RETURN 2
+END FUNCTION
+FUNCTION AexMemoryPermissionExecute() AS U32
+    RETURN 4
+END FUNCTION
+FUNCTION AexMemorySemanticImmutable() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexMemorySemanticPrivate() AS U32
+    RETURN 2
+END FUNCTION
+FUNCTION AexMemorySemanticShared() AS U32
+    RETURN 4
+END FUNCTION
+FUNCTION AexMemorySemanticCopyOnWrite() AS U32
+    RETURN 8
+END FUNCTION
+FUNCTION AexMemorySemanticZeroInitialized() AS U32
+    RETURN 16
+END FUNCTION
+FUNCTION AexMemoryKnownPermissionMask() AS U32
+    RETURN 7
+END FUNCTION
+FUNCTION AexMemoryKnownSemanticMask() AS U32
+    RETURN 31
+END FUNCTION
+
+FUNCTION AexErrorMemoryPolicyInvalid() AS U32
+    RETURN 46
+END FUNCTION
+FUNCTION AexErrorMemoryPolicyOutOfBounds() AS U32
+    RETURN 47
+END FUNCTION
+FUNCTION AexErrorMemoryPolicyOwnerInvalid() AS U32
+    RETURN 48
+END FUNCTION
+FUNCTION AexErrorMemoryPolicyWXDenied() AS U32
+    RETURN 49
+END FUNCTION
+
+FUNCTION AexMemoryPolicyFixedSize() AS U32
+    RETURN 28
+END FUNCTION
+FUNCTION AexReadMemoryPolicyID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 0))
+END FUNCTION
+FUNCTION AexReadMemoryPolicyOwningComponentID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 4))
+END FUNCTION
+FUNCTION AexReadMemoryPolicyTargetImplementationID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 8))
+END FUNCTION
+FUNCTION AexReadMemoryPolicyTargetChunkID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 12))
+END FUNCTION
+FUNCTION AexReadMemoryPolicyPermissionFlags(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 16))
+END FUNCTION
+FUNCTION AexReadMemoryPolicySemanticsFlags(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 20))
+END FUNCTION
+FUNCTION AexReadMemoryPolicyReserved(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 24))
+END FUNCTION
+
+FUNCTION AexValidateMemoryPolicyTargetChunk(buffer AS MMIOPTR, chunkID AS U32) AS U32
+    IF chunkID = 0 THEN
+        RETURN AexErrorOk()
+    END IF
+    LET entry AS MMIOPTR = AexFindChunkByID(buffer, chunkID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMemoryPolicyInvalid()
+    END IF
+    LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+    LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+    IF typeHigh = AexTypeCodeHigh() THEN
+        IF typeLow = AexTypeCodeLow() THEN
+            RETURN AexErrorOk()
+        END IF
+    END IF
+    IF typeHigh = AexTypeDataHigh() THEN
+        IF typeLow = AexTypeDataLow() THEN
+            RETURN AexErrorOk()
+        END IF
+    END IF
+    RETURN AexErrorMemoryPolicyInvalid()
+END FUNCTION
+
+FUNCTION AexValidateOneMemoryPolicy(buffer AS MMIOPTR, manifestData AS MMIOPTR, policyEntry AS MMIOPTR, fileLength AS U64) AS U32
+    LET policyID AS U32 = AexReadEntryChunkID(policyEntry)
+    LET policyLogicalLength AS U64 = AexReadEntryLogicalLength(policyEntry)
+    LET fixedSize AS U64 = AexMemoryPolicyFixedSize()
+    IF policyLogicalLength < fixedSize THEN
+        RETURN AexErrorMemoryPolicyOutOfBounds()
+    END IF
+
+    LET policyOffset AS U64 = AexReadEntryOffset(policyEntry)
+    LET policyData AS MMIOPTR = ADDRESS.Offset(buffer, policyOffset)
+    IF AexReadMemoryPolicyID(policyData) <> policyID THEN
+        RETURN AexErrorMemoryPolicyInvalid()
+    END IF
+
+    LET ownerID AS U32 = AexReadMemoryPolicyOwningComponentID(policyData)
+    IF AexManifestDeclaresComponentID(manifestData, ownerID) = 0 THEN
+        RETURN AexErrorMemoryPolicyOwnerInvalid()
+    END IF
+
+    LET targetID AS U32 = AexReadMemoryPolicyTargetImplementationID(policyData)
+    LET targetResult AS U32 = AexValidateBindingTargetImplementation(buffer, targetID, ownerID)
+    IF targetResult = AexErrorBindingOwnerInvalid() THEN
+        RETURN AexErrorMemoryPolicyOwnerInvalid()
+    END IF
+    IF targetResult <> AexErrorOk() THEN
+        RETURN AexErrorMemoryPolicyInvalid()
+    END IF
+
+    LET chunkResult AS U32 = AexValidateMemoryPolicyTargetChunk(buffer, AexReadMemoryPolicyTargetChunkID(policyData))
+    IF chunkResult <> AexErrorOk() THEN
+        RETURN chunkResult
+    END IF
+
+    LET permissionFlags AS U32 = AexReadMemoryPolicyPermissionFlags(policyData)
+    IF (permissionFlags AND (NOT AexMemoryKnownPermissionMask())) <> 0 THEN
+        RETURN AexErrorMemoryPolicyInvalid()
+    END IF
+    IF (permissionFlags AND AexMemoryPermissionWrite()) <> 0 THEN
+        IF (permissionFlags AND AexMemoryPermissionExecute()) <> 0 THEN
+            RETURN AexErrorMemoryPolicyWXDenied()
+        END IF
+    END IF
+
+    LET semanticFlags AS U32 = AexReadMemoryPolicySemanticsFlags(policyData)
+    IF (semanticFlags AND (NOT AexMemoryKnownSemanticMask())) <> 0 THEN
+        RETURN AexErrorMemoryPolicyInvalid()
+    END IF
+    IF (semanticFlags AND AexMemorySemanticImmutable()) <> 0 THEN
+        IF (permissionFlags AND AexMemoryPermissionWrite()) <> 0 THEN
+            RETURN AexErrorMemoryPolicyInvalid()
+        END IF
+    END IF
+    IF (semanticFlags AND AexMemorySemanticShared()) <> 0 THEN
+        IF (semanticFlags AND AexMemorySemanticPrivate()) <> 0 THEN
+            RETURN AexErrorMemoryPolicyInvalid()
+        END IF
+    END IF
+    IF (semanticFlags AND AexMemorySemanticZeroInitialized()) <> 0 THEN
+        IF AexReadMemoryPolicyTargetChunkID(policyData) <> 0 THEN
+            RETURN AexErrorMemoryPolicyInvalid()
+        END IF
+    END IF
+    IF AexReadMemoryPolicyReserved(policyData) <> 0 THEN
+        RETURN AexErrorMemoryPolicyInvalid()
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.ValidateMemoryPolicies(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    LET rootManifestID AS U32 = AexReadRootManifestID(buffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(buffer, rootManifestID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingManifest()
+    END IF
+    LET manifestOffset AS U64 = AexReadEntryOffset(manifestEntry)
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(buffer, manifestOffset)
+
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+    WHILE index < dirCount
+        LET entry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+        LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+        IF typeHigh = AexTypeMemoryPolicyHigh() THEN
+            IF typeLow = AexTypeMemoryPolicyLow() THEN
+                LET result AS U32 = AexValidateOneMemoryPolicy(buffer, manifestData, entry, fileLength)
+                IF result <> AexErrorOk() THEN
+                    RETURN result
+                END IF
+            END IF
+        END IF
+        index = index + 1
+    WEND
+    RETURN AexErrorOk()
+END FUNCTION
+
+' -----------------------------------------------------------------------------------------------
+' Phase 8: Interface metadata (Section 18 / Section 48 / Section 61 Phase 8).
+'
+' Concrete INTERFACE chunk content for this first metadata slice:
+'   +0  InterfaceID            U32  (must equal the chunk ID that contains this record)
+'   +4  OwningComponentID      U32
+'   +8  Direction              U32  (1=PROVIDED, 2=REQUIRED)
+'   +12 VersionMajor           U32
+'   +16 VersionMinor           U32
+'   +20 ContractIDHigh         U64  (stable 128-bit interface identity)
+'   +28 ContractIDLow          U64
+'   +36 Flags                  U32  (reserved for optional/required semantics in Phase 9+)
+'   +40 Reserved               U32  (must be zero in this phase's fixed layout)
+'
+' This phase validates only the metadata a component declares through its ProvidedInterfaceIDs and
+' RequiredInterfaceIDs lists. Interface resolution is exposed separately below so callers can first
+' validate metadata and then materialize the provider map later dispatch phases will consume.
+
+FUNCTION AexInterfaceDirectionProvided() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexInterfaceDirectionRequired() AS U32
+    RETURN 2
+END FUNCTION
+FUNCTION AexInterfaceVersionMajorCurrent() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexInterfaceVersionMinorCurrent() AS U32
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexErrorInterfaceInvalid() AS U32
+    RETURN 25
+END FUNCTION
+FUNCTION AexErrorInterfaceOutOfBounds() AS U32
+    RETURN 26
+END FUNCTION
+FUNCTION AexErrorInterfaceOwnerMismatch() AS U32
+    RETURN 27
+END FUNCTION
+FUNCTION AexErrorInterfaceUnsupportedVersion() AS U32
+    RETURN 28
+END FUNCTION
+FUNCTION AexErrorInterfaceResolutionMissingProvider() AS U32
+    RETURN 51
+END FUNCTION
+FUNCTION AexErrorInterfaceResolutionRegistryFull() AS U32
+    RETURN 52
+END FUNCTION
+
+FUNCTION AexInterfaceResolutionRegistryMaxEntries() AS U32
+    RETURN 16
+END FUNCTION
+FUNCTION AexInterfaceResolutionRegistryEntryStride() AS U32
+    RETURN 32
+END FUNCTION
+FUNCTION AexInterfaceResolutionRegistryBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61222912))
+END FUNCTION
+FUNCTION AexInterfaceResolutionRegistryCountAddress() AS MMIOPTR
+    RETURN AexInterfaceResolutionRegistryBaseAddress()
+END FUNCTION
+FUNCTION AexInterfaceResolutionRegistryEntryAddress(index AS U32) AS MMIOPTR
+    LET indexAsU64 AS U64 = index
+    RETURN ADDRESS.Offset(AexInterfaceResolutionRegistryBaseAddress(), 8 + (indexAsU64 * AexInterfaceResolutionRegistryEntryStride()))
+END FUNCTION
+
+FUNCTION AexInterfaceFixedSize() AS U32
+    RETURN 44
+END FUNCTION
+FUNCTION AexReadInterfaceID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 0))
+END FUNCTION
+FUNCTION AexReadInterfaceOwningComponentID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 4))
+END FUNCTION
+FUNCTION AexReadInterfaceDirection(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 8))
+END FUNCTION
+FUNCTION AexReadInterfaceVersionMajor(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 12))
+END FUNCTION
+FUNCTION AexReadInterfaceVersionMinor(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 16))
+END FUNCTION
+FUNCTION AexReadInterfaceContractIDHigh(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 20))
+END FUNCTION
+FUNCTION AexReadInterfaceContractIDLow(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 28))
+END FUNCTION
+FUNCTION AexReadInterfaceFlags(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 36))
+END FUNCTION
+FUNCTION AexReadInterfaceReserved(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 40))
+END FUNCTION
+
+FUNCTION AexValidateOneInterface(buffer AS MMIOPTR, interfaceID AS U32, expectComponentID AS U32, expectDirection AS U32, fileLength AS U64) AS U32
+    LET interfaceEntry AS MMIOPTR = AexFindChunkByID(buffer, interfaceID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorInterfaceInvalid()
+    END IF
+    LET typeHigh AS U64 = AexReadEntryTypeHigh(interfaceEntry)
+    LET typeLow AS U64 = AexReadEntryTypeLow(interfaceEntry)
+    IF typeHigh <> AexTypeInterfaceHigh() THEN
+        RETURN AexErrorInterfaceInvalid()
+    END IF
+    IF typeLow <> AexTypeInterfaceLow() THEN
+        RETURN AexErrorInterfaceInvalid()
+    END IF
+
+    LET interfaceLogicalLength AS U64 = AexReadEntryLogicalLength(interfaceEntry)
+    LET fixedSize AS U64 = AexInterfaceFixedSize()
+    IF interfaceLogicalLength < fixedSize THEN
+        RETURN AexErrorInterfaceOutOfBounds()
+    END IF
+
+    LET interfaceOffset AS U64 = AexReadEntryOffset(interfaceEntry)
+    LET interfaceData AS MMIOPTR = ADDRESS.Offset(buffer, interfaceOffset)
+    IF AexReadInterfaceID(interfaceData) <> interfaceID THEN
+        RETURN AexErrorInterfaceInvalid()
+    END IF
+    IF AexReadInterfaceOwningComponentID(interfaceData) <> expectComponentID THEN
+        RETURN AexErrorInterfaceOwnerMismatch()
+    END IF
+    IF AexReadInterfaceDirection(interfaceData) <> expectDirection THEN
+        RETURN AexErrorInterfaceInvalid()
+    END IF
+    IF AexReadInterfaceVersionMajor(interfaceData) <> AexInterfaceVersionMajorCurrent() THEN
+        RETURN AexErrorInterfaceUnsupportedVersion()
+    END IF
+    IF AexReadInterfaceVersionMinor(interfaceData) > AexInterfaceVersionMinorCurrent() THEN
+        RETURN AexErrorInterfaceUnsupportedVersion()
+    END IF
+    IF AexReadInterfaceReserved(interfaceData) <> 0 THEN
+        RETURN AexErrorInterfaceInvalid()
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AexValidateComponentInterfaces(buffer AS MMIOPTR, componentID AS U32, fileLength AS U64) AS U32
+    LET componentEntry AS MMIOPTR = AexFindChunkByID(buffer, componentID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingRequiredComponent()
+    END IF
+    LET componentOffset AS U64 = AexReadEntryOffset(componentEntry)
+    LET componentData AS MMIOPTR = ADDRESS.Offset(buffer, componentOffset)
+    LET providedCount AS U32 = AexReadComponentProvidedInterfaceCount(componentData)
+    LET requiredCount AS U32 = AexReadComponentRequiredInterfaceCount(componentData)
+
+    LET p AS U32 = 0
+    WHILE p < providedCount
+        LET providedID AS U32 = AexComponentProvidedInterfaceIDAt(componentData, p)
+        LET providedResult AS U32 = AexValidateOneInterface(buffer, providedID, componentID, AexInterfaceDirectionProvided(), fileLength)
+        IF providedResult <> AexErrorOk() THEN
+            RETURN providedResult
+        END IF
+        p = p + 1
+    WEND
+
+    LET r AS U32 = 0
+    WHILE r < requiredCount
+        LET requiredID AS U32 = AexComponentRequiredInterfaceIDAt(componentData, r)
+        LET requiredResult AS U32 = AexValidateOneInterface(buffer, requiredID, componentID, AexInterfaceDirectionRequired(), fileLength)
+        IF requiredResult <> AexErrorOk() THEN
+            RETURN requiredResult
+        END IF
+        r = r + 1
+    WEND
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.ValidateInterfaces(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    LET rootManifestID AS U32 = AexReadRootManifestID(buffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(buffer, rootManifestID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingManifest()
+    END IF
+    LET manifestOffset AS U64 = AexReadEntryOffset(manifestEntry)
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(buffer, manifestOffset)
+    LET declaredCount AS U32 = AexReadManifestDeclaredComponentCount(manifestData)
+
+    LET i AS U32 = 0
+    WHILE i < declaredCount
+        LET componentID AS U32 = AexManifestDeclaredComponentIDAt(manifestData, i)
+        LET componentResult AS U32 = AexValidateComponentInterfaces(buffer, componentID, fileLength)
+        IF componentResult <> AexErrorOk() THEN
+            RETURN componentResult
+        END IF
+        i = i + 1
+    WEND
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.InterfaceResolutionCount() AS U32
+    RETURN MEMORY.Read32(AexInterfaceResolutionRegistryCountAddress())
+END FUNCTION
+
+FUNCTION AEX.InterfaceResolutionRequiredIDAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexInterfaceResolutionRegistryEntryAddress(index), 0))
+END FUNCTION
+
+FUNCTION AEX.InterfaceResolutionRequiredOwnerAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexInterfaceResolutionRegistryEntryAddress(index), 4))
+END FUNCTION
+
+FUNCTION AEX.InterfaceResolutionProviderIDAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexInterfaceResolutionRegistryEntryAddress(index), 8))
+END FUNCTION
+
+FUNCTION AEX.InterfaceResolutionProviderOwnerAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexInterfaceResolutionRegistryEntryAddress(index), 12))
+END FUNCTION
+
+FUNCTION AexComponentDeclaresProvidedInterfaceID(buffer AS MMIOPTR, componentID AS U32, interfaceID AS U32) AS BOOL
+    LET componentEntry AS MMIOPTR = AexFindChunkByID(buffer, componentID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN 0
+    END IF
+    LET componentOffset AS U64 = AexReadEntryOffset(componentEntry)
+    LET componentData AS MMIOPTR = ADDRESS.Offset(buffer, componentOffset)
+    LET providedCount AS U32 = AexReadComponentProvidedInterfaceCount(componentData)
+    LET i AS U32 = 0
+    WHILE i < providedCount
+        IF AexComponentProvidedInterfaceIDAt(componentData, i) = interfaceID THEN
+            RETURN 1
+        END IF
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexRegisterResolvedInterface(requiredData AS MMIOPTR, providerID AS U32, providerData AS MMIOPTR) AS U32
+    LET count AS U32 = MEMORY.Read32(AexInterfaceResolutionRegistryCountAddress())
+    IF count >= AexInterfaceResolutionRegistryMaxEntries() THEN
+        RETURN AexErrorInterfaceResolutionRegistryFull()
+    END IF
+
+    LET dest AS MMIOPTR = AexInterfaceResolutionRegistryEntryAddress(count)
+    MEMORY.Write32(ADDRESS.Offset(dest, 0), AexReadInterfaceID(requiredData))
+    MEMORY.Write32(ADDRESS.Offset(dest, 4), AexReadInterfaceOwningComponentID(requiredData))
+    MEMORY.Write32(ADDRESS.Offset(dest, 8), providerID)
+    MEMORY.Write32(ADDRESS.Offset(dest, 12), AexReadInterfaceOwningComponentID(providerData))
+    MEMORY.Write64(ADDRESS.Offset(dest, 16), AexReadInterfaceContractIDHigh(requiredData))
+    MEMORY.Write64(ADDRESS.Offset(dest, 24), AexReadInterfaceContractIDLow(requiredData))
+    MEMORY.Write32(AexInterfaceResolutionRegistryCountAddress(), count + 1)
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AexResolveOneRequiredInterface(buffer AS MMIOPTR, requiredID AS U32, requiredOwnerID AS U32, fileLength AS U64) AS U32
+    LET requiredResult AS U32 = AexValidateOneInterface(buffer, requiredID, requiredOwnerID, AexInterfaceDirectionRequired(), fileLength)
+    IF requiredResult <> AexErrorOk() THEN
+        RETURN requiredResult
+    END IF
+
+    LET requiredEntry AS MMIOPTR = AexFindChunkByID(buffer, requiredID)
+    LET requiredData AS MMIOPTR = ADDRESS.Offset(buffer, AexReadEntryOffset(requiredEntry))
+    LET requiredHigh AS U64 = AexReadInterfaceContractIDHigh(requiredData)
+    LET requiredLow AS U64 = AexReadInterfaceContractIDLow(requiredData)
+    LET requiredMajor AS U32 = AexReadInterfaceVersionMajor(requiredData)
+    LET requiredMinor AS U32 = AexReadInterfaceVersionMinor(requiredData)
+    LET sawContract AS BOOL = 0
+
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+    WHILE index < dirCount
+        LET providerEntry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        LET typeHigh AS U64 = AexReadEntryTypeHigh(providerEntry)
+        LET typeLow AS U64 = AexReadEntryTypeLow(providerEntry)
+        IF typeHigh = AexTypeInterfaceHigh() THEN
+            IF typeLow = AexTypeInterfaceLow() THEN
+                LET logicalLength AS U64 = AexReadEntryLogicalLength(providerEntry)
+                LET fixedSize AS U64 = AexInterfaceFixedSize()
+                IF logicalLength < fixedSize THEN
+                    RETURN AexErrorInterfaceOutOfBounds()
+                END IF
+
+                LET providerData AS MMIOPTR = ADDRESS.Offset(buffer, AexReadEntryOffset(providerEntry))
+                IF AexReadInterfaceDirection(providerData) = AexInterfaceDirectionProvided() THEN
+                    IF AexReadInterfaceContractIDHigh(providerData) = requiredHigh THEN
+                        IF AexReadInterfaceContractIDLow(providerData) = requiredLow THEN
+                            sawContract = 1
+                            IF AexReadInterfaceVersionMajor(providerData) = requiredMajor THEN
+                                IF AexReadInterfaceVersionMinor(providerData) >= requiredMinor THEN
+                                    LET providerID AS U32 = AexReadEntryChunkID(providerEntry)
+                                    IF AexReadInterfaceID(providerData) <> providerID THEN
+                                        RETURN AexErrorInterfaceInvalid()
+                                    END IF
+                                    LET providerOwnerID AS U32 = AexReadInterfaceOwningComponentID(providerData)
+                                    IF AexManifestDeclaresComponentID(ADDRESS.Offset(buffer, AexReadEntryOffset(AexFindChunkByID(buffer, AexReadRootManifestID(buffer)))), providerOwnerID) = 0 THEN
+                                        RETURN AexErrorInterfaceOwnerMismatch()
+                                    END IF
+                                    IF AexComponentDeclaresProvidedInterfaceID(buffer, providerOwnerID, providerID) = 0 THEN
+                                        RETURN AexErrorInterfaceInvalid()
+                                    END IF
+                                    RETURN AexRegisterResolvedInterface(requiredData, providerID, providerData)
+                                END IF
+                            END IF
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+        index = index + 1
+    WEND
+
+    IF sawContract = 1 THEN
+        RETURN AexErrorInterfaceUnsupportedVersion()
+    END IF
+    RETURN AexErrorInterfaceResolutionMissingProvider()
+END FUNCTION
+
+FUNCTION AEX.ResolveInterfaces(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    MEMORY.Write32(AexInterfaceResolutionRegistryCountAddress(), 0)
+
+    LET validateResult AS U32 = AEX.ValidateInterfaces(buffer, fileLength)
+    IF validateResult <> AexErrorOk() THEN
+        RETURN validateResult
+    END IF
+
+    LET rootManifestID AS U32 = AexReadRootManifestID(buffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(buffer, rootManifestID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingManifest()
+    END IF
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(buffer, AexReadEntryOffset(manifestEntry))
+    LET declaredCount AS U32 = AexReadManifestDeclaredComponentCount(manifestData)
+
+    LET i AS U32 = 0
+    WHILE i < declaredCount
+        LET componentID AS U32 = AexManifestDeclaredComponentIDAt(manifestData, i)
+        LET componentEntry AS MMIOPTR = AexFindChunkByID(buffer, componentID)
+        IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+            RETURN AexErrorMissingRequiredComponent()
+        END IF
+        LET componentData AS MMIOPTR = ADDRESS.Offset(buffer, AexReadEntryOffset(componentEntry))
+        LET requiredCount AS U32 = AexReadComponentRequiredInterfaceCount(componentData)
+        LET r AS U32 = 0
+        WHILE r < requiredCount
+            LET requiredID AS U32 = AexComponentRequiredInterfaceIDAt(componentData, r)
+            LET resolveResult AS U32 = AexResolveOneRequiredInterface(buffer, requiredID, componentID, fileLength)
+            IF resolveResult <> AexErrorOk() THEN
+                RETURN resolveResult
+            END IF
+            r = r + 1
+        WEND
+        i = i + 1
+    WEND
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+' -----------------------------------------------------------------------------------------------
+' Phase 9: Capability request evaluation (Section 19 / Section 61 Phase 9).
+'
+' Concrete CAPABILITY_REQUEST chunk content for this first policy slice:
+'   +0  CapabilityRequestID    U32  (must equal the chunk ID that contains this record)
+'   +4  OwningComponentID      U32  (must name a component declared by the root manifest)
+'   +8  Requirement            U32  (1=REQUIRED, 2=OPTIONAL)
+'   +12 CapabilityIDHigh       U64  (stable 128-bit capability identity)
+'   +20 CapabilityIDLow        U64
+'   +28 Flags                  U32  (reserved for policy-specific qualifiers)
+'   +32 Reserved               U32  (must be zero in this phase's fixed layout)
+'
+' A declaration is not a grant. This phase validates the request records and evaluates them
+' against explicit loader grant state. The legacy evaluator below keeps the original fail-closed
+' behavior for required capabilities; EvaluateCapabilityRequestsWithGrants consumes the bounded
+' grant table populated through AEX.AllowCapability.
+
+FUNCTION AexCapabilityRequirementRequired() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexCapabilityRequirementOptional() AS U32
+    RETURN 2
+END FUNCTION
+
+FUNCTION AexErrorCapabilityInvalid() AS U32
+    RETURN 29
+END FUNCTION
+FUNCTION AexErrorCapabilityOutOfBounds() AS U32
+    RETURN 30
+END FUNCTION
+FUNCTION AexErrorCapabilityOwnerInvalid() AS U32
+    RETURN 31
+END FUNCTION
+FUNCTION AexErrorRequiredCapabilityDenied() AS U32
+    RETURN 32
+END FUNCTION
+FUNCTION AexErrorCapabilityGrantRegistryFull() AS U32
+    RETURN 53
+END FUNCTION
+
+FUNCTION AexCapabilityRequestFixedSize() AS U32
+    RETURN 36
+END FUNCTION
+FUNCTION AexCapabilityGrantRegistryMaxEntries() AS U32
+    RETURN 16
+END FUNCTION
+FUNCTION AexCapabilityGrantRegistryEntryStride() AS U32
+    RETURN 24
+END FUNCTION
+FUNCTION AexCapabilityGrantRegistryBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61227008))
+END FUNCTION
+FUNCTION AexCapabilityGrantRegistryCountAddress() AS MMIOPTR
+    RETURN AexCapabilityGrantRegistryBaseAddress()
+END FUNCTION
+FUNCTION AexCapabilityGrantRegistryEntryAddress(index AS U32) AS MMIOPTR
+    LET indexAsU64 AS U64 = index
+    RETURN ADDRESS.Offset(AexCapabilityGrantRegistryBaseAddress(), 8 + (indexAsU64 * AexCapabilityGrantRegistryEntryStride()))
+END FUNCTION
+FUNCTION AexReadCapabilityRequestID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 0))
+END FUNCTION
+FUNCTION AexReadCapabilityOwningComponentID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 4))
+END FUNCTION
+FUNCTION AexReadCapabilityRequirement(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 8))
+END FUNCTION
+FUNCTION AexReadCapabilityIDHigh(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 12))
+END FUNCTION
+FUNCTION AexReadCapabilityIDLow(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 20))
+END FUNCTION
+FUNCTION AexReadCapabilityFlags(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 28))
+END FUNCTION
+FUNCTION AexReadCapabilityReserved(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 32))
+END FUNCTION
+
+FUNCTION AexManifestDeclaresComponentID(data AS MMIOPTR, componentID AS U32) AS BOOL
+    LET declaredCount AS U32 = AexReadManifestDeclaredComponentCount(data)
+    LET i AS U32 = 0
+    WHILE i < declaredCount
+        IF AexManifestDeclaredComponentIDAt(data, i) = componentID THEN
+            RETURN 1
+        END IF
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexValidateOneCapabilityRequestMetadata(buffer AS MMIOPTR, manifestData AS MMIOPTR, requestEntry AS MMIOPTR, fileLength AS U64) AS U32
+    LET requestID AS U32 = AexReadEntryChunkID(requestEntry)
+    LET requestLogicalLength AS U64 = AexReadEntryLogicalLength(requestEntry)
+    LET fixedSize AS U64 = AexCapabilityRequestFixedSize()
+    IF requestLogicalLength < fixedSize THEN
+        RETURN AexErrorCapabilityOutOfBounds()
+    END IF
+
+    LET requestOffset AS U64 = AexReadEntryOffset(requestEntry)
+    LET requestData AS MMIOPTR = ADDRESS.Offset(buffer, requestOffset)
+    IF AexReadCapabilityRequestID(requestData) <> requestID THEN
+        RETURN AexErrorCapabilityInvalid()
+    END IF
+
+    LET ownerID AS U32 = AexReadCapabilityOwningComponentID(requestData)
+    IF AexManifestDeclaresComponentID(manifestData, ownerID) = 0 THEN
+        RETURN AexErrorCapabilityOwnerInvalid()
+    END IF
+
+    LET requirement AS U32 = AexReadCapabilityRequirement(requestData)
+    IF requirement <> AexCapabilityRequirementRequired() THEN
+        IF requirement <> AexCapabilityRequirementOptional() THEN
+            RETURN AexErrorCapabilityInvalid()
+        END IF
+    END IF
+    IF AexReadCapabilityReserved(requestData) <> 0 THEN
+        RETURN AexErrorCapabilityInvalid()
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AexValidateOneCapabilityRequest(buffer AS MMIOPTR, manifestData AS MMIOPTR, requestEntry AS MMIOPTR, fileLength AS U64) AS U32
+    LET result AS U32 = AexValidateOneCapabilityRequestMetadata(buffer, manifestData, requestEntry, fileLength)
+    IF result <> AexErrorOk() THEN
+        RETURN result
+    END IF
+
+    LET requestData AS MMIOPTR = ADDRESS.Offset(buffer, AexReadEntryOffset(requestEntry))
+    LET requirement AS U32 = AexReadCapabilityRequirement(requestData)
+    IF requirement = AexCapabilityRequirementRequired() THEN
+        RETURN AexErrorRequiredCapabilityDenied()
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.ClearCapabilityGrants() AS U32
+    MEMORY.Write32(AexCapabilityGrantRegistryCountAddress(), 0)
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.CapabilityGrantCount() AS U32
+    RETURN MEMORY.Read32(AexCapabilityGrantRegistryCountAddress())
+END FUNCTION
+
+FUNCTION AEX.AllowCapability(capabilityIDHigh AS U64, capabilityIDLow AS U64) AS U32
+    LET count AS U32 = MEMORY.Read32(AexCapabilityGrantRegistryCountAddress())
+    IF count >= AexCapabilityGrantRegistryMaxEntries() THEN
+        RETURN AexErrorCapabilityGrantRegistryFull()
+    END IF
+
+    LET dest AS MMIOPTR = AexCapabilityGrantRegistryEntryAddress(count)
+    MEMORY.Write64(ADDRESS.Offset(dest, 0), capabilityIDHigh)
+    MEMORY.Write64(ADDRESS.Offset(dest, 8), capabilityIDLow)
+    MEMORY.Write32(ADDRESS.Offset(dest, 16), 1)
+    MEMORY.Write32(AexCapabilityGrantRegistryCountAddress(), count + 1)
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.CapabilityIsGranted(capabilityIDHigh AS U64, capabilityIDLow AS U64) AS BOOL
+    LET count AS U32 = MEMORY.Read32(AexCapabilityGrantRegistryCountAddress())
+    LET i AS U32 = 0
+    WHILE i < count
+        LET entry AS MMIOPTR = AexCapabilityGrantRegistryEntryAddress(i)
+        IF MEMORY.Read32(ADDRESS.Offset(entry, 16)) = 1 THEN
+            IF MEMORY.Read64(ADDRESS.Offset(entry, 0)) = capabilityIDHigh THEN
+                IF MEMORY.Read64(ADDRESS.Offset(entry, 8)) = capabilityIDLow THEN
+                    RETURN 1
+                END IF
+            END IF
+        END IF
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AEX.EvaluateCapabilityRequests(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    LET rootManifestID AS U32 = AexReadRootManifestID(buffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(buffer, rootManifestID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingManifest()
+    END IF
+    LET manifestOffset AS U64 = AexReadEntryOffset(manifestEntry)
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(buffer, manifestOffset)
+
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+    WHILE index < dirCount
+        LET entry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+        LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+        IF typeHigh = AexTypeCapabilityRequestHigh() THEN
+            IF typeLow = AexTypeCapabilityRequestLow() THEN
+                LET requestResult AS U32 = AexValidateOneCapabilityRequest(buffer, manifestData, entry, fileLength)
+                IF requestResult <> AexErrorOk() THEN
+                    RETURN requestResult
+                END IF
+            END IF
+        END IF
+        index = index + 1
+    WEND
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.EvaluateCapabilityRequestsWithGrants(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    LET rootManifestID AS U32 = AexReadRootManifestID(buffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(buffer, rootManifestID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingManifest()
+    END IF
+    LET manifestOffset AS U64 = AexReadEntryOffset(manifestEntry)
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(buffer, manifestOffset)
+
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+    WHILE index < dirCount
+        LET entry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+        LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+        IF typeHigh = AexTypeCapabilityRequestHigh() THEN
+            IF typeLow = AexTypeCapabilityRequestLow() THEN
+                LET requestResult AS U32 = AexValidateOneCapabilityRequestMetadata(buffer, manifestData, entry, fileLength)
+                IF requestResult <> AexErrorOk() THEN
+                    RETURN requestResult
+                END IF
+
+                LET requestData AS MMIOPTR = ADDRESS.Offset(buffer, AexReadEntryOffset(entry))
+                IF AexReadCapabilityRequirement(requestData) = AexCapabilityRequirementRequired() THEN
+                    IF AEX.CapabilityIsGranted(AexReadCapabilityIDHigh(requestData), AexReadCapabilityIDLow(requestData)) = 0 THEN
+                        RETURN AexErrorRequiredCapabilityDenied()
+                    END IF
+                END IF
+            END IF
+        END IF
+        index = index + 1
+    WEND
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+' -----------------------------------------------------------------------------------------------
+' Phase 10: ArcoBASIC Binding Table registration (Section 20 / Section 21 / Section 61 Phase 10).
+'
+' Concrete ARCO_BINDING chunk content for this first ABT registration slice:
+'   +0  BindingID              U32  (must equal the chunk ID that contains this record)
+'   +4  OwningComponentID      U32  (must name a component declared by the root manifest)
+'   +8  BindingKind            U32  (1=OBJECT, 2=PROPERTY, 3=METHOD, 4=EVENT)
+'   +12 TargetImplementationID U32  (0 = metadata-only; nonzero must be this component's impl)
+'   +16 NameIDHigh             U64  (stable 128-bit binding name/semantic identity)
+'   +24 NameIDLow              U64
+'   +32 AuthorityIDHigh        U64  (reserved for Phase 9+ authority linkage; zero allowed)
+'   +40 AuthorityIDLow         U64
+'   +48 Flags                  U32  (reserved for access/read/write/invoke semantics)
+'   +52 Reserved               U32  (must be zero in this phase's fixed layout)
+'
+' Registration here means "validated and copied into the loader's bounded ABT registry scratch
+' table" so later shell/inspector/runtime work has a real handoff point. It does not invoke or
+' dispatch methods, expose object instances, enforce authority, or synthesize ArcoBASIC wrappers.
+
+FUNCTION AexBindingKindObject() AS U32
+    RETURN 1
+END FUNCTION
+FUNCTION AexBindingKindProperty() AS U32
+    RETURN 2
+END FUNCTION
+FUNCTION AexBindingKindMethod() AS U32
+    RETURN 3
+END FUNCTION
+FUNCTION AexBindingKindEvent() AS U32
+    RETURN 4
+END FUNCTION
+
+FUNCTION AexErrorBindingInvalid() AS U32
+    RETURN 33
+END FUNCTION
+FUNCTION AexErrorBindingOutOfBounds() AS U32
+    RETURN 34
+END FUNCTION
+FUNCTION AexErrorBindingOwnerInvalid() AS U32
+    RETURN 35
+END FUNCTION
+FUNCTION AexErrorBindingRegistryFull() AS U32
+    RETURN 36
+END FUNCTION
+FUNCTION AexErrorBindingAuthorityDenied() AS U32
+    RETURN 54
+END FUNCTION
+
+FUNCTION AexArcoBindingFixedSize() AS U32
+    RETURN 56
+END FUNCTION
+FUNCTION AexBindingRegistryMaxEntries() AS U32
+    RETURN 16
+END FUNCTION
+FUNCTION AexBindingRegistryEntryStride() AS U32
+    RETURN 32
+END FUNCTION
+FUNCTION AexBindingRegistryBaseAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61210624))
+END FUNCTION
+FUNCTION AexBindingRegistryCountAddress() AS MMIOPTR
+    RETURN AexBindingRegistryBaseAddress()
+END FUNCTION
+FUNCTION AexBindingRegistryEntryAddress(index AS U32) AS MMIOPTR
+    LET indexAsU64 AS U64 = index
+    RETURN ADDRESS.Offset(AexBindingRegistryBaseAddress(), 8 + (indexAsU64 * AexBindingRegistryEntryStride()))
+END FUNCTION
+
+FUNCTION AexReadBindingID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 0))
+END FUNCTION
+FUNCTION AexReadBindingOwningComponentID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 4))
+END FUNCTION
+FUNCTION AexReadBindingKind(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 8))
+END FUNCTION
+FUNCTION AexReadBindingTargetImplementationID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 12))
+END FUNCTION
+FUNCTION AexReadBindingNameIDHigh(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 16))
+END FUNCTION
+FUNCTION AexReadBindingNameIDLow(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 24))
+END FUNCTION
+FUNCTION AexReadBindingAuthorityIDHigh(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 32))
+END FUNCTION
+FUNCTION AexReadBindingAuthorityIDLow(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 40))
+END FUNCTION
+FUNCTION AexReadBindingFlags(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 48))
+END FUNCTION
+FUNCTION AexReadBindingReserved(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 52))
+END FUNCTION
+
+FUNCTION AexValidateBindingTargetImplementation(buffer AS MMIOPTR, targetImplementationID AS U32, expectComponentID AS U32) AS U32
+    IF targetImplementationID = 0 THEN
+        RETURN AexErrorOk()
+    END IF
+
+    LET implEntry AS MMIOPTR = AexFindChunkByID(buffer, targetImplementationID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorBindingInvalid()
+    END IF
+    LET typeHigh AS U64 = AexReadEntryTypeHigh(implEntry)
+    LET typeLow AS U64 = AexReadEntryTypeLow(implEntry)
+    IF typeHigh <> AexTypeImplementationHigh() THEN
+        RETURN AexErrorBindingInvalid()
+    END IF
+    IF typeLow <> AexTypeImplementationLow() THEN
+        RETURN AexErrorBindingInvalid()
+    END IF
+    LET implLogicalLength AS U64 = AexReadEntryLogicalLength(implEntry)
+    LET implFixedSize AS U64 = AexImplementationFixedSize()
+    IF implLogicalLength < implFixedSize THEN
+        RETURN AexErrorBindingInvalid()
+    END IF
+    LET implOffset AS U64 = AexReadEntryOffset(implEntry)
+    LET implData AS MMIOPTR = ADDRESS.Offset(buffer, implOffset)
+    IF AexReadImplementationOwningComponentID(implData) <> expectComponentID THEN
+        RETURN AexErrorBindingOwnerInvalid()
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AexValidateOneArcoBinding(buffer AS MMIOPTR, manifestData AS MMIOPTR, bindingEntry AS MMIOPTR, fileLength AS U64) AS U32
+    LET bindingID AS U32 = AexReadEntryChunkID(bindingEntry)
+    LET bindingLogicalLength AS U64 = AexReadEntryLogicalLength(bindingEntry)
+    LET fixedSize AS U64 = AexArcoBindingFixedSize()
+    IF bindingLogicalLength < fixedSize THEN
+        RETURN AexErrorBindingOutOfBounds()
+    END IF
+
+    LET bindingOffset AS U64 = AexReadEntryOffset(bindingEntry)
+    LET bindingData AS MMIOPTR = ADDRESS.Offset(buffer, bindingOffset)
+    IF AexReadBindingID(bindingData) <> bindingID THEN
+        RETURN AexErrorBindingInvalid()
+    END IF
+
+    LET ownerID AS U32 = AexReadBindingOwningComponentID(bindingData)
+    IF AexManifestDeclaresComponentID(manifestData, ownerID) = 0 THEN
+        RETURN AexErrorBindingOwnerInvalid()
+    END IF
+
+    LET kind AS U32 = AexReadBindingKind(bindingData)
+    IF kind < AexBindingKindObject() THEN
+        RETURN AexErrorBindingInvalid()
+    END IF
+    IF kind > AexBindingKindEvent() THEN
+        RETURN AexErrorBindingInvalid()
+    END IF
+    IF AexReadBindingReserved(bindingData) <> 0 THEN
+        RETURN AexErrorBindingInvalid()
+    END IF
+
+    LET targetID AS U32 = AexReadBindingTargetImplementationID(bindingData)
+    LET targetResult AS U32 = AexValidateBindingTargetImplementation(buffer, targetID, ownerID)
+    IF targetResult <> AexErrorOk() THEN
+        RETURN targetResult
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AexBindingAuthorityAllowed(bindingData AS MMIOPTR) AS BOOL
+    LET authorityHigh AS U64 = AexReadBindingAuthorityIDHigh(bindingData)
+    LET authorityLow AS U64 = AexReadBindingAuthorityIDLow(bindingData)
+    IF authorityHigh = 0 THEN
+        IF authorityLow = 0 THEN
+            RETURN 1
+        END IF
+    END IF
+    RETURN AEX.CapabilityIsGranted(authorityHigh, authorityLow)
+END FUNCTION
+
+FUNCTION AexRegisterOneArcoBinding(bindingEntry AS MMIOPTR, bindingData AS MMIOPTR) AS U32
+    LET count AS U32 = MEMORY.Read32(AexBindingRegistryCountAddress())
+    IF count >= AexBindingRegistryMaxEntries() THEN
+        RETURN AexErrorBindingRegistryFull()
+    END IF
+
+    LET dest AS MMIOPTR = AexBindingRegistryEntryAddress(count)
+    MEMORY.Write32(ADDRESS.Offset(dest, 0), AexReadEntryChunkID(bindingEntry))
+    MEMORY.Write32(ADDRESS.Offset(dest, 4), AexReadBindingOwningComponentID(bindingData))
+    MEMORY.Write32(ADDRESS.Offset(dest, 8), AexReadBindingKind(bindingData))
+    MEMORY.Write32(ADDRESS.Offset(dest, 12), AexReadBindingTargetImplementationID(bindingData))
+    MEMORY.Write64(ADDRESS.Offset(dest, 16), AexReadBindingNameIDHigh(bindingData))
+    MEMORY.Write64(ADDRESS.Offset(dest, 24), AexReadBindingNameIDLow(bindingData))
+    MEMORY.Write32(AexBindingRegistryCountAddress(), count + 1)
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AexRegisterOneArcoBindingWithAuthority(bindingEntry AS MMIOPTR, bindingData AS MMIOPTR) AS U32
+    IF AexBindingAuthorityAllowed(bindingData) = 0 THEN
+        RETURN AexErrorBindingAuthorityDenied()
+    END IF
+    RETURN AexRegisterOneArcoBinding(bindingEntry, bindingData)
+END FUNCTION
+
+FUNCTION AEX.RegisterArcoBindings(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    MEMORY.Write32(AexBindingRegistryCountAddress(), 0)
+
+    LET rootManifestID AS U32 = AexReadRootManifestID(buffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(buffer, rootManifestID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingManifest()
+    END IF
+    LET manifestOffset AS U64 = AexReadEntryOffset(manifestEntry)
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(buffer, manifestOffset)
+
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+    WHILE index < dirCount
+        LET entry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+        LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+        IF typeHigh = AexTypeArcoBindingHigh() THEN
+            IF typeLow = AexTypeArcoBindingLow() THEN
+                LET validateResult AS U32 = AexValidateOneArcoBinding(buffer, manifestData, entry, fileLength)
+                IF validateResult <> AexErrorOk() THEN
+                    RETURN validateResult
+                END IF
+                LET bindingOffset AS U64 = AexReadEntryOffset(entry)
+                LET bindingData AS MMIOPTR = ADDRESS.Offset(buffer, bindingOffset)
+                LET registerResult AS U32 = AexRegisterOneArcoBinding(entry, bindingData)
+                IF registerResult <> AexErrorOk() THEN
+                    RETURN registerResult
+                END IF
+            END IF
+        END IF
+        index = index + 1
+    WEND
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.RegisterArcoBindingsWithAuthority(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    MEMORY.Write32(AexBindingRegistryCountAddress(), 0)
+
+    LET rootManifestID AS U32 = AexReadRootManifestID(buffer)
+    LET manifestEntry AS MMIOPTR = AexFindChunkByID(buffer, rootManifestID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorMissingManifest()
+    END IF
+    LET manifestOffset AS U64 = AexReadEntryOffset(manifestEntry)
+    LET manifestData AS MMIOPTR = ADDRESS.Offset(buffer, manifestOffset)
+
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+    WHILE index < dirCount
+        LET entry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+        LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+        IF typeHigh = AexTypeArcoBindingHigh() THEN
+            IF typeLow = AexTypeArcoBindingLow() THEN
+                LET validateResult AS U32 = AexValidateOneArcoBinding(buffer, manifestData, entry, fileLength)
+                IF validateResult <> AexErrorOk() THEN
+                    RETURN validateResult
+                END IF
+                LET bindingOffset AS U64 = AexReadEntryOffset(entry)
+                LET bindingData AS MMIOPTR = ADDRESS.Offset(buffer, bindingOffset)
+                LET registerResult AS U32 = AexRegisterOneArcoBindingWithAuthority(entry, bindingData)
+                IF registerResult <> AexErrorOk() THEN
+                    RETURN registerResult
+                END IF
+            END IF
+        END IF
+        index = index + 1
+    WEND
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AEX.BindingRegistryCount() AS U32
+    RETURN MEMORY.Read32(AexBindingRegistryCountAddress())
+END FUNCTION
+
+FUNCTION AEX.BindingRegistryIDAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexBindingRegistryEntryAddress(index), 0))
+END FUNCTION
+
+FUNCTION AEX.BindingRegistryOwnerAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexBindingRegistryEntryAddress(index), 4))
+END FUNCTION
+
+FUNCTION AEX.BindingRegistryKindAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexBindingRegistryEntryAddress(index), 8))
+END FUNCTION
+
+FUNCTION AEX.BindingRegistryTargetImplementationAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexBindingRegistryEntryAddress(index), 12))
+END FUNCTION
+
+FUNCTION AEX.BindingRegistryNameHighAt(index AS U32) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexBindingRegistryEntryAddress(index), 16))
+END FUNCTION
+
+FUNCTION AEX.BindingRegistryNameLowAt(index AS U32) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexBindingRegistryEntryAddress(index), 24))
+END FUNCTION
+
+FUNCTION AEX.FindResolvedProviderBinding(requiredInterfaceID AS U32, bindingKind AS U32, nameIDHigh AS U64, nameIDLow AS U64) AS U32
+    LET resolutionCount AS U32 = AEX.InterfaceResolutionCount()
+    LET r AS U32 = 0
+    WHILE r < resolutionCount
+        IF AEX.InterfaceResolutionRequiredIDAt(r) = requiredInterfaceID THEN
+            LET providerOwner AS U32 = AEX.InterfaceResolutionProviderOwnerAt(r)
+            LET bindingCount AS U32 = AEX.BindingRegistryCount()
+            LET b AS U32 = 0
+            WHILE b < bindingCount
+                IF AEX.BindingRegistryOwnerAt(b) = providerOwner THEN
+                    IF AEX.BindingRegistryKindAt(b) = bindingKind THEN
+                        IF AEX.BindingRegistryNameHighAt(b) = nameIDHigh THEN
+                            IF AEX.BindingRegistryNameLowAt(b) = nameIDLow THEN
+                                RETURN AEX.BindingRegistryIDAt(b)
+                            END IF
+                        END IF
+                    END IF
+                END IF
+                b = b + 1
+            WEND
+            RETURN 0
+        END IF
+        r = r + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AEX.DiagnosticRegistryCount() AS U32
+    RETURN MEMORY.Read32(AexDiagnosticRegistryCountAddress())
+END FUNCTION
+
+FUNCTION AEX.DiagnosticRegistryIDAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexDiagnosticRegistryEntryAddress(index), 0))
+END FUNCTION
+
+FUNCTION AEX.DiagnosticRegistryOwnerAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexDiagnosticRegistryEntryAddress(index), 4))
+END FUNCTION
+
+FUNCTION AEX.DiagnosticRegistryKindAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexDiagnosticRegistryEntryAddress(index), 8))
+END FUNCTION
+
+FUNCTION AEX.DiagnosticRegistryTargetImplementationAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexDiagnosticRegistryEntryAddress(index), 12))
+END FUNCTION
+
+FUNCTION AEX.DiagnosticRegistryCodeChunkAt(index AS U32) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(AexDiagnosticRegistryEntryAddress(index), 16))
+END FUNCTION
+
+FUNCTION AEX.DiagnosticRegistryCodeOffsetAt(index AS U32) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexDiagnosticRegistryEntryAddress(index), 20))
+END FUNCTION
+
+FUNCTION AEX.DiagnosticRegistryCodeLengthAt(index AS U32) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexDiagnosticRegistryEntryAddress(index), 28))
+END FUNCTION
+
+FUNCTION AEX.DiagnosticRegistryNameHighAt(index AS U32) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexDiagnosticRegistryEntryAddress(index), 36))
+END FUNCTION
+
+FUNCTION AEX.DiagnosticRegistryNameLowAt(index AS U32) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(AexDiagnosticRegistryEntryAddress(index), 44))
+END FUNCTION
+
+FUNCTION AEX.FindBindingDispatchDiagnostic(bindingID AS U32) AS U32
+    LET bindingCount AS U32 = AEX.BindingRegistryCount()
+    LET b AS U32 = 0
+    WHILE b < bindingCount
+        IF AEX.BindingRegistryIDAt(b) = bindingID THEN
+            IF AEX.BindingRegistryKindAt(b) <> AexBindingKindMethod() THEN
+                RETURN 0
+            END IF
+            LET diagnosticCount AS U32 = AEX.DiagnosticRegistryCount()
+            LET d AS U32 = 0
+            WHILE d < diagnosticCount
+                IF AEX.DiagnosticRegistryOwnerAt(d) = AEX.BindingRegistryOwnerAt(b) THEN
+                    IF AEX.DiagnosticRegistryKindAt(d) = AexDiagnosticKindOperation() THEN
+                        IF AEX.DiagnosticRegistryTargetImplementationAt(d) = AEX.BindingRegistryTargetImplementationAt(b) THEN
+                            IF AEX.DiagnosticRegistryNameHighAt(d) = AEX.BindingRegistryNameHighAt(b) THEN
+                                IF AEX.DiagnosticRegistryNameLowAt(d) = AEX.BindingRegistryNameLowAt(b) THEN
+                                    RETURN AEX.DiagnosticRegistryIDAt(d)
+                                END IF
+                            END IF
+                        END IF
+                    END IF
+                END IF
+                d = d + 1
+            WEND
+            RETURN 0
+        END IF
+        b = b + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AEX.FindBindingDispatchCodeChunk(bindingID AS U32) AS U32
+    LET diagnosticID AS U32 = AEX.FindBindingDispatchDiagnostic(bindingID)
+    IF diagnosticID = 0 THEN
+        RETURN 0
+    END IF
+    LET diagnosticCount AS U32 = AEX.DiagnosticRegistryCount()
+    LET d AS U32 = 0
+    WHILE d < diagnosticCount
+        IF AEX.DiagnosticRegistryIDAt(d) = diagnosticID THEN
+            RETURN AEX.DiagnosticRegistryCodeChunkAt(d)
+        END IF
+        d = d + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AEX.FindBindingDispatchCodeOffset(bindingID AS U32) AS U64
+    LET diagnosticID AS U32 = AEX.FindBindingDispatchDiagnostic(bindingID)
+    IF diagnosticID = 0 THEN
+        RETURN 0
+    END IF
+    LET diagnosticCount AS U32 = AEX.DiagnosticRegistryCount()
+    LET d AS U32 = 0
+    WHILE d < diagnosticCount
+        IF AEX.DiagnosticRegistryIDAt(d) = diagnosticID THEN
+            RETURN AEX.DiagnosticRegistryCodeOffsetAt(d)
+        END IF
+        d = d + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AEX.InvokeBindingDispatch1(bindingID AS U32, codeBase AS MMIOPTR, arg0 AS U64) AS U64
+    LET codeOffset AS U64 = AEX.FindBindingDispatchCodeOffset(bindingID)
+    RETURN AEX.InvokeNative1(ADDRESS.Offset(codeBase, codeOffset), arg0)
+END FUNCTION
+
+' -----------------------------------------------------------------------------------------------
+' Phase 11: Integrity verification (Section 26 / Section 27 / Section 37 Stage 7 /
+' Section 61 Phase 11).
+'
+' Concrete INTEGRITY chunk content for this first verification slice:
+'   +0  IntegrityID            U32  (must equal the chunk ID that contains this record)
+'   +4  Algorithm              U32  (1=AEX_CHECKSUM32, a deterministic bootstrap checksum)
+'   +8  CoveredChunkID         U32
+'   +12 ExpectedChecksum32     U32
+'   +16 CoveredLength          U64  (must equal the covered chunk's StoredLength)
+'   +24 Flags                  U32  (reserved for root-tree/required/optional semantics)
+'   +28 Reserved               U32  (must be zero in this phase's fixed layout)
+'
+' AEX_CHECKSUM32 is deliberately not a cryptographic hash. It is a real fail-closed integrity
+' gate for this loader stage and catches mutated protected content, but SHA-256/signature-backed
+' integrity remains a later security hardening milestone once a cryptographic primitive exists in
+' the freestanding substrate.
+
+FUNCTION AexIntegrityAlgorithmChecksum32() AS U32
+    RETURN 1
+END FUNCTION
+
+FUNCTION AexErrorIntegrityInvalid() AS U32
+    RETURN 37
+END FUNCTION
+FUNCTION AexErrorIntegrityOutOfBounds() AS U32
+    RETURN 38
+END FUNCTION
+FUNCTION AexErrorIntegrityMismatch() AS U32
+    RETURN 39
+END FUNCTION
+FUNCTION AexErrorIntegrityMissing() AS U32
+    RETURN 40
+END FUNCTION
+
+FUNCTION AexIntegrityFixedSize() AS U32
+    RETURN 32
+END FUNCTION
+FUNCTION AexReadIntegrityID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 0))
+END FUNCTION
+FUNCTION AexReadIntegrityAlgorithm(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 4))
+END FUNCTION
+FUNCTION AexReadIntegrityCoveredChunkID(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 8))
+END FUNCTION
+FUNCTION AexReadIntegrityExpectedChecksum32(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 12))
+END FUNCTION
+FUNCTION AexReadIntegrityCoveredLength(data AS MMIOPTR) AS U64
+    RETURN MEMORY.Read64(ADDRESS.Offset(data, 16))
+END FUNCTION
+FUNCTION AexReadIntegrityFlags(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 24))
+END FUNCTION
+FUNCTION AexReadIntegrityReserved(data AS MMIOPTR) AS U32
+    RETURN MEMORY.Read32(ADDRESS.Offset(data, 28))
+END FUNCTION
+
+FUNCTION AexChecksum32(chunkData AS MMIOPTR, byteLength AS U64) AS U64
+    LET checksum AS U64 = 0
+    LET i AS U64 = 0
+    WHILE i < byteLength
+        LET byteValue AS U64 = MEMORY.Read8(ADDRESS.Offset(chunkData, i))
+        checksum = (checksum + byteValue) MOD 4294967296
+        i = i + 1
+    WEND
+    RETURN checksum
+END FUNCTION
+
+FUNCTION AexValidateOneIntegrityRecord(buffer AS MMIOPTR, integrityEntry AS MMIOPTR, fileLength AS U64) AS U32
+    LET integrityID AS U32 = AexReadEntryChunkID(integrityEntry)
+    LET integrityLogicalLength AS U64 = AexReadEntryLogicalLength(integrityEntry)
+    LET fixedSize AS U64 = AexIntegrityFixedSize()
+    IF integrityLogicalLength < fixedSize THEN
+        RETURN AexErrorIntegrityOutOfBounds()
+    END IF
+
+    LET integrityOffset AS U64 = AexReadEntryOffset(integrityEntry)
+    LET integrityData AS MMIOPTR = ADDRESS.Offset(buffer, integrityOffset)
+    IF AexReadIntegrityID(integrityData) <> integrityID THEN
+        RETURN AexErrorIntegrityInvalid()
+    END IF
+    IF AexReadIntegrityAlgorithm(integrityData) <> AexIntegrityAlgorithmChecksum32() THEN
+        RETURN AexErrorIntegrityInvalid()
+    END IF
+    IF AexReadIntegrityReserved(integrityData) <> 0 THEN
+        RETURN AexErrorIntegrityInvalid()
+    END IF
+
+    LET coveredChunkID AS U32 = AexReadIntegrityCoveredChunkID(integrityData)
+    LET coveredEntry AS MMIOPTR = AexFindChunkByID(buffer, coveredChunkID)
+    IF MEMORY.Read32(AexFindChunkFoundAddress()) = 0 THEN
+        RETURN AexErrorIntegrityInvalid()
+    END IF
+
+    LET coveredStoredLength AS U64 = AexReadEntryStoredLength(coveredEntry)
+    IF AexReadIntegrityCoveredLength(integrityData) <> coveredStoredLength THEN
+        RETURN AexErrorIntegrityInvalid()
+    END IF
+
+    LET coveredOffset AS U64 = AexReadEntryOffset(coveredEntry)
+    LET coveredData AS MMIOPTR = ADDRESS.Offset(buffer, coveredOffset)
+    LET actual AS U64 = AexChecksum32(coveredData, coveredStoredLength)
+    LET expected AS U64 = AexReadIntegrityExpectedChecksum32(integrityData)
+    IF actual <> expected THEN
+        RETURN AexErrorIntegrityMismatch()
+    END IF
+
+    RETURN AexErrorOk()
+END FUNCTION
+
+FUNCTION AexIntegrityRecordCoversChunk(buffer AS MMIOPTR, chunkID AS U32) AS BOOL
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+    WHILE index < dirCount
+        LET entry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+        LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+        IF typeHigh = AexTypeIntegrityHigh() THEN
+            IF typeLow = AexTypeIntegrityLow() THEN
+                LET integrityOffset AS U64 = AexReadEntryOffset(entry)
+                LET integrityData AS MMIOPTR = ADDRESS.Offset(buffer, integrityOffset)
+                IF AexReadIntegrityCoveredChunkID(integrityData) = chunkID THEN
+                    RETURN 1
+                END IF
+            END IF
+        END IF
+        index = index + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AEX.VerifyIntegrity(buffer AS MMIOPTR, fileLength AS U64) AS U32
+    LET dirOffset AS U64 = AexReadDirectoryOffset(buffer)
+    LET dirCount AS U32 = AexReadDirectoryCount(buffer)
+    LET index AS U32 = 0
+    WHILE index < dirCount
+        LET entry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, index)
+        LET typeHigh AS U64 = AexReadEntryTypeHigh(entry)
+        LET typeLow AS U64 = AexReadEntryTypeLow(entry)
+        IF typeHigh = AexTypeIntegrityHigh() THEN
+            IF typeLow = AexTypeIntegrityLow() THEN
+                LET integrityResult AS U32 = AexValidateOneIntegrityRecord(buffer, entry, fileLength)
+                IF integrityResult <> AexErrorOk() THEN
+                    RETURN integrityResult
+                END IF
+            END IF
+        END IF
+        index = index + 1
+    WEND
+
+    LET codeIndex AS U32 = 0
+    WHILE codeIndex < dirCount
+        LET codeEntry AS MMIOPTR = AexDirectoryEntryAddress(buffer, dirOffset, codeIndex)
+        LET codeTypeHigh AS U64 = AexReadEntryTypeHigh(codeEntry)
+        LET codeTypeLow AS U64 = AexReadEntryTypeLow(codeEntry)
+        IF codeTypeHigh = AexTypeCodeHigh() THEN
+            IF codeTypeLow = AexTypeCodeLow() THEN
+                IF AexIntegrityRecordCoversChunk(buffer, AexReadEntryChunkID(codeEntry)) = 0 THEN
+                    RETURN AexErrorIntegrityMissing()
+                END IF
+            END IF
+        END IF
+        codeIndex = codeIndex + 1
+    WEND
+
     RETURN AexErrorOk()
 END FUNCTION

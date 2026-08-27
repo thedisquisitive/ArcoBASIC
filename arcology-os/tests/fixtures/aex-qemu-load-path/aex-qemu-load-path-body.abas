@@ -1,0 +1,368 @@
+' RFC-0046 AEX Phase 14 test body. This is the combined automated QEMU load-path fixture:
+' ArcFS load, metadata validation, native implementation selection, integrity, ABT diagnostics,
+' code/data mapping, lifecycle resolution, and native activation.
+
+FUNCTION SerialByte(value AS U8) AS U64
+    PORT.Write8(PORT.Address(1016), value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialText(a AS U32, b AS U32, c AS U32, d AS U32, e AS U32) AS U64
+    LET aByte AS U8 = a
+    LET bByte AS U8 = b
+    LET cByte AS U8 = c
+    LET dByte AS U8 = d
+    LET eByte AS U8 = e
+    SerialByte(aByte)
+    SerialByte(bByte)
+    SerialByte(cByte)
+    SerialByte(dByte)
+    SerialByte(eByte)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase14SourceAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62914560))   ' 0x3C00000
+END FUNCTION
+FUNCTION AexPhase14LoadedAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62980096))   ' 0x3C10000
+END FUNCTION
+FUNCTION AexPhase14CodeDestAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(63045632))   ' 0x3C20000
+END FUNCTION
+FUNCTION AexPhase14DataDestAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(63111168))   ' 0x3C30000
+END FUNCTION
+FUNCTION AexPhase14NameAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(63176704))   ' 0x3C40000
+END FUNCTION
+
+FUNCTION AexPhase14FileLength() AS U64
+    RETURN 1292
+END FUNCTION
+
+FUNCTION AexPhase14Clear(base AS MMIOPTR, count AS U64) AS U64
+    LET i AS U64 = 0
+    WHILE i < count
+        MEMORY.Write8(ADDRESS.Offset(base, i), 0)
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase14WriteMagic(base AS MMIOPTR) AS U64
+    MEMORY.Write8(ADDRESS.Offset(base, 0), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 1), 82)
+    MEMORY.Write8(ADDRESS.Offset(base, 2), 67)
+    MEMORY.Write8(ADDRESS.Offset(base, 3), 79)
+    MEMORY.Write8(ADDRESS.Offset(base, 4), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 5), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 6), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 7), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase14WriteEntry(index AS U32, chunkID AS U32, typeHigh AS U64, typeLow AS U64, offset AS U64, length AS U64) AS U64
+    LET index64 AS U64 = index
+    LET entry AS MMIOPTR = ADDRESS.Offset(AexPhase14SourceAddress(), 64 + (index64 * 96))
+    MEMORY.Write32(ADDRESS.Offset(entry, 0), chunkID)
+    MEMORY.Write64(ADDRESS.Offset(entry, 4), typeHigh)
+    MEMORY.Write64(ADDRESS.Offset(entry, 12), typeLow)
+    MEMORY.Write32(ADDRESS.Offset(entry, 20), 1)
+    MEMORY.Write64(ADDRESS.Offset(entry, 24), offset)
+    MEMORY.Write64(ADDRESS.Offset(entry, 32), length)
+    MEMORY.Write64(ADDRESS.Offset(entry, 40), length)
+    MEMORY.Write32(ADDRESS.Offset(entry, 48), 8)
+    MEMORY.Write32(ADDRESS.Offset(entry, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase14WriteHeaderAndDirectory() AS U64
+    LET base AS MMIOPTR = AexPhase14SourceAddress()
+    AexPhase14Clear(base, 1536)
+    AexPhase14WriteMagic(base)
+    MEMORY.Write32(ADDRESS.Offset(base, 8), 65536)
+    MEMORY.Write32(ADDRESS.Offset(base, 12), 64)
+    MEMORY.Write64(ADDRESS.Offset(base, 16), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(base, 24), 2459565876494606882)
+    MEMORY.Write64(ADDRESS.Offset(base, 32), 64)
+    MEMORY.Write32(ADDRESS.Offset(base, 40), 9)
+    MEMORY.Write32(ADDRESS.Offset(base, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(base, 48), 0)
+
+    AexPhase14WriteEntry(0, 1, AexTypeManifestHigh(), AexTypeManifestLow(), 928, 80)
+    AexPhase14WriteEntry(1, 2, AexTypeComponentHigh(), AexTypeComponentLow(), 1008, 48)
+    AexPhase14WriteEntry(2, 10, AexTypeImplementationHigh(), AexTypeImplementationLow(), 1056, 40)
+    AexPhase14WriteEntry(3, 22, AexTypeLifecycleHigh(), AexTypeLifecycleLow(), 1096, 16)
+    AexPhase14WriteEntry(4, 30, AexTypeCodeHigh(), AexTypeCodeLow(), 1112, 8)
+    AexPhase14WriteEntry(5, 31, AexTypeDataHigh(), AexTypeDataLow(), 1120, 8)
+    AexPhase14WriteEntry(6, 90, AexTypeIntegrityHigh(), AexTypeIntegrityLow(), 1128, 32)
+    AexPhase14WriteEntry(7, 95, AexTypeArcoBindingHigh(), AexTypeArcoBindingLow(), 1160, 56)
+    AexPhase14WriteEntry(8, 100, AexTypeDiagnosticHigh(), AexTypeDiagnosticLow(), 1216, 76)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase14WriteName() AS U64
+    LET name AS MMIOPTR = AexPhase14NameAddress()
+    MEMORY.Write8(ADDRESS.Offset(name, 0), 113)
+    MEMORY.Write8(ADDRESS.Offset(name, 1), 101)
+    MEMORY.Write8(ADDRESS.Offset(name, 2), 109)
+    MEMORY.Write8(ADDRESS.Offset(name, 3), 117)
+    MEMORY.Write8(ADDRESS.Offset(name, 4), 46)
+    MEMORY.Write8(ADDRESS.Offset(name, 5), 97)
+    MEMORY.Write8(ADDRESS.Offset(name, 6), 101)
+    MEMORY.Write8(ADDRESS.Offset(name, 7), 120)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase14WriteBinding(offset AS U64) AS U64
+    LET data AS MMIOPTR = ADDRESS.Offset(AexPhase14SourceAddress(), offset)
+    MEMORY.Write32(ADDRESS.Offset(data, 0), 95)
+    MEMORY.Write32(ADDRESS.Offset(data, 4), 2)
+    MEMORY.Write32(ADDRESS.Offset(data, 8), AexBindingKindMethod())
+    MEMORY.Write32(ADDRESS.Offset(data, 12), 10)
+    MEMORY.Write64(ADDRESS.Offset(data, 16), 1229801703532086340)
+    MEMORY.Write64(ADDRESS.Offset(data, 24), 6148933456521300104)
+    MEMORY.Write64(ADDRESS.Offset(data, 32), 0)
+    MEMORY.Write64(ADDRESS.Offset(data, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 52), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase14WriteDiagnostic(offset AS U64) AS U64
+    LET data AS MMIOPTR = ADDRESS.Offset(AexPhase14SourceAddress(), offset)
+    MEMORY.Write32(ADDRESS.Offset(data, 0), 100)
+    MEMORY.Write32(ADDRESS.Offset(data, 4), 2)
+    MEMORY.Write32(ADDRESS.Offset(data, 8), AexDiagnosticKindLifecycle())
+    MEMORY.Write32(ADDRESS.Offset(data, 12), 10)
+    MEMORY.Write32(ADDRESS.Offset(data, 16), 30)
+    MEMORY.Write64(ADDRESS.Offset(data, 20), 0)
+    MEMORY.Write64(ADDRESS.Offset(data, 28), 6)
+    MEMORY.Write64(ADDRESS.Offset(data, 36), 1229801703532086340)
+    MEMORY.Write64(ADDRESS.Offset(data, 44), 6148933456521300104)
+    MEMORY.Write64(ADDRESS.Offset(data, 52), 0)
+    MEMORY.Write64(ADDRESS.Offset(data, 60), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 68), 0)
+    MEMORY.Write32(ADDRESS.Offset(data, 72), 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION AexPhase14WriteFixture() AS U64
+    AexPhase14WriteHeaderAndDirectory()
+    LET base AS MMIOPTR = AexPhase14SourceAddress()
+
+    LET manifest AS MMIOPTR = ADDRESS.Offset(base, 928)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 0), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 8), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 16), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 24), 0)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 28), 3689348814741910323)
+    MEMORY.Write64(ADDRESS.Offset(manifest, 36), 4919131752989213764)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 44), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 48), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 52), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 56), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 60), 2)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 64), 1)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 68), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 72), 0)
+    MEMORY.Write32(ADDRESS.Offset(manifest, 76), 2)
+
+    LET component AS MMIOPTR = ADDRESS.Offset(base, 1008)
+    MEMORY.Write32(ADDRESS.Offset(component, 0), 2)
+    MEMORY.Write64(ADDRESS.Offset(component, 4), 1229782938247303441)
+    MEMORY.Write64(ADDRESS.Offset(component, 12), 2459565876494606882)
+    MEMORY.Write32(ADDRESS.Offset(component, 20), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 28), 1)
+    MEMORY.Write32(ADDRESS.Offset(component, 32), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 36), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 40), 0)
+    MEMORY.Write32(ADDRESS.Offset(component, 44), 10)
+
+    LET impl AS MMIOPTR = ADDRESS.Offset(base, 1056)
+    MEMORY.Write32(ADDRESS.Offset(impl, 0), 2)
+    MEMORY.Write32(ADDRESS.Offset(impl, 4), AexImplTypeNative())
+    MEMORY.Write32(ADDRESS.Offset(impl, 8), AexArchX86_64())
+    MEMORY.Write32(ADDRESS.Offset(impl, 12), AexAbiNativeMajorCurrent())
+    MEMORY.Write32(ADDRESS.Offset(impl, 16), AexAbiNativeMinorCurrent())
+    MEMORY.Write64(ADDRESS.Offset(impl, 20), 0)
+    MEMORY.Write32(ADDRESS.Offset(impl, 28), 7)
+    MEMORY.Write32(ADDRESS.Offset(impl, 32), 30)
+    MEMORY.Write32(ADDRESS.Offset(impl, 36), 31)
+
+    LET lifecycle AS MMIOPTR = ADDRESS.Offset(base, 1096)
+    MEMORY.Write32(ADDRESS.Offset(lifecycle, 0), 2)
+    MEMORY.Write32(ADDRESS.Offset(lifecycle, 4), 10)
+    MEMORY.Write64(ADDRESS.Offset(lifecycle, 8), 0)
+
+    MEMORY.Write8(ADDRESS.Offset(base, 1112), 184)
+    MEMORY.Write8(ADDRESS.Offset(base, 1113), 42)
+    MEMORY.Write8(ADDRESS.Offset(base, 1114), 0)
+    MEMORY.Write8(ADDRESS.Offset(base, 1115), 0)
+    MEMORY.Write8(ADDRESS.Offset(base, 1116), 0)
+    MEMORY.Write8(ADDRESS.Offset(base, 1117), 195)
+    MEMORY.Write8(ADDRESS.Offset(base, 1118), 204)
+    MEMORY.Write8(ADDRESS.Offset(base, 1119), 204)
+
+    MEMORY.Write8(ADDRESS.Offset(base, 1120), 65)
+    MEMORY.Write8(ADDRESS.Offset(base, 1121), 69)
+    MEMORY.Write8(ADDRESS.Offset(base, 1122), 88)
+    MEMORY.Write8(ADDRESS.Offset(base, 1123), 81)
+    MEMORY.Write8(ADDRESS.Offset(base, 1124), 49)
+    MEMORY.Write8(ADDRESS.Offset(base, 1125), 52)
+    MEMORY.Write8(ADDRESS.Offset(base, 1126), 0)
+    MEMORY.Write8(ADDRESS.Offset(base, 1127), 0)
+
+    LET integrity AS MMIOPTR = ADDRESS.Offset(base, 1128)
+    MEMORY.Write32(ADDRESS.Offset(integrity, 0), 90)
+    MEMORY.Write32(ADDRESS.Offset(integrity, 4), AexIntegrityAlgorithmChecksum32())
+    MEMORY.Write32(ADDRESS.Offset(integrity, 8), 30)
+    MEMORY.Write32(ADDRESS.Offset(integrity, 12), 829)
+    MEMORY.Write64(ADDRESS.Offset(integrity, 16), 8)
+    MEMORY.Write32(ADDRESS.Offset(integrity, 24), 0)
+    MEMORY.Write32(ADDRESS.Offset(integrity, 28), 0)
+
+    AexPhase14WriteBinding(1160)
+    AexPhase14WriteDiagnostic(1216)
+    RETURN 0
+END FUNCTION
+
+FUNCTION RunQemuLoadPath() AS BOOL
+    AexPhase14WriteFixture()
+    AexPhase14WriteName()
+    IF ArcFS.Initialize() = 0 THEN
+        RETURN 0
+    END IF
+    LET oid AS U64 = ArcFS.CreateFile(1, AexPhase14NameAddress(), 8)
+    IF oid = 0 THEN
+        RETURN 0
+    END IF
+    LET handle AS U64 = ArcFS.OpenHandle(oid)
+    IF handle = 0 THEN
+        RETURN 0
+    END IF
+    LET wrote AS U64 = ArcFS.HandleWrite(handle, AexPhase14SourceAddress(), AexPhase14FileLength(), 0)
+    ArcFS.CloseHandle(handle)
+    IF wrote <> AexPhase14FileLength() THEN
+        RETURN 0
+    END IF
+
+    AexPhase14Clear(AexPhase14LoadedAddress(), 1536)
+    LET loaded AS U64 = AEX.LoadFromArcFS(oid, AexPhase14LoadedAddress())
+    IF loaded <> AexPhase14FileLength() THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateHeader(AexPhase14LoadedAddress(), loaded) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateDirectory(AexPhase14LoadedAddress(), loaded) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateManifest(AexPhase14LoadedAddress(), loaded) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF AEX.SelectImplementation(AexPhase14LoadedAddress(), 2, loaded) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(AexSelectedImplementationIDAddress()) <> 10 THEN
+        RETURN 0
+    END IF
+    IF AEX.ValidateMemoryPolicies(AexPhase14LoadedAddress(), loaded) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF AEX.VerifyIntegrity(AexPhase14LoadedAddress(), loaded) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF AEX.RegisterArcoBindings(AexPhase14LoadedAddress(), loaded) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(AexBindingRegistryCountAddress()) <> 1 THEN
+        RETURN 0
+    END IF
+    IF AEX.RegisterDiagnostics(AexPhase14LoadedAddress(), loaded) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read32(AexDiagnosticRegistryCountAddress()) <> 1 THEN
+        RETURN 0
+    END IF
+    IF AEX.MapCodeChunk(AexPhase14LoadedAddress(), 30, AexPhase14CodeDestAddress(), 16) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF AEX.MapDataChunk(AexPhase14LoadedAddress(), 31, AexPhase14DataDestAddress(), 16) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(AexPhase14DataDestAddress()) <> 65 THEN
+        RETURN 0
+    END IF
+    IF MEMORY.Read8(ADDRESS.Offset(AexPhase14DataDestAddress(), 5)) <> 52 THEN
+        RETURN 0
+    END IF
+    IF AEX.ResolveLifecycleEntry(AexPhase14LoadedAddress(), 10, loaded) <> AexErrorOk() THEN
+        RETURN 0
+    END IF
+    CPU.MemoryBarrier
+    LET result AS U64 = AEX.InvokeResolvedLifecycle0(AexPhase14CodeDestAddress())
+    IF result <> 42 THEN
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION ReportCase(label0 AS U32, label1 AS U32, label2 AS U32, label3 AS U32, label4 AS U32, ok AS BOOL) AS U64
+    SerialText(label0, label1, label2, label3, label4)
+    IF ok = 1 THEN
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+    ELSE
+        SerialByte(58)
+        SerialByte(32)
+        SerialByte(70)
+        SerialByte(65)
+        SerialByte(73)
+        SerialByte(76)
+    END IF
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    LET ok AS BOOL = RunQemuLoadPath()
+    ReportCase(76, 79, 65, 68, 32, ok)
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(32)
+    IF ok = 1 THEN
+        SerialByte(65)
+        SerialByte(76)
+        SerialByte(76)
+        SerialByte(80)
+        SerialByte(65)
+        SerialByte(83)
+        SerialByte(83)
+        SerialByte(13)
+        SerialByte(10)
+        RETURN 0
+    END IF
+    SerialByte(83)
+    SerialByte(79)
+    SerialByte(77)
+    SerialByte(69)
+    SerialByte(70)
+    SerialByte(65)
+    SerialByte(73)
+    SerialByte(76)
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 1
+END FUNCTION

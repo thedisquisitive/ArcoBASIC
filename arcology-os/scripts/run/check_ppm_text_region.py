@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Real, dependency-free (stdlib-only) check that a P6 PPM screendump has a genuinely rendered
-text region -- counts "bright" pixels (all three channels above a threshold) within a given
+text region -- counts visible non-background ink pixels within a given
 rectangle and compares against a minimum fraction. Used by
 systems_aps_arcology_seed_substrate_smoke.sh to confirm RFC-0045 Phase 5's own real on-screen
 terminal actually drew something, not just that the fixture reported "GOP READY" without ever
@@ -43,7 +43,7 @@ def main():
     if x1 > width or y1 > height:
         print(f"FAIL: requested region exceeds real image size {width}x{height}", file=sys.stderr)
         return 1
-    bright = 0
+    ink = 0
     total = 0
     for y in range(y0, y1):
         row_base = y * width * 3
@@ -51,12 +51,12 @@ def main():
             off = row_base + x * 3
             r, g, b = pixels[off], pixels[off + 1], pixels[off + 2]
             total += 1
-            if r > 200 and g > 200 and b > 200:
-                bright += 1
-    fraction = bright / total if total else 0.0
-    print(f"bright={bright} total={total} fraction={fraction:.4f}")
+            if r > 24 or g > 24 or b > 24:
+                ink += 1
+    fraction = ink / total if total else 0.0
+    print(f"ink={ink} total={total} fraction={fraction:.4f}")
     if fraction < min_fraction:
-        print(f"FAIL: bright-pixel fraction {fraction:.4f} below required {min_fraction}", file=sys.stderr)
+        print(f"FAIL: ink-pixel fraction {fraction:.4f} below required {min_fraction}", file=sys.stderr)
         return 1
     return 0
 

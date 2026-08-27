@@ -1034,6 +1034,9 @@ private:
             if (name == "ADDRESS.MMIO") return "MMIOPTR";
             if (name == "ADDRESS.VALUE") return "U64";
             if (name == "ADDRESS.LOCAL") return "PTR";
+            if (name == "ADDRESS.OFFSET" || name == "ADDRESS.ALIGNUP" || name == "ADDRESS.ALIGNDOWN") {
+                return node.children.empty() ? expected : type_of_expression(*node.children.front(), expected);
+            }
             if (name == "MEMORY.MAP") return "VIRTUALPTR";
             if (name == "MEMORY.MAPDEVICE") return "MMIOPTR";
             if (name == "GRAPHICS.PRIMARYSURFACE") return "SURFACE";
@@ -1043,6 +1046,7 @@ private:
             if (name == "MEMORY.READ32") return "U32";
             if (name == "MEMORY.READ64") return "U64";
             if (name == "MEMORY.ISALIGNED") return "BOOL";
+            if (name == "AEX.INVOKENATIVE0" || name == "AEX.INVOKENATIVE1") return "U64";
             return "";
         }
         return expected;
@@ -1395,6 +1399,22 @@ private:
                     if (name == "GRAPHICS.DESTROYSURFACE") call.ownership = "Consumed";
                     else call.ownership = "Borrowed";
                     current_block(function).instructions.push_back(std::move(call));
+                    return result;
+                }
+                if (name == "AEX.INVOKENATIVE0" || name == "AEX.InvokeNative0") {
+                    if (node.children.size() != 1 || type_of_expression(*node.children.front()) != "MMIOPTR") {
+                        report_integer_error("AEX.InvokeNative0 expects one MMIOPTR entry address");
+                    }
+                    const std::string result = temp();
+                    current_block(function).instructions.push_back(amir_memory("AEXINVOKENATIVE0", result, std::move(args), "U64", {"MMIOPTR"}));
+                    return result;
+                }
+                if (name == "AEX.INVOKENATIVE1" || name == "AEX.InvokeNative1") {
+                    if (node.children.size() != 2 || type_of_expression(*node.children[0]) != "MMIOPTR" || type_of_expression(*node.children[1], "U64") != "U64") {
+                        report_integer_error("AEX.InvokeNative1 expects an MMIOPTR entry address and one U64 argument");
+                    }
+                    const std::string result = temp();
+                    current_block(function).instructions.push_back(amir_memory("AEXINVOKENATIVE1", result, std::move(args), "U64", {"MMIOPTR", "U64"}));
                     return result;
                 }
                 if (op.rfind("ADDRESS.", 0) == 0) op = op.substr(8);
@@ -4914,6 +4934,20 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     const int surface_offset = scratch_base + 24;
                     if (surface_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(surface_offset), Reg::RAX);
                     else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(surface_offset), Reg::RAX);
+                    break;
+                }
+                if (op == "AEXINVOKENATIVE0") {
+                    if (instruction.operands.size() != 1 || !load_value(instruction.operands[0], "MMIOPTR", Reg::RAX)) return result;
+                    result.text.call_reg(Reg::RAX);
+                    if (!store_result(instruction.result, "U64")) return result;
+                    break;
+                }
+                if (op == "AEXINVOKENATIVE1") {
+                    if (instruction.operands.size() != 2) { result.ok = false; result.error = "malformed AEX native1 invocation"; return result; }
+                    if (!load_value(instruction.operands[1], "U64", Reg::RCX)) return result;
+                    if (!load_value(instruction.operands[0], "MMIOPTR", Reg::RAX)) return result;
+                    result.text.call_reg(Reg::RAX);
+                    if (!store_result(instruction.result, "U64")) return result;
                     break;
                 }
                 if (op == "LOCAL") {
