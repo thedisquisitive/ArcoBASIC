@@ -13,9 +13,15 @@
 ' calls through this contract -- the addendum's own explicit acceptance requirement for "remaining
 ' N0 work" (Section 11).
 '
-' Transmit/Receive are deliberately NOT exposed yet: virtqueue setup and frame ownership are the
-' next real increment (RFC-0048 Section 6.1's own ownership requirement applies there), not
-' implemented ahead of that proof. Start/Stop/GetCapabilities/GetMAC/GetLinkState are real today.
+' Transmit/receive are now real too (RFC-0048 Section 6.1's own explicit ownership requirement is
+' implemented in the backend -- see virtio_net_policy.abas's own header comment -- and exposed
+' here behind the same generic boundary as everything else). A caller never touches a virtqueue,
+' descriptor, or the backend's own state layout directly: SetupReceive/SetupTransmit bring the two
+' queues up, Transmit publishes a frame, PollReceive/PollTransmitComplete check for a completion
+' (non-blocking -- the caller owns its own bounded retry loop, matching this project's established
+' busy-wait idiom), and ReceiveBufferAddress/ReceiveHeaderSize let a caller read a received frame
+' without needing to know the backend's own wire-format header size (virtio-net's real 10-byte
+' virtio_net_hdr) is even virtio-specific -- a future second backend reports its own real value.
 
 #PROFILE UEFI
 #TARGET X86_64
@@ -77,4 +83,82 @@ FUNCTION NetworkInterface.GetLinkState(backendTag AS U32) AS U32
         RETURN VirtioNet.LinkState()
     END IF
     RETURN 2
+END FUNCTION
+
+' Brings the receive queue up and posts its one real buffer. Ownership of that buffer transfers to
+' the device as part of this call -- see virtio_net_policy.abas's own ownership discussion.
+FUNCTION NetworkInterface.SetupReceive(backendTag AS U32, systemTable AS UEFI.SystemTable) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET rxState AS MMIOPTR = VirtioNetRxQueueStateAddress()
+        LET setup AS BOOL = VirtioNet.SetupQueue(systemTable, 0, rxState)
+        IF setup = 0 THEN
+            RETURN 0
+        END IF
+        RETURN VirtioNet.PostRxBuffer(rxState)
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Brings the transmit queue up. No buffer is published until NetworkInterface.Transmit is called.
+FUNCTION NetworkInterface.SetupTransmit(backendTag AS U32, systemTable AS UEFI.SystemTable) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET txState AS MMIOPTR = VirtioNetTxQueueStateAddress()
+        RETURN VirtioNet.SetupQueue(systemTable, 1, txState)
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Publishes frameAddr/frameLen for transmission. Ownership of that memory transfers to the device
+' at this call -- the caller MUST NOT touch it again until NetworkInterface.PollTransmitComplete
+' reports it back.
+FUNCTION NetworkInterface.Transmit(backendTag AS U32, frameAddr AS MMIOPTR, frameLen AS U32) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET txState AS MMIOPTR = VirtioNetTxQueueStateAddress()
+        RETURN VirtioNet.TransmitFrame(txState, frameAddr, frameLen)
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Non-blocking check: TRUE and outLen written if the device has returned the transmitted buffer.
+' Callers own their own bounded polling loop, never blocking indefinitely inside this function.
+FUNCTION NetworkInterface.PollTransmitComplete(backendTag AS U32, outLen AS PTR) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET txState AS MMIOPTR = VirtioNetTxQueueStateAddress()
+        RETURN VirtioNet.TryConsumeUsed(txState, outLen)
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Non-blocking check: TRUE and outLen written if a frame has arrived. Ownership of the receive
+' buffer returns to the caller at this point -- see NetworkInterface.ReceiveBufferAddress to read
+' it, and NetworkInterface.SetupReceive again to re-post it for a future receive.
+FUNCTION NetworkInterface.PollReceive(backendTag AS U32, outLen AS PTR) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET rxState AS MMIOPTR = VirtioNetRxQueueStateAddress()
+        RETURN VirtioNet.TryConsumeUsed(rxState, outLen)
+    END IF
+    RETURN 0
+END FUNCTION
+
+' The real address of the receive queue's one buffer -- valid to read only after
+' NetworkInterface.PollReceive has reported a completion. Includes the backend's own real wire-
+' format header (see NetworkInterface.ReceiveHeaderSize); the actual frame begins after that many
+' bytes.
+FUNCTION NetworkInterface.ReceiveBufferAddress(backendTag AS U32) AS MMIOPTR
+    IF backendTag = NetBackendVirtio() THEN
+        LET rxState AS MMIOPTR = VirtioNetRxQueueStateAddress()
+        LET bufPhys AS U64 = MEMORY.Read64(VirtioNetQueueBufPhysAddrField(rxState))
+        RETURN ADDRESS.MMIO(ADDRESS.Virtual(bufPhys))
+    END IF
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(0))
+END FUNCTION
+
+' Real, backend-reported byte count a caller must skip at the start of a received buffer before
+' the actual Ethernet frame begins -- VirtIO-net's own real 10-byte virtio_net_hdr today. A future
+' second backend reports its own real value here; callers never hardcode this.
+FUNCTION NetworkInterface.ReceiveHeaderSize(backendTag AS U32) AS U32
+    IF backendTag = NetBackendVirtio() THEN
+        RETURN 10
+    END IF
+    RETURN 0
 END FUNCTION

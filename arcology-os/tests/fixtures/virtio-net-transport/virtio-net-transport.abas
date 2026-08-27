@@ -266,6 +266,228 @@ FUNCTION VirtioNet.LinkState() AS U32
     RETURN 0
 END FUNCTION
 
+FUNCTION VirtioNetRxQueueStateAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 512)
+END FUNCTION
+FUNCTION VirtioNetTxQueueStateAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 576)
+END FUNCTION
+
+FUNCTION VirtioNetQueuePhysAddrField(base AS MMIOPTR) AS MMIOPTR
+    RETURN base
+END FUNCTION
+FUNCTION VirtioNetQueueMmioValueField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 8)
+END FUNCTION
+FUNCTION VirtioNetQueueSizeField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 16)
+END FUNCTION
+FUNCTION VirtioNetQueueUsedOffsetField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 20)
+END FUNCTION
+FUNCTION VirtioNetQueueLastUsedIdxField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 24)
+END FUNCTION
+FUNCTION VirtioNetQueueNextAvailIdxField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 28)
+END FUNCTION
+FUNCTION VirtioNetQueueBufPhysAddrField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 32)
+END FUNCTION
+FUNCTION VirtioNetQueueBufMmioValueField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 40)
+END FUNCTION
+
+FUNCTION VirtioNet.SetupQueue(systemTable AS UEFI.SystemTable, queueIndex AS U32, stateBase AS MMIOPTR) AS BOOL
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET selectPortNum AS U16 = ioBase + 14
+    LET selectPort AS IOPORT = PORT.Address(selectPortNum)
+    LET queueIndexU16 AS U16 = queueIndex
+    PORT.WriteWord(selectPort, queueIndexU16)
+
+    LET sizePortNum AS U16 = ioBase + 12
+    LET sizePort AS IOPORT = PORT.Address(sizePortNum)
+    LET queueSize16 AS U16 = PORT.ReadWord(sizePort)
+    LET queueSize AS U32 = queueSize16
+    IF queueSize = 0 THEN
+        RETURN 0
+    END IF
+    IF queueSize > 1024 THEN
+        RETURN 0
+    END IF
+
+    LET descBytes AS U32 = queueSize * 16
+    LET availBytes AS U32 = 4 + (queueSize * 2)
+    LET unalignedUsedOffset AS U32 = descBytes + availBytes
+    LET alignedUsedOffset AS U32 = ((unalignedUsedOffset + 4095) \ 4096) * 4096
+    LET usedBytes AS U32 = 4 + (queueSize * 8)
+    LET totalBytes AS U32 = alignedUsedOffset + usedBytes
+    LET pagesNeeded AS U32 = (totalBytes + 4095) \ 4096
+
+    LET queuePhys AS U64 = 0
+    LET queuePhysAddr AS PTR = ADDRESS.Local(queuePhys)
+    LET pagesNeededU64 AS U64 = pagesNeeded
+    LET allocStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, pagesNeededU64, queuePhysAddr)
+    IF allocStatus <> 0 THEN
+        RETURN 0
+    END IF
+
+    LET queueMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(queuePhys))
+    LET zeroTotalBytes AS U32 = pagesNeeded * 4096
+    LET qwordIndex AS U32 = 0
+    WHILE (qwordIndex * 8) < zeroTotalBytes
+        MEMORY.Write64(ADDRESS.Offset(queueMmio, qwordIndex * 8), 0)
+        qwordIndex = qwordIndex + 1
+    WEND
+
+    MEMORY.Write64(VirtioNetQueuePhysAddrField(stateBase), queuePhys)
+    LET queueMmioValue AS U64 = ADDRESS.Value(queueMmio)
+    MEMORY.Write64(VirtioNetQueueMmioValueField(stateBase), queueMmioValue)
+    MEMORY.Write32(VirtioNetQueueSizeField(stateBase), queueSize)
+    MEMORY.Write32(VirtioNetQueueUsedOffsetField(stateBase), alignedUsedOffset)
+    MEMORY.Write32(VirtioNetQueueLastUsedIdxField(stateBase), 0)
+    MEMORY.Write32(VirtioNetQueueNextAvailIdxField(stateBase), 0)
+
+    LET pfn64 AS U64 = queuePhys SHR 12
+    LET pfn32 AS U32 = pfn64
+    LET addrPortNum AS U16 = ioBase + 8
+    LET addrPort AS IOPORT = PORT.Address(addrPortNum)
+    PORT.WriteDWord(addrPort, pfn32)
+
+    LET bufPhys AS U64 = 0
+    LET bufPhysAddr AS PTR = ADDRESS.Local(bufPhys)
+    LET bufAllocStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 1, bufPhysAddr)
+    IF bufAllocStatus <> 0 THEN
+        RETURN 0
+    END IF
+    LET bufMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(bufPhys))
+    LET bufZeroIndex AS U32 = 0
+    WHILE (bufZeroIndex * 8) < 4096
+        MEMORY.Write64(ADDRESS.Offset(bufMmio, bufZeroIndex * 8), 0)
+        bufZeroIndex = bufZeroIndex + 1
+    WEND
+    MEMORY.Write64(VirtioNetQueueBufPhysAddrField(stateBase), bufPhys)
+    LET bufMmioValue AS U64 = ADDRESS.Value(bufMmio)
+    MEMORY.Write64(VirtioNetQueueBufMmioValueField(stateBase), bufMmioValue)
+
+    RETURN 1
+END FUNCTION
+
+FUNCTION VirtioNet.PostRxBuffer(stateBase AS MMIOPTR) AS BOOL
+    LET queueMmioValue AS U64 = MEMORY.Read64(VirtioNetQueueMmioValueField(stateBase))
+    LET queueMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(queueMmioValue))
+    LET bufPhys AS U64 = MEMORY.Read64(VirtioNetQueueBufPhysAddrField(stateBase))
+    LET queueSize AS U32 = MEMORY.Read32(VirtioNetQueueSizeField(stateBase))
+    LET availOffset AS U32 = queueSize * 16
+
+    MEMORY.Write64(queueMmio, bufPhys)
+    MEMORY.Write32(ADDRESS.Offset(queueMmio, 8), 2048)
+    LET writeFlag AS U16 = 2
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, 12), writeFlag)
+    LET zeroU16 AS U16 = 0
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, 14), zeroU16)
+
+    LET nextAvailIdx AS U32 = MEMORY.Read32(VirtioNetQueueNextAvailIdxField(stateBase))
+    LET ringSlot AS U32 = nextAvailIdx MOD queueSize
+    LET descIndexU16 AS U16 = 0
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, availOffset + 4 + (ringSlot * 2)), descIndexU16)
+
+    CPU.MemoryBarrier
+
+    LET newAvailIdx AS U32 = nextAvailIdx + 1
+    LET newAvailIdxU16 AS U16 = newAvailIdx
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, availOffset + 2), newAvailIdxU16)
+    MEMORY.Write32(VirtioNetQueueNextAvailIdxField(stateBase), newAvailIdx)
+
+    CPU.MemoryBarrier
+
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET notifyPortNum AS U16 = ioBase + 16
+    LET notifyPort AS IOPORT = PORT.Address(notifyPortNum)
+    LET rxQueueIndexU16 AS U16 = 0
+    PORT.WriteWord(notifyPort, rxQueueIndexU16)
+
+    RETURN 1
+END FUNCTION
+
+FUNCTION VirtioNet.TransmitFrame(stateBase AS MMIOPTR, frameAddr AS MMIOPTR, frameLen AS U32) AS BOOL
+    LET queueMmioValue AS U64 = MEMORY.Read64(VirtioNetQueueMmioValueField(stateBase))
+    LET queueMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(queueMmioValue))
+    LET bufPhys AS U64 = MEMORY.Read64(VirtioNetQueueBufPhysAddrField(stateBase))
+    LET bufMmioValue AS U64 = MEMORY.Read64(VirtioNetQueueBufMmioValueField(stateBase))
+    LET bufMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(bufMmioValue))
+    LET queueSize AS U32 = MEMORY.Read32(VirtioNetQueueSizeField(stateBase))
+    LET availOffset AS U32 = queueSize * 16
+
+    LET hdrIndex AS U32 = 0
+    WHILE hdrIndex < 10
+        MEMORY.Write8(ADDRESS.Offset(bufMmio, hdrIndex), 0)
+        hdrIndex = hdrIndex + 1
+    WEND
+    LET copyIndex AS U32 = 0
+    WHILE copyIndex < frameLen
+        LET frameByte AS U8 = MEMORY.Read8(ADDRESS.Offset(frameAddr, copyIndex))
+        MEMORY.Write8(ADDRESS.Offset(bufMmio, 10 + copyIndex), frameByte)
+        copyIndex = copyIndex + 1
+    WEND
+
+    LET totalLen AS U32 = 10 + frameLen
+
+    MEMORY.Write64(queueMmio, bufPhys)
+    MEMORY.Write32(ADDRESS.Offset(queueMmio, 8), totalLen)
+    LET noFlags AS U16 = 0
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, 12), noFlags)
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, 14), noFlags)
+
+    LET nextAvailIdx AS U32 = MEMORY.Read32(VirtioNetQueueNextAvailIdxField(stateBase))
+    LET ringSlot AS U32 = nextAvailIdx MOD queueSize
+    LET descIndexU16 AS U16 = 0
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, availOffset + 4 + (ringSlot * 2)), descIndexU16)
+
+    CPU.MemoryBarrier
+
+    LET newAvailIdx AS U32 = nextAvailIdx + 1
+    LET newAvailIdxU16 AS U16 = newAvailIdx
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, availOffset + 2), newAvailIdxU16)
+    MEMORY.Write32(VirtioNetQueueNextAvailIdxField(stateBase), newAvailIdx)
+
+    CPU.MemoryBarrier
+
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET notifyPortNum AS U16 = ioBase + 16
+    LET notifyPort AS IOPORT = PORT.Address(notifyPortNum)
+    LET txQueueIndexU16 AS U16 = 1
+    PORT.WriteWord(notifyPort, txQueueIndexU16)
+
+    RETURN 1
+END FUNCTION
+
+FUNCTION VirtioNet.TryConsumeUsed(stateBase AS MMIOPTR, outLen AS PTR) AS BOOL
+    LET queueMmioValue AS U64 = MEMORY.Read64(VirtioNetQueueMmioValueField(stateBase))
+    LET queueMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(queueMmioValue))
+    LET usedOffset AS U32 = MEMORY.Read32(VirtioNetQueueUsedOffsetField(stateBase))
+    LET queueSize AS U32 = MEMORY.Read32(VirtioNetQueueSizeField(stateBase))
+    LET lastUsedIdx AS U32 = MEMORY.Read32(VirtioNetQueueLastUsedIdxField(stateBase))
+    LET lastUsedIdx16 AS U16 = lastUsedIdx
+
+    LET usedIdx16 AS U16 = MEMORY.Read16(ADDRESS.Offset(queueMmio, usedOffset + 2))
+    IF usedIdx16 = lastUsedIdx16 THEN
+        RETURN 0
+    END IF
+
+    CPU.MemoryBarrier
+
+    LET ringSlot AS U32 = lastUsedIdx MOD queueSize
+    LET lenAddr AS MMIOPTR = ADDRESS.Offset(queueMmio, usedOffset + 4 + (ringSlot * 8) + 4)
+    LET consumedLen AS U32 = MEMORY.Read32(lenAddr)
+    MEMORY.Write32(outLen, consumedLen)
+
+    LET newLastUsedIdx AS U32 = lastUsedIdx + 1
+    MEMORY.Write32(VirtioNetQueueLastUsedIdxField(stateBase), newLastUsedIdx)
+
+    RETURN 1
+END FUNCTION
+
 FUNCTION NetBackendVirtio() AS U32
     RETURN 1
 END FUNCTION
@@ -313,6 +535,66 @@ FUNCTION NetworkInterface.GetLinkState(backendTag AS U32) AS U32
         RETURN VirtioNet.LinkState()
     END IF
     RETURN 2
+END FUNCTION
+
+FUNCTION NetworkInterface.SetupReceive(backendTag AS U32, systemTable AS UEFI.SystemTable) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET rxState AS MMIOPTR = VirtioNetRxQueueStateAddress()
+        LET setup AS BOOL = VirtioNet.SetupQueue(systemTable, 0, rxState)
+        IF setup = 0 THEN
+            RETURN 0
+        END IF
+        RETURN VirtioNet.PostRxBuffer(rxState)
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION NetworkInterface.SetupTransmit(backendTag AS U32, systemTable AS UEFI.SystemTable) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET txState AS MMIOPTR = VirtioNetTxQueueStateAddress()
+        RETURN VirtioNet.SetupQueue(systemTable, 1, txState)
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION NetworkInterface.Transmit(backendTag AS U32, frameAddr AS MMIOPTR, frameLen AS U32) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET txState AS MMIOPTR = VirtioNetTxQueueStateAddress()
+        RETURN VirtioNet.TransmitFrame(txState, frameAddr, frameLen)
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION NetworkInterface.PollTransmitComplete(backendTag AS U32, outLen AS PTR) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET txState AS MMIOPTR = VirtioNetTxQueueStateAddress()
+        RETURN VirtioNet.TryConsumeUsed(txState, outLen)
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION NetworkInterface.PollReceive(backendTag AS U32, outLen AS PTR) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET rxState AS MMIOPTR = VirtioNetRxQueueStateAddress()
+        RETURN VirtioNet.TryConsumeUsed(rxState, outLen)
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION NetworkInterface.ReceiveBufferAddress(backendTag AS U32) AS MMIOPTR
+    IF backendTag = NetBackendVirtio() THEN
+        LET rxState AS MMIOPTR = VirtioNetRxQueueStateAddress()
+        LET bufPhys AS U64 = MEMORY.Read64(VirtioNetQueueBufPhysAddrField(rxState))
+        RETURN ADDRESS.MMIO(ADDRESS.Virtual(bufPhys))
+    END IF
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(0))
+END FUNCTION
+
+FUNCTION NetworkInterface.ReceiveHeaderSize(backendTag AS U32) AS U32
+    IF backendTag = NetBackendVirtio() THEN
+        RETURN 10
+    END IF
+    RETURN 0
 END FUNCTION
 
 FUNCTION SerialByte(value AS U8) AS U64
@@ -377,6 +659,253 @@ END FUNCTION
 
 FUNCTION MacBufAddress() AS MMIOPTR
     RETURN ADDRESS.MMIO(ADDRESS.Virtual(62918912))   ' 0x3C01100, clear of the serial decimal scratch region
+END FUNCTION
+
+FUNCTION TxFrameBufAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62919168))   ' 0x3C01200, clear of MacBufAddress's own 6-byte region
+END FUNCTION
+
+' Builds a known 60-byte frame into TxFrameBufAddress(): dst=52:54:00:aa:bb:cc, src=this NIC's own
+' real negotiated MAC, ethertype=0x88B6, payload "ARCOECHO" padded with zero bytes to the real
+' Ethernet minimum payload (46 bytes). The harness independently captures this frame off the wire
+' and verifies it byte-for-byte outside this driver. Split out of Main so Main's own stack frame
+' stays within this backend's supported layout.
+FUNCTION BuildTxFrame() AS MMIOPTR
+    LET txFrameAddr AS MMIOPTR = TxFrameBufAddress()
+    MEMORY.Write8(txFrameAddr, 82)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 1), 84)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 2), 0)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 3), 170)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 4), 187)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 5), 204)
+    LET ownMacBuf AS MMIOPTR = MacBufAddress()
+    LET macIndex AS U32 = 0
+    WHILE macIndex < 6
+        LET macByteVal AS U8 = MEMORY.Read8(ADDRESS.Offset(ownMacBuf, macIndex))
+        MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 6 + macIndex), macByteVal)
+        macIndex = macIndex + 1
+    WEND
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 12), 136)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 13), 182)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 14), 65)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 15), 82)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 16), 67)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 17), 79)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 18), 69)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 19), 67)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 20), 72)
+    MEMORY.Write8(ADDRESS.Offset(txFrameAddr, 21), 79)
+    LET padIndex AS U32 = 22
+    WHILE padIndex < 60
+        MEMORY.Write8(ADDRESS.Offset(txFrameAddr, padIndex), 0)
+        padIndex = padIndex + 1
+    WEND
+    RETURN txFrameAddr
+END FUNCTION
+
+' Transmits the known frame, polls (bounded) for the device to return the buffer via the used
+' ring, and reports TXOK on success. Returns TRUE once the device has confirmed consumption.
+FUNCTION RunTxAndReport() AS BOOL
+    LET txFrameAddr AS MMIOPTR = BuildTxFrame()
+    NetworkInterface.Transmit(NetBackendVirtio(), txFrameAddr, 60)
+
+    LET txLen AS U32 = 0
+    LET txLenAddr AS PTR = ADDRESS.Local(txLen)
+    LET txCeiling AS U64 = 2000000
+    LET txAttempts AS U64 = 0
+    LET txDone AS BOOL = 0
+    WHILE txAttempts < txCeiling
+        IF txDone = 0 THEN
+            LET gotTx AS BOOL = NetworkInterface.PollTransmitComplete(NetBackendVirtio(), txLenAddr)
+            IF gotTx = 1 THEN
+                txDone = 1
+                txAttempts = txCeiling
+            ELSE
+                CPU.Pause
+                txAttempts = txAttempts + 1
+            END IF
+        END IF
+    WEND
+
+    IF txDone = 1 THEN
+        SerialByte(84)
+        SerialByte(88)
+        SerialByte(79)
+        SerialByte(75)
+        SerialByte(13)
+        SerialByte(10)
+    END IF
+    RETURN txDone
+END FUNCTION
+
+' Prints one already-consumed RX buffer's real content: real received length, real destination
+' and source MAC bytes, real EtherType, and the first 8 real payload bytes -- all read directly
+' from the buffer the device just wrote into, past the backend's own real reported header size
+' (this caller never hardcodes VirtIO-net's own 10-byte virtio_net_hdr).
+FUNCTION ReportRxFrame(rxLen AS U32) AS U64
+    LET rxBufMmio AS MMIOPTR = NetworkInterface.ReceiveBufferAddress(NetBackendVirtio())
+    LET headerSize AS U32 = NetworkInterface.ReceiveHeaderSize(NetBackendVirtio())
+    LET ethAddr AS MMIOPTR = ADDRESS.Offset(rxBufMmio, headerSize)
+
+    SerialByte(82)
+    SerialByte(88)
+    SerialByte(79)
+    SerialByte(75)
+    SerialByte(32)
+
+    SerialByte(76)
+    SerialByte(69)
+    SerialByte(78)
+    SerialByte(61)
+    SerialWriteDecimal(rxLen)
+    SerialByte(32)
+
+    SerialByte(68)
+    SerialByte(83)
+    SerialByte(84)
+    SerialByte(61)
+    LET dstIndex AS U32 = 0
+    WHILE dstIndex < 6
+        SerialWriteHexByte(MEMORY.Read8(ADDRESS.Offset(ethAddr, dstIndex)))
+        dstIndex = dstIndex + 1
+    WEND
+    SerialByte(32)
+
+    SerialByte(83)
+    SerialByte(82)
+    SerialByte(67)
+    SerialByte(61)
+    LET srcIndex AS U32 = 0
+    WHILE srcIndex < 6
+        SerialWriteHexByte(MEMORY.Read8(ADDRESS.Offset(ethAddr, 6 + srcIndex)))
+        srcIndex = srcIndex + 1
+    WEND
+    SerialByte(32)
+
+    SerialByte(69)
+    SerialByte(84)
+    SerialByte(61)
+    SerialWriteHexByte(MEMORY.Read8(ADDRESS.Offset(ethAddr, 12)))
+    SerialWriteHexByte(MEMORY.Read8(ADDRESS.Offset(ethAddr, 13)))
+    SerialByte(32)
+
+    SerialByte(80)
+    SerialByte(65)
+    SerialByte(89)
+    SerialByte(61)
+    LET payIndex AS U32 = 0
+    WHILE payIndex < 8
+        SerialWriteHexByte(MEMORY.Read8(ADDRESS.Offset(ethAddr, 14 + payIndex)))
+        payIndex = payIndex + 1
+    WEND
+    SerialByte(13)
+    SerialByte(10)
+    RETURN 0
+END FUNCTION
+
+' Bounded poll for one inbound frame; reports RXOK (with real content, via ReportRxFrame) or
+' RXTIMEOUT. Returns TRUE if a frame was received within the bound.
+FUNCTION RunRxPollAndReport() AS BOOL
+    LET rxLen AS U32 = 0
+    LET rxLenAddr AS PTR = ADDRESS.Local(rxLen)
+    LET rxCeiling AS U64 = 8000000
+    LET rxAttempts AS U64 = 0
+    LET rxDone AS BOOL = 0
+    WHILE rxAttempts < rxCeiling
+        IF rxDone = 0 THEN
+            LET gotRx AS BOOL = NetworkInterface.PollReceive(NetBackendVirtio(), rxLenAddr)
+            IF gotRx = 1 THEN
+                rxDone = 1
+                rxAttempts = rxCeiling
+            ELSE
+                CPU.Pause
+                rxAttempts = rxAttempts + 1
+            END IF
+        END IF
+    WEND
+
+    IF rxDone = 1 THEN
+        ReportRxFrame(rxLen)
+    ELSE
+        SerialByte(82)
+        SerialByte(88)
+        SerialByte(84)
+        SerialByte(73)
+        SerialByte(77)
+        SerialByte(69)
+        SerialByte(79)
+        SerialByte(85)
+        SerialByte(84)
+        SerialByte(13)
+        SerialByte(10)
+    END IF
+    RETURN rxDone
+END FUNCTION
+
+' Sets up both queues, posts the RX buffer, prints the RXREADY marker, then runs the TX proof
+' followed by the bounded RX proof. Split out of Main so Main's own stack frame stays within this
+' backend's supported layout.
+FUNCTION RunQueueProof(systemTable AS UEFI.SystemTable) AS U64
+    LET rxSetup AS BOOL = NetworkInterface.SetupReceive(NetBackendVirtio(), systemTable)
+    LET txSetup AS BOOL = NetworkInterface.SetupTransmit(NetBackendVirtio(), systemTable)
+
+    SerialByte(82)
+    SerialByte(88)
+    SerialByte(81)
+    SerialByte(61)
+    LET rxQueueSize AS U32 = MEMORY.Read32(VirtioNetQueueSizeField(VirtioNetRxQueueStateAddress()))
+    SerialWriteDecimal(rxQueueSize)
+    SerialByte(13)
+    SerialByte(10)
+
+    SerialByte(84)
+    SerialByte(88)
+    SerialByte(81)
+    SerialByte(61)
+    LET txQueueSize AS U32 = MEMORY.Read32(VirtioNetQueueSizeField(VirtioNetTxQueueStateAddress()))
+    SerialWriteDecimal(txQueueSize)
+    SerialByte(13)
+    SerialByte(10)
+
+    IF rxSetup = 0 THEN
+        RETURN 0
+    END IF
+    IF txSetup = 0 THEN
+        RETURN 0
+    END IF
+
+    ' NetworkInterface.SetupReceive already posted the one RX buffer as part of bringing the queue
+    ' up (see its own definition) -- reaching here with rxSetup=1 means it is posted.
+    SerialByte(82)
+    SerialByte(88)
+    SerialByte(80)
+    SerialByte(79)
+    SerialByte(83)
+    SerialByte(84)
+    SerialByte(69)
+    SerialByte(68)
+    SerialByte(61)
+    SerialWriteDecimal(rxSetup)
+    SerialByte(13)
+    SerialByte(10)
+
+    ' Readiness marker: the RX buffer is posted and the device may deliver an inbound frame from
+    ' this point forward. The harness injects its known frame only after seeing this, matching
+    ' this project's own established "wait for a readiness marker, not just socket existence"
+    ' keystroke-injection discipline.
+    SerialByte(82)
+    SerialByte(88)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(65)
+    SerialByte(68)
+    SerialByte(89)
+    SerialByte(13)
+    SerialByte(10)
+
+    RunTxAndReport()
+    RunRxPollAndReport()
+    RETURN 0
 END FUNCTION
 
 FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
@@ -458,6 +987,8 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
         SerialWriteDecimal(link)
         SerialByte(13)
         SerialByte(10)
+
+        RunQueueProof(systemTable)
 
         NetworkInterface.Stop(NetBackendVirtio())
     END IF
