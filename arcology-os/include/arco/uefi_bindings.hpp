@@ -59,7 +59,37 @@ inline std::optional<UefiType> lookup_uefi_type(const std::string& name) {
                 // consistent with this exact layout, cross-checking this new field's own offset.
                 UefiField{"ConsoleIn", "ConIn", 0x30, "UEFI.SimpleTextInputProtocol", false, false, ""},
                 UefiField{"ConsoleOut", "ConOut", 0x40, "UEFI.SimpleTextOutputProtocol", false, false, ""},
+                // EFI_SYSTEM_TABLE.RuntimeServices (offset 0x58, immediately before BootServices'
+                // own already-proven 0x60 -- the same cross-check reasoning ConsoleIn's own header
+                // comment already applies): StandardErrorHandle(8,0x48) + StdErr(8,0x50) +
+                // RuntimeServices(8,0x58) + BootServices(8,0x60). Real motivation: Runtime
+                // Services (unlike Boot Services) are specified to remain callable after
+                // ExitBootServices -- the one candidate mechanism for this project's own
+                // interactive post-ExitBootServices shell to durably request something (e.g. a
+                // display mode) that a future boot should apply, since every Boot-Services-
+                // derived facility this project has (GOP's own QueryMode/SetMode, all block I/O)
+                // has now been confirmed unsafe to call that late.
+                UefiField{"RuntimeServices", "RuntimeServices", 0x58, "UEFI.RuntimeServices", false, false, ""},
                 UefiField{"BootServices", "BootServices", 0x60, "UEFI.BootServices", false, false, ""},
+            },
+        };
+    }
+    // EFI_RUNTIME_SERVICES (MdePkg/Include/Uefi/UefiSpec.h). Only GetVariable/SetVariable are
+    // bound -- this project's own real, scoped need. Real vtable offsets: Hdr(24,0x00) +
+    // GetTime(8,0x18) + SetTime(8,0x20) + GetWakeupTime(8,0x28) + SetWakeupTime(8,0x30) +
+    // SetVirtualAddressMap(8,0x38) + ConvertPointer(8,0x40) + GetVariable(8,0x48) +
+    // GetNextVariableName(8,0x50) + SetVariable(8,0x58). Both are real service-table functions
+    // (no implicit This, matching EFI_BOOT_SERVICES.SetWatchdogTimer's own already-proven shape),
+    // real signatures GetVariable(Name CHAR16*, Guid EFI_GUID*, Attributes OUT U32*, DataSize IN
+    // OUT UINTN*, Data OUT VOID*) and SetVariable(Name CHAR16*, Guid EFI_GUID*, Attributes IN
+    // U32, DataSize IN UINTN, Data IN VOID*) -- both 5 explicit arguments.
+    if (name == "UEFI.RuntimeServices") {
+        return UefiType{
+            "UEFI.RuntimeServices",
+            0x68,
+            {
+                UefiField{"GetVariable", "GetVariable", 0x48, "", true, false, "U64"},
+                UefiField{"SetVariable", "SetVariable", 0x58, "", true, false, "U64"},
             },
         };
     }
@@ -131,11 +161,23 @@ inline std::optional<UefiType> lookup_uefi_type(const std::string& name) {
             },
         };
     }
+    // EFI_GRAPHICS_OUTPUT_PROTOCOL (MdePkg/Include/Protocol/GraphicsOutput.h), real vtable layout:
+    // QueryMode(This, ModeNumber, SizeOfInfo*, Info**) at 0x00, SetMode(This, ModeNumber) at
+    // 0x08, Blt(...) at 0x10 (not bound -- no real consumer yet), Mode* at 0x18. QueryMode/SetMode
+    // are real protocol methods, callable through the same generic CallExternal mechanism
+    // UEFI.PciIoProtocol.GetLocation and UEFI.BlockIoProtocol.ReadBlocks already use (RFC-0048's
+    // networking work needed no new calling-convention codegen for its own protocol methods
+    // either -- this is the same story). Mode itself stays a hand-rolled accessor (UEFI.GOP.*),
+    // matching this file's own established reasoning just below: the generic CallExternal path
+    // only resolves terminal METHOD calls, not the plain (and here, multiply-pointer-chained)
+    // DATA fields Width/Height/etc. ultimately need.
     if (name == "UEFI.GraphicsOutputProtocol") {
         return UefiType{
             "UEFI.GraphicsOutputProtocol",
             32,
             {
+                UefiField{"QueryMode", "QueryMode", 0x00, "", true, true, "U64"},
+                UefiField{"SetMode", "SetMode", 0x08, "", true, true, "U64"},
                 UefiField{"Mode", "Mode", 0x18, "UEFI.GraphicsOutputMode", false, false, ""},
             },
         };

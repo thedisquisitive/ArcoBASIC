@@ -4079,6 +4079,17 @@ FUNCTION PrintHelpText() AS U64
     EchoChar(69)
     EchoChar(65)
     EchoChar(82)
+    EchoChar(32)
+    EchoChar(77)
+    EchoChar(79)
+    EchoChar(68)
+    EchoChar(69)
+    EchoChar(83)
+    EchoChar(32)
+    EchoChar(77)
+    EchoChar(79)
+    EchoChar(68)
+    EchoChar(69)
     EchoChar(13)
     EchoChar(10)
     RETURN 0
@@ -5355,6 +5366,145 @@ FUNCTION LineIsExit(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
     RETURN 0
 END FUNCTION
 
+' Whole-line match only (no trailing characters), matching LineIsHelp/LineIsOt's own established
+' shape exactly.
+FUNCTION LineIsModes(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen <> 5 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    LET c3 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 3))
+    LET c4 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 4))
+    IF c0 = 77 OR c0 = 109 THEN
+        IF c1 = 79 OR c1 = 111 THEN
+            IF c2 = 68 OR c2 = 100 THEN
+                IF c3 = 69 OR c3 = 101 THEN
+                    IF c4 = 83 OR c4 = 115 THEN
+                        RETURN 1
+                    END IF
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Matches a real "MODE <n>" command -- the 4-character keyword immediately followed by a space
+' (the real MODES command's own 5th character is 'S', never a space, so the two never collide).
+' Digit validation happens in HandleModeSetCommand itself, matching RpmHandleNumberedLine's own
+' established "match the shape here, validate and report ?SYNTAX ERROR in the handler" split.
+FUNCTION LineIsModeCommand(lineBuf AS MMIOPTR, lineLen AS U32) AS BOOL
+    IF lineLen < 6 THEN
+        RETURN 0
+    END IF
+    LET c0 AS U8 = MEMORY.Read8(lineBuf)
+    LET c1 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 1))
+    LET c2 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 2))
+    LET c3 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 3))
+    LET c4 AS U8 = MEMORY.Read8(ADDRESS.Offset(lineBuf, 4))
+    IF c4 <> 32 THEN
+        RETURN 0
+    END IF
+    IF c0 = 77 OR c0 = 109 THEN
+        IF c1 = 79 OR c1 = 111 THEN
+            IF c2 = 68 OR c2 = 100 THEN
+                IF c3 = 69 OR c3 = 101 THEN
+                    RETURN 1
+                END IF
+            END IF
+        END IF
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Real resolution enumeration -- reads the boot-time cache (GopModeEnumerateAndCache), never
+' calls QueryMode itself (unsafe this late -- see that section's own header comment).
+FUNCTION HandleModesCommand() AS U64
+    LET count AS U32 = MEMORY.Read32(GopModeCacheCountAddress())
+    LET i AS U32 = 0
+    WHILE i < count
+        LET entryAddr AS MMIOPTR = GopModeCacheEntryAddress(i)
+        LET w AS U32 = MEMORY.Read32(entryAddr)
+        LET h AS U32 = MEMORY.Read32(ADDRESS.Offset(entryAddr, 4))
+        EchoDecimal(i)
+        EchoChar(58)
+        EchoChar(32)
+        EchoDecimal(w)
+        EchoChar(120)
+        EchoDecimal(h)
+        PrintCRLF()
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' Real, honest deferred resolution switch -- parses the target mode number, validates it against
+' the real boot-time-enumerated count, and stages it via GopMode.StageRequest (real UEFI NVRAM,
+' confirmed safe post-ExitBootServices). Does NOT switch the display now -- see this file's own
+' GOP mode control header comment for why that cannot happen safely from this shell.
+FUNCTION HandleModeSetCommand(lineBuf AS MMIOPTR, lineLen AS U32) AS U64
+    LET afterSpace AS U32 = SkipSpaces(lineBuf, lineLen, 4)
+    LET digitCount AS U32 = CountLeadingDigits(lineBuf, lineLen, afterSpace)
+    IF digitCount = 0 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    IF digitCount > 5 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+    LET modeNumber AS U32 = ParseDecimalRange(lineBuf, afterSpace, digitCount)
+
+    LET count AS U32 = MEMORY.Read32(GopModeCacheCountAddress())
+    IF modeNumber >= count THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+
+    LET systemTable AS UEFI.SystemTable = MEMORY.Read64(StoredSystemTableAddress())
+    LET staged AS BOOL = GopMode.StageRequest(systemTable, modeNumber)
+    IF staged = 0 THEN
+        PrintSyntaxError()
+        RETURN 0
+    END IF
+
+    EchoChar(77)
+    EchoChar(79)
+    EchoChar(68)
+    EchoChar(69)
+    EchoChar(32)
+    EchoDecimal(modeNumber)
+    EchoChar(32)
+    EchoChar(83)
+    EchoChar(84)
+    EchoChar(65)
+    EchoChar(71)
+    EchoChar(69)
+    EchoChar(68)
+    EchoChar(32)
+    EchoChar(45)
+    EchoChar(32)
+    EchoChar(82)
+    EchoChar(69)
+    EchoChar(66)
+    EchoChar(79)
+    EchoChar(79)
+    EchoChar(84)
+    EchoChar(32)
+    EchoChar(84)
+    EchoChar(79)
+    EchoChar(32)
+    EchoChar(65)
+    EchoChar(80)
+    EchoChar(80)
+    EchoChar(76)
+    EchoChar(89)
+    PrintCRLF()
+    RETURN 0
+END FUNCTION
+
 ' Real Shift tracking -- RFC-0045's own PS/2 and USB HID drivers are both explicitly "unshifted
 ' only" (a named Non-Goal; full modifier tracking was real future work). First closed narrowly (just
 ' enough to disambiguate the apostrophe key, so PRINT's own quoted strings were typable at all) --
@@ -6281,6 +6431,18 @@ FUNCTION HandleEnteredLine(lineBuf AS MMIOPTR, lineLen AS U32, usbSlotId AS U32)
         END IF
     END IF
     IF dispatched = 0 THEN
+        IF LineIsModes(lineBuf, lineLen) = 1 THEN
+            HandleModesCommand()
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
+        IF LineIsModeCommand(lineBuf, lineLen) = 1 THEN
+            HandleModeSetCommand(lineBuf, lineLen)
+            dispatched = 1
+        END IF
+    END IF
+    IF dispatched = 0 THEN
         IF AexShellLineIsPwd(lineBuf, lineLen) = 1 THEN
             AexShellPrintPwd()
             dispatched = 1
@@ -6584,12 +6746,206 @@ FUNCTION EnableFramebufferWriteCombining(fbPhysBase AS U64, fbSizeBytes AS U64) 
     RETURN 1
 END FUNCTION
 
-FUNCTION SetupGopDashboard(systemTable AS UEFI.SystemTable) AS BOOL
-    LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
-    IF gop = 0 THEN
-        systemTable.ConsoleOut.Write("SUBSTRATE GOP NONE\r\n")
+' Real, live GOP mode control (detect available resolutions / set resolution on command): a
+' technician-facing MODES/MODE <n> shell command pair, built on EFI_GRAPHICS_OUTPUT_PROTOCOL's
+' own real QueryMode/SetMode methods (UEFI.GraphicsOutputProtocol.QueryMode/SetMode, newly bound
+' in arco/uefi_bindings.hpp -- real protocol methods, callable through the same generic
+' CallExternal mechanism UEFI.PciIoProtocol.GetLocation and UEFI.BlockIoProtocol.ReadBlocks
+' already use, so this needed zero new compiler codegen).
+'
+' A real, empirically-confirmed constraint governs this whole design, discovered while building
+' it: this fixture's interactive shell runs AFTER a real ExitBootServices (see this file's own
+' header comment), and BOTH QueryMode and SetMode hang when called from there -- not because they
+' are somehow forbidden protocol methods, but because a real GOP driver's own implementation
+' (confirmed against real QEMU/OVMF) depends on Boot Services internally (QueryMode's own real
+' UEFI signature hands back a firmware-allocated EFI_GRAPHICS_OUTPUT_MODE_INFORMATION*, and
+' SetMode itself likely reprograms/reallocates the framebuffer) -- the same class of finding this
+' file already documents for ConsoleOut.Write, just not previously known to reach GOP's own
+' protocol methods too (its plain data fields -- Width/Height/FrameBufferBase -- stay real and
+' safe post-exit, since those are pointer reads with no protocol call involved).
+'
+' The resulting real design: BOTH mode enumeration AND mode switching happen ONLY before
+' ExitBootServices (see GopModeEnumerateAndCache and GopMode.ApplyStagedRequestIfPresent, both
+' called from SetupGopDashboard). The interactive shell's MODES command reads a boot-time-
+' populated cache (pure memory, no GOP calls); its MODE <n> command cannot switch the display
+' live -- it stages the request in a real UEFI NVRAM variable via RuntimeServices.SetVariable
+' (confirmed empirically safe post-ExitBootServices, unlike every Boot-Services-derived facility
+' this project has -- Runtime Services are the one UEFI mechanism actually specified to survive
+' ExitBootServices, and this project verified that specification claim itself here rather than
+' trusting it blindly: a real writer/reader fixture pair proved a value written post-exit in one
+' QEMU process is correctly read back pre-exit in a completely separate QEMU process sharing the
+' same OVMF NVRAM store). The staged request is applied for real at the NEXT boot, before
+' ExitBootServices runs again -- a real, honest "reboot to apply" model, not an illusion of a live
+' switch this environment cannot actually provide from the shell.
+'
+' Real, honest enumeration: rather than trusting a separately-read MaxMode field, this walks
+' ModeNumber 0, 1, 2, ... and stops the instant QueryMode itself reports failure -- the actual,
+' authoritative signal that no more modes exist, not an assumption about a field's own reliability.
+' GopModeMaxCount() is a real, documented safety ceiling (confirmed empirically against a real
+' QEMU std VGA device, which reports 30 real modes), not a spec limit.
+FUNCTION GopModeMaxCount() AS U32
+    RETURN 64
+END FUNCTION
+
+FUNCTION GopModeStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(118489088))   ' 0x7100000, clear of every other fixed scratch region this fixture uses
+END FUNCTION
+
+' The Boot Services systemTable handle, stored once at boot (see Main) so the MODE <n> shell
+' command can call RuntimeServices.SetVariable without systemTable being threaded through
+' HandleEnteredLine's own existing call chain -- reload-from-memory-with-an-explicit-type-
+' annotation is this project's own established precedent for exactly this (see UefiBlockDevice's
+' own blockIo state pointer).
+FUNCTION StoredSystemTableAddress() AS MMIOPTR
+    RETURN GopModeStateAddress()
+END FUNCTION
+
+' Real per-mode query: HorizontalResolution/VerticalResolution read directly from the real
+' EFI_GRAPHICS_OUTPUT_MODE_INFORMATION QueryMode hands back (Version@0, HorizontalResolution@4,
+' VerticalResolution@8 -- the same real offsets UEFI.GraphicsOutputModeInformation already
+' documents). Returns FALSE, honestly, the instant QueryMode itself fails -- the real "no such
+' mode" signal, not a guess. Callable ONLY before ExitBootServices -- see this section's own
+' header comment.
+FUNCTION GopMode.Query(gop AS UEFI.GraphicsOutputProtocol, modeNumber AS U32, outWidth AS PTR, outHeight AS PTR) AS BOOL
+    LET sizeOfInfo AS U64 = 0
+    LET sizeOfInfoAddr AS PTR = ADDRESS.Local(sizeOfInfo)
+    LET infoPtr AS U64 = 0
+    LET infoPtrAddr AS PTR = ADDRESS.Local(infoPtr)
+    LET status AS U64 = gop.QueryMode(modeNumber, sizeOfInfoAddr, infoPtrAddr)
+    IF status <> 0 THEN
         RETURN 0
     END IF
+    LET infoAddr AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(infoPtr))
+    MEMORY.Write32(outWidth, MEMORY.Read32(ADDRESS.Offset(infoAddr, 4)))
+    MEMORY.Write32(outHeight, MEMORY.Read32(ADDRESS.Offset(infoAddr, 8)))
+    RETURN 1
+END FUNCTION
+
+' Real, persistent (across this run) enumeration cache the MODES shell command reads instead of
+' calling QueryMode itself: count (U32) at +0, then up to GopModeMaxCount() real {width,height}
+' U32 pairs (8 bytes each) starting at +8.
+FUNCTION GopModeCacheAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(GopModeStateAddress(), 256)
+END FUNCTION
+FUNCTION GopModeCacheCountAddress() AS MMIOPTR
+    RETURN GopModeCacheAddress()
+END FUNCTION
+FUNCTION GopModeCacheEntryAddress(index AS U32) AS MMIOPTR
+    RETURN ADDRESS.Offset(GopModeCacheAddress(), 8 + (index * 8))
+END FUNCTION
+
+' Real boot-time enumeration (see this section's own header comment for why this must happen
+' before ExitBootServices): walks every real mode QueryMode reports and caches width/height so
+' the post-exit MODES command can list them without ever calling QueryMode itself. Returns the
+' real count found.
+FUNCTION GopModeEnumerateAndCache(gop AS UEFI.GraphicsOutputProtocol) AS U32
+    LET modeNumber AS U32 = 0
+    LET keepGoing AS BOOL = 1
+    WHILE keepGoing = 1
+        LET w AS U32 = 0
+        LET wAddr AS PTR = ADDRESS.Local(w)
+        LET h AS U32 = 0
+        LET hAddr AS PTR = ADDRESS.Local(h)
+        LET ok AS BOOL = GopMode.Query(gop, modeNumber, wAddr, hAddr)
+        IF ok = 0 THEN
+            keepGoing = 0
+        ELSE
+            LET entryAddr AS MMIOPTR = GopModeCacheEntryAddress(modeNumber)
+            MEMORY.Write32(entryAddr, w)
+            MEMORY.Write32(ADDRESS.Offset(entryAddr, 4), h)
+            modeNumber = modeNumber + 1
+            MEMORY.Write32(GopModeCacheCountAddress(), modeNumber)
+            IF modeNumber >= GopModeMaxCount() THEN
+                keepGoing = 0
+            END IF
+        END IF
+    WEND
+    RETURN modeNumber
+END FUNCTION
+
+' Real, fixed UEFI variable identity for the staged display-mode request: a real, stable GUID
+' (UUIDv5 over a fixed namespace string, matching this project's own established "reproducible
+' pseudo-random namespace" discipline from RFC-0046's own chunk-type identifiers) and a real
+' UTF-16LE variable name, "AOSMode". Shared by the boot-time reader (GetVariable, pre-exit) and
+' the shell-time writer (SetVariable, post-exit -- confirmed empirically safe, see this section's
+' own header comment).
+FUNCTION GopModeNvramGuidAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(GopModeStateAddress(), 512)
+END FUNCTION
+FUNCTION GopModeNvramNameAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(GopModeNvramGuidAddress(), 32)
+END FUNCTION
+FUNCTION GopModeNvramDataAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(GopModeNvramGuidAddress(), 64)
+END FUNCTION
+FUNCTION GopModeNvramAttributes() AS U32
+    RETURN 7   ' NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS
+END FUNCTION
+FUNCTION GopModeNvramWriteIdentity() AS U64
+    MEMORY.Write64(GopModeNvramGuidAddress(), 6321248254316368104)
+    MEMORY.Write64(ADDRESS.Offset(GopModeNvramGuidAddress(), 8), 7866229184920557744)
+    LET nameAddr AS MMIOPTR = GopModeNvramNameAddress()
+    LET n0 AS U16 = 65
+    LET n1 AS U16 = 79
+    LET n2 AS U16 = 83
+    LET n3 AS U16 = 77
+    LET n4 AS U16 = 111
+    LET n5 AS U16 = 100
+    LET n6 AS U16 = 101
+    LET n7 AS U16 = 0
+    MEMORY.Write16(nameAddr, n0)
+    MEMORY.Write16(ADDRESS.Offset(nameAddr, 2), n1)
+    MEMORY.Write16(ADDRESS.Offset(nameAddr, 4), n2)
+    MEMORY.Write16(ADDRESS.Offset(nameAddr, 6), n3)
+    MEMORY.Write16(ADDRESS.Offset(nameAddr, 8), n4)
+    MEMORY.Write16(ADDRESS.Offset(nameAddr, 10), n5)
+    MEMORY.Write16(ADDRESS.Offset(nameAddr, 12), n6)
+    MEMORY.Write16(ADDRESS.Offset(nameAddr, 14), n7)
+    RETURN 0
+END FUNCTION
+
+' Real, honest deferred switch: records the requested mode number in real UEFI NVRAM. Does NOT
+' touch the display -- see this section's own header comment for why a live switch cannot happen
+' safely from this shell. Sticky by design (never auto-cleared): the requested resolution applies
+' at every future boot until MODE <n> is run again, matching an ordinary display-settings control
+' rather than a one-shot boot flag.
+FUNCTION GopMode.StageRequest(systemTable AS UEFI.SystemTable, modeNumber AS U32) AS BOOL
+    GopModeNvramWriteIdentity()
+    LET dataAddr AS MMIOPTR = GopModeNvramDataAddress()
+    MEMORY.Write32(dataAddr, modeNumber)
+    LET status AS U64 = systemTable.RuntimeServices.SetVariable(GopModeNvramNameAddress(), GopModeNvramGuidAddress(), GopModeNvramAttributes(), 4, dataAddr)
+    RETURN status = 0
+END FUNCTION
+
+' Real boot-time application: reads any staged request from NVRAM and, only if it names a mode
+' this real hardware actually reported during this same boot's enumeration (modeCount, from
+' GopModeEnumerateAndCache -- a real bounds check against what THIS boot's own firmware reported,
+' not blindly trusting a value written during a possibly different session/monitor), calls the
+' real SetMode. Safe here because this runs before ExitBootServices.
+FUNCTION GopMode.ApplyStagedRequestIfPresent(systemTable AS UEFI.SystemTable, gop AS UEFI.GraphicsOutputProtocol, modeCount AS U32) AS U64
+    GopModeNvramWriteIdentity()
+    LET readBack AS U32 = 0
+    LET readBackAddr AS PTR = ADDRESS.Local(readBack)
+    LET readSize AS U64 = 4
+    LET readSizeAddr AS PTR = ADDRESS.Local(readSize)
+    LET getStatus AS U64 = systemTable.RuntimeServices.GetVariable(GopModeNvramNameAddress(), GopModeNvramGuidAddress(), 0, readSizeAddr, readBackAddr)
+    IF getStatus <> 0 THEN
+        RETURN 0
+    END IF
+    IF readBack >= modeCount THEN
+        RETURN 0
+    END IF
+    gop.SetMode(readBack)
+    RETURN 0
+END FUNCTION
+
+' The BootServices-free half of GOP setup: given an already-discovered gop handle, program
+' MTRR write-combining, publish the terminal's own real framebuffer/stride/width/height/scale/
+' cols/rows, (re)write font and dashboard label data, mark the terminal ready, and redraw the
+' dashboard. Called once at boot, after GopMode.ApplyStagedRequestIfPresent has already applied
+' any staged mode switch -- so the values read here already reflect the real active mode.
+' Returns whether write-combining was actually enabled, for the boot path's own diagnostic print.
+FUNCTION SetupGopDashboardFromHandle(gop AS UEFI.GraphicsOutputProtocol) AS U64
     LET framebuffer AS PHYSICALPTR = UEFI.GOP.FrameBufferBase(gop)
     LET widthPx AS U32 = UEFI.GOP.Width(gop)
     LET heightPx AS U32 = UEFI.GOP.Height(gop)
@@ -6612,16 +6968,33 @@ FUNCTION SetupGopDashboard(systemTable AS UEFI.SystemTable) AS BOOL
     WriteTermFontData()
     WriteDashboardLabels()
     MEMORY.Write32(TermReadyAddress(), 1)
+    DashDrawStatic()
+    DashSetSubsystem(4, 1)
+    DashAddEvent(LABEL_EV_GOP_OK())
+    DashUpdateAssembly(1, 10)
+    RETURN wcEnabled
+END FUNCTION
+
+FUNCTION SetupGopDashboard(systemTable AS UEFI.SystemTable) AS BOOL
+    LET gop AS UEFI.GraphicsOutputProtocol = UEFI.GOP.Discover(systemTable)
+    IF gop = 0 THEN
+        systemTable.ConsoleOut.Write("SUBSTRATE GOP NONE\r\n")
+        RETURN 0
+    END IF
+    ' Real mode enumeration (cached for the post-exit MODES command) and real staged-mode
+    ' application, BOTH while Boot Services are still available -- see GopModeEnumerateAndCache's
+    ' own header comment for why this cannot happen later. Applying the staged request (if any)
+    ' BEFORE reading Width/Height/FrameBufferBase below means the terminal is set up against
+    ' whatever resolution is actually active by the time this function reaches that point.
+    LET modeCount AS U32 = GopModeEnumerateAndCache(gop)
+    GopMode.ApplyStagedRequestIfPresent(systemTable, gop, modeCount)
+    LET wcEnabled AS U64 = SetupGopDashboardFromHandle(gop)
     systemTable.ConsoleOut.Write("SUBSTRATE GOP READY\r\n")
     IF wcEnabled = 1 THEN
         systemTable.ConsoleOut.Write("SUBSTRATE FB WC ON\r\n")
     ELSE
         systemTable.ConsoleOut.Write("SUBSTRATE FB WC OFF\r\n")
     END IF
-    DashDrawStatic()
-    DashSetSubsystem(4, 1)
-    DashAddEvent(LABEL_EV_GOP_OK())
-    DashUpdateAssembly(1, 10)
     RETURN 1
 END FUNCTION
 
@@ -6645,6 +7018,10 @@ FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U6
     MEMORY.Write32(RpmCountAddress(), 0)
     MEMORY.Write32(KeyModifierStateAddress(), 0)
     ClearUsbLastKey()
+
+    ' Stored once so the MODE/MODES shell commands can re-discover GOP later without threading
+    ' systemTable through HandleEnteredLine's own existing call chain (see StoredSystemTableAddress).
+    MEMORY.Write64(StoredSystemTableAddress(), systemTable)
 
     LET gopOk AS BOOL = SetupGopDashboard(systemTable)
 

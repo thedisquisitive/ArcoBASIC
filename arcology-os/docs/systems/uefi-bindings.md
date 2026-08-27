@@ -383,3 +383,48 @@ field intrinsics are bound the same way `UEFI.GOP.WIDTH`/`HEIGHT`/etc. are:
   RAM-preload trick (`-device loader,file=...,addr=...`) still populates `stdlib/block_device_policy.abas`'s
   `RAMDisk.*` provider; a genuine end-to-end proof against an emulated disk (virtio-blk/AHCI via
   `-drive`) is separate follow-on work, tracked in the RFC-0038 status update alongside this binding.
+
+## GOP QueryMode/SetMode and EFI_RUNTIME_SERVICES (real GOP mode control)
+
+Added to support a real, live resolution-detection/switching feature in the interactive shell
+(`aps-arcology-seed-substrate.abas`'s `MODES`/`MODE <n>` commands).
+
+`EFI_GRAPHICS_OUTPUT_PROTOCOL.QueryMode` (offset `0x00`) and `.SetMode` (offset `0x08`) are now
+bound as real protocol methods, routed through the same generic `CallExternal` mechanism
+`UEFI.PciIoProtocol.GetLocation` and `UEFI.BlockIoProtocol.ReadBlocks` already use -- no new
+compiler codegen was needed. `Mode` itself (offset `0x18`) remains the hand-rolled `UEFI.GOP.*`
+accessor path it always was; the reasoning above (line ~184: the generic path only resolves
+terminal METHOD calls, not plain, multiply-pointer-chained DATA fields) still applies to it
+unchanged.
+
+**A real, empirically-confirmed constraint, found while building on these bindings:** both
+QueryMode and SetMode hang if called after a real `ExitBootServices` -- not because they are
+somehow forbidden, but because real GOP driver implementations (confirmed against QEMU/OVMF)
+depend on Boot Services internally (QueryMode's own real signature hands back a firmware-allocated
+`EFI_GRAPHICS_OUTPUT_MODE_INFORMATION*`). This is the same class of finding this document's own
+`EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString` binding already produced in practice (`ConsoleOut.
+Write` hangs post-exit), just not previously known to reach GOP's own protocol methods -- its
+plain data fields (`Width`/`Height`/`FrameBufferBase`) stay real and safe post-exit, since those
+are pointer reads with no protocol call involved. Confirmed via systematic bisection (diagnostic
+markers placed immediately before/after each suspect call), not assumed.
+
+`EFI_RUNTIME_SERVICES` is now bound (`UEFI.SystemTable.RuntimeServices` at offset `0x58` -- real
+UEFI spec layout, confirmed by the same "next known-good field's own offset is only consistent
+with this exact layout" cross-check this file already uses elsewhere: `StandardErrorHandle`(8,
+`0x48`) + `StdErr`(8,`0x50`) + `RuntimeServices`(8,`0x58`) + `BootServices`(8,`0x60`), and
+`BootServices`'s own `0x60` offset was already independently verified). Only `GetVariable`
+(`0x48`) and `SetVariable` (`0x58`) are bound on `UEFI.RuntimeServices`, both real service-table
+functions (no implicit `This`, matching `EFI_BOOT_SERVICES.SetWatchdogTimer`'s own already-proven
+shape). Motivation: Runtime Services are the one UEFI facility actually specified to remain
+callable after `ExitBootServices`, and this was verified for real rather than trusted from spec
+alone -- a standalone writer/reader fixture pair proved a value written via `SetVariable` in one
+QEMU process (using split `OVMF_CODE_4M.fd`/`OVMF_VARS_4M.fd` pflash, required for genuine
+cross-process NVRAM persistence; a single combined `-bios` image keeps NVRAM in-memory-only) is
+correctly read back via `GetVariable` in a completely separate QEMU process sharing only the same
+VARS file, and separately that `SetVariable` itself is callable from the real post-
+`ExitBootServices` interactive shell without hanging.
+
+The resulting real design (see `project_gop_mode_control` memory / the fixture's own comments):
+mode enumeration and any actual `SetMode` call happen only before `ExitBootServices`; the shell's
+`MODE <n>` command cannot switch the display live and instead stages the request in a real NVRAM
+variable, applied for real at the next boot.

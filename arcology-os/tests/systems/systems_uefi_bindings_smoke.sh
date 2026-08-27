@@ -91,7 +91,7 @@ FUNCTION Main(systemTable AS UEFI.SystemTable) AS U64
     systemTable.Foo.Bar(1)
     RETURN 0
 END FUNCTION' \
-    'UEFI.SystemTable has no bound field or method "Foo" in this milestone. Bound fields: ConsoleIn, ConsoleOut, BootServices.'
+    'UEFI.SystemTable has no bound field or method "Foo" in this milestone. Bound fields: ConsoleIn, ConsoleOut, RuntimeServices, BootServices.'
 
 # A real UEFI field that this milestone deliberately did not bind is rejected honestly (not
 # silently accepted, and not confused with an invented/nonexistent field). StdErr (RFC-0007 has no
