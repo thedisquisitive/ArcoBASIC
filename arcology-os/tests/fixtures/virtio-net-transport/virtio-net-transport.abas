@@ -1,0 +1,474 @@
+' RFC-0048 Milestone N0 remaining work: real VirtIO-net legacy PCI transport probe, run through
+' the generic Network Interface Contract (network_interface_contract.abas) rather than calling the
+' VirtioNet backend directly -- proving the contract boundary itself works, not just the backend.
+' Matches this project's own established pattern for a driver's first real proof (ps2-keyboard-
+' driver.abas, usb-hid-keyboard-driver.abas, gpu-discovery-probe.abas, network-nic-discovery-
+' probe.abas).
+'
+' Inlined verbatim from stdlib/virtio_net_policy.abas and stdlib/network_interface_contract.abas
+' -- this backend has no #INCLUDE mechanism, matching every other real driver fixture here.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION VirtioNetStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62914560))   ' 0x3C00000
+END FUNCTION
+FUNCTION VirtioNetPciBusAddress() AS MMIOPTR
+    RETURN VirtioNetStateAddress()
+END FUNCTION
+FUNCTION VirtioNetPciDeviceAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 4)
+END FUNCTION
+FUNCTION VirtioNetPciFunctionAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 8)
+END FUNCTION
+FUNCTION VirtioNetFeaturesAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 16)
+END FUNCTION
+FUNCTION VirtioNetDisconnectGuidAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 320)
+END FUNCTION
+FUNCTION VirtioNetDisconnectHandlesAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 336)
+END FUNCTION
+FUNCTION VirtioNetDisconnectIfaceAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 464)
+END FUNCTION
+
+FUNCTION VirtioNetPciConfigAddressPort() AS IOPORT
+    RETURN PORT.Address(3320)
+END FUNCTION
+FUNCTION VirtioNetPciConfigDataPort() AS IOPORT
+    RETURN PORT.Address(3324)
+END FUNCTION
+FUNCTION VirtioNetPciConfigReadU32(bus AS U32, device AS U32, func AS U32, offset AS U32) AS U32
+    LET address AS U32 = 2147483648
+    address = address OR (bus SHL 16)
+    address = address OR (device SHL 11)
+    address = address OR (func SHL 8)
+    address = address OR (offset AND 252)
+    LET addrPort AS IOPORT = VirtioNetPciConfigAddressPort()
+    LET dataPort AS IOPORT = VirtioNetPciConfigDataPort()
+    PORT.WriteDWord(addrPort, address)
+    LET value AS U32 = PORT.ReadDWord(dataPort)
+    RETURN value
+END FUNCTION
+FUNCTION VirtioNetPciConfigWriteU32(bus AS U32, device AS U32, func AS U32, offset AS U32, value AS U32) AS BOOL
+    LET address AS U32 = 2147483648
+    address = address OR (bus SHL 16)
+    address = address OR (device SHL 11)
+    address = address OR (func SHL 8)
+    address = address OR (offset AND 252)
+    LET addrPort AS IOPORT = VirtioNetPciConfigAddressPort()
+    LET dataPort AS IOPORT = VirtioNetPciConfigDataPort()
+    PORT.WriteDWord(addrPort, address)
+    PORT.WriteDWord(dataPort, value)
+    RETURN 1
+END FUNCTION
+
+FUNCTION VirtioNet.DiscoverPci(systemTable AS UEFI.SystemTable) AS BOOL
+    LET found AS BOOL = 0
+    LET bus AS U32 = 0
+    WHILE bus < 256
+        IF found = 0 THEN
+            LET device AS U32 = 0
+            WHILE device < 32
+                IF found = 0 THEN
+                    LET func AS U32 = 0
+                    WHILE func < 8
+                        IF found = 0 THEN
+                            LET vendorDevice AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 0)
+                            LET vendorId AS U32 = vendorDevice AND 65535
+                            IF vendorId = 6900 THEN
+                                LET classReg AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 8)
+                                LET baseClass AS U32 = (classReg SHR 24) AND 255
+                                IF baseClass = 2 THEN
+                                    found = 1
+                                    MEMORY.Write32(VirtioNetPciBusAddress(), bus)
+                                    MEMORY.Write32(VirtioNetPciDeviceAddress(), device)
+                                    MEMORY.Write32(VirtioNetPciFunctionAddress(), func)
+                                END IF
+                            END IF
+                        END IF
+                        func = func + 1
+                    WEND
+                END IF
+                device = device + 1
+            WEND
+        END IF
+        bus = bus + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+FUNCTION VirtioNet.DisconnectFirmwareDriver(systemTable AS UEFI.SystemTable) AS BOOL
+    LET guidBuf AS MMIOPTR = VirtioNetDisconnectGuidAddress()
+    MEMORY.Write64(guidBuf, 5522935658814222848)
+    MEMORY.Write64(ADDRESS.Offset(guidBuf, 8), 11097520664359398558)
+
+    LET maxHandles AS U64 = 16
+    LET bufferSize AS U64 = maxHandles * 8
+    LET bufferSizeAddr AS PTR = ADDRESS.Local(bufferSize)
+    LET handleBuffer AS MMIOPTR = VirtioNetDisconnectHandlesAddress()
+
+    LET status AS U64 = systemTable.BootServices.LocateHandle(2, guidBuf, 0, bufferSizeAddr, handleBuffer)
+    IF status <> 0 THEN
+        RETURN 0
+    END IF
+
+    LET foundCount AS U64 = bufferSize \ 8
+    IF foundCount > maxHandles THEN
+        foundCount = maxHandles
+    END IF
+
+    LET targetBus AS U32 = MEMORY.Read32(VirtioNetPciBusAddress())
+    LET targetDevice AS U32 = MEMORY.Read32(VirtioNetPciDeviceAddress())
+    LET targetFunction AS U32 = MEMORY.Read32(VirtioNetPciFunctionAddress())
+
+    LET disconnected AS BOOL = 0
+    LET i AS U64 = 0
+    WHILE i < foundCount
+        LET handleEntry AS MMIOPTR = ADDRESS.Offset(handleBuffer, i * 8)
+        LET handle AS U64 = MEMORY.Read64(handleEntry)
+        LET ifaceOutAddr AS MMIOPTR = VirtioNetDisconnectIfaceAddress()
+        LET hpStatus AS U64 = systemTable.BootServices.HandleProtocol(handle, guidBuf, ifaceOutAddr)
+        IF hpStatus = 0 THEN
+            LET pciIo AS UEFI.PciIoProtocol = MEMORY.Read64(ifaceOutAddr)
+            LET segOut AS U64 = 0
+            LET segOutAddr AS PTR = ADDRESS.Local(segOut)
+            LET busOut AS U64 = 0
+            LET busOutAddr AS PTR = ADDRESS.Local(busOut)
+            LET devOut AS U64 = 0
+            LET devOutAddr AS PTR = ADDRESS.Local(devOut)
+            LET funcOut AS U64 = 0
+            LET funcOutAddr AS PTR = ADDRESS.Local(funcOut)
+            LET glStatus AS U64 = pciIo.GetLocation(segOutAddr, busOutAddr, devOutAddr, funcOutAddr)
+            IF glStatus = 0 THEN
+                LET busU32 AS U32 = busOut
+                LET devU32 AS U32 = devOut
+                LET funcU32 AS U32 = funcOut
+                IF busU32 = targetBus THEN
+                    IF devU32 = targetDevice THEN
+                        IF funcU32 = targetFunction THEN
+                            systemTable.BootServices.DisconnectController(handle, 0, 0)
+                            disconnected = 1
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+        i = i + 1
+    WEND
+    RETURN disconnected
+END FUNCTION
+
+FUNCTION VirtioNetIoBase() AS U16
+    LET bus AS U32 = MEMORY.Read32(VirtioNetPciBusAddress())
+    LET device AS U32 = MEMORY.Read32(VirtioNetPciDeviceAddress())
+    LET func AS U32 = MEMORY.Read32(VirtioNetPciFunctionAddress())
+    LET bar0 AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 16)
+    LET ioBase32 AS U32 = bar0 AND 4294967292
+    LET ioBase AS U16 = ioBase32
+    RETURN ioBase
+END FUNCTION
+
+FUNCTION VirtioNet.MapIo(systemTable AS UEFI.SystemTable) AS BOOL
+    VirtioNet.DisconnectFirmwareDriver(systemTable)
+
+    LET bus AS U32 = MEMORY.Read32(VirtioNetPciBusAddress())
+    LET device AS U32 = MEMORY.Read32(VirtioNetPciDeviceAddress())
+    LET func AS U32 = MEMORY.Read32(VirtioNetPciFunctionAddress())
+
+    LET bar0 AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 16)
+    LET isIoBar AS U32 = bar0 AND 1
+    IF isIoBar = 0 THEN
+        RETURN 0
+    END IF
+
+    LET commandReg AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 4)
+    VirtioNetPciConfigWriteU32(bus, device, func, 4, commandReg OR 5)
+    RETURN 1
+END FUNCTION
+
+FUNCTION VirtioNet.Reset() AS BOOL
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET statusPortNum AS U16 = ioBase + 18
+    LET statusPort AS IOPORT = PORT.Address(statusPortNum)
+    PORT.WriteByte(statusPort, 0)
+    LET readback AS U8 = PORT.ReadByte(statusPort)
+    RETURN readback = 0
+END FUNCTION
+
+FUNCTION VirtioNet.Negotiate() AS BOOL
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET statusPortNum AS U16 = ioBase + 18
+    LET statusPort AS IOPORT = PORT.Address(statusPortNum)
+    LET featuresPortNum AS U16 = ioBase
+    LET featuresPort AS IOPORT = PORT.Address(featuresPortNum)
+    LET guestFeaturesPortNum AS U16 = ioBase + 4
+    LET guestFeaturesPort AS IOPORT = PORT.Address(guestFeaturesPortNum)
+
+    PORT.WriteByte(statusPort, 1)
+    PORT.WriteByte(statusPort, 3)
+
+    LET deviceFeatures AS U32 = PORT.ReadDWord(featuresPort)
+    LET understoodMask AS U32 = 65568
+    LET acceptedFeatures AS U32 = deviceFeatures AND understoodMask
+    PORT.WriteDWord(guestFeaturesPort, acceptedFeatures)
+    MEMORY.Write32(VirtioNetFeaturesAddress(), acceptedFeatures)
+
+    PORT.WriteByte(statusPort, 7)
+    LET readback AS U8 = PORT.ReadByte(statusPort)
+    LET driverOkBit AS U8 = readback AND 4
+    RETURN driverOkBit = 4
+END FUNCTION
+
+FUNCTION VirtioNet.GetCapabilities() AS U32
+    RETURN MEMORY.Read32(VirtioNetFeaturesAddress())
+END FUNCTION
+
+FUNCTION VirtioNet.ReadMac(outAddr AS MMIOPTR) AS BOOL
+    LET features AS U32 = VirtioNet.GetCapabilities()
+    LET macFeature AS U32 = features AND 32
+    IF macFeature = 0 THEN
+        RETURN 0
+    END IF
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET configBase AS U16 = ioBase + 20
+    LET i AS U32 = 0
+    WHILE i < 6
+        LET iU16 AS U16 = i
+        LET bytePortNum AS U16 = configBase + iU16
+        LET bytePort AS IOPORT = PORT.Address(bytePortNum)
+        LET macByte AS U8 = PORT.ReadByte(bytePort)
+        MEMORY.Write8(ADDRESS.Offset(outAddr, i), macByte)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+FUNCTION VirtioNet.LinkState() AS U32
+    LET features AS U32 = VirtioNet.GetCapabilities()
+    LET statusFeature AS U32 = features AND 65536
+    IF statusFeature = 0 THEN
+        RETURN 2
+    END IF
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET statusFieldPortNum AS U16 = ioBase + 26
+    LET statusFieldPort AS IOPORT = PORT.Address(statusFieldPortNum)
+    LET linkStatus AS U16 = PORT.ReadWord(statusFieldPort)
+    LET linkUpBit AS U16 = linkStatus AND 1
+    IF linkUpBit = 1 THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION NetBackendVirtio() AS U32
+    RETURN 1
+END FUNCTION
+
+FUNCTION NetworkInterface.Start(backendTag AS U32, systemTable AS UEFI.SystemTable) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET found AS BOOL = VirtioNet.DiscoverPci(systemTable)
+        IF found = 0 THEN
+            RETURN 0
+        END IF
+        LET mapped AS BOOL = VirtioNet.MapIo(systemTable)
+        IF mapped = 0 THEN
+            RETURN 0
+        END IF
+        VirtioNet.Reset()
+        LET negotiated AS BOOL = VirtioNet.Negotiate()
+        RETURN negotiated
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION NetworkInterface.Stop(backendTag AS U32) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        RETURN VirtioNet.Reset()
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION NetworkInterface.GetCapabilities(backendTag AS U32) AS U32
+    IF backendTag = NetBackendVirtio() THEN
+        RETURN VirtioNet.GetCapabilities()
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION NetworkInterface.GetMAC(backendTag AS U32, outAddr AS MMIOPTR) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        RETURN VirtioNet.ReadMac(outAddr)
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION NetworkInterface.GetLinkState(backendTag AS U32) AS U32
+    IF backendTag = NetBackendVirtio() THEN
+        RETURN VirtioNet.LinkState()
+    END IF
+    RETURN 2
+END FUNCTION
+
+FUNCTION SerialByte(value AS U8) AS U64
+    LET port AS IOPORT = PORT.Address(1016)
+    PORT.WriteByte(port, value)
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialDecimalScratchAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62918656))   ' 0x3C01000
+END FUNCTION
+
+FUNCTION SerialWriteDecimal(value AS U64) AS U64
+    IF value = 0 THEN
+        SerialByte(48)
+        RETURN 0
+    END IF
+    LET dest AS MMIOPTR = SerialDecimalScratchAddress()
+    LET v AS U64 = value
+    LET count AS U64 = 0
+    WHILE v > 0
+        LET digit AS U64 = v MOD 10
+        LET digitByte AS U8 = digit + 48
+        MEMORY.Write8(ADDRESS.Offset(dest, count), digitByte)
+        v = v \ 10
+        count = count + 1
+    WEND
+    LET lo AS U64 = 0
+    LET hi AS U64 = count - 1
+    WHILE lo < hi
+        LET a AS U8 = MEMORY.Read8(ADDRESS.Offset(dest, lo))
+        LET b AS U8 = MEMORY.Read8(ADDRESS.Offset(dest, hi))
+        MEMORY.Write8(ADDRESS.Offset(dest, lo), b)
+        MEMORY.Write8(ADDRESS.Offset(dest, hi), a)
+        lo = lo + 1
+        hi = hi - 1
+    WEND
+    LET i AS U64 = 0
+    WHILE i < count
+        SerialByte(MEMORY.Read8(ADDRESS.Offset(dest, i)))
+        i = i + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialWriteHexNibble(nibble AS U8) AS U64
+    IF nibble < 10 THEN
+        SerialByte(48 + nibble)
+    ELSE
+        SerialByte(55 + nibble)
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION SerialWriteHexByte(value AS U8) AS U64
+    LET hi AS U8 = (value SHR 4) AND 15
+    LET lo AS U8 = value AND 15
+    SerialWriteHexNibble(hi)
+    SerialWriteHexNibble(lo)
+    RETURN 0
+END FUNCTION
+
+FUNCTION MacBufAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62918912))   ' 0x3C01100, clear of the serial decimal scratch region
+END FUNCTION
+
+FUNCTION Main(imageHandle AS UEFI.Handle, systemTable AS UEFI.SystemTable) AS U64
+    systemTable.BootServices.SetWatchdogTimer(0, 0, 0, 0)
+    SerialByte(80)
+    SerialByte(82)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+
+    LET started AS BOOL = NetworkInterface.Start(NetBackendVirtio(), systemTable)
+
+    SerialByte(83)
+    SerialByte(84)
+    SerialByte(65)
+    SerialByte(82)
+    SerialByte(84)
+    SerialByte(61)
+    SerialWriteDecimal(started)
+    SerialByte(13)
+    SerialByte(10)
+
+    IF started = 1 THEN
+        LET caps AS U32 = NetworkInterface.GetCapabilities(NetBackendVirtio())
+        LET macFeature AS U32 = caps AND 32
+        LET statusFeature AS U32 = caps AND 65536
+
+        SerialByte(77)
+        SerialByte(65)
+        SerialByte(67)
+        SerialByte(70)
+        SerialByte(69)
+        SerialByte(65)
+        SerialByte(84)
+        SerialByte(61)
+        SerialWriteDecimal(macFeature)
+        SerialByte(13)
+        SerialByte(10)
+
+        SerialByte(83)
+        SerialByte(84)
+        SerialByte(65)
+        SerialByte(84)
+        SerialByte(70)
+        SerialByte(69)
+        SerialByte(65)
+        SerialByte(84)
+        SerialByte(61)
+        SerialWriteDecimal(statusFeature)
+        SerialByte(13)
+        SerialByte(10)
+
+        LET macBuf AS MMIOPTR = MacBufAddress()
+        LET gotMac AS BOOL = NetworkInterface.GetMAC(NetBackendVirtio(), macBuf)
+        IF gotMac = 1 THEN
+            SerialByte(77)
+            SerialByte(65)
+            SerialByte(67)
+            SerialByte(61)
+            LET i AS U32 = 0
+            WHILE i < 6
+                LET macByte AS U8 = MEMORY.Read8(ADDRESS.Offset(macBuf, i))
+                SerialWriteHexByte(macByte)
+                IF i < 5 THEN
+                    SerialByte(58)
+                END IF
+                i = i + 1
+            WEND
+            SerialByte(13)
+            SerialByte(10)
+        END IF
+
+        LET link AS U32 = NetworkInterface.GetLinkState(NetBackendVirtio())
+        SerialByte(76)
+        SerialByte(73)
+        SerialByte(78)
+        SerialByte(75)
+        SerialByte(61)
+        SerialWriteDecimal(link)
+        SerialByte(13)
+        SerialByte(10)
+
+        NetworkInterface.Stop(NetBackendVirtio())
+    END IF
+
+    SerialByte(68)
+    SerialByte(79)
+    SerialByte(78)
+    SerialByte(69)
+    SerialByte(13)
+    SerialByte(10)
+
+    CPU.HaltForever
+    RETURN 0
+END FUNCTION

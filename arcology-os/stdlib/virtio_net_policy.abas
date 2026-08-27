@@ -1,0 +1,326 @@
+' RFC-0048 Milestone N0 remaining work (per the 2026-08-26 Networking Development Steering
+' Addendum, Section 11): real VirtIO-net legacy PCI transport -- MMIO/BAR mapping, device
+' reset/feature negotiation, and interface identity (MAC, link state, capabilities). This is the
+' first concrete NIC Backend behind the generic Network Interface Contract the addendum requires
+' (see network_interface_contract.abas); frame transmit/receive via virtqueues is the next
+' increment, deliberately not claimed here (Section 12: "do not implement tomorrow's feature
+' today", but this file's own state layout and the generic facade above it are already shaped so
+' that increment does not require a rewrite of anything below).
+'
+' Reuses this project's own established raw-PCI-scan and firmware-disconnect patterns verbatim in
+' shape: RFC-0045's UsbXhci.DiscoverPci / UsbXhci.DisconnectFirmwareDriver, RFC-0047's
+' GpuDiscovery. Same PciConfigReadU32/PciConfigAddressPort/PciConfigDataPort machinery, same
+' bus/device/function walk, same EFI_PCI_IO_PROTOCOL GetLocation-based firmware-driver eviction
+' (RFC-0045 Phase 3 found, via real QEMU trace events, that OVMF's own native driver for a
+' controller can stay bound and race this project's own raw-register driver for the same device;
+' many real OVMF builds also ship a VirtIO driver stack for cloud PXE boot, so the same defensive
+' step is applied here before this driver touches the controller).
+'
+' Scoped to real legacy VirtIO PCI transport (pre-1.0 "transitional" layout): a plain I/O-space
+' BAR0, an 8-bit DeviceStatus register, and device-specific config (MAC, link status) starting
+' immediately after the fixed legacy header. This driver assumes MSI-X is not present on the
+' function (QEMU: `vectors=0`), which keeps the device-specific config offset fixed at +0x14
+' rather than +0x18 -- confirmed empirically under real QEMU, not assumed, matching this project's
+' own established discipline (see systems_virtio_net_transport_smoke.sh).
+'
+' Real, honest feature negotiation: this driver accepts only the two device-offered feature bits
+' it actually understands and uses -- VIRTIO_NET_F_MAC (bit 5) and VIRTIO_NET_F_STATUS (bit 16) --
+' rather than either accepting nothing (which would make the device-specific fields it reads
+' meaningless per spec) or blindly echoing every offered feature back (which would be a false claim
+' of support this driver does not have).
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION VirtioNetStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62914560))   ' 0x3C00000, clear of every other fixed scratch region this project uses
+END FUNCTION
+
+' State layout: PCI Bus/Device/Function (U32 each, +0/+4/+8), negotiated feature mask (U32, +16).
+FUNCTION VirtioNetPciBusAddress() AS MMIOPTR
+    RETURN VirtioNetStateAddress()
+END FUNCTION
+FUNCTION VirtioNetPciDeviceAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 4)
+END FUNCTION
+FUNCTION VirtioNetPciFunctionAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 8)
+END FUNCTION
+FUNCTION VirtioNetFeaturesAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 16)
+END FUNCTION
+FUNCTION VirtioNetDisconnectGuidAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 320)
+END FUNCTION
+FUNCTION VirtioNetDisconnectHandlesAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 336)
+END FUNCTION
+FUNCTION VirtioNetDisconnectIfaceAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 464)
+END FUNCTION
+
+FUNCTION VirtioNetPciConfigAddressPort() AS IOPORT
+    RETURN PORT.Address(3320)   ' 0xCF8
+END FUNCTION
+FUNCTION VirtioNetPciConfigDataPort() AS IOPORT
+    RETURN PORT.Address(3324)   ' 0xCFC
+END FUNCTION
+FUNCTION VirtioNetPciConfigReadU32(bus AS U32, device AS U32, func AS U32, offset AS U32) AS U32
+    LET address AS U32 = 2147483648
+    address = address OR (bus SHL 16)
+    address = address OR (device SHL 11)
+    address = address OR (func SHL 8)
+    address = address OR (offset AND 252)
+    LET addrPort AS IOPORT = VirtioNetPciConfigAddressPort()
+    LET dataPort AS IOPORT = VirtioNetPciConfigDataPort()
+    PORT.WriteDWord(addrPort, address)
+    LET value AS U32 = PORT.ReadDWord(dataPort)
+    RETURN value
+END FUNCTION
+FUNCTION VirtioNetPciConfigWriteU32(bus AS U32, device AS U32, func AS U32, offset AS U32, value AS U32) AS BOOL
+    LET address AS U32 = 2147483648
+    address = address OR (bus SHL 16)
+    address = address OR (device SHL 11)
+    address = address OR (func SHL 8)
+    address = address OR (offset AND 252)
+    LET addrPort AS IOPORT = VirtioNetPciConfigAddressPort()
+    LET dataPort AS IOPORT = VirtioNetPciConfigDataPort()
+    PORT.WriteDWord(addrPort, address)
+    PORT.WriteDWord(dataPort, value)
+    RETURN 1
+END FUNCTION
+
+' Real, full PCI bus scan for VirtIO's own PCI vendor ID (0x1AF4, Red Hat, Inc.'s real VirtIO
+' allocation) with PCI base class 0x02 (Network Controller). Deliberately vendor+class scoped,
+' not "any NIC" -- this file is specifically the VirtIO-net backend, matching UsbXhci.DiscoverPci's
+' own precedent of searching for its exact target class/subclass/prog-if rather than a generic scan.
+FUNCTION VirtioNet.DiscoverPci(systemTable AS UEFI.SystemTable) AS BOOL
+    LET found AS BOOL = 0
+    LET bus AS U32 = 0
+    WHILE bus < 256
+        IF found = 0 THEN
+            LET device AS U32 = 0
+            WHILE device < 32
+                IF found = 0 THEN
+                    LET func AS U32 = 0
+                    WHILE func < 8
+                        IF found = 0 THEN
+                            LET vendorDevice AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 0)
+                            LET vendorId AS U32 = vendorDevice AND 65535
+                            IF vendorId = 6900 THEN
+                                LET classReg AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 8)
+                                LET baseClass AS U32 = (classReg SHR 24) AND 255
+                                IF baseClass = 2 THEN
+                                    found = 1
+                                    MEMORY.Write32(VirtioNetPciBusAddress(), bus)
+                                    MEMORY.Write32(VirtioNetPciDeviceAddress(), device)
+                                    MEMORY.Write32(VirtioNetPciFunctionAddress(), func)
+                                END IF
+                            END IF
+                        END IF
+                        func = func + 1
+                    WEND
+                END IF
+                device = device + 1
+            WEND
+        END IF
+        bus = bus + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+' Identical shape to UsbXhci.DisconnectFirmwareDriver (RFC-0045 Phase 3's own real, QEMU-trace-
+' confirmed fix): finds the EFI_HANDLE firmware knows this exact PCI Bus/Device/Function by, via
+' EFI_PCI_IO_PROTOCOL's GetLocation, and calls BootServices.DisconnectController on it. Real,
+' honest fail-open: if no matching handle is found, this returns FALSE without touching anything
+' else -- not a hard requirement upstream.
+FUNCTION VirtioNet.DisconnectFirmwareDriver(systemTable AS UEFI.SystemTable) AS BOOL
+    LET guidBuf AS MMIOPTR = VirtioNetDisconnectGuidAddress()
+    MEMORY.Write64(guidBuf, 5522935658814222848)
+    MEMORY.Write64(ADDRESS.Offset(guidBuf, 8), 11097520664359398558)
+
+    LET maxHandles AS U64 = 16
+    LET bufferSize AS U64 = maxHandles * 8
+    LET bufferSizeAddr AS PTR = ADDRESS.Local(bufferSize)
+    LET handleBuffer AS MMIOPTR = VirtioNetDisconnectHandlesAddress()
+
+    LET status AS U64 = systemTable.BootServices.LocateHandle(2, guidBuf, 0, bufferSizeAddr, handleBuffer)
+    IF status <> 0 THEN
+        RETURN 0
+    END IF
+
+    LET foundCount AS U64 = bufferSize \ 8
+    IF foundCount > maxHandles THEN
+        foundCount = maxHandles
+    END IF
+
+    LET targetBus AS U32 = MEMORY.Read32(VirtioNetPciBusAddress())
+    LET targetDevice AS U32 = MEMORY.Read32(VirtioNetPciDeviceAddress())
+    LET targetFunction AS U32 = MEMORY.Read32(VirtioNetPciFunctionAddress())
+
+    LET disconnected AS BOOL = 0
+    LET i AS U64 = 0
+    WHILE i < foundCount
+        LET handleEntry AS MMIOPTR = ADDRESS.Offset(handleBuffer, i * 8)
+        LET handle AS U64 = MEMORY.Read64(handleEntry)
+        LET ifaceOutAddr AS MMIOPTR = VirtioNetDisconnectIfaceAddress()
+        LET hpStatus AS U64 = systemTable.BootServices.HandleProtocol(handle, guidBuf, ifaceOutAddr)
+        IF hpStatus = 0 THEN
+            LET pciIo AS UEFI.PciIoProtocol = MEMORY.Read64(ifaceOutAddr)
+            LET segOut AS U64 = 0
+            LET segOutAddr AS PTR = ADDRESS.Local(segOut)
+            LET busOut AS U64 = 0
+            LET busOutAddr AS PTR = ADDRESS.Local(busOut)
+            LET devOut AS U64 = 0
+            LET devOutAddr AS PTR = ADDRESS.Local(devOut)
+            LET funcOut AS U64 = 0
+            LET funcOutAddr AS PTR = ADDRESS.Local(funcOut)
+            LET glStatus AS U64 = pciIo.GetLocation(segOutAddr, busOutAddr, devOutAddr, funcOutAddr)
+            IF glStatus = 0 THEN
+                LET busU32 AS U32 = busOut
+                LET devU32 AS U32 = devOut
+                LET funcU32 AS U32 = funcOut
+                IF busU32 = targetBus THEN
+                    IF devU32 = targetDevice THEN
+                        IF funcU32 = targetFunction THEN
+                            systemTable.BootServices.DisconnectController(handle, 0, 0)
+                            disconnected = 1
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+        i = i + 1
+    WEND
+    RETURN disconnected
+END FUNCTION
+
+' Recomputed fresh from PCI config on every call rather than cached: this raw driver is the only
+' software touching the device after VirtioNet.DisconnectFirmwareDriver, so BAR0 cannot change
+' underneath it, and a fresh read keeps every accessor self-contained (matching this file's own
+' "simple over minimal" discipline already established elsewhere in this project).
+FUNCTION VirtioNetIoBase() AS U16
+    LET bus AS U32 = MEMORY.Read32(VirtioNetPciBusAddress())
+    LET device AS U32 = MEMORY.Read32(VirtioNetPciDeviceAddress())
+    LET func AS U32 = MEMORY.Read32(VirtioNetPciFunctionAddress())
+    LET bar0 AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 16)
+    LET ioBase32 AS U32 = bar0 AND 4294967292   ' clear bit0 (I/O indicator) and bit1 (reserved)
+    LET ioBase AS U16 = ioBase32
+    RETURN ioBase
+END FUNCTION
+
+' Confirms BAR0 is a real I/O-space BAR (bit0=1; legacy VirtIO PCI, forced via QEMU's own
+' `disable-modern=on`), enables I/O Space (bit0) + Bus Master (bit2) in the PCI Command register,
+' and disconnects any firmware-bound driver first. Real, honest failure if BAR0 is not an I/O BAR
+' (e.g. a modern-only virtio-net-pci with legacy transport disabled) -- this driver does not
+' attempt the separate modern-virtio MMIO-capability transport.
+FUNCTION VirtioNet.MapIo(systemTable AS UEFI.SystemTable) AS BOOL
+    VirtioNet.DisconnectFirmwareDriver(systemTable)
+
+    LET bus AS U32 = MEMORY.Read32(VirtioNetPciBusAddress())
+    LET device AS U32 = MEMORY.Read32(VirtioNetPciDeviceAddress())
+    LET func AS U32 = MEMORY.Read32(VirtioNetPciFunctionAddress())
+
+    LET bar0 AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 16)
+    LET isIoBar AS U32 = bar0 AND 1
+    IF isIoBar = 0 THEN
+        RETURN 0
+    END IF
+
+    LET commandReg AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 4)
+    VirtioNetPciConfigWriteU32(bus, device, func, 4, commandReg OR 5)
+    RETURN 1
+END FUNCTION
+
+' Legacy VirtIO device reset: writing 0 to the 8-bit DeviceStatus register (I/O offset +0x12)
+' both initializes and tears down the device per the VirtIO legacy spec. Reads back to confirm,
+' matching this project's own "read back to confirm" discipline (e.g. UsbXhci.Reset).
+FUNCTION VirtioNet.Reset() AS BOOL
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET statusPortNum AS U16 = ioBase + 18
+    LET statusPort AS IOPORT = PORT.Address(statusPortNum)
+    PORT.WriteByte(statusPort, 0)
+    LET readback AS U8 = PORT.ReadByte(statusPort)
+    RETURN readback = 0
+END FUNCTION
+
+' Real legacy VirtIO status handshake (ACKNOWLEDGE -> DRIVER -> feature negotiation -> DRIVER_OK).
+' Feature negotiation is real and minimal, not all-or-nothing: this driver accepts only the device-
+' offered bits it actually understands and uses right now -- VIRTIO_NET_F_MAC (bit 5, value 32) and
+' VIRTIO_NET_F_STATUS (bit 16, value 65536) -- ANDed against what the device actually offers, never
+' claiming support this driver does not have.
+FUNCTION VirtioNet.Negotiate() AS BOOL
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET statusPortNum AS U16 = ioBase + 18
+    LET statusPort AS IOPORT = PORT.Address(statusPortNum)
+    LET featuresPortNum AS U16 = ioBase
+    LET featuresPort AS IOPORT = PORT.Address(featuresPortNum)
+    LET guestFeaturesPortNum AS U16 = ioBase + 4
+    LET guestFeaturesPort AS IOPORT = PORT.Address(guestFeaturesPortNum)
+
+    PORT.WriteByte(statusPort, 1)   ' ACKNOWLEDGE
+    PORT.WriteByte(statusPort, 3)   ' ACKNOWLEDGE | DRIVER
+
+    LET deviceFeatures AS U32 = PORT.ReadDWord(featuresPort)
+    LET understoodMask AS U32 = 65568   ' VIRTIO_NET_F_MAC (32) | VIRTIO_NET_F_STATUS (65536)
+    LET acceptedFeatures AS U32 = deviceFeatures AND understoodMask
+    PORT.WriteDWord(guestFeaturesPort, acceptedFeatures)
+    MEMORY.Write32(VirtioNetFeaturesAddress(), acceptedFeatures)
+
+    PORT.WriteByte(statusPort, 7)   ' ACKNOWLEDGE | DRIVER | DRIVER_OK
+    LET readback AS U8 = PORT.ReadByte(statusPort)
+    LET driverOkBit AS U8 = readback AND 4
+    RETURN driverOkBit = 4
+END FUNCTION
+
+' Real negotiated-feature bitmask this driver accepted, for capability reporting -- not the raw
+' device-offered set, which would overstate what this driver actually understands and uses.
+FUNCTION VirtioNet.GetCapabilities() AS U32
+    RETURN MEMORY.Read32(VirtioNetFeaturesAddress())
+END FUNCTION
+
+' Legacy VirtIO device-specific config begins at I/O offset +0x14 (20) when the function has no
+' MSI-X capability (QEMU: `vectors=0`) -- confirmed empirically under real QEMU, not assumed. For
+' virtio-net, the first 6 bytes of device-specific config are the real MAC address. Honest about
+' scope: if VIRTIO_NET_F_MAC was not negotiated (this driver did not accept it, or the device did
+' not offer it), the field's contents are not meaningful per spec and this returns FALSE without
+' writing anything to outAddr.
+FUNCTION VirtioNet.ReadMac(outAddr AS MMIOPTR) AS BOOL
+    LET features AS U32 = VirtioNet.GetCapabilities()
+    LET macFeature AS U32 = features AND 32
+    IF macFeature = 0 THEN
+        RETURN 0
+    END IF
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET configBase AS U16 = ioBase + 20
+    LET i AS U32 = 0
+    WHILE i < 6
+        LET iU16 AS U16 = i
+        LET bytePortNum AS U16 = configBase + iU16
+        LET bytePort AS IOPORT = PORT.Address(bytePortNum)
+        LET macByte AS U8 = PORT.ReadByte(bytePort)
+        MEMORY.Write8(ADDRESS.Offset(outAddr, i), macByte)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Real link state, gated on whether VIRTIO_NET_F_STATUS was actually negotiated. Returns 0=DOWN,
+' 1=UP, 2=UNKNOWN (feature not negotiated, so the status field's contents are not meaningful).
+FUNCTION VirtioNet.LinkState() AS U32
+    LET features AS U32 = VirtioNet.GetCapabilities()
+    LET statusFeature AS U32 = features AND 65536
+    IF statusFeature = 0 THEN
+        RETURN 2
+    END IF
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET statusFieldPortNum AS U16 = ioBase + 26   ' device-specific config +6 (past the 6-byte MAC)
+    LET statusFieldPort AS IOPORT = PORT.Address(statusFieldPortNum)
+    LET linkStatus AS U16 = PORT.ReadWord(statusFieldPort)
+    LET linkUpBit AS U16 = linkStatus AND 1
+    IF linkUpBit = 1 THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION

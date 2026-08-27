@@ -313,6 +313,12 @@ arco_add_script_test(
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 arco_add_script_test(
+    systems_virtio_net_transport_smoke
+    arcology-os/tests/systems/systems_virtio_net_transport_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+arco_add_script_test(
     systems_aex_format_probe_smoke
     arcology-os/tests/systems/systems_aex_format_probe_smoke.sh
     $<TARGET_FILE:ArcoFission>

@@ -1,0 +1,80 @@
+' RFC-0048 Section 8.1 / Steering Addendum Section 2.1: the driver-side Network Interface Contract.
+' Higher layers (the Networking Fabric, and eventually Ethernet/ARP/IPv4) MUST consume NIC
+' capability through this generic boundary, never by depending on a specific backend's own
+' function names or state layout. This is a real, minimal instance of that boundary -- an
+' explicit IF-chain dispatch on a backend tag, matching this project's own established idiom for
+' "more than one provider behind one call surface" (loop_policy.abas's LoopInvokeSlot,
+' volumes_policy.abas's provider-tag dispatch, fat32_policy.abas's block-device selection). This
+' backend has no interface/polymorphism mechanism, so an explicit tag dispatch IS the generic
+' boundary on this backend, not a placeholder for one.
+'
+' Exactly one backend is registered today (VirtIO-net, tag NET_BACKEND_VIRTIO). The dispatch shape
+' is structurally ready for a second backend to attach beside it without any change to whatever
+' calls through this contract -- the addendum's own explicit acceptance requirement for "remaining
+' N0 work" (Section 11).
+'
+' Transmit/Receive are deliberately NOT exposed yet: virtqueue setup and frame ownership are the
+' next real increment (RFC-0048 Section 6.1's own ownership requirement applies there), not
+' implemented ahead of that proof. Start/Stop/GetCapabilities/GetMAC/GetLinkState are real today.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION NetBackendVirtio() AS U32
+    RETURN 1
+END FUNCTION
+
+' Real backend bring-up: discover the device on the PCI bus, map its I/O transport, reset it, and
+' negotiate the feature subset this project's driver actually understands. Returns FALSE, honestly,
+' at whichever real stage first fails -- no partial success is reported as success.
+FUNCTION NetworkInterface.Start(backendTag AS U32, systemTable AS UEFI.SystemTable) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        LET found AS BOOL = VirtioNet.DiscoverPci(systemTable)
+        IF found = 0 THEN
+            RETURN 0
+        END IF
+        LET mapped AS BOOL = VirtioNet.MapIo(systemTable)
+        IF mapped = 0 THEN
+            RETURN 0
+        END IF
+        VirtioNet.Reset()
+        LET negotiated AS BOOL = VirtioNet.Negotiate()
+        RETURN negotiated
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Real legacy VirtIO teardown: writing 0 to DeviceStatus is the spec-defined reset/release step.
+FUNCTION NetworkInterface.Stop(backendTag AS U32) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        RETURN VirtioNet.Reset()
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Real negotiated-feature bitmask, not a synthesized capability list -- honest about exactly what
+' this driver actually accepted from the device.
+FUNCTION NetworkInterface.GetCapabilities(backendTag AS U32) AS U32
+    IF backendTag = NetBackendVirtio() THEN
+        RETURN VirtioNet.GetCapabilities()
+    END IF
+    RETURN 0
+END FUNCTION
+
+' Writes the real 6-byte MAC address to outAddr. Returns FALSE without writing anything if the
+' backend cannot honestly report one (e.g. VIRTIO_NET_F_MAC was not negotiated).
+FUNCTION NetworkInterface.GetMAC(backendTag AS U32, outAddr AS MMIOPTR) AS BOOL
+    IF backendTag = NetBackendVirtio() THEN
+        RETURN VirtioNet.ReadMac(outAddr)
+    END IF
+    RETURN 0
+END FUNCTION
+
+' 0=DOWN, 1=UP, 2=UNKNOWN (backend cannot honestly report link state right now).
+FUNCTION NetworkInterface.GetLinkState(backendTag AS U32) AS U32
+    IF backendTag = NetBackendVirtio() THEN
+        RETURN VirtioNet.LinkState()
+    END IF
+    RETURN 2
+END FUNCTION
