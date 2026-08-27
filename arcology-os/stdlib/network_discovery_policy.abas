@@ -1,0 +1,137 @@
+' RFC-0048 Milestone N0 Phase 1: real NIC identification. Before any NIC register gets touched,
+' the Networking Fabric needs to know, for real, whether a network controller is even present --
+' not assumed. Reuses RFC-0047's own GpuDiscovery shape verbatim (itself reused from RFC-0045's
+' UsbXhci.DiscoverPci raw-PCI-scan pattern) -- same PciConfigReadU32/PciConfigAddressPort/
+' PciConfigDataPort machinery, same bus/device/function walk -- scanned for PCI base class 0x02
+' (Network Controller) instead of 0x03 (Display) or 0x0C/0x03/0x30 (USB xHCI).
+'
+' RFC-0048 Section 6.2 calls for VirtIO-net as the first deterministic development NIC backend.
+' This phase does not yet touch the device's own MMIO/BAR registers (that is Milestone N0 Phase 2,
+' the driver-side transport itself) -- it only proves the device can be found and correctly
+' classified, matching this project's established "discovery before programming" phase order
+' (RFC-0047 Phase 1 before Phase 2, RFC-0045 DiscoverPci before MapMmio).
+'
+' Deliberately does NOT stop at the first match: a real machine can have more than one network
+' controller (e.g. onboard Ethernet plus a discrete NIC), and later phases' own real scope depends
+' on knowing which one(s) are actually there.
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION NetDiscoveryPciConfigAddressPort() AS IOPORT
+    RETURN PORT.Address(3320)   ' 0xCF8
+END FUNCTION
+
+FUNCTION NetDiscoveryPciConfigDataPort() AS IOPORT
+    RETURN PORT.Address(3324)   ' 0xCFC
+END FUNCTION
+
+FUNCTION NetDiscoveryPciConfigReadU32(bus AS U32, device AS U32, func AS U32, offset AS U32) AS U32
+    LET address AS U32 = 2147483648
+    address = address OR (bus SHL 16)
+    address = address OR (device SHL 11)
+    address = address OR (func SHL 8)
+    address = address OR (offset AND 252)
+    LET addrPort AS IOPORT = NetDiscoveryPciConfigAddressPort()
+    LET dataPort AS IOPORT = NetDiscoveryPciConfigDataPort()
+    PORT.WriteDWord(addrPort, address)
+    LET value AS U32 = PORT.ReadDWord(dataPort)
+    RETURN value
+END FUNCTION
+
+' Fixed-size real result table: up to 4 real network-class devices, each a fixed-stride record.
+' Same "fixed scratch buffer, not a heap" idiom this project has used since RFC-0007's own RPM.
+FUNCTION NetDiscoveryStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(61865984))   ' 0x3B00000, clear of every other fixed scratch region this project uses
+END FUNCTION
+FUNCTION NetDiscoveryCountAddress() AS MMIOPTR
+    RETURN NetDiscoveryStateAddress()
+END FUNCTION
+FUNCTION NetDiscoveryMaxDevices() AS U32
+    RETURN 4
+END FUNCTION
+FUNCTION NetDiscoveryEntryStride() AS U32
+    RETURN 64
+END FUNCTION
+FUNCTION NetDiscoveryEntryAddress(index AS U32) AS MMIOPTR
+    RETURN ADDRESS.Offset(NetDiscoveryStateAddress(), 8 + (index * NetDiscoveryEntryStride()))
+END FUNCTION
+' Per-entry layout (64 bytes): +0 bus(U32) +4 device(U32) +8 func(U32) +12 vendorId(U32)
+' +16 deviceId(U32) +20 baseClass(U32) +24 subclass(U32) +28 progIf(U32)
+' +32..+55 six real BAR values (U32 each, raw/unparsed -- real 32-vs-64-bit-vs-I/O BAR
+' interpretation, MMIO mapping, and virtqueue setup are Milestone N0 Phase 2's own scope)
+
+FUNCTION NetDiscoveryWriteEntry(index AS U32, bus AS U32, device AS U32, func AS U32, vendorId AS U32, deviceId AS U32, baseClass AS U32, subclass AS U32, progIf AS U32) AS U64
+    LET addr AS MMIOPTR = NetDiscoveryEntryAddress(index)
+    MEMORY.Write32(addr, bus)
+    MEMORY.Write32(ADDRESS.Offset(addr, 4), device)
+    MEMORY.Write32(ADDRESS.Offset(addr, 8), func)
+    MEMORY.Write32(ADDRESS.Offset(addr, 12), vendorId)
+    MEMORY.Write32(ADDRESS.Offset(addr, 16), deviceId)
+    MEMORY.Write32(ADDRESS.Offset(addr, 20), baseClass)
+    MEMORY.Write32(ADDRESS.Offset(addr, 24), subclass)
+    MEMORY.Write32(ADDRESS.Offset(addr, 28), progIf)
+    LET barIndex AS U32 = 0
+    WHILE barIndex < 6
+        LET barValue AS U32 = NetDiscoveryPciConfigReadU32(bus, device, func, 16 + (barIndex * 4))
+        MEMORY.Write32(ADDRESS.Offset(addr, 32 + (barIndex * 4)), barValue)
+        barIndex = barIndex + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' Real, full PCI bus scan for base class 0x02 (Network Controller), any subclass -- catches
+' Ethernet (0x00), Token Ring (0x01), FDDI (0x02), ATM (0x03), ISDN (0x04), WorldFip (0x05),
+' PICMG (0x06), Infiniband (0x07), Fabric (0x08), and "Other" (0x80) alike. Records every real
+' match found, up to NetDiscoveryMaxDevices(). Returns the real count found.
+FUNCTION NetDiscovery.Discover(systemTable AS UEFI.SystemTable) AS U32
+    MEMORY.Write32(NetDiscoveryCountAddress(), 0)
+    LET count AS U32 = 0
+    LET bus AS U32 = 0
+    WHILE bus < 256
+        LET device AS U32 = 0
+        WHILE device < 32
+            LET func AS U32 = 0
+            WHILE func < 8
+                LET vendorDevice AS U32 = NetDiscoveryPciConfigReadU32(bus, device, func, 0)
+                LET vendorId AS U32 = vendorDevice AND 65535
+                IF vendorId <> 65535 THEN
+                    LET classReg AS U32 = NetDiscoveryPciConfigReadU32(bus, device, func, 8)
+                    LET baseClass AS U32 = (classReg SHR 24) AND 255
+                    IF baseClass = 2 THEN
+                        IF count < NetDiscoveryMaxDevices() THEN
+                            LET deviceId AS U32 = (vendorDevice SHR 16) AND 65535
+                            LET subclass AS U32 = (classReg SHR 16) AND 255
+                            LET progIf AS U32 = (classReg SHR 8) AND 255
+                            NetDiscoveryWriteEntry(count, bus, device, func, vendorId, deviceId, baseClass, subclass, progIf)
+                            count = count + 1
+                            MEMORY.Write32(NetDiscoveryCountAddress(), count)
+                        END IF
+                    END IF
+                END IF
+                func = func + 1
+            WEND
+            device = device + 1
+        WEND
+        bus = bus + 1
+    WEND
+    RETURN count
+END FUNCTION
+
+' Real, honest vendor identification -- PCI vendor IDs are public and stable, kept as an explicit
+' lookup rather than a heuristic. Returns a real label code: 1=VirtIO (Red Hat, Inc.), 2=Intel,
+' 3=Realtek, 0=Unknown. VirtIO is checked first: RFC-0048 Section 6.2 names it this project's own
+' first deterministic development NIC backend.
+FUNCTION NetDiscoveryVendorCode(vendorId AS U32) AS U32
+    IF vendorId = 6900 THEN
+        RETURN 1
+    END IF
+    IF vendorId = 32902 THEN
+        RETURN 2
+    END IF
+    IF vendorId = 5348 THEN
+        RETURN 3
+    END IF
+    RETURN 0
+END FUNCTION

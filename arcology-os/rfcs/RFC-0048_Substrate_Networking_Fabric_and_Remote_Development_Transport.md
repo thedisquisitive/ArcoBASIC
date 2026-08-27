@@ -2,7 +2,9 @@
 
 RFC Number: RFC-0048
 Title: Substrate Networking Fabric and Remote Development Transport
-Status: Draft
+Status: Draft -- Milestone N0 Phase 1 (real NIC identification, real PCI class-0x02 scan)
+implemented and QEMU-proven; Phase 2 (MMIO/BAR mapping and virtqueue transport) and Milestones
+N1-N6 not started
 Category: Substrate / Networking / Development Infrastructure
 Authors: Arcology Project
 Created: 2026-08-26
@@ -1104,3 +1106,12 @@ This RFC reaches its initial implementation goal when all of the following are t
 15. Networking remains operational without AEX userspace.
 16. The architecture exposes a defined path for future contract-based AEX networking without requiring replacement of the substrate network stack.
 17. QEMU/virtual regression tests and at least one physical-hardware validation are documented.
+
+---
+
+## Revision History
+
+| Version | Date | Summary |
+|---------|------|---------|
+|0.1|2026-08-26|Initial draft, saved verbatim as submitted, design-only.|
+|0.2|2026-08-26|Milestone N0 Phase 1 (real NIC identification, Section 6.2/18.1) real and QEMU-proven. Reuses RFC-0047's own `GpuDiscovery` shape verbatim (itself reused from RFC-0045's `UsbXhci.DiscoverPci` raw-PCI-scan pattern) -- same `PciConfigReadU32`/`PciConfigAddressPort`/`PciConfigDataPort` machinery, same bus/device/function walk -- scanned for PCI base class 0x02 (Network Controller) instead of 0x03 (Display) or 0x0C/0x03/0x30 (USB xHCI). `NetDiscovery.Discover` (`stdlib/network_discovery_policy.abas`) records up to 4 real network-class devices found (bus/device/function, vendor/device ID, class/subclass/prog-if, all 6 real BARs) into a fixed scratch table; `NetDiscoveryVendorCode` recognizes VirtIO (Red Hat, Inc., vendor 0x1AF4/6900) first, matching Section 6.2's own naming of VirtIO-net as this project's first deterministic development NIC backend. Proven by new smoke test `systems_network_nic_discovery_probe_smoke`: a positive case attaches a real QEMU `virtio-net-pci` device and confirms it is found, correctly classified as Network Controller/Ethernet (class 2/0/0), and correctly identified as VirtIO by its real vendor ID; a negative control with no network device attached confirms zero false matches. Deliberately not claimed yet: MMIO/BAR mapping, virtqueue setup, frame transmit/receive, or any protocol layer above raw PCI discovery -- Milestone N0 Phase 2 (driver-side transport) and Milestones N1-N6 remain real, separate, later increments.|
