@@ -1,0 +1,612 @@
+' Arco3D canonical scene/asset object model (RFC-0049 Section 19, implementation step 1).
+'
+' This module is deliberately headless: no GUI.* calls anywhere below. It defines the in-memory
+' shapes construction/rig/surface/style engines will all read and write, plus block-primitive
+' construction and basic move/rotate/scale transforms (RFC-0049 Section 7.1).
+'
+' Explicit scope for this first increment (see RFC-0049 Section 19 "Recommended Implementation
+' Order", steps 1 and 3, folded together since primitives ARE the object model's first real
+' content):
+'   - Vec3 math, a Position/Euler/Scale Transform, and a triangulated Mesh/Face/Component/Asset
+'     object model with stable (non-positional) string IDs.
+'   - Five primitive builders: block, wedge, cylinder, plane, sphere.
+'   - Absolute/relative move, rotate, scale, and Clone()-based duplication on Component.
+' Deliberately NOT in this increment (later phases, per the RFC's own recommended order):
+'   - The non-destructive Construction Stack itself (enable/disable/reorder/commit) -- Section 7.2.
+'   - Mirror/array/snap/extrude/inset/bevel -- these are stack operations in the RFC's own example
+'     diagram (Block -> Mirror -> Extrusion Group -> Bevel -> Subdivision -> Detail Pass), not
+'     primitive-creation concerns.
+'   - Kitbash attachment-point semantics (Section 7.3) -- Component.AttachmentPoints below is a
+'     reserved empty array, not a working feature yet.
+'   - Rig/pose, materials, paint, style, and A3D file serialization -- separate phases/RFCs.
+'
+' Known simplifications, stated up front rather than left implicit:
+'   - Face normals are flat (one Vec3 per face), not smoothed per-vertex. Smoothing/sharp-edge
+'     metadata is a later "Detail Pass" concern (RFC-0050 Section 11 lists it as SHOULD, not MUST).
+'   - Transform.ApplyToDirection() rotates but does not apply an inverse-transpose correction for
+'     non-uniform scale, so face normals will skew slightly under non-uniform ScaleBy(). Fine for
+'     uniform scale (the common case); flagged here so it isn't a silent bug later.
+'   - Coordinate convention: right-handed, Y-up, and CCW winding (viewed from outside) produces an
+'     outward-facing normal via (v1-v0) x (v2-v0). This is Arco3D's own internal working
+'     convention, chosen for this increment's own consistency -- RFC-0050 Section 10 requires the
+'     *interchange* format's convention to be frozen separately, later, and explicitly says it
+'     should minimize ambiguity rather than mirror Blender internals (Blender is Z-up).
+'   - No file format yet: "save/load round-trip" (RFC-0049 Section 17.1) is tested here as
+'     Clone()-then-compare-by-value, proving the object model itself has no hidden aliasing. Real
+'     file-backed round-trip is RFC-0050's job (Recommended Implementation Order step 5).
+
+DEG2RAD = PI() / 180
+RAD2DEG = 180 / PI()
+
+' ---- Vec3 ---------------------------------------------------------------------------------
+
+CLASS Vec3
+    X AS Number = 0
+    Y AS Number = 0
+    Z AS Number = 0
+
+    CONSTRUCTOR(x AS Number = 0, y AS Number = 0, z AS Number = 0)
+        SELF.X = x
+        SELF.Y = y
+        SELF.Z = z
+    END CONSTRUCTOR
+
+    FUNCTION Plus(other AS Vec3) AS Vec3
+        RETURN Vec3(SELF.X + other.X, SELF.Y + other.Y, SELF.Z + other.Z)
+    END FUNCTION
+
+    FUNCTION Minus(other AS Vec3) AS Vec3
+        RETURN Vec3(SELF.X - other.X, SELF.Y - other.Y, SELF.Z - other.Z)
+    END FUNCTION
+
+    FUNCTION Scaled(factor AS Number) AS Vec3
+        RETURN Vec3(SELF.X * factor, SELF.Y * factor, SELF.Z * factor)
+    END FUNCTION
+
+    ' Component-wise scale (distinct from Scaled(), which is a uniform scalar multiply).
+    FUNCTION ScaledBy(other AS Vec3) AS Vec3
+        RETURN Vec3(SELF.X * other.X, SELF.Y * other.Y, SELF.Z * other.Z)
+    END FUNCTION
+
+    FUNCTION Negated() AS Vec3
+        RETURN Vec3(0 - SELF.X, 0 - SELF.Y, 0 - SELF.Z)
+    END FUNCTION
+
+    FUNCTION Dot(other AS Vec3) AS Number
+        RETURN SELF.X * other.X + SELF.Y * other.Y + SELF.Z * other.Z
+    END FUNCTION
+
+    FUNCTION Cross(other AS Vec3) AS Vec3
+        RETURN Vec3(
+            SELF.Y * other.Z - SELF.Z * other.Y,
+            SELF.Z * other.X - SELF.X * other.Z,
+            SELF.X * other.Y - SELF.Y * other.X)
+    END FUNCTION
+
+    FUNCTION Length() AS Number
+        RETURN SQRT(SELF.Dot(SELF))
+    END FUNCTION
+
+    ' Returns the zero vector for a (near-)zero-length input rather than dividing by zero -- a
+    ' degenerate face (two coincident vertices) should not crash mesh construction.
+    FUNCTION Normalized() AS Vec3
+        length = SELF.Length()
+        IF length < 0.000001 THEN
+            RETURN Vec3(0, 0, 0)
+        END IF
+        RETURN SELF.Scaled(1 / length)
+    END FUNCTION
+
+    FUNCTION LerpTo(other AS Vec3, t AS Number) AS Vec3
+        RETURN Vec3(
+            SELF.X + (other.X - SELF.X) * t,
+            SELF.Y + (other.Y - SELF.Y) * t,
+            SELF.Z + (other.Z - SELF.Z) * t)
+    END FUNCTION
+
+    FUNCTION Clone() AS Vec3
+        RETURN Vec3(SELF.X, SELF.Y, SELF.Z)
+    END FUNCTION
+
+    FUNCTION EqualsApprox(other AS Vec3, epsilon AS Number = 0.0001) AS Boolean
+        RETURN ABS(SELF.X - other.X) < epsilon ANDALSO ABS(SELF.Y - other.Y) < epsilon ANDALSO ABS(SELF.Z - other.Z) < epsilon
+    END FUNCTION
+END CLASS
+
+' A single UV coordinate. Kept as its own tiny class (rather than a bare {U:, V:} object) so
+' Mesh.UVs reads the same way Mesh.Vertices does.
+CLASS Vec2
+    U AS Number = 0
+    V AS Number = 0
+
+    CONSTRUCTOR(u AS Number = 0, v AS Number = 0)
+        SELF.U = u
+        SELF.V = v
+    END CONSTRUCTOR
+
+    FUNCTION Clone() AS Vec2
+        RETURN Vec2(SELF.U, SELF.V)
+    END FUNCTION
+END CLASS
+
+' ---- Transform ------------------------------------------------------------------------------
+
+CLASS Transform
+    Position AS Vec3 = Vec3(0, 0, 0)
+    ' Degrees, applied in X-then-Y-then-Z order (matches examples/gui_cube.abas's RotatePoint).
+    RotationEuler AS Vec3 = Vec3(0, 0, 0)
+    Scale AS Vec3 = Vec3(1, 1, 1)
+
+    FUNCTION RotatedOnly(localPoint AS Vec3) AS Vec3
+        rx = SELF.RotationEuler.X * DEG2RAD
+        ry = SELF.RotationEuler.Y * DEG2RAD
+        rz = SELF.RotationEuler.Z * DEG2RAD
+
+        x1 = localPoint.X
+        y1 = localPoint.Y * COS(rx) - localPoint.Z * SIN(rx)
+        z1 = localPoint.Y * SIN(rx) + localPoint.Z * COS(rx)
+
+        x2 = x1 * COS(ry) + z1 * SIN(ry)
+        y2 = y1
+        z2 = 0 - x1 * SIN(ry) + z1 * COS(ry)
+
+        x3 = x2 * COS(rz) - y2 * SIN(rz)
+        y3 = x2 * SIN(rz) + y2 * COS(rz)
+        z3 = z2
+
+        RETURN Vec3(x3, y3, z3)
+    END FUNCTION
+
+    ' Local -> world for a position: scale, then rotate, then translate.
+    FUNCTION ApplyToPoint(localPoint AS Vec3) AS Vec3
+        scaled = localPoint.ScaledBy(SELF.Scale)
+        rotated = SELF.RotatedOnly(scaled)
+        RETURN rotated.Plus(SELF.Position)
+    END FUNCTION
+
+    ' Local -> world for a direction (e.g. a face normal): rotate only, no translation. Known
+    ' simplification (see module header): does not inverse-transpose for non-uniform Scale.
+    FUNCTION ApplyToDirection(localDirection AS Vec3) AS Vec3
+        rotated = SELF.RotatedOnly(localDirection)
+        RETURN rotated.Normalized()
+    END FUNCTION
+
+    FUNCTION Clone() AS Transform
+        copy = Transform()
+        position = SELF.Position
+        rotation = SELF.RotationEuler
+        scale = SELF.Scale
+        copy.Position = position.Clone()
+        copy.RotationEuler = rotation.Clone()
+        copy.Scale = scale.Clone()
+        RETURN copy
+    END FUNCTION
+END CLASS
+
+' ---- Mesh -------------------------------------------------------------------------------------
+
+CLASS Face
+    ' Always exactly 3 vertex indices into the owning Mesh.Vertices -- primitives below emit
+    ' triangulated geometry directly (see module header: quad/ngon editing is a later phase).
+    Indices AS Array = []
+    Normal AS Vec3 = Vec3(0, 0, 0)
+    ' Reserved for the Surface phase (RFC-0049 Section 7.7); every face is slot 0 until materials
+    ' exist.
+    MaterialSlot AS Number = 0
+
+    CONSTRUCTOR(a AS Number = 0, b AS Number = 0, c AS Number = 0)
+        SELF.Indices = [a, b, c]
+    END CONSTRUCTOR
+
+    FUNCTION Clone() AS Face
+        copy = Face(SELF.Indices[0], SELF.Indices[1], SELF.Indices[2])
+        normal = SELF.Normal
+        copy.Normal = normal.Clone()
+        copy.MaterialSlot = SELF.MaterialSlot
+        RETURN copy
+    END FUNCTION
+END CLASS
+
+CLASS Mesh
+    Vertices AS Array = []
+    ' Parallel to Vertices when present; empty until a mapping phase populates it (RFC-0049
+    ' Section 7.10) -- routine block surfacing does not require UVs to exist yet.
+    UVs AS Array = []
+    Faces AS Array = []
+
+    FUNCTION VertexCount() AS Number
+        RETURN LEN(SELF.Vertices)
+    END FUNCTION
+
+    FUNCTION FaceCount() AS Number
+        RETURN LEN(SELF.Faces)
+    END FUNCTION
+
+    ' Flat per-face normals via the first triangle corner and its two edges. Winding convention:
+    ' CCW viewed from outside yields an outward normal from (v1-v0) x (v2-v0) (see module header).
+    FUNCTION RecomputeFaceNormals()
+        FOR face IN SELF.Faces
+            v0 = SELF.Vertices[face.Indices[0]]
+            v1 = SELF.Vertices[face.Indices[1]]
+            v2 = SELF.Vertices[face.Indices[2]]
+            edge1 = v1.Minus(v0)
+            edge2 = v2.Minus(v0)
+            crossProduct = edge1.Cross(edge2)
+            face.Normal = crossProduct.Normalized()
+        NEXT
+    END FUNCTION
+
+    FUNCTION Clone() AS Mesh
+        copy = Mesh()
+        FOR vertex IN SELF.Vertices
+            ignoredPush = Array.Add(copy.Vertices, vertex.Clone())
+        NEXT
+        FOR uv IN SELF.UVs
+            ignoredPush = Array.Add(copy.UVs, uv.Clone())
+        NEXT
+        FOR face IN SELF.Faces
+            ignoredPush = Array.Add(copy.Faces, face.Clone())
+        NEXT
+        RETURN copy
+    END FUNCTION
+END CLASS
+
+' ---- Stable IDs (RFC-0050 Section 9: "Stable IDs MUST NOT be based solely on array position") --
+
+CLASS ArcoId
+    SHARED NextId AS Number = 0
+
+    SHARED FUNCTION Issue(prefix AS String) AS String
+        ArcoId.NextId = ArcoId.NextId + 1
+        RETURN prefix + "-" + STRING(ArcoId.NextId)
+    END FUNCTION
+END CLASS
+
+' ---- Component / Asset -------------------------------------------------------------------------
+
+CLASS Component
+    Id AS String = ""
+    Name AS String = ""
+    Transform AS Transform = Transform()
+    ' NULL for a pure group/organizational component (no geometry of its own).
+    LocalMesh AS Mesh = NULL
+    ' Child components, transformed relative to this one. Kitbash/attachment assembly (RFC-0049
+    ' Section 7.3) is a later phase; this only carries hierarchy today.
+    Children AS Array = []
+    ' Reserved for the kitbash phase (RFC-0049 Section 7.3) -- always empty for now.
+    AttachmentPoints AS Array = []
+    ' A ConstructionStack (RFC-0049 Section 7.2), or NULL if this component has none yet. Left
+    ' untyped and unset here deliberately: arco3d_construction.abas depends on this file, not the
+    ' other way around, so this file cannot name the ConstructionStack class. See
+    ' AttachConstructionStack()/AddConstructionOp()/RefreshComponentFromStack() there.
+    Stack = NULL
+
+    CONSTRUCTOR(name AS String = "")
+        SELF.Id = ArcoId.Issue("component")
+        SELF.Name = name
+    END CONSTRUCTOR
+
+    FUNCTION Translate(dx AS Number, dy AS Number, dz AS Number)
+        transform = SELF.Transform
+        position = transform.Position
+        transform.Position = position.Plus(Vec3(dx, dy, dz))
+    END FUNCTION
+
+    FUNCTION SetPosition(x AS Number, y AS Number, z AS Number)
+        transform = SELF.Transform
+        transform.Position = Vec3(x, y, z)
+    END FUNCTION
+
+    ' Additive, in degrees.
+    FUNCTION RotateEuler(dx AS Number, dy AS Number, dz AS Number)
+        transform = SELF.Transform
+        rotation = transform.RotationEuler
+        transform.RotationEuler = rotation.Plus(Vec3(dx, dy, dz))
+    END FUNCTION
+
+    FUNCTION SetRotationEuler(x AS Number, y AS Number, z AS Number)
+        transform = SELF.Transform
+        transform.RotationEuler = Vec3(x, y, z)
+    END FUNCTION
+
+    ' Multiplicative (SetScale(2,2,2) then ScaleBy(2,2,2) leaves an effective 4x scale).
+    FUNCTION ScaleBy(sx AS Number, sy AS Number, sz AS Number)
+        transform = SELF.Transform
+        scale = transform.Scale
+        transform.Scale = scale.ScaledBy(Vec3(sx, sy, sz))
+    END FUNCTION
+
+    FUNCTION SetScale(x AS Number, y AS Number, z AS Number)
+        SELF.Transform.Scale = Vec3(x, y, z)
+    END FUNCTION
+
+    ' World-space vertex positions for this component's own mesh only (children are evaluated
+    ' separately by whatever walks the hierarchy -- no implicit parent-transform composition yet,
+    ' since Children is currently just a hierarchy container, not a working attachment system).
+    FUNCTION EvaluatedVertices() AS Array
+        result = []
+        localMesh = SELF.LocalMesh
+        IF localMesh == NULL THEN
+            RETURN result
+        END IF
+        transform = SELF.Transform
+        FOR vertex IN localMesh.Vertices
+            ignoredPush = Array.Add(result, transform.ApplyToPoint(vertex))
+        NEXT
+        RETURN result
+    END FUNCTION
+
+    ' A genuine independent duplicate (RFC-0049 Section 7.1 "duplication"): same structure and
+    ' values, but a freshly minted Id, since it is a new object in the scene. For a same-identity
+    ' structural copy (used by the round-trip test), compare fields directly instead of Id.
+    FUNCTION Clone() AS Component
+        copy = Component(SELF.Name)
+        transform = SELF.Transform
+        copy.Transform = transform.Clone()
+        localMesh = SELF.LocalMesh
+        IF localMesh <> NULL THEN
+            copy.LocalMesh = localMesh.Clone()
+        END IF
+        FOR child IN SELF.Children
+            ignoredPush = Array.Add(copy.Children, child.Clone())
+        NEXT
+        ' Dynamically dispatched: this file never names ConstructionStack (see the Stack field
+        ' comment above), but method calls in this runtime resolve by the value's actual class at
+        ' call time, not by any static/declared type, so this works regardless.
+        stackField = SELF.Stack
+        IF stackField <> NULL THEN
+            copy.Stack = stackField.Clone()
+        END IF
+        RETURN copy
+    END FUNCTION
+END CLASS
+
+CLASS Asset
+    Id AS String = ""
+    Name AS String = ""
+    Root AS Component = NULL
+    ' A Rig (arco3d_rig.abas), or NULL. Untyped for the same reason Component.Stack is (see its
+    ' own comment): arco3d_rig.abas depends on this file, not the other way around, so this file
+    ' cannot name the Rig class. Assign directly (`asset.Rig = myRig`) -- no attach-function
+    ' wrapper is needed the way ConstructionStack has one, since a Rig needs no asset-specific
+    ' initialization.
+    Rig = NULL
+    ' PoseCatalog instances (arco3d_rig.abas) carried with this asset, or empty. Same reasoning.
+    PoseCatalogs AS Array = []
+
+    CONSTRUCTOR(name AS String = "")
+        SELF.Id = ArcoId.Issue("asset")
+        SELF.Name = name
+    END CONSTRUCTOR
+
+    FUNCTION Clone() AS Asset
+        copy = Asset(SELF.Name)
+        root = SELF.Root
+        IF root <> NULL THEN
+            copy.Root = root.Clone()
+        END IF
+        RETURN copy
+    END FUNCTION
+END CLASS
+
+' ---- Primitives (RFC-0049 Section 7.1) ---------------------------------------------------------
+'
+' All primitives are centered on their own local origin and triangulated. Coordinate convention:
+' right-handed, Y-up (see module header).
+
+FUNCTION CreateBlock(width AS Number = 1, height AS Number = 1, depth AS Number = 1) AS Component
+    hw = width / 2
+    hh = height / 2
+    hd = depth / 2
+
+    mesh = Mesh()
+    mesh.Vertices = [
+        Vec3(0 - hw, 0 - hh, 0 - hd),
+        Vec3(hw, 0 - hh, 0 - hd),
+        Vec3(hw, hh, 0 - hd),
+        Vec3(0 - hw, hh, 0 - hd),
+        Vec3(0 - hw, 0 - hh, hd),
+        Vec3(hw, 0 - hh, hd),
+        Vec3(hw, hh, hd),
+        Vec3(0 - hw, hh, hd)
+    ]
+
+    mesh.Faces = [
+        Face(0, 2, 1), Face(0, 3, 2),
+        Face(5, 7, 4), Face(5, 6, 7),
+        Face(4, 3, 0), Face(4, 7, 3),
+        Face(1, 6, 5), Face(1, 2, 6),
+        Face(3, 6, 2), Face(3, 7, 6),
+        Face(4, 1, 5), Face(4, 0, 1)
+    ]
+    mesh.RecomputeFaceNormals()
+
+    block = Component("Block")
+    block.LocalMesh = mesh
+    RETURN block
+END FUNCTION
+
+' A ramp: rectangular base, sloping up from the front (-Z) edge to a ridge along the back (+Z)
+' edge at full height. 6 vertices, 8 triangular faces (bottom/back/slope quads + two end caps).
+FUNCTION CreateWedge(width AS Number = 1, height AS Number = 1, depth AS Number = 1) AS Component
+    hw = width / 2
+    hd = depth / 2
+
+    mesh = Mesh()
+    mesh.Vertices = [
+        Vec3(0 - hw, 0, 0 - hd),
+        Vec3(hw, 0, 0 - hd),
+        Vec3(hw, 0, hd),
+        Vec3(0 - hw, 0, hd),
+        Vec3(hw, height, hd),
+        Vec3(0 - hw, height, hd)
+    ]
+
+    mesh.Faces = [
+        Face(0, 1, 2), Face(0, 2, 3),
+        Face(3, 2, 4), Face(3, 4, 5),
+        Face(0, 5, 4), Face(0, 4, 1),
+        Face(0, 3, 5),
+        Face(1, 4, 2)
+    ]
+    mesh.RecomputeFaceNormals()
+
+    wedge = Component("Wedge")
+    wedge.LocalMesh = mesh
+    RETURN wedge
+END FUNCTION
+
+FUNCTION CreatePlane(width AS Number = 1, depth AS Number = 1) AS Component
+    hw = width / 2
+    hd = depth / 2
+
+    mesh = Mesh()
+    mesh.Vertices = [
+        Vec3(0 - hw, 0, 0 - hd),
+        Vec3(hw, 0, 0 - hd),
+        Vec3(hw, 0, hd),
+        Vec3(0 - hw, 0, hd)
+    ]
+    mesh.Faces = [Face(0, 2, 1), Face(0, 3, 2)]
+    mesh.RecomputeFaceNormals()
+
+    plane = Component("Plane")
+    plane.LocalMesh = mesh
+    RETURN plane
+END FUNCTION
+
+' A capped cylinder standing along Y, centered at its own midpoint. `segments` is the number of
+' sides around the circumference (minimum 3). Vertex count is 2*segments+2 (a top and bottom ring
+' plus one center vertex per cap); face count is 4*segments (side quads triangulated, plus one
+' triangle per segment per cap).
+FUNCTION CreateCylinder(radius AS Number = 0.5, height AS Number = 1, segments AS Number = 16) AS Component
+    sides = segments
+    IF sides < 3 THEN
+        sides = 3
+    END IF
+    hh = height / 2
+
+    mesh = Mesh()
+    vertices = []
+    ' Bottom ring: indices 0..sides-1. Top ring: indices sides..2*sides-1.
+    FOR i IN Range(sides)
+        angle = (i / sides) * TAU()
+        x = COS(angle) * radius
+        z = SIN(angle) * radius
+        ignoredPush = Array.Add(vertices, Vec3(x, 0 - hh, z))
+    NEXT
+    FOR i IN Range(sides)
+        angle = (i / sides) * TAU()
+        x = COS(angle) * radius
+        z = SIN(angle) * radius
+        ignoredPush = Array.Add(vertices, Vec3(x, hh, z))
+    NEXT
+    bottomCenterIndex = sides * 2
+    topCenterIndex = sides * 2 + 1
+    ignoredPush = Array.Add(vertices, Vec3(0, 0 - hh, 0))
+    ignoredPush = Array.Add(vertices, Vec3(0, hh, 0))
+    mesh.Vertices = vertices
+
+    faces = []
+    FOR i IN Range(sides)
+        nextIndex = (i + 1) % sides
+        bottomA = i
+        bottomB = nextIndex
+        topA = i + sides
+        topB = nextIndex + sides
+        ' Side quad, split into two triangles, wound outward.
+        ignoredPush = Array.Add(faces, Face(bottomA, topB, bottomB))
+        ignoredPush = Array.Add(faces, Face(bottomA, topA, topB))
+        ' Bottom cap triangle (normal points down, so reverse winding vs. the top cap).
+        ignoredPush = Array.Add(faces, Face(bottomCenterIndex, bottomA, bottomB))
+        ' Top cap triangle.
+        ignoredPush = Array.Add(faces, Face(topCenterIndex, topB, topA))
+    NEXT
+    mesh.Faces = faces
+    mesh.RecomputeFaceNormals()
+
+    cylinder = Component("Cylinder")
+    cylinder.LocalMesh = mesh
+    RETURN cylinder
+END FUNCTION
+
+' Vertex index of the first vertex in interior latitude ring `ringNumber` (1-based; ring 0 would be
+' the top pole itself, which is always vertex index 0 -- see CreateSphere below).
+FUNCTION SphereRingStart(ringNumber AS Number, segmentsPerRing AS Number) AS Number
+    RETURN 1 + (ringNumber - 1) * segmentsPerRing
+END FUNCTION
+
+' A UV sphere: `rings` latitude bands (minimum 2), `segments` longitude divisions (minimum 3).
+' Vertex count is 2 + (rings-1)*segments (a pole at each end plus interior latitude rings); face
+' count is 2*segments (the two polar caps) + (rings-2)*segments*2 (the interior quad bands).
+FUNCTION CreateSphere(radius AS Number = 0.5, segments AS Number = 16, rings AS Number = 8) AS Component
+    lonSegments = segments
+    IF lonSegments < 3 THEN
+        lonSegments = 3
+    END IF
+    latRings = rings
+    IF latRings < 2 THEN
+        latRings = 2
+    END IF
+
+    mesh = Mesh()
+    vertices = []
+    topPoleIndex = 0
+    ignoredPush = Array.Add(vertices, Vec3(0, radius, 0))
+
+    ' Interior latitude rings, from just below the top pole to just above the bottom pole.
+    FOR ring IN Range(1, latRings)
+        polarAngle = (ring / latRings) * PI()
+        y = COS(polarAngle) * radius
+        ringRadius = SIN(polarAngle) * radius
+        FOR segment IN Range(lonSegments)
+            azimuth = (segment / lonSegments) * TAU()
+            x = COS(azimuth) * ringRadius
+            z = SIN(azimuth) * ringRadius
+            ignoredPush = Array.Add(vertices, Vec3(x, y, z))
+        NEXT
+    NEXT
+
+    bottomPoleIndex = LEN(vertices)
+    ignoredPush = Array.Add(vertices, Vec3(0, 0 - radius, 0))
+    mesh.Vertices = vertices
+
+    faces = []
+    ' Top cap: pole to the first interior ring.
+    firstRingStart = SphereRingStart(1, lonSegments)
+    FOR segment IN Range(lonSegments)
+        a = firstRingStart + segment
+        b = firstRingStart + (segment + 1) % lonSegments
+        ignoredPush = Array.Add(faces, Face(topPoleIndex, b, a))
+    NEXT
+
+    ' Interior bands between consecutive rings.
+    FOR ring IN Range(1, latRings - 1)
+        currentStart = SphereRingStart(ring, lonSegments)
+        nextStart = SphereRingStart(ring + 1, lonSegments)
+        FOR segment IN Range(lonSegments)
+            nextSegment = (segment + 1) % lonSegments
+            a = currentStart + segment
+            b = currentStart + nextSegment
+            c = nextStart + nextSegment
+            d = nextStart + segment
+            ignoredPush = Array.Add(faces, Face(a, b, c))
+            ignoredPush = Array.Add(faces, Face(a, c, d))
+        NEXT
+    NEXT
+
+    ' Bottom cap: last interior ring to the pole.
+    lastRingStart = SphereRingStart(latRings - 1, lonSegments)
+    FOR segment IN Range(lonSegments)
+        a = lastRingStart + segment
+        b = lastRingStart + (segment + 1) % lonSegments
+        ignoredPush = Array.Add(faces, Face(bottomPoleIndex, a, b))
+    NEXT
+
+    mesh.Faces = faces
+    mesh.RecomputeFaceNormals()
+
+    sphere = Component("Sphere")
+    sphere.LocalMesh = mesh
+    RETURN sphere
+END FUNCTION

@@ -1,0 +1,254 @@
+#DESCRIPTION "Arco3D scene/asset object model smoke test (RFC-0049 Section 17.1)"
+'
+' Run via arco3d/scripts/test.sh (builds arcosh if needed, runs every tests/*.abas file), or
+' directly with `cd arco3d && ./build/arcosh tests/scene_smoke.abas` -- either way, run from
+' inside arco3d/ itself, since #IMPORT below resolves relative to the current directory (see
+' arco3d/README.md).
+'
+' There is no TEST/ASSERT block feature in this toolchain yet (RFC-0033 is Draft, unimplemented --
+' checked directly against src/ before relying on it). This is a self-checking script instead:
+' each Check* call records a label to the `failures` array on mismatch, and the script exits
+' nonzero if anything failed, matching the shell-smoke-test convention already used elsewhere in
+' this repo (tests/integration/*.sh).
+'
+' arco3d_scene.abas's intermediate-variable style (`v = x.Field` then `v.Method()`, rather than
+' `x.Field.Method()` inline) predates a real compiler fix (see arco3d/README.md) for what used to
+' be a hard failure on that shape. Left as-is here since it costs nothing and still reads fine.
+
+#IMPORT "arco3d_scene"
+
+failures = []
+
+FUNCTION CheckTrue(condition AS Boolean, label AS String)
+    IF condition == FALSE THEN
+        ignoredPush = Array.Add(failures, label)
+        PRINT "FAIL: " + label
+    END IF
+END FUNCTION
+
+FUNCTION CheckNumberEquals(actual AS Number, expected AS Number, label AS String)
+    difference = ABS(actual - expected)
+    IF difference > 0.0005 THEN
+        detail = label + " (expected " + STRING(expected) + ", got " + STRING(actual) + ")"
+        ignoredPush = Array.Add(failures, detail)
+        PRINT "FAIL: " + detail
+    END IF
+END FUNCTION
+
+FUNCTION CheckVec3Equals(actual AS Vec3, expected AS Vec3, label AS String)
+    ok = actual.EqualsApprox(expected, 0.0005)
+    IF ok == FALSE THEN
+        detail = label + " (expected " + STRING(expected.X) + "," + STRING(expected.Y) + "," + STRING(expected.Z)
+        detail = detail + " got " + STRING(actual.X) + "," + STRING(actual.Y) + "," + STRING(actual.Z) + ")"
+        ignoredPush = Array.Add(failures, detail)
+        PRINT "FAIL: " + detail
+    END IF
+END FUNCTION
+
+' ---- Vec3 math ----------------------------------------------------------------------------
+
+a = Vec3(1, 2, 3)
+b = Vec3(4, 5, 6)
+
+sum = a.Plus(b)
+CheckVec3Equals(sum, Vec3(5, 7, 9), "Vec3.Plus")
+
+difference = a.Minus(b)
+CheckVec3Equals(difference, Vec3(-3, -3, -3), "Vec3.Minus")
+
+scaled = a.Scaled(2)
+CheckVec3Equals(scaled, Vec3(2, 4, 6), "Vec3.Scaled")
+
+scaledBy = a.ScaledBy(Vec3(2, 0, 1))
+CheckVec3Equals(scaledBy, Vec3(2, 0, 3), "Vec3.ScaledBy component-wise")
+
+negated = a.Negated()
+CheckVec3Equals(negated, Vec3(-1, -2, -3), "Vec3.Negated")
+
+dotValue = a.Dot(b)
+CheckNumberEquals(dotValue, 32, "Vec3.Dot")
+
+xAxis = Vec3(1, 0, 0)
+yAxis = Vec3(0, 1, 0)
+crossValue = xAxis.Cross(yAxis)
+CheckVec3Equals(crossValue, Vec3(0, 0, 1), "Vec3.Cross X-cross-Y is +Z")
+
+triangle345 = Vec3(3, 4, 0)
+lengthValue = triangle345.Length()
+CheckNumberEquals(lengthValue, 5, "Vec3.Length 3-4-5 triangle")
+
+fiveUp = Vec3(0, 5, 0)
+normalized = fiveUp.Normalized()
+CheckVec3Equals(normalized, Vec3(0, 1, 0), "Vec3.Normalized")
+
+zero = Vec3(0, 0, 0)
+zeroNormalized = zero.Normalized()
+CheckVec3Equals(zeroNormalized, Vec3(0, 0, 0), "Vec3.Normalized zero-length stays zero")
+
+lerpStart = Vec3(0, 0, 0)
+lerpEnd = Vec3(10, 0, 0)
+lerped = lerpStart.LerpTo(lerpEnd, 0.5)
+CheckVec3Equals(lerped, Vec3(5, 0, 0), "Vec3.LerpTo midpoint")
+
+' ---- Transform accuracy (RFC-0049 Section 17.1 "transform accuracy") --------------------------
+
+translated = Transform()
+translated.Position = Vec3(10, 0, 0)
+originPoint = Vec3(0, 0, 0)
+translatedResult = translated.ApplyToPoint(originPoint)
+CheckVec3Equals(translatedResult, Vec3(10, 0, 0), "Transform.ApplyToPoint translation only")
+
+rotated90Y = Transform()
+rotated90Y.RotationEuler = Vec3(0, 90, 0)
+forwardX = Vec3(1, 0, 0)
+rotatedResult = rotated90Y.ApplyToPoint(forwardX)
+CheckVec3Equals(rotatedResult, Vec3(0, 0, -1), "Transform.ApplyToPoint 90deg Y rotation")
+
+scaledTransform = Transform()
+scaledTransform.Scale = Vec3(2, 2, 2)
+unitPoint = Vec3(1, 1, 1)
+scaledResult = scaledTransform.ApplyToPoint(unitPoint)
+CheckVec3Equals(scaledResult, Vec3(2, 2, 2), "Transform.ApplyToPoint uniform scale")
+
+' ---- Component move/rotate/scale (RFC-0049 Section 7.1) ---------------------------------------
+
+mover = CreateBlock(1, 1, 1)
+mover.Translate(1, 2, 3)
+mover.Translate(1, 0, 0)
+moverTransform = mover.Transform
+CheckVec3Equals(moverTransform.Position, Vec3(2, 2, 3), "Component.Translate accumulates")
+
+mover.SetPosition(0, 0, 0)
+moverTransform2 = mover.Transform
+CheckVec3Equals(moverTransform2.Position, Vec3(0, 0, 0), "Component.SetPosition is absolute")
+
+rotator = CreateBlock(1, 1, 1)
+rotator.RotateEuler(0, 45, 0)
+rotator.RotateEuler(0, 45, 0)
+rotatorTransform = rotator.Transform
+CheckVec3Equals(rotatorTransform.RotationEuler, Vec3(0, 90, 0), "Component.RotateEuler accumulates")
+
+scaler = CreateBlock(1, 1, 1)
+scaler.ScaleBy(2, 2, 2)
+scaler.ScaleBy(2, 2, 2)
+scalerTransform = scaler.Transform
+CheckVec3Equals(scalerTransform.Scale, Vec3(4, 4, 4), "Component.ScaleBy is multiplicative")
+
+' ---- Primitive vertex/face counts --------------------------------------------------------------
+
+blockMesh = CreateBlock(2, 1, 3)
+blockMeshData = blockMesh.LocalMesh
+CheckNumberEquals(blockMeshData.VertexCount(), 8, "CreateBlock vertex count")
+CheckNumberEquals(blockMeshData.FaceCount(), 12, "CreateBlock face count")
+
+wedgeMesh = CreateWedge(2, 1, 3)
+wedgeMeshData = wedgeMesh.LocalMesh
+CheckNumberEquals(wedgeMeshData.VertexCount(), 6, "CreateWedge vertex count")
+CheckNumberEquals(wedgeMeshData.FaceCount(), 8, "CreateWedge face count")
+
+planeMesh = CreatePlane(2, 3)
+planeMeshData = planeMesh.LocalMesh
+CheckNumberEquals(planeMeshData.VertexCount(), 4, "CreatePlane vertex count")
+CheckNumberEquals(planeMeshData.FaceCount(), 2, "CreatePlane face count")
+
+cylinderMesh = CreateCylinder(0.5, 2, 8)
+cylinderMeshData = cylinderMesh.LocalMesh
+CheckNumberEquals(cylinderMeshData.VertexCount(), 18, "CreateCylinder(segments=8) vertex count")
+CheckNumberEquals(cylinderMeshData.FaceCount(), 32, "CreateCylinder(segments=8) face count")
+
+sphereMesh = CreateSphere(0.5, 8, 4)
+sphereMeshData = sphereMesh.LocalMesh
+CheckNumberEquals(sphereMeshData.VertexCount(), 26, "CreateSphere(segments=8,rings=4) vertex count")
+CheckNumberEquals(sphereMeshData.FaceCount(), 48, "CreateSphere(segments=8,rings=4) face count")
+
+' Degenerate/clamped input shouldn't crash: segments/rings below the documented minimum clamp up.
+tinyCylinder = CreateCylinder(0.5, 1, 1)
+tinyCylinderMesh = tinyCylinder.LocalMesh
+CheckNumberEquals(tinyCylinderMesh.VertexCount(), 8, "CreateCylinder clamps segments to 3")
+
+tinySphere = CreateSphere(0.5, 1, 1)
+tinySphereMesh = tinySphere.LocalMesh
+CheckNumberEquals(tinySphereMesh.VertexCount(), 5, "CreateSphere clamps segments to 3, rings to 2")
+
+' ---- Face-normal correctness -------------------------------------------------------------------
+'
+' Block/Cylinder/Sphere are convex and centered on their own local origin, so a correctly wound
+' outward-facing normal must have a positive dot product with the vector from the origin to that
+' face's own centroid. This checks every face's winding at once instead of hand-deriving each
+' face's expected normal by hand (error-prone -- verified against the actual generated data
+' instead of against a second, independently-fallible hand calculation).
+
+FUNCTION CheckAllFacesOutward(mesh AS Mesh, label AS String)
+    THIRD = 1 / 3
+    FOR face IN mesh.Faces
+        indices = face.Indices
+        v0 = mesh.Vertices[indices[0]]
+        v1 = mesh.Vertices[indices[1]]
+        v2 = mesh.Vertices[indices[2]]
+        sumXY = v0.Plus(v1)
+        sum = sumXY.Plus(v2)
+        centroid = sum.Scaled(THIRD)
+        faceNormal = face.Normal
+        outwardness = faceNormal.Dot(centroid)
+        CheckTrue(outwardness > 0, label + " face normal points outward")
+    NEXT
+END FUNCTION
+
+CheckAllFacesOutward(blockMeshData, "CreateBlock")
+CheckAllFacesOutward(cylinderMeshData, "CreateCylinder")
+CheckAllFacesOutward(sphereMeshData, "CreateSphere")
+
+' Plane is a simple flat quad: by convention it faces up (+Y), like a ground/floor plane.
+planeFirstFace = planeMeshData.Faces[0]
+CheckVec3Equals(planeFirstFace.Normal, Vec3(0, 1, 0), "CreatePlane faces +Y (up) by convention")
+
+' Wedge bottom face (vertices 0,1,2,3, all at local Y=0) must face straight down.
+wedgeBottomFace = wedgeMeshData.Faces[0]
+CheckVec3Equals(wedgeBottomFace.Normal, Vec3(0, -1, 0), "CreateWedge bottom face faces down")
+
+' ---- Duplication independence / in-memory round trip (RFC-0049 Section 17.1) -------------------
+'
+' No A3D file format exists yet (RFC-0050's job). Standing in for "save/load round-trip" for now:
+' Clone() must produce a value-equal but fully independent copy -- mutating the original afterward
+' must not affect the clone. This is the object model's own aliasing guarantee, which a real
+' file-backed round trip will also depend on later.
+
+original = CreateBlock(1, 1, 1)
+original.SetPosition(5, 5, 5)
+clone = original.Clone()
+
+originalTransform = original.Transform
+cloneTransform = clone.Transform
+CheckVec3Equals(cloneTransform.Position, Vec3(5, 5, 5), "Component.Clone copies Transform by value")
+
+originalIdMatchesClone = original.Id == clone.Id
+CheckTrue(originalIdMatchesClone == FALSE, "Component.Clone mints a new stable Id (RFC-0050 Section 9)")
+
+original.SetPosition(999, 999, 999)
+cloneTransformAfter = clone.Transform
+CheckVec3Equals(cloneTransformAfter.Position, Vec3(5, 5, 5), "Component.Clone is independent of later mutation")
+
+originalMesh = original.LocalMesh
+cloneMesh = clone.LocalMesh
+originalFirstVertex = originalMesh.Vertices[0]
+originalFirstVertex.X = 999
+cloneFirstVertex = cloneMesh.Vertices[0]
+CheckTrue(cloneFirstVertex.X <> 999, "Component.Clone deep-copies mesh vertices, not references")
+
+' ---- Stable IDs (RFC-0050 Section 9) ------------------------------------------------------------
+
+idComponentA = CreateBlock(1, 1, 1)
+idComponentB = CreateBlock(1, 1, 1)
+idsDiffer = idComponentA.Id <> idComponentB.Id
+CheckTrue(idsDiffer, "Two components receive distinct stable Ids")
+
+' ---- Result -------------------------------------------------------------------------------------
+
+failureCount = LEN(failures)
+IF failureCount > 0 THEN
+    PRINT STRING(failureCount) + " CHECK(S) FAILED"
+    ExitTheProgram(1)
+ELSE
+    PRINT "ALL CHECKS PASSED"
+    ExitTheProgram(0)
+END IF

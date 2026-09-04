@@ -1,0 +1,230 @@
+#DESCRIPTION "Arco3D rig/pose smoke test (RFC-0049 Section 7.4/7.5)"
+'
+' Run via arco3d/scripts/test.sh, or `cd arco3d && ./build/arcosh tests/rig_smoke.abas`.
+' See arco3d/tests/scene_smoke.abas for the self-checking-script convention, and arco3d/README.md
+' for a real compiler bug this project found and fixed (`x.Field.Method()` chains, typed-return
+' NULL) while building this file.
+
+#IMPORT "arco3d_rig"
+
+failures = []
+
+FUNCTION CheckTrue(condition AS Boolean, label AS String)
+    IF condition == FALSE THEN
+        ignoredPush = Array.Add(failures, label)
+        PRINT "FAIL: " + label
+    END IF
+END FUNCTION
+
+FUNCTION CheckNumberEquals(actual AS Number, expected AS Number, label AS String)
+    difference = ABS(actual - expected)
+    IF difference > 0.001 THEN
+        detail = label + " (expected " + STRING(expected) + ", got " + STRING(actual) + ")"
+        ignoredPush = Array.Add(failures, detail)
+        PRINT "FAIL: " + detail
+    END IF
+END FUNCTION
+
+FUNCTION CheckVec3Equals(actual AS Vec3, expected AS Vec3, label AS String)
+    ok = actual.EqualsApprox(expected, 0.001)
+    IF ok == FALSE THEN
+        detail = label + " (expected " + STRING(expected.X) + "," + STRING(expected.Y) + "," + STRING(expected.Z)
+        detail = detail + " got " + STRING(actual.X) + "," + STRING(actual.Y) + "," + STRING(actual.Z) + ")"
+        ignoredPush = Array.Add(failures, detail)
+        PRINT "FAIL: " + detail
+    END IF
+END FUNCTION
+
+' ---- Quaternion: rotation correctness on known 90-degree cases --------------------------------
+
+xAxis = Vec3(1, 0, 0)
+yAxis = Vec3(0, 1, 0)
+zAxis = Vec3(0, 0, 1)
+
+rotateZ90 = QuaternionFromAxisAngle(zAxis, 90)
+resultA = rotateZ90.RotateVector(xAxis)
+CheckVec3Equals(resultA, Vec3(0, 1, 0), "90deg about Z rotates +X to +Y")
+
+rotateX90 = QuaternionFromAxisAngle(xAxis, 90)
+resultB = rotateX90.RotateVector(yAxis)
+CheckVec3Equals(resultB, Vec3(0, 0, 1), "90deg about X rotates +Y to +Z")
+
+rotateY90 = QuaternionFromAxisAngle(yAxis, 90)
+resultC = rotateY90.RotateVector(zAxis)
+CheckVec3Equals(resultC, Vec3(1, 0, 0), "90deg about Y rotates +Z to +X")
+
+identity = QuaternionIdentity()
+resultD = identity.RotateVector(xAxis)
+CheckVec3Equals(resultD, Vec3(1, 0, 0), "Identity quaternion leaves a vector unchanged")
+
+' ---- Quaternion.ComposedWith: two sequential rotations equal one composed rotation -------------
+
+rotateZ45 = QuaternionFromAxisAngle(zAxis, 45)
+sequential = rotateZ45.RotateVector(xAxis)
+sequential = rotateZ45.RotateVector(sequential)
+composed = rotateZ45.ComposedWith(rotateZ45)
+composedResult = composed.RotateVector(xAxis)
+CheckVec3Equals(composedResult, sequential, "ComposedWith(q, q) matches applying q twice in sequence")
+CheckVec3Equals(composedResult, Vec3(0, 1, 0), "Two 45deg Z rotations composed equal one 90deg Z rotation")
+
+' ---- Quaternion.Slerp -------------------------------------------------------------------------
+
+slerpStart = QuaternionIdentity()
+slerpEnd = QuaternionFromAxisAngle(zAxis, 90)
+
+slerpAtZero = slerpStart.Slerp(slerpEnd, 0)
+CheckTrue(slerpAtZero.EqualsApprox(slerpStart, 0.001), "Slerp(t=0) returns the start rotation")
+
+slerpAtOne = slerpStart.Slerp(slerpEnd, 1)
+CheckTrue(slerpAtOne.EqualsApprox(slerpEnd, 0.001), "Slerp(t=1) returns the end rotation")
+
+slerpAtHalf = slerpStart.Slerp(slerpEnd, 0.5)
+halfResult = slerpAtHalf.RotateVector(xAxis)
+expectedHalf = QuaternionFromAxisAngle(zAxis, 45)
+expectedHalfResult = expectedHalf.RotateVector(xAxis)
+CheckVec3Equals(halfResult, expectedHalfResult, "Slerp(t=0.5) between identity and 90deg Z is a 45deg Z rotation")
+
+' ---- Rig: hierarchy, bind pose, world-transform composition -----------------------------------
+
+rig = Rig("TestRig")
+rootIndex = rig.AddBone("Root", -1)
+spineIndex = rig.AddBone("Spine", rootIndex)
+
+foundSpineIndex = rig.FindBoneIndexByName("Spine")
+CheckNumberEquals(foundSpineIndex, spineIndex, "FindBoneIndexByName finds an existing bone")
+
+missingIndex = rig.FindBoneIndexByName("Nonexistent")
+CheckNumberEquals(missingIndex, -1, "FindBoneIndexByName returns -1 for an unknown name")
+
+chain = rig.AncestryChain(spineIndex)
+CheckNumberEquals(LEN(chain), 2, "AncestryChain includes the bone and every ancestor")
+firstInChain = chain[0]
+secondInChain = chain[1]
+CheckNumberEquals(firstInChain, rootIndex, "AncestryChain starts at the root")
+CheckNumberEquals(secondInChain, spineIndex, "AncestryChain ends at the requested bone")
+
+' Root bind: rotated 90deg about Z. Spine bind: local offset (0, 1, 0) from the root, no rotation
+' of its own. The spine's WORLD position must reflect the root's bind rotation being applied to
+' that local offset -- (0,1,0) rotated 90deg about Z is (-1,0,0).
+bones = rig.Bones
+rootBone = bones[rootIndex]
+rootBone.BindTransform = BoneTransform(Vec3(0, 0, 0), rotateZ90, Vec3(1, 1, 1))
+spineBone = bones[spineIndex]
+spineBone.BindTransform = BoneTransform(Vec3(0, 1, 0), QuaternionIdentity(), Vec3(1, 1, 1))
+
+spineWorldBind = rig.WorldBindTransform(spineIndex)
+spineWorldPosition = spineWorldBind.Position
+CheckVec3Equals(spineWorldPosition, Vec3(-1, 0, 0), "WorldBindTransform composes parent rotation into a child's world position")
+
+' ---- RigPoseState: bind pose, local edits, world transform, capture/apply ----------------------
+
+poseState = RigPoseState(rig)
+initialSpineWorld = poseState.WorldTransform(spineIndex)
+initialSpinePosition = initialSpineWorld.Position
+CheckVec3Equals(initialSpinePosition, Vec3(-1, 0, 0), "RigPoseState starts at the rig's bind pose")
+
+liftedSpineLocal = BoneTransform(Vec3(0, 2, 0), QuaternionIdentity(), Vec3(1, 1, 1))
+poseState.SetLocalTransform(spineIndex, liftedSpineLocal)
+liftedSpineWorld = poseState.WorldTransform(spineIndex)
+liftedSpinePosition = liftedSpineWorld.Position
+CheckVec3Equals(liftedSpinePosition, Vec3(-2, 0, 0), "SetLocalTransform + WorldTransform reflects the edit through the parent rotation")
+
+capturedFull = poseState.CapturePose("Lifted")
+capturedEntries = capturedFull.Entries
+CheckNumberEquals(LEN(capturedEntries), 2, "CapturePose() captures every bone (a dense/full pose)")
+
+poseState.ResetToBindPose()
+resetSpineWorld = poseState.WorldTransform(spineIndex)
+resetSpinePosition = resetSpineWorld.Position
+CheckVec3Equals(resetSpinePosition, Vec3(-1, 0, 0), "ResetToBindPose reverts a local edit")
+
+poseState.ApplyPose(capturedFull)
+reappliedSpineWorld = poseState.WorldTransform(spineIndex)
+reappliedSpinePosition = reappliedSpineWorld.Position
+CheckVec3Equals(reappliedSpinePosition, Vec3(-2, 0, 0), "ApplyPose() restores a previously captured pose")
+
+' ---- Pose: sparse entries, partial ApplyPose leaves other bones untouched ----------------------
+
+partialPose = Pose("RootOnly")
+raisedRootLocal = BoneTransform(Vec3(0, 5, 0), rotateZ90, Vec3(1, 1, 1))
+partialPose.SetBoneTransform(rootIndex, raisedRootLocal)
+partialPoseEntries = partialPose.Entries
+CheckNumberEquals(LEN(partialPoseEntries), 1, "A sparse Pose only holds the bones it specifies")
+
+poseState.ResetToBindPose()
+spineLocalBefore = poseState.LocalTransform(spineIndex)
+spineLocalPositionBefore = spineLocalBefore.Position
+poseState.ApplyPose(partialPose)
+spineLocalAfter = poseState.LocalTransform(spineIndex)
+spineLocalPositionAfter = spineLocalAfter.Position
+CheckVec3Equals(spineLocalPositionAfter, spineLocalPositionBefore, "ApplyPose() with a sparse pose leaves unspecified bones untouched")
+
+rootWorldAfterPartial = poseState.WorldTransform(rootIndex)
+rootWorldPositionAfterPartial = rootWorldAfterPartial.Position
+CheckVec3Equals(rootWorldPositionAfterPartial, Vec3(0, 5, 0), "ApplyPose() with a sparse pose still applies the bones it does specify")
+
+' ---- Pose.Clone() independence -----------------------------------------------------------------
+
+poseOriginal = Pose("Original")
+poseOriginal.SetBoneTransform(rootIndex, BoneTransform(Vec3(1, 1, 1), QuaternionIdentity(), Vec3(1, 1, 1)))
+poseClone = poseOriginal.Clone()
+poseCloneTransform = poseClone.FindTransform(rootIndex)
+poseCloneTransform.Position = Vec3(99, 99, 99)
+poseOriginalTransform = poseOriginal.FindTransform(rootIndex)
+poseOriginalPosition = poseOriginalTransform.Position
+CheckVec3Equals(poseOriginalPosition, Vec3(1, 1, 1), "Pose.Clone() deep-copies entries, not references")
+
+' ---- InterpolatePoses: overlapping bones blend, non-overlapping bones are dropped --------------
+
+poseIdle = Pose("Idle")
+poseIdle.SetBoneTransform(rootIndex, BoneTransform(Vec3(0, 0, 0), QuaternionIdentity(), Vec3(1, 1, 1)))
+poseIdle.SetBoneTransform(spineIndex, BoneTransform(Vec3(0, 1, 0), QuaternionIdentity(), Vec3(1, 1, 1)))
+
+poseReach = Pose("Reach")
+poseReach.SetBoneTransform(rootIndex, BoneTransform(Vec3(0, 0, 0), rotateZ90, Vec3(1, 1, 1)))
+' Deliberately does not specify spineIndex, to test that InterpolatePoses drops bones not present
+' in both poses rather than guessing a value for them.
+
+blendedPose = InterpolatePoses(poseIdle, poseReach, 0.5)
+blendedEntries = blendedPose.Entries
+CheckNumberEquals(LEN(blendedEntries), 1, "InterpolatePoses only includes bones present in both poses")
+
+blendedRootTransform = blendedPose.FindTransform(rootIndex)
+CheckTrue(blendedRootTransform <> NULL, "InterpolatePoses includes a bone specified by both poses")
+blendedRootRotation = blendedRootTransform.Rotation
+blendedRootResult = blendedRootRotation.RotateVector(xAxis)
+expectedBlendedResult = QuaternionFromAxisAngle(zAxis, 45)
+expectedBlendedRotationResult = expectedBlendedResult.RotateVector(xAxis)
+CheckVec3Equals(blendedRootResult, expectedBlendedRotationResult, "InterpolatePoses(t=0.5) slerps rotation halfway")
+
+blendedSpineTransform = blendedPose.FindTransform(spineIndex)
+CheckTrue(blendedSpineTransform == NULL, "InterpolatePoses drops a bone only one of the two poses specifies")
+
+' ---- PoseCatalog --------------------------------------------------------------------------------
+
+catalog = PoseCatalog("Standard", rig.Id)
+catalog.AddPose(poseIdle)
+catalog.AddPose(poseReach)
+
+foundIdle = catalog.FindPoseByName("Idle")
+CheckTrue(foundIdle <> NULL, "PoseCatalog.FindPoseByName finds an existing pose")
+foundMissing = catalog.FindPoseByName("Nonexistent")
+CheckTrue(foundMissing == NULL, "PoseCatalog.FindPoseByName returns NULL for an unknown name")
+
+compatible = catalog.IsCompatibleWith(rig)
+CheckTrue(compatible, "PoseCatalog is compatible with the rig it was created for")
+
+otherRig = Rig("OtherRig")
+incompatible = catalog.IsCompatibleWith(otherRig)
+CheckTrue(incompatible == FALSE, "PoseCatalog is not compatible with an unrelated rig")
+
+' ---- Result -------------------------------------------------------------------------------------
+
+failureCount = LEN(failures)
+IF failureCount > 0 THEN
+    PRINT STRING(failureCount) + " CHECK(S) FAILED"
+    ExitTheProgram(1)
+ELSE
+    PRINT "ALL CHECKS PASSED"
+    ExitTheProgram(0)
+END IF

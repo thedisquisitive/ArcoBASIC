@@ -1,0 +1,210 @@
+#DESCRIPTION "Arco3D Construction Stack smoke test (RFC-0049 Section 7.2)"
+'
+' Run via arco3d/scripts/test.sh, or `cd arco3d && ./build/arcosh tests/construction_smoke.abas`.
+' See arco3d/tests/scene_smoke.abas for the self-checking-script convention this follows (no
+' TEST/ASSERT block feature exists in this toolchain yet), and arco3d/README.md for a real
+' compiler bug this project found and fixed (`x.Field.Method()` chains, typed-return NULL).
+
+#IMPORT "arco3d_construction"
+
+failures = []
+
+FUNCTION CheckTrue(condition AS Boolean, label AS String)
+    IF condition == FALSE THEN
+        ignoredPush = Array.Add(failures, label)
+        PRINT "FAIL: " + label
+    END IF
+END FUNCTION
+
+FUNCTION CheckNumberEquals(actual AS Number, expected AS Number, label AS String)
+    difference = ABS(actual - expected)
+    IF difference > 0.0005 THEN
+        detail = label + " (expected " + STRING(expected) + ", got " + STRING(actual) + ")"
+        ignoredPush = Array.Add(failures, detail)
+        PRINT "FAIL: " + detail
+    END IF
+END FUNCTION
+
+FUNCTION MeshContainsVertexApprox(mesh AS Mesh, target AS Vec3) AS Boolean
+    foundIndex = FindNearVertexIndex(mesh.Vertices, target, 0.0005)
+    RETURN foundIndex >= 0
+END FUNCTION
+
+' ---- ConstructionStack basics: no-op passthrough, add, enable/disable -------------------------
+
+plainBlock = CreateBlock(1, 1, 1)
+plainMesh = plainBlock.LocalMesh
+emptyStack = ConstructionStack(plainMesh)
+passthrough = emptyStack.Evaluate()
+CheckNumberEquals(passthrough.VertexCount(), 8, "Empty stack Evaluate() passes the base mesh through")
+
+mirrorX = MirrorOp("X", TRUE)
+mirroredStack = ConstructionStack(plainMesh)
+mirroredStack.AddOperation(mirrorX)
+mirroredResult = mirroredStack.Evaluate()
+' A Block is already symmetric about its own local X=0, so mirroring it welds every mirrored
+' vertex back onto an existing one (0 new vertices) while still doubling the (now-overlapping)
+' faces -- a real, if slightly pathological, result of mirroring an already-symmetric shape.
+CheckNumberEquals(mirroredResult.VertexCount(), 8, "MirrorOp welds onto an already-symmetric mesh")
+CheckNumberEquals(mirroredResult.FaceCount(), 24, "MirrorOp still doubles face count")
+
+mirrorX.Enabled = FALSE
+disabledResult = mirroredStack.Evaluate()
+CheckNumberEquals(disabledResult.FaceCount(), 12, "Disabling an operation excludes it from Evaluate()")
+mirrorX.Enabled = TRUE
+
+' BaseMesh itself must never be mutated by Evaluate().
+CheckNumberEquals(plainMesh.FaceCount(), 12, "Evaluate() never mutates BaseMesh")
+
+' ---- MirrorOp on a genuinely asymmetric mesh (no welding possible) -----------------------------
+
+offCenter = Mesh()
+offCenter.Vertices = [Vec3(2, 0, 0), Vec3(3, 0, 0), Vec3(2, 1, 0)]
+offCenter.Faces = [Face(0, 1, 2)]
+
+mirrorNoWeld = MirrorOp("X", FALSE)
+offCenterStack = ConstructionStack(offCenter)
+offCenterStack.AddOperation(mirrorNoWeld)
+offCenterResult = offCenterStack.Evaluate()
+CheckNumberEquals(offCenterResult.VertexCount(), 6, "MirrorOp with no shared vertices doubles vertex count")
+CheckNumberEquals(offCenterResult.FaceCount(), 2, "MirrorOp doubles face count")
+CheckTrue(MeshContainsVertexApprox(offCenterResult, Vec3(-2, 0, 0)), "MirrorOp reflects X across the origin")
+CheckTrue(MeshContainsVertexApprox(offCenterResult, Vec3(-3, 0, 0)), "MirrorOp reflects a second vertex")
+
+' Mirrored faces must still wind outward: the original triangle's normal and the mirrored
+' triangle's normal should be mirror images of each other (same Y/Z sign, flipped X sign) rather
+' than both pointing the same way (which would mean the reversed-winding fix above regressed).
+firstFace = offCenterResult.Faces[0]
+secondFace = offCenterResult.Faces[1]
+firstNormal = firstFace.Normal
+secondNormal = secondFace.Normal
+expectedMirroredNormal = Vec3(0 - firstNormal.X, firstNormal.Y, firstNormal.Z)
+normalsMirrored = secondNormal.EqualsApprox(expectedMirroredNormal, 0.0005)
+CheckTrue(normalsMirrored, "MirrorOp reverses winding so the mirrored face normal is a true mirror image")
+
+' ---- ArrayOp -------------------------------------------------------------------------------
+
+singleVertexMesh = Mesh()
+singleVertexMesh.Vertices = [Vec3(1, 0, 0)]
+
+arrayOp = ArrayOp(3, 10, 0, 0)
+arrayStack = ConstructionStack(singleVertexMesh)
+arrayStack.AddOperation(arrayOp)
+arrayResult = arrayStack.Evaluate()
+CheckNumberEquals(arrayResult.VertexCount(), 3, "ArrayOp(count=3) produces 3 copies")
+CheckTrue(MeshContainsVertexApprox(arrayResult, Vec3(1, 0, 0)), "ArrayOp keeps the unshifted original")
+CheckTrue(MeshContainsVertexApprox(arrayResult, Vec3(11, 0, 0)), "ArrayOp places copy 1 at +10")
+CheckTrue(MeshContainsVertexApprox(arrayResult, Vec3(21, 0, 0)), "ArrayOp places copy 2 at +20")
+
+' ---- Order sensitivity: Mirror-then-Array must differ from Array-then-Mirror -------------------
+
+mirrorFirstMesh = Mesh()
+mirrorFirstMesh.Vertices = [Vec3(1, 0, 0)]
+mirrorFirstStack = ConstructionStack(mirrorFirstMesh)
+mirrorFirstStack.AddOperation(MirrorOp("X", FALSE))
+mirrorFirstStack.AddOperation(ArrayOp(2, 10, 0, 0))
+mirrorFirstResult = mirrorFirstStack.Evaluate()
+' Mirror(X) on (1,0,0) with no weld -> {(1,0,0), (-1,0,0)}; then Array(count=2, +10) shifts a
+' second copy of that pair by +10 -> {(1,0,0), (-1,0,0), (11,0,0), (9,0,0)}.
+CheckTrue(MeshContainsVertexApprox(mirrorFirstResult, Vec3(9, 0, 0)), "Mirror-then-Array: (-1,0,0) shifted by +10 lands at (9,0,0)")
+CheckTrue(MeshContainsVertexApprox(mirrorFirstResult, Vec3(-11, 0, 0)) == FALSE, "Mirror-then-Array never produces (-11,0,0)")
+
+arrayFirstMesh = Mesh()
+arrayFirstMesh.Vertices = [Vec3(1, 0, 0)]
+arrayFirstStack = ConstructionStack(arrayFirstMesh)
+arrayFirstStack.AddOperation(ArrayOp(2, 10, 0, 0))
+arrayFirstStack.AddOperation(MirrorOp("X", FALSE))
+arrayFirstResult = arrayFirstStack.Evaluate()
+' Array(count=2, +10) on (1,0,0) -> {(1,0,0), (11,0,0)}; then Mirror(X) appends the reflection of
+' both -> {(1,0,0), (11,0,0), (-1,0,0), (-11,0,0)}.
+CheckTrue(MeshContainsVertexApprox(arrayFirstResult, Vec3(-11, 0, 0)), "Array-then-Mirror produces (-11,0,0)")
+CheckTrue(MeshContainsVertexApprox(arrayFirstResult, Vec3(9, 0, 0)) == FALSE, "Array-then-Mirror never produces (9,0,0)")
+
+' ---- Reorder / remove ----------------------------------------------------------------------
+
+reorderStack = ConstructionStack(Mesh())
+opA = MirrorOp("X", TRUE)
+opB = MirrorOp("Y", TRUE)
+opC = MirrorOp("Z", TRUE)
+reorderStack.AddOperation(opA)
+reorderStack.AddOperation(opB)
+reorderStack.AddOperation(opC)
+
+movedDown = reorderStack.MoveOperation(0, 1)
+CheckTrue(movedDown, "MoveOperation reports success for a valid move")
+operationsAfterMove = reorderStack.Operations
+firstOp = operationsAfterMove[0]
+secondOp = operationsAfterMove[1]
+CheckTrue(firstOp.Axis == "Y", "MoveOperation swapped position 0")
+CheckTrue(secondOp.Axis == "X", "MoveOperation swapped position 1")
+
+movedPastEnd = reorderStack.MoveOperation(2, 1)
+CheckTrue(movedPastEnd == FALSE, "MoveOperation refuses to move past the end of the stack")
+
+removed = reorderStack.RemoveOperationAt(1)
+CheckTrue(removed, "RemoveOperationAt reports success for a valid index")
+operationsAfterRemove = reorderStack.Operations
+CheckNumberEquals(LEN(operationsAfterRemove), 2, "RemoveOperationAt shrinks the stack")
+
+removedOutOfRange = reorderStack.RemoveOperationAt(99)
+CheckTrue(removedOutOfRange == FALSE, "RemoveOperationAt refuses an out-of-range index")
+
+' ---- Operation duplication (RFC-0049 Section 7.2 "duplication") -------------------------------
+
+sourceOp = MirrorOp("X", TRUE)
+duplicateOp = sourceOp.Clone()
+duplicateOp.Axis = "Z"
+CheckTrue(sourceOp.Axis == "X", "MirrorOp.Clone() is independent -- editing the clone leaves the source alone")
+CheckTrue(sourceOp.Id <> duplicateOp.Id, "MirrorOp.Clone() mints a new stable Id")
+
+' ---- Commit (RFC-0049 Section 7.2 "explicit commit/apply") -------------------------------------
+
+commitMesh = Mesh()
+commitMesh.Vertices = [Vec3(1, 0, 0)]
+commitStack = ConstructionStack(commitMesh)
+commitStack.AddOperation(MirrorOp("X", FALSE))
+commitStack.Commit()
+
+committedBase = commitStack.BaseMesh
+CheckNumberEquals(committedBase.VertexCount(), 2, "Commit() bakes the evaluated mesh into BaseMesh")
+committedOperations = commitStack.Operations
+CheckNumberEquals(LEN(committedOperations), 0, "Commit() clears the operation list")
+
+reEvaluated = commitStack.Evaluate()
+CheckNumberEquals(reEvaluated.VertexCount(), 2, "Evaluate() after Commit() is stable (no operations left to reapply)")
+
+' ---- Component integration: AttachConstructionStack / AddConstructionOp -----------------------
+
+componentBlock = CreateBlock(1, 1, 1)
+componentStackBefore = componentBlock.Stack
+CheckTrue(componentStackBefore == NULL, "A plain CreateBlock() component has no stack until attached")
+
+attachedStack = AttachConstructionStack(componentBlock)
+componentStackAfter = componentBlock.Stack
+CheckTrue(componentStackAfter <> NULL, "AttachConstructionStack() attaches a stack")
+
+AddConstructionOp(componentBlock, MirrorOp("X", TRUE))
+refreshedMesh = componentBlock.LocalMesh
+CheckNumberEquals(refreshedMesh.FaceCount(), 24, "AddConstructionOp() refreshes the component's LocalMesh")
+
+' The stack's own BaseMesh is a clone taken at attach time -- mutating the component's LocalMesh
+' afterward (as AddConstructionOp just did) must not alias back into it.
+attachedStackBase = attachedStack.BaseMesh
+CheckNumberEquals(attachedStackBase.FaceCount(), 12, "ConstructionStack.BaseMesh is independent of the component's live LocalMesh")
+
+clonedComponent = componentBlock.Clone()
+clonedComponentStack = clonedComponent.Stack
+CheckTrue(clonedComponentStack <> NULL, "Component.Clone() also clones an attached Stack")
+clonedComponentOperations = clonedComponentStack.Operations
+CheckNumberEquals(LEN(clonedComponentOperations), 1, "Component.Clone()'s cloned Stack keeps its operations")
+
+' ---- Result -------------------------------------------------------------------------------------
+
+failureCount = LEN(failures)
+IF failureCount > 0 THEN
+    PRINT STRING(failureCount) + " CHECK(S) FAILED"
+    ExitTheProgram(1)
+ELSE
+    PRINT "ALL CHECKS PASSED"
+    ExitTheProgram(0)
+END IF

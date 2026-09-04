@@ -1,0 +1,125 @@
+#DESCRIPTION "Arco3D A3D rig/pose-catalog round-trip smoke test (RFC-0050 Section 29 optional capabilities)"
+'
+' Run via arco3d/scripts/test.sh, or `cd arco3d && ./build/arcosh tests/a3d_rig_io_smoke.abas`.
+' Separate from a3d_io_smoke.abas on purpose: this file imports BOTH arco3d_io AND arco3d_rig,
+' which is exactly the real constraint being tested -- see arco3d_io.abas's own ExportA3D comment
+' for why an importing script needs arco3d_rig declared to restore working Rig/Bone/Quaternion/
+' Pose/PoseCatalog instances, not just the core mesh classes.
+#INSTRUCTION_LIMIT 50000000
+
+#IMPORT "arco3d_io"
+#IMPORT "arco3d_rig"
+
+failures = []
+
+FUNCTION CheckTrue(condition AS Boolean, label AS String)
+    IF condition == FALSE THEN
+        ignoredPush = Array.Add(failures, label)
+        PRINT "FAIL: " + label
+    END IF
+END FUNCTION
+
+FUNCTION CheckNumberEquals(actual AS Number, expected AS Number, label AS String)
+    difference = ABS(actual - expected)
+    IF difference > 0.0005 THEN
+        detail = label + " (expected " + STRING(expected) + ", got " + STRING(actual) + ")"
+        ignoredPush = Array.Add(failures, detail)
+        PRINT "FAIL: " + detail
+    END IF
+END FUNCTION
+
+FUNCTION CheckVec3Equals(actual AS Vec3, expected AS Vec3, label AS String)
+    ok = actual.EqualsApprox(expected, 0.0005)
+    CheckTrue(ok, label)
+END FUNCTION
+
+' ---- Build a small rig + pose catalog, attach to an asset alongside real geometry --------------
+
+rig = Rig("Humanoid")
+rootIndex = rig.AddBone("Root", -1)
+spineIndex = rig.AddBone("Spine", rootIndex)
+bones = rig.Bones
+spineBone = bones[spineIndex]
+spineBone.BindTransform = BoneTransform(Vec3(0, 1, 0), QuaternionIdentity(), Vec3(1, 1, 1))
+
+idlePose = Pose("Idle")
+idlePose.Category = "Standard"
+idlePose.SetBoneTransform(spineIndex, BoneTransform(Vec3(0, 1, 0), QuaternionFromAxisAngle(Vec3(0, 1, 0), 45), Vec3(1, 1, 1)))
+
+catalog = PoseCatalog("Standard", rig.Id)
+catalog.AddPose(idlePose)
+
+asset = Asset("Rigged")
+asset.Root = CreateBlock(1, 1, 1)
+asset.Rig = rig
+ignoredPush = Array.Add(asset.PoseCatalogs, catalog)
+
+path = "build/a3d_rig_io_smoke.a3d"
+ExportA3D(asset, path)
+
+' ---- Import and verify ---------------------------------------------------------------------
+
+result = ImportA3D(path)
+CheckTrue(result.Ok, "rig-bearing asset imports Ok")
+
+restoredAsset = result.Asset
+restoredRoot = restoredAsset.Root
+CheckNumberEquals(restoredRoot.LocalMesh.VertexCount(), 8, "geometry survives alongside rig data in the same file")
+
+restoredRig = restoredAsset.Rig
+CheckTrue(CLASSOF(restoredRig) == "Rig", "restored Rig is a real, working Rig instance")
+CheckTrue(restoredRig.Name == "Humanoid", "Rig.Name round-trips")
+
+restoredBones = restoredRig.Bones
+CheckNumberEquals(LEN(restoredBones), 2, "bone count round-trips")
+restoredSpineBone = restoredBones[spineIndex]
+CheckTrue(restoredSpineBone.Name == "Spine", "bone name round-trips")
+CheckNumberEquals(restoredSpineBone.ParentIndex, rootIndex, "bone hierarchy (ParentIndex) round-trips")
+
+restoredBindTransform = restoredSpineBone.BindTransform
+CheckVec3Equals(restoredBindTransform.Position, Vec3(0, 1, 0), "bind pose position round-trips")
+
+' A restored Quaternion must still be a real, working instance -- not just inert fields -- proving
+' ArcoCompy's class-instance round-trip covers this file's own new types too.
+foundIndex = restoredRig.FindBoneIndexByName("Spine")
+CheckNumberEquals(foundIndex, spineIndex, "restored Rig's own methods (FindBoneIndexByName) still work")
+
+restoredWorldBind = restoredRig.WorldBindTransform(spineIndex)
+restoredWorldPosition = restoredWorldBind.Position
+CheckVec3Equals(restoredWorldPosition, Vec3(0, 1, 0), "restored Rig can still compose world transforms (methods survive, not just data)")
+
+restoredCatalogs = restoredAsset.PoseCatalogs
+CheckNumberEquals(LEN(restoredCatalogs), 1, "pose catalog count round-trips")
+restoredCatalog = restoredCatalogs[0]
+CheckTrue(restoredCatalog.Name == "Standard", "PoseCatalog.Name round-trips")
+CheckTrue(restoredCatalog.RigId == rig.Id, "PoseCatalog.RigId round-trips (rig-compatibility signature preserved)")
+
+restoredPose = restoredCatalog.FindPoseByName("Idle")
+CheckTrue(restoredPose <> NULL, "PoseCatalog.FindPoseByName still works on restored data")
+restoredPoseTransform = restoredPose.FindTransform(spineIndex)
+CheckTrue(restoredPoseTransform <> NULL, "restored Pose still has its bone entry")
+
+restoredPoseRotation = restoredPoseTransform.Rotation
+rotatedResult = restoredPoseRotation.RotateVector(Vec3(1, 0, 0))
+expectedRotation = QuaternionFromAxisAngle(Vec3(0, 1, 0), 45)
+expectedResult = expectedRotation.RotateVector(Vec3(1, 0, 0))
+CheckVec3Equals(rotatedResult, expectedResult, "restored Pose's Quaternion rotation still computes correctly (real method, not just data)")
+
+' ---- The manifest itself must actually advertise these as optional capabilities ----------------
+
+rawText = File.ReadText(path)
+unpackedManifest = ArcoCompy.Unpack(rawText)
+advertised = Object.Get(unpackedManifest, "OptionalCapabilities")
+CheckTrue(advertised CONTAINS "rig.core", "manifest advertises rig.core as an optional capability")
+CheckTrue(advertised CONTAINS "pose.catalog", "manifest advertises pose.catalog as an optional capability")
+
+' ---- Result -------------------------------------------------------------------------------------
+
+failureCount = LEN(failures)
+IF failureCount > 0 THEN
+    PRINT STRING(failureCount) + " CHECK(S) FAILED"
+    ExitTheProgram(1)
+ELSE
+    PRINT "ALL CHECKS PASSED"
+    ExitTheProgram(0)
+END IF

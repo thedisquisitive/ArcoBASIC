@@ -40,4 +40,6 @@ bool confirm(int, const std::string&, const std::string&) { unsupported(); }
 void present(int) { unsupported(); }
 Value poll_event() { unsupported(); }
 Value wait_event(double) { unsupported(); }
+void clear_3d(int, double, double, double, double, double, double, double, double, double, double, double, double, double, double, double) { unsupported(); }
+void triangle_3d(int, double, double, double, double, double, double, double, double, double, double, double, double, double) { unsupported(); }
 } // namespace arco::gui

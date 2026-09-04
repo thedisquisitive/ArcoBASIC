@@ -140,6 +140,13 @@ std::vector<Token> Lexer::scan_tokens() {
             case ':':
                 add(TokenType::Colon);
                 break;
+            case '.':
+                // Reached only when '.' is NOT immediately consumed as part of a number literal
+                // (number()'s own '.' handling) or as a continuation character inside identifier()
+                // 's dotted-name fusion -- i.e. a '.' following a ')', ']', or another already-
+                // lexed token, as in `expr.Method()` chained onto a call/index result.
+                add(TokenType::Dot);
+                break;
             case '+':
                 add(match('=') ? TokenType::PlusEqual : TokenType::Plus);
                 break;

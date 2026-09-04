@@ -1,0 +1,316 @@
+' Arco3D non-destructive Construction Stack (RFC-0049 Section 7.2, implementation step 4).
+'
+' Depends on arco3d_scene.abas (Vec3, Mesh, Face, Component) -- imported below, so any script that
+' imports this file gets the scene object model transitively (confirmed: legacy #IMPORT behaves
+' like textual inclusion into one shared global scope, not an isolated module -- there is no
+' MODULE/EXPORT support in this toolchain yet).
+'
+' Scope for this increment:
+'   - The stack machinery itself: an ordered list of operations, each independently enabled/
+'     disabled, reorderable, editable, and duplicable (RFC-0049 Section 7.2's own MUST list),
+'     evaluated non-destructively (BaseMesh is never mutated by Evaluate()), plus an explicit
+'     Commit() that is the ONLY way geometry gets destructively baked.
+'   - Two real operations to prove the stack end-to-end: MirrorOp (reflect + optional seam weld)
+'     and ArrayOp (linear repeat). Both are genuinely non-destructive: each Apply() call takes an
+'     input Mesh and returns a brand new Mesh, never mutating its input.
+' Deliberately NOT in this increment (bigger, separate algorithms -- topology-aware mesh editing,
+' not just whole-mesh transforms like Mirror/Array):
+'   - Extrude, Inset, Bevel, cutting/Subdivision (RFC-0049 Section 7.1/7.2's "Extrusion Group",
+'     "Bevel", "Subdivision" stack nodes). These need real edge/half-edge topology tracking that
+'     Mesh doesn't have yet; adding them here would either be fake or a much bigger increment.
+'   - Snapping/alignment (RFC-0049 Section 7.1) -- viewport/interaction concerns, not stack ops.
+'
+' Known simplification: there is no dirty-tracking/observer system. Mutating an operation's field
+' directly (e.g. `op.Enabled = FALSE`) does not auto-recompute anything -- the owning Component's
+' RefreshFromStack() (or ConstructionStack.Evaluate() directly) must be called again afterward.
+' This is a pull-based, not reactive, evaluation model for now.
+
+#IMPORT "arco3d_scene"
+
+' Documents the contract every construction operation follows. Interfaces in this toolchain only
+' validate methods, not fields -- Enabled/Id/Clone() are a convention every op below still follows,
+' checked by the smoke test, not by the language itself.
+INTERFACE ConstructionOp
+    FUNCTION Apply(inputMesh AS Mesh) AS Mesh
+END INTERFACE
+
+' Negates the chosen local axis of a point. Nested IF/ELSE only -- this dialect has no ELSEIF.
+FUNCTION MirrorVertex(vertex AS Vec3, axis AS String) AS Vec3
+    IF axis == "X" THEN
+        RETURN Vec3(0 - vertex.X, vertex.Y, vertex.Z)
+    ELSE
+        IF axis == "Y" THEN
+            RETURN Vec3(vertex.X, 0 - vertex.Y, vertex.Z)
+        ELSE
+            RETURN Vec3(vertex.X, vertex.Y, 0 - vertex.Z)
+        END IF
+    END IF
+END FUNCTION
+
+' Linear scan for a vertex within `tolerance` of `target`. Mesh sizes here are small (primitive-
+' scale), so O(n) per query / O(n^2) per weld pass is an acceptable, simple starting point -- not
+' something a real production mesh editor would keep doing once meshes get large.
+FUNCTION FindNearVertexIndex(vertexList AS Array, target AS Vec3, tolerance AS Number) AS Number
+    FOR i IN Range(LEN(vertexList))
+        candidate = vertexList[i]
+        isNear = candidate.EqualsApprox(target, tolerance)
+        IF isNear THEN
+            RETURN i
+        END IF
+    NEXT
+    RETURN -1
+END FUNCTION
+
+' Reflects a mesh across a local axis plane through the origin and appends the mirrored half to
+' the original (RFC-0049 Section 7.2's own "Mirror" stack-node example). With Weld enabled (the
+' default), seam vertices within WeldTolerance of an existing vertex are reused rather than
+' duplicated. Mirrored faces have their winding reversed (index 1 and 2 swapped) because a
+' reflection inverts triangle handedness -- without this every mirrored face would point inward.
+CLASS MirrorOp IMPLEMENTS ConstructionOp
+    Id AS String = ""
+    Enabled AS Boolean = TRUE
+    Axis AS String = "X"
+    Weld AS Boolean = TRUE
+    WeldTolerance AS Number = 0.0001
+
+    CONSTRUCTOR(axis AS String = "X", weld AS Boolean = TRUE)
+        SELF.Id = ArcoId.Issue("op")
+        SELF.Axis = axis
+        SELF.Weld = weld
+    END CONSTRUCTOR
+
+    FUNCTION Apply(inputMesh AS Mesh) AS Mesh
+        axis = SELF.Axis
+        weld = SELF.Weld
+        tolerance = SELF.WeldTolerance
+
+        outputVertices = []
+        FOR vertex IN inputMesh.Vertices
+            ignoredPush = Array.Add(outputVertices, vertex.Clone())
+        NEXT
+
+        ' remap[i] is the final output-vertex index standing in for input vertex i's mirrored copy
+        ' (either a freshly appended vertex, or a weld onto an existing one).
+        remap = []
+        FOR sourceVertex IN inputMesh.Vertices
+            mirrored = MirrorVertex(sourceVertex, axis)
+            foundIndex = -1
+            IF weld THEN
+                foundIndex = FindNearVertexIndex(outputVertices, mirrored, tolerance)
+            END IF
+            IF foundIndex >= 0 THEN
+                ignoredPush = Array.Add(remap, foundIndex)
+            ELSE
+                ignoredPush = Array.Add(outputVertices, mirrored)
+                newIndex = LEN(outputVertices) - 1
+                ignoredPush = Array.Add(remap, newIndex)
+            END IF
+        NEXT
+
+        outputFaces = []
+        FOR face IN inputMesh.Faces
+            indices = face.Indices
+            ignoredPush = Array.Add(outputFaces, Face(indices[0], indices[1], indices[2]))
+        NEXT
+        FOR face IN inputMesh.Faces
+            indices = face.Indices
+            a = remap[indices[0]]
+            b = remap[indices[1]]
+            c = remap[indices[2]]
+            ' Swap b/c: reverses winding to correct for the reflection's handedness flip.
+            ignoredPush = Array.Add(outputFaces, Face(a, c, b))
+        NEXT
+
+        outputMesh = Mesh()
+        outputMesh.Vertices = outputVertices
+        outputMesh.Faces = outputFaces
+        outputMesh.RecomputeFaceNormals()
+        RETURN outputMesh
+    END FUNCTION
+
+    FUNCTION Clone() AS MirrorOp
+        copy = MirrorOp(SELF.Axis, SELF.Weld)
+        copy.Enabled = SELF.Enabled
+        copy.WeldTolerance = SELF.WeldTolerance
+        RETURN copy
+    END FUNCTION
+END CLASS
+
+' Repeats the input mesh `Count` times (including the unshifted original at index 0), each copy
+' shifted by an additional Offset. No welding -- array copies are not generally expected to touch.
+CLASS ArrayOp IMPLEMENTS ConstructionOp
+    Id AS String = ""
+    Enabled AS Boolean = TRUE
+    Count AS Number = 2
+    Offset AS Vec3 = Vec3(1, 0, 0)
+
+    CONSTRUCTOR(count AS Number = 2, offsetX AS Number = 1, offsetY AS Number = 0, offsetZ AS Number = 0)
+        SELF.Id = ArcoId.Issue("op")
+        SELF.Count = count
+        SELF.Offset = Vec3(offsetX, offsetY, offsetZ)
+    END CONSTRUCTOR
+
+    FUNCTION Apply(inputMesh AS Mesh) AS Mesh
+        copies = SELF.Count
+        IF copies < 1 THEN
+            copies = 1
+        END IF
+        offset = SELF.Offset
+        vertexCountPerCopy = LEN(inputMesh.Vertices)
+
+        outputVertices = []
+        outputFaces = []
+        FOR copyIndex IN Range(copies)
+            shift = offset.Scaled(copyIndex)
+            FOR vertex IN inputMesh.Vertices
+                shifted = vertex.Plus(shift)
+                ignoredPush = Array.Add(outputVertices, shifted)
+            NEXT
+            indexBase = copyIndex * vertexCountPerCopy
+            FOR face IN inputMesh.Faces
+                indices = face.Indices
+                a = indices[0] + indexBase
+                b = indices[1] + indexBase
+                c = indices[2] + indexBase
+                ignoredPush = Array.Add(outputFaces, Face(a, b, c))
+            NEXT
+        NEXT
+
+        outputMesh = Mesh()
+        outputMesh.Vertices = outputVertices
+        outputMesh.Faces = outputFaces
+        outputMesh.RecomputeFaceNormals()
+        RETURN outputMesh
+    END FUNCTION
+
+    FUNCTION Clone() AS ArrayOp
+        offset = SELF.Offset
+        copy = ArrayOp(SELF.Count, offset.X, offset.Y, offset.Z)
+        copy.Enabled = SELF.Enabled
+        RETURN copy
+    END FUNCTION
+END CLASS
+
+' An ordered, non-destructively evaluated list of operations over a base mesh. Evaluate() never
+' mutates BaseMesh or any operation; Commit() is the sole, explicit, destructive bake (RFC-0049
+' Section 7.2: "The user MUST NOT be forced to destructively commit geometry merely to preview
+' later refinement").
+CLASS ConstructionStack
+    BaseMesh AS Mesh = NULL
+    Operations AS Array = []
+
+    CONSTRUCTOR(baseMesh AS Mesh = NULL)
+        SELF.BaseMesh = baseMesh
+    END CONSTRUCTOR
+
+    FUNCTION AddOperation(operation)
+        operations = SELF.Operations
+        ignoredPush = Array.Add(operations, operation)
+    END FUNCTION
+
+    ' Swaps the operation at `index` with its neighbor in `direction` (-1 earlier, +1 later).
+    ' Returns FALSE (no change) if `index` or the resulting position is out of range.
+    FUNCTION MoveOperation(index AS Number, direction AS Number) AS Boolean
+        operations = SELF.Operations
+        count = LEN(operations)
+        targetIndex = index + direction
+        IF index < 0 THEN
+            RETURN FALSE
+        END IF
+        IF index >= count THEN
+            RETURN FALSE
+        END IF
+        IF targetIndex < 0 THEN
+            RETURN FALSE
+        END IF
+        IF targetIndex >= count THEN
+            RETURN FALSE
+        END IF
+        moving = operations[index]
+        displaced = operations[targetIndex]
+        operations[index] = displaced
+        operations[targetIndex] = moving
+        RETURN TRUE
+    END FUNCTION
+
+    FUNCTION RemoveOperationAt(index AS Number) AS Boolean
+        operations = SELF.Operations
+        count = LEN(operations)
+        IF index < 0 THEN
+            RETURN FALSE
+        END IF
+        IF index >= count THEN
+            RETURN FALSE
+        END IF
+        ignoredRemoved = Array.RemoveAt(operations, index)
+        RETURN TRUE
+    END FUNCTION
+
+    ' Runs every enabled operation in order over a clone of BaseMesh. BaseMesh, and every
+    ' operation's own parameters, are left untouched -- calling this repeatedly (e.g. after toggling
+    ' one operation's Enabled flag) always recomputes from scratch rather than incrementally.
+    FUNCTION Evaluate() AS Mesh
+        baseMesh = SELF.BaseMesh
+        current = baseMesh.Clone()
+        operations = SELF.Operations
+        FOR operation IN operations
+            enabled = operation.Enabled
+            IF enabled THEN
+                current = operation.Apply(current)
+            END IF
+        NEXT
+        RETURN current
+    END FUNCTION
+
+    ' The only destructive operation: bakes the current evaluated result as the new BaseMesh and
+    ' clears the operation list. Ordinary Evaluate() calls never do this implicitly.
+    FUNCTION Commit()
+        evaluated = SELF.Evaluate()
+        SELF.BaseMesh = evaluated
+        SELF.Operations = []
+    END FUNCTION
+
+    FUNCTION Clone() AS ConstructionStack
+        baseMesh = SELF.BaseMesh
+        clonedBase = baseMesh.Clone()
+        copy = ConstructionStack(clonedBase)
+        operations = SELF.Operations
+        FOR operation IN operations
+            ignoredPush = Array.Add(copy.Operations, operation.Clone())
+        NEXT
+        RETURN copy
+    END FUNCTION
+END CLASS
+
+' ---- Component integration --------------------------------------------------------------------
+'
+' Component.Stack (declared in arco3d_scene.abas) is deliberately untyped there, since that file
+' cannot name ConstructionStack without a circular dependency. These three functions are the real
+' entry points for giving a component a construction stack; a plain CreateBlock()/CreateWedge()/
+' etc. Component has Stack == NULL until AttachConstructionStack() is called on it.
+
+' Wraps a component's current LocalMesh (cloned, so later edits to the component's live mesh don't
+' alias the stack's own BaseMesh) in a fresh ConstructionStack and attaches it. Returns the stack.
+FUNCTION AttachConstructionStack(component AS Component) AS ConstructionStack
+    localMesh = component.LocalMesh
+    clonedMesh = localMesh.Clone()
+    stack = ConstructionStack(clonedMesh)
+    component.Stack = stack
+    RETURN stack
+END FUNCTION
+
+' Appends `operation` to component.Stack and immediately refreshes LocalMesh from it. Requires
+' AttachConstructionStack() to have been called first.
+FUNCTION AddConstructionOp(component AS Component, operation)
+    stack = component.Stack
+    stack.AddOperation(operation)
+    RefreshComponentFromStack(component)
+END FUNCTION
+
+' Recomputes component.LocalMesh from component.Stack.Evaluate(). Call this after directly
+' mutating an operation's fields (e.g. `op.Enabled = FALSE`) or reordering/removing operations --
+' there is no automatic dirty-tracking (see module header).
+FUNCTION RefreshComponentFromStack(component AS Component)
+    stack = component.Stack
+    component.LocalMesh = stack.Evaluate()
+END FUNCTION

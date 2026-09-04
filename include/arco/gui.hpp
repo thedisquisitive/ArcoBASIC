@@ -58,4 +58,21 @@ void present(int id);
 Value poll_event();
 Value wait_event(double timeout_seconds);
 
+// Real, depth-tested 3D rendering (RFC-0047/arco3d's own viewport phase) -- a second layer under
+// the ordinary 2D canvas above, not a replacement for it. clear_3d() clears BOTH the real GL
+// color+depth buffers (the 3D scene) AND the 2D cairo canvas to fully transparent (so ordinary
+// GUI.Text/GUI.Line/etc. calls made afterward, before Present(), composite as a HUD overlay on
+// top of the 3D content instead of hiding it); triangle_3d() draws one world-space triangle,
+// depth-tested against whatever was already drawn this frame, flat-shaded (a single color for the
+// whole triangle -- the caller supplies it, e.g. from a face normal dot a light direction; there
+// is no built-in lighting model). Camera is a plain look-at (eye/target/up) plus vertical
+// field-of-view in degrees; near/far are the standard perspective clip planes. Present(id) is
+// unchanged from the caller's side -- it detects internally whether clear_3d() was used this frame
+// and blends the 2D layer over the 3D one instead of replacing it.
+void clear_3d(int id, double eye_x, double eye_y, double eye_z, double target_x, double target_y, double target_z,
+              double up_x, double up_y, double up_z, double fov_y_degrees, double near_plane, double far_plane,
+              double background_red, double background_green, double background_blue);
+void triangle_3d(int id, double x1, double y1, double z1, double x2, double y2, double z2, double x3, double y3, double z3,
+                 double red, double green, double blue, double alpha);
+
 } // namespace arco::gui

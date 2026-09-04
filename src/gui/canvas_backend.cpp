@@ -679,6 +679,16 @@ void present(int) {
     // WaitEvent poll loop starts spinning again.
     emscripten_sleep(0);
 }
+void clear_3d(int, double, double, double, double, double, double, double, double, double, double, double, double, double, double, double) {
+    // Deliberately unimplemented for the web capsule target for now: real depth-tested 3D
+    // (glfw_backend.cpp's own clear_3d()/triangle_3d()) needs a real WebGL context, not the 2D
+    // canvas this backend draws through -- a separate increment, not silently faked here as a 2D
+    // approximation.
+    throw std::runtime_error("GUI.Clear3D is not yet supported on the web capsule target");
+}
+void triangle_3d(int, double, double, double, double, double, double, double, double, double, double, double, double, double) {
+    throw std::runtime_error("GUI.Triangle3D is not yet supported on the web capsule target");
+}
 Value poll_event() {
     if (!initialized) { js_ensure_initialized(); initialized = true; }
     js_flush_pending_events();

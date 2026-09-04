@@ -23,6 +23,7 @@ enum class TokenType {
     RightBrace,
     Comma,
     Colon,
+    Dot,
     Plus,
     PlusEqual,
     Minus,

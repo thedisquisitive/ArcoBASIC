@@ -1,0 +1,15 @@
+#DESCRIPTION "Example Arco3D automation script -- spawns a 3x3 grid of blocks, mirrors one, and exports the result"
+#IMPORT "arco3d_api"
+
+FOR row IN Range(3)
+    FOR col IN Range(3)
+        block = SpawnBlock()
+        ignoredCall = SetPosition(block, col * 2, 0, row * 2)
+    NEXT
+NEXT
+
+sphere = SpawnSphere()
+ignoredCall = SetPosition(sphere, 8, 0, 8)
+ignoredCall = AddMirror(sphere, "X")
+
+ignoredCall = ExportScene("arco3d_scripted_grid.a3d")

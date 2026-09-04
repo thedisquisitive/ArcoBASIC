@@ -3020,6 +3020,28 @@ Runtime::Runtime()
         expect_arg_count(args, "TAU", 0, 0);
         return 6.28318530717958647692528676655900576;
     });
+    // "Exit"/"ExitProgram"/"ExitTheProgram" (and lowercase-first aliases) were previously
+    // registered only by ArcoSH's own register_shell_builtins (src/shell/arcosh.cpp) -- fine for
+    // the interactive shell, but that left them entirely unavailable to a native/hosted capsule
+    // (confirmed directly: an ArcoFission `native` build of any script calling ExitTheProgram()
+    // fails at runtime with "unknown host function: exittheprogram"). ExitSignal itself is
+    // already a core Runtime type, not shell-specific, so the actual mechanism was always
+    // available here -- only the ArcoBASIC-callable wrapper wasn't. Registered once, for real,
+    // rather than duplicating this closure in arcosh.cpp -- that registration is left alone since
+    // re-registering the same name is harmless, not because it's still needed.
+    const auto exit_the_program = [](const std::vector<Value>& args) -> Value {
+        if (args.size() > 1) {
+            throw std::runtime_error("Exit expects 0 or 1 arguments");
+        }
+        const int code = args.empty() ? 0 : static_cast<int>(args[0].as_number());
+        throw ExitSignal(code);
+    };
+    register_function("Exit", exit_the_program);
+    register_function("exit", exit_the_program);
+    register_function("ExitProgram", exit_the_program);
+    register_function("exitProgram", exit_the_program);
+    register_function("ExitTheProgram", exit_the_program);
+    register_function("exitTheProgram", exit_the_program);
     const auto random_from_value = [this](const Value* value, const std::string& function) -> std::shared_ptr<Pcg32> {
         if (value == nullptr || value->is_null()) {
             return default_random_;
@@ -3433,6 +3455,27 @@ Runtime::Runtime()
         if (args.size() < 7 || args.size() > 8) throw std::runtime_error("GUI.Circle expects window, centerX, centerY, radius, red, green, blue, and optional alpha");
         gui::circle(static_cast<int>(args[0].as_number()), args[1].as_number(), args[2].as_number(), args[3].as_number(),
                     args[4].as_number(), args[5].as_number(), args[6].as_number(), args.size() == 8 ? args[7].as_number() : 1.0);
+        return {};
+    });
+    register_function("GUI.Clear3D", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 16) {
+            throw std::runtime_error("GUI.Clear3D expects window, eyeX, eyeY, eyeZ, targetX, targetY, targetZ, "
+                                      "upX, upY, upZ, fovYDegrees, nearPlane, farPlane, backgroundRed, backgroundGreen, backgroundBlue");
+        }
+        gui::clear_3d(static_cast<int>(args[0].as_number()), args[1].as_number(), args[2].as_number(), args[3].as_number(),
+                      args[4].as_number(), args[5].as_number(), args[6].as_number(), args[7].as_number(), args[8].as_number(),
+                      args[9].as_number(), args[10].as_number(), args[11].as_number(), args[12].as_number(),
+                      args[13].as_number(), args[14].as_number(), args[15].as_number());
+        return {};
+    });
+    register_function("GUI.Triangle3D", [](const std::vector<Value>& args) -> Value {
+        if (args.size() < 13 || args.size() > 14) {
+            throw std::runtime_error("GUI.Triangle3D expects window, x1,y1,z1, x2,y2,z2, x3,y3,z3, red, green, blue, and optional alpha");
+        }
+        gui::triangle_3d(static_cast<int>(args[0].as_number()), args[1].as_number(), args[2].as_number(), args[3].as_number(),
+                         args[4].as_number(), args[5].as_number(), args[6].as_number(), args[7].as_number(), args[8].as_number(),
+                         args[9].as_number(), args[10].as_number(), args[11].as_number(), args[12].as_number(),
+                         args.size() == 14 ? args[13].as_number() : 1.0);
         return {};
     });
     register_function("GUI.Text", [](const std::vector<Value>& args) -> Value {
@@ -4194,6 +4237,28 @@ void Runtime::set_global(const std::string& name, Value value) {
         }
     }
 
+    // Plain (non-dotted) name: ALWAYS shadow into the innermost active scope (or globals_ if none
+    // is active), matching this interpreter's real, deliberate semantics -- a bare assignment
+    // inside a FUNCTION always creates a function-local, even if a same-named variable happens to
+    // exist at script scope or in an unrelated outer call frame. This is a genuine language design
+    // choice (BASIC here has no explicit "declare a new local" syntax distinct from plain
+    // assignment, so "local by default" -- the same default Python's own bare assignment uses,
+    // requiring an explicit `global` statement to opt OUT of it -- is what keeps two functions'
+    // same-named local variables from ever silently colliding).
+    //
+    // A previous version of this function tried to make plain-name writes search outward and
+    // mutate an existing same-named binding wherever found (to let a function update a
+    // script-level counter across separate calls), mirroring the dotted-path branch above. That
+    // broke three real, independent test suites (arco_runtime_tests, arcosh_alpha_smoke,
+    // arcology_commons_unit_tests) that all use a generic local variable name (e.g. "restored")
+    // inside more than one function -- under that change, the SECOND function's own local
+    // assignment silently found and overwrote the FIRST function's already-existing local of the
+    // same name instead of creating its own, isolated one. Confirmed via the full regression suite
+    // (ctest), not assumed: reverted rather than kept as a "mostly works" tradeoff. The real,
+    // narrower need that prompted the attempt (a function persisting a counter across calls) has
+    // a correct, already-existing, EXPLICIT mechanism instead: a CLASS SHARED field, which goes
+    // through the dotted-path branch above precisely because it's spelled as `ClassName.Field`,
+    // an unambiguous opt-in a bare identifier can never be.
     if (!scopes_.empty()) {
         scopes_.back()[name] = std::move(value);
         return;
@@ -4238,6 +4303,17 @@ void Runtime::set_indexed(const std::string& name, const std::vector<int>& index
     throw std::runtime_error("undefined variable: " + name);
 }
 
+Value Runtime::get_member(const Value& target, const std::string& property) const {
+    const std::string runtime_class = object_runtime_class(target);
+    if (!runtime_class.empty()) {
+        ensure_member_access(runtime_class, property, false);
+    }
+    if (is_reference(target) && function_key(property) == "value") {
+        return reference_value(target);
+    }
+    return target.get_property(property);
+}
+
 Value Runtime::get_global(const std::string& name) const {
     for (auto scope = scopes_.rbegin(); scope != scopes_.rend(); ++scope) {
         const auto local = scope->find(name);
@@ -4256,15 +4332,7 @@ Value Runtime::get_global(const std::string& name) const {
                 while (start < name.size()) {
                     const auto next = name.find('.', start);
                     const std::string property = name.substr(start, next == std::string::npos ? std::string::npos : next - start);
-                    const std::string runtime_class = object_runtime_class(value);
-                    if (!runtime_class.empty()) {
-                        ensure_member_access(runtime_class, property, false);
-                    }
-                    if (is_reference(value) && function_key(property) == "value") {
-                        value = reference_value(value);
-                    } else {
-                        value = value.get_property(property);
-                    }
+                    value = get_member(value, property);
                     if (next == std::string::npos) {
                         return value;
                     }
@@ -4287,15 +4355,7 @@ Value Runtime::get_global(const std::string& name) const {
             while (start < name.size()) {
                 const auto next = name.find('.', start);
                 const std::string property = name.substr(start, next == std::string::npos ? std::string::npos : next - start);
-                const std::string runtime_class = object_runtime_class(value);
-                if (!runtime_class.empty()) {
-                    ensure_member_access(runtime_class, property, false);
-                }
-                if (is_reference(value) && function_key(property) == "value") {
-                    value = reference_value(value);
-                } else {
-                    value = value.get_property(property);
-                }
+                value = get_member(value, property);
                 if (next == std::string::npos) {
                     return value;
                 }

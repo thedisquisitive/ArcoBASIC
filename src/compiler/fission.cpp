@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <limits>
 #include <cstdlib>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1619,8 +1620,34 @@ private:
         return result;
     }
 
+    // True for exactly `ClassName.FieldName` where FieldName is a SHARED field of ClassName --
+    // see shared_fields_'s own comment. Not meaningful for longer chains (a SHARED field is never
+    // itself an object with further dotted properties in any code this compiler has seen).
+    bool is_shared_field_reference(const std::vector<std::string>& parts) const {
+        if (parts.size() != 2) return false;
+        const auto found = shared_fields_.find(parts[0]);
+        return found != shared_fields_.end() && found->second.count(parts[1]) != 0;
+    }
+
     std::string lower_variable(AmirBlock& out, const std::string& name) {
         const auto parts = split_identifier_path(name);
+        if (is_shared_field_reference(parts)) {
+            // A plain per-function LOAD only ever sees this function's own call-frame-local slot
+            // (confirmed with a minimal repro: a SHARED counter incremented through ordinary
+            // amir_store/amir_load silently reset to its initial value on every read from a
+            // different function than the one that last wrote it -- exactly the same cross-
+            // function-visibility gap apply_script_global_scoping() exists to close for ordinary
+            // script-scope variables, just needed here too, for a different reason). Route through
+            // the same Runtime.GetGlobal/SetGlobal primitive that mechanism already uses, which is
+            // backed by Runtime's actual persistent globals_ map, not any one call frame.
+            const std::string key = temp();
+            out.instructions.push_back(amir_const(key, "\"" + escaped(name) + "\""));
+            const std::string result = temp();
+            auto instruction = amir_call_value(result, "Runtime.GetGlobal", {key});
+            instruction.result_type = types_.count(name) ? types_.at(name) : "U64";
+            out.instructions.push_back(std::move(instruction));
+            return result;
+        }
         if (parts.size() <= 1) {
             const std::string result = temp();
             auto instruction = amir_load(result, name);
@@ -1750,11 +1777,48 @@ private:
         // external-call path this heuristic exists for -- exclude it explicitly rather than
         // route every method-calling-another-method-on-itself through CALL_EXTERNAL, which the
         // bytecode VM doesn't implement.
+        //
+        // The same problem exists for any OTHER parameter, not just SELF: has_parameter() alone
+        // only asks "is the receiver some parameter of this function", with no regard for its
+        // type, so an entirely ordinary `FUNCTION Foo(actual AS Vec3) ... actual.EqualsApprox(...)`
+        // was ALSO wrongly routed into CALL_EXTERNAL merely because `actual` is a parameter --
+        // confirmed with a minimal repro (a plain class method call on a typed, non-UEFI
+        // parameter), not hypothetical.
+        //
+        // Narrowing has_parameter() to "is this NOT a CLASS actually declared in this module" is
+        // not, by itself, the whole fix: systems_amir_primitives_smoke (a real, existing fixture)
+        // deliberately calls through a `handle AS Custom.Opaque` parameter -- an intentionally
+        // made-up non-UEFI type name -- and still requires CALL_EXTERNAL ("a call through a
+        // parameter is external ... position/parameter-name based [classification], not
+        // [dependent on whether the type is] a real bound field of anything", that fixture's own
+        // comment). Separately, systems_arco_basic_multi_blockio_discovery_smoke calls through a
+        // `LET blockIo AS UEFI.BlockIoProtocol = ...` -- a plain LOCAL variable, never a
+        // parameter at all -- so has_parameter() alone (however it's gated) can never cover this
+        // case; it needs the independent "is the type UEFI.*-prefixed" signal alongside it.
+        //
+        // A THIRD case, found the same way (a real repro, not hypothesized): a parameter with NO
+        // type annotation at all -- `FUNCTION SpawnAt(newComponent) ... newComponent.SetPosition
+        // (...)`, arco3d's own polymorphic-parameter style -- must NOT be treated as external
+        // either, even though has_parameter() is still true for it. SELF is exactly this shape
+        // (never given an explicit type by this compiler), which is why the ORIGINAL code needed
+        // to special-case it by name at all -- generalizing "untyped parameter defaults to
+        // ordinary dispatch" below covers SELF too, without a name-based special case. So the
+        // has_parameter() fallback only applies when the parameter DOES have a type annotation
+        // and that type is not a declared class (Custom.Opaque, UEFI.SystemTable): a completely
+        // untyped parameter is presumed an ordinary polymorphic object, matching how the
+        // tree-walking interpreter always treats one (it has no such distinction at all).
+        //
+        // All three real fixtures broke, one at a time, as this heuristic was narrowed further
+        // each round -- confirmed by rerunning the full fixture suite after each attempt, not
+        // assumed.
+        const bool receiver_type_known = types_.count(receiver_name) != 0;
+        const bool receiver_is_declared_class = receiver_type_known && module_.class_parents.count(types_.at(receiver_name)) != 0;
+        const bool receiver_is_typed_non_class_parameter = receiver_type_known && !receiver_is_declared_class;
+        const bool receiver_type_is_external_uefi = receiver_type_known && types_.at(receiver_name).rfind("UEFI.", 0) == 0;
         if (node.kind == AstKind::MethodCall && node.secondary_name != "SELF" &&
-            (has_parameter(function, node.secondary_name) ||
-            (types_.count(receiver_name) != 0 && types_.at(receiver_name).rfind("UEFI.", 0) == 0))) {
+            ((has_parameter(function, node.secondary_name) && receiver_is_typed_non_class_parameter) || receiver_type_is_external_uefi)) {
             instruction.kind = AmirInstruction::Kind::CallExternal;
-            if (!receiver_name.empty() && types_.count(receiver_name) != 0) instruction.operand_types = {types_.at(receiver_name)};
+            if (!receiver_name.empty() && receiver_type_known) instruction.operand_types = {types_.at(receiver_name)};
         }
         current_block(function).instructions.push_back(std::move(instruction));
         return result;
@@ -1931,6 +1995,17 @@ private:
             : node.type_name;
         if (!declared_type.empty()) types_[node.name] = declared_type;
         const auto parts = split_identifier_path(node.name);
+        // See lower_variable()'s identical Runtime.SetGlobal/GetGlobal reasoning: a SHARED field
+        // needs a real cross-function-call store, not an indexed store into ClassName (which
+        // isn't a local holding an object at all) and not a plain per-frame STORE either (which
+        // the very next call into a *different* function would never see).
+        if (is_shared_field_reference(parts)) {
+            const std::string value = lower_expression(function, *node.children.back(), declared_type);
+            const std::string key = temp();
+            current_block(function).instructions.push_back(amir_const(key, "\"" + escaped(node.name) + "\""));
+            current_block(function).instructions.push_back(amir_call_value(temp(), "Runtime.SetGlobal", {key, value}));
+            return;
+        }
         std::vector<std::string> indexes;
         for (std::size_t i = 1; i < parts.size(); ++i) {
             const std::string property = temp();
@@ -2413,6 +2488,29 @@ private:
 
         module_.class_parents[node.name] = node.secondary_name;
 
+        // SHARED fields (RFC docs/classes.md) have no per-instance storage -- this class's own
+        // .__new below deliberately skips them -- so back each one with Runtime's persistent
+        // globals_ map (via Runtime.SetGlobal, the same primitive apply_script_global_scoping()
+        // already uses for cross-function script-scope variables -- see lower_variable()'s own
+        // comment for why a plain per-frame amir_store isn't enough here), keyed by
+        // "ClassName.FieldName" and initialized once, right here, before any method body
+        // (including this class's own) can reference it. Must run before the method-compiling
+        // loop below records shared_fields_ for lower_variable()/lower_assignment() to find.
+        for (const auto& field : ast_group(node, "fields")) {
+            if (field->kind != AstKind::ClassField || !field->flag) continue;
+            shared_fields_[node.name].insert(field->name);
+            std::string field_value;
+            if (!field->children.empty() && field->children[0]) {
+                field_value = lower_expression(owner, *field->children[0]);
+            } else {
+                field_value = temp();
+                current_block(owner).instructions.push_back(amir_const(field_value, "nothing"));
+            }
+            const std::string key = temp();
+            current_block(owner).instructions.push_back(amir_const(key, "\"" + escaped(node.name + "." + field->name) + "\""));
+            current_block(owner).instructions.push_back(amir_call_value(temp(), "Runtime.SetGlobal", {key, field_value}));
+        }
+
         const CanonicalAstNode* init_method = nullptr;
         for (const auto& method : ast_group(node, "methods")) {
             if (method->kind != AstKind::ClassMethod || method->flag2) continue;
@@ -2424,12 +2522,25 @@ private:
             function.blocks.push_back(AmirBlock{"Entry"});
             const std::size_t saved_block = current_block_;
             const auto saved_loops = loop_stack_;
+            // lower_function() (plain FUNCTIONs) already does this; class methods never did,
+            // which meant a typed method parameter's type was silently indistinguishable from an
+            // untyped one downstream -- e.g. `FUNCTION ApplyToPoint(localPoint AS Vec3) ...
+            // localPoint.ScaledBy(...)` -- confirmed with a minimal repro to be the reason a
+            // perfectly ordinary method call on a class-typed method parameter was still being
+            // misclassified as CALL_EXTERNAL (the has_parameter() fallback in lower_call() only
+            // stops firing once a parameter's type is actually known).
+            const auto saved_types = types_;
+            types_.clear();
+            for (const auto& param : method->parameters) {
+                if (!param.type_name.empty()) types_[param.name] = param.type_name;
+            }
             current_block_ = 0;
             loop_stack_.clear();
             lower_statements(function, ast_group(*method, "body"));
             ensure_terminated(function, current_block_, "VALUE", "nothing");
             current_block_ = saved_block;
             loop_stack_ = saved_loops;
+            types_ = saved_types;
             module_.functions.push_back(std::move(function));
             if (method->name == "Init") init_method = method.get();
         }
@@ -2578,6 +2689,11 @@ private:
     AmirModule module_;
     std::vector<CanonicalAstNodePtr> roots_;
     std::unordered_map<std::string, std::string> types_;
+    // Class name -> its own SHARED field names (RFC docs/classes.md's "SHARED for class-level
+    // members"). A SHARED field has no per-instance storage at all (lower_class's own .__new
+    // deliberately skips it), so `ClassName.FieldName` is instead backed by one global bytecode
+    // local named exactly that -- see lower_variable()/lower_assignment()'s shared-field checks.
+    std::unordered_map<std::string, std::unordered_set<std::string>> shared_fields_;
     std::vector<LoopTarget> loop_stack_;
     int temporary_ = 0;
     int hidden_counter_ = 0;
@@ -3127,6 +3243,14 @@ struct BytecodeFunction {
     std::unordered_map<std::string, std::string> local_refs_by_base;
     std::vector<std::string> param_local_refs;
     std::vector<std::optional<Value>> param_defaults;
+    // Parallel to param_defaults, for a default value that ISN'T a simple literal -- e.g.
+    // `CONSTRUCTOR(position AS Vec3 = Vec3(0, 0, 0))` -- which parse_constant_value can't produce
+    // a Value for at prepare time (there is no live object to construct yet). Resolved once here,
+    // at prepare_bytecode_module time, to the target function plus its (literal) argument values;
+    // evaluated fresh via execute_function() every time the default actually fires, rather than
+    // computed once and shared, so mutating one caller's default-constructed instance can never
+    // alias another's. See resolve_param_default_call().
+    std::vector<std::optional<std::pair<const BytecodeFunction*, std::vector<Value>>>> param_default_calls;
     std::size_t temp_count = 0;
 };
 
@@ -5665,6 +5789,63 @@ Value parse_constant_value(const std::string& text) {
     return std::stod(text);
 }
 
+// A default parameter value that isn't a simple literal -- e.g. `Vec3(0, 0, 0)` for
+// `CONSTRUCTOR(position AS Vec3 = Vec3(0, 0, 0))` -- has no Value parse_constant_value() could
+// produce at prepare time (there's no live object to construct). Recognizes exactly the shape
+// this compiler actually renders such a default as, `Identifier(literal, literal, ...)`
+// (render_ast_expression's own output for a Call/constructor expression), resolving it against
+// already-compiled functions in `module` so BytecodeFunction::param_default_calls can evaluate it
+// fresh (via execute_function) every time the default actually fires. Returns nullopt for
+// anything else (nested non-literal arguments, arbitrary expressions) -- callers degrade to no
+// default at all for those rather than guessing.
+std::optional<std::pair<const BytecodeFunction*, std::vector<Value>>> resolve_param_default_call(
+        const BytecodeModule& module, const std::string& default_text) {
+    const auto open_paren = default_text.find('(');
+    if (open_paren == std::string::npos || default_text.empty() || default_text.back() != ')') {
+        return std::nullopt;
+    }
+    const std::string callee_name = default_text.substr(0, open_paren);
+    if (callee_name.empty()) {
+        return std::nullopt;
+    }
+    for (const char c : callee_name) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '.') {
+            return std::nullopt;
+        }
+    }
+    const auto found = module.function_indices.find(callee_name);
+    if (found == module.function_indices.end()) {
+        return std::nullopt;
+    }
+
+    std::vector<Value> args;
+    const std::string inner = default_text.substr(open_paren + 1, default_text.size() - open_paren - 2);
+    if (!inner.empty()) {
+        int depth = 0;
+        std::size_t start = 0;
+        for (std::size_t i = 0; i <= inner.size(); ++i) {
+            const bool at_end = i == inner.size();
+            const char c = at_end ? ',' : inner[i];
+            if (!at_end && (c == '(' || c == '[')) depth++;
+            else if (!at_end && (c == ')' || c == ']')) depth--;
+            if (c == ',' && depth == 0) {
+                std::string piece = inner.substr(start, i - start);
+                while (!piece.empty() && std::isspace(static_cast<unsigned char>(piece.front()))) piece.erase(piece.begin());
+                while (!piece.empty() && std::isspace(static_cast<unsigned char>(piece.back()))) piece.pop_back();
+                try {
+                    args.push_back(parse_constant_value(piece));
+                } catch (const std::exception&) {
+                    // A nested non-literal argument (e.g. another constructor call) -- outside
+                    // this fix's scope; let the caller treat the whole default as unresolved.
+                    return std::nullopt;
+                }
+                start = i + 1;
+            }
+        }
+    }
+    return std::make_pair(&module.functions[found->second], std::move(args));
+}
+
 bool looks_like_inline_bytecode_value(const std::string& text) {
     if (text.empty()) return false;
     if (text == "nothing" || text == "null" || text == "true" || text == "false" || text == "[]") return true;
@@ -5727,6 +5908,7 @@ void prepare_bytecode_module(BytecodeModule& module) {
         function.local_refs_by_base.clear();
         function.param_local_refs.clear();
         function.param_defaults.clear();
+        function.param_default_calls.clear();
         function.temp_count = 0;
 
         for (std::size_t local_index = 0; local_index < function.locals.size(); ++local_index) {
@@ -5735,11 +5917,25 @@ void prepare_bytecode_module(BytecodeModule& module) {
 
         function.param_local_refs.reserve(function.params.size());
         function.param_defaults.reserve(function.params.size());
+        function.param_default_calls.reserve(function.params.size());
         for (const auto& param : function.params) {
             const auto found = function.local_refs_by_base.find(local_base_name(param));
             function.param_local_refs.push_back(found == function.local_refs_by_base.end() ? std::string() : found->second);
             const std::string default_text = param_default_text(param);
-            function.param_defaults.push_back(default_text.empty() ? std::optional<Value>() : std::optional<Value>(parse_constant_value(default_text)));
+            if (default_text.empty()) {
+                function.param_defaults.emplace_back();
+                function.param_default_calls.emplace_back();
+            } else if (looks_like_inline_bytecode_value(default_text)) {
+                function.param_defaults.push_back(parse_constant_value(default_text));
+                function.param_default_calls.emplace_back();
+            } else {
+                // See resolve_param_default_call()'s own comment. module.function_indices is
+                // already populated above, before this per-function loop, so a default like
+                // `Vec3(0, 0, 0)` can resolve against a class constructor compiled earlier in the
+                // very same module.
+                function.param_defaults.emplace_back();
+                function.param_default_calls.push_back(resolve_param_default_call(module, default_text));
+            }
         }
 
         for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
@@ -6294,6 +6490,14 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
             set_local(function, frame, local_index, args[i], function.param_local_refs[i]);
         } else if (i < function.param_defaults.size() && function.param_defaults[i].has_value()) {
             set_local(function, frame, local_index, *function.param_defaults[i], function.param_local_refs[i]);
+        } else if (i < function.param_default_calls.size() && function.param_default_calls[i].has_value()) {
+            // A non-literal default (e.g. `Vec3(0, 0, 0)`) resolved at prepare time -- see
+            // resolve_param_default_call(). Evaluated fresh on every call that actually needs it,
+            // the same as a real expression default would be, rather than a single Value shared
+            // (and potentially aliased/mutated) across every caller that omits this argument.
+            const auto& [target_function, call_args] = *function.param_default_calls[i];
+            set_local(function, frame, local_index, execute_function(module, *target_function, runtime, call_args, count_instructions),
+                      function.param_local_refs[i]);
         }
     }
 
@@ -6448,8 +6652,28 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                 if (!callable_target.has_value()) {
                     const auto dot = instruction.operands[1].find('.');
                     if (dot != std::string::npos) {
-                        const std::string receiver_name = instruction.operands[1].substr(0, dot);
-                        const std::string method_name = instruction.operands[1].substr(dot + 1);
+                        // Split EVERY segment, not just the first: `a.b.c.Method` must dispatch
+                        // method `Method` on the value reached by walking a -> .b -> .c, not
+                        // search for a method literally named "b.c.Method" on `a`. A real,
+                        // reproduced bug (not hypothetical): `restoredRoot.LocalMesh.VertexCount()`
+                        // was misdispatched as looking for "Component.LocalMesh.VertexCount",
+                        // found nothing, and fell through to "unknown host function". Same bug
+                        // family, and the same fix shape (last segment is the method, everything
+                        // before it is a receiver path), as MethodCallExpr's fix in
+                        // src/frontend/parser.cpp for the tree-walking interpreter side of this --
+                        // that fix doesn't cover this bytecode-VM dispatch path since it's a
+                        // wholly separate C++ implementation, confirmed by this exact case still
+                        // failing here after that fix landed.
+                        std::vector<std::string> parts;
+                        std::size_t part_start = 0;
+                        while (part_start <= instruction.operands[1].size()) {
+                            const auto next_dot = instruction.operands[1].find('.', part_start);
+                            parts.push_back(instruction.operands[1].substr(part_start, next_dot == std::string::npos ? std::string::npos : next_dot - part_start));
+                            if (next_dot == std::string::npos) break;
+                            part_start = next_dot + 1;
+                        }
+                        const std::string& receiver_name = parts.front();
+                        const std::string& method_name = parts.back();
                         std::optional<Value> receiver_value;
                         const auto receiver_local = function.local_refs_by_base.find(receiver_name);
                         if (receiver_local != function.local_refs_by_base.end()) {
@@ -6459,6 +6683,11 @@ Value execute_function(const BytecodeModule& module, const BytecodeFunction& fun
                             }
                         } else if (runtime.has_global(receiver_name)) {
                             receiver_value = runtime.get_global(receiver_name);
+                        }
+                        // Walk any intermediate field segments (parts[1 .. size-2]) to reach the
+                        // real receiver the final segment's method dispatches against.
+                        for (std::size_t i = 1; receiver_value.has_value() && i + 1 < parts.size(); ++i) {
+                            receiver_value = runtime.get_member(*receiver_value, parts[i]);
                         }
                         if (receiver_value.has_value() && receiver_value->is_object()) {
                             const auto& receiver_object = receiver_value->as_object();
@@ -7616,17 +7845,25 @@ Result reveal_bytecode_file(const std::string& path) {
 }
 
 Result run_bytecode(const std::string& bytecode, std::optional<std::size_t> instruction_limit_override) {
+    std::ostringstream output;
     try {
         Runtime runtime;
         runtime.set_instruction_limit_policy(true);
         runtime.set_instruction_limit_override(instruction_limit_override);
-        std::ostringstream output;
         runtime.set_output(output);
         auto module = parse_bytecode(bytecode);
         prepare_bytecode_module(module);
         const bool count_instructions = !(instruction_limit_override.has_value() && *instruction_limit_override == 0);
         (void)execute_bytecode(module, runtime, count_instructions);
         return {true, output.str(), ""};
+    } catch (const ExitSignal& signal) {
+        // Exit()/ExitTheProgram() (registered as a core builtin -- see Runtime's constructor in
+        // runtime.cpp) is a real, immediate process exit, not an ordinary runtime error: flush
+        // whatever output already accumulated, matching what a normal successful run would have
+        // printed, then actually terminate with the requested code instead of reporting a
+        // synthetic Result failure that would misrepresent a clean exit as a crash.
+        std::cout << output.str();
+        std::exit(signal.code());
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }
@@ -7634,11 +7871,11 @@ Result run_bytecode(const std::string& bytecode, std::optional<std::size_t> inst
 
 Result run_bytecode_binary(const std::string& bytecode, std::optional<std::size_t> instruction_limit_override,
                            const std::vector<std::string>& script_args) {
+    std::ostringstream output;
     try {
         Runtime runtime;
         runtime.set_instruction_limit_policy(true);
         runtime.set_instruction_limit_override(instruction_limit_override);
-        std::ostringstream output;
         runtime.set_output(output);
         register_self_compile_run(runtime);
         Value::Array args_array;
@@ -7650,6 +7887,13 @@ Result run_bytecode_binary(const std::string& bytecode, std::optional<std::size_
         const bool count_instructions = !(instruction_limit_override.has_value() && *instruction_limit_override == 0);
         (void)execute_bytecode(module, runtime, count_instructions);
         return {true, output.str(), ""};
+    } catch (const ExitSignal& signal) {
+        // See run_bytecode()'s identical catch above -- this is the path every native capsule
+        // actually runs through (native_launcher_source() calls this), so this is what makes
+        // ExitTheProgram() in a compiled arco3d program (or any other native capsule) actually
+        // terminate the process instead of crashing with an uncaught C++ exception.
+        std::cout << output.str();
+        std::exit(signal.code());
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }
@@ -7665,6 +7909,7 @@ Result run_bytecode_file(const std::string& path, std::optional<std::size_t> ins
 
 Result compile_run(const std::string& source, const std::string& source_name,
                    std::optional<std::size_t> instruction_limit_override) {
+    std::ostringstream output;
     try {
         Runtime preprocess_runtime;
         const std::string processed = preprocess_runtime.preprocess_source(source);
@@ -7677,7 +7922,6 @@ Result compile_run(const std::string& source, const std::string& source_name,
         Runtime runtime;
         runtime.set_instruction_limit_policy(true);
         runtime.set_instruction_limit_override(instruction_limit_override);
-        std::ostringstream output;
         runtime.set_output(output);
         register_self_compile_run(runtime);
         auto module = build_bytecode(build_amir(
@@ -7686,6 +7930,10 @@ Result compile_run(const std::string& source, const std::string& source_name,
         const bool count_instructions = !(instruction_limit_override.has_value() && *instruction_limit_override == 0);
         (void)execute_bytecode(module, runtime, count_instructions);
         return {true, output.str(), ""};
+    } catch (const ExitSignal& signal) {
+        // See run_bytecode()/run_bytecode_binary()'s identical catch above.
+        std::cout << output.str();
+        std::exit(signal.code());
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }

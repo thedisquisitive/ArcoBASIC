@@ -1,0 +1,146 @@
+' Arco3D A3D asset serialization (RFC-0050), first real increment: "minimum subset" per RFC-0049
+' Section 19's recommended order -- geometry/hierarchy/transform only. No rig/pose, materials,
+' paint, style, or external resource references yet; those are later, separately scoped
+' increments (RFC-0050 itself only requires the FIRST version to cover core mesh semantics before
+' advancing past Draft -- see its own Section 31 Definition of Done).
+'
+' Container encoding: plain UTF-8 text, ArcoCompy-packed (#IMPORT "compy", already a real,
+' existing, tested value-serialization library in this repo -- see stdlib/compy.abas's own header
+' for its tagged-length-prefixed format). This is a deliberate, considered choice, not a
+' placeholder:
+'   - RFC-0050 Section 6 explicitly wants the initial reference implementation to favor
+'     "simplicity, inspectability, and robust tooling over maximum compression", and permits
+'     packaging as "another seekable archive form provided normative semantics are preserved"
+'     rather than mandating a bespoke binary chunk format from day one.
+'   - ArcoCompy.Pack/TryUnpack already round-trip a REAL live object graph -- class instances,
+'     nested arrays/objects, __class tags and all -- confirmed directly: packing a CreateBlock()
+'     Component and unpacking it restores a genuine Component with a genuine Mesh of genuine Vec3
+'     instances, methods included (CLASSOF/instance dispatch both work on the restored value).
+'     That means this file needs no hand-written recursive tree-walking encoder/decoder at all --
+'     the manifest wrapper below is the only real work.
+'   - ArcoCompy.TryUnpack already enforces depth/item bounds against untrusted input (see its own
+'     header) -- exactly RFC-0050 Section 25's "integer overflow / oversized allocations /
+'     decompression bombs" concern, gotten for free rather than re-implemented here.
+'
+' Coordinate/unit convention (RFC-0050 Section 10, frozen for v1): right-handed, Y-up, meters --
+' matching arco3d_scene.abas's own existing internal convention exactly, so export/import need no
+' conversion step. Revisit only if a real downstream consumer (the eventual Blender Bridge,
+' RFC-0051) needs otherwise -- Blender's own convention is Z-up, so that bridge will need an
+' explicit conversion step regardless of what this file picks.
+'
+' Known, deliberate limitations of this increment:
+'   - No external/embedded resource support (RFC-0050 Section 22) -- nothing here references
+'     textures or other binary payloads yet, so that requirement doesn't apply until a Surface
+'     phase exists.
+'   - A Component's Stack field (arco3d_construction.abas's ConstructionStack), if attached, is
+'     packed as-is, best-effort -- it is NOT yet a specified, stable part of the A3D schema (RFC-
+'     0049 Section 7.2 explicitly only says construction history MAY be stored as an optional
+'     extension). Round-trip tests in this increment deliberately use plain, stack-free components
+'     so the CORE mesh/hierarchy schema is tested independent of that still-unspecified case.
+'   - No semantic validation beyond the manifest header and ArcoCompy's own structural bounds --
+'     a hand-crafted file with a plausible manifest but a malformed Asset (missing fields) will
+'     fail loudly the first time something tries to use the missing field, not at import time.
+'     Full schema validation is future work, not silently promised here.
+
+#IMPORT "compy"
+#IMPORT "arco3d_scene"
+
+FUNCTION A3DFormatName() AS String
+    RETURN "A3D"
+END FUNCTION
+
+FUNCTION A3DContainerVersion() AS Number
+    RETURN 1
+END FUNCTION
+
+FUNCTION A3DSchemaVersion() AS Number
+    RETURN 1
+END FUNCTION
+
+' RFC-0050 Section 23: capabilities THIS reader/writer understands. A file whose manifest lists a
+' RequiredCapability outside this list must be rejected (see ImportA3D below) rather than guessed
+' at.
+FUNCTION A3DSupportedCapabilities() AS Array
+    RETURN ["mesh.core"]
+END FUNCTION
+
+' Rig/pose data (arco3d_rig.abas's Rig/PoseCatalog, carried on Asset.Rig/Asset.PoseCatalogs -- see
+' arco3d_scene.abas's own comment on those fields) is real but OPTIONAL, per RFC-0050 Section 29's
+' own example manifest listing "pose.catalog" as optional, not required: a reader that only cares
+' about geometry should still be able to open the file. Advertised here only when actually present,
+' so a plain geometry-only asset's manifest stays exactly as before this addition.
+'
+' Restoring a Rig/Bone/Quaternion/Pose/PoseCatalog instance with working methods after import
+' requires the IMPORTING script to have `#IMPORT "arco3d_rig"` itself, the same way this file
+' needs arco3d_scene declared for Vec3/Component/Mesh to restore correctly -- ArcoCompy can only
+' rebuild a real, working class instance for a class that's actually declared in the running
+' script (confirmed directly: unpacking an object tagged __class="Vec3" into a script that never
+' declared CLASS Vec3 fails outright on first field access, not gracefully). A script that only
+' ever touches Asset.Root never hits this; one that reads Asset.Rig without importing arco3d_rig
+' first will.
+FUNCTION ExportA3D(asset AS Asset, path AS String)
+    optionalCapabilities = []
+    rig = asset.Rig
+    IF rig <> NULL THEN
+        ignoredPush = Array.Add(optionalCapabilities, "rig.core")
+    END IF
+    poseCatalogs = asset.PoseCatalogs
+    IF LEN(poseCatalogs) > 0 THEN
+        ignoredPush = Array.Add(optionalCapabilities, "pose.catalog")
+    END IF
+
+    coordinateSystem = {Up: "Y", Handedness: "Right", Unit: "Meter"}
+    manifest = {
+        Format: A3DFormatName(),
+        ContainerVersion: A3DContainerVersion(),
+        SchemaVersion: A3DSchemaVersion(),
+        CoordinateSystem: coordinateSystem,
+        RequiredCapabilities: ["mesh.core"],
+        OptionalCapabilities: optionalCapabilities,
+        Asset: asset
+    }
+    packed = ArcoCompy.Pack(manifest)
+    File.WriteText(path, packed)
+END FUNCTION
+
+' Returns {Ok, Asset, Error} (RFC-0049 Section 19's "do not silently discard unsupported
+' semantics" -- callers get an explicit reason rather than a bare NULL). Ok is only TRUE when
+' `.Asset` is safe to use.
+FUNCTION ImportA3D(path AS String)
+    IF File.Exists(path) == FALSE THEN
+        RETURN {Ok: FALSE, Asset: NULL, Error: "file not found: " + path}
+    END IF
+
+    text = File.ReadText(path)
+    unpacked = ArcoCompy.TryUnpack(text)
+    IF unpacked.Ok == FALSE THEN
+        RETURN {Ok: FALSE, Asset: NULL, Error: "corrupt A3D container: " + unpacked.Error}
+    END IF
+
+    manifest = unpacked.Value
+    IF TYPEOF(manifest) <> "Object" THEN
+        RETURN {Ok: FALSE, Asset: NULL, Error: "malformed A3D manifest (not an object)"}
+    END IF
+
+    manifestFormat = Object.Get(manifest, "Format")
+    IF manifestFormat <> A3DFormatName() THEN
+        RETURN {Ok: FALSE, Asset: NULL, Error: "not an A3D file (Format=" + STRING(manifestFormat) + ")"}
+    END IF
+
+    containerVersion = Object.Get(manifest, "ContainerVersion")
+    IF containerVersion > A3DContainerVersion() THEN
+        RETURN {Ok: FALSE, Asset: NULL, Error: "unsupported A3D container version " + STRING(containerVersion)}
+    END IF
+
+    requiredCapabilities = Object.Get(manifest, "RequiredCapabilities")
+    supported = A3DSupportedCapabilities()
+    FOR capability IN requiredCapabilities
+        isSupported = supported CONTAINS capability
+        IF isSupported == FALSE THEN
+            RETURN {Ok: FALSE, Asset: NULL, Error: "unsupported required capability: " + capability}
+        END IF
+    NEXT
+
+    asset = Object.Get(manifest, "Asset")
+    RETURN {Ok: TRUE, Asset: asset, Error: ""}
+END FUNCTION

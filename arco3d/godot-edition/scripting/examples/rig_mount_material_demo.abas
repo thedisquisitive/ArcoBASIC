@@ -1,0 +1,37 @@
+#DESCRIPTION "Example Arco3D automation script -- rigs a character, poses one bone, mounts+attaches a second object with a rotation constraint, and adds a material layer. Real end-to-end coverage of every command added when Rig/Mount/Material got wired into ArcoBASIC automation."
+#IMPORT "arco3d_api"
+
+' The image path below is a real file the test suite itself writes before running this script
+' (see tests/test_headless.gd's own "ArcoBASIC automation: Rig/Mount/Material commands" section) --
+' point this at any real image on your own disk to run this script standalone.
+imagePath = "/tmp/arco3d_test_material_for_script.png"
+
+character = SpawnBlock()
+ignoredCall = AddHumanoidRig(character)
+' LeftShoulder is bone index 5 in the Humanoid preset -- rotate it 30 degrees around X.
+ignoredCall = SetPose(character, 5, 30, 0, 0)
+
+' The constraint belongs on whichever mount point actually plays PARENT in the Attach call below --
+' it's the PARENT's own mount that governs what rotational freedom an attached child gets (a real,
+' non-obvious point: a mount's own constraint describes "what can attach HERE", not "what this
+' object is allowed to do once attached elsewhere").
+characterMount = AddMountPoint(character, "Female")
+ignoredCall = SetMountType(characterMount, "Hand")
+ignoredCall = SetMountConstraint(characterMount, "Y", -45, 90)
+
+prop = SpawnCylinder()
+propMount = AddMountPoint(prop, "Male")
+ignoredCall = SetMountType(propMount, "Hand")
+
+' prop is the CHILD (it moves to attach onto the character's own hand mount, not the other way
+' around) -- Attach's own argument order is (childMountHandle, parentMountHandle).
+ignoredCall = Attach(propMount, characterMount)
+ignoredCall = SetJointAngle(prop, 20)
+
+layer = AddMaterialLayer(character, imagePath)
+ignoredCall = SetLayerMapping(layer, "Box")
+ignoredCall = SetLayerTransform(layer, 0, 0, 0, 1, 1, 1, 0, 0, 0)
+ignoredCall = SetLayerCrop(layer, 0, 0, 1, 1)
+ignoredCall = SetLayerBlend(layer, "Normal", 1)
+
+ignoredCall = ExportScene("arco3d_scripted_rig_mount_material.a3d")

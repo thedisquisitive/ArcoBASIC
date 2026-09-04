@@ -1,0 +1,273 @@
+#DESCRIPTION "Arco3D (Godot Edition) automation API -- ArcoBASIC scripts import this to drive scene construction, the same idea as Blender's own bpy module for Python"
+'
+' This is the "arcobasic woven into the program" layer the user explicitly asked for: "Kinda like
+' blenderpy, but arcobasic for automation, plugins, etc." Real, working scope for THIS first
+' increment: batch scene-construction automation, run once per script invocation -- spawn
+' primitives, transform them, add modifiers, export. NOT yet a live, persistent plugin system with
+' registered operators/panels/event handlers the way Blender's own addons work -- that needs a much
+' deeper embedding (ArcoBASIC compiled into Godot as a real GDExtension native module, calling back
+' into the running scene bidirectionally and continuously) that wasn't attempted this pass; see
+' godot-edition/README.md for the honest reasoning on why that was deliberately deferred rather
+' than half-built.
+'
+' How this actually works: a script #IMPORTs this module, calls these functions, and each call
+' PRINTs one line of a small, deliberately simple text protocol to stdout (not JSON -- ArcoBASIC
+' has no built-in JSON serializer, and a text protocol needs none). The Godot app runs the whole
+' script as a subprocess via its own already-working `arcosh` interpreter (no new toolchain, no
+' GDExtension, reusing infrastructure that already exists and is already tested), reads back
+' stdout, and replays each line as a real call against the actual live scene. Spawn commands are
+' implicitly numbered in the order they're issued (0, 1, 2, ...) -- HandleCounter below mirrors
+' that numbering exactly, so a script can reference "the block I just spawned" by the handle a
+' Spawn* function returns, with no need for the Godot side to ever send anything back.
+'
+' HandleCounter is a CLASS with a SHARED field, not a bare top-level variable -- a real, found-the-
+' hard-way distinction. A bare `counter = 0` at script scope, reassigned from inside a FUNCTION via
+' plain `counter = counter + 1`, does NOT persist across separate calls to that function in this
+' interpreter: a bare assignment inside a function always creates a new function-local shadow, even
+' when a same-named variable already exists at script scope (confirmed directly: such a counter
+' read back as 0 on every single call). That's a deliberate interpreter semantic, not a bug in the
+' end -- BASIC here has no explicit "declare a new local" syntax distinct from plain assignment, so
+' "local by default" is what keeps two DIFFERENT functions' own same-named local variables from
+' ever silently colliding with each other. A SHARED class field is the correct, explicit,
+' already-proven way to opt into real persistent state instead (the same pattern the paused
+' ArcoBASIC-native track used for its own stable object-id counter, ArcoId.NextId).
+' Three SEPARATE counters, same class, same reasoning as NextHandle's own comment above -- mount
+' points and material layers are numbered in issue order too, independently on both sides, the
+' exact same way spawned objects always have been. Added when Rig/Mount/Material got wired into
+' automation for real (the user's own direct "is this all being connected to the ArcoBASIC layer?"
+' question -- the honest answer at the time was no: only the original 8 SPAWN/POSITION/.../EXPORT
+' commands existed, and everything built since -- vertex editing, Apply Modifiers, all three rig
+' presets, Mount Points/Attachment/Constraints, and the whole Material Layers system -- was real,
+' UI-only, with zero ArcoBASIC surface at all).
+CLASS HandleCounter
+    SHARED NextHandle = 0
+    SHARED NextMountHandle = 0
+    SHARED NextLayerHandle = 0
+END CLASS
+
+FUNCTION SpawnBlock() AS Number
+    RETURN _Spawn("Block")
+END FUNCTION
+
+FUNCTION SpawnSphere() AS Number
+    RETURN _Spawn("Sphere")
+END FUNCTION
+
+FUNCTION SpawnCylinder() AS Number
+    RETURN _Spawn("Cylinder")
+END FUNCTION
+
+FUNCTION SpawnCone() AS Number
+    RETURN _Spawn("Cone")
+END FUNCTION
+
+FUNCTION SpawnWedge() AS Number
+    RETURN _Spawn("Wedge")
+END FUNCTION
+
+FUNCTION _Spawn(kind AS String) AS Number
+    PRINT "SPAWN " + kind
+    handle = HandleCounter.NextHandle
+    HandleCounter.NextHandle = HandleCounter.NextHandle + 1
+    RETURN handle
+END FUNCTION
+
+FUNCTION SetPosition(handle AS Number, x AS Number, y AS Number, z AS Number)
+    PRINT "POSITION " + STRING(handle) + " " + STRING(x) + " " + STRING(y) + " " + STRING(z)
+END FUNCTION
+
+FUNCTION SetRotation(handle AS Number, x AS Number, y AS Number, z AS Number)
+    PRINT "ROTATION " + STRING(handle) + " " + STRING(x) + " " + STRING(y) + " " + STRING(z)
+END FUNCTION
+
+FUNCTION SetScale(handle AS Number, x AS Number, y AS Number, z AS Number)
+    PRINT "SCALE " + STRING(handle) + " " + STRING(x) + " " + STRING(y) + " " + STRING(z)
+END FUNCTION
+
+' axis is "X", "Y", or "Z"
+FUNCTION AddMirror(handle AS Number, axis AS String)
+    PRINT "MIRROR " + STRING(handle) + " " + axis
+END FUNCTION
+
+FUNCTION AddArray(handle AS Number, count AS Number, offsetX AS Number, offsetY AS Number, offsetZ AS Number)
+    PRINT "ARRAY " + STRING(handle) + " " + STRING(count) + " " + STRING(offsetX) + " " + STRING(offsetY) + " " + STRING(offsetZ)
+END FUNCTION
+
+' operation is "Subtract", "Union", or "Intersect"; targetHandle is another Spawn*'s own returned handle
+FUNCTION AddBoolean(handle AS Number, operation AS String, targetHandle AS Number)
+    PRINT "BOOLEAN " + STRING(handle) + " " + operation + " " + STRING(targetHandle)
+END FUNCTION
+
+FUNCTION ExportScene(path AS String)
+    PRINT "EXPORT " + path
+END FUNCTION
+
+' "I plan on making a bunch of kit parts so I can rapidly make new creations without needing to
+' model everything every time" -- the user's own explicit ask. Merges path's own objects into the
+' CURRENT scene (unlike opening a file by hand, which replaces it) -- the Godot side rebases every
+' id the imported file carries so it can never collide with anything already built earlier in this
+' same script, then registers a handle for the file's own FIRST top-level object (see the Godot-side
+' IMPORT dispatch case's own comment on why only the first: this whole handle-numbering scheme is a
+' pure convention mirrored independently on both sides, with no real channel for Godot to report
+' back exactly how many objects a given file turned out to contain). Returns the SAME handle space
+' as Spawn* -- both share HandleCounter.NextHandle -- since Godot registers an imported kit part
+' into the identical dictionary a spawned primitive would be.
+FUNCTION ImportKitPart(path AS String) AS Number
+    PRINT "IMPORT " + path
+    handle = HandleCounter.NextHandle
+    HandleCounter.NextHandle = HandleCounter.NextHandle + 1
+    RETURN handle
+END FUNCTION
+
+' --- Rigging ---------------------------------------------------------------------------------
+
+FUNCTION AddHumanoidRig(handle AS Number)
+    PRINT "ADD_HUMANOID_RIG " + STRING(handle)
+END FUNCTION
+
+FUNCTION AddQuadrupedRig(handle AS Number)
+    PRINT "ADD_QUADRUPED_RIG " + STRING(handle)
+END FUNCTION
+
+' A pivot rig is the "vehicle rigid-pivot" case (wheels, doors, hatches) -- a single joint, bone
+' index 0, is the only one that ever exists on it.
+FUNCTION AddPivotRig(handle AS Number)
+    PRINT "ADD_PIVOT_RIG " + STRING(handle)
+END FUNCTION
+
+' boneIndex is the joint's own position in whichever rig preset was added (0-based; see
+' HUMANOID_RIG_PRESET/QUADRUPED_RIG_PRESET in Main.gd for the real joint order of each -- e.g. the
+' Humanoid preset's own LeftShoulder is index 5). Sets the ABSOLUTE pose rotation for that one
+' joint, same as dragging its own Pose Mode handle or typing into the Rotation fields would.
+FUNCTION SetPose(handle AS Number, boneIndex AS Number, rx AS Number, ry AS Number, rz AS Number)
+    PRINT "SET_POSE " + STRING(handle) + " " + STRING(boneIndex) + " " + STRING(rx) + " " + STRING(ry) + " " + STRING(rz)
+END FUNCTION
+
+' --- Mount points and attachment --------------------------------------------------------------
+
+' gender is "Male" or "Female". Returns a mount-point handle for the Set*/Attach functions below --
+' if the object handle currently has a rig AND a joint is "selected" in Rig/Pose Mode in the live
+' UI, this attaches to that bone the same way the UI's own "Add Mount Point" button would; a purely
+' scripted session (no UI interaction at all) always gets an object-level mount point instead.
+FUNCTION AddMountPoint(handle AS Number, gender AS String) AS Number
+    PRINT "ADD_MOUNT_POINT " + STRING(handle) + " " + gender
+    mountHandle = HandleCounter.NextMountHandle
+    HandleCounter.NextMountHandle = HandleCounter.NextMountHandle + 1
+    RETURN mountHandle
+END FUNCTION
+
+FUNCTION SetMountType(mountHandle AS Number, mountType AS String)
+    PRINT "SET_MOUNT_TYPE " + STRING(mountHandle) + " " + mountType
+END FUNCTION
+
+FUNCTION SetMountPosition(mountHandle AS Number, x AS Number, y AS Number, z AS Number)
+    PRINT "SET_MOUNT_POSITION " + STRING(mountHandle) + " " + STRING(x) + " " + STRING(y) + " " + STRING(z)
+END FUNCTION
+
+' axis is "None" (fully rigid, the default), "X", "Y", or "Z" -- see the README's own "Mount points
+' and attachment" section for the real turret/barrel-traverse use case this exists for.
+FUNCTION SetMountConstraint(mountHandle AS Number, axis AS String, minDegrees AS Number, maxDegrees AS Number)
+    PRINT "SET_MOUNT_CONSTRAINT " + STRING(mountHandle) + " " + axis + " " + STRING(minDegrees) + " " + STRING(maxDegrees)
+END FUNCTION
+
+' Both arguments are mount-point handles (from AddMountPoint), not object handles -- attaches the
+' CHILD mount's own object onto the PARENT mount's current world transform. Refused (silently, from
+' the script's own point of view -- check the app's status bar) on a gender/type mismatch or a
+' cycle, the same real validation the UI's own "Attach To..." picker already enforces.
+FUNCTION Attach(childMountHandle AS Number, parentMountHandle AS Number)
+    PRINT "ATTACH " + STRING(childMountHandle) + " " + STRING(parentMountHandle)
+END FUNCTION
+
+' handle here is the OBJECT handle (the attached child), not a mount handle -- detaches whatever
+' it's currently attached to, leaving it exactly where it was.
+FUNCTION Detach(handle AS Number)
+    PRINT "DETACH " + STRING(handle)
+END FUNCTION
+
+' handle is the attached CHILD's own object handle. Only has a visible effect if that object's
+' current attachment point has a real constraint set (SetMountConstraint on the PARENT's mount) --
+' clamped to that constraint's own range regardless of what's requested here.
+FUNCTION SetJointAngle(handle AS Number, degrees AS Number)
+    PRINT "SET_JOINT_ANGLE " + STRING(handle) + " " + STRING(degrees)
+END FUNCTION
+
+' --- Join and Bridge: "I chop the hand off [the arm]... and replace it with my new hand. The mesh
+' needs to correctly make that connection" -- the user's own explicit ask for combining two
+' separately-modeled objects into one seamless mesh. ----------------------------------------------
+
+' Merges sourceHandle's CURRENT geometry into targetHandle and deletes sourceHandle outright --
+' exactly one object survives (targetHandle). sourceHandle's own handle number is NOT reusable
+' afterward (same caveat DETACH/DeleteSelected already have for their own targets).
+FUNCTION JoinInto(sourceHandle AS Number, targetHandle AS Number)
+    PRINT "JOIN_INTO " + STRING(sourceHandle) + " " + STRING(targetHandle)
+END FUNCTION
+
+' vertexA/vertexB are the two real vertex indices (into that object's own base_mesh_data) forming
+' one boundary edge on the loop you want to bridge FROM -- must be a genuine open/hole edge, not an
+' interior one. Real, deliberate scripting-only difference from the UI's own "Mark Bridge Start"
+' button: a script addresses an edge by its own known vertex indices directly, since there's no
+' live UI selection state to read from during a batch run.
+FUNCTION MarkBridgeStart(handle AS Number, vertexA AS Number, vertexB AS Number)
+    PRINT "MARK_BRIDGE_START " + STRING(handle) + " " + STRING(vertexA) + " " + STRING(vertexB)
+END FUNCTION
+
+' Bridges the loop MarkBridgeStart marked to the boundary loop starting at (vertexA, vertexB) on
+' handle -- joining the two objects together first if they're different ones (matching the UI's own
+' "Bridge To..." button exactly). Refuses (check the app's own status bar) if the two loops don't
+' have the same number of vertices -- equalize them first (CutEdge/DeleteVertex aren't yet exposed
+' to ArcoBASIC themselves; do this step in the UI, then resume scripting from MarkBridgeStart).
+FUNCTION BridgeTo(handle AS Number, vertexA AS Number, vertexB AS Number)
+    PRINT "BRIDGE_TO " + STRING(handle) + " " + STRING(vertexA) + " " + STRING(vertexB)
+END FUNCTION
+
+' --- Undo/Redo: a real, previously entirely-missing safety net. Real, honest caveat for scripted
+' use specifically: this whole protocol replays PRINTed commands as a batch AFTER the script has
+' already finished running (see this file's own header comment) -- Undo/Redo here act on the LIVE
+' APP'S OWN undo history at the moment each replayed line runs, not on a per-script-run history of
+' just this script's own commands, so calling Undo right after, say, a JoinInto in the SAME script
+' undoes that join exactly as expected, but calling it with nothing else in between undoes whatever
+' the human last did in the UI before running this script at all.
+FUNCTION Undo()
+    PRINT "UNDO"
+END FUNCTION
+
+FUNCTION Redo()
+    PRINT "REDO"
+END FUNCTION
+
+' --- Material layers ---------------------------------------------------------------------------
+
+' imagePath is a real file on disk (PNG/JPG/BMP/WebP) -- same "resolved relative to wherever the
+' script itself runs" convention ExportScene's own path uses. Returns a layer handle for the Set*
+' functions below, or a handle to a layer that silently failed to load (a bad path) -- check the
+' app's own status bar, same as every other real failure in this protocol.
+FUNCTION AddMaterialLayer(handle AS Number, imagePath AS String) AS Number
+    PRINT "ADD_MATERIAL_LAYER " + STRING(handle) + " " + imagePath
+    layerHandle = HandleCounter.NextLayerHandle
+    HandleCounter.NextLayerHandle = HandleCounter.NextLayerHandle + 1
+    RETURN layerHandle
+END FUNCTION
+
+' mapping is "Triplanar" (blended, seamless), "Planar" (one fixed projection), "Box" (hard-picked
+' per-face axis), or "Decal" (only paints within its own Offset/Scale-defined box).
+FUNCTION SetLayerMapping(layerHandle AS Number, mapping AS String)
+    PRINT "SET_LAYER_MAPPING " + STRING(layerHandle) + " " + mapping
+END FUNCTION
+
+' The real "slide it around on the model" control -- one shared mechanism for every Mapping mode
+' (see the README's own "Material layers" section for why). offset/scale/rot are all real, live,
+' object-local values, same units the model itself is built in.
+FUNCTION SetLayerTransform(layerHandle AS Number, offsetX AS Number, offsetY AS Number, offsetZ AS Number, scaleX AS Number, scaleY AS Number, scaleZ AS Number, rotX AS Number, rotY AS Number, rotZ AS Number)
+    PRINT "SET_LAYER_TRANSFORM " + STRING(layerHandle) + " " + STRING(offsetX) + " " + STRING(offsetY) + " " + STRING(offsetZ) + " " + STRING(scaleX) + " " + STRING(scaleY) + " " + STRING(scaleZ) + " " + STRING(rotX) + " " + STRING(rotY) + " " + STRING(rotZ)
+END FUNCTION
+
+' x/y/w/h are 0..1 fractions of the SOURCE IMAGE -- "use parts of a texture... instead of
+' unwrapping it": treats imagePath as an atlas/sprite-sheet and only projects this sub-rectangle.
+FUNCTION SetLayerCrop(layerHandle AS Number, x AS Number, y AS Number, w AS Number, h AS Number)
+    PRINT "SET_LAYER_CROP " + STRING(layerHandle) + " " + STRING(x) + " " + STRING(y) + " " + STRING(w) + " " + STRING(h)
+END FUNCTION
+
+' blendMode is "Normal", "Multiply", "Add", or "Screen"; opacity is 0..1.
+FUNCTION SetLayerBlend(layerHandle AS Number, blendMode AS String, opacity AS Number)
+    PRINT "SET_LAYER_BLEND " + STRING(layerHandle) + " " + blendMode + " " + STRING(opacity)
+END FUNCTION

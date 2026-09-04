@@ -159,6 +159,11 @@ public:
     void set_indexed(const std::string& name, const std::vector<int>& indexes, Value value);
     Value get_global(const std::string& name) const;
     bool has_global(const std::string& name) const;
+    // Reads one property off an already-evaluated value, applying the same access-control and
+    // REF-transparency rules get_global() applies per dotted segment. Used by generic postfix
+    // member access on an arbitrary expression (`expr.Property`), where the base is not a plain
+    // variable name get_global() could resolve on its own.
+    Value get_member(const Value& target, const std::string& property) const;
     Value make_reference_to(std::string name, std::string type_name = "") const;
     Value make_reference(Value value, std::string type_name = "") const;
     Value reference_value(const Value& reference) const;

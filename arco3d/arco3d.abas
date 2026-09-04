@@ -1,0 +1,231 @@
+#DESCRIPTION "Arco3D -- minimal interactive block-building tool (RFC-0049 first BUILD-mode increment)"
+'
+' Run with `arco3d/build/arcosh arco3d.abas` from inside arco3d/. Needs a real Wayland or X11
+' desktop session (GUI.Available() guards this below, same as every other GUI example in this
+' repo).
+'
+' This is a genuinely first, minimal increment of RFC-0049's BUILD workspace -- not the full
+' authoring tool the RFC describes (no gizmos, no undo, no non-destructive Construction Stack
+' wiring yet, keyboard-only per the laptop-first baseline but without touchpad gestures yet
+' either). What it DOES prove end-to-end, for real: spawning real primitives from
+' arco3d_scene.abas, viewing them through the new real depth-tested GPU viewport
+' (GUI.Clear3D/GUI.Triangle3D -- see src/gui/glfw_backend.cpp), selecting and moving one, and
+' exporting the whole scene as a real, working, round-tripping .a3d file via arco3d_io.abas.
+'
+' An interactive session has no natural instruction-count ceiling the way a short batch script
+' does -- see docs/instruction-limits.md. This is real, expected, long-running work, not a runaway
+' script, so it asks for a large budget rather than crashing after however many frames the
+' 100,000-instruction default would allow (confirmed directly: without this, a session hits
+' "instruction limit exceeded" well before a minute of normal use). The literal "unlimited"
+' spelling docs/instruction-limits.md documents is only accepted on the operator's own
+' --instruction-limit CLI override, not in this source-level directive, which the same doc says
+' must be a decimal integer (confirmed directly: "unlimited" here is a hard parse error, not a
+' silently-ignored no-op) -- the max is 9007199254740991, comfortably enough for any real session.
+#INSTRUCTION_LIMIT 9000000000000
+
+#IMPORT "gui"
+#IMPORT "arco3d_io"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "Arco3D needs a Wayland or X11 desktop session."
+    ExitTheProgram(0)
+END IF
+
+GUI.Application("arco3d", "Arco3D")
+window = GUI.Window("Arco3D", 1100, 750)
+
+' ---- Scene state ---------------------------------------------------------------------------
+'
+' A flat list of top-level Components for this first increment -- real component HIERARCHY
+' (RFC-0049 Section 7.3's kitbash assemblies) is future work; ExportA3D below just wraps this flat
+' list under one synthetic root Component so the exported file still matches the real A3D
+' Component/Children schema (arco3d_io.abas doesn't need to know or care that this app's own scene
+' representation happens to be flat).
+
+sceneObjects = []
+selectedIndex = -1
+
+' ---- Camera state (keyboard-only orbit, per RFC-0049 Section 9.2's laptop baseline) ----------
+
+orbitYawDegrees = 35
+orbitPitchDegrees = 22
+orbitDistance = 8
+ORBIT_STEP = 2.5
+ZOOM_STEP = 0.5
+MOVE_STEP = 0.25
+
+lightDirection = Vec3(0.4, 0.6, 0.7)
+normalizedLight = lightDirection.Normalized()
+
+FUNCTION CameraEye(yawDegrees AS Number, pitchDegrees AS Number, distance AS Number) AS Vec3
+    yawRadians = yawDegrees * DEG2RAD
+    pitchRadians = pitchDegrees * DEG2RAD
+    x = distance * COS(pitchRadians) * SIN(yawRadians)
+    y = distance * SIN(pitchRadians)
+    z = distance * COS(pitchRadians) * COS(yawRadians)
+    RETURN Vec3(x, y, z)
+END FUNCTION
+
+FUNCTION DrawComponent(window, component, isSelected AS Boolean)
+    transform = component.Transform
+    mesh = component.LocalMesh
+    IF mesh == NULL THEN
+        RETURN
+    END IF
+    ' Transform every vertex exactly ONCE per frame, not once per face-vertex-occurrence.
+    ' Interior mesh vertices are shared by several faces (a UV sphere's are shared by ~6 on
+    ' average), so the naive per-face version below was calling the interpreted
+    ' Transform.ApplyToPoint() 3x per triangle regardless of sharing -- for CreateSphere(0.6, 16, 8)
+    ' specifically, that's 224 faces * 3 = 672 calls to transform only 114 distinct vertices, ~5.9x
+    ' more interpreted method-call overhead than the geometry actually needs. Found via a real,
+    ' user-reported "detected as a crash" slowdown (window-manager unresponsiveness, ~5fps with
+    ' just a block+sphere on screen) that survived an unrelated 26x compiler-optimization fix,
+    ' which ruled out build flags and pointed straight at this function's own algorithmic cost.
+    vertices = mesh.Vertices
+    worldVertices = []
+    FOR localVertex IN vertices
+        ignoredPush = Array.Add(worldVertices, transform.ApplyToPoint(localVertex))
+    NEXT
+    FOR face IN mesh.Faces
+        indices = face.Indices
+        worldV0 = worldVertices[indices[0]]
+        worldV1 = worldVertices[indices[1]]
+        worldV2 = worldVertices[indices[2]]
+
+        faceNormal = face.Normal
+        worldNormal = transform.ApplyToDirection(faceNormal)
+        litAmount = worldNormal.Dot(normalizedLight)
+        shade = CLAMP(litAmount, 0.2, 1.0)
+
+        red = shade * 0.55
+        green = shade * 0.75
+        blue = shade * 0.95
+        IF isSelected THEN
+            red = CLAMP(shade * 0.95, 0.0, 1.0)
+            green = CLAMP(shade * 0.85, 0.0, 1.0)
+            blue = shade * 0.25
+        END IF
+
+        GUI.Triangle3D(window, worldV0.X, worldV0.Y, worldV0.Z, worldV1.X, worldV1.Y, worldV1.Z, worldV2.X, worldV2.Y, worldV2.Z, red, green, blue, 1.0)
+    NEXT
+END FUNCTION
+
+FUNCTION SpawnAt(newComponent, index AS Number)
+    newComponent.SetPosition(index * 2, 0, 0)
+    RETURN newComponent
+END FUNCTION
+
+FUNCTION ExportScene(sceneObjects AS Array, path AS String) AS Number
+    exportRoot = Component("Scene")
+    exportRoot.Children = sceneObjects
+    asset = Asset("ArcoBuilderScene")
+    asset.Root = exportRoot
+    ExportA3D(asset, path)
+    RETURN LEN(sceneObjects)
+END FUNCTION
+
+exportPath = "arco3d_builder_output.a3d"
+exportMessage = ""
+
+' Live on-screen frame timer -- temporary diagnostic, not a permanent feature. Time.Timestamp()
+' only has whole-second resolution, so it can't distinguish a healthy 16ms frame from a sluggish
+' 200ms one, but it CAN prove or rule out a multi-second-per-frame stall (the kind a window
+' manager's "not responding" detector would actually trip on), which is exactly the open question
+' right now. Shown in the window title (see the arco3d_scene.abas-adjacent note elsewhere in this
+' repo: PRINT doesn't flush from inside a running GUI loop, GUI.SetTitle does) plus worst-frame and
+' rolling-average text so a single run captures both a spike and the steady-state cost.
+frameTimerLastTimestamp = Time.Timestamp()
+frameTimerCount = 0
+frameTimerWorstSeconds = 0
+frameTimerTotalSeconds = 0
+
+running = TRUE
+WHILE running
+    eye = CameraEye(orbitYawDegrees, orbitPitchDegrees, orbitDistance)
+    GUI.Clear3D(window, eye.X, eye.Y, eye.Z, 0, 0, 0, 0, 1, 0, 55, 0.1, 200, 0.08, 0.09, 0.12)
+
+    objectIndex = 0
+    FOR sceneObject IN sceneObjects
+        isSelected = objectIndex == selectedIndex
+        DrawComponent(window, sceneObject, isSelected)
+        objectIndex = objectIndex + 1
+    NEXT
+
+    GUI.Text(window, "Arco3D -- B block  N sphere  Tab select  Arrows/PageUp/PageDown move  Delete remove", 16, 16, 15, 0.85, 0.9, 1.0)
+    GUI.Text(window, "A/D orbit  W/S pitch  Q/E zoom  X export  Escape quit", 16, 38, 15, 0.85, 0.9, 1.0)
+    objectCountText = "Objects: " + STRING(LEN(sceneObjects)) + "   Selected: " + STRING(selectedIndex)
+    GUI.Text(window, objectCountText, 16, 64, 15, 0.6, 0.85, 0.6)
+    IF exportMessage <> "" THEN
+        GUI.Text(window, exportMessage, 16, 90, 15, 0.95, 0.85, 0.4)
+    END IF
+
+    GUI.Present(window)
+
+    frameTimerNow = Time.Timestamp()
+    frameTimerDeltaSeconds = frameTimerNow - frameTimerLastTimestamp
+    frameTimerLastTimestamp = frameTimerNow
+    frameTimerCount = frameTimerCount + 1
+    frameTimerTotalSeconds = frameTimerTotalSeconds + frameTimerDeltaSeconds
+    IF frameTimerDeltaSeconds > frameTimerWorstSeconds THEN frameTimerWorstSeconds = frameTimerDeltaSeconds
+    frameTimerAverageSeconds = frameTimerTotalSeconds / frameTimerCount
+    GUI.SetTitle(window, "Arco3D -- objs " + STRING(LEN(sceneObjects)) + "  last frame " + STRING(frameTimerDeltaSeconds) + "s  worst " + STRING(frameTimerWorstSeconds) + "s  avg " + STRING(frameTimerAverageSeconds) + "s  frame# " + STRING(frameTimerCount))
+
+    event = GUI.WaitEvent(0.02)
+    IF event.Type == "close" THEN running = FALSE
+    IF GUI.ShouldClose(window) THEN running = FALSE
+
+    IF event.Type == "key" THEN
+        isPress = event.Action == "press"
+        isHeld = event.Action == "press" OR event.Action == "repeat"
+
+        IF event.Key == "escape" AND isPress THEN running = FALSE
+
+        IF event.Key == "a" AND isHeld THEN orbitYawDegrees = orbitYawDegrees - ORBIT_STEP
+        IF event.Key == "d" AND isHeld THEN orbitYawDegrees = orbitYawDegrees + ORBIT_STEP
+        IF event.Key == "w" AND isHeld THEN orbitPitchDegrees = CLAMP(orbitPitchDegrees + ORBIT_STEP, -85, 85)
+        IF event.Key == "s" AND isHeld THEN orbitPitchDegrees = CLAMP(orbitPitchDegrees - ORBIT_STEP, -85, 85)
+        IF event.Key == "q" AND isHeld THEN orbitDistance = CLAMP(orbitDistance - ZOOM_STEP, 1, 60)
+        IF event.Key == "e" AND isHeld THEN orbitDistance = CLAMP(orbitDistance + ZOOM_STEP, 1, 60)
+
+        IF event.Key == "b" AND isPress THEN
+            newBlock = SpawnAt(CreateBlock(1, 1, 1), LEN(sceneObjects))
+            ignoredPush = Array.Add(sceneObjects, newBlock)
+            selectedIndex = LEN(sceneObjects) - 1
+        END IF
+        IF event.Key == "n" AND isPress THEN
+            ' 10 segments/6 rings (100 faces) instead of the default 16/8 (224 faces) -- plenty
+            ' smooth at the on-screen scale this tool spawns objects at, and roughly halves the
+            ' interpreted per-frame cost of every sphere in the scene (see DrawComponent's own
+            ' comment above for why face count matters this much here).
+            newSphere = SpawnAt(CreateSphere(0.6, 10, 6), LEN(sceneObjects))
+            ignoredPush = Array.Add(sceneObjects, newSphere)
+            selectedIndex = LEN(sceneObjects) - 1
+        END IF
+
+        objectCount = LEN(sceneObjects)
+        IF event.Key == "tab" AND isPress AND objectCount > 0 THEN
+            selectedIndex = (selectedIndex + 1) % objectCount
+        END IF
+
+        IF selectedIndex >= 0 AND selectedIndex < objectCount THEN
+            selected = sceneObjects[selectedIndex]
+            IF event.Key == "left" AND isHeld THEN selected.Translate(0 - MOVE_STEP, 0, 0)
+            IF event.Key == "right" AND isHeld THEN selected.Translate(MOVE_STEP, 0, 0)
+            IF event.Key == "up" AND isHeld THEN selected.Translate(0, 0, 0 - MOVE_STEP)
+            IF event.Key == "down" AND isHeld THEN selected.Translate(0, 0, MOVE_STEP)
+            IF event.Key == "pageup" AND isHeld THEN selected.Translate(0, MOVE_STEP, 0)
+            IF event.Key == "pagedown" AND isHeld THEN selected.Translate(0, 0 - MOVE_STEP, 0)
+            IF (event.Key == "delete" OR event.Key == "backspace") AND isPress THEN
+                ignoredRemoved = Array.RemoveAt(sceneObjects, selectedIndex)
+                selectedIndex = LEN(sceneObjects) - 1
+            END IF
+        END IF
+
+        IF event.Key == "x" AND isPress THEN
+            exportedCount = ExportScene(sceneObjects, exportPath)
+            exportMessage = "Exported " + STRING(exportedCount) + " object(s) to " + exportPath
+        END IF
+    END IF
+WEND
+
+GUI.Close(window)

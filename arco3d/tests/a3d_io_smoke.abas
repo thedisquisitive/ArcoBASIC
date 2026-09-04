@@ -1,0 +1,153 @@
+#DESCRIPTION "Arco3D A3D save/load round-trip smoke test (RFC-0050)"
+'
+' Run via arco3d/scripts/test.sh, or `cd arco3d && ./build/arcosh tests/a3d_io_smoke.abas`.
+' Writes scratch .a3d files under build/ (gitignored) -- if this capsule is run directly from
+' somewhere other than arco3d/, the scratch files land in that directory instead; harmless, this
+' is a test capsule, not a production import/export tool.
+'
+' The default hosted instruction budget (100,000 -- see docs/instruction-limits.md) isn't enough
+' for ArcoCompy to pack/unpack a real mesh's worth of nested objects (confirmed directly: the
+' hierarchy round-trip below hit "instruction limit exceeded" at the default). This is ordinary,
+' legitimate work, not a runaway script, so this raises its own budget explicitly rather than
+' trimming the test down to fit -- exactly what this directive exists for.
+#INSTRUCTION_LIMIT 50000000
+
+#IMPORT "arco3d_io"
+
+failures = []
+
+FUNCTION CheckTrue(condition AS Boolean, label AS String)
+    IF condition == FALSE THEN
+        ignoredPush = Array.Add(failures, label)
+        PRINT "FAIL: " + label
+    END IF
+END FUNCTION
+
+FUNCTION CheckNumberEquals(actual AS Number, expected AS Number, label AS String)
+    difference = ABS(actual - expected)
+    IF difference > 0.0005 THEN
+        detail = label + " (expected " + STRING(expected) + ", got " + STRING(actual) + ")"
+        ignoredPush = Array.Add(failures, detail)
+        PRINT "FAIL: " + detail
+    END IF
+END FUNCTION
+
+FUNCTION CheckVec3Equals(actual AS Vec3, expected AS Vec3, label AS String)
+    ok = actual.EqualsApprox(expected, 0.0005)
+    CheckTrue(ok, label)
+END FUNCTION
+
+' ---- Round-trip: single primitive, geometry + transform --------------------------------------
+
+singleAsset = Asset("SingleBlock")
+singleRoot = CreateBlock(2, 1, 3)
+singleRoot.SetPosition(5, 0, -2)
+singleRoot.SetRotationEuler(0, 90, 0)
+singleRoot.SetScale(2, 2, 2)
+singleAsset.Root = singleRoot
+
+singlePath = "build/a3d_io_smoke_single.a3d"
+ExportA3D(singleAsset, singlePath)
+
+singleResult = ImportA3D(singlePath)
+CheckTrue(singleResult.Ok, "single-asset import reports Ok")
+
+restoredSingle = singleResult.Asset
+CheckTrue(CLASSOF(restoredSingle) == "Asset", "restored value is a real Asset instance")
+CheckTrue(restoredSingle.Name == "SingleBlock", "Asset.Name round-trips")
+
+restoredSingleRoot = restoredSingle.Root
+CheckTrue(CLASSOF(restoredSingleRoot) == "Component", "restored Root is a real Component instance")
+
+restoredSingleTransform = restoredSingleRoot.Transform
+CheckVec3Equals(restoredSingleTransform.Position, Vec3(5, 0, -2), "Transform.Position round-trips")
+CheckVec3Equals(restoredSingleTransform.RotationEuler, Vec3(0, 90, 0), "Transform.RotationEuler round-trips")
+CheckVec3Equals(restoredSingleTransform.Scale, Vec3(2, 2, 2), "Transform.Scale round-trips")
+
+restoredSingleMesh = restoredSingleRoot.LocalMesh
+CheckTrue(CLASSOF(restoredSingleMesh) == "Mesh", "restored LocalMesh is a real Mesh instance")
+CheckNumberEquals(restoredSingleMesh.VertexCount(), 8, "CreateBlock vertex count round-trips")
+CheckNumberEquals(restoredSingleMesh.FaceCount(), 12, "CreateBlock face count round-trips")
+
+' A restored mesh's vertices must be real, working Vec3 instances, not inert data -- confirms
+' ArcoCompy's class-instance round-trip covers methods, not just fields.
+restoredFirstVertex = restoredSingleMesh.Vertices[0]
+CheckTrue(CLASSOF(restoredFirstVertex) == "Vec3", "restored mesh vertex is a real Vec3 instance")
+shifted = restoredFirstVertex.Plus(Vec3(1, 1, 1))
+CheckNumberEquals(shifted.X, restoredFirstVertex.X + 1, "restored Vec3 instance methods still work")
+
+' Export must be a snapshot: mutating the original AFTER export must not affect what was written.
+singleRoot.SetPosition(999, 999, 999)
+singleResultAgain = ImportA3D(singlePath)
+restoredAgainRoot = singleResultAgain.Asset.Root
+restoredAgainTransform = restoredAgainRoot.Transform
+CheckVec3Equals(restoredAgainTransform.Position, Vec3(5, 0, -2), "ExportA3D captures a snapshot, not a live reference")
+
+' ---- Round-trip: component hierarchy -----------------------------------------------------------
+
+hierarchyAsset = Asset("Hierarchy")
+hierarchyRoot = Component("Root")
+child = CreateSphere(0.5, 8, 4)
+child.SetPosition(0, 3, 0)
+ignoredPush = Array.Add(hierarchyRoot.Children, child)
+hierarchyAsset.Root = hierarchyRoot
+
+hierarchyPath = "build/a3d_io_smoke_hierarchy.a3d"
+ExportA3D(hierarchyAsset, hierarchyPath)
+
+hierarchyResult = ImportA3D(hierarchyPath)
+CheckTrue(hierarchyResult.Ok, "hierarchy import reports Ok")
+
+restoredHierarchyRoot = hierarchyResult.Asset.Root
+CheckTrue(restoredHierarchyRoot.Name == "Root", "hierarchy root name round-trips")
+restoredChildren = restoredHierarchyRoot.Children
+CheckNumberEquals(LEN(restoredChildren), 1, "component hierarchy (Children) round-trips")
+
+restoredChild = restoredChildren[0]
+CheckTrue(restoredChild.Name == "Sphere", "child component name round-trips")
+restoredChildTransform = restoredChild.Transform
+CheckVec3Equals(restoredChildTransform.Position, Vec3(0, 3, 0), "child component transform round-trips")
+restoredChildMesh = restoredChild.LocalMesh
+CheckNumberEquals(restoredChildMesh.VertexCount(), 26, "child component mesh round-trips")
+
+' ---- Rejection: missing file, corrupt container, wrong format, unsupported capability ----------
+
+missingResult = ImportA3D("build/a3d_io_smoke_does_not_exist.a3d")
+CheckTrue(missingResult.Ok == FALSE, "importing a missing file fails cleanly")
+CheckTrue(missingResult.Asset == NULL, "a failed import never returns a partial Asset")
+
+garbagePath = "build/a3d_io_smoke_garbage.a3d"
+File.WriteText(garbagePath, "this is not an A3D file at all")
+garbageResult = ImportA3D(garbagePath)
+CheckTrue(garbageResult.Ok == FALSE, "importing a non-ACPY1 file fails cleanly, not a crash")
+
+wrongFormatPath = "build/a3d_io_smoke_wrong_format.a3d"
+wrongFormatManifest = {Format: "NOT_A3D", ContainerVersion: 1, RequiredCapabilities: []}
+File.WriteText(wrongFormatPath, ArcoCompy.Pack(wrongFormatManifest))
+wrongFormatResult = ImportA3D(wrongFormatPath)
+CheckTrue(wrongFormatResult.Ok == FALSE, "importing a file with the wrong Format tag fails cleanly")
+
+unsupportedCapabilityPath = "build/a3d_io_smoke_unsupported_capability.a3d"
+unsupportedManifest = {Format: "A3D", ContainerVersion: 1, RequiredCapabilities: ["mesh.core", "rig.core"]}
+File.WriteText(unsupportedCapabilityPath, ArcoCompy.Pack(unsupportedManifest))
+unsupportedResult = ImportA3D(unsupportedCapabilityPath)
+CheckTrue(unsupportedResult.Ok == FALSE, "importing a file requiring an unsupported capability (rig.core) fails cleanly (RFC-0050 Section 23)")
+
+' A future container version must fail cleanly too, per RFC-0050 Section 23 -- readers must not
+' guess at a schema newer than the one they understand.
+futureVersionPath = "build/a3d_io_smoke_future_version.a3d"
+futureVersionManifest = {Format: "A3D", ContainerVersion: 999, RequiredCapabilities: []}
+File.WriteText(futureVersionPath, ArcoCompy.Pack(futureVersionManifest))
+futureVersionResult = ImportA3D(futureVersionPath)
+CheckTrue(futureVersionResult.Ok == FALSE, "importing a file from a newer, unsupported container version fails cleanly")
+
+' ---- Result -------------------------------------------------------------------------------------
+
+failureCount = LEN(failures)
+IF failureCount > 0 THEN
+    PRINT STRING(failureCount) + " CHECK(S) FAILED"
+    ExitTheProgram(1)
+ELSE
+    PRINT "ALL CHECKS PASSED"
+    ExitTheProgram(0)
+END IF

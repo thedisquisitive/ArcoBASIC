@@ -1,0 +1,509 @@
+' Arco3D rig and pose representation (RFC-0049 Section 19, implementation steps 6-7).
+'
+' Depends on arco3d_scene.abas (Vec3) -- imported below, transitively available to any importer of
+' this file (see arco3d_construction.abas's own header for why that's safe in this toolchain).
+'
+' Scope for this increment:
+'   - A real Quaternion (not Euler) for bone rotation, since pose interpolation needs slerp to
+'     avoid gimbal-lock/shortest-path artifacts (RFC-0050 Section 13 says so explicitly). Component
+'     (arco3d_scene.abas) keeps Euler for its own Transform -- that's a separate, simpler concern
+'     (static object placement, matching examples/gui_cube.abas's own convention) and staying
+'     Euler there is a deliberate, unrelated choice, not an oversight.
+'   - Bone/Rig: named bones, stable IDs, parent-index hierarchy, rest/bind transforms, and world-
+'     transform composition up the parent chain (RFC-0049 Section 7.4's MUST list, minus skinning).
+'   - RigPoseState: a live/current per-bone local-transform array a future interactive posing UI
+'     would mutate; starts at the rig's bind pose. CapturePose()/ApplyPose() are RFC-0049 Section
+'     7.5's "capture the current rig state as a named pose" / "apply saved poses".
+'   - Pose: a SPARSE per-bone transform list (RFC-0050 Section 13's "a pose MAY contain only a
+'     subset of bones" and "distinguish unspecified bone... from an authored transform" -- modeled
+'     here as plain absence from the list, needing no extra tri-state flag).
+'   - PoseCatalog: named poses grouped under one rig-compatibility Id (RFC-0049 Section 7.5/7.6,
+'     RFC-0050 Section 14).
+'   - InterpolatePoses(): RFC-0049 Section 7.5's "interpolate between two compatible poses",
+'     restricted to bones present in BOTH poses (documented below on the function itself).
+' Deliberately NOT in this increment (separate, larger features):
+'   - Skin weights / actual mesh deformation from a posed rig (RFC-0049 Section 7.4's "skin
+'     weights", "automatic weighting", "manual weight painting"). This phase gets the skeleton and
+'     its poses right first; deforming Mesh.Vertices by blended bone transforms is its own
+'     increment on top of this one.
+'   - IK chains, joint constraints, rig templates (RFC-0049 Section 7.4 SHOULD/MAY items).
+'   - Pose sequences (RFC-0049 Section 7.6) -- a separate, lighter-weight ordered-list feature that
+'     can be built on top of Pose/PoseCatalog once they exist, not bundled in here.
+
+#IMPORT "arco3d_scene"
+
+' ---- Quaternion -----------------------------------------------------------------------------
+
+CLASS Quaternion
+    X AS Number = 0
+    Y AS Number = 0
+    Z AS Number = 0
+    W AS Number = 1
+
+    CONSTRUCTOR(x AS Number = 0, y AS Number = 0, z AS Number = 0, w AS Number = 1)
+        SELF.X = x
+        SELF.Y = y
+        SELF.Z = z
+        SELF.W = w
+    END CONSTRUCTOR
+
+    FUNCTION Length() AS Number
+        sumOfSquares = SELF.X * SELF.X + SELF.Y * SELF.Y + SELF.Z * SELF.Z + SELF.W * SELF.W
+        RETURN SQRT(sumOfSquares)
+    END FUNCTION
+
+    FUNCTION Normalized() AS Quaternion
+        length = SELF.Length()
+        IF length < 0.000001 THEN
+            RETURN Quaternion(0, 0, 0, 1)
+        END IF
+        inverse = 1 / length
+        RETURN Quaternion(SELF.X * inverse, SELF.Y * inverse, SELF.Z * inverse, SELF.W * inverse)
+    END FUNCTION
+
+    ' Hamilton product: SELF.ComposedWith(other) applies `other` first, then SELF -- i.e. it
+    ' matches the usual "world = parentWorldRotation.ComposedWith(localRotation)" composition used
+    ' throughout this file.
+    FUNCTION ComposedWith(other AS Quaternion) AS Quaternion
+        newW = SELF.W * other.W - SELF.X * other.X - SELF.Y * other.Y - SELF.Z * other.Z
+        newX = SELF.W * other.X + SELF.X * other.W + SELF.Y * other.Z - SELF.Z * other.Y
+        newY = SELF.W * other.Y - SELF.X * other.Z + SELF.Y * other.W + SELF.Z * other.X
+        newZ = SELF.W * other.Z + SELF.X * other.Y - SELF.Y * other.X + SELF.Z * other.W
+        RETURN Quaternion(newX, newY, newZ, newW)
+    END FUNCTION
+
+    ' Rotates `v` by this quaternion via the closed-form v + 2w(u x v) + 2(u x (u x v)) identity
+    ' (u = the quaternion's vector part), expanded below without a second cross product:
+    ' v' = u*(2 * u.v) + v*(w^2 - u.u) + (u x v)*(2w). Hand-verified against known 90-degree cases
+    ' in tests/rig_smoke.abas.
+    FUNCTION RotateVector(v AS Vec3) AS Vec3
+        u = Vec3(SELF.X, SELF.Y, SELF.Z)
+        w = SELF.W
+        uDotV = u.Dot(v)
+        uDotU = u.Dot(u)
+        uCrossV = u.Cross(v)
+
+        term1 = u.Scaled(2 * uDotV)
+        term2 = v.Scaled(w * w - uDotU)
+        term3 = uCrossV.Scaled(2 * w)
+
+        sum12 = term1.Plus(term2)
+        RETURN sum12.Plus(term3)
+    END FUNCTION
+
+    FUNCTION Clone() AS Quaternion
+        RETURN Quaternion(SELF.X, SELF.Y, SELF.Z, SELF.W)
+    END FUNCTION
+
+    FUNCTION EqualsApprox(other AS Quaternion, epsilon AS Number = 0.0001) AS Boolean
+        dx = ABS(SELF.X - other.X)
+        dy = ABS(SELF.Y - other.Y)
+        dz = ABS(SELF.Z - other.Z)
+        dw = ABS(SELF.W - other.W)
+        RETURN dx < epsilon ANDALSO dy < epsilon ANDALSO dz < epsilon ANDALSO dw < epsilon
+    END FUNCTION
+
+    ' Spherical linear interpolation (RFC-0050 Section 13's recommended rotation-interpolation
+    ' method). Falls back to normalized linear interpolation when the two quaternions are nearly
+    ' identical, to avoid dividing by a near-zero sine.
+    FUNCTION Slerp(other AS Quaternion, t AS Number) AS Quaternion
+        dot = SELF.X * other.X + SELF.Y * other.Y + SELF.Z * other.Z + SELF.W * other.W
+
+        bx = other.X
+        by = other.Y
+        bz = other.Z
+        bw = other.W
+        ' Take the shorter arc: a quaternion and its negation represent the same rotation.
+        IF dot < 0 THEN
+            dot = 0 - dot
+            bx = 0 - bx
+            by = 0 - by
+            bz = 0 - bz
+            bw = 0 - bw
+        END IF
+
+        IF dot > 0.9995 THEN
+            lerpedX = SELF.X + (bx - SELF.X) * t
+            lerpedY = SELF.Y + (by - SELF.Y) * t
+            lerpedZ = SELF.Z + (bz - SELF.Z) * t
+            lerpedW = SELF.W + (bw - SELF.W) * t
+            lerped = Quaternion(lerpedX, lerpedY, lerpedZ, lerpedW)
+            RETURN lerped.Normalized()
+        ELSE
+            theta0 = ACOS(dot)
+            theta = theta0 * t
+            sinTheta0 = SIN(theta0)
+            sinTheta = SIN(theta)
+            scaleSelf = COS(theta) - dot * sinTheta / sinTheta0
+            scaleOther = sinTheta / sinTheta0
+            resultX = SELF.X * scaleSelf + bx * scaleOther
+            resultY = SELF.Y * scaleSelf + by * scaleOther
+            resultZ = SELF.Z * scaleSelf + bz * scaleOther
+            resultW = SELF.W * scaleSelf + bw * scaleOther
+            RETURN Quaternion(resultX, resultY, resultZ, resultW)
+        END IF
+    END FUNCTION
+END CLASS
+
+FUNCTION QuaternionIdentity() AS Quaternion
+    RETURN Quaternion(0, 0, 0, 1)
+END FUNCTION
+
+FUNCTION QuaternionFromAxisAngle(axis AS Vec3, degrees AS Number) AS Quaternion
+    normalizedAxis = axis.Normalized()
+    halfRadians = (degrees * DEG2RAD) / 2
+    s = SIN(halfRadians)
+    c = COS(halfRadians)
+    RETURN Quaternion(normalizedAxis.X * s, normalizedAxis.Y * s, normalizedAxis.Z * s, c)
+END FUNCTION
+
+' ---- BoneTransform ----------------------------------------------------------------------------
+'
+' A local transform (relative to a parent bone, or to the rig root for a root bone). Used both for
+' a bone's rest/bind pose (Bone.BindTransform) and for a single bone's value within a live
+' RigPoseState or a sparse Pose entry -- one small value type instead of three near-duplicates.
+
+CLASS BoneTransform
+    Position AS Vec3 = Vec3(0, 0, 0)
+    Rotation AS Quaternion = Quaternion(0, 0, 0, 1)
+    Scale AS Vec3 = Vec3(1, 1, 1)
+
+    CONSTRUCTOR(position AS Vec3 = Vec3(0, 0, 0), rotation AS Quaternion = Quaternion(0, 0, 0, 1), scale AS Vec3 = Vec3(1, 1, 1))
+        SELF.Position = position
+        SELF.Rotation = rotation
+        SELF.Scale = scale
+    END CONSTRUCTOR
+
+    FUNCTION Clone() AS BoneTransform
+        position = SELF.Position
+        rotation = SELF.Rotation
+        scale = SELF.Scale
+        clonedPosition = position.Clone()
+        clonedRotation = rotation.Clone()
+        clonedScale = scale.Clone()
+        RETURN BoneTransform(clonedPosition, clonedRotation, clonedScale)
+    END FUNCTION
+
+    ' Position/scale lerp, rotation slerp -- the actual pose-interpolation primitive (RFC-0049
+    ' Section 7.5, RFC-0050 Section 13).
+    FUNCTION LerpTo(other AS BoneTransform, t AS Number) AS BoneTransform
+        position = SELF.Position
+        otherPosition = other.Position
+        blendedPosition = position.LerpTo(otherPosition, t)
+
+        rotation = SELF.Rotation
+        otherRotation = other.Rotation
+        blendedRotation = rotation.Slerp(otherRotation, t)
+
+        scale = SELF.Scale
+        otherScale = other.Scale
+        blendedScale = scale.LerpTo(otherScale, t)
+
+        RETURN BoneTransform(blendedPosition, blendedRotation, blendedScale)
+    END FUNCTION
+END CLASS
+
+' Composes a child's local position into its parent's world space: rotate the local offset by the
+' parent's world rotation, then add the parent's world position. Known simplification (matching
+' Transform.ApplyToDirection's own precedent in arco3d_scene.abas): parent scale does not affect
+' how a child's local position is rotated/offset -- fine for the common case of uniform or
+' scale-free rigs, not correct in general for a non-uniformly-scaled parent bone.
+FUNCTION ComposeWorldPosition(parentPosition AS Vec3, parentRotation AS Quaternion, localPosition AS Vec3) AS Vec3
+    rotatedLocal = parentRotation.RotateVector(localPosition)
+    RETURN parentPosition.Plus(rotatedLocal)
+END FUNCTION
+
+' ---- Bone / Rig -------------------------------------------------------------------------------
+
+CLASS Bone
+    Id AS String = ""
+    Name AS String = ""
+    ' -1 means "no parent" (a root bone).
+    ParentIndex AS Number = -1
+    BindTransform AS BoneTransform = BoneTransform(Vec3(0, 0, 0), Quaternion(0, 0, 0, 1), Vec3(1, 1, 1))
+
+    CONSTRUCTOR(name AS String = "", parentIndex AS Number = -1)
+        SELF.Id = ArcoId.Issue("bone")
+        SELF.Name = name
+        SELF.ParentIndex = parentIndex
+    END CONSTRUCTOR
+END CLASS
+
+CLASS Rig
+    Id AS String = ""
+    Name AS String = ""
+    Bones AS Array = []
+
+    CONSTRUCTOR(name AS String = "")
+        SELF.Id = ArcoId.Issue("rig")
+        SELF.Name = name
+    END CONSTRUCTOR
+
+    ' Appends a new bone and returns its index (a Rig's own bone indices are stable for the
+    ' lifetime of the Rig -- bones are never removed/reordered by this increment).
+    FUNCTION AddBone(name AS String, parentIndex AS Number = -1) AS Number
+        bones = SELF.Bones
+        bone = Bone(name, parentIndex)
+        ignoredPush = Array.Add(bones, bone)
+        RETURN LEN(bones) - 1
+    END FUNCTION
+
+    FUNCTION FindBoneIndexByName(name AS String) AS Number
+        bones = SELF.Bones
+        FOR i IN Range(LEN(bones))
+            bone = bones[i]
+            IF bone.Name == name THEN
+                RETURN i
+            END IF
+        NEXT
+        RETURN -1
+    END FUNCTION
+
+    ' Bone indices from the root down to (and including) boneIndex -- the order a world transform
+    ' must be composed in.
+    FUNCTION AncestryChain(boneIndex AS Number) AS Array
+        bones = SELF.Bones
+        reversedChain = []
+        current = boneIndex
+        WHILE current >= 0
+            ignoredPush = Array.Add(reversedChain, current)
+            bone = bones[current]
+            current = bone.ParentIndex
+        WEND
+
+        chain = []
+        count = LEN(reversedChain)
+        FOR i IN Range(count)
+            sourceIndex = count - 1 - i
+            boneIndexAtLevel = reversedChain[sourceIndex]
+            ignoredPush = Array.Add(chain, boneIndexAtLevel)
+        NEXT
+        RETURN chain
+    END FUNCTION
+
+    FUNCTION WorldBindTransform(boneIndex AS Number) AS BoneTransform
+        chain = SELF.AncestryChain(boneIndex)
+        bones = SELF.Bones
+        worldPosition = Vec3(0, 0, 0)
+        worldRotation = QuaternionIdentity()
+        worldScale = Vec3(1, 1, 1)
+        FOR index IN chain
+            bone = bones[index]
+            localTransform = bone.BindTransform
+            localPosition = localTransform.Position
+            localRotation = localTransform.Rotation
+            localScale = localTransform.Scale
+            worldPosition = ComposeWorldPosition(worldPosition, worldRotation, localPosition)
+            worldRotation = worldRotation.ComposedWith(localRotation)
+            worldScale = worldScale.ScaledBy(localScale)
+        NEXT
+        RETURN BoneTransform(worldPosition, worldRotation, worldScale)
+    END FUNCTION
+END CLASS
+
+' ---- RigPoseState (the "current live skeletal state" a future posing UI would mutate) ---------
+
+CLASS RigPoseState
+    TargetRig AS Rig = NULL
+    ' Dense: exactly one entry per bone, always populated (unlike Pose.Entries, which is sparse).
+    BoneLocalTransforms AS Array = []
+
+    CONSTRUCTOR(rig AS Rig)
+        SELF.TargetRig = rig
+        SELF.ResetToBindPose()
+    END CONSTRUCTOR
+
+    FUNCTION ResetToBindPose()
+        rig = SELF.TargetRig
+        bones = rig.Bones
+        locals = []
+        FOR bone IN bones
+            bindTransform = bone.BindTransform
+            clonedTransform = bindTransform.Clone()
+            ignoredPush = Array.Add(locals, clonedTransform)
+        NEXT
+        SELF.BoneLocalTransforms = locals
+    END FUNCTION
+
+    FUNCTION SetLocalTransform(boneIndex AS Number, transform AS BoneTransform)
+        locals = SELF.BoneLocalTransforms
+        locals[boneIndex] = transform
+    END FUNCTION
+
+    FUNCTION LocalTransform(boneIndex AS Number) AS BoneTransform
+        locals = SELF.BoneLocalTransforms
+        RETURN locals[boneIndex]
+    END FUNCTION
+
+    FUNCTION WorldTransform(boneIndex AS Number) AS BoneTransform
+        rig = SELF.TargetRig
+        chain = rig.AncestryChain(boneIndex)
+        locals = SELF.BoneLocalTransforms
+        worldPosition = Vec3(0, 0, 0)
+        worldRotation = QuaternionIdentity()
+        worldScale = Vec3(1, 1, 1)
+        FOR index IN chain
+            localTransform = locals[index]
+            localPosition = localTransform.Position
+            localRotation = localTransform.Rotation
+            localScale = localTransform.Scale
+            worldPosition = ComposeWorldPosition(worldPosition, worldRotation, localPosition)
+            worldRotation = worldRotation.ComposedWith(localRotation)
+            worldScale = worldScale.ScaledBy(localScale)
+        NEXT
+        RETURN BoneTransform(worldPosition, worldRotation, worldScale)
+    END FUNCTION
+
+    ' RFC-0049 Section 7.5: "capture the current rig state as a named pose". Always captures every
+    ' bone (a full pose) -- editing a captured pose down to a sparse subset is a later UI concern.
+    FUNCTION CapturePose(name AS String) AS Pose
+        pose = Pose(name)
+        locals = SELF.BoneLocalTransforms
+        FOR i IN Range(LEN(locals))
+            transform = locals[i]
+            clonedTransform = transform.Clone()
+            pose.SetBoneTransform(i, clonedTransform)
+        NEXT
+        RETURN pose
+    END FUNCTION
+
+    ' RFC-0049 Section 7.5: "apply saved poses". Only touches bones the pose actually specifies --
+    ' a sparse Pose leaves every other bone's current local transform alone.
+    FUNCTION ApplyPose(pose AS Pose)
+        entries = pose.Entries
+        locals = SELF.BoneLocalTransforms
+        FOR entry IN entries
+            boneIndex = entry.BoneIndex
+            transform = entry.Transform
+            clonedTransform = transform.Clone()
+            locals[boneIndex] = clonedTransform
+        NEXT
+    END FUNCTION
+END CLASS
+
+' ---- Pose / PoseCatalog -------------------------------------------------------------------------
+
+CLASS PoseEntry
+    BoneIndex AS Number = 0
+    Transform AS BoneTransform = BoneTransform(Vec3(0, 0, 0), Quaternion(0, 0, 0, 1), Vec3(1, 1, 1))
+
+    CONSTRUCTOR(boneIndex AS Number = 0, transform AS BoneTransform = BoneTransform(Vec3(0, 0, 0), Quaternion(0, 0, 0, 1), Vec3(1, 1, 1)))
+        SELF.BoneIndex = boneIndex
+        SELF.Transform = transform
+    END CONSTRUCTOR
+END CLASS
+
+' A named, possibly-partial (sparse) set of per-bone transforms (RFC-0050 Section 13). A bone
+' absent from Entries is "unspecified" -- there is no separate flag for "explicitly reset to
+' bind", since that case is just an entry whose value happens to equal the bind transform.
+CLASS Pose
+    Id AS String = ""
+    Name AS String = ""
+    Category AS String = ""
+    Entries AS Array = []
+
+    CONSTRUCTOR(name AS String = "")
+        SELF.Id = ArcoId.Issue("pose")
+        SELF.Name = name
+    END CONSTRUCTOR
+
+    FUNCTION FindEntryIndex(boneIndex AS Number) AS Number
+        entries = SELF.Entries
+        FOR i IN Range(LEN(entries))
+            entry = entries[i]
+            IF entry.BoneIndex == boneIndex THEN
+                RETURN i
+            END IF
+        NEXT
+        RETURN -1
+    END FUNCTION
+
+    ' Overwrites this bone's entry if one already exists, otherwise appends a new one.
+    FUNCTION SetBoneTransform(boneIndex AS Number, transform AS BoneTransform)
+        existingIndex = SELF.FindEntryIndex(boneIndex)
+        entries = SELF.Entries
+        IF existingIndex >= 0 THEN
+            entries[existingIndex] = PoseEntry(boneIndex, transform)
+        ELSE
+            ignoredPush = Array.Add(entries, PoseEntry(boneIndex, transform))
+        END IF
+    END FUNCTION
+
+    ' NULL if this pose does not specify boneIndex.
+    FUNCTION FindTransform(boneIndex AS Number) AS BoneTransform
+        index = SELF.FindEntryIndex(boneIndex)
+        IF index < 0 THEN
+            RETURN NULL
+        END IF
+        entries = SELF.Entries
+        entry = entries[index]
+        RETURN entry.Transform
+    END FUNCTION
+
+    FUNCTION Clone() AS Pose
+        copy = Pose(SELF.Name)
+        copy.Category = SELF.Category
+        entries = SELF.Entries
+        FOR entry IN entries
+            transform = entry.Transform
+            clonedTransform = transform.Clone()
+            copy.SetBoneTransform(entry.BoneIndex, clonedTransform)
+        NEXT
+        RETURN copy
+    END FUNCTION
+END CLASS
+
+' Interpolates two poses (RFC-0049 Section 7.5's "interpolate between two compatible poses"),
+' restricted to bones BOTH poses specify -- a bone missing from either side has no defined start or
+' end to blend between, so it is simply absent from the result rather than guessed at. This is a
+' preview/blocking aid, not authoritative animation data (RFC-0049 Section 7.5).
+FUNCTION InterpolatePoses(poseA AS Pose, poseB AS Pose, t AS Number) AS Pose
+    result = Pose("Interpolated")
+    entriesA = poseA.Entries
+    FOR entryA IN entriesA
+        boneIndex = entryA.BoneIndex
+        transformB = poseB.FindTransform(boneIndex)
+        IF transformB <> NULL THEN
+            transformA = entryA.Transform
+            blended = transformA.LerpTo(transformB, t)
+            result.SetBoneTransform(boneIndex, blended)
+        END IF
+    NEXT
+    RETURN result
+END FUNCTION
+
+' A reusable, named collection of poses sharing one rig-compatibility Id (RFC-0049 Section 7.5's
+' pose catalogs, RFC-0050 Section 14). Compatibility here is exact-Id, the simplest possible
+' signature -- RFC-0050 Section 14's richer "semantic bone identity" matching is future work.
+CLASS PoseCatalog
+    Id AS String = ""
+    Name AS String = ""
+    RigId AS String = ""
+    Poses AS Array = []
+
+    CONSTRUCTOR(name AS String = "", rigId AS String = "")
+        SELF.Id = ArcoId.Issue("posecatalog")
+        SELF.Name = name
+        SELF.RigId = rigId
+    END CONSTRUCTOR
+
+    FUNCTION AddPose(pose AS Pose)
+        poses = SELF.Poses
+        ignoredPush = Array.Add(poses, pose)
+    END FUNCTION
+
+    FUNCTION FindPoseByName(name AS String) AS Pose
+        poses = SELF.Poses
+        FOR pose IN poses
+            IF pose.Name == name THEN
+                RETURN pose
+            END IF
+        NEXT
+        RETURN NULL
+    END FUNCTION
+
+    FUNCTION IsCompatibleWith(rig AS Rig) AS Boolean
+        rigId = rig.Id
+        RETURN SELF.RigId == rigId
+    END FUNCTION
+END CLASS

@@ -1,0 +1,53 @@
+#DESCRIPTION "Minimal isolation test for GUI.Clear3D/GUI.Triangle3D -- NOT a smoke test, a human-eyes diagnostic"
+'
+' This is deliberately as small as possible: one hardcoded triangle, one fixed camera, no
+' arco3d_scene.abas involvement at all. It exists to answer exactly one question a human needs to
+' answer by looking at the actual screen (no amount of process-alive/CPU-usage checking can answer
+' it): does GUI.Clear3D/GUI.Triangle3D's real GPU 3D pipeline show ANYTHING at all on this machine?
+'
+' What you should see: a dark red-brown window background, a large bright green triangle roughly
+' centered on screen, and white text in the top-left corner. The window title bar (if your desktop
+' shows one) counts frames, so even if the triangle/text don't appear, the title tells you whether
+' the render loop is alive at all.
+'
+' Report back exactly what you see -- "green triangle and text, as described", "just the dark
+' background, no triangle, no text", "solid black, nothing at all", or anything else -- since each
+' of those points at a different real bug.
+#INSTRUCTION_LIMIT 9000000000000
+
+#IMPORT "gui"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "This diagnostic needs a Wayland or X11 desktop session."
+    ExitTheProgram(0)
+END IF
+
+GUI.Application("arco3d-diagnostic", "Arco3D Viewport Diagnostic")
+window = GUI.Window("Arco3D Viewport Diagnostic", 800, 600)
+
+frameCount = 0
+frameTimerLastTimestamp = Time.Timestamp()
+frameTimerWorstSeconds = 0
+frameTimerTotalSeconds = 0
+running = TRUE
+WHILE running
+    frameCount = frameCount + 1
+    GUI.Clear3D(window, 0, 0, 5, 0, 0, 0, 0, 1, 0, 60, 0.1, 100, 0.25, 0.08, 0.08)
+    GUI.Triangle3D(window, -1.5, -1.0, 0, 1.5, -1.0, 0, 0, 1.5, 0, 0.1, 0.9, 0.2, 1.0)
+    GUI.Text(window, "If you can read this over a green triangle, 3D rendering works.", 16, 16, 16, 1.0, 1.0, 1.0, 1.0)
+    GUI.Present(window)
+
+    frameTimerNow = Time.Timestamp()
+    frameTimerDeltaSeconds = frameTimerNow - frameTimerLastTimestamp
+    frameTimerLastTimestamp = frameTimerNow
+    frameTimerTotalSeconds = frameTimerTotalSeconds + frameTimerDeltaSeconds
+    IF frameTimerDeltaSeconds > frameTimerWorstSeconds THEN frameTimerWorstSeconds = frameTimerDeltaSeconds
+    frameTimerAverageSeconds = frameTimerTotalSeconds / frameCount
+    GUI.SetTitle(window, "Arco3D Viewport Diagnostic -- last frame " + STRING(frameTimerDeltaSeconds) + "s worst " + STRING(frameTimerWorstSeconds) + "s avg " + STRING(frameTimerAverageSeconds) + "s frame# " + STRING(frameCount))
+
+    event = GUI.WaitEvent(0.02)
+    IF event.Type == "close" THEN running = FALSE
+    IF GUI.ShouldClose(window) THEN running = FALSE
+    IF event.Type == "key" ANDALSO event.Key == "escape" ANDALSO event.Action == "press" THEN running = FALSE
+WEND
+GUI.Close(window)

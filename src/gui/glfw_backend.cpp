@@ -32,6 +32,9 @@ struct WindowRecord {
     double last_click_x = 0;
     double last_click_y = 0;
     int last_click_button = -1;
+    // Set by clear_3d(), read and reset by present() -- see gui.hpp's own comment on clear_3d()
+    // for why present() needs to know whether a 3D scene was drawn this frame at all.
+    bool scene3d_active = false;
 
     ~WindowRecord() {
         if (context) cairo_destroy(context);
@@ -108,6 +111,25 @@ void resize_canvas(WindowRecord& item, int width, int height) {
 void set_color(cairo_t* context, double red, double green, double blue, double alpha) {
     cairo_set_source_rgba(context, std::clamp(red, 0.0, 1.0), std::clamp(green, 0.0, 1.0),
                           std::clamp(blue, 0.0, 1.0), std::clamp(alpha, 0.0, 1.0));
+}
+
+// Minimal 3D vector math for clear_3d()'s look-at matrix -- deliberately not a general math
+// library, just the handful of operations one camera matrix needs.
+struct Vec3d {
+    double x = 0;
+    double y = 0;
+    double z = 0;
+};
+
+Vec3d vec3_subtract(const Vec3d& a, const Vec3d& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+double vec3_dot(const Vec3d& a, const Vec3d& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3d vec3_cross(const Vec3d& a, const Vec3d& b) {
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+Vec3d vec3_normalized(const Vec3d& v) {
+    const double length = std::sqrt(vec3_dot(v, v));
+    if (length < 1e-9) return {0, 0, 0};
+    return {v.x / length, v.y / length, v.z / length};
 }
 
 void rounded_path(cairo_t* context, double x, double y, double width, double height, double radius) {
@@ -412,6 +434,87 @@ void clear(int id, double r, double g, double b, double a) {
     cairo_paint(item.context);
     cairo_restore(item.context);
 }
+void clear_3d(int id, double eye_x, double eye_y, double eye_z, double target_x, double target_y, double target_z,
+              double up_x, double up_y, double up_z, double fov_y_degrees, double near_plane, double far_plane,
+              double background_red, double background_green, double background_blue) {
+    auto& item = find_window(id);
+    glfwMakeContextCurrent(item.handle);
+
+    // Real GL clear (color + depth), not the cairo canvas -- this IS the 3D scene's own
+    // background, drawn straight to the framebuffer present() will later composite the 2D layer
+    // on top of.
+    glClearColor(static_cast<GLfloat>(std::clamp(background_red, 0.0, 1.0)),
+                 static_cast<GLfloat>(std::clamp(background_green, 0.0, 1.0)),
+                 static_cast<GLfloat>(std::clamp(background_blue, 0.0, 1.0)), 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+
+    int framebuffer_width = 0;
+    int framebuffer_height = 0;
+    glfwGetFramebufferSize(item.handle, &framebuffer_width, &framebuffer_height);
+    framebuffer_width = std::max(1, framebuffer_width);
+    framebuffer_height = std::max(1, framebuffer_height);
+    glViewport(0, 0, framebuffer_width, framebuffer_height);
+
+    // Perspective projection (glFrustum-based, since gluPerspective isn't guaranteed linked).
+    const double aspect = static_cast<double>(framebuffer_width) / static_cast<double>(framebuffer_height);
+    const double fov_y_radians = std::clamp(fov_y_degrees, 1.0, 179.0) * 3.14159265358979323846 / 180.0;
+    const double safe_near = std::max(near_plane, 1e-4);
+    const double safe_far = std::max(far_plane, safe_near + 1e-4);
+    const double top = safe_near * std::tan(fov_y_radians / 2.0);
+    const double right_edge = top * aspect;
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glFrustum(-right_edge, right_edge, -top, top, safe_near, safe_far);
+
+    // Look-at view matrix (gluLookAt-equivalent, hand-built for the same reason as above).
+    const Vec3d eye{eye_x, eye_y, eye_z};
+    const Vec3d target{target_x, target_y, target_z};
+    const Vec3d up{up_x, up_y, up_z};
+    const Vec3d forward = vec3_normalized(vec3_subtract(target, eye));
+    Vec3d right = vec3_normalized(vec3_cross(forward, up));
+    if (right.x == 0 && right.y == 0 && right.z == 0) {
+        // forward and up were parallel (a degenerate camera setup) -- fall back to a fixed right
+        // vector rather than producing a NaN-filled matrix.
+        right = Vec3d{1, 0, 0};
+    }
+    const Vec3d true_up = vec3_cross(right, forward);
+    const double view_matrix[16] = {
+        right.x, true_up.x, -forward.x, 0.0,
+        right.y, true_up.y, -forward.y, 0.0,
+        right.z, true_up.z, -forward.z, 0.0,
+        -vec3_dot(right, eye), -vec3_dot(true_up, eye), vec3_dot(forward, eye), 1.0,
+    };
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glMultMatrixd(view_matrix);
+
+    // The 2D cairo canvas becomes a transparent HUD overlay for the rest of this frame -- see
+    // gui.hpp's own comment on clear_3d() for why this is done here rather than left to the
+    // caller's own separate GUI.Clear call.
+    cairo_save(item.context);
+    cairo_set_operator(item.context, CAIRO_OPERATOR_SOURCE);
+    set_color(item.context, 0.0, 0.0, 0.0, 0.0);
+    cairo_paint(item.context);
+    cairo_restore(item.context);
+
+    item.scene3d_active = true;
+}
+void triangle_3d(int id, double x1, double y1, double z1, double x2, double y2, double z2, double x3, double y3, double z3,
+                 double red, double green, double blue, double alpha) {
+    auto& item = find_window(id);
+    if (!item.scene3d_active) {
+        throw std::runtime_error("GUI.Triangle3D was called without a preceding GUI.Clear3D this frame");
+    }
+    glfwMakeContextCurrent(item.handle);
+    glColor4d(std::clamp(red, 0.0, 1.0), std::clamp(green, 0.0, 1.0), std::clamp(blue, 0.0, 1.0), std::clamp(alpha, 0.0, 1.0));
+    glBegin(GL_TRIANGLES);
+    glVertex3d(x1, y1, z1);
+    glVertex3d(x2, y2, z2);
+    glVertex3d(x3, y3, z3);
+    glEnd();
+}
 void set_scale(int id, double factor) {
     // cairo_paint() above fills the whole surface via the default clip (device-space, unaffected
     // by any active scale), so unlike the web canvas backend's fillRect-based clear, clear() here
@@ -619,7 +722,15 @@ void present(int id) {
     auto& item = find_window(id);
     begin_present(item);
     cairo_surface_flush(item.surface);
-    glClear(GL_COLOR_BUFFER_BIT);
+    // A 3D scene (clear_3d() + triangle_3d() calls) already cleared and drew into the real
+    // framebuffer this frame -- clearing color again here would erase it. The 2D canvas becomes a
+    // transparent HUD layer composited on top instead of an opaque replacement; see gui.hpp's own
+    // comment on clear_3d().
+    if (!item.scene3d_active) {
+        glClear(GL_COLOR_BUFFER_BIT);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+    }
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, item.texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -628,12 +739,24 @@ void present(int id) {
     glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 1, 1, 0, -1, 1);
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
     glColor4d(1, 1, 1, 1);
+    if (item.scene3d_active) {
+        // Cairo's ARGB32 surfaces are premultiplied-alpha, so the correct compositing equation is
+        // (ONE, ONE_MINUS_SRC_ALPHA), not the more common straight-alpha (SRC_ALPHA,
+        // ONE_MINUS_SRC_ALPHA) -- using the straight-alpha equation would fringe every
+        // antialiased text/line edge with a dark halo.
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    }
     glBegin(GL_QUADS);
     glTexCoord2d(0, 0); glVertex2d(0, 0); glTexCoord2d(1, 0); glVertex2d(1, 0);
     glTexCoord2d(1, 1); glVertex2d(1, 1); glTexCoord2d(0, 1); glVertex2d(0, 1);
     glEnd();
+    if (item.scene3d_active) {
+        glDisable(GL_BLEND);
+    }
     glDisable(GL_TEXTURE_2D);
     glfwSwapBuffers(item.handle);
+    item.scene3d_active = false;
 }
 Value poll_event() {
     ensure_initialized();

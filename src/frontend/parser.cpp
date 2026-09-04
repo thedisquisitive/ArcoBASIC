@@ -563,8 +563,28 @@ struct CallExpr final : Expr {
 };
 
 struct MethodCallExpr final : Expr {
-    MethodCallExpr(std::string full_name, std::string receiver, std::string method, std::vector<std::unique_ptr<Expr>> args)
-        : full_name(std::move(full_name)), receiver(std::move(receiver)), method(std::move(method)), args(std::move(args)) {}
+    // `receiver`/`method` are ALWAYS the original first-dot split (receiver = first segment,
+    // method = everything after it, e.g. receiver="UEFI", method="GOP.Discover" for
+    // "UEFI.GOP.Discover(...)") -- unchanged from before this file's postfix-chain fix, and left
+    // that way deliberately: dump_ast()/canonical_ast() below key their PORT/ADDRESS/MEMORY/CPU/
+    // GRAPHICS/AEX/UEFI.GOP/UEFI.BLOCKIO special-casing on exactly this shape (e.g. "does method
+    // start with GOP."), and canonical_ast()'s secondary_name is read the same way by
+    // src/compiler/fission.cpp's AMIR lowering (its CALL_EXTERNAL/UEFI-parameter detection at
+    // lower_call() matches secondary_name against a parameter name, which is always the first
+    // segment). Both were confirmed to regress with a real fixture
+    // (systems_arco_basic_substrate_smoke, systems_amir_primitives_smoke) when this constructor
+    // was first changed to pass the corrected split here instead.
+    //
+    // `resolved_receiver`/`resolved_method` are the SEPARATE, correct-for-dispatch split (last dot:
+    // receiver = everything before it, method = the final segment, e.g. receiver="UEFI.GOP",
+    // method="Discover" for the same example) -- used only by eval() below, which is the one place
+    // that actually needs to resolve and call a method on a real value rather than pattern-match a
+    // namespace-style string.
+    MethodCallExpr(std::string full_name, std::string receiver, std::string method,
+                   std::string resolved_receiver, std::string resolved_method,
+                   std::vector<std::unique_ptr<Expr>> args)
+        : full_name(std::move(full_name)), receiver(std::move(receiver)), method(std::move(method)),
+          resolved_receiver(std::move(resolved_receiver)), resolved_method(std::move(resolved_method)), args(std::move(args)) {}
 
     Value eval(Runtime& runtime) const override {
         if (uppercase(receiver) == "PORT") {
@@ -575,8 +595,16 @@ struct MethodCallExpr final : Expr {
         for (const auto& arg : args) {
             values.push_back(arg->eval(runtime));
         }
-        if (runtime.has_global(receiver)) {
-            const Value target = runtime.get_global(receiver);
+        // resolved_receiver may itself be a dotted path (e.g. "component.Transform" for
+        // "component.Transform.Plus(...)"), not just a bare name -- check the ROOT segment's
+        // existence (cheap, no exception, and correct for the plain single-segment case too,
+        // where root == resolved_receiver) before asking get_global() to walk the full path. This
+        // avoids paying for get_global()'s per-segment walk (and its exceptions on a miss) on
+        // every Array.Add/GUI.*/etc. namespaced host call, which is not a real variable at all.
+        const auto receiver_root_dot = resolved_receiver.find('.');
+        const std::string receiver_root = receiver_root_dot == std::string::npos ? resolved_receiver : resolved_receiver.substr(0, receiver_root_dot);
+        if (runtime.has_global(receiver_root)) {
+            const Value target = runtime.get_global(resolved_receiver);
             if (target.is_object()) {
                 bool has_class = false;
                 try {
@@ -585,7 +613,7 @@ struct MethodCallExpr final : Expr {
                 } catch (const std::exception&) {
                 }
                 if (has_class) {
-                    return runtime.call_method(target, method, values);
+                    return runtime.call_method(target, resolved_method, values);
                 }
             }
         }
@@ -615,6 +643,56 @@ struct MethodCallExpr final : Expr {
 
     std::string full_name;
     std::string receiver;
+    std::string method;
+    std::string resolved_receiver;
+    std::string resolved_method;
+    std::vector<std::unique_ptr<Expr>> args;
+};
+
+// Generic postfix member access on an arbitrary already-parsed expression (`expr.Property`).
+// MethodCallExpr/VariableExpr above resolve a *name* (walking get_global's own dotted-path logic);
+// this instead evaluates `object` first and reads `property` off whatever value that produces --
+// needed when the base is not a plain variable, e.g. the result of a call or index expression
+// (`f().Property`, `arr[0].Property`). Interpreter-only: canonical_ast() intentionally uses the
+// Expr base class's default (AstKind::Unsupported) rather than adding new AstKind cases, since the
+// A-MIR/bytecode/native pipeline does not lower this yet.
+struct DynamicGetExpr final : Expr {
+    DynamicGetExpr(std::unique_ptr<Expr> object, std::string property)
+        : object(std::move(object)), property(std::move(property)) {}
+    Value eval(Runtime& runtime) const override {
+        const Value target = object->eval(runtime);
+        return runtime.get_member(target, property);
+    }
+    void dump_ast(std::ostream& output, int indent) const override {
+        ast_line(output, indent, "DynamicGet " + property);
+        object->dump_ast(output, indent + 1);
+    }
+    std::unique_ptr<Expr> object;
+    std::string property;
+};
+
+// Generic postfix method call on an arbitrary already-parsed expression (`expr.Method(...)`).
+// See DynamicGetExpr above for why this exists alongside MethodCallExpr.
+struct DynamicMethodCallExpr final : Expr {
+    DynamicMethodCallExpr(std::unique_ptr<Expr> object, std::string method, std::vector<std::unique_ptr<Expr>> args)
+        : object(std::move(object)), method(std::move(method)), args(std::move(args)) {}
+    Value eval(Runtime& runtime) const override {
+        Value target = object->eval(runtime);
+        std::vector<Value> values;
+        values.reserve(args.size());
+        for (const auto& arg : args) {
+            values.push_back(arg->eval(runtime));
+        }
+        return runtime.call_method(std::move(target), method, values);
+    }
+    void dump_ast(std::ostream& output, int indent) const override {
+        ast_line(output, indent, "DynamicMethodCall " + method);
+        object->dump_ast(output, indent + 1);
+        for (const auto& arg : args) {
+            arg->dump_ast(output, indent + 1);
+        }
+    }
+    std::unique_ptr<Expr> object;
     std::string method;
     std::vector<std::unique_ptr<Expr>> args;
 };
@@ -1268,7 +1346,12 @@ std::string param_summary(const FunctionParam& param) {
 }
 
 Value enforce_return_type(Runtime& runtime, const std::string& callable, const std::string& type_name, const Value& value) {
-    if (!type_name.empty() && !runtime.value_matches_type(value, type_name)) {
+    // NULL is exempt, matching every other `AS Type` check in this runtime (field assignment in
+    // ensure_field_assignment_type, REF targets in make_reference_to/make_reference/
+    // set_reference_value): a typed field with no initializer starts as NULL and later
+    // *non-null* assignments must match the declared type, so a typed return should behave the
+    // same way rather than being a stricter special case.
+    if (!type_name.empty() && !value.is_null() && !runtime.value_matches_type(value, type_name)) {
         throw std::runtime_error(callable + " should return " + type_name);
     }
     return value;
@@ -3222,6 +3305,26 @@ Parser::ExprPtr Parser::unary() {
     return call();
 }
 
+std::vector<Parser::ExprPtr> Parser::call_arguments() {
+    std::vector<ExprPtr> args;
+    skip_newlines();
+    if (!check(TokenType::RightParen)) {
+        while (true) {
+            args.push_back(expression());
+            skip_newlines();
+            if (!match(TokenType::Comma)) {
+                break;
+            }
+            skip_newlines();
+            if (check(TokenType::RightParen)) {
+                break;
+            }
+        }
+    }
+    consume(TokenType::RightParen, "expected ')' after arguments");
+    return args;
+}
+
 Parser::ExprPtr Parser::call() {
     auto expr = primary();
     while (true) {
@@ -3230,22 +3333,7 @@ Parser::ExprPtr Parser::call() {
             if (!variable) {
                 throw std::runtime_error(token_error(previous(), "only named host functions can be called"));
             }
-            std::vector<ExprPtr> args;
-            skip_newlines();
-            if (!check(TokenType::RightParen)) {
-                while (true) {
-                    args.push_back(expression());
-                    skip_newlines();
-                    if (!match(TokenType::Comma)) {
-                        break;
-                    }
-                    skip_newlines();
-                    if (check(TokenType::RightParen)) {
-                        break;
-                    }
-                }
-            }
-            consume(TokenType::RightParen, "expected ')' after arguments");
+            std::vector<ExprPtr> args = call_arguments();
             const auto dot = variable->name.find('.');
             if (freestanding_runtime_none_) {
                 const std::string first_segment = dot != std::string::npos ? variable->name.substr(0, dot) : variable->name;
@@ -3272,7 +3360,18 @@ Parser::ExprPtr Parser::call() {
                     }
                     expr = std::make_unique<SuperCallExpr>(current_super_class_, variable->name.substr(dot + 1), std::move(args));
                 } else {
-                    expr = std::make_unique<MethodCallExpr>(variable->name, receiver_name, variable->name.substr(dot + 1), std::move(args));
+                    // For an actual method DISPATCH (as opposed to canonical_ast()'s namespace-
+                    // string pattern matching -- see MethodCallExpr's own comment), the method
+                    // name must come from the LAST dot, not the first: `a.b.c(...)` calls method
+                    // `c` on receiver path `a.b`, not a (nonexistent) method `b.c` on `a`. A
+                    // single-dot name (the common case) is unaffected -- resolved_receiver ==
+                    // receiver_name and resolved_method == method whenever there is only one dot.
+                    const auto last_dot = variable->name.rfind('.');
+                    std::string resolved_receiver = variable->name.substr(0, last_dot);
+                    std::string resolved_method = variable->name.substr(last_dot + 1);
+                    std::string method_name = variable->name.substr(dot + 1);
+                    expr = std::make_unique<MethodCallExpr>(variable->name, receiver_name, std::move(method_name),
+                                                             std::move(resolved_receiver), std::move(resolved_method), std::move(args));
                 }
             } else {
                 expr = std::make_unique<CallExpr>(variable->name, std::move(args));
@@ -3297,6 +3396,36 @@ Parser::ExprPtr Parser::call() {
             while (match(TokenType::Newline)) {}
             consume(TokenType::RightBracket, "expected ']' after index");
             expr = std::make_unique<IndexExpr>(std::move(expr), std::move(first));
+        } else if (match(TokenType::Dot)) {
+            // A generic `.member` continuation on whatever `expr` currently is -- reached only
+            // when the base is NOT a plain dotted variable name (that case is fused into one
+            // Identifier token by the lexer and handled above/by VariableExpr's own get_global()
+            // walk). Typical triggers: `f().Property`, `arr[0].Method()`, or chaining further off
+            // a MethodCallExpr/DynamicGetExpr/DynamicMethodCallExpr built by an earlier iteration
+            // of this same loop.
+            const Token member_token = consume(TokenType::Identifier, "expected member name after '.'");
+            // identifier()'s own lexing fuses any immediately-following `.ident` runs into this
+            // SAME token (the same mechanism that fuses "a.b.c" into one token when a name starts
+            // fresh) -- e.g. `f().Bar.Baz` arrives here as one Dot then one Identifier "Bar.Baz".
+            // Split it the same way MethodCallExpr's own construction does.
+            std::vector<std::string> segments;
+            std::size_t segment_start = 0;
+            while (true) {
+                const auto next_dot = member_token.lexeme.find('.', segment_start);
+                segments.push_back(member_token.lexeme.substr(segment_start, next_dot == std::string::npos ? std::string::npos : next_dot - segment_start));
+                if (next_dot == std::string::npos) break;
+                segment_start = next_dot + 1;
+            }
+            for (std::size_t i = 0; i + 1 < segments.size(); ++i) {
+                expr = std::make_unique<DynamicGetExpr>(std::move(expr), segments[i]);
+            }
+            const std::string last_segment = segments.back();
+            if (match(TokenType::LeftParen)) {
+                std::vector<ExprPtr> args = call_arguments();
+                expr = std::make_unique<DynamicMethodCallExpr>(std::move(expr), last_segment, std::move(args));
+            } else {
+                expr = std::make_unique<DynamicGetExpr>(std::move(expr), last_segment);
+            }
         } else {
             break;
         }

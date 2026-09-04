@@ -194,6 +194,7 @@ private:
     ExprPtr unary();
     ExprPtr call();
     ExprPtr primary();
+    std::vector<ExprPtr> call_arguments();
 
     std::vector<Token> tokens_;
     std::size_t current_ = 0;
