@@ -494,9 +494,14 @@ WHILE running
     main_x = rail_w + 18
     main_y = 86
     main_w = size.Width - main_x - 28
-    main_h = size.Height - 272
     actions_y = size.Height - 226
     console_y = size.Height - 104
+    ' main_h must end where the actions panel begins (with a small gap) -- it used to be a
+    ' separate literal (size.Height - 272) that didn't agree with actions_y (size.Height - 226),
+    ' a 40px shortfall that let DrawVolumes' device list clip region run past where DrawActions'
+    ' "Selected" label and buttons start, so the two painted into the same band. Deriving main_h
+    ' from actions_y keeps them from drifting apart again.
+    main_h = actions_y - main_y - 12
 
     GUI.Clear(window, 0.045, 0.050, 0.058, 1.0)
     GUI.Rectangle(window, 0, 0, rail_w, size.Height, 0.065, 0.073, 0.086, 1.0)
