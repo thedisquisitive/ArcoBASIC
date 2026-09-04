@@ -2816,6 +2816,85 @@ Runtime::Runtime()
         write_plain_file(args[0].to_string(), string_from_bytes(args[1]), std::ios::binary | std::ios::trunc);
         return true;
     });
+    // Directory.Create/Exists, File.List, and System.Open had the same arco_shell-only gap as
+    // Path.*/ArcoSH.AssetsDir below and above -- examples/arconaut.abas (now built as a standalone
+    // ArcoFission capsule, not run through arcosh) uses all of them: Directory.Create/Exists and
+    // File.List for its Plugins tab's `~/.arcology/arcfs/plugins` discovery, System.Open to launch
+    // a mounted volume in the desktop file manager.
+    register_function("Directory.Create", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Directory.Create", 1, 1);
+        std::error_code error;
+        std::filesystem::create_directories(args[0].to_string(), error);
+        return !error || std::filesystem::exists(args[0].to_string());
+    });
+    register_function("Directory.Exists", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Directory.Exists", 1, 1);
+        return std::filesystem::is_directory(args[0].to_string());
+    });
+    register_function("File.List", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "File.List", 1, 1);
+        const std::filesystem::path directory(args[0].to_string());
+        std::error_code error;
+        if (!std::filesystem::is_directory(directory, error)) throw std::runtime_error("not a directory: " + directory.string());
+        std::vector<std::filesystem::directory_entry> entries;
+        for (std::filesystem::directory_iterator iterator(directory, std::filesystem::directory_options::skip_permission_denied, error), end;
+             !error && iterator != end; iterator.increment(error)) entries.push_back(*iterator);
+        if (error) throw std::runtime_error("could not list directory: " + directory.string() + ": " + error.message());
+        std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+            std::error_code left_error, right_error;
+            const bool left_directory = left.is_directory(left_error);
+            const bool right_directory = right.is_directory(right_error);
+            if (left_directory != right_directory) return left_directory;
+            return left.path().filename().string() < right.path().filename().string();
+        });
+        Value::Array result;
+        for (const auto& entry : entries) {
+            std::error_code entry_error;
+            const bool directory_entry = entry.is_directory(entry_error);
+            const auto name = entry.path().filename().string();
+            double size = 0;
+            if (!directory_entry) {
+                const auto bytes = entry.file_size(entry_error);
+                if (!entry_error) size = static_cast<double>(bytes);
+            }
+            result.emplace_back(Value::Object{{"Name", name}, {"Path", entry.path().string()}, {"IsDirectory", directory_entry},
+                                               {"IsFile", entry.is_regular_file(entry_error)}, {"IsHidden", !name.empty() && name.front() == '.'},
+                                               {"Size", size}, {"Extension", entry.path().extension().string()}});
+        }
+        return result;
+    });
+    register_function("System.Open", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "System.Open", 1, 1);
+        auto shell_quote = [](const std::string& text) {
+            std::string quoted = "'";
+            for (const char ch : text) {
+                if (ch == '\'') quoted += "'\\''";
+                else quoted += ch;
+            }
+            quoted += "'";
+            return quoted;
+        };
+        std::string opener;
+#ifdef _WIN32
+        opener = "start";
+#elif defined(__APPLE__)
+        if (process_run("command -v open >/dev/null 2>&1").get_property("Ok").truthy()) opener = "open";
+#else
+        if (process_run("command -v xdg-open >/dev/null 2>&1").get_property("Ok").truthy()) opener = "xdg-open";
+        else if (process_run("command -v gio >/dev/null 2>&1").get_property("Ok").truthy()) opener = "gio open";
+#endif
+        if (opener.empty()) throw std::runtime_error("System.Open is not available on this host");
+        const std::string target = args[0].to_string();
+#ifdef _WIN32
+        const std::string command = "cmd /c start \"\" " + shell_quote(target);
+        const int status = std::system(command.c_str());
+        return status == 0;
+#else
+        const std::string command = opener + " " + shell_quote(target) + " >/dev/null 2>&1 &";
+        const int status = std::system(command.c_str());
+        return WIFEXITED(status) ? WEXITSTATUS(status) == 0 : false;
+#endif
+    });
     // Path.* previously existed only in arco_shell (src/shell/arcosh.cpp) -- plain std::filesystem
     // wrappers with no shell-specific dependency, so a capsule (e.g. arcoflow/arcoflow.abas,
     // which needs Path.BaseName for its window title) had no way to reach them despite File.*
@@ -2847,6 +2926,28 @@ Runtime::Runtime()
     register_function("Path.Extension", [](const std::vector<Value>& args) -> Value {
         expect_arg_count(args, "Path.Extension", 1, 1);
         return std::filesystem::path(args[0].to_string()).extension().string();
+    });
+    // ArcoSH.AssetsDir had the same Path.*-shaped gap: registered only in arco_shell even though
+    // it's a plain std::filesystem search relative to the running executable, no shell state
+    // involved. examples/arconaut.abas calls it to locate its own bundled icon and is now built as
+    // a standalone ArcoFission capsule (not run through arcosh) -- "unknown host function:
+    // ArcoSH.AssetsDir" at launch, same shape as the Path.* gap above.
+    register_function("ArcoSH.AssetsDir", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "ArcoSH.AssetsDir", 0, 0);
+        std::vector<std::filesystem::path> candidates;
+        candidates.emplace_back(std::filesystem::current_path() / "assets");
+        if (const auto exe_dir = executable_directory()) {
+            candidates.emplace_back(*exe_dir / "assets");
+            candidates.emplace_back(*exe_dir / "share" / "arcobasic" / "assets");
+            candidates.emplace_back(*exe_dir / ".." / "share" / "arcobasic" / "assets");
+        }
+        for (const auto& candidate : candidates) {
+            std::error_code error;
+            if (std::filesystem::is_directory(candidate, error)) {
+                return std::filesystem::weakly_canonical(candidate, error).string();
+            }
+        }
+        return candidates.front().string();
     });
     // The ArcoFlow project format (see [[project_arcoflow_ide]] in agent memory / the working
     // agreement in the IDE's own project notes): a ".arcoproj" file is a single ArcoBASIC
