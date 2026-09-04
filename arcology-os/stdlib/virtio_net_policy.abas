@@ -1,0 +1,598 @@
+' RFC-0048 Milestone N0 remaining work (per the 2026-08-26 Networking Development Steering
+' Addendum, Section 11): real VirtIO-net legacy PCI transport -- MMIO/BAR mapping, device
+' reset/feature negotiation, and interface identity (MAC, link state, capabilities). This is the
+' first concrete NIC Backend behind the generic Network Interface Contract the addendum requires
+' (see network_interface_contract.abas); frame transmit/receive via virtqueues is the next
+' increment, deliberately not claimed here (Section 12: "do not implement tomorrow's feature
+' today", but this file's own state layout and the generic facade above it are already shaped so
+' that increment does not require a rewrite of anything below).
+'
+' Reuses this project's own established raw-PCI-scan and firmware-disconnect patterns verbatim in
+' shape: RFC-0045's UsbXhci.DiscoverPci / UsbXhci.DisconnectFirmwareDriver, RFC-0047's
+' GpuDiscovery. Same PciConfigReadU32/PciConfigAddressPort/PciConfigDataPort machinery, same
+' bus/device/function walk, same EFI_PCI_IO_PROTOCOL GetLocation-based firmware-driver eviction
+' (RFC-0045 Phase 3 found, via real QEMU trace events, that OVMF's own native driver for a
+' controller can stay bound and race this project's own raw-register driver for the same device;
+' many real OVMF builds also ship a VirtIO driver stack for cloud PXE boot, so the same defensive
+' step is applied here before this driver touches the controller).
+'
+' Scoped to real legacy VirtIO PCI transport (pre-1.0 "transitional" layout): a plain I/O-space
+' BAR0, an 8-bit DeviceStatus register, and device-specific config (MAC, link status) starting
+' immediately after the fixed legacy header. This driver assumes MSI-X is not present on the
+' function (QEMU: `vectors=0`), which keeps the device-specific config offset fixed at +0x14
+' rather than +0x18 -- confirmed empirically under real QEMU, not assumed, matching this project's
+' own established discipline (see systems_virtio_net_transport_smoke.sh).
+'
+' Real, honest feature negotiation: this driver accepts only the two device-offered feature bits
+' it actually understands and uses -- VIRTIO_NET_F_MAC (bit 5) and VIRTIO_NET_F_STATUS (bit 16) --
+' rather than either accepting nothing (which would make the device-specific fields it reads
+' meaningless per spec) or blindly echoing every offered feature back (which would be a false claim
+' of support this driver does not have).
+
+#PROFILE UEFI
+#TARGET X86_64
+#RUNTIME NONE
+
+FUNCTION VirtioNetStateAddress() AS MMIOPTR
+    RETURN ADDRESS.MMIO(ADDRESS.Virtual(62914560))   ' 0x3C00000, clear of every other fixed scratch region this project uses
+END FUNCTION
+
+' State layout: PCI Bus/Device/Function (U32 each, +0/+4/+8), negotiated feature mask (U32, +16).
+FUNCTION VirtioNetPciBusAddress() AS MMIOPTR
+    RETURN VirtioNetStateAddress()
+END FUNCTION
+FUNCTION VirtioNetPciDeviceAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 4)
+END FUNCTION
+FUNCTION VirtioNetPciFunctionAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 8)
+END FUNCTION
+FUNCTION VirtioNetFeaturesAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 16)
+END FUNCTION
+FUNCTION VirtioNetDisconnectGuidAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 320)
+END FUNCTION
+FUNCTION VirtioNetDisconnectHandlesAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 336)
+END FUNCTION
+FUNCTION VirtioNetDisconnectIfaceAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 464)
+END FUNCTION
+
+FUNCTION VirtioNetPciConfigAddressPort() AS IOPORT
+    RETURN PORT.Address(3320)   ' 0xCF8
+END FUNCTION
+FUNCTION VirtioNetPciConfigDataPort() AS IOPORT
+    RETURN PORT.Address(3324)   ' 0xCFC
+END FUNCTION
+FUNCTION VirtioNetPciConfigReadU32(bus AS U32, device AS U32, func AS U32, offset AS U32) AS U32
+    LET address AS U32 = 2147483648
+    address = address OR (bus SHL 16)
+    address = address OR (device SHL 11)
+    address = address OR (func SHL 8)
+    address = address OR (offset AND 252)
+    LET addrPort AS IOPORT = VirtioNetPciConfigAddressPort()
+    LET dataPort AS IOPORT = VirtioNetPciConfigDataPort()
+    PORT.WriteDWord(addrPort, address)
+    LET value AS U32 = PORT.ReadDWord(dataPort)
+    RETURN value
+END FUNCTION
+FUNCTION VirtioNetPciConfigWriteU32(bus AS U32, device AS U32, func AS U32, offset AS U32, value AS U32) AS BOOL
+    LET address AS U32 = 2147483648
+    address = address OR (bus SHL 16)
+    address = address OR (device SHL 11)
+    address = address OR (func SHL 8)
+    address = address OR (offset AND 252)
+    LET addrPort AS IOPORT = VirtioNetPciConfigAddressPort()
+    LET dataPort AS IOPORT = VirtioNetPciConfigDataPort()
+    PORT.WriteDWord(addrPort, address)
+    PORT.WriteDWord(dataPort, value)
+    RETURN 1
+END FUNCTION
+
+' Real, full PCI bus scan for VirtIO's own PCI vendor ID (0x1AF4, Red Hat, Inc.'s real VirtIO
+' allocation) with PCI base class 0x02 (Network Controller). Deliberately vendor+class scoped,
+' not "any NIC" -- this file is specifically the VirtIO-net backend, matching UsbXhci.DiscoverPci's
+' own precedent of searching for its exact target class/subclass/prog-if rather than a generic scan.
+FUNCTION VirtioNet.DiscoverPci(systemTable AS UEFI.SystemTable) AS BOOL
+    LET found AS BOOL = 0
+    LET bus AS U32 = 0
+    WHILE bus < 256
+        IF found = 0 THEN
+            LET device AS U32 = 0
+            WHILE device < 32
+                IF found = 0 THEN
+                    LET func AS U32 = 0
+                    WHILE func < 8
+                        IF found = 0 THEN
+                            LET vendorDevice AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 0)
+                            LET vendorId AS U32 = vendorDevice AND 65535
+                            IF vendorId = 6900 THEN
+                                LET classReg AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 8)
+                                LET baseClass AS U32 = (classReg SHR 24) AND 255
+                                IF baseClass = 2 THEN
+                                    found = 1
+                                    MEMORY.Write32(VirtioNetPciBusAddress(), bus)
+                                    MEMORY.Write32(VirtioNetPciDeviceAddress(), device)
+                                    MEMORY.Write32(VirtioNetPciFunctionAddress(), func)
+                                END IF
+                            END IF
+                        END IF
+                        func = func + 1
+                    WEND
+                END IF
+                device = device + 1
+            WEND
+        END IF
+        bus = bus + 1
+    WEND
+    RETURN found
+END FUNCTION
+
+' Identical shape to UsbXhci.DisconnectFirmwareDriver (RFC-0045 Phase 3's own real, QEMU-trace-
+' confirmed fix): finds the EFI_HANDLE firmware knows this exact PCI Bus/Device/Function by, via
+' EFI_PCI_IO_PROTOCOL's GetLocation, and calls BootServices.DisconnectController on it. Real,
+' honest fail-open: if no matching handle is found, this returns FALSE without touching anything
+' else -- not a hard requirement upstream.
+FUNCTION VirtioNet.DisconnectFirmwareDriver(systemTable AS UEFI.SystemTable) AS BOOL
+    LET guidBuf AS MMIOPTR = VirtioNetDisconnectGuidAddress()
+    MEMORY.Write64(guidBuf, 5522935658814222848)
+    MEMORY.Write64(ADDRESS.Offset(guidBuf, 8), 11097520664359398558)
+
+    LET maxHandles AS U64 = 16
+    LET bufferSize AS U64 = maxHandles * 8
+    LET bufferSizeAddr AS PTR = ADDRESS.Local(bufferSize)
+    LET handleBuffer AS MMIOPTR = VirtioNetDisconnectHandlesAddress()
+
+    LET status AS U64 = systemTable.BootServices.LocateHandle(2, guidBuf, 0, bufferSizeAddr, handleBuffer)
+    IF status <> 0 THEN
+        RETURN 0
+    END IF
+
+    LET foundCount AS U64 = bufferSize \ 8
+    IF foundCount > maxHandles THEN
+        foundCount = maxHandles
+    END IF
+
+    LET targetBus AS U32 = MEMORY.Read32(VirtioNetPciBusAddress())
+    LET targetDevice AS U32 = MEMORY.Read32(VirtioNetPciDeviceAddress())
+    LET targetFunction AS U32 = MEMORY.Read32(VirtioNetPciFunctionAddress())
+
+    LET disconnected AS BOOL = 0
+    LET i AS U64 = 0
+    WHILE i < foundCount
+        LET handleEntry AS MMIOPTR = ADDRESS.Offset(handleBuffer, i * 8)
+        LET handle AS U64 = MEMORY.Read64(handleEntry)
+        LET ifaceOutAddr AS MMIOPTR = VirtioNetDisconnectIfaceAddress()
+        LET hpStatus AS U64 = systemTable.BootServices.HandleProtocol(handle, guidBuf, ifaceOutAddr)
+        IF hpStatus = 0 THEN
+            LET pciIo AS UEFI.PciIoProtocol = MEMORY.Read64(ifaceOutAddr)
+            LET segOut AS U64 = 0
+            LET segOutAddr AS PTR = ADDRESS.Local(segOut)
+            LET busOut AS U64 = 0
+            LET busOutAddr AS PTR = ADDRESS.Local(busOut)
+            LET devOut AS U64 = 0
+            LET devOutAddr AS PTR = ADDRESS.Local(devOut)
+            LET funcOut AS U64 = 0
+            LET funcOutAddr AS PTR = ADDRESS.Local(funcOut)
+            LET glStatus AS U64 = pciIo.GetLocation(segOutAddr, busOutAddr, devOutAddr, funcOutAddr)
+            IF glStatus = 0 THEN
+                LET busU32 AS U32 = busOut
+                LET devU32 AS U32 = devOut
+                LET funcU32 AS U32 = funcOut
+                IF busU32 = targetBus THEN
+                    IF devU32 = targetDevice THEN
+                        IF funcU32 = targetFunction THEN
+                            systemTable.BootServices.DisconnectController(handle, 0, 0)
+                            disconnected = 1
+                        END IF
+                    END IF
+                END IF
+            END IF
+        END IF
+        i = i + 1
+    WEND
+    RETURN disconnected
+END FUNCTION
+
+' Recomputed fresh from PCI config on every call rather than cached: this raw driver is the only
+' software touching the device after VirtioNet.DisconnectFirmwareDriver, so BAR0 cannot change
+' underneath it, and a fresh read keeps every accessor self-contained (matching this file's own
+' "simple over minimal" discipline already established elsewhere in this project).
+FUNCTION VirtioNetIoBase() AS U16
+    LET bus AS U32 = MEMORY.Read32(VirtioNetPciBusAddress())
+    LET device AS U32 = MEMORY.Read32(VirtioNetPciDeviceAddress())
+    LET func AS U32 = MEMORY.Read32(VirtioNetPciFunctionAddress())
+    LET bar0 AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 16)
+    LET ioBase32 AS U32 = bar0 AND 4294967292   ' clear bit0 (I/O indicator) and bit1 (reserved)
+    LET ioBase AS U16 = ioBase32
+    RETURN ioBase
+END FUNCTION
+
+' Confirms BAR0 is a real I/O-space BAR (bit0=1; legacy VirtIO PCI, forced via QEMU's own
+' `disable-modern=on`), enables I/O Space (bit0) + Bus Master (bit2) in the PCI Command register,
+' and disconnects any firmware-bound driver first. Real, honest failure if BAR0 is not an I/O BAR
+' (e.g. a modern-only virtio-net-pci with legacy transport disabled) -- this driver does not
+' attempt the separate modern-virtio MMIO-capability transport.
+FUNCTION VirtioNet.MapIo(systemTable AS UEFI.SystemTable) AS BOOL
+    VirtioNet.DisconnectFirmwareDriver(systemTable)
+
+    LET bus AS U32 = MEMORY.Read32(VirtioNetPciBusAddress())
+    LET device AS U32 = MEMORY.Read32(VirtioNetPciDeviceAddress())
+    LET func AS U32 = MEMORY.Read32(VirtioNetPciFunctionAddress())
+
+    LET bar0 AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 16)
+    LET isIoBar AS U32 = bar0 AND 1
+    IF isIoBar = 0 THEN
+        RETURN 0
+    END IF
+
+    LET commandReg AS U32 = VirtioNetPciConfigReadU32(bus, device, func, 4)
+    VirtioNetPciConfigWriteU32(bus, device, func, 4, commandReg OR 5)
+    RETURN 1
+END FUNCTION
+
+' Legacy VirtIO device reset: writing 0 to the 8-bit DeviceStatus register (I/O offset +0x12)
+' both initializes and tears down the device per the VirtIO legacy spec. Reads back to confirm,
+' matching this project's own "read back to confirm" discipline (e.g. UsbXhci.Reset).
+FUNCTION VirtioNet.Reset() AS BOOL
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET statusPortNum AS U16 = ioBase + 18
+    LET statusPort AS IOPORT = PORT.Address(statusPortNum)
+    PORT.WriteByte(statusPort, 0)
+    LET readback AS U8 = PORT.ReadByte(statusPort)
+    RETURN readback = 0
+END FUNCTION
+
+' Real legacy VirtIO status handshake (ACKNOWLEDGE -> DRIVER -> feature negotiation -> DRIVER_OK).
+' Feature negotiation is real and minimal, not all-or-nothing: this driver accepts only the device-
+' offered bits it actually understands and uses right now -- VIRTIO_NET_F_MAC (bit 5, value 32) and
+' VIRTIO_NET_F_STATUS (bit 16, value 65536) -- ANDed against what the device actually offers, never
+' claiming support this driver does not have.
+FUNCTION VirtioNet.Negotiate() AS BOOL
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET statusPortNum AS U16 = ioBase + 18
+    LET statusPort AS IOPORT = PORT.Address(statusPortNum)
+    LET featuresPortNum AS U16 = ioBase
+    LET featuresPort AS IOPORT = PORT.Address(featuresPortNum)
+    LET guestFeaturesPortNum AS U16 = ioBase + 4
+    LET guestFeaturesPort AS IOPORT = PORT.Address(guestFeaturesPortNum)
+
+    PORT.WriteByte(statusPort, 1)   ' ACKNOWLEDGE
+    PORT.WriteByte(statusPort, 3)   ' ACKNOWLEDGE | DRIVER
+
+    LET deviceFeatures AS U32 = PORT.ReadDWord(featuresPort)
+    LET understoodMask AS U32 = 65568   ' VIRTIO_NET_F_MAC (32) | VIRTIO_NET_F_STATUS (65536)
+    LET acceptedFeatures AS U32 = deviceFeatures AND understoodMask
+    PORT.WriteDWord(guestFeaturesPort, acceptedFeatures)
+    MEMORY.Write32(VirtioNetFeaturesAddress(), acceptedFeatures)
+
+    PORT.WriteByte(statusPort, 7)   ' ACKNOWLEDGE | DRIVER | DRIVER_OK
+    LET readback AS U8 = PORT.ReadByte(statusPort)
+    LET driverOkBit AS U8 = readback AND 4
+    RETURN driverOkBit = 4
+END FUNCTION
+
+' Real negotiated-feature bitmask this driver accepted, for capability reporting -- not the raw
+' device-offered set, which would overstate what this driver actually understands and uses.
+FUNCTION VirtioNet.GetCapabilities() AS U32
+    RETURN MEMORY.Read32(VirtioNetFeaturesAddress())
+END FUNCTION
+
+' Legacy VirtIO device-specific config begins at I/O offset +0x14 (20) when the function has no
+' MSI-X capability (QEMU: `vectors=0`) -- confirmed empirically under real QEMU, not assumed. For
+' virtio-net, the first 6 bytes of device-specific config are the real MAC address. Honest about
+' scope: if VIRTIO_NET_F_MAC was not negotiated (this driver did not accept it, or the device did
+' not offer it), the field's contents are not meaningful per spec and this returns FALSE without
+' writing anything to outAddr.
+FUNCTION VirtioNet.ReadMac(outAddr AS MMIOPTR) AS BOOL
+    LET features AS U32 = VirtioNet.GetCapabilities()
+    LET macFeature AS U32 = features AND 32
+    IF macFeature = 0 THEN
+        RETURN 0
+    END IF
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET configBase AS U16 = ioBase + 20
+    LET i AS U32 = 0
+    WHILE i < 6
+        LET iU16 AS U16 = i
+        LET bytePortNum AS U16 = configBase + iU16
+        LET bytePort AS IOPORT = PORT.Address(bytePortNum)
+        LET macByte AS U8 = PORT.ReadByte(bytePort)
+        MEMORY.Write8(ADDRESS.Offset(outAddr, i), macByte)
+        i = i + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Real link state, gated on whether VIRTIO_NET_F_STATUS was actually negotiated. Returns 0=DOWN,
+' 1=UP, 2=UNKNOWN (feature not negotiated, so the status field's contents are not meaningful).
+FUNCTION VirtioNet.LinkState() AS U32
+    LET features AS U32 = VirtioNet.GetCapabilities()
+    LET statusFeature AS U32 = features AND 65536
+    IF statusFeature = 0 THEN
+        RETURN 2
+    END IF
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET statusFieldPortNum AS U16 = ioBase + 26   ' device-specific config +6 (past the 6-byte MAC)
+    LET statusFieldPort AS IOPORT = PORT.Address(statusFieldPortNum)
+    LET linkStatus AS U16 = PORT.ReadWord(statusFieldPort)
+    LET linkUpBit AS U16 = linkStatus AND 1
+    IF linkUpBit = 1 THEN
+        RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+' --- Virtqueues: real transmit/receive transport, RFC-0048 Section 6.1's own explicit-ownership
+' requirement and the Steering Addendum's Section 2.2 (packet/DMA ownership must never be
+' ambiguous). A buffer has exactly one owner at any moment: the driver owns it until the moment it
+' is published on a queue's avail ring (an explicit, code-visible transfer of ownership to the
+' device -- see VirtioNet.PostRxBuffer and VirtioNet.TransmitFrame), and the device owns it from
+' that point until it appears on the used ring (VirtioNet.TryConsumeUsed is the only place
+' ownership returns to the driver). No function in this file reads or writes a buffer outside
+' those two explicit transfer points.
+'
+' Scoped deliberately to exactly what a first real transport proof needs: one descriptor, one
+' buffer, one packet in flight per queue (RX = queue 0, TX = queue 1), no chained descriptors, no
+' interrupts (polled only). A production driver would pool multiple buffers per queue; that is real
+' future work, not a defect in this proof -- the ownership discipline above does not change when
+' that work happens; only the number of buffers in flight does.
+'
+' Real legacy virtqueue layout (VirtIO 0.9.5 legacy transport): a descriptor table, immediately
+' followed by the avail ring, then real page-aligned padding up to the next 4096-byte boundary,
+' then the used ring. QueueSize is read from real hardware (VirtioNet.SetupQueue), never assumed,
+' and every offset below is computed from that real value -- not hardcoded for one specific size.
+
+FUNCTION VirtioNetRxQueueStateAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 512)
+END FUNCTION
+FUNCTION VirtioNetTxQueueStateAddress() AS MMIOPTR
+    RETURN ADDRESS.Offset(VirtioNetStateAddress(), 576)
+END FUNCTION
+
+' Per-queue state fields (64-byte stride, addressed relative to a caller-supplied base -- either
+' VirtioNetRxQueueStateAddress() or VirtioNetTxQueueStateAddress()): physical address of the
+' allocated queue memory (U64, +0), the same memory's own MMIOPTR value for reuse (U64, +8), the
+' real hardware-reported QueueSize (U32, +16), the real computed used-ring byte offset (U32, +20),
+' the driver's own free-running used-ring consumption counter (U32, +24), the driver's own
+' free-running avail-ring publish counter (U32, +28), and the one real DMA-visible packet buffer
+' this queue owns (physical address U64 +32, MMIOPTR value U64 +40).
+FUNCTION VirtioNetQueuePhysAddrField(base AS MMIOPTR) AS MMIOPTR
+    RETURN base
+END FUNCTION
+FUNCTION VirtioNetQueueMmioValueField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 8)
+END FUNCTION
+FUNCTION VirtioNetQueueSizeField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 16)
+END FUNCTION
+FUNCTION VirtioNetQueueUsedOffsetField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 20)
+END FUNCTION
+FUNCTION VirtioNetQueueLastUsedIdxField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 24)
+END FUNCTION
+FUNCTION VirtioNetQueueNextAvailIdxField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 28)
+END FUNCTION
+FUNCTION VirtioNetQueueBufPhysAddrField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 32)
+END FUNCTION
+FUNCTION VirtioNetQueueBufMmioValueField(base AS MMIOPTR) AS MMIOPTR
+    RETURN ADDRESS.Offset(base, 40)
+END FUNCTION
+
+' Selects queueIndex, reads its real hardware-reported QueueSize (0 means "queue does not exist";
+' this driver requires exactly 2 queues -- 0=receiveq, 1=transmitq -- matching legacy virtio-net
+' with VIRTIO_NET_F_CTRL_VQ not negotiated), computes the real legacy virtqueue layout for that
+' size, allocates and zeroes enough real pages to hold it (BootServices.AllocatePages -- no zero-
+' fill guarantee, so this driver zeroes explicitly, matching UsbXhci.SetupRings's own established
+' discipline), programs QueueAddress with the real PFN, and allocates this queue's one real packet
+' buffer. A QueueSize above 1024 is rejected closed -- a real, documented safety ceiling for this
+' initial implementation, not a spec limit.
+FUNCTION VirtioNet.SetupQueue(systemTable AS UEFI.SystemTable, queueIndex AS U32, stateBase AS MMIOPTR) AS BOOL
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET selectPortNum AS U16 = ioBase + 14
+    LET selectPort AS IOPORT = PORT.Address(selectPortNum)
+    LET queueIndexU16 AS U16 = queueIndex
+    PORT.WriteWord(selectPort, queueIndexU16)
+
+    LET sizePortNum AS U16 = ioBase + 12
+    LET sizePort AS IOPORT = PORT.Address(sizePortNum)
+    LET queueSize16 AS U16 = PORT.ReadWord(sizePort)
+    LET queueSize AS U32 = queueSize16
+    IF queueSize = 0 THEN
+        RETURN 0
+    END IF
+    IF queueSize > 1024 THEN
+        RETURN 0
+    END IF
+
+    LET descBytes AS U32 = queueSize * 16
+    LET availBytes AS U32 = 4 + (queueSize * 2)
+    LET unalignedUsedOffset AS U32 = descBytes + availBytes
+    LET alignedUsedOffset AS U32 = ((unalignedUsedOffset + 4095) \ 4096) * 4096
+    LET usedBytes AS U32 = 4 + (queueSize * 8)
+    LET totalBytes AS U32 = alignedUsedOffset + usedBytes
+    LET pagesNeeded AS U32 = (totalBytes + 4095) \ 4096
+
+    LET queuePhys AS U64 = 0
+    LET queuePhysAddr AS PTR = ADDRESS.Local(queuePhys)
+    LET pagesNeededU64 AS U64 = pagesNeeded
+    LET allocStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, pagesNeededU64, queuePhysAddr)
+    IF allocStatus <> 0 THEN
+        RETURN 0
+    END IF
+
+    LET queueMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(queuePhys))
+    LET zeroTotalBytes AS U32 = pagesNeeded * 4096
+    LET qwordIndex AS U32 = 0
+    WHILE (qwordIndex * 8) < zeroTotalBytes
+        MEMORY.Write64(ADDRESS.Offset(queueMmio, qwordIndex * 8), 0)
+        qwordIndex = qwordIndex + 1
+    WEND
+
+    MEMORY.Write64(VirtioNetQueuePhysAddrField(stateBase), queuePhys)
+    LET queueMmioValue AS U64 = ADDRESS.Value(queueMmio)
+    MEMORY.Write64(VirtioNetQueueMmioValueField(stateBase), queueMmioValue)
+    MEMORY.Write32(VirtioNetQueueSizeField(stateBase), queueSize)
+    MEMORY.Write32(VirtioNetQueueUsedOffsetField(stateBase), alignedUsedOffset)
+    MEMORY.Write32(VirtioNetQueueLastUsedIdxField(stateBase), 0)
+    MEMORY.Write32(VirtioNetQueueNextAvailIdxField(stateBase), 0)
+
+    LET pfn64 AS U64 = queuePhys SHR 12
+    LET pfn32 AS U32 = pfn64
+    LET addrPortNum AS U16 = ioBase + 8
+    LET addrPort AS IOPORT = PORT.Address(addrPortNum)
+    PORT.WriteDWord(addrPort, pfn32)
+
+    LET bufPhys AS U64 = 0
+    LET bufPhysAddr AS PTR = ADDRESS.Local(bufPhys)
+    LET bufAllocStatus AS U64 = systemTable.BootServices.AllocatePages(0, 2, 1, bufPhysAddr)
+    IF bufAllocStatus <> 0 THEN
+        RETURN 0
+    END IF
+    LET bufMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(bufPhys))
+    LET bufZeroIndex AS U32 = 0
+    WHILE (bufZeroIndex * 8) < 4096
+        MEMORY.Write64(ADDRESS.Offset(bufMmio, bufZeroIndex * 8), 0)
+        bufZeroIndex = bufZeroIndex + 1
+    WEND
+    MEMORY.Write64(VirtioNetQueueBufPhysAddrField(stateBase), bufPhys)
+    LET bufMmioValue AS U64 = ADDRESS.Value(bufMmio)
+    MEMORY.Write64(VirtioNetQueueBufMmioValueField(stateBase), bufMmioValue)
+
+    RETURN 1
+END FUNCTION
+
+' Publishes this RX queue's one real buffer to the device as a device-writable descriptor (flag
+' VIRTQ_DESC_F_WRITE=2) and rings the RX queue's doorbell. Ownership of the buffer transfers to the
+' device at this point -- this driver MUST NOT read or write it again until VirtioNet.
+' TryConsumeUsed reports it back on the used ring.
+FUNCTION VirtioNet.PostRxBuffer(stateBase AS MMIOPTR) AS BOOL
+    LET queueMmioValue AS U64 = MEMORY.Read64(VirtioNetQueueMmioValueField(stateBase))
+    LET queueMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(queueMmioValue))
+    LET bufPhys AS U64 = MEMORY.Read64(VirtioNetQueueBufPhysAddrField(stateBase))
+    LET queueSize AS U32 = MEMORY.Read32(VirtioNetQueueSizeField(stateBase))
+    LET availOffset AS U32 = queueSize * 16
+
+    MEMORY.Write64(queueMmio, bufPhys)
+    MEMORY.Write32(ADDRESS.Offset(queueMmio, 8), 2048)
+    LET writeFlag AS U16 = 2
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, 12), writeFlag)
+    LET zeroU16 AS U16 = 0
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, 14), zeroU16)
+
+    LET nextAvailIdx AS U32 = MEMORY.Read32(VirtioNetQueueNextAvailIdxField(stateBase))
+    LET ringSlot AS U32 = nextAvailIdx MOD queueSize
+    LET descIndexU16 AS U16 = 0
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, availOffset + 4 + (ringSlot * 2)), descIndexU16)
+
+    CPU.MemoryBarrier
+
+    LET newAvailIdx AS U32 = nextAvailIdx + 1
+    LET newAvailIdxU16 AS U16 = newAvailIdx
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, availOffset + 2), newAvailIdxU16)
+    MEMORY.Write32(VirtioNetQueueNextAvailIdxField(stateBase), newAvailIdx)
+
+    CPU.MemoryBarrier
+
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET notifyPortNum AS U16 = ioBase + 16
+    LET notifyPort AS IOPORT = PORT.Address(notifyPortNum)
+    LET rxQueueIndexU16 AS U16 = 0
+    PORT.WriteWord(notifyPort, rxQueueIndexU16)
+
+    RETURN 1
+END FUNCTION
+
+' Copies frameLen bytes from frameAddr into the TX queue's one real buffer, preceded by a real
+' 10-byte virtio_net_hdr (all-zero: no checksum/segmentation offload negotiated or used -- legacy
+' virtio-net's own real wire format requires this header regardless), publishes a device-readable
+' descriptor (no WRITE flag: ownership transfers to the device, which will only read it), and rings
+' the TX queue's doorbell.
+FUNCTION VirtioNet.TransmitFrame(stateBase AS MMIOPTR, frameAddr AS MMIOPTR, frameLen AS U32) AS BOOL
+    LET queueMmioValue AS U64 = MEMORY.Read64(VirtioNetQueueMmioValueField(stateBase))
+    LET queueMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(queueMmioValue))
+    LET bufPhys AS U64 = MEMORY.Read64(VirtioNetQueueBufPhysAddrField(stateBase))
+    LET bufMmioValue AS U64 = MEMORY.Read64(VirtioNetQueueBufMmioValueField(stateBase))
+    LET bufMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(bufMmioValue))
+    LET queueSize AS U32 = MEMORY.Read32(VirtioNetQueueSizeField(stateBase))
+    LET availOffset AS U32 = queueSize * 16
+
+    LET hdrIndex AS U32 = 0
+    WHILE hdrIndex < 10
+        MEMORY.Write8(ADDRESS.Offset(bufMmio, hdrIndex), 0)
+        hdrIndex = hdrIndex + 1
+    WEND
+    LET copyIndex AS U32 = 0
+    WHILE copyIndex < frameLen
+        LET frameByte AS U8 = MEMORY.Read8(ADDRESS.Offset(frameAddr, copyIndex))
+        MEMORY.Write8(ADDRESS.Offset(bufMmio, 10 + copyIndex), frameByte)
+        copyIndex = copyIndex + 1
+    WEND
+
+    LET totalLen AS U32 = 10 + frameLen
+
+    MEMORY.Write64(queueMmio, bufPhys)
+    MEMORY.Write32(ADDRESS.Offset(queueMmio, 8), totalLen)
+    LET noFlags AS U16 = 0
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, 12), noFlags)
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, 14), noFlags)
+
+    LET nextAvailIdx AS U32 = MEMORY.Read32(VirtioNetQueueNextAvailIdxField(stateBase))
+    LET ringSlot AS U32 = nextAvailIdx MOD queueSize
+    LET descIndexU16 AS U16 = 0
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, availOffset + 4 + (ringSlot * 2)), descIndexU16)
+
+    CPU.MemoryBarrier
+
+    LET newAvailIdx AS U32 = nextAvailIdx + 1
+    LET newAvailIdxU16 AS U16 = newAvailIdx
+    MEMORY.Write16(ADDRESS.Offset(queueMmio, availOffset + 2), newAvailIdxU16)
+    MEMORY.Write32(VirtioNetQueueNextAvailIdxField(stateBase), newAvailIdx)
+
+    CPU.MemoryBarrier
+
+    LET ioBase AS U16 = VirtioNetIoBase()
+    LET notifyPortNum AS U16 = ioBase + 16
+    LET notifyPort AS IOPORT = PORT.Address(notifyPortNum)
+    LET txQueueIndexU16 AS U16 = 1
+    PORT.WriteWord(notifyPort, txQueueIndexU16)
+
+    RETURN 1
+END FUNCTION
+
+' Non-blocking single check for a new used-ring completion. Returns FALSE immediately if nothing
+' new is pending -- callers own their own bounded polling loop (matching this project's own
+' established busy-wait idiom, e.g. UsbXhci.Reset), never blocking indefinitely inside this
+' function. This is the ONLY place a buffer's ownership returns from the device to the driver.
+' Compares the real hardware used.idx against this driver's own consumption counter narrowed to
+' the same 16-bit width, so wraparound of the free-running index compares correctly.
+FUNCTION VirtioNet.TryConsumeUsed(stateBase AS MMIOPTR, outLen AS PTR) AS BOOL
+    LET queueMmioValue AS U64 = MEMORY.Read64(VirtioNetQueueMmioValueField(stateBase))
+    LET queueMmio AS MMIOPTR = ADDRESS.MMIO(ADDRESS.Virtual(queueMmioValue))
+    LET usedOffset AS U32 = MEMORY.Read32(VirtioNetQueueUsedOffsetField(stateBase))
+    LET queueSize AS U32 = MEMORY.Read32(VirtioNetQueueSizeField(stateBase))
+    LET lastUsedIdx AS U32 = MEMORY.Read32(VirtioNetQueueLastUsedIdxField(stateBase))
+    LET lastUsedIdx16 AS U16 = lastUsedIdx
+
+    LET usedIdx16 AS U16 = MEMORY.Read16(ADDRESS.Offset(queueMmio, usedOffset + 2))
+    IF usedIdx16 = lastUsedIdx16 THEN
+        RETURN 0
+    END IF
+
+    CPU.MemoryBarrier
+
+    LET ringSlot AS U32 = lastUsedIdx MOD queueSize
+    LET lenAddr AS MMIOPTR = ADDRESS.Offset(queueMmio, usedOffset + 4 + (ringSlot * 8) + 4)
+    LET consumedLen AS U32 = MEMORY.Read32(lenAddr)
+    MEMORY.Write32(outLen, consumedLen)
+
+    LET newLastUsedIdx AS U32 = lastUsedIdx + 1
+    MEMORY.Write32(VirtioNetQueueLastUsedIdxField(stateBase), newLastUsedIdx)
+
+    RETURN 1
+END FUNCTION
