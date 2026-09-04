@@ -1,0 +1,16 @@
+# ArcFS filesystem discovery for udev/udisks2.
+#
+# libblkid does not know ArcFS yet, so this rule asks arcfs-linux to validate
+# candidate block devices and import ID_FS_* properties when the ArcFS FMV2
+# superblock ring and checkpoint are valid.
+
+ACTION=="remove", GOTO="arcfs_probe_end"
+SUBSYSTEM!="block", GOTO="arcfs_probe_end"
+ENV{DEVNAME}!="?*", GOTO="arcfs_probe_end"
+ENV{ID_FS_TYPE}=="?*", GOTO="arcfs_probe_end"
+KERNEL=="ram*|zram*|fd*", GOTO="arcfs_probe_end"
+
+IMPORT{program}="/bin/sh -c 'PATH=/usr/bin:/usr/local/bin:/bin:/usr/sbin:/usr/local/sbin exec arcfs-linux probe \"$DEVNAME\"'"
+ENV{ID_FS_TYPE}=="arcfs", ENV{UDISKS_PRESENTATION_NAME}="ArcFS Volume"
+
+LABEL="arcfs_probe_end"

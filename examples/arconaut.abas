@@ -1,283 +1,557 @@
-#DESCRIPTION "Arconaut desktop file navigator"
+#TARGET linux
+#DESCRIPTION "Arconaut ArcFS administrator"
+
+FUNCTION ShellQuote(value)
+    text = STRING(value)
+    quoted = "'"
+    index = 0
+    WHILE index < String.Length(text)
+        ch = String.Slice(text, index, 1)
+        IF ch == "'" THEN
+            quoted = quoted + "'\''"
+        ELSE
+            quoted = quoted + ch
+        END IF
+        index = index + 1
+    WEND
+    RETURN quoted + "'"
+END FUNCTION
+
+FUNCTION RunCommand(command)
+    result = Process.Run(command)
+    output = ""
+    IF Object.Has(result, "Output") THEN output = result.Output
+    IF result.Ok THEN
+        app.Status = "Command completed"
+    ELSE
+        app.Status = "Command failed: " + STRING(result.ExitCode)
+        IF Object.Has(result, "Error") THEN output = output + "\n" + result.Error
+    END IF
+    IF String.Length(String.Trim(output)) > 0 THEN app.Console = String.Trim(output)
+    RETURN result.Ok
+END FUNCTION
+
+FUNCTION CommandExists(name)
+    result = Process.Run("command -v " + ShellQuote(name) + " >/dev/null 2>&1")
+    RETURN result.Ok
+END FUNCTION
+
+FUNCTION FirstToken(line)
+    parts = String.Split(String.Trim(line), " ")
+    index = 0
+    WHILE index < LEN(parts)
+        token = String.Trim(parts[index])
+        IF token <> "" THEN RETURN token
+        index = index + 1
+    WEND
+    RETURN ""
+END FUNCTION
+
+FUNCTION AddLog(text)
+    ignored = Array.Push(app.Log, text)
+    WHILE LEN(app.Log) > 7
+        ignored = Array.Shift(app.Log)
+    WEND
+END FUNCTION
+
+FUNCTION SetConsole(title, text)
+    app.ConsoleTitle = title
+    app.Console = text
+END FUNCTION
+
+FUNCTION RefreshDevices()
+    IF CommandExists("lsblk") THEN
+        result = Process.Run("lsblk -pnro PATH,SIZE,FSTYPE,TRAN,RM,RO,MOUNTPOINTS")
+        IF Object.Has(result, "Output") THEN
+            app.DeviceText = String.Trim(result.Output)
+            app.Devices = String.Split(app.DeviceText, "\n")
+            SetConsole("Devices", app.DeviceText)
+            app.Status = STRING(LEN(app.Devices)) + " block entries"
+            AddLog("Refreshed block devices")
+        ELSE
+            app.Status = "lsblk returned no output"
+        END IF
+    ELSE
+        app.Status = "lsblk is not installed"
+    END IF
+END FUNCTION
+
+FUNCTION SelectDevice(index)
+    IF index >= 0 AND index < LEN(app.Devices) THEN
+        line = app.Devices[index]
+        source = FirstToken(line)
+        IF source <> "" THEN
+            app.SelectedSource = source
+            app.SelectedKind = "device"
+            app.Status = "Selected " + source
+        END IF
+    END IF
+END FUNCTION
+
+FUNCTION OpenImage()
+    path = GUI.OpenFileDialog(window, "Open ArcFS image", app.Home)
+    IF path <> "" THEN
+        app.SelectedSource = path
+        app.SelectedKind = "image"
+        app.Status = "Selected image " + path
+        InspectSource()
+    END IF
+END FUNCTION
+
+FUNCTION CreateImage()
+    path = GUI.SaveFileDialog(window, "Create ArcFS image", Path.Join(app.Home, "arcfs.img"))
+    IF path <> "" THEN
+        command = "arcfsctl create-image " + ShellQuote(path) + " " + ShellQuote(app.ImageSize) + " --format"
+        IF RunCommand(command) THEN
+            app.SelectedSource = path
+            app.SelectedKind = "image"
+            app.Status = "Created " + path
+            AddLog("Created image " + path)
+        END IF
+    END IF
+END FUNCTION
+
+FUNCTION InspectSource()
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a device or image first"
+        RETURN FALSE
+    END IF
+    command = "arcfs-linux inspect " + ShellQuote(app.SelectedSource)
+    ok = RunCommand(command)
+    app.ConsoleTitle = "Inspect: " + app.SelectedSource
+    IF ok THEN AddLog("Inspected " + app.SelectedSource)
+    RETURN ok
+END FUNCTION
+
+FUNCTION ListRoot()
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a device or image first"
+        RETURN FALSE
+    END IF
+    command = "arcfs-linux ls " + ShellQuote(app.SelectedSource) + " /"
+    ok = RunCommand(command)
+    app.ConsoleTitle = "Root listing"
+    IF ok THEN AddLog("Listed / on " + app.SelectedSource)
+    RETURN ok
+END FUNCTION
+
+FUNCTION MountSelected()
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a device or image first"
+        RETURN FALSE
+    END IF
+    IF String.StartsWith(app.SelectedSource, "/dev/") THEN
+        IF RunCommand("udisksctl mount -b " + ShellQuote(app.SelectedSource)) THEN AddLog("Mounted " + app.SelectedSource)
+        RETURN TRUE
+    END IF
+
+    mounts = Path.Join(app.Home, ".cache")
+    ignored = Directory.Create(mounts)
+    mounts = Path.Join(mounts, "arconaut")
+    ignored = Directory.Create(mounts)
+    mountpoint = Path.Join(mounts, "arcfs-image")
+    ignored = Directory.Create(mountpoint)
+    IF RunCommand("arcfsctl mount " + ShellQuote(app.SelectedSource) + " " + ShellQuote(mountpoint)) THEN
+        app.MountPath = mountpoint
+        AddLog("Mounted image at " + mountpoint)
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ExploreMount()
+    IF app.MountPath <> "" THEN
+        ignored = System.Open(app.MountPath)
+    ELSE
+        IF String.StartsWith(app.SelectedSource, "/dev/") THEN
+            ignored = System.Open("/media/" + Process.Env("USER"))
+        ELSE
+            app.Status = "Mount the image first"
+        END IF
+    END IF
+END FUNCTION
+
+FUNCTION FormatSelected()
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a target first"
+        RETURN FALSE
+    END IF
+    IF GUI.Confirm(window, "Format ArcFS", "Format " + app.SelectedSource + " as ArcFS? Existing data will be lost.") == FALSE THEN RETURN FALSE
+    command = "pkexec mkfs.arcfs " + ShellQuote(app.SelectedSource) + " --force"
+    IF app.SelectedKind == "image" THEN command = "mkfs.arcfs " + ShellQuote(app.SelectedSource) + " --force"
+    IF RunCommand(command) THEN AddLog("Formatted " + app.SelectedSource)
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION Maintenance()
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a device or image first"
+        RETURN FALSE
+    END IF
+    ok = InspectSource()
+    IF ok THEN app.Status = "Maintenance inspection complete"
+    RETURN ok
+END FUNCTION
+
+FUNCTION InstallSupport()
+    command = "arcfsctl install-support"
+    IF CommandExists("pkexec") THEN command = "pkexec arcfsctl install-support"
+    IF RunCommand(command) THEN AddLog("Installed or refreshed Linux support")
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION UpdateSupport()
+    path = GUI.OpenFileDialog(window, "Open ArcFS support update", app.Home)
+    IF path == "" THEN RETURN FALSE
+    IF String.EndsWith(Lower(path), ".deb") THEN
+        command = "apt install -y " + ShellQuote(path)
+        IF CommandExists("pkexec") THEN command = "pkexec apt install -y " + ShellQuote(path)
+        IF RunCommand(command) THEN AddLog("Applied update package " + path)
+    ELSE
+        app.Status = "Update file must be a .deb on Linux"
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION RefreshPlugins()
+    ignored = Directory.Create(app.PluginDir)
+    app.Plugins = []
+    IF Directory.Exists(app.PluginDir) THEN
+        entries = File.List(app.PluginDir)
+        FOR item IN entries
+            IF item.IsDirectory == FALSE AND Lower(item.Extension) == ".abas" THEN
+                ignored = Array.Push(app.Plugins, item)
+            END IF
+        NEXT
+    END IF
+    app.Status = STRING(LEN(app.Plugins)) + " plugins"
+END FUNCTION
+
+FUNCTION AddPlugin()
+    path = GUI.OpenFileDialog(window, "Open ArcoBASIC plugin", app.Home)
+    IF path <> "" THEN
+        app.SelectedPlugin = path
+        app.Status = "Selected plugin " + path
+    END IF
+END FUNCTION
+
+FUNCTION RunPlugin()
+    IF app.SelectedPlugin == "" THEN
+        IF LEN(app.Plugins) > 0 THEN app.SelectedPlugin = app.Plugins[0].Path
+    END IF
+    IF app.SelectedPlugin == "" THEN
+        app.Status = "Select a plugin first"
+        RETURN FALSE
+    END IF
+    command = "ArcoFission compile-run " + ShellQuote(app.SelectedPlugin)
+    IF app.SelectedSource <> "" THEN command = command + " -- " + ShellQuote(app.SelectedSource)
+    IF RunCommand(command) THEN AddLog("Ran plugin " + Path.BaseName(app.SelectedPlugin))
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION Hit(x, y, bx, by, bw, bh)
+    RETURN x >= bx AND x < bx + bw AND y >= by AND y < by + bh
+END FUNCTION
+
+FUNCTION Button(window, id, label, x, y, w, h, r = 0.13, g = 0.16, b = 0.20)
+    hovered = app.Hover == id
+    rr = r
+    gg = g
+    bb = b
+    IF hovered THEN
+        rr = r + 0.05
+        gg = g + 0.05
+        bb = b + 0.05
+    END IF
+    GUI.RoundedRectangle(window, x, y, w, h, 6, rr, gg, bb, 1.0)
+    measured = GUI.MeasureText(window, label, 14)
+    GUI.Text(window, label, x + (w - measured.Width) / 2, y + (h - measured.Height) / 2, 14, 0.89, 0.92, 0.96, 1.0)
+END FUNCTION
+
+FUNCTION Tab(window, id, label, x, y, selected)
+    r = 0.08
+    g = 0.10
+    b = 0.13
+    IF selected THEN
+        r = 0.13
+        g = 0.23
+        b = 0.25
+    END IF
+    Button(window, id, label, x, y, 150, 34, r, g, b)
+END FUNCTION
+
+FUNCTION DrawIcon(window, x, y, kind)
+    IF kind == "disk" THEN
+        GUI.RoundedRectangle(window, x, y, 28, 34, 4, 0.40, 0.55, 0.66, 1.0)
+        GUI.Circle(window, x + 14, y + 18, 5, 0.08, 0.10, 0.13, 1.0)
+    ELSE
+        IF kind == "image" THEN
+            GUI.RoundedRectangle(window, x, y + 3, 28, 28, 4, 0.50, 0.40, 0.66, 1.0)
+            GUI.Line(window, x + 7, y + 11, x + 21, y + 11, 2, 0.90, 0.86, 0.98, 1.0)
+        ELSE
+            GUI.RoundedRectangle(window, x + 4, y + 4, 20, 26, 3, 0.57, 0.62, 0.45, 1.0)
+        END IF
+    END IF
+END FUNCTION
+
+FUNCTION DrawConsole(window, x, y, w, h)
+    GUI.Rectangle(window, x, y, w, h, 0.055, 0.065, 0.082, 1.0)
+    GUI.Text(window, app.ConsoleTitle, x + 14, y + 12, 13, 0.60, 0.75, 0.78, 1.0)
+    GUI.Line(window, x + 14, y + 38, x + w - 14, y + 38, 1, 0.15, 0.18, 0.22, 1.0)
+    GUI.SetClip(window, x + 12, y + 48, w - 24, h - 60)
+    lines = String.Split(app.Console, "\n")
+    line = 0
+    WHILE line < LEN(lines) AND line < 22
+        GUI.TextMono(window, lines[line], x + 14, y + 50 + line * 19, 13, 0.82, 0.86, 0.88, 1.0)
+        line = line + 1
+    WEND
+    GUI.ResetClip(window)
+END FUNCTION
+
+FUNCTION DrawVolumes(window, x, y, w, h)
+    GUI.Text(window, "Block Devices", x, y, 22, 0.90, 0.93, 0.96, 1.0)
+    Button(window, "refresh", "Refresh", x + w - 314, y - 2, 94, 32)
+    Button(window, "open-image", "Open Image", x + w - 212, y - 2, 104, 32)
+    Button(window, "create-image", "New Image", x + w - 100, y - 2, 100, 32)
+    GUI.Line(window, x, y + 42, x + w, y + 42, 1, 0.15, 0.18, 0.22, 1.0)
+    GUI.SetClip(window, x, y + 54, w, h - 62)
+    row = 0
+    FOR line IN app.Devices
+        row_y = y + 54 + row * 40
+        IF row_y < y + h THEN
+            source = FirstToken(line)
+            IF source == app.SelectedSource THEN GUI.RoundedRectangle(window, x, row_y, w, 34, 6, 0.14, 0.28, 0.27, 1.0)
+            IF app.Hover == "device-" + STRING(row) AND source <> app.SelectedSource THEN GUI.RoundedRectangle(window, x, row_y, w, 34, 6, 0.085, 0.105, 0.13, 1.0)
+            DrawIcon(window, x + 8, row_y, "disk")
+            GUI.TextMono(window, line, x + 48, row_y + 9, 13, 0.82, 0.86, 0.90, 1.0)
+        END IF
+        row = row + 1
+    NEXT
+    GUI.ResetClip(window)
+END FUNCTION
+
+FUNCTION DrawActions(window, x, y, w)
+    GUI.Text(window, "Selected", x, y, 13, 0.50, 0.62, 0.68, 1.0)
+    selected = app.SelectedSource
+    IF selected == "" THEN selected = "No ArcFS target selected"
+    GUI.Text(window, selected, x, y + 22, 15, 0.88, 0.91, 0.94, 1.0)
+    Button(window, "inspect", "Inspect", x, y + 58, 86, 34)
+    Button(window, "list-root", "List /", x + 94, y + 58, 82, 34)
+    Button(window, "mount", "Mount", x + 184, y + 58, 86, 34)
+    Button(window, "explore", "Explore", x + 278, y + 58, 92, 34)
+    Button(window, "format", "Format", x + 378, y + 58, 92, 34, 0.28, 0.12, 0.11)
+END FUNCTION
+
+FUNCTION DrawMaintenance(window, x, y, w, h)
+    GUI.Text(window, "Maintenance", x, y, 22, 0.90, 0.93, 0.96, 1.0)
+    Button(window, "maintenance", "Run Inspect", x, y + 52, 124, 36)
+    GUI.Text(window, "Volume checks run through the installed ArcFS host tools.", x, y + 110, 15, 0.64, 0.70, 0.76, 1.0)
+END FUNCTION
+
+FUNCTION DrawSupport(window, x, y, w, h)
+    GUI.Text(window, "System Support", x, y, 22, 0.90, 0.93, 0.96, 1.0)
+    Button(window, "install-support", "Install/Refresh", x, y + 52, 140, 36)
+    Button(window, "update-support", "Apply Update", x + 152, y + 52, 124, 36)
+    GUI.Text(window, "Linux FUSE helper, udev rule, udisks integration, and package updates.", x, y + 110, 15, 0.64, 0.70, 0.76, 1.0)
+END FUNCTION
+
+FUNCTION DrawPlugins(window, x, y, w, h)
+    GUI.Text(window, "Plugins", x, y, 22, 0.90, 0.93, 0.96, 1.0)
+    Button(window, "refresh-plugins", "Refresh", x + w - 314, y - 2, 94, 32)
+    Button(window, "add-plugin", "Open Script", x + w - 212, y - 2, 104, 32)
+    Button(window, "run-plugin", "Run", x + w - 100, y - 2, 100, 32)
+    GUI.Text(window, app.PluginDir, x, y + 48, 13, 0.48, 0.57, 0.64, 1.0)
+    row = 0
+    FOR item IN app.Plugins
+        row_y = y + 78 + row * 34
+        IF item.Path == app.SelectedPlugin THEN GUI.RoundedRectangle(window, x, row_y, w, 30, 6, 0.14, 0.28, 0.27, 1.0)
+        DrawIcon(window, x + 8, row_y, "plugin")
+        GUI.Text(window, item.Name, x + 44, row_y + 7, 14, 0.84, 0.88, 0.92, 1.0)
+        row = row + 1
+    NEXT
+END FUNCTION
+
+FUNCTION HandleAction(id)
+    IF String.StartsWith(id, "tab-") THEN
+        app.Mode = String.Slice(id, 4)
+        RETURN TRUE
+    END IF
+    IF String.StartsWith(id, "device-") THEN
+        SelectDevice(INT(String.Slice(id, 7)))
+        RETURN TRUE
+    END IF
+    IF id == "refresh" THEN RefreshDevices()
+    IF id == "open-image" THEN OpenImage()
+    IF id == "create-image" THEN CreateImage()
+    IF id == "inspect" THEN ignored = InspectSource()
+    IF id == "list-root" THEN ignored = ListRoot()
+    IF id == "mount" THEN ignored = MountSelected()
+    IF id == "explore" THEN ExploreMount()
+    IF id == "format" THEN ignored = FormatSelected()
+    IF id == "maintenance" THEN ignored = Maintenance()
+    IF id == "install-support" THEN ignored = InstallSupport()
+    IF id == "update-support" THEN ignored = UpdateSupport()
+    IF id == "refresh-plugins" THEN RefreshPlugins()
+    IF id == "add-plugin" THEN AddPlugin()
+    IF id == "run-plugin" THEN ignored = RunPlugin()
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION FindHover(mx, my)
+    app.Hover = ""
+    tab_y = 78
+    tab = 0
+    tabs = ["Volumes", "Images", "Files", "Maintenance", "Support", "Plugins"]
+    FOR label IN tabs
+        IF Hit(mx, my, 18, tab_y + tab * 42, 150, 34) THEN app.Hover = "tab-" + Lower(label)
+        tab = tab + 1
+    NEXT
+
+    size = GUI.Size(window)
+    x = 202
+    y = 86
+    w = size.Width - 230
+    IF app.Mode == "volumes" OR app.Mode == "images" OR app.Mode == "files" THEN
+        IF Hit(mx, my, x + w - 314, y - 2, 94, 32) THEN app.Hover = "refresh"
+        IF Hit(mx, my, x + w - 212, y - 2, 104, 32) THEN app.Hover = "open-image"
+        IF Hit(mx, my, x + w - 100, y - 2, 100, 32) THEN app.Hover = "create-image"
+        IF Hit(mx, my, x, size.Height - 168, 86, 34) THEN app.Hover = "inspect"
+        IF Hit(mx, my, x + 94, size.Height - 168, 82, 34) THEN app.Hover = "list-root"
+        IF Hit(mx, my, x + 184, size.Height - 168, 86, 34) THEN app.Hover = "mount"
+        IF Hit(mx, my, x + 278, size.Height - 168, 92, 34) THEN app.Hover = "explore"
+        IF Hit(mx, my, x + 378, size.Height - 168, 92, 34) THEN app.Hover = "format"
+
+        row = 0
+        FOR line IN app.Devices
+            row_y = y + 54 + row * 40
+            IF Hit(mx, my, x, row_y, w, 34) THEN app.Hover = "device-" + STRING(row)
+            row = row + 1
+        NEXT
+    END IF
+
+    IF app.Mode == "maintenance" THEN
+        IF Hit(mx, my, x, y + 52, 124, 36) THEN app.Hover = "maintenance"
+    END IF
+    IF app.Mode == "support" THEN
+        IF Hit(mx, my, x, y + 52, 140, 36) THEN app.Hover = "install-support"
+        IF Hit(mx, my, x + 152, y + 52, 124, 36) THEN app.Hover = "update-support"
+    END IF
+    IF app.Mode == "plugins" THEN
+        IF Hit(mx, my, x + w - 314, y - 2, 94, 32) THEN app.Hover = "refresh-plugins"
+        IF Hit(mx, my, x + w - 212, y - 2, 104, 32) THEN app.Hover = "add-plugin"
+        IF Hit(mx, my, x + w - 100, y - 2, 100, 32) THEN app.Hover = "run-plugin"
+    END IF
+END FUNCTION
+
+args = Runtime.Args()
+IF LEN(args) > 0 THEN
+    IF args[0] == "--smoke" THEN
+        PRINT "arconaut: ArcFS administrator capsule"
+        ExitTheProgram(0)
+    END IF
+END IF
 
 IF GUI.Available() == FALSE THEN
     PRINT "Arconaut needs a Wayland or X11 desktop session."
     ExitTheProgram(0)
 END IF
 
-home = Path.Home()
-title_icon = Path.Join(ArcoSH.AssetsDir(), "arconaut", "title-icon.png")
-arcobasic_icon = Path.Join(ArcoSH.AssetsDir(), "arconaut", "arcobasic-file.png")
-start_path = home
-IF LEN(Args) > 0 THEN start_path = Args[0]
 TRY
+    title_icon = Path.Join(ArcoSH.AssetsDir(), "arconaut", "title-icon.png")
     GUI.Application("arconaut", "Arconaut", title_icon)
-    window = GUI.Window("Arconaut", 1040, 680)
+    window = GUI.Window("Arconaut", 1180, 760)
 CATCH err
     PRINT "Arconaut window could not be opened: " + err.Message
     ExitTheProgram(0)
 END TRY
-app = {"CurrentPath": "", "Entries": [], "BackStack": [], "ForwardStack": [], "SelectedIndex": -1, "ScrollY": 0, "Status": "Ready"}
-rail_open = TRUE
-hover_row = -1
+
+home = Path.Home()
+app = {
+    "Home": home,
+    "Mode": "volumes",
+    "Hover": "",
+    "SelectedSource": "",
+    "SelectedKind": "",
+    "MountPath": "",
+    "ImageSize": "1073741824",
+    "DeviceText": "",
+    "Devices": [],
+    "ConsoleTitle": "ArcFS",
+    "Console": "Ready",
+    "Status": "Ready",
+    "Log": [],
+    "PluginDir": Path.Join(home, ".arcology", "arcfs", "plugins"),
+    "Plugins": [],
+    "SelectedPlugin": ""
+}
+
+ignored = RefreshDevices()
+ignored = RefreshPlugins()
 running = TRUE
-
-FUNCTION LoadDirectory(next_path, remember = TRUE)
-    IF File.Exists(next_path) == FALSE THEN
-        app.Status = "Location not found: " + next_path
-        RETURN FALSE
-    END IF
-    IF remember AND app.CurrentPath <> "" THEN ignored = Array.Push(app.BackStack, app.CurrentPath)
-    IF remember THEN app.ForwardStack = []
-    app.CurrentPath = next_path
-    app.Entries = File.List(app.CurrentPath)
-    app.SelectedIndex = -1
-    app.ScrollY = 0
-    app.Status = STRING(LEN(app.Entries)) + " items"
-    GUI.SetTitle(window, "Arconaut — " + Path.BaseName(app.CurrentPath))
-    RETURN TRUE
-END FUNCTION
-
-FUNCTION GoBack()
-    IF LEN(app.BackStack) > 0 THEN
-        ignored = Array.Push(app.ForwardStack, app.CurrentPath)
-        destination = Array.Pop(app.BackStack)
-        ignored = LoadDirectory(destination, FALSE)
-    END IF
-END FUNCTION
-
-FUNCTION GoForward()
-    IF LEN(app.ForwardStack) > 0 THEN
-        ignored = Array.Push(app.BackStack, app.CurrentPath)
-        destination = Array.Pop(app.ForwardStack)
-        ignored = LoadDirectory(destination, FALSE)
-    END IF
-END FUNCTION
-
-FUNCTION GoUp()
-    parent = Path.DirName(app.CurrentPath)
-    IF parent <> app.CurrentPath THEN ignored = LoadDirectory(parent)
-END FUNCTION
-
-FUNCTION Refresh()
-    selected_name = ""
-    IF app.SelectedIndex >= 0 AND app.SelectedIndex < LEN(app.Entries) THEN
-        selected = app.Entries[app.SelectedIndex]
-        selected_name = selected.Name
-    END IF
-    ignored = LoadDirectory(app.CurrentPath, FALSE)
-    IF selected_name <> "" THEN
-        row = 0
-        FOR item IN app.Entries
-            IF item.Name == selected_name THEN app.SelectedIndex = row
-            row = row + 1
-        NEXT
-    END IF
-    app.Status = "Refreshed " + app.CurrentPath
-    RETURN TRUE
-END FUNCTION
-
-FUNCTION Activate(index)
-    item = app.Entries[index]
-    IF item.IsDirectory THEN
-        ignored = LoadDirectory(item.Path)
-    ELSE
-        app.Status = "Opening " + item.Name
-        ignored = System.Open(item.Path)
-    END IF
-END FUNCTION
-
-FUNCTION SizeLabel(bytes)
-    IF bytes < 1024 THEN RETURN STRING(bytes) + " B"
-    IF bytes < 1048576 THEN RETURN STRING(bytes / 1024) + " KB"
-    RETURN STRING(bytes / 1048576) + " MB"
-END FUNCTION
-
-CLASS EntryPresenter
-    Item = NULL
-
-    CONSTRUCTOR(item)
-        SELF.Item = item
-    END CONSTRUCTOR
-
-    FUNCTION TypeLabel() AS String
-        IF SELF.Item.IsDirectory THEN RETURN "Folder"
-        IF SELF.Item.Extension == "" THEN RETURN "File"
-        RETURN SELF.Item.Extension
-    END FUNCTION
-
-    FUNCTION SizeText() AS String
-        IF SELF.Item.IsDirectory THEN RETURN "—"
-        RETURN SizeLabel(SELF.Item.Size)
-    END FUNCTION
-
-    FUNCTION Summary() AS String
-        RETURN SELF.Item.Name + " | " + SELF.TypeLabel() + " | " + SELF.SizeText()
-    END FUNCTION
-END CLASS
-
-ignored = LoadDirectory(start_path, FALSE)
 
 WHILE running
     size = GUI.Size(window)
-    rail_width = 64
-    IF rail_open THEN rail_width = 210
-    inspector_width = 0
-    IF size.Width >= 900 THEN inspector_width = 238
-    content_x = rail_width + 16
-    content_width = size.Width - content_x - inspector_width - 16
-    list_top = 116
-    list_bottom = size.Height - 48
+    rail_w = 184
+    main_x = rail_w + 18
+    main_y = 86
+    main_w = size.Width - main_x - 28
+    main_h = size.Height - 272
+    actions_y = size.Height - 226
+    console_y = size.Height - 104
 
-    GUI.Clear(window, 0.045, 0.052, 0.07)
+    GUI.Clear(window, 0.045, 0.050, 0.058, 1.0)
+    GUI.Rectangle(window, 0, 0, rail_w, size.Height, 0.065, 0.073, 0.086, 1.0)
+    DrawIcon(window, 18, 18, "disk")
+    GUI.Text(window, "ARCONAUT", 58, 22, 18, 0.88, 0.92, 0.94, 1.0)
+    GUI.Text(window, "ArcFS Administrator", main_x, 24, 28, 0.93, 0.95, 0.96, 1.0)
+    GUI.Text(window, app.Status, main_x, 56, 14, 0.56, 0.67, 0.68, 1.0)
 
-    ' Arco constellation rail
-    GUI.Rectangle(window, 0, 0, rail_width, size.Height, 0.065, 0.076, 0.104)
-    GUI.Image(window, title_icon, 8, 6, 46, 46)
-    IF rail_open THEN GUI.Text(window, "ARCONAUT", 58, 18, 18, 0.78, 0.88, 1.0)
-    GUI.Line(window, 14, 58, rail_width - 14, 58, 1, 0.14, 0.18, 0.25)
-
-    GUI.Text(window, "H", 23, 81, 18, 0.62, 0.78, 0.96)
-    GUI.Text(window, "D", 23, 127, 18, 0.62, 0.78, 0.96)
-    GUI.Text(window, "↓", 22, 172, 20, 0.62, 0.78, 0.96)
-    IF rail_open THEN
-        GUI.Text(window, "Home", 58, 81, 16, 0.82, 0.87, 0.94)
-        GUI.Text(window, "Documents", 58, 127, 16, 0.82, 0.87, 0.94)
-        GUI.Text(window, "Downloads", 58, 173, 16, 0.82, 0.87, 0.94)
-        GUI.Text(window, "PLACES", 18, 229, 12, 0.38, 0.5, 0.68)
-        GUI.Text(window, app.CurrentPath, 18, 254, 12, 0.46, 0.55, 0.69)
-    END IF
-
-    ' Navigation and location band
-    GUI.RoundedRectangle(window, content_x, 16, 38, 38, 8, 0.10, 0.13, 0.18)
-    GUI.RoundedRectangle(window, content_x + 46, 16, 38, 38, 8, 0.10, 0.13, 0.18)
-    GUI.RoundedRectangle(window, content_x + 92, 16, 38, 38, 8, 0.10, 0.13, 0.18)
-    GUI.RoundedRectangle(window, content_x + 138, 16, 38, 38, 8, 0.10, 0.13, 0.18)
-    GUI.Text(window, "‹", content_x + 12, 18, 25, 0.75, 0.84, 0.95)
-    GUI.Text(window, "›", content_x + 58, 18, 25, 0.75, 0.84, 0.95)
-    GUI.Text(window, "↑", content_x + 104, 20, 21, 0.75, 0.84, 0.95)
-    GUI.Text(window, "R", content_x + 150, 24, 16, 0.75, 0.84, 0.95)
-    GUI.RoundedRectangle(window, content_x + 188, 16, content_width - 188, 38, 8, 0.075, 0.09, 0.125)
-    GUI.Text(window, app.CurrentPath, content_x + 204, 25, 15, 0.68, 0.77, 0.9)
-    GUI.Text(window, "NAME", content_x + 14, 84, 12, 0.4, 0.51, 0.68)
-    GUI.Text(window, "TYPE", content_x + content_width - 170, 84, 12, 0.4, 0.51, 0.68)
-    GUI.Text(window, "SIZE", content_x + content_width - 78, 84, 12, 0.4, 0.51, 0.68)
-    GUI.Line(window, content_x, 108, content_x + content_width, 108, 1, 0.13, 0.17, 0.23)
-
-    ' File surface
-    GUI.SetClip(window, content_x, list_top, content_width, list_bottom - list_top)
-    row = 0
-    FOR item IN app.Entries
-        row_y = list_top + row * 40 - app.ScrollY
-        IF row_y > list_top - 40 AND row_y < list_bottom THEN
-            presenter = EntryPresenter(item)
-            IF row == app.SelectedIndex THEN GUI.RoundedRectangle(window, content_x, row_y, content_width, 36, 7, 0.13, 0.34, 0.56)
-            IF row == hover_row AND row <> app.SelectedIndex THEN GUI.RoundedRectangle(window, content_x, row_y, content_width, 36, 7, 0.085, 0.11, 0.155)
-            IF Lower(item.Extension) == ".abas" THEN
-                GUI.Image(window, arcobasic_icon, content_x + 7, row_y + 4, 29, 29)
-            ELSE
-            IF item.IsDirectory THEN
-                GUI.RoundedRectangle(window, content_x + 10, row_y + 9, 20, 16, 3, 0.25, 0.62, 0.94)
-            ELSE
-                GUI.RoundedRectangle(window, content_x + 12, row_y + 7, 16, 20, 2, 0.45, 0.55, 0.7)
-            END IF
-            END IF
-            GUI.Text(window, item.Name, content_x + 42, row_y + 8, 16, 0.84, 0.88, 0.94)
-            GUI.Text(window, presenter.TypeLabel(), content_x + content_width - 170, row_y + 9, 14, 0.5, 0.61, 0.75)
-            GUI.Text(window, presenter.SizeText(), content_x + content_width - 78, row_y + 9, 14, 0.5, 0.61, 0.75)
-        END IF
-        row = row + 1
+    tabs = ["Volumes", "Images", "Files", "Maintenance", "Support", "Plugins"]
+    tab_y = 78
+    tab = 0
+    FOR label IN tabs
+        Tab(window, "tab-" + Lower(label), label, 18, tab_y + tab * 42, app.Mode == Lower(label))
+        tab = tab + 1
     NEXT
-    GUI.ResetClip(window)
 
-    ' Context inspector: Konqueror-like utility, Arco visual language
-    IF inspector_width > 0 THEN
-        inspector_x = size.Width - inspector_width
-        GUI.Rectangle(window, inspector_x, 0, inspector_width, size.Height, 0.06, 0.07, 0.095)
-        GUI.Text(window, "DETAILS", inspector_x + 22, 25, 13, 0.38, 0.55, 0.78)
-        IF app.SelectedIndex >= 0 THEN
-            selected = app.Entries[app.SelectedIndex]
-            presenter = EntryPresenter(selected)
-            detail_y = 137
-            IF Lower(selected.Extension) == ".abas" THEN
-                GUI.Image(window, arcobasic_icon, inspector_x + 22, 58, 194, 194)
-                detail_y = 268
-            ELSE
-                GUI.Circle(window, inspector_x + 52, 91, 27, 0.18, 0.48, 0.75)
-            END IF
-            GUI.Text(window, selected.Name, inspector_x + 22, detail_y, 18, 0.86, 0.9, 0.96)
-            GUI.Text(window, presenter.SizeText(), inspector_x + 22, detail_y + 37, 14, 0.52, 0.62, 0.75)
-            GUI.Text(window, "Type: " + presenter.TypeLabel(), inspector_x + 22, detail_y + 58, 12, 0.43, 0.52, 0.65)
-            GUI.Text(window, selected.Path, inspector_x + 22, detail_y + 82, 12, 0.43, 0.52, 0.65)
-        ELSE
-            GUI.Text(window, "Select an item", inspector_x + 22, 74, 16, 0.48, 0.57, 0.69)
-            GUI.Text(window, "Double-click to travel", inspector_x + 22, 105, 13, 0.38, 0.47, 0.6)
-        END IF
+    GUI.Text(window, "Activity", 18, size.Height - 168, 13, 0.48, 0.58, 0.62, 1.0)
+    log_y = size.Height - 142
+    FOR line IN app.Log
+        GUI.Text(window, line, 18, log_y, 12, 0.68, 0.72, 0.74, 1.0)
+        log_y = log_y + 19
+    NEXT
+
+    IF app.Mode == "volumes" OR app.Mode == "images" OR app.Mode == "files" THEN
+        DrawVolumes(window, main_x, main_y, main_w, main_h)
+        DrawActions(window, main_x, actions_y, main_w)
+    ELSE
+        IF app.Mode == "maintenance" THEN DrawMaintenance(window, main_x, main_y, main_w, main_h)
+        IF app.Mode == "support" THEN DrawSupport(window, main_x, main_y, main_w, main_h)
+        IF app.Mode == "plugins" THEN DrawPlugins(window, main_x, main_y, main_w, main_h)
     END IF
 
-    GUI.Text(window, app.Status, content_x, size.Height - 31, 13, 0.47, 0.57, 0.7)
-    GUI.Text(window, "Enter open   Backspace up   R/F5 refresh   Esc quit", size.Width - 420, size.Height - 31, 13, 0.42, 0.5, 0.62)
+    DrawConsole(window, main_x, console_y, main_w, 88)
     GUI.Present(window)
 
     event = GUI.WaitEvent(0.05)
     IF event.Type == "close" THEN running = FALSE
-    IF event.Type == "scroll" THEN
-        app.ScrollY = app.ScrollY - event.DeltaY * 34
-        IF app.ScrollY < 0 THEN app.ScrollY = 0
-    END IF
     IF event.Type == "pointer-move" THEN
-        hover_row = -1
-        row = 0
-        FOR item IN app.Entries
-            row_y = list_top + row * 40 - app.ScrollY
-            IF event.X >= content_x AND event.X < content_x + content_width AND event.Y >= row_y AND event.Y < row_y + 36 THEN hover_row = row
-            row = row + 1
-        NEXT
-        GUI.SetCursor(window, "default")
-        IF hover_row >= 0 OR event.X < rail_width OR event.Y < 58 THEN GUI.SetCursor(window, "hand")
+        FindHover(event.X, event.Y)
+        IF app.Hover <> "" THEN GUI.SetCursor(window, "hand") ELSE GUI.SetCursor(window, "default")
     END IF
     IF event.Type == "pointer-button" THEN
         IF event.Action == "press" AND event.Button == "left" THEN
-            IF event.X < rail_width AND event.Y < 58 THEN
-                IF rail_open THEN rail_open = FALSE ELSE rail_open = TRUE
-            END IF
-            IF event.X < rail_width AND event.Y >= 68 AND event.Y < 112 THEN ignored = LoadDirectory(home)
-            IF event.X < rail_width AND event.Y >= 114 AND event.Y < 158 THEN ignored = LoadDirectory(Path.Join(home, "Documents"))
-            IF event.X < rail_width AND event.Y >= 160 AND event.Y < 204 THEN ignored = LoadDirectory(Path.Join(home, "Downloads"))
-            IF event.Y >= 16 AND event.Y < 54 THEN
-                IF event.X >= content_x AND event.X < content_x + 38 THEN GoBack()
-                IF event.X >= content_x + 46 AND event.X < content_x + 84 THEN GoForward()
-                IF event.X >= content_x + 92 AND event.X < content_x + 130 THEN GoUp()
-                IF event.X >= content_x + 138 AND event.X < content_x + 176 THEN ignored = Refresh()
-            END IF
-            IF hover_row >= 0 THEN
-                app.SelectedIndex = hover_row
-                selected_item = app.Entries[app.SelectedIndex]
-                app.Status = selected_item.Path
-                IF event.Clicks >= 2 THEN Activate(app.SelectedIndex)
-            END IF
+            IF app.Hover <> "" THEN ignored = HandleAction(app.Hover)
         END IF
     END IF
     IF event.Type == "key" THEN
         IF event.Action == "press" THEN
             IF event.Key == "escape" THEN running = FALSE
-            IF event.Key == "enter" AND app.SelectedIndex >= 0 THEN Activate(app.SelectedIndex)
-            IF event.Key == "backspace" THEN GoUp()
-            IF event.Key == "r" OR event.Key == "f5" THEN ignored = Refresh()
-            IF event.Key == "down" THEN
-                IF app.SelectedIndex < LEN(app.Entries) - 1 THEN app.SelectedIndex = app.SelectedIndex + 1
-            END IF
-            IF event.Key == "up" THEN
-                IF app.SelectedIndex > 0 THEN app.SelectedIndex = app.SelectedIndex - 1
-            END IF
-            IF event.Key == "home" THEN
-                IF LEN(app.Entries) > 0 THEN app.SelectedIndex = 0
-            END IF
-            IF event.Key == "end" THEN
-                IF LEN(app.Entries) > 0 THEN app.SelectedIndex = LEN(app.Entries) - 1
-            END IF
+            IF event.Key == "r" OR event.Key == "f5" THEN RefreshDevices()
+            IF event.Key == "i" THEN ignored = InspectSource()
+            IF event.Key == "m" THEN ignored = MountSelected()
         END IF
     END IF
+    IF GUI.ShouldClose(window) THEN running = FALSE
 WEND
 
 GUI.Close(window)

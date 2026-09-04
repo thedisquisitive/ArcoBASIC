@@ -45,7 +45,7 @@ Section: shells
 Priority: optional
 Architecture: $ARCH
 Maintainer: $MAINTAINER
-Depends: libc6, libstdc++6
+Depends: libc6, libstdc++6, libfuse3-4 | libfuse3-3, fuse3, udev, udisks2, libglfw3, libcairo2, libpango-1.0-0, libpangocairo-1.0-0, libgtk-3-0 | libgtk-3-0t64, libcurl4
 Installed-Size: $INSTALLED_SIZE
 Description: ArcoBASIC language tools and ArcoSH shell
  ArcoBASIC is a readable BASIC-family scripting language.
@@ -53,7 +53,38 @@ Description: ArcoBASIC language tools and ArcoSH shell
  profile scripting, tutorials, and interactive automation.
 CONTROL
 
+cat > "$PKG_ROOT/DEBIAN/postinst" <<'POSTINST'
+#!/bin/sh
+set -e
+
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload || true
+    udevadm trigger --subsystem-match=block || true
+fi
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl try-reload-or-restart udisks2.service >/dev/null 2>&1 || true
+fi
+
+exit 0
+POSTINST
+
+cat > "$PKG_ROOT/DEBIAN/postrm" <<'POSTRM'
+#!/bin/sh
+set -e
+
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload || true
+    udevadm trigger --subsystem-match=block || true
+fi
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl try-reload-or-restart udisks2.service >/dev/null 2>&1 || true
+fi
+
+exit 0
+POSTRM
+
 chmod 0755 "$PKG_ROOT/DEBIAN"
+chmod 0755 "$PKG_ROOT/DEBIAN/postinst" "$PKG_ROOT/DEBIAN/postrm"
 find "$PKG_ROOT/usr/bin" -type f -exec chmod 0755 {} +
 find "$PKG_ROOT/usr/share" -type f -exec chmod 0644 {} +
 find "$PKG_ROOT/usr/share/arcobasic/scripts" -type f -name "*.sh" -exec chmod 0755 {} + 2>/dev/null || true

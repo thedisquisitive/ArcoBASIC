@@ -228,7 +228,7 @@ Section: shells
 Priority: optional
 Architecture: $deb_arch
 Maintainer: $MAINTAINER
-Depends: libc6, libstdc++6
+Depends: libc6, libstdc++6, libfuse3-4 | libfuse3-3, fuse3, udev, udisks2, libglfw3, libcairo2, libpango-1.0-0, libpangocairo-1.0-0, libgtk-3-0 | libgtk-3-0t64, libcurl4
 Installed-Size: $installed_size
 Description: $SUMMARY
  ArcoBASIC is a readable BASIC-family scripting language.
@@ -236,7 +236,38 @@ Description: $SUMMARY
  profile scripting, tutorials, and interactive automation.
 CONTROL
 
+    cat > "$pkg_root/DEBIAN/postinst" <<'POSTINST'
+#!/bin/sh
+set -e
+
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload || true
+    udevadm trigger --subsystem-match=block || true
+fi
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl try-reload-or-restart udisks2.service >/dev/null 2>&1 || true
+fi
+
+exit 0
+POSTINST
+
+    cat > "$pkg_root/DEBIAN/postrm" <<'POSTRM'
+#!/bin/sh
+set -e
+
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload || true
+    udevadm trigger --subsystem-match=block || true
+fi
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl try-reload-or-restart udisks2.service >/dev/null 2>&1 || true
+fi
+
+exit 0
+POSTRM
+
     chmod 0755 "$pkg_root/DEBIAN"
+    chmod 0755 "$pkg_root/DEBIAN/postinst" "$pkg_root/DEBIAN/postrm"
     deb="$OUT_DIR/${PACKAGE}_${VERSION}_${deb_arch}.deb"
     dpkg-deb --build --root-owner-group "$pkg_root" "$deb"
     rm -rf "$stage_root"

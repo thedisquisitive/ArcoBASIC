@@ -11,6 +11,36 @@ install(TARGETS arcosh arco_cli ArcoFission
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
+if(TARGET arcfsctl)
+    install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/generated/arcfsctl
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/tools/arcfsctl.abas
+        DESTINATION share/arcobasic/tools
+    )
+endif()
+
+if(TARGET arconaut)
+    install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/generated/arconaut
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
+
+if(TARGET arcfs-linux)
+    install(TARGETS arcfs-linux
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/packaging/linux/mount.arcfs
+        DESTINATION ${CMAKE_INSTALL_SBINDIR}
+    )
+    install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/packaging/linux/mkfs.arcfs
+        DESTINATION ${CMAKE_INSTALL_SBINDIR}
+    )
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/packaging/linux/61-arcfs.rules
+        DESTINATION lib/udev/rules.d
+    )
+endif()
+
 install(DIRECTORY include/arco/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/arco
     FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"

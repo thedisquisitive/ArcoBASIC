@@ -9,8 +9,10 @@ This is the authoritative vocabulary for Arcology-specific implementation and di
 - **Substrate**: the foundational modular execution environment.
 - **APS**: Arcology Provider System, responsible for discovering, validating, and coordinating
   Providers.
+- **ArcoFission**: the ArcoBASIC compiler pipeline tool and runtime-capsule builder. It is not an
+  ArcFS management utility.
 - **Capsule**: a self-contained Arcology application package containing code, resources, metadata,
-  manifests, and contracts.
+  manifests, and contracts. Capsules are built through the ArcoFission toolchain.
 - **Resource**: a runtime object managed by the Resource Registry.
 - **Handle**: an opaque runtime identifier.
 - **Capability**: a permission or functional right granted by a Contract.

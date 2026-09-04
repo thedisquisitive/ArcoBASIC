@@ -80,6 +80,12 @@ target_link_libraries(arco_compiler PUBLIC arco_runtime arcology_os)
 target_compile_definitions(arco_compiler PRIVATE ARCO_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
 add_library(ArcoBASIC::compiler ALIAS arco_compiler)
 
+add_library(arco_arcfs_host STATIC
+    src/arcfs/host.cpp
+)
+arco_configure_library(arco_arcfs_host)
+add_library(ArcoBASIC::arcfs_host ALIAS arco_arcfs_host)
+
 # A second, lean build of the runtime/compiler libraries without the optional GUI/network
 # backends, so native capsule builds have a portable option for programs that don't call real
 # GUI.* functions (see fission.cpp's bytecode_needs_full_runtime) instead of always inheriting
@@ -133,6 +139,57 @@ target_link_libraries(arcosh PRIVATE arco_shell)
 
 add_executable(ArcoFission apps/arcofission/main.cpp)
 target_link_libraries(ArcoFission PRIVATE arco_compiler)
+
+set(ARCFSCTL_CAPSULE ${CMAKE_CURRENT_BINARY_DIR}/generated/arcfsctl)
+add_custom_command(
+    OUTPUT ${ARCFSCTL_CAPSULE}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
+    COMMAND $<TARGET_FILE:ArcoFission> build
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/arcfsctl.abas
+            -o ${ARCFSCTL_CAPSULE}
+    DEPENDS ArcoFission ${CMAKE_CURRENT_SOURCE_DIR}/tools/arcfsctl.abas
+    COMMENT "Building arcfsctl ArcoBASIC capsule"
+    VERBATIM
+)
+add_custom_target(arcfsctl ALL DEPENDS ${ARCFSCTL_CAPSULE})
+
+set(ARCONAUT_CAPSULE ${CMAKE_CURRENT_BINARY_DIR}/generated/arconaut)
+add_custom_command(
+    OUTPUT ${ARCONAUT_CAPSULE}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
+    COMMAND $<TARGET_FILE:ArcoFission> build
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/arconaut.abas
+            -o ${ARCONAUT_CAPSULE}
+    DEPENDS ArcoFission ${CMAKE_CURRENT_SOURCE_DIR}/examples/arconaut.abas
+    COMMENT "Building Arconaut ArcoBASIC capsule"
+    VERBATIM
+)
+add_custom_target(arconaut ALL DEPENDS ${ARCONAUT_CAPSULE})
+
+if(UNIX AND NOT APPLE)
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/mount.arcfs.in
+        ${CMAKE_CURRENT_BINARY_DIR}/packaging/linux/mount.arcfs
+        @ONLY
+    )
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/mkfs.arcfs.in
+        ${CMAKE_CURRENT_BINARY_DIR}/packaging/linux/mkfs.arcfs
+        @ONLY
+    )
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/61-arcfs.rules.in
+        ${CMAKE_CURRENT_BINARY_DIR}/packaging/linux/61-arcfs.rules
+        @ONLY
+    )
+
+    add_executable(arcfs-linux apps/arcfs-linux/main.cpp)
+    target_link_libraries(arcfs-linux PRIVATE arco_arcfs_host)
+    if(ARCO_FUSE3_FOUND)
+        target_link_libraries(arcfs-linux PRIVATE PkgConfig::FUSE3)
+        target_compile_definitions(arcfs-linux PRIVATE ARCO_HAVE_FUSE3=1)
+    endif()
+endif()
 
 if(BUILD_TESTING)
     include(cmake/Testing.cmake)

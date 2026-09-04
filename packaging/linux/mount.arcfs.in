@@ -1,0 +1,143 @@
+#!/bin/sh
+set -eu
+
+PATH=/usr/bin:/usr/local/bin:/bin:/usr/sbin:/usr/local/sbin:${PATH:-}
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  mount.arcfs SOURCE MOUNTPOINT [-o OPTIONS]
+
+ArcFS-specific -o options:
+  partition=N    select GPT partition N from a whole-disk image/device
+  offset=BYTES   mount an ArcFS volume embedded at byte offset BYTES
+
+Set ARCFS_MOUNT_DRY_RUN=1 to print the arcfs-linux command without executing it.
+EOF
+}
+
+fail() {
+    echo "mount.arcfs: $*" >&2
+    exit 1
+}
+
+if [ "$#" -lt 2 ]; then
+    usage
+    exit 1
+fi
+
+source=$1
+mountpoint=$2
+shift 2
+
+partition=
+offset=
+fuse_options=
+have_allow_other=
+
+append_fuse_option() {
+    if [ -z "$fuse_options" ]; then
+        fuse_options=$1
+    else
+        fuse_options=$fuse_options,$1
+    fi
+    if [ "$1" = allow_other ]; then
+        have_allow_other=1
+    fi
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o)
+            [ "$#" -ge 2 ] || fail "-o requires an option list"
+            opts=$2
+            shift 2
+            old_ifs=$IFS
+            IFS=,
+            set -- $opts "$@"
+            IFS=$old_ifs
+            ;;
+        -o*)
+            opts=${1#-o}
+            shift
+            old_ifs=$IFS
+            IFS=,
+            set -- $opts "$@"
+            IFS=$old_ifs
+            ;;
+        -r|-v|-n|-s|-w)
+            shift
+            ;;
+        rw)
+            shift
+            ;;
+        ro)
+            shift
+            ;;
+        partition=*)
+            [ -z "$offset" ] || fail "partition= and offset= are mutually exclusive"
+            partition=${1#partition=}
+            shift
+            ;;
+        offset=*)
+            [ -z "$partition" ] || fail "partition= and offset= are mutually exclusive"
+            offset=${1#offset=}
+            shift
+            ;;
+        user|users|owner|group|nofail|auto|noauto|defaults)
+            shift
+            ;;
+        uhelper=*|x-*|comment=*)
+            shift
+            ;;
+        *)
+            append_fuse_option "$1"
+            shift
+            ;;
+    esac
+done
+
+if [ -z "${ARCFS_MOUNT_UID:-}" ] || [ -z "${ARCFS_MOUNT_GID:-}" ]; then
+    case "$mountpoint" in
+        /media/*/*|/run/media/*/*)
+            owner=$(printf '%s\n' "$mountpoint" | awk -F/ '{print $3}')
+            if id "$owner" >/dev/null 2>&1; then
+                export ARCFS_MOUNT_UID=$(id -u "$owner")
+                export ARCFS_MOUNT_GID=$(id -g "$owner")
+            fi
+            ;;
+    esac
+fi
+
+if [ -z "$have_allow_other" ]; then
+    append_fuse_option allow_other
+fi
+
+arcfs_linux=${ARCFS_LINUX:-@CMAKE_INSTALL_FULL_BINDIR@/arcfs-linux}
+if [ ! -x "$arcfs_linux" ]; then
+    command -v arcfs-linux >/dev/null 2>&1 || fail "arcfs-linux not found; set ARCFS_LINUX or install arcfs-linux"
+    arcfs_linux=$(command -v arcfs-linux)
+fi
+
+set -- "$arcfs_linux" mount "$source" "$mountpoint"
+if [ -n "$partition" ]; then
+    set -- "$@" --partition "$partition"
+fi
+if [ -n "$offset" ]; then
+    set -- "$@" --offset "$offset"
+fi
+if [ -n "$fuse_options" ]; then
+    set -- "$@" -- -o "$fuse_options"
+fi
+
+if [ "${ARCFS_MOUNT_DRY_RUN:-0}" = 1 ]; then
+    printf '%s' "$1"
+    shift
+    for arg in "$@"; do
+        printf ' %s' "$arg"
+    done
+    printf '\n'
+    exit 0
+fi
+
+exec "$@"

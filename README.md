@@ -118,6 +118,19 @@ The installer installs the `.deb`, runs the doctor, initializes the ArcoSH
 profile, offers prompt presets with live preview, can activate built-in mods
 such as ArcoGotchi, and can configure ArcoSH as the login shell.
 
+Build the focused ArcFS Linux support package:
+
+```sh
+scripts/build/build-arcfs-deb.sh
+sudo apt install ./dist/arcobasic-arcfs_0.1.0_amd64.deb
+arcfsctl status
+arconaut
+```
+
+That package installs `arcfs-linux`, `arcfsctl`, the Arconaut ArcFS administrator capsule,
+`mount.arcfs`, `mkfs.arcfs`, and the udev rule used by udisks2/Dolphin to recognize and mount
+ArcFS volumes.
+
 Build Linux packages for broader distro testing:
 
 ```sh
@@ -195,6 +208,27 @@ See [`arcology-os/docs/systems/README.md`](arcology-os/docs/systems/README.md) f
 full directive/type/binding surface this target supports, troubleshooting,
 and an architecture overview of the pipeline (lexer -> parser -> A-MIR ->
 x86-64 machine code -> PE32+ image).
+
+## ArcFS Linux Host Access
+
+Linux builds also produce `arcfs-linux`, a host tool for inspecting, extracting, formatting, and,
+when `fuse3` is available at build time, mounting ArcFS FMV2 partitions and images with basic
+read-write support:
+
+```sh
+arcfs-linux inspect /dev/sdb2
+arcfs-linux ls disk.img / --partition 2
+arcfs-linux mkfs arcfs.img --force
+arcfs-linux mount /dev/sdb2 /mnt/arcfs -- -f
+sudo mkfs.arcfs /dev/sdXN --force
+sudo mount -t arcfs /dev/sdb2 /mnt/arcfs
+```
+
+System installs also include `mount.arcfs` and a udev probe rule so Linux storage stacks can
+recognize ArcFS block devices as `ID_FS_TYPE=arcfs`.
+
+See [`docs/arcfs-linux.md`](docs/arcfs-linux.md) and [`docs/arconaut.md`](docs/arconaut.md) for
+scope and usage.
 
 ## Windows
 

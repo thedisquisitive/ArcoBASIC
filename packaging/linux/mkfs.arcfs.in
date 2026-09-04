@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+PATH=/usr/bin:/usr/local/bin:/bin:/usr/sbin:/usr/local/sbin:${PATH:-}
+
+arcfs_linux=${ARCFS_LINUX:-@CMAKE_INSTALL_FULL_BINDIR@/arcfs-linux}
+if [ ! -x "$arcfs_linux" ]; then
+    command -v arcfs-linux >/dev/null 2>&1 || {
+        echo "mkfs.arcfs: arcfs-linux not found; set ARCFS_LINUX or install arcfs-linux" >&2
+        exit 1
+    }
+    arcfs_linux=$(command -v arcfs-linux)
+fi
+
+exec "$arcfs_linux" mkfs "$@"
