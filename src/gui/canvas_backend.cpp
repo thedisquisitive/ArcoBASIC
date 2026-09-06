@@ -364,6 +364,20 @@ EM_JS(void, js_circle, (int id, double cx, double cy, double radius, double r, d
     ctx.fill();
 });
 
+EM_JS(void, js_fill_polygon, (int id, const double* points_ptr, int count, double r, double g, double b, double a), {
+    if (count < 3) return;
+    const ctx = Module.arcoGui.ctxs[id];
+    const points = Module.HEAPF64.subarray(points_ptr / 8, points_ptr / 8 + count * 2);
+    ctx.beginPath();
+    ctx.moveTo(points[0], points[1]);
+    for (let i = 1; i < count; i++) {
+        ctx.lineTo(points[i * 2], points[i * 2 + 1]);
+    }
+    ctx.closePath();
+    ctx.fillStyle = "rgba(" + Math.round(r * 255) + "," + Math.round(g * 255) + "," + Math.round(b * 255) + "," + a + ")";
+    ctx.fill();
+});
+
 EM_JS(void, js_pixel, (int id, int x, int y, double r, double g, double b, double a), {
     const ctx = Module.arcoGui.ctxs[id];
     ctx.fillStyle = "rgba(" + Math.round(r * 255) + "," + Math.round(g * 255) + "," + Math.round(b * 255) + "," + a + ")";
@@ -559,6 +573,38 @@ int create_window(const std::string& title, int width, int height) {
     js_create_window(id, title.c_str(), width, height);
     return id;
 }
+
+// A browser <canvas> has no OS-level window chrome, transparency, or click-through concept to
+// shape (RFC-ArcoUI section 9.3/42's own allowance that not every backend need implement shape
+// identically) -- frameless/transparent are accepted and ignored so ArcoUI's stdlib layer can
+// call the same create_window signature on every backend; supports_shaped_windows() below is how
+// a caller finds out ahead of time that this backend's shapes are draw-only, not real click-through.
+int create_window(const std::string& title, int width, int height, bool /*frameless*/, bool /*transparent*/) {
+    return create_window(title, width, height);
+}
+
+bool supports_shaped_windows() { return false; }
+
+void fill_polygon(int id, const std::vector<std::pair<double, double>>& points,
+                  double r, double g, double b, double a) {
+    if (points.size() < 3) return;
+    std::vector<double> flat;
+    flat.reserve(points.size() * 2);
+    for (const auto& point : points) {
+        flat.push_back(point.first);
+        flat.push_back(point.second);
+    }
+    js_fill_polygon(id, flat.data(), static_cast<int>(points.size()), r, g, b, a);
+}
+
+// No OS window to make click-through here (see supports_shaped_windows()) -- a no-op, not an
+// error, so ArcoUI's stdlib layer doesn't need a backend-specific branch just to call this safely.
+void set_input_passthrough(int, bool) {}
+
+// No OS window position to report or change for an in-page <canvas> -- same no-op convention as
+// set_input_passthrough above.
+Value window_position(int) { return Value::Object{{"X", 0}, {"Y", 0}}; }
+void set_window_position(int, int, int) {}
 
 void destroy_window(int id) {
     js_destroy_window(id);

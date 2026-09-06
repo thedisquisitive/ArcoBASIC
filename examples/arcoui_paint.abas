@@ -1,0 +1,72 @@
+' ArcoUI Milestone 4 benchmark (RFC-ArcoUI section 30.2/57 Test B): a tiny paint program built
+' entirely on the ArcoUI core's Transaction API -- every stroke is a real Begin/Update/Commit
+' transaction (Canvas widget, stdlib/arcoui.abas), not a bespoke pointer-capture state machine
+' hand-rolled per app the way every pre-ArcoUI GUI.* example (gui_window.abas, arconote.abas, ...)
+' had to. Undo/Redo pop real committed transaction records off the ArcoUI core's own stack.
+
+#IMPORT "arcoui"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "GUI support was not enabled in this build -- nothing to show."
+ELSE
+    TRY
+        app = App("Paint")
+        win = app.Window("ArcoUI Paint", 640, 480)
+
+        ' Canvas needs a CONTINUOUS intent (Begin/Update/Commit) -- ArcoSurface.DefineIntent only
+        ' ever makes discrete ones, so Paint defines this one directly against the core.
+        strokeIntent = ArcoUI.DefineIntent("Draw", win.RootSemantic, TRUE)
+
+        canvas = Canvas()
+        ignored = canvas.Bind(win, strokeIntent)
+        ignored = canvas.SetBounds(win.Theme.Spacing, 60, 640 - win.Theme.Spacing * 2, 480 - 60 - win.Theme.Spacing)
+        ignored = win.Attach(canvas, "", FALSE)
+
+        undoButton = Button("Undo")
+        undoButton.SetBounds(win.Theme.Spacing, 14, 90, 32)
+        ignored = win.Attach(undoButton)
+
+        redoButton = Button("Redo")
+        redoButton.SetBounds(win.Theme.Spacing + 98, 14, 90, 32)
+        ignored = win.Attach(redoButton)
+
+        status = Label("Draw with the mouse. Undo/Redo above.")
+        status.SetPosition(win.Theme.Spacing + 206, 24)
+        ignored = win.Attach(status, "", FALSE)
+
+        WHILE app.AnyOpen()
+            timestamp = Time.Timestamp()
+            event = GUI.WaitEvent(0.02)
+            IF event.Type <> "none" ANDALSO event.Window == win.Window THEN
+                IF event.Type == "close" THEN
+                    ignored = win.Invoke("Close", timestamp)
+                ELSE
+                    IF event.Type == "pointer-button" ANDALSO event.Action == "release" ANDALSO event.Button == "left" THEN
+                        IF undoButton.ContainsPoint(event.X, event.Y) THEN
+                            IF canvas.Undo() THEN
+                                status.Text = "Undid a stroke"
+                            ELSE
+                                status.Text = "Nothing to undo"
+                            END IF
+                        END IF
+                        IF redoButton.ContainsPoint(event.X, event.Y) THEN
+                            IF canvas.Redo() THEN
+                                status.Text = "Redid a stroke"
+                            ELSE
+                                status.Text = "Nothing to redo"
+                            END IF
+                        END IF
+                    END IF
+                    ignored = win.HandleEvent(event, timestamp)
+                END IF
+            END IF
+
+            ignored = app.Pump()
+            IF NOT win.ShouldClose() THEN win.Draw()
+        WEND
+
+        ignored = win.Close()
+    CATCH err
+        PRINT "ArcoUI paint failed: " + err
+    END TRY
+END IF

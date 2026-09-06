@@ -135,9 +135,17 @@ FUNCTION SeedProducts()
     RETURN TRUE
 END FUNCTION
 
+FUNCTION Rule(title, width)
+    line = ""
+    FOR i = 1 TO width
+        line = line + "="
+    NEXT
+    RETURN line + " " + title
+END FUNCTION
+
 FUNCTION PrintHeader(title)
     PRINT ""
-    PRINT TUI.ThemeRule("circuit", title, 72)
+    PRINT Rule(title, 72)
 END FUNCTION
 
 FUNCTION ListProducts()
@@ -348,7 +356,7 @@ END FUNCTION
 
 FUNCTION DrawMenu()
     PRINT ""
-    PRINT TUI.ThemeRule("circuit", app.StoreName, 72)
+    PRINT Rule(app.StoreName, 72)
     PRINT "1. List products"
     PRINT "2. Add product"
     PRINT "3. Edit product"

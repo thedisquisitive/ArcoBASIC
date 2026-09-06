@@ -79,3 +79,23 @@ large_image=$TMP_ROOT/mkfs-large.img
 truncate -s 128M "$large_image"
 "$ARCFS_LINUX" mkfs "$large_image" --force --volume-id 2a >/dev/null
 "$ARCFS_LINUX" inspect "$large_image" | grep -q '^objects: 1 (0 files, 1 directories)$'
+
+# Snapshot/rollback through the real CLI binary's own argv parsing and dispatch -- a different
+# failure surface than tests/unit/arcfs_host_tests.cpp, which calls Volume's C++ API directly and
+# never exercises parse_args()/main()'s "snapshot"/"rollback" command handling at all. File-content
+# preservation across a snapshot is already covered thoroughly there; this just proves the CLI
+# plumbing (create/list/ls/delete/rollback, --label, positional ID) actually works end to end.
+snapshot_image=$TMP_ROOT/snapshot-cli.img
+truncate -s 4194304 "$snapshot_image"
+"$ARCFS_LINUX" mkfs "$snapshot_image" --force --volume-id 2a >/dev/null
+"$ARCFS_LINUX" snapshot list "$snapshot_image" | grep -q '^no snapshots$'
+"$ARCFS_LINUX" snapshot create "$snapshot_image" --label "cli-smoke" | grep -q '^created snapshot 1 ("cli-smoke")'
+"$ARCFS_LINUX" inspect "$snapshot_image" | grep -q '^snapshots: 1$'
+snapshot_line=$("$ARCFS_LINUX" snapshot list "$snapshot_image" | tail -n1)
+snapshot_id=$(printf '%s' "$snapshot_line" | cut -f1)
+[[ "$snapshot_id" == "1" ]]
+printf '%s' "$snapshot_line" | grep -q 'cli-smoke$'
+"$ARCFS_LINUX" snapshot ls "$snapshot_image" "$snapshot_id" / >/dev/null
+"$ARCFS_LINUX" rollback "$snapshot_image" "$snapshot_id" | grep -q '^rolled back to snapshot 1'
+"$ARCFS_LINUX" snapshot delete "$snapshot_image" "$snapshot_id" | grep -q '^deleted snapshot 1$'
+"$ARCFS_LINUX" snapshot list "$snapshot_image" | grep -q '^no snapshots$'

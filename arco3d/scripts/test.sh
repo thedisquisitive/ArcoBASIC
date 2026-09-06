@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs every arco3d test as a real, standalone compiled capsule (arco3d/build/<name>, built by
-# arco3d/build.sh) -- no arcosh/ArcoFission needed at run time, only at build time. Run from
+# arco3d/build.sh) -- no ArcoFission toolchain needed at run time, only at build time. Run from
 # anywhere (it locates itself); builds everything first if arco3d/build/ is missing or stale.
 set -euo pipefail
 

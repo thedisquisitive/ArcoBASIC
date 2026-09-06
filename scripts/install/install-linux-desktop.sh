@@ -2,28 +2,28 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-build_arcosh="${repo_root}/build/arcosh"
+build_arconaut="${repo_root}/arcfs-utils/build/generated/arconaut"
 desktop_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/applications"
 mime_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/mime/packages"
 icon_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/icons/hicolor/512x512"
 pixmaps_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/pixmaps"
 
-if [[ ! -x "${build_arcosh}" ]]; then
-    echo "Build arcosh first: cmake --build build -j2" >&2
+if [[ ! -x "${build_arconaut}" ]]; then
+    echo "Build arconaut first: cmake --build build -j2" >&2
     exit 1
 fi
 
 mkdir -p "${desktop_dir}" "${mime_dir}" "${icon_dir}/apps" "${icon_dir}/mimetypes" "${pixmaps_dir}"
 
 cp "${repo_root}/packaging/linux/application-x-arcobasic.xml" "${mime_dir}/application-x-arcobasic.xml"
-cp "${repo_root}/assets/arconaut/title-icon.png" "${icon_dir}/apps/arconaut.png"
-cp "${repo_root}/assets/arconaut/title-icon.png" "${pixmaps_dir}/arconaut.png"
-cp "${repo_root}/assets/arconaut/arcobasic-file.png" "${icon_dir}/mimetypes/application-x-arcobasic.png"
+cp "${repo_root}/arcfs-utils/assets/arconaut/title-icon.png" "${icon_dir}/apps/arconaut.png"
+cp "${repo_root}/arcfs-utils/assets/arconaut/title-icon.png" "${pixmaps_dir}/arconaut.png"
+cp "${repo_root}/arcfs-utils/assets/arconaut/arcobasic-file.png" "${icon_dir}/mimetypes/application-x-arcobasic.png"
 
 sed \
-    -e "s|@CMAKE_INSTALL_FULL_BINDIR@/arcosh|${build_arcosh}|g" \
-    -e "s|@CMAKE_INSTALL_FULL_DATADIR@/arcobasic/examples/arconaut.abas|${repo_root}/examples/arconaut.abas|g" \
-    "${repo_root}/packaging/linux/arconaut.desktop.in" > "${desktop_dir}/arconaut.desktop"
+    -e "s|@CMAKE_INSTALL_FULL_BINDIR@/arconaut|${build_arconaut}|g" \
+    -e "s|@CMAKE_INSTALL_FULL_DATADIR@/arcobasic/examples/arconaut.abas|${repo_root}/arcfs-utils/apps/arconaut/arconaut.abas|g" \
+    "${repo_root}/arcfs-utils/packaging/linux/arconaut.desktop.in" > "${desktop_dir}/arconaut.desktop"
 
 chmod 0644 "${desktop_dir}/arconaut.desktop"
 

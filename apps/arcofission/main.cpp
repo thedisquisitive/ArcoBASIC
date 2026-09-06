@@ -23,6 +23,9 @@ void print_usage(std::ostream& output) {
         << "  ArcoFission reveal FILE --stage BYTECODE\n"
         << "  ArcoFission build FILE -o OUT\n"
         << "  ArcoFission build FILE -o OUT.efi --target uefi-x86_64 [--entry NAME]\n"
+        << "  ArcoFission build FILE -o OUT --target linux-x86_64 [--entry NAME]\n"
+        << "    (experimental: compiles straight to real x86-64 machine code, no embedded bytecode\n"
+        << "    VM -- Phase 1 scope only, see .agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md)\n"
         << "  ArcoFission bytecode FILE -o OUT.arcof\n"
         << "  ArcoFission native FILE -o OUT\n"
         << "  ArcoFission native FILE -o OUT.exe --target windows-x86_64\n"
@@ -216,6 +219,20 @@ int main(int argc, char** argv) {
             const auto result = arco::fission::build_efi_image_file(argv[2], entry_function, output_path);
             if (!result.ok) {
                 std::cerr << "EFI BUILD FAILED\n\n" << result.error << '\n';
+                return 1;
+            }
+            std::cout << result.output;
+            return 0;
+        }
+        // Phase 1 of the native (no-bytecode-VM) Linux backend -- see
+        // .agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md. A distinct opt-in --target value
+        // rather than the default `build`/`native` behavior, which stays exactly the ELF64
+        // bytecode-VM-embedding capsule format it always has been -- this is a separate, narrower,
+        // still-experimental output shape, not a replacement for it.
+        if (target == "linux-x86_64" || target == "linux-x86-64") {
+            const auto result = arco::fission::build_linux_native_image_file(argv[2], entry_function, output_path);
+            if (!result.ok) {
+                std::cerr << "LINUX NATIVE BUILD FAILED\n\n" << result.error << '\n';
                 return 1;
             }
             std::cout << result.output;

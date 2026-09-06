@@ -145,7 +145,7 @@ if (-not [string]::IsNullOrWhiteSpace($generator)) {
 }
 Invoke-Native "cmake" $configureArgs
 
-Write-Step "Building ArcoBASIC and ArcoSH"
+Write-Step "Building ArcoBASIC"
 Invoke-Native "cmake" @("--build", $BuildDir, "--config", $Configuration)
 
 if ($RunTests) {
@@ -167,8 +167,5 @@ $exeDir = if ($generator -like "Visual Studio*") {
 
 Write-Host ""
 Write-Host "Build complete." -ForegroundColor Green
-Write-Host "ArcoSH:    $(Join-Path $exeDir 'arcosh.exe')"
 Write-Host "ArcoBASIC: $(Join-Path $exeDir 'arco_cli.exe')"
-Write-Host ""
-Write-Host "Example:"
-Write-Host "  $(Join-Path $exeDir 'arcosh.exe') --version"
+Write-Host "ArcoFission: $(Join-Path $exeDir 'ArcoFission.exe')"

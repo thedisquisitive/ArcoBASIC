@@ -1,0 +1,968 @@
+#TARGET linux
+#DESCRIPTION "Arconaut ArcFS administrator"
+
+FUNCTION ShellQuote(value AS STRING)
+    text = STRING(value)
+    quoted = "'"
+    index = 0
+    WHILE index < String.Length(text)
+        ch = String.Slice(text, index, 1)
+        IF ch == "'" THEN
+            quoted = quoted + "'\''"
+        ELSE
+            quoted = quoted + ch
+        END IF
+        index = index + 1
+    WEND
+    RETURN quoted + "'"
+END FUNCTION
+
+FUNCTION RunCommand(command AS STRING)
+    result = Process.Run(command)
+    output = ""
+    IF Object.Has(result, "Output") THEN output = result.Output
+    IF result.Ok THEN
+        app.Status = "Command completed"
+    ELSE
+        app.Status = "Command failed: " + STRING(result.ExitCode)
+        IF Object.Has(result, "Error") THEN output = output + "\n" + result.Error
+    END IF
+    IF String.Length(String.Trim(output)) > 0 THEN
+        app.Console = String.Trim(output)
+        app.ConsoleScroll = 0
+    END IF
+    RETURN result.Ok
+END FUNCTION
+
+FUNCTION CommandExists(name AS STRING)
+    result = Process.Run("command -v " + ShellQuote(name) + " >/dev/null 2>&1")
+    RETURN result.Ok
+END FUNCTION
+
+' 0-based index of the nth non-empty whitespace-separated token on `line` -- lsblk's raw (-r)
+' output is space-separated with no guaranteed single-space-only gaps, so a naive Split leaves
+' empty strings between runs of spaces that this skips over.
+FUNCTION NthToken(line AS STRING, n)
+    parts = String.Split(String.Trim(line), " ")
+    index = 0
+    found = 0
+    WHILE index < LEN(parts)
+        token = String.Trim(parts[index])
+        IF token <> "" THEN
+            IF found == n THEN RETURN token
+            found = found + 1
+        END IF
+        index = index + 1
+    WEND
+    RETURN ""
+END FUNCTION
+
+FUNCTION FirstToken(line AS STRING)
+    RETURN NthToken(line, 0)
+END FUNCTION
+
+' arcfs-linux's `snapshot list` output is tab-separated (id/generation/created_at/label), unlike
+' lsblk's whitespace-separated columns above -- a label can itself contain spaces, so NthToken's
+' whitespace splitting isn't safe to reuse here.
+FUNCTION NthTabToken(line AS STRING, n)
+    parts = String.Split(line, "\t")
+    IF n >= 0 AND n < LEN(parts) THEN RETURN String.Trim(parts[n])
+    RETURN ""
+END FUNCTION
+
+' lsblk -pnro PATH,SIZE,FSTYPE,TRAN,RM,RO,MOUNTPOINTS -- FSTYPE is the 3rd column (index 2).
+FUNCTION DeviceFstype(line AS STRING)
+    RETURN NthToken(line, 2)
+END FUNCTION
+
+' app.Devices filtered down to ArcFS volumes only when the "Hide non-ArcFS volumes" checkbox is
+' on; the raw list otherwise. A plain function of app state (not cached) -- device lists are at
+' most a few dozen entries, cheap enough to recompute every frame the same way every other bit of
+' this immediate-mode UI already does.
+FUNCTION FilteredDevices()
+    IF app.HideNonArcFS == FALSE THEN RETURN app.Devices
+    result = []
+    FOR line IN app.Devices
+        IF Lower(DeviceFstype(line)) == "arcfs" THEN ignored = Array.Push(result, line)
+    NEXT
+    RETURN result
+END FUNCTION
+
+' Was called unconditionally from inside DrawVolumes -- once per frame, every frame, forever --
+' on the documented assumption that it was "cheap enough." Built-in capsule profiling
+' (ARCOFISSION_DEBUG=1, see execute_function()'s own comment in fission.cpp) proved that wrong: on
+' a real device list this alone cost ~2.3ms of every ~20ms frame, entirely wasted since the actual
+' filtered result only ever changes when app.Devices or app.HideNonArcFS does -- both already
+' discrete events (a Refresh click, the checkbox toggle), not continuous per-frame state. Call this
+' once at each of those points instead and have DrawVolumes just read the result.
+FUNCTION RefreshFilteredDeviceCache()
+    app.FilteredDeviceCache = FilteredDevices()
+END FUNCTION
+
+FUNCTION AddLog(text AS STRING)
+    ignored = Array.Push(app.Log, text)
+    WHILE LEN(app.Log) > 7
+        ignored = Array.Shift(app.Log)
+    WEND
+END FUNCTION
+
+FUNCTION SetConsole(title AS STRING, text AS STRING)
+    app.ConsoleTitle = title
+    app.Console = text
+    app.ConsoleScroll = 0
+END FUNCTION
+
+FUNCTION RefreshDevices()
+    IF CommandExists("lsblk") THEN
+        result = Process.Run("lsblk -pnro PATH,SIZE,FSTYPE,TRAN,RM,RO,MOUNTPOINTS")
+        IF Object.Has(result, "Output") THEN
+            app.DeviceText = String.Trim(result.Output)
+            app.Devices = String.Split(app.DeviceText, "\n")
+            ignored = RefreshFilteredDeviceCache()
+            SetConsole("Devices", app.DeviceText)
+            app.Status = STRING(LEN(app.Devices)) + " block entries"
+            AddLog("Refreshed block devices")
+        ELSE
+            app.Status = "lsblk returned no output"
+        END IF
+    ELSE
+        app.Status = "lsblk is not installed"
+    END IF
+END FUNCTION
+
+' `visibleRow` is a row position within the currently drawn (scrolled + filtered) list, not a raw
+' index into app.Devices -- DrawVolumes/FindHover only ever know about visible rows, so this is
+' where that gets turned back into an actual device line.
+FUNCTION SelectDevice(visibleRow AS NUMBER)
+    devices = FilteredDevices()
+    index = app.DeviceScroll + visibleRow
+    IF index >= 0 AND index < LEN(devices) THEN
+        line = devices[index]
+        source = FirstToken(line)
+        IF source <> "" THEN
+            app.SelectedSource = source
+            app.SelectedKind = "device"
+            app.Status = "Selected " + source
+        END IF
+    END IF
+END FUNCTION
+
+FUNCTION OpenImage()
+    path = GUI.OpenFileDialog(window, "Open ArcFS image", app.Home)
+    IF path <> "" THEN
+        app.SelectedSource = path
+        app.SelectedKind = "image"
+        app.Status = "Selected image " + path
+        InspectSource()
+    END IF
+END FUNCTION
+
+FUNCTION CreateImage()
+    path = GUI.SaveFileDialog(window, "Create ArcFS image", Path.Join(app.Home, "arcfs.img"))
+    IF path <> "" THEN
+        command = "arcfsctl create-image " + ShellQuote(path) + " " + ShellQuote(app.ImageSize) + " --format"
+        IF RunCommand(command) THEN
+            app.SelectedSource = path
+            app.SelectedKind = "image"
+            app.Status = "Created " + path
+            AddLog("Created image " + path)
+        END IF
+    END IF
+END FUNCTION
+
+' A raw block device (/dev/sdX) defaults to root:disk 0660, which an ordinary user can't open
+' directly -- but the 61-arcfs.rules udev rule now regrants ArcFS-formatted devices specifically
+' (not a blanket disk-group grant) to the `plugdev` group, which a normal desktop user account is
+' already a member of. No pkexec/sudo needed for either of these once that rule is installed --
+' matches Mount() below, which now mounts device sources the same direct, unprivileged way.
+FUNCTION InspectSource()
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a device or image first"
+        RETURN FALSE
+    END IF
+    ok = RunCommand("arcfs-linux inspect " + ShellQuote(app.SelectedSource))
+    app.ConsoleTitle = "Inspect: " + app.SelectedSource
+    IF ok THEN AddLog("Inspected " + app.SelectedSource)
+    RETURN ok
+END FUNCTION
+
+FUNCTION ListRoot()
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a device or image first"
+        RETURN FALSE
+    END IF
+    ok = RunCommand("arcfs-linux ls " + ShellQuote(app.SelectedSource) + " /")
+    app.ConsoleTitle = "Root listing"
+    IF ok THEN AddLog("Listed / on " + app.SelectedSource)
+    RETURN ok
+END FUNCTION
+
+' Mounts directly via arcfs-linux -- deliberately NOT udisksctl for a device source. udisksctl's
+' own Mount() always runs as root regardless of filesystem type (that's inherent to how udisks2
+' itself is built, not something ArcFS-specific), which is why every ArcFS operation used to force
+' a pkexec/sudo/root round-trip even for a user's own personal USB stick. Once the device node
+' itself is readable by this user -- see the 61-arcfs.rules udev rule's `GROUP="plugdev"` grant,
+' scoped to ArcFS-formatted devices only, not a blanket disk-group grant -- FUSE's own normal
+' unprivileged-mount path (the same one sshfs/rclone use) needs no escalation at all: no
+' `allow_other` either, since only this same user ever needs to read it. Uses the identical
+' Arconaut-owned-mountpoint pattern the image branch below already established, rather than
+' /media/<user>/... (which is udisks2's own namespace, not this program's to manage).
+FUNCTION MountSelected()
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a device or image first"
+        RETURN FALSE
+    END IF
+    IF String.StartsWith(app.SelectedSource, "/dev/") THEN
+        mounts = Path.Join(app.Home, ".cache")
+        ignored = Directory.Create(mounts)
+        mounts = Path.Join(mounts, "arconaut")
+        ignored = Directory.Create(mounts)
+        mountpoint = Path.Join(mounts, "arcfs-device")
+        ignored = Directory.Create(mountpoint)
+        IF RunCommand("arcfs-linux mount " + ShellQuote(app.SelectedSource) + " " + ShellQuote(mountpoint)) THEN
+            app.MountPath = mountpoint
+            AddLog("Mounted " + app.SelectedSource + " at " + mountpoint)
+        END IF
+        RETURN TRUE
+    END IF
+
+    mounts = Path.Join(app.Home, ".cache")
+    ignored = Directory.Create(mounts)
+    mounts = Path.Join(mounts, "arconaut")
+    ignored = Directory.Create(mounts)
+    mountpoint = Path.Join(mounts, "arcfs-image")
+    ignored = Directory.Create(mountpoint)
+    IF RunCommand("arcfsctl mount " + ShellQuote(app.SelectedSource) + " " + ShellQuote(mountpoint)) THEN
+        app.MountPath = mountpoint
+        AddLog("Mounted image at " + mountpoint)
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION ExploreMount()
+    ' MountSelected() now sets app.MountPath for a device the same way it already did for an image
+    ' (see that function's own comment) -- no more guessing at udisks2's /media/<user> namespace,
+    ' which Arconaut's own device mounts don't use at all any more.
+    IF app.MountPath <> "" THEN
+        ignored = System.Open(app.MountPath)
+    ELSE
+        app.Status = "Mount the device or image first"
+    END IF
+END FUNCTION
+
+' app.Snapshots holds raw tab-separated data rows only (the "id\tgeneration\tcreated_at\tlabel"
+' header line and the plain "no snapshots" line are both excluded) -- same convention as
+' app.Devices holding raw lsblk lines for FirstToken/NthToken to parse on demand.
+FUNCTION RefreshSnapshots()
+    app.Snapshots = []
+    app.SelectedSnapshotId = ""
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a device or image first"
+        RETURN FALSE
+    END IF
+    result = Process.Run("arcfs-linux snapshot list " + ShellQuote(app.SelectedSource))
+    output = ""
+    IF Object.Has(result, "Output") THEN output = result.Output
+    IF result.Ok == FALSE THEN
+        app.Status = "Failed to list snapshots"
+        IF Object.Has(result, "Error") THEN SetConsole("Snapshots", result.Error)
+        RETURN FALSE
+    END IF
+    trimmed = String.Trim(output)
+    IF trimmed <> "no snapshots" THEN
+        lines = String.Split(trimmed, "\n")
+        index = 1 ' skip the "id\tgeneration\tcreated_at\tlabel" header row
+        WHILE index < LEN(lines)
+            line = String.Trim(lines[index])
+            IF line <> "" THEN ignored = Array.Push(app.Snapshots, line)
+            index = index + 1
+        WEND
+    END IF
+    app.Status = STRING(LEN(app.Snapshots)) + " snapshots"
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION SelectSnapshot(visibleRow AS NUMBER)
+    index = app.SnapshotScroll + visibleRow
+    IF index >= 0 AND index < LEN(app.Snapshots) THEN
+        app.SelectedSnapshotId = NthTabToken(app.Snapshots[index], 0)
+        app.Status = "Selected snapshot " + app.SelectedSnapshotId
+    END IF
+END FUNCTION
+
+' Auto-labeled, one-click -- this app has no single-line text-entry widget of its own to build (only
+' Button/Checkbox/Tab exist), and building one is out of scope for this feature. Full custom
+' labeling stays a first-class arcfsctl/arcfs-linux CLI capability (--label "..."), matching this
+' app's existing "simple one-click GUI action, fuller control via the CLI" split (see FormatSelected
+' vs. `arcfsctl format --volume-id`).
+FUNCTION CreateSnapshot()
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a device or image first"
+        RETURN FALSE
+    END IF
+    label = "Snapshot " + Time.Now()
+    command = "arcfs-linux snapshot create " + ShellQuote(app.SelectedSource) + " --label " + ShellQuote(label)
+    IF RunCommand(command) THEN
+        AddLog("Created snapshot on " + app.SelectedSource)
+        ignored = RefreshSnapshots()
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION RollbackSnapshot()
+    IF app.SelectedSnapshotId == "" THEN
+        app.Status = "Select a snapshot first"
+        RETURN FALSE
+    END IF
+    prompt = "Roll back " + app.SelectedSource + " to snapshot " + app.SelectedSnapshotId + "? This overwrites the live volume's current content."
+    IF GUI.Confirm(window, "Rollback", prompt) == FALSE THEN RETURN FALSE
+    command = "arcfs-linux rollback " + ShellQuote(app.SelectedSource) + " " + ShellQuote(app.SelectedSnapshotId)
+    IF RunCommand(command) THEN
+        AddLog("Rolled back " + app.SelectedSource + " to snapshot " + app.SelectedSnapshotId)
+        ignored = RefreshSnapshots()
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION DeleteSnapshot()
+    IF app.SelectedSnapshotId == "" THEN
+        app.Status = "Select a snapshot first"
+        RETURN FALSE
+    END IF
+    IF GUI.Confirm(window, "Delete Snapshot", "Delete snapshot " + app.SelectedSnapshotId + "? This cannot be undone.") == FALSE THEN RETURN FALSE
+    command = "arcfs-linux snapshot delete " + ShellQuote(app.SelectedSource) + " " + ShellQuote(app.SelectedSnapshotId)
+    IF RunCommand(command) THEN
+        AddLog("Deleted snapshot " + app.SelectedSnapshotId)
+        ignored = RefreshSnapshots()
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION FormatSelected()
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a target first"
+        RETURN FALSE
+    END IF
+    IF GUI.Confirm(window, "Format ArcFS", "Format " + app.SelectedSource + " as ArcFS? Existing data will be lost.") == FALSE THEN RETURN FALSE
+    command = "pkexec mkfs.arcfs " + ShellQuote(app.SelectedSource) + " --force"
+    IF app.SelectedKind == "image" THEN command = "mkfs.arcfs " + ShellQuote(app.SelectedSource) + " --force"
+    IF RunCommand(command) THEN AddLog("Formatted " + app.SelectedSource)
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION Maintenance()
+    IF app.SelectedSource == "" THEN
+        app.Status = "Select a device or image first"
+        RETURN FALSE
+    END IF
+    ok = InspectSource()
+    IF ok THEN app.Status = "Maintenance inspection complete"
+    RETURN ok
+END FUNCTION
+
+FUNCTION InstallSupport()
+    command = "arcfsctl install-support"
+    IF CommandExists("pkexec") THEN command = "pkexec arcfsctl install-support"
+    IF RunCommand(command) THEN AddLog("Installed or refreshed Linux support")
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION UpdateSupport()
+    path = GUI.OpenFileDialog(window, "Open ArcFS support update", app.Home)
+    IF path == "" THEN RETURN FALSE
+    IF String.EndsWith(Lower(path), ".deb") THEN
+        command = "apt install -y " + ShellQuote(path)
+        IF CommandExists("pkexec") THEN command = "pkexec apt install -y " + ShellQuote(path)
+        IF RunCommand(command) THEN AddLog("Applied update package " + path)
+    ELSE
+        app.Status = "Update file must be a .deb on Linux"
+    END IF
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION RefreshPlugins()
+    ignored = Directory.Create(app.PluginDir)
+    app.Plugins = []
+    IF Directory.Exists(app.PluginDir) THEN
+        entries = File.List(app.PluginDir)
+        FOR item IN entries
+            IF item.IsDirectory == FALSE AND Lower(item.Extension) == ".abas" THEN
+                ignored = Array.Push(app.Plugins, item)
+            END IF
+        NEXT
+    END IF
+    app.Status = STRING(LEN(app.Plugins)) + " plugins"
+END FUNCTION
+
+FUNCTION AddPlugin()
+    path = GUI.OpenFileDialog(window, "Open ArcoBASIC plugin", app.Home)
+    IF path <> "" THEN
+        app.SelectedPlugin = path
+        app.Status = "Selected plugin " + path
+    END IF
+END FUNCTION
+
+FUNCTION RunPlugin()
+    IF app.SelectedPlugin == "" THEN
+        IF LEN(app.Plugins) > 0 THEN app.SelectedPlugin = app.Plugins[0].Path
+    END IF
+    IF app.SelectedPlugin == "" THEN
+        app.Status = "Select a plugin first"
+        RETURN FALSE
+    END IF
+    command = "ArcoFission compile-run " + ShellQuote(app.SelectedPlugin)
+    IF app.SelectedSource <> "" THEN command = command + " -- " + ShellQuote(app.SelectedSource)
+    IF RunCommand(command) THEN AddLog("Ran plugin " + Path.BaseName(app.SelectedPlugin))
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION Hit(x AS NUMBER, y AS NUMBER, bx AS NUMBER, by AS NUMBER, bw AS NUMBER, bh AS NUMBER)
+    RETURN x >= bx AND x < bx + bw AND y >= by AND y < by + bh
+END FUNCTION
+
+' The single place a widget's clickable geometry gets recorded -- Button/Checkbox call this with
+' whatever position they actually draw at, and FindHover just replays the list back against the
+' pointer instead of every mode maintaining its own second copy of the same coordinates. This is
+' the direct fix for a real, twice-caught bug class: FindHover used to hardcode its own literals
+' for each button (duplicating Button()'s own x/y/w/h math by hand), and a later change to one of
+' those two copies (moving the console/actions layout) silently left the other stale -- clicks and
+' hover landed on where things USED to be drawn, not where they actually were. A hardcoded pixel
+' pair can drift from what it's supposed to match; a value read back from the thing that drew it
+' cannot. Reset to [] once per frame (see the main loop) so only what's actually on screen this
+' frame is ever hit-testable -- a hidden tab's old buttons can't catch a click either.
+FUNCTION RegisterRegion(id AS STRING, x, y, w, h)
+    ignored = Array.Push(app.Regions, {"Id": id, "X": x, "Y": y, "W": w, "H": h})
+END FUNCTION
+
+' GUI.MeasureText does real Pango text shaping from scratch on every single call -- a known,
+' documented, systemic cost of this whole rendering backend, not something button-specific. Button
+' labels are all static string literals (every call site in this file passes a fixed label, never
+' a computed one), so measuring the same handful of strings again on every one of the ~15-17
+' Button() calls this app makes EVERY FRAME -- continuously, at 20+fps from GUI.WaitEvent's own
+' 0.05s poll, whether or not anything is actually happening -- was pure waste: hundreds of real
+' text-shaping calls a second for text that never changes. This is very likely the actual,
+' ongoing root cause behind repeated "the UI is laggy" reports this session, not any one specific
+' interaction -- confirmed live by just how much idle CPU this process burns doing nothing at all.
+FUNCTION MeasureTextCached(window AS NUMBER, label AS STRING, size)
+    key = label + "|" + STRING(size)
+    FOR entry IN app.MeasureCache
+        IF entry.Key == key THEN RETURN entry
+    NEXT
+    measured = GUI.MeasureText(window, label, size)
+    entry = {"Key": key, "Width": measured.Width, "Height": measured.Height}
+    ignored = Array.Push(app.MeasureCache, entry)
+    RETURN entry
+END FUNCTION
+
+FUNCTION Button(window AS NUMBER, id AS STRING, label AS STRING, x, y, w, h, r = 0.13, g = 0.16, b = 0.20)
+    ignored = RegisterRegion(id, x, y, w, h)
+    hovered = app.Hover == id
+    rr = r
+    gg = g
+    bb = b
+    IF hovered THEN
+        rr = r + 0.05
+        gg = g + 0.05
+        bb = b + 0.05
+    END IF
+    GUI.RoundedRectangle(window, x, y, w, h, 6, rr, gg, bb, 1.0)
+    measured = MeasureTextCached(window, label, 14)
+    GUI.Text(window, label, x + (w - measured.Width) / 2, y + (h - measured.Height) / 2, 14, 0.89, 0.92, 0.96, 1.0)
+END FUNCTION
+
+FUNCTION Checkbox(window AS NUMBER, id AS STRING, label AS STRING, x, y, checked AS BOOL)
+    ' Fixed 230x20 hit region (not the tighter visual box, not GUI.MeasureText -- see the comment
+    ' this used to carry in FindHover, now moot: GUI.MeasureText on every pointer-move is what
+    ' actually caused this app's very first reported lag, long before the layout-drift one). Wide
+    ' enough to comfortably cover the checkbox plus its label.
+    ignored = RegisterRegion(id, x, y, 230, 20)
+    hovered = app.Hover == id
+    size = 18
+    br = 0.13
+    bg = 0.16
+    bb = 0.20
+    IF hovered THEN
+        br = br + 0.05
+        bg = bg + 0.05
+        bb = bb + 0.05
+    END IF
+    GUI.RoundedRectangle(window, x, y, size, size, 4, br, bg, bb, 1.0)
+    IF checked THEN
+        inset = 4
+        GUI.RoundedRectangle(window, x + inset, y + inset, size - inset * 2, size - inset * 2, 2, 0.42, 0.78, 0.75, 1.0)
+    END IF
+    GUI.Text(window, label, x + size + 8, y + 2, 14, 0.82, 0.86, 0.90, 1.0)
+END FUNCTION
+
+' Draws a thin scroll position indicator on the right edge of a list panel -- only when there's
+' actually more content than fits, matching this app's existing "don't paint what isn't relevant"
+' convention (e.g. DrawScrollbar's own IF below mirrors how the Activity log/console panels just
+' don't show anything extra when there's nothing to show). Position-only, not itself draggable --
+' the wheel is the only current way to scroll (see the main loop's "scroll" event handling).
+FUNCTION DrawScrollbar(window AS NUMBER, x, y, h, total_rows, visible_rows, scroll_rows AS NUMBER)
+    IF total_rows <= visible_rows THEN RETURN
+    track_w = 6
+    GUI.RoundedRectangle(window, x, y, track_w, h, 3, 0.10, 0.12, 0.15, 1.0)
+    thumb_h = h * (visible_rows / total_rows)
+    IF thumb_h < 20 THEN thumb_h = 20
+    max_scroll = total_rows - visible_rows
+    fraction = 0
+    IF max_scroll > 0 THEN fraction = scroll_rows / max_scroll
+    thumb_y = y + fraction * (h - thumb_h)
+    GUI.RoundedRectangle(window, x, thumb_y, track_w, thumb_h, 3, 0.35, 0.55, 0.58, 1.0)
+END FUNCTION
+
+FUNCTION Tab(window AS NUMBER, id AS STRING, label AS STRING, x, y, selected AS BOOL)
+    r = 0.08
+    g = 0.10
+    b = 0.13
+    IF selected THEN
+        r = 0.13
+        g = 0.23
+        b = 0.25
+    END IF
+    Button(window, id, label, x, y, 150, 34, r, g, b)
+END FUNCTION
+
+FUNCTION DrawIcon(window AS NUMBER, x, y, kind AS STRING)
+    IF kind == "disk" THEN
+        GUI.RoundedRectangle(window, x, y, 28, 34, 4, 0.40, 0.55, 0.66, 1.0)
+        GUI.Circle(window, x + 14, y + 18, 5, 0.08, 0.10, 0.13, 1.0)
+    ELSE
+        IF kind == "image" THEN
+            GUI.RoundedRectangle(window, x, y + 3, 28, 28, 4, 0.50, 0.40, 0.66, 1.0)
+            GUI.Line(window, x + 7, y + 11, x + 21, y + 11, 2, 0.90, 0.86, 0.98, 1.0)
+        ELSE
+            IF kind == "snapshot" THEN
+                GUI.Circle(window, x + 14, y + 17, 13, 0.42, 0.60, 0.78, 1.0)
+                GUI.Circle(window, x + 14, y + 17, 9, 0.09, 0.11, 0.14, 1.0)
+                GUI.Line(window, x + 14, y + 17, x + 14, y + 10, 2, 0.82, 0.90, 0.96, 1.0)
+                GUI.Line(window, x + 14, y + 17, x + 19, y + 17, 2, 0.82, 0.90, 0.96, 1.0)
+            ELSE
+                GUI.RoundedRectangle(window, x + 4, y + 4, 20, 26, 3, 0.57, 0.62, 0.45, 1.0)
+            END IF
+        END IF
+    END IF
+END FUNCTION
+
+' Single source of truth for the main-panel geometry every Draw* function needs -- FindHover no
+' longer recomputes any of this itself (see RegisterRegion's own comment for why that was the
+' actual bug), but every Draw* call in the main loop still shares these same values, which is what
+' keeps what's drawn and what RegisterRegion recorded this frame in agreement in the first place.
+'
+' ConsoleH went from a fixed 88px (barely more than a single line -- real complaint: "can't read
+' the output") to 200px, trading some of the main list's own height for it, since the console is
+' where every Inspect/List/snapshot command's actual output lands and multi-line output is the
+' common case, not the exception.
+FUNCTION Layout()
+    size = GUI.Size(window)
+    rail_w = 184
+    main_x = rail_w + 18
+    main_y = 86
+    main_w = size.Width - main_x - 28
+    console_h = 200
+    console_y = size.Height - console_h - 16
+    actions_y = console_y - 112
+    main_h = actions_y - main_y - 12
+    RETURN {
+        "Width": size.Width, "Height": size.Height, "RailW": rail_w,
+        "MainX": main_x, "MainY": main_y, "MainW": main_w, "MainH": main_h,
+        "ActionsY": actions_y, "ConsoleY": console_y, "ConsoleH": console_h
+    }
+END FUNCTION
+
+' Real scrolling (mouse wheel + the same DrawScrollbar every other list in this app already uses),
+' not the previous hardcoded "first 22 lines and nothing else" -- a fresh command's output resets
+' app.ConsoleScroll to 0 (see RunCommand()/SetConsole()) so it always starts readable at the top.
+FUNCTION DrawConsole(window AS NUMBER, x AS NUMBER, y AS NUMBER, w AS NUMBER, h AS NUMBER)
+    GUI.Rectangle(window, x, y, w, h, 0.055, 0.065, 0.082, 1.0)
+    GUI.Text(window, app.ConsoleTitle, x + 14, y + 12, 13, 0.60, 0.75, 0.78, 1.0)
+    GUI.Line(window, x + 14, y + 38, x + w - 14, y + 38, 1, 0.15, 0.18, 0.22, 1.0)
+
+    lines = String.Split(app.Console, "\n")
+    row_height = 19
+    list_top = y + 48
+    list_h = h - 60
+    visible_rows = FLOOR(list_h / row_height)
+    IF visible_rows < 1 THEN visible_rows = 1
+    max_scroll = LEN(lines) - visible_rows
+    IF max_scroll < 0 THEN max_scroll = 0
+    IF app.ConsoleScroll > max_scroll THEN app.ConsoleScroll = max_scroll
+    IF app.ConsoleScroll < 0 THEN app.ConsoleScroll = 0
+
+    GUI.SetClip(window, x + 12, list_top, w - 24, list_h)
+    row = 0
+    WHILE row < visible_rows AND (app.ConsoleScroll + row) < LEN(lines)
+        GUI.TextMono(window, lines[app.ConsoleScroll + row], x + 14, list_top + row * row_height, 13, 0.82, 0.86, 0.88, 1.0)
+        row = row + 1
+    WEND
+    GUI.ResetClip(window)
+
+    ignored = DrawScrollbar(window, x + w - 10, list_top, list_h, LEN(lines), visible_rows, app.ConsoleScroll)
+END FUNCTION
+
+FUNCTION DrawVolumes(window AS NUMBER, x AS NUMBER, y AS NUMBER, w AS NUMBER, h AS NUMBER)
+    GUI.Text(window, "Block Devices", x, y, 22, 0.90, 0.93, 0.96, 1.0)
+    Button(window, "refresh", "Refresh", x + w - 314, y - 2, 94, 32)
+    Button(window, "open-image", "Open Image", x + w - 212, y - 2, 104, 32)
+    Button(window, "create-image", "New Image", x + w - 100, y - 2, 100, 32)
+    ignored = Checkbox(window, "hide-non-arcfs", "Hide non-ArcFS volumes", x + 210, y + 4, app.HideNonArcFS)
+    GUI.Line(window, x, y + 42, x + w, y + 42, 1, 0.15, 0.18, 0.22, 1.0)
+
+    ' app.FilteredDeviceCache is kept up to date by RefreshFilteredDeviceCache(), called only when
+    ' app.Devices or app.HideNonArcFS actually change (a Refresh click, the checkbox toggle) --
+    ' NOT recomputed here every frame any more. See RefreshFilteredDeviceCache()'s own comment for
+    ' the real, measured cost that used to be.
+    devices = app.FilteredDeviceCache
+    row_height = 40
+    list_top = y + 54
+    list_h = h - 62
+    visible_rows = FLOOR(list_h / row_height)
+    IF visible_rows < 1 THEN visible_rows = 1
+    max_scroll = LEN(devices) - visible_rows
+    IF max_scroll < 0 THEN max_scroll = 0
+    IF app.DeviceScroll > max_scroll THEN app.DeviceScroll = max_scroll
+    IF app.DeviceScroll < 0 THEN app.DeviceScroll = 0
+
+    GUI.SetClip(window, x, list_top, w, list_h)
+    row = 0
+    WHILE row < visible_rows AND (app.DeviceScroll + row) < LEN(devices)
+        line = devices[app.DeviceScroll + row]
+        row_y = list_top + row * row_height
+        source = FirstToken(line)
+        ignored = RegisterRegion("device-" + STRING(row), x, row_y, w, 34)
+        IF source == app.SelectedSource THEN GUI.RoundedRectangle(window, x, row_y, w, 34, 6, 0.14, 0.28, 0.27, 1.0)
+        IF app.Hover == "device-" + STRING(row) AND source <> app.SelectedSource THEN GUI.RoundedRectangle(window, x, row_y, w, 34, 6, 0.085, 0.105, 0.13, 1.0)
+        DrawIcon(window, x + 8, row_y, "disk")
+        GUI.TextMono(window, line, x + 48, row_y + 9, 13, 0.82, 0.86, 0.90, 1.0)
+        row = row + 1
+    WEND
+    GUI.ResetClip(window)
+
+    ignored = DrawScrollbar(window, x + w - 6, list_top, list_h, LEN(devices), visible_rows, app.DeviceScroll)
+END FUNCTION
+
+FUNCTION DrawActions(window AS NUMBER, x AS NUMBER, y AS NUMBER, w AS NUMBER)
+    GUI.Text(window, "Selected", x, y, 13, 0.50, 0.62, 0.68, 1.0)
+    selected = app.SelectedSource
+    IF selected == "" THEN selected = "No ArcFS target selected"
+    GUI.Text(window, selected, x, y + 22, 15, 0.88, 0.91, 0.94, 1.0)
+    Button(window, "inspect", "Inspect", x, y + 58, 86, 34)
+    Button(window, "list-root", "List /", x + 94, y + 58, 82, 34)
+    Button(window, "mount", "Mount", x + 184, y + 58, 86, 34)
+    Button(window, "explore", "Explore", x + 278, y + 58, 92, 34)
+    Button(window, "format", "Format", x + 378, y + 58, 92, 34, 0.28, 0.12, 0.11)
+END FUNCTION
+
+FUNCTION DrawMaintenance(window AS NUMBER, x AS NUMBER, y AS NUMBER, w AS NUMBER, h AS NUMBER)
+    GUI.Text(window, "Maintenance", x, y, 22, 0.90, 0.93, 0.96, 1.0)
+    Button(window, "maintenance", "Run Inspect", x, y + 52, 124, 36)
+    GUI.Text(window, "Volume checks run through the installed ArcFS host tools.", x, y + 110, 15, 0.64, 0.70, 0.76, 1.0)
+END FUNCTION
+
+FUNCTION DrawSupport(window AS NUMBER, x AS NUMBER, y AS NUMBER, w AS NUMBER, h AS NUMBER)
+    GUI.Text(window, "System Support", x, y, 22, 0.90, 0.93, 0.96, 1.0)
+    Button(window, "install-support", "Install/Refresh", x, y + 52, 140, 36)
+    Button(window, "update-support", "Apply Update", x + 152, y + 52, 124, 36)
+    GUI.Text(window, "Linux FUSE helper, udev rule, udisks integration, and package updates.", x, y + 110, 15, 0.64, 0.70, 0.76, 1.0)
+END FUNCTION
+
+FUNCTION DrawPlugins(window AS NUMBER, x AS NUMBER, y AS NUMBER, w AS NUMBER, h AS NUMBER)
+    GUI.Text(window, "Plugins", x, y, 22, 0.90, 0.93, 0.96, 1.0)
+    Button(window, "refresh-plugins", "Refresh", x + w - 314, y - 2, 94, 32)
+    Button(window, "add-plugin", "Open Script", x + w - 212, y - 2, 104, 32)
+    Button(window, "run-plugin", "Run", x + w - 100, y - 2, 100, 32)
+    GUI.Text(window, app.PluginDir, x, y + 48, 13, 0.48, 0.57, 0.64, 1.0)
+
+    row_height = 34
+    list_top = y + 78
+    list_h = h - (list_top - y) - 8
+    IF list_h < row_height THEN list_h = row_height
+    visible_rows = FLOOR(list_h / row_height)
+    IF visible_rows < 1 THEN visible_rows = 1
+    max_scroll = LEN(app.Plugins) - visible_rows
+    IF max_scroll < 0 THEN max_scroll = 0
+    IF app.PluginScroll > max_scroll THEN app.PluginScroll = max_scroll
+    IF app.PluginScroll < 0 THEN app.PluginScroll = 0
+
+    GUI.SetClip(window, x, list_top, w, list_h)
+    row = 0
+    WHILE row < visible_rows AND (app.PluginScroll + row) < LEN(app.Plugins)
+        item = app.Plugins[app.PluginScroll + row]
+        row_y = list_top + row * row_height
+        IF item.Path == app.SelectedPlugin THEN GUI.RoundedRectangle(window, x, row_y, w, 30, 6, 0.14, 0.28, 0.27, 1.0)
+        DrawIcon(window, x + 8, row_y, "plugin")
+        GUI.Text(window, item.Name, x + 44, row_y + 7, 14, 0.84, 0.88, 0.92, 1.0)
+        row = row + 1
+    WEND
+    GUI.ResetClip(window)
+
+    ignored = DrawScrollbar(window, x + w - 6, list_top, list_h, LEN(app.Plugins), visible_rows, app.PluginScroll)
+END FUNCTION
+
+FUNCTION DrawSnapshots(window AS NUMBER, x AS NUMBER, y AS NUMBER, w AS NUMBER, h AS NUMBER)
+    GUI.Text(window, "Snapshots", x, y, 22, 0.90, 0.93, 0.96, 1.0)
+    Button(window, "refresh-snapshots", "Refresh", x + w - 208, y - 2, 94, 32)
+    Button(window, "create-snapshot", "Create", x + w - 100, y - 2, 100, 32)
+    GUI.Line(window, x, y + 42, x + w, y + 42, 1, 0.15, 0.18, 0.22, 1.0)
+
+    row_height = 40
+    list_top = y + 54
+    list_h = h - 62
+    visible_rows = FLOOR(list_h / row_height)
+    IF visible_rows < 1 THEN visible_rows = 1
+    max_scroll = LEN(app.Snapshots) - visible_rows
+    IF max_scroll < 0 THEN max_scroll = 0
+    IF app.SnapshotScroll > max_scroll THEN app.SnapshotScroll = max_scroll
+    IF app.SnapshotScroll < 0 THEN app.SnapshotScroll = 0
+
+    IF LEN(app.Snapshots) == 0 THEN
+        GUI.Text(window, "No snapshots yet -- Create pins the current committed state for later recovery.", x, list_top, 14, 0.56, 0.63, 0.68, 1.0)
+    END IF
+
+    GUI.SetClip(window, x, list_top, w, list_h)
+    row = 0
+    WHILE row < visible_rows AND (app.SnapshotScroll + row) < LEN(app.Snapshots)
+        line = app.Snapshots[app.SnapshotScroll + row]
+        row_y = list_top + row * row_height
+        id = NthTabToken(line, 0)
+        label = NthTabToken(line, 3)
+        IF label == "" THEN label = "Snapshot " + id
+        ignored = RegisterRegion("snapshot-" + STRING(row), x, row_y, w, 34)
+        IF id == app.SelectedSnapshotId THEN GUI.RoundedRectangle(window, x, row_y, w, 34, 6, 0.14, 0.28, 0.27, 1.0)
+        IF app.Hover == "snapshot-" + STRING(row) AND id <> app.SelectedSnapshotId THEN GUI.RoundedRectangle(window, x, row_y, w, 34, 6, 0.085, 0.105, 0.13, 1.0)
+        DrawIcon(window, x + 8, row_y, "snapshot")
+        GUI.Text(window, label, x + 48, row_y + 3, 15, 0.88, 0.91, 0.94, 1.0)
+        meta = "id " + id + "  generation " + NthTabToken(line, 1) + "  " + NthTabToken(line, 2)
+        GUI.Text(window, meta, x + 48, row_y + 21, 12, 0.55, 0.63, 0.68, 1.0)
+        row = row + 1
+    WEND
+    GUI.ResetClip(window)
+
+    ignored = DrawScrollbar(window, x + w - 6, list_top, list_h, LEN(app.Snapshots), visible_rows, app.SnapshotScroll)
+END FUNCTION
+
+FUNCTION DrawSnapshotActions(window AS NUMBER, x AS NUMBER, y AS NUMBER, w AS NUMBER)
+    GUI.Text(window, "Selected Snapshot", x, y, 13, 0.50, 0.62, 0.68, 1.0)
+    selected = app.SelectedSnapshotId
+    IF selected == "" THEN selected = "No snapshot selected"
+    GUI.Text(window, selected, x, y + 22, 15, 0.88, 0.91, 0.94, 1.0)
+    Button(window, "rollback-snapshot", "Rollback", x, y + 58, 100, 34, 0.22, 0.17, 0.08)
+    Button(window, "delete-snapshot", "Delete", x + 108, y + 58, 92, 34, 0.28, 0.12, 0.11)
+END FUNCTION
+
+FUNCTION HandleAction(id AS STRING)
+    IF String.StartsWith(id, "tab-") THEN
+        app.Mode = String.Slice(id, 4)
+        IF app.Mode == "snapshots" THEN ignored = RefreshSnapshots()
+        RETURN TRUE
+    END IF
+    IF String.StartsWith(id, "snapshot-") THEN
+        SelectSnapshot(Number(String.Slice(id, 9)))
+        RETURN TRUE
+    END IF
+    IF String.StartsWith(id, "device-") THEN
+        ' Not INT(...) -- no such host function exists anywhere in this runtime (never did, this
+        ' call predates every change in this session); every prior "device selection works" check
+        ' in this project was a screenshot confirming the row rendered and highlighted correctly,
+        ' never an actual working click, because none of those sessions had real click-input
+        ' available either. Clicking a device row has always thrown "unknown host function: int"
+        ' here, uncaught, killing the whole app -- Number(...) is this runtime's real string-to-
+        ' number conversion (confirmed against the actual compiled-capsule pipeline, not just the
+        ' hosted interpreter, since those two are not guaranteed to expose the same builtins).
+        SelectDevice(Number(String.Slice(id, 7)))
+        RETURN TRUE
+    END IF
+    IF id == "hide-non-arcfs" THEN
+        ' Not NOT -- that's this language's BITWISE complement (NOT FALSE is -1, not TRUE; see
+        ' BitNot in the lexer), not logical negation, so this would have stored -1/-2/0 into
+        ' app.HideNonArcFS instead of a real boolean. It happened to keep working via Value's
+        ' truthy-comparison special case for bools (`x == FALSE` compares truthiness when either
+        ' side is a bool), so this wasn't the cause of any reported bug -- fixed anyway since it's
+        ' genuinely the wrong operator and storing a non-boolean into a boolean-shaped field is a
+        ' latent trap for the next comparison that isn't so forgiving. `!` is real logical negation.
+        app.HideNonArcFS = !app.HideNonArcFS
+        app.DeviceScroll = 0
+        ignored = RefreshFilteredDeviceCache()
+        RETURN TRUE
+    END IF
+    IF id == "refresh" THEN RefreshDevices()
+    IF id == "open-image" THEN OpenImage()
+    IF id == "create-image" THEN CreateImage()
+    IF id == "inspect" THEN ignored = InspectSource()
+    IF id == "list-root" THEN ignored = ListRoot()
+    IF id == "mount" THEN ignored = MountSelected()
+    IF id == "explore" THEN ExploreMount()
+    IF id == "format" THEN ignored = FormatSelected()
+    IF id == "maintenance" THEN ignored = Maintenance()
+    IF id == "install-support" THEN ignored = InstallSupport()
+    IF id == "update-support" THEN ignored = UpdateSupport()
+    IF id == "refresh-plugins" THEN RefreshPlugins()
+    IF id == "add-plugin" THEN AddPlugin()
+    IF id == "run-plugin" THEN ignored = RunPlugin()
+    IF id == "refresh-snapshots" THEN ignored = RefreshSnapshots()
+    IF id == "create-snapshot" THEN ignored = CreateSnapshot()
+    IF id == "rollback-snapshot" THEN ignored = RollbackSnapshot()
+    IF id == "delete-snapshot" THEN ignored = DeleteSnapshot()
+    RETURN TRUE
+END FUNCTION
+
+' Trivial and mode-agnostic on purpose: app.Regions already holds exactly the widgets actually
+' drawn this frame (populated by RegisterRegion, reset once per frame in the main loop), so there
+' is nothing left for this function to know about which mode is active, what today's layout
+' numbers are, or how any particular list scrolls -- all of that lives in exactly one place each
+' (the Draw* function that computes it), not here as well. See RegisterRegion's own comment for
+' the real bug this replaces.
+FUNCTION FindHover(mx AS NUMBER, my AS NUMBER)
+    app.Hover = ""
+    FOR region IN app.Regions
+        IF Hit(mx, my, region.X, region.Y, region.W, region.H) THEN app.Hover = region.Id
+    NEXT
+END FUNCTION
+
+args = Runtime.Args()
+IF LEN(args) > 0 THEN
+    IF args[0] == "--smoke" THEN
+        PRINT "arconaut: ArcFS administrator capsule"
+        ExitTheProgram(0)
+    END IF
+END IF
+
+IF GUI.Available() == FALSE THEN
+    PRINT "Arconaut needs a Wayland or X11 desktop session."
+    ExitTheProgram(0)
+END IF
+
+TRY
+    title_icon = Path.Join(ArcoSH.AssetsDir(), "arconaut", "title-icon.png")
+    GUI.Application("arconaut", "Arconaut", title_icon)
+    window = GUI.Window("Arconaut", 1180, 760)
+CATCH err
+    PRINT "Arconaut window could not be opened: " + err.Message
+    ExitTheProgram(0)
+END TRY
+
+home = Path.Home()
+app = {
+    "Home": home,
+    "Mode": "volumes",
+    "Hover": "",
+    "SelectedSource": "",
+    "SelectedKind": "",
+    "MountPath": "",
+    "ImageSize": "1073741824",
+    "DeviceText": "",
+    "Devices": [],
+    "DeviceScroll": 0,
+    "PluginScroll": 0,
+    "SnapshotScroll": 0,
+    "ConsoleScroll": 0,
+    "Snapshots": [],
+    "SelectedSnapshotId": "",
+    "HideNonArcFS": TRUE,
+    "FilteredDeviceCache": [],
+    "Regions": [],
+    "MeasureCache": [],
+    "ConsoleTitle": "ArcFS",
+    "Console": "Ready",
+    "Status": "Ready",
+    "Log": [],
+    "PluginDir": Path.Join(home, ".arcology", "arcfs", "plugins"),
+    "Plugins": [],
+    "SelectedPlugin": ""
+}
+
+ignored = RefreshDevices()
+ignored = RefreshPlugins()
+running = TRUE
+
+WHILE running
+    layout = Layout()
+    size = GUI.Size(window)
+    rail_w = layout.RailW
+    main_x = layout.MainX
+    main_y = layout.MainY
+    main_w = layout.MainW
+    main_h = layout.MainH
+    actions_y = layout.ActionsY
+    console_y = layout.ConsoleY
+    ' Cleared at the start of every frame -- only what actually gets drawn (via RegisterRegion,
+    ' called from Button/Checkbox/the list-row loops below) is ever hit-testable this frame. See
+    ' RegisterRegion's own comment.
+    app.Regions = []
+
+    GUI.Clear(window, 0.045, 0.050, 0.058, 1.0)
+    GUI.Rectangle(window, 0, 0, rail_w, size.Height, 0.065, 0.073, 0.086, 1.0)
+    DrawIcon(window, 18, 18, "disk")
+    GUI.Text(window, "ARCONAUT", 58, 22, 18, 0.88, 0.92, 0.94, 1.0)
+    GUI.Text(window, "ArcFS Administrator", main_x, 24, 28, 0.93, 0.95, 0.96, 1.0)
+    GUI.Text(window, app.Status, main_x, 56, 14, 0.56, 0.67, 0.68, 1.0)
+
+    tabs = ["Volumes", "Images", "Files", "Snapshots", "Maintenance", "Support", "Plugins"]
+    tab_y = 78
+    tab = 0
+    FOR label IN tabs
+        Tab(window, "tab-" + Lower(label), label, 18, tab_y + tab * 42, app.Mode == Lower(label))
+        tab = tab + 1
+    NEXT
+
+    GUI.Text(window, "Activity", 18, size.Height - 168, 13, 0.48, 0.58, 0.62, 1.0)
+    log_y = size.Height - 142
+    FOR line IN app.Log
+        GUI.Text(window, line, 18, log_y, 12, 0.68, 0.72, 0.74, 1.0)
+        log_y = log_y + 19
+    NEXT
+
+    IF app.Mode == "volumes" OR app.Mode == "images" OR app.Mode == "files" THEN
+        DrawVolumes(window, main_x, main_y, main_w, main_h)
+        DrawActions(window, main_x, actions_y, main_w)
+    ELSE
+        IF app.Mode == "maintenance" THEN DrawMaintenance(window, main_x, main_y, main_w, main_h)
+        IF app.Mode == "support" THEN DrawSupport(window, main_x, main_y, main_w, main_h)
+        IF app.Mode == "plugins" THEN DrawPlugins(window, main_x, main_y, main_w, main_h)
+        IF app.Mode == "snapshots" THEN
+            DrawSnapshots(window, main_x, main_y, main_w, main_h)
+            DrawSnapshotActions(window, main_x, actions_y, main_w)
+        END IF
+    END IF
+
+    DrawConsole(window, main_x, console_y, main_w, layout.ConsoleH)
+    GUI.Present(window)
+
+    event = GUI.WaitEvent(0.05)
+    IF event.Type == "close" THEN running = FALSE
+    IF event.Type == "pointer-move" THEN
+        FindHover(event.X, event.Y)
+        IF app.Hover <> "" THEN GUI.SetCursor(window, "hand") ELSE GUI.SetCursor(window, "default")
+    END IF
+    IF event.Type == "pointer-button" THEN
+        IF event.Action == "press" AND event.Button == "left" THEN
+            IF app.Hover <> "" THEN ignored = HandleAction(app.Hover)
+        END IF
+    END IF
+    IF event.Type == "scroll" THEN
+        IF (app.Mode == "volumes" OR app.Mode == "images" OR app.Mode == "files") AND Hit(event.X, event.Y, main_x, main_y, main_w, main_h) THEN
+            app.DeviceScroll = app.DeviceScroll - event.DeltaY
+        END IF
+        IF app.Mode == "plugins" AND Hit(event.X, event.Y, main_x, main_y, main_w, main_h) THEN
+            app.PluginScroll = app.PluginScroll - event.DeltaY
+        END IF
+        IF app.Mode == "snapshots" AND Hit(event.X, event.Y, main_x, main_y, main_w, main_h) THEN
+            app.SnapshotScroll = app.SnapshotScroll - event.DeltaY
+        END IF
+        IF Hit(event.X, event.Y, main_x, console_y, main_w, layout.ConsoleH) THEN
+            app.ConsoleScroll = app.ConsoleScroll - event.DeltaY
+        END IF
+    END IF
+    IF event.Type == "key" THEN
+        IF event.Action == "press" THEN
+            IF event.Key == "escape" THEN running = FALSE
+            IF event.Key == "r" OR event.Key == "f5" THEN RefreshDevices()
+            IF event.Key == "i" THEN ignored = InspectSource()
+            IF event.Key == "m" THEN ignored = MountSelected()
+        END IF
+    END IF
+    IF GUI.ShouldClose(window) THEN running = FALSE
+WEND
+
+GUI.Close(window)

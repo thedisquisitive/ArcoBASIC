@@ -17,8 +17,8 @@ if [[ ! -f "$DEB" ]]; then
 fi
 
 echo "Installing $DEB ..."
-"$SCRIPT_DIR/../install/install-deb-wizard.sh" "$DEB"
+sudo dpkg -i "$DEB" || sudo apt-get install -f -y
 
 echo
-arcosh --version
-echo "Installed. Try: arcosh --doctor"
+command -v arco_cli
+echo "Installed."

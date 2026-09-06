@@ -1,7 +1,7 @@
 # arcfsctl
 
 `arcfsctl` is the host utility for managing ArcFS support and ArcFS media. It is written in
-ArcoBASIC at `tools/arcfsctl.abas` and built by ArcoFission into a native runtime capsule.
+ArcoBASIC at `arcfs-utils/tools/arcfsctl.abas` and built by ArcoFission into a native runtime capsule.
 Arconaut, the graphical ArcFS administrator, is also an ArcoBASIC source compiled into a capsule
 and uses this CLI as one of its Linux backends.
 
@@ -23,7 +23,7 @@ arcfsctl unmount /dev/sdXN
 Linux support uses:
 
 - `arcfs-linux` for ArcFS probing, formatting, reading, writing, and FUSE mounting;
-- `ArcoFission` to compile `tools/arcfsctl.abas` into the `arcfsctl` capsule;
+- `ArcoFission` to compile `arcfs-utils/tools/arcfsctl.abas` into the `arcfsctl` capsule;
 - `mount.arcfs` for `mount -t arcfs`;
 - `mkfs.arcfs` for system formatter dispatch;
 - `61-arcfs.rules` for udev and udisks2 filesystem discovery;
@@ -32,7 +32,7 @@ Linux support uses:
 Distribution package:
 
 ```sh
-scripts/build/build-arcfs-deb.sh
+arcfs-utils/scripts/build-arcfs-deb.sh
 sudo apt install ./dist/arcobasic-arcfs_0.1.0_amd64.deb
 arcfsctl status
 ```

@@ -18,11 +18,29 @@
 ' Widget interface (Draw/HandleEvent as a shared contract) and is a bigger design decision on its
 ' own, left for when something actually needs it rather than speculatively built here. VStack/
 ' HStack below cover the common "lay these out in a column/row" case without that machinery.
+'
+' Widget interface: formalizes the Draw(window)/HandleEvent(window, event) convention every class
+' below already followed by hand. Declared here (not in stdlib/arcoui.abas, which owns the actual
+' Panel/Surface container that walks a heterogeneous array of these) so this module has no
+' dependency the other way -- arcoui.abas imports gui, not the reverse. Deliberately untyped
+' params/return: only the shared method names and arities are being standardized, matching how
+' every widget below already differs in what HandleEvent actually returns.
+INTERFACE Widget
+    FUNCTION Draw(window)
+    FUNCTION HandleEvent(window, event)
+END INTERFACE
 
-CLASS TextArea
+CLASS TextArea IMPLEMENTS Widget
     Text AS String = ""
     Caret AS Number = 0
     ScrollLine AS Number = 0
+    ' Defaults TRUE so every existing caller (arconote.abas, arcowrite.abas, ...) that never
+    ' touches this field keeps today's always-on behavior. A caller hosting more than one text-
+    ' capable widget at once (ArcoUI's TextField, e.g. a Notes app's title field next to its body
+    ' TextArea) sets this FALSE on whichever one shouldn't currently consume typed/key input --
+    ' otherwise every keystroke reaches every text widget in the same Surface at once, since
+    ' HandleEvent has no other way to know which one the user means to be typing into.
+    Focused AS Bool = TRUE
     X AS Number = 0
     Y AS Number = 0
     Width AS Number = 400
@@ -242,12 +260,12 @@ CLASS TextArea
             SELF.ScrollLine = SELF.ScrollLine - event.DeltaY
         END IF
 
-        IF event.Type == "text" THEN
+        IF event.Type == "text" ANDALSO SELF.Focused THEN
             SELF.InsertText(event.Text)
             changed = TRUE
         END IF
 
-        IF event.Type == "key" ANDALSO (event.Action == "press" ORELSE event.Action == "repeat") THEN
+        IF event.Type == "key" ANDALSO SELF.Focused ANDALSO (event.Action == "press" ORELSE event.Action == "repeat") THEN
             IF event.Key == "left" THEN SELF.MoveLeft()
             IF event.Key == "right" THEN SELF.MoveRight()
             IF event.Key == "up" THEN SELF.MoveUp()
@@ -273,7 +291,7 @@ CLASS TextArea
     END FUNCTION
 END CLASS
 
-CLASS Button
+CLASS Button IMPLEMENTS Widget
     Label AS String = ""
     X AS Number = 0
     Y AS Number = 0
@@ -334,7 +352,7 @@ CLASS Button
     END FUNCTION
 END CLASS
 
-CLASS Checkbox
+CLASS Checkbox IMPLEMENTS Widget
     Label AS String = ""
     Checked AS Bool = FALSE
     X AS Number = 0
@@ -403,7 +421,7 @@ END CLASS
 ' value by a small fixed fraction of its range, for fine adjustment without needing pixel-perfect
 ' dragging (see the Disabled flag below for locking a slider out entirely, e.g. a tutorial level
 ' that only wants one parameter touchable at a time).
-CLASS Slider
+CLASS Slider IMPLEMENTS Widget
     Label AS String = ""
     Value AS Number = 0
     Min AS Number = 0

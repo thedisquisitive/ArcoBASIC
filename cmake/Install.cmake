@@ -1,45 +1,17 @@
 install(TARGETS
         arco_runtime
         arco_compiler
-        arco_shell
         arco_c_api
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
-install(TARGETS arcosh arco_cli ArcoFission
+install(TARGETS arco_cli ArcoFission
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-if(TARGET arcfsctl)
-    install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/generated/arcfsctl
-        DESTINATION ${CMAKE_INSTALL_BINDIR}
-    )
-    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/tools/arcfsctl.abas
-        DESTINATION share/arcobasic/tools
-    )
-endif()
-
-if(TARGET arconaut)
-    install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/generated/arconaut
-        DESTINATION ${CMAKE_INSTALL_BINDIR}
-    )
-endif()
-
-if(TARGET arcfs-linux)
-    install(TARGETS arcfs-linux
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    )
-    install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/packaging/linux/mount.arcfs
-        DESTINATION ${CMAKE_INSTALL_SBINDIR}
-    )
-    install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/packaging/linux/mkfs.arcfs
-        DESTINATION ${CMAKE_INSTALL_SBINDIR}
-    )
-    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/packaging/linux/61-arcfs.rules
-        DESTINATION lib/udev/rules.d
-    )
-endif()
+# arcfsctl/arconaut/arcfs-linux and all of their packaging (desktop entry, icons, udev rules,
+# mount/mkfs wrappers) install themselves from arcfs-utils/CMakeLists.txt -- see that file.
 
 install(DIRECTORY include/arco/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/arco
@@ -54,55 +26,18 @@ install(DIRECTORY stdlib/
     FILES_MATCHING PATTERN "*.abas" PATTERN "*.arc" PATTERN "*.bas"
 )
 
-install(DIRECTORY tutorials/
-    DESTINATION share/arcosh/tutorials
-    FILES_MATCHING PATTERN "*.abas" PATTERN "*.arc" PATTERN "*.bas"
-)
-
-install(DIRECTORY scripts/arcosh/
-    DESTINATION share/arcosh/scripts
-    FILES_MATCHING PATTERN "*.abas" PATTERN "*.arc" PATTERN "*.bas" PATTERN "*.arcsh"
-)
-
-install(PROGRAMS scripts/install/install-deb-wizard.sh
-    DESTINATION share/arcobasic/scripts
-)
-
 install(DIRECTORY examples/
     DESTINATION share/arcobasic/examples
     FILES_MATCHING PATTERN "*.abas" PATTERN "*.arc" PATTERN "*.bas" PATTERN "*.arcsh"
 )
 
-install(DIRECTORY mods/
-    DESTINATION share/arcobasic/mods
-    FILES_MATCHING PATTERN "*.abas" PATTERN "*.arc" PATTERN "*.bas" PATTERN "*.arcsh"
-)
-
 install(DIRECTORY assets/ DESTINATION share/arcobasic/assets)
 
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/arconaut.desktop.in
-    ${CMAKE_CURRENT_BINARY_DIR}/packaging/linux/arconaut.desktop
-    @ONLY
-)
-
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/packaging/linux/arconaut.desktop
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/applications
-)
+# application-x-arcobasic.xml is the general ArcoBASIC MIME type (any .abas file, not ArcFS-
+# specific), so it stays installed from here rather than arcfs-utils/ -- Arconaut's own .desktop
+# entry, icons, and everything else ArcFS-specific install from arcfs-utils/CMakeLists.txt.
 install(FILES packaging/linux/application-x-arcobasic.xml
     DESTINATION ${CMAKE_INSTALL_DATADIR}/mime/packages
-)
-install(FILES assets/arconaut/title-icon.png
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/512x512/apps
-    RENAME arconaut.png
-)
-install(FILES assets/arconaut/arcobasic-file.png
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/512x512/mimetypes
-    RENAME application-x-arcobasic.png
-)
-install(FILES assets/arconaut/title-icon.png
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/pixmaps
-    RENAME arconaut.png
 )
 
 install(DIRECTORY docs/

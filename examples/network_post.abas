@@ -1,7 +1,7 @@
 #DESCRIPTION "POST text or JSON to a URL"
 
 IF LEN(Args) < 2 THEN
-    PRINT "Usage: arcosh examples/network_post.abas URL BODY [CONTENT_TYPE]"
+    PRINT "Usage: arco_cli examples/network_post.abas URL BODY [CONTENT_TYPE]"
     ExitTheProgram(2)
 END IF
 

@@ -1,0 +1,82 @@
+' ArcoUI Milestone 3/4 benchmark (RFC-ArcoUI section 30.4/57 Test C): a frameless, diamond-shaped
+' desktop gadget -- no title bar, no OS chrome, no platform-specific ArcoBASIC code anywhere in
+' this file. The whole diamond is its own drag region (there's no title bar left to grab one from
+' -- ArcoSurface.SetDragRegion/GUI.SetPosition), and its window intents (Close/PutAway/Restore/
+' FillWorkspace/Move -- the same five every ArcoSurface exposes by default) are presented through
+' a hex-cell radial menu, keyboard-reachable on its own (Left/Right/Enter) as RFC section 26
+' requires for any geometric intent surface. Same real GUI window shape/mask/hit-test machinery as
+' the RFC mockup's own "Custom-Shaped Window" + "Hex Intent Menu" reference panels.
+'
+' Also wires a real Throw-to-close (RFC-ArcoUI section 10.4/45): shake the diamond by dragging it
+' back and forth a couple of times and release while still moving fast, and it resolves the same
+' Close intent the menu's own Close cell or a window-manager close would -- Throw is a reusable
+' interaction primitive, not something wired directly to "destroy this window" (section 10.5).
+
+#IMPORT "arcoui"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "GUI support was not enabled in this build -- nothing to show."
+ELSE
+    TRY
+        win = ArcoSurface("System Monitor", 260, 260, "Diamond")
+        ignored = win.SetDragRegion(0, 0, 260, 260)
+
+        menu = RadialMenu()
+        menu.CellShape = "Hexagon"
+        menu.Radius = 58
+        menu.ItemRadius = 22
+        ignored = menu.Bind(win)
+        ignored = menu.AddItem("Close", "Close")
+        ignored = menu.AddItem("Put Away", "PutAway")
+        ignored = menu.AddItem("Restore", "Restore")
+        ignored = menu.AddItem("Fill", "FillWorkspace")
+        ignored = menu.AddItem("Move", "Move")
+        ignored = menu.SetCenter(130, 130)
+        ignored = win.Attach(menu)
+
+        throwGesture = ArcoUI.CreateGesture()
+        ignored = ArcoUI.ConfigureGesture(throwGesture, 0.8, 40, 250, 2)
+
+        WHILE NOT win.ShouldClose()
+            timestamp = Time.Timestamp()
+            event = GUI.WaitEvent(0.02)
+            IF event.Type <> "none" ANDALSO event.Window == win.Window THEN
+                IF event.Type == "close" THEN
+                    ignored = win.Invoke("Close", timestamp)
+                ELSE
+                    IF event.Type == "pointer-button" ANDALSO event.Button == "left" ANDALSO win.InDragRegion(event.X, event.Y) THEN
+                        IF event.Action == "press" THEN
+                            ignored = ArcoUI.GesturePress(throwGesture, event.X, event.Y, timestamp)
+                        END IF
+                        IF event.Action == "release" THEN
+                            gestureResult = ArcoUI.GestureRelease(throwGesture, event.X, event.Y, timestamp)
+                            IF gestureResult == "Throw" THEN ignored = win.Invoke("Close", timestamp)
+                        END IF
+                    END IF
+                    IF event.Type == "pointer-move" THEN
+                        ignored = ArcoUI.GestureMove(throwGesture, event.X, event.Y, timestamp)
+                    END IF
+
+                    ignored = win.HandleEvent(event, timestamp)
+                END IF
+            END IF
+
+            ' No App wrapper here -- one window, so this gadget drains ArcoUI's intent queue
+            ' itself and reacts to Close directly, the same pattern App.Pump/RouteCloseEvents
+            ' generalizes for multi-surface apps.
+            pending = ArcoUI.PollIntentEvent()
+            WHILE pending.Type <> "none"
+                IF pending.Intent == win.IntentHandle("Close") THEN
+                    ignored = GUI.SetShouldClose(win.Window, TRUE)
+                END IF
+                pending = ArcoUI.PollIntentEvent()
+            WEND
+
+            IF NOT win.ShouldClose() THEN win.Draw()
+        WEND
+
+        ignored = win.Close()
+    CATCH err
+        PRINT "ArcoUI gadget failed: " + err
+    END TRY
+END IF

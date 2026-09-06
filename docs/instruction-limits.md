@@ -18,7 +18,7 @@ ArcoFission compile-run program.abas --instruction-limit 50000000
 ArcoFission run program.arcof --instruction-limit unlimited
 ```
 
-ArcoSH script execution and ArcoFission hosted native builds accept the same option. Numeric zero
+ArcoFission hosted native builds accept the same option. Numeric zero
 is rejected; the explicit, case-insensitive `unlimited` spelling disables instruction-count
 termination. Unlimited execution can consume CPU indefinitely and does not relax filesystem,
 network, memory, or other host permissions.

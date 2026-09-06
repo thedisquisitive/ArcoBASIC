@@ -107,21 +107,16 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Build a Debian package and run the interactive installer:
+Build and install a Debian package:
 
 ```sh
-scripts/build/build-deb.sh
-scripts/install/install-deb-wizard.sh --latest
+scripts/build/build-and-install.sh
 ```
-
-The installer installs the `.deb`, runs the doctor, initializes the ArcoSH
-profile, offers prompt presets with live preview, can activate built-in mods
-such as ArcoGotchi, and can configure ArcoSH as the login shell.
 
 Build the focused ArcFS Linux support package:
 
 ```sh
-scripts/build/build-arcfs-deb.sh
+arcfs-utils/scripts/build-arcfs-deb.sh
 sudo apt install ./dist/arcobasic-arcfs_0.1.0_amd64.deb
 arcfsctl status
 arconaut
@@ -240,7 +235,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 The script installs/checks CMake, Ninja, and Visual Studio Build Tools through
-`winget`, then builds `arcosh.exe` and `arco_cli.exe`. Use
+`winget`, then builds `arco_cli.exe` and `ArcoFission.exe`. Use
 `-SkipDependencyInstall` on machines that already have the toolchain installed.
 
 ---
@@ -248,12 +243,11 @@ The script installs/checks CMake, Ninja, and Visual Studio Build Tools through
 # Project Layout
 
 ```text
-apps/                 Executable entry points: arco, arcosh, and ArcoFission
+apps/                 Executable entry points: arco and ArcoFission
 src/                  Private C++ implementation, grouped by subsystem
   frontend/           Lexer, parser, canonical AST, and internal headers
   runtime/            Hosted interpreter/runtime
   compiler/           Shared A-MIR, bytecode, native capsule, and systems integration
-  shell/              ArcoSH implementation
   gui/                Real and stub GUI backends
   bindings/           Binding implementations
 include/              Public embedding API and compatibility headers
@@ -261,8 +255,7 @@ cmake/                Dependency, test, and installation definitions
 tests/                Generic ArcoBASIC unit, integration, and fixture coverage
 stdlib/               Importable ArcoBASIC standard-library modules
 examples/             Runnable example programs
-tutorials/            Guided ArcoSH programs
-scripts/              Generic build, install, run, and ArcoSH tools
+scripts/              Generic build, install, and run tools
 docs/                 Generic ArcoBASIC user and developer documentation
 books/                Long-form technical references for Arcology components
 arcology-os/          Arcology OS systems library, UEFI examples, tests, tooling, RFCs, and docs
@@ -838,12 +831,12 @@ planned.
 Networking utility scripts:
 
 ```sh
-arcosh examples/network_probe.abas
-arcosh examples/network_fetch.abas https://example.com
-arcosh examples/network_download.abas https://example.com out.html
-arcosh examples/network_post.abas https://example.com/api '{"ok":true}'
-arcosh examples/network_dns.abas localhost
-arcosh examples/network_tcp_probe.abas example.com 80 "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n"
+arco_cli examples/network_probe.abas
+arco_cli examples/network_fetch.abas https://example.com
+arco_cli examples/network_download.abas https://example.com out.html
+arco_cli examples/network_post.abas https://example.com/api '{"ok":true}'
+arco_cli examples/network_dns.abas localhost
+arco_cli examples/network_tcp_probe.abas example.com 80 "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n"
 ```
 
 `network_probe.abas` is safe to run offline unless you pass a URL as its second
@@ -856,53 +849,13 @@ argument.
 Terminal Web Browser
 
 ```sh
-arcosh examples/arconav.abas https://example.com
-arcosh examples/arconav.abas https://example.com --dump
+arco_cli examples/arconav.abas https://example.com
+arco_cli examples/arconav.abas https://example.com --dump
 ```
 
 ArcoNav is a lightweight ArcoBASIC browser for terminal sessions. It fetches
 pages with `Network.Get`, renders readable text, extracts links, supports
 numbered link navigation, `g URL`, `b` back, `r` reload, and `q` quit.
-
----
-
-# ArcoSH Mods
-
-User-space Shell Mods
-
-```basic
-Mod.Install("my-mod.abas", "my-mod")
-Mod.Activate("my-mod")
-FOR mod IN Mod.List()
-    PRINT mod.Name + " active=" + STRING(mod.Active)
-NEXT
-Mod.Deactivate("my-mod")
-```
-
-Mods install into `~/.arcosh/mods`. Active mod names are saved in
-`~/.arcosh/mods/enabled.txt`, so they load again on the next ArcoSH startup.
-Use `Mod.Load(name)` to load an installed mod immediately in the current
-session.
-
-There is also a small ArcoBASIC manager utility:
-
-```sh
-arcosh examples/arcosh_mods.abas list
-arcosh examples/arcosh_mods.abas install path/to/mod.abas my-mod
-arcosh examples/arcosh_mods.abas activate my-mod
-arcosh examples/arcosh_mods.abas deactivate my-mod
-```
-
-Built-in shipped mods can be installed by name:
-
-```sh
-arcosh examples/arcosh_mods.abas install-builtin arcogotchi
-arcosh examples/arcosh_mods.abas activate arcogotchi
-```
-
-ArcoGotchi adds a small terminal pet to ArcoSH. After activation and the next
-startup, use `gotchi`, `gotchi-feed`, `gotchi-play`, `gotchi-nap`, and
-`gotchi-rename NAME`.
 
 ---
 
@@ -1017,7 +970,7 @@ Static HTML export is available before the live web server exists:
 
 ```sh
 ARCOBASIC_STDLIB=arcology-commons/stdlib \
-  arcosh arcology-commons/examples/arcology_export_site.abas \
+  arco_cli arcology-commons/examples/arcology_export_site.abas \
   arcology-commons/var/local/arcology-v01a.arcodb arcology-commons/dist/commons
 ```
 
@@ -1031,7 +984,7 @@ Or choose paths and a port explicitly:
 
 ```sh
 ARCOBASIC_STDLIB=arcology-commons/stdlib \
-  arcosh arcology-commons/examples/arcology_serve_static.abas \
+  arco_cli arcology-commons/examples/arcology_serve_static.abas \
   arcology-commons/var/local/arcology-v01a.arcodb arcology-commons/dist/commons 8080
 ```
 
@@ -1060,7 +1013,7 @@ access. See [docs/references.md](docs/references.md) and
 ArcoBASIC:
 
 ```sh
-arcosh --safe examples/arcomart.abas arcomart.arcodb
+arco_cli examples/arcomart.abas arcomart.arcodb
 ```
 
 It supports adding/editing/removing products, receiving stock, customer

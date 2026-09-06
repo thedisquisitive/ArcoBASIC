@@ -1,5 +1,4 @@
 #include "arco/runtime.hpp"
-#include "arco/shell.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -16,9 +15,8 @@ void require(bool condition, const std::string& message) {
     }
 }
 
-std::string run_shell_capture(const std::string& code) {
+std::string run_capture(const std::string& code) {
     arco::Runtime runtime;
-    arco::shell::register_shell_builtins(runtime);
     std::ostringstream output;
     runtime.set_output(output);
     const auto result = runtime.run_string(code);
@@ -29,7 +27,7 @@ std::string run_shell_capture(const std::string& code) {
 } // namespace
 
 int main() {
-    require(run_shell_capture(
+    require(run_capture(
         "#IMPORT \"commons\"\n"
         "router = Commons.Router()\n"
         "router = Commons.AddRoute(router, \"GET\", \"/communities/:id\", \"ShowCommunity\", \"Community page\")\n"
@@ -59,7 +57,7 @@ int main() {
         const auto db_file = std::filesystem::temp_directory_path() / "arcology-v01a-runtime-test.arcodb";
         std::filesystem::remove(db_file);
         std::filesystem::remove(db_file.string() + ".journal");
-        require(run_shell_capture(
+        require(run_capture(
             "#IMPORT \"arcology\"\n"
             "app = Arcology.Open(\"" + db_file.string() + "\")\n"
             "PRINT Arcology.Version()\n"
@@ -103,7 +101,7 @@ int main() {
         std::filesystem::remove(db_file);
         std::filesystem::remove(db_file.string() + ".journal");
         std::filesystem::remove_all(site_dir);
-        require(run_shell_capture(
+        require(run_capture(
             "#IMPORT \"arcology\"\n"
             "app = Arcology.Open(\"" + db_file.string() + "\")\n"
             "ignored = Arcology.CreateUser(app, \"Ada\", \"Ada Lovelace\")\n"

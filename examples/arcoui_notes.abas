@@ -1,0 +1,151 @@
+' ArcoUI Milestone 2 benchmark (RFC-ArcoUI section 30.1/57 Test A): a real notepad --
+'   - a TextArea for the note body (multi-line, scrolls, real caret/edit -- stdlib/gui.abas)
+'   - New/Open/Save wired as real ArcoUI intents, each reachable two ways: a Button click, AND
+'     (Save specifically) Ctrl+S, proving RFC section 7.3 -- one intent, several presentations
+'   - unsaved-state tracking: SaveDocument reports itself Blocked with a reason when there is
+'     nothing to save, and the status label mirrors Modified/Saved/Blocked state
+'   - a real find-next search (Ctrl+F to search, Enter to jump to the next match, Escape to leave
+'     search) using a second text-capable widget (TextField) that coexists with the body TextArea
+'     via each one's own `Focused` gate -- never both capturing the same keystroke at once
+'   - keyboard operation throughout, plus the default window intents every ArcoSurface exposes
+'     (PutAway/FillWorkspace/Restore/Move/Close) for free
+'
+' Uses its own event loop instead of App.Start() -- Level Two of RFC-ArcoUI's authoring model
+' (section 14.2): still built entirely on ArcoSurface/App's widget, focus, and intent-routing
+' machinery, but with the extra Ctrl+F/Escape handling and Save/Open/New file I/O a beginner
+' script wouldn't need layered in around it.
+
+#IMPORT "arcoui"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "GUI support was not enabled in this build -- nothing to show."
+ELSE
+    TRY
+        app = App("Notes")
+        win = app.Window("ArcoUI Notes", 720, 480)
+
+        ignored = win.DefineIntent("NewDocument")
+        ignored = win.DefineIntent("OpenDocument")
+        ignored = win.DefineIntent("SaveDocument")
+        saveIntent = win.IntentHandle("SaveDocument")
+        openIntent = win.IntentHandle("OpenDocument")
+        newIntent = win.IntentHandle("NewDocument")
+
+        newButton = Button("New")
+        newButton.SetBounds(720 - win.Theme.Spacing - 3 * 90 - 2 * 8, 12, 90, 32)
+        ignored = win.Attach(newButton, "NewDocument")
+
+        openButton = Button("Open")
+        openButton.SetBounds(720 - win.Theme.Spacing - 2 * 90 - 8, 12, 90, 32)
+        ignored = win.Attach(openButton, "OpenDocument")
+
+        saveButton = Button("Save")
+        saveButton.SetBounds(720 - win.Theme.Spacing - 90, 12, 90, 32)
+        ignored = win.Attach(saveButton, "SaveDocument")
+
+        searchField = TextField("")
+        searchField.SetBounds(win.Theme.Spacing, 52, 300, 28)
+        ignored = win.Attach(searchField, "", FALSE)
+
+        body = TextArea("")
+        body.SetBounds(win.Theme.Spacing, 88, 720 - win.Theme.Spacing * 2, 480 - 88 - 30)
+        ignored = win.Attach(body)
+
+        status = Label("New document (unsaved)")
+        status.SetPosition(win.Theme.Spacing, 480 - 22)
+        ignored = win.Attach(status, "", FALSE)
+
+        currentPath = ""
+        modified = FALSE
+        searching = FALSE
+
+        WHILE app.AnyOpen()
+            timestamp = Time.Timestamp()
+            event = GUI.WaitEvent(0.02)
+
+            IF event.Type <> "none" ANDALSO event.Window == win.Window THEN
+                IF event.Type == "close" THEN
+                    ignored = win.Invoke("Close", timestamp)
+                ELSE
+                    handledSpecial = FALSE
+
+                    IF event.Type == "key" ANDALSO event.Action == "press" ANDALSO event.Ctrl ANDALSO event.Key == "f" THEN
+                        searching = TRUE
+                        body.Focused = FALSE
+                        searchField.Focused = TRUE
+                        handledSpecial = TRUE
+                    END IF
+
+                    IF event.Type == "key" ANDALSO event.Action == "press" ANDALSO event.Key == "escape" ANDALSO searching THEN
+                        searching = FALSE
+                        body.Focused = TRUE
+                        searchField.Focused = FALSE
+                        handledSpecial = TRUE
+                    END IF
+
+                    IF searching ANDALSO event.Type == "key" ANDALSO event.Action == "press" ANDALSO event.Key == "enter" ANDALSO searchField.Text <> "" THEN
+                        found = String.IndexOf(body.Text, searchField.Text, body.Caret + 1)
+                        IF found < 0 THEN found = String.IndexOf(body.Text, searchField.Text, 0)
+                        IF found >= 0 THEN
+                            body.Caret = found
+                            ignored = body.EnsureCaretVisible()
+                            status.Text = "Found \"" + searchField.Text + "\" at " + found
+                        ELSE
+                            status.Text = "Not found: " + searchField.Text
+                        END IF
+                        handledSpecial = TRUE
+                    END IF
+
+                    IF NOT handledSpecial THEN
+                        changed = win.HandleEvent(event, timestamp)
+                        IF changed ANDALSO body.Focused ANDALSO (event.Type == "text" ORELSE event.Type == "key") THEN
+                            modified = TRUE
+                            status.Text = "Modified"
+                        END IF
+                    END IF
+                END IF
+            END IF
+
+            ignored = app.Pump()
+            pending = app.PollEvent()
+            WHILE pending <> NULL
+                IF pending.Intent == saveIntent THEN
+                    IF NOT modified ANDALSO currentPath <> "" THEN
+                        status.Text = "Nothing to save"
+                    ELSE
+                        path = currentPath
+                        IF path == "" THEN path = GUI.SaveFileDialog(win.Window, "Save Note", "note.txt")
+                        IF path <> "" THEN
+                            ignored = File.WriteText(path, body.Text)
+                            currentPath = path
+                            modified = FALSE
+                            status.Text = "Saved to " + path
+                        END IF
+                    END IF
+                END IF
+                IF pending.Intent == openIntent THEN
+                    path = GUI.OpenFileDialog(win.Window, "Open Note", "")
+                    IF path <> "" THEN
+                        ignored = body.SetText(File.ReadText(path))
+                        currentPath = path
+                        modified = FALSE
+                        status.Text = "Opened " + path
+                    END IF
+                END IF
+                IF pending.Intent == newIntent THEN
+                    ignored = body.SetText("")
+                    currentPath = ""
+                    modified = FALSE
+                    status.Text = "New document (unsaved)"
+                END IF
+                pending = app.PollEvent()
+            WEND
+
+            IF NOT win.ShouldClose() THEN win.Draw()
+        WEND
+
+        ignored = win.Close()
+    CATCH err
+        PRINT "ArcoUI notes failed: " + err
+    END TRY
+END IF

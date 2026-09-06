@@ -388,12 +388,18 @@ void set_application(const std::string& app_id, const std::string& display_name,
     g_set_application_name(application_name.c_str());
 }
 
-int create_window(const std::string& title, int width, int height) {
+int create_window_impl(const std::string& title, int width, int height, bool frameless, bool transparent) {
     ensure_initialized();
     if (width <= 0 || height <= 0) throw std::runtime_error("GUI.Window dimensions must be positive");
     apply_application_hints();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    // ArcoUI shaped/frameless surfaces (RFC-ArcoUI section 9/42): both hints must be set before
+    // creation -- GLFW_TRANSPARENT_FRAMEBUFFER in particular cannot be changed after the fact.
+    // GLFW resets every window hint to its default at the start of each glfwCreateWindow call, so
+    // the ordinary (frameless=false) path above never sees these -- no behavior change for it.
+    glfwWindowHint(GLFW_DECORATED, frameless ? GLFW_FALSE : GLFW_TRUE);
+    glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, transparent ? GLFW_TRUE : GLFW_FALSE);
     GLFWwindow* handle = glfwCreateWindow(width, height, title.c_str(), nullptr, nullptr);
     if (!handle) throw std::runtime_error("GUI window creation failed");
     apply_window_icon(handle);
@@ -408,6 +414,44 @@ int create_window(const std::string& title, int width, int height) {
     glGenTextures(1, &windows.at(id)->texture);
     glfwSwapInterval(1);
     return id;
+}
+
+int create_window(const std::string& title, int width, int height) {
+    return create_window_impl(title, width, height, false, false);
+}
+
+int create_window(const std::string& title, int width, int height, bool frameless, bool transparent) {
+    return create_window_impl(title, width, height, frameless, transparent);
+}
+
+bool supports_shaped_windows() { return true; }
+
+void fill_polygon(int id, const std::vector<std::pair<double, double>>& points,
+                  double r, double g, double b, double a) {
+    if (points.size() < 3) return;
+    auto& item = find_window(id);
+    cairo_move_to(item.context, points[0].first, points[0].second);
+    for (std::size_t i = 1; i < points.size(); ++i) {
+        cairo_line_to(item.context, points[i].first, points[i].second);
+    }
+    cairo_close_path(item.context);
+    set_color(item.context, r, g, b, a);
+    cairo_fill(item.context);
+}
+
+void set_input_passthrough(int id, bool passthrough) {
+    glfwSetWindowAttrib(find_window(id).handle, GLFW_MOUSE_PASSTHROUGH, passthrough ? GLFW_TRUE : GLFW_FALSE);
+}
+
+Value window_position(int id) {
+    int x = 0;
+    int y = 0;
+    glfwGetWindowPos(find_window(id).handle, &x, &y);
+    return Value::Object{{"X", x}, {"Y", y}};
+}
+
+void set_window_position(int id, int x, int y) {
+    glfwSetWindowPos(find_window(id).handle, x, y);
 }
 
 void destroy_window(int id) {

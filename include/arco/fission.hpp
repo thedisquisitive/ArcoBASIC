@@ -42,5 +42,8 @@ Result reveal_x86_64_file(const std::string& path, const std::string& entry_func
 Result build_efi_image(const std::string& source, const std::string& source_name, const std::string& entry_function,
                         const std::string& output_path);
 Result build_efi_image_file(const std::string& path, const std::string& entry_function, const std::string& output_path);
+Result build_linux_native_image(const std::string& source, const std::string& source_name,
+                                 const std::string& entry_function, const std::string& output_path);
+Result build_linux_native_image_file(const std::string& path, const std::string& entry_function, const std::string& output_path);
 
 } // namespace arco::fission

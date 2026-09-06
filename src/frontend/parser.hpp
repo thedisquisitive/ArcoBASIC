@@ -25,6 +25,7 @@ enum class AstKind {
     Call,
     MethodCall,
     SuperCall,
+    DynamicMethodCall,
     Index,
     Slice,
     Copy,

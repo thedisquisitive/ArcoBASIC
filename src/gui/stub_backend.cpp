@@ -8,6 +8,12 @@ bool available() { return false; }
 std::string backend() { return "none"; }
 void set_application(const std::string&, const std::string&, const std::string&) { unsupported(); }
 int create_window(const std::string&, int, int) { unsupported(); }
+int create_window(const std::string&, int, int, bool, bool) { unsupported(); }
+bool supports_shaped_windows() { return false; }
+void fill_polygon(int, const std::vector<std::pair<double, double>>&, double, double, double, double) { unsupported(); }
+void set_input_passthrough(int, bool) { unsupported(); }
+Value window_position(int) { unsupported(); }
+void set_window_position(int, int, int) { unsupported(); }
 void destroy_window(int) { unsupported(); }
 bool should_close(int) { unsupported(); }
 void set_should_close(int, bool) { unsupported(); }

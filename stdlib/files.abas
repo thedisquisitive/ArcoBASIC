@@ -1,4 +1,4 @@
-' ArcoBASIC file helpers for ArcoSH scripts
+' ArcoBASIC file helpers
 #IMPORT "text"
 
 FUNCTION Files.ReadLines(path)

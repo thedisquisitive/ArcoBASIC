@@ -67,10 +67,8 @@ Maintainer: $MAINTAINER
 Depends: libc6, libstdc++6, libglfw3, libcairo2, libpango-1.0-0, libpangocairo-1.0-0, libgtk-3-0 | libgtk-3-0t64, libcurl4
 Recommends: arcobasic-arcfs
 Installed-Size: $INSTALLED_SIZE
-Description: ArcoBASIC language tools and ArcoSH shell
+Description: ArcoBASIC language tools
  ArcoBASIC is a readable BASIC-family scripting language.
- ArcoSH is an ArcoBASIC-powered shell intended for sysadmin workflows,
- profile scripting, tutorials, and interactive automation.
 CONTROL
 
 cat > "$PKG_ROOT/DEBIAN/postinst" <<'POSTINST'

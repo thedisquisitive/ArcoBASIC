@@ -1,7 +1,7 @@
 #DESCRIPTION "Download a URL to a file"
 
 IF LEN(Args) < 2 THEN
-    PRINT "Usage: arcosh examples/network_download.abas URL OUTFILE"
+    PRINT "Usage: arco_cli examples/network_download.abas URL OUTFILE"
     ExitTheProgram(2)
 END IF
 

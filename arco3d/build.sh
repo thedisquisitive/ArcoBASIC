@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Builds real, standalone native capsules for every arco3d test into arco3d/build/ (via
-# `ArcoFission native`), plus a plain arcosh symlink for ad-hoc interactive use. Run from
-# anywhere; it locates itself. Safe to rerun any time -- rebuilds ArcoFission/arcosh first if
-# either is missing, then recompiles every capsule fresh.
+# Builds real, standalone native capsules for every arco3d test into arco3d/build/ via
+# `ArcoFission native`. Run from anywhere; it locates itself. Safe to rerun any time -- rebuilds
+# ArcoFission first if missing, then recompiles every capsule fresh.
 #
 # Each resulting arco3d/build/<name> is a genuine ELF64 executable with the ArcoBASIC bytecode and
 # a bytecode VM embedded directly in it -- no arcosh, no ArcoFission, no ArcoBASIC toolchain of any
@@ -10,6 +9,12 @@
 # fixing four real, distinct compiler bugs (all in this same session) that made every nontrivial
 # CLASS-based ArcoBASIC program fail at bytecode-VM runtime despite compiling without error --
 # see arco3d/README.md for what each one was.
+#
+# NOTE: the repo's `arcosh` binary has been removed (it is being rebuilt from scratch) -- this
+# script no longer builds or symlinks it. The test/tool capsules above were always self-contained
+# native builds and are unaffected, but godot-edition's live-console feature, which spawned
+# `arcosh` as a persistent interactive subprocess, has lost its backing interpreter until the new
+# ArcoSH lands; see godot-edition/README.md's own notes on that feature.
 #
 # REPO_BUILD_DIR defaults to a real CMAKE_BUILD_TYPE=Release configuration (-O3), not the
 # no-build-type-set `build/` most of the repo's own docs mention -- an unoptimized capsule embeds
@@ -25,10 +30,10 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 REPO_BUILD_DIR="${REPO_BUILD_DIR:-$REPO_ROOT/build-release}"
 
 NPROC="$(nproc 2>/dev/null || echo 4)"
-if [ ! -x "$REPO_BUILD_DIR/arcosh" ] || [ ! -x "$REPO_BUILD_DIR/ArcoFission" ]; then
-    echo "arco3d/build.sh: building arcosh + ArcoFission into $REPO_BUILD_DIR (first run only) ..."
+if [ ! -x "$REPO_BUILD_DIR/ArcoFission" ]; then
+    echo "arco3d/build.sh: building ArcoFission into $REPO_BUILD_DIR (first run only) ..."
     cmake -S "$REPO_ROOT" -B "$REPO_BUILD_DIR" -DCMAKE_BUILD_TYPE=Release >/dev/null
-    cmake --build "$REPO_BUILD_DIR" --target arcosh ArcoFission -j"$NPROC"
+    cmake --build "$REPO_BUILD_DIR" --target ArcoFission -j"$NPROC"
 fi
 # The lean/no-GUI/no-libcurl runtime ArcoFission prefers linking native capsules against
 # (see fission.cpp's `prefer_lean_runtime`/`native_core_link_dependencies`) is its own
@@ -41,7 +46,6 @@ if grep -q "ArcoFissionCapsuleCoreProbe" "$REPO_BUILD_DIR/CMakeCache.txt" 2>/dev
 fi
 
 mkdir -p "$SCRIPT_DIR/build"
-ln -sf "$REPO_BUILD_DIR/arcosh" "$SCRIPT_DIR/build/arcosh"
 
 cd "$SCRIPT_DIR"
 for test_file in tests/*.abas; do

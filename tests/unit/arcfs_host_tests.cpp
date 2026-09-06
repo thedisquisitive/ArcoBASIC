@@ -177,6 +177,12 @@ void test_mount_and_read() {
     const auto children = volume.children(1);
     assert(children.size() == 1);
     assert(children[0].name == "home");
+    // build_image() is a hand-built OLD-format (112-byte checkpoint, no snapshot bit) fixture --
+    // this is the real backward-compatibility guarantee: it must mount cleanly with zero snapshots,
+    // no incompat-bit rejection, exactly as if the Snapshot Tree feature didn't exist yet.
+    assert(volume.checkpoint().snapshot_tree_root == 0);
+    assert(volume.checkpoint().snapshot_tree_count == 0);
+    assert(volume.snapshots().empty());
 }
 
 void test_rejects_bad_checksum() {
@@ -227,6 +233,139 @@ void test_large_host_write() {
     std::filesystem::remove(path);
 }
 
+// The core "time regression" guarantee: a snapshot keeps reading the content that existed at the
+// moment it was taken, even after the live volume has been overwritten and re-committed on top of
+// it -- checked both in-memory and after a completely fresh mount (durability, not just a cache).
+void test_snapshot_preserves_old_generation() {
+    const auto path = std::filesystem::temp_directory_path() / "arcfs_host_snapshot.img";
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.seekp(4 * 1024 * 1024 - 1);
+        out.put('\0');
+    }
+    arco::arcfs::format_file(path.string(), {});
+    auto source = std::make_shared<arco::arcfs::FileBlockSource>(path.string());
+    arco::arcfs::Volume volume;
+    volume.mount(source);
+
+    const auto oid = volume.create_file(1, "note.txt");
+    const std::string original = "original content";
+    volume.write_file(oid, 0, reinterpret_cast<const std::uint8_t*>(original.data()), original.size());
+    volume.commit();
+
+    const auto snapshot_id = volume.create_snapshot("before-edit");
+    assert(volume.snapshots().size() == 1);
+    assert(volume.snapshots()[0].label == "before-edit");
+    assert(volume.snapshots()[0].source_generation == volume.checkpoint().generation);
+
+    const std::string updated = "updated content, longer than the original";
+    volume.write_file(oid, 0, reinterpret_cast<const std::uint8_t*>(updated.data()), updated.size());
+    volume.commit();
+
+    const auto live = volume.read_file(oid, 0, updated.size());
+    assert(std::string(live.begin(), live.end()) == updated);
+
+    const auto snap_oid = volume.resolve_posix_path_in_snapshot(snapshot_id, "/note.txt");
+    assert(snap_oid && *snap_oid == oid);
+    const auto snap_data = volume.read_file_in_snapshot(snapshot_id, *snap_oid, 0, original.size());
+    assert(std::string(snap_data.begin(), snap_data.end()) == original);
+
+    const auto snap_children = volume.children_in_snapshot(snapshot_id, 1);
+    assert(snap_children.size() == 1 && snap_children[0].name == "note.txt");
+
+    arco::arcfs::Volume remounted;
+    remounted.mount(source);
+    assert(remounted.snapshots().size() == 1);
+    const auto remounted_snap_data = remounted.read_file_in_snapshot(snapshot_id, oid, 0, original.size());
+    assert(std::string(remounted_snap_data.begin(), remounted_snap_data.end()) == original);
+    const auto remounted_live = remounted.read_file(oid, 0, updated.size());
+    assert(std::string(remounted_live.begin(), remounted_live.end()) == updated);
+
+    std::filesystem::remove(path);
+}
+
+// Restores the live volume's content by committing a NEW generation whose roots equal the
+// snapshot's own -- not by rewinding the generation counter -- and leaves the Snapshot Tree
+// (including the snapshot just restored from) untouched.
+void test_rollback_round_trip() {
+    const auto path = std::filesystem::temp_directory_path() / "arcfs_host_rollback.img";
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.seekp(4 * 1024 * 1024 - 1);
+        out.put('\0');
+    }
+    arco::arcfs::format_file(path.string(), {});
+    auto source = std::make_shared<arco::arcfs::FileBlockSource>(path.string());
+    arco::arcfs::Volume volume;
+    volume.mount(source);
+
+    const auto oid = volume.create_file(1, "state.txt");
+    const std::string original = "state v1";
+    volume.write_file(oid, 0, reinterpret_cast<const std::uint8_t*>(original.data()), original.size());
+    volume.commit();
+
+    const auto snapshot_id = volume.create_snapshot("v1");
+    const auto generation_at_snapshot = volume.checkpoint().generation;
+
+    const std::string updated = "state v2, a different length entirely";
+    volume.write_file(oid, 0, reinterpret_cast<const std::uint8_t*>(updated.data()), updated.size());
+    volume.commit();
+    const auto before_rollback = volume.read_file(oid, 0, updated.size());
+    assert(std::string(before_rollback.begin(), before_rollback.end()) == updated);
+
+    volume.rollback_to_snapshot(snapshot_id);
+
+    // Rollback moves forward: a strictly newer generation, not the snapshot's own generation number.
+    assert(volume.checkpoint().generation > generation_at_snapshot);
+    const auto restored = volume.read_file(oid, 0, original.size());
+    assert(std::string(restored.begin(), restored.end()) == original);
+    assert(volume.snapshots().size() == 1);
+    assert(volume.snapshots()[0].snapshot_id == snapshot_id);
+
+    arco::arcfs::Volume remounted;
+    remounted.mount(source);
+    const auto remounted_oid = remounted.resolve_posix_path("/state.txt");
+    assert(remounted_oid);
+    const auto remounted_data = remounted.read_file(*remounted_oid, 0, original.size());
+    assert(std::string(remounted_data.begin(), remounted_data.end()) == original);
+    assert(remounted.snapshots().size() == 1);
+
+    std::filesystem::remove(path);
+}
+
+void test_delete_snapshot() {
+    const auto path = std::filesystem::temp_directory_path() / "arcfs_host_delete_snapshot.img";
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.seekp(4 * 1024 * 1024 - 1);
+        out.put('\0');
+    }
+    arco::arcfs::format_file(path.string(), {});
+    auto source = std::make_shared<arco::arcfs::FileBlockSource>(path.string());
+    arco::arcfs::Volume volume;
+    volume.mount(source);
+
+    volume.create_file(1, "a.txt");
+    volume.commit();
+    const auto first = volume.create_snapshot("first");
+    const auto second = volume.create_snapshot("second");
+    assert(volume.snapshots().size() == 2);
+
+    assert(volume.delete_snapshot(first));
+    assert(volume.snapshots().size() == 1);
+    assert(volume.snapshots()[0].snapshot_id == second);
+    // Deleting an already-gone id is a clean no-op, not an error.
+    assert(!volume.delete_snapshot(first));
+
+    arco::arcfs::Volume remounted;
+    remounted.mount(source);
+    assert(remounted.snapshots().size() == 1);
+    assert(remounted.snapshots()[0].snapshot_id == second);
+    assert(remounted.snapshots()[0].label == "second");
+
+    std::filesystem::remove(path);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -241,6 +380,9 @@ int main(int argc, char** argv) {
     test_rejects_bad_checksum();
     test_gpt_partition_offset();
     test_large_host_write();
+    test_snapshot_preserves_old_generation();
+    test_rollback_round_trip();
+    test_delete_snapshot();
     std::cout << "ArcFS host tests passed\n";
     return 0;
 }

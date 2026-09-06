@@ -1,0 +1,28 @@
+' ArcoUI Milestone 1 benchmark: the smallest real ArcoUI app -- a Label, a Button wired to the
+' default Close intent, keyboard focus (Tab cycles Label/Button -- well, Label opts out via
+' `focusable = FALSE`, so Tab is a no-op with one focusable widget, but the mechanism is exercised
+' the moment a second focusable control exists), and the Arcology default theme, with none of
+' GUI.WaitEvent's loop plumbing written by hand (App.Start owns that).
+
+#IMPORT "arcoui"
+
+IF GUI.Available() == FALSE THEN
+    PRINT "GUI support was not enabled in this build -- nothing to show."
+ELSE
+    TRY
+        app = App("Hello")
+        win = app.Window("Hello from ArcoUI", 480, 240)
+
+        greeting = Label("Hello from ArcoUI")
+        greeting.SetPosition(win.Theme.Spacing, win.Theme.Spacing)
+        ignored = win.Attach(greeting, "", FALSE)
+
+        closeButton = Button("Close")
+        closeButton.SetBounds(win.Theme.Spacing, 80, 120, 36)
+        ignored = win.Attach(closeButton, "Close")
+
+        ignored = app.Start()
+    CATCH err
+        PRINT "ArcoUI hello failed: " + err
+    END TRY
+END IF

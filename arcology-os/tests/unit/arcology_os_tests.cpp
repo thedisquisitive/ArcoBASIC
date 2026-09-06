@@ -317,6 +317,123 @@ int main() {
             asm_.call_reg(Reg::R8);
             require(bytes_equal(asm_.bytes(), {0x41, 0xFF, 0xD0}), "call r8 matches nasm");
         }
+        // Scalar-double (SSE2) support, added for the Linux/System V hosted native backend --
+        // every byte below independently verified against real `nasm -f bin` output (source kept
+        // in this test's own history, same discipline include/arco/jit_x86_64.hpp's own tests use
+        // for its equivalent, narrower loop-JIT encoder).
+        {
+            Assembler asm_;
+            asm_.movsd_load_disp32(Xmm::XMM0, Reg::RSP, 0x300);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x0F, 0x10, 0x84, 0x24, 0x00, 0x03, 0x00, 0x00}),
+                    "movsd xmm0, [rsp+0x300] matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.movsd_store_disp32(Reg::RSP, 0x200, Xmm::XMM1);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x0F, 0x11, 0x8C, 0x24, 0x00, 0x02, 0x00, 0x00}),
+                    "movsd [rsp+0x200], xmm1 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.movsd_reg_reg(Xmm::XMM2, Xmm::XMM3);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x0F, 0x10, 0xD3}), "movsd xmm2, xmm3 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.addsd(Xmm::XMM0, Xmm::XMM1);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x0F, 0x58, 0xC1}), "addsd xmm0, xmm1 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.subsd(Xmm::XMM0, Xmm::XMM1);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x0F, 0x5C, 0xC1}), "subsd xmm0, xmm1 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.mulsd(Xmm::XMM0, Xmm::XMM1);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x0F, 0x59, 0xC1}), "mulsd xmm0, xmm1 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.divsd(Xmm::XMM0, Xmm::XMM1);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x0F, 0x5E, 0xC1}), "divsd xmm0, xmm1 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.ucomisd(Xmm::XMM4, Xmm::XMM5);
+            require(bytes_equal(asm_.bytes(), {0x66, 0x0F, 0x2E, 0xE5}), "ucomisd xmm4, xmm5 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.movq_xmm_reg(Xmm::XMM0, Reg::RAX);
+            require(bytes_equal(asm_.bytes(), {0x66, 0x48, 0x0F, 0x6E, 0xC0}), "movq xmm0, rax matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.movq_xmm_reg(Xmm::XMM3, Reg::RCX);
+            require(bytes_equal(asm_.bytes(), {0x66, 0x48, 0x0F, 0x6E, 0xD9}), "movq xmm3, rcx matches nasm");
+        }
+        {
+            // The one case that actually needs REX.B (a src GPR from R8-R15) -- this codegen's
+            // own usage only ever passes RAX, but the encoding is verified correct generally
+            // rather than only for the one register this file happens to exercise today.
+            Assembler asm_;
+            asm_.movq_xmm_reg(Xmm::XMM0, Reg::R8);
+            require(bytes_equal(asm_.bytes(), {0x66, 0x49, 0x0F, 0x6E, 0xC0}), "movq xmm0, r8 matches nasm");
+        }
+        {
+            // R12 as a memory-operand base needs an explicit SIB byte (its low 3 bits, 100,
+            // collide with the "SIB follows" ModRM.rm encoding), same as RSP -- and, being an
+            // extended register, also needs REX.B, unlike RSP.
+            Assembler asm_;
+            asm_.movsd_load_disp32(Xmm::XMM6, Reg::R12, 0x300);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x41, 0x0F, 0x10, 0xB4, 0x24, 0x00, 0x03, 0x00, 0x00}),
+                    "movsd xmm6, [r12+0x300] matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.cvttsd2si_reg_xmm(Reg::RAX, Xmm::XMM0);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x48, 0x0F, 0x2C, 0xC0}), "cvttsd2si rax, xmm0 matches nasm");
+        }
+        {
+            // The one case that needs REX.R (a dst GPR from R8-R15).
+            Assembler asm_;
+            asm_.cvttsd2si_reg_xmm(Reg::R8, Xmm::XMM0);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x4C, 0x0F, 0x2C, 0xC0}), "cvttsd2si r8, xmm0 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.cvttsd2si_reg_xmm(Reg::RAX, Xmm::XMM7);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x48, 0x0F, 0x2C, 0xC7}), "cvttsd2si rax, xmm7 matches nasm");
+        }
+        {
+            // Both an extended dst GPR and a non-zero-low3 src XMM in the same instruction.
+            Assembler asm_;
+            asm_.cvttsd2si_reg_xmm(Reg::R12, Xmm::XMM3);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x4C, 0x0F, 0x2C, 0xE3}), "cvttsd2si r12, xmm3 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.cvtsi2sd_xmm_reg(Xmm::XMM0, Reg::RAX);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x48, 0x0F, 0x2A, 0xC0}), "cvtsi2sd xmm0, rax matches nasm");
+        }
+        {
+            // The one case that needs REX.B (a src GPR from R8-R15).
+            Assembler asm_;
+            asm_.cvtsi2sd_xmm_reg(Xmm::XMM0, Reg::R8);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x49, 0x0F, 0x2A, 0xC0}), "cvtsi2sd xmm0, r8 matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.cvtsi2sd_xmm_reg(Xmm::XMM7, Reg::RAX);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x48, 0x0F, 0x2A, 0xF8}), "cvtsi2sd xmm7, rax matches nasm");
+        }
+        {
+            // Both a non-zero-low3 dst XMM and an extended src GPR in the same instruction.
+            Assembler asm_;
+            asm_.cvtsi2sd_xmm_reg(Xmm::XMM3, Reg::R12);
+            require(bytes_equal(asm_.bytes(), {0xF2, 0x49, 0x0F, 0x2A, 0xDC}), "cvtsi2sd xmm3, r12 matches nasm");
+        }
         {
             Assembler asm_;
             const std::size_t disp_offset = asm_.call_rel32_placeholder();

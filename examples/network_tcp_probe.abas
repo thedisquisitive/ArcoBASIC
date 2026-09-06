@@ -1,7 +1,7 @@
 #DESCRIPTION "Connect to a TCP server, send text, and print one response chunk"
 
 IF LEN(Args) < 3 THEN
-    PRINT "Usage: arcosh examples/network_tcp_probe.abas HOST PORT TEXT [MAX_BYTES]"
+    PRINT "Usage: arco_cli examples/network_tcp_probe.abas HOST PORT TEXT [MAX_BYTES]"
     ExitTheProgram(2)
 END IF
 

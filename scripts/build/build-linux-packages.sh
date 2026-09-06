@@ -9,7 +9,7 @@ OUT_DIR="${OUT_DIR:-$SOURCE_DIR/dist}"
 PACKAGE="${PACKAGE:-arcobasic}"
 VERSION="${VERSION:-}"
 MAINTAINER="${MAINTAINER:-Daedalus <daedalus@localhost>}"
-SUMMARY="${SUMMARY:-ArcoBASIC language tools and ArcoSH shell}"
+SUMMARY="${SUMMARY:-ArcoBASIC language tools}"
 LICENSE="${LICENSE:-Proprietary}"
 XBPS_BINDIR="${XBPS_BINDIR:-}"
 PACKAGE_PROFILE="${PACKAGE_PROFILE:-full}"
@@ -232,8 +232,6 @@ Depends: libc6, libstdc++6, libfuse3-4 | libfuse3-3, fuse3, udev, udisks2, libgl
 Installed-Size: $installed_size
 Description: $SUMMARY
  ArcoBASIC is a readable BASIC-family scripting language.
- ArcoSH is an ArcoBASIC-powered shell intended for sysadmin workflows,
- profile scripting, tutorials, and interactive automation.
 CONTROL
 
     cat > "$pkg_root/DEBIAN/postinst" <<'POSTINST'
@@ -286,7 +284,6 @@ build_tarball() {
 ArcoBASIC portable Linux package
 
 Run tools directly from:
-  usr/bin/arcosh
   usr/bin/arco_cli
   usr/bin/ArcoFission
 
@@ -323,19 +320,15 @@ BuildArch:      $rpm_arch
 
 %description
 ArcoBASIC is a readable BASIC-family scripting language.
-ArcoSH is an ArcoBASIC-powered shell intended for sysadmin workflows,
-profile scripting, tutorials, and interactive automation.
 
 %install
 mkdir -p %{buildroot}
 cp -a "$install_root"/* %{buildroot}/
 
 %files
-/usr/bin/arcosh
 /usr/bin/arco_cli
 /usr/bin/ArcoFission
 /usr/share/arcobasic
-/usr/share/arcosh
 /usr/share/applications/arconaut.desktop
 /usr/share/mime/packages/application-x-arcobasic.xml
 /usr/share/icons/hicolor/512x512/apps/arconaut.png
@@ -395,7 +388,7 @@ do_build() {
 }
 
 do_check() {
-	ctest --test-dir build --output-on-failure -R 'arcosh_alpha_smoke|arcofission_alpha_smoke'
+	ctest --test-dir build --output-on-failure -R 'arcofission_alpha_smoke'
 }
 
 do_install() {

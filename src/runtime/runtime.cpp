@@ -3,6 +3,7 @@
 #include "arco/random.hpp"
 #include "arco/graphics.hpp"
 #include "arco/gui.hpp"
+#include "arcoui/bindings.hpp"
 
 #include "frontend/lexer.hpp"
 #include "frontend/parser.hpp"
@@ -2817,7 +2818,7 @@ Runtime::Runtime()
         return true;
     });
     // Directory.Create/Exists, File.List, and System.Open had the same arco_shell-only gap as
-    // Path.*/ArcoSH.AssetsDir below and above -- examples/arconaut.abas (now built as a standalone
+    // Path.*/ArcoSH.AssetsDir below and above -- arcfs-utils/apps/arconaut/arconaut.abas (now built as a standalone
     // ArcoFission capsule, not run through arcosh) uses all of them: Directory.Create/Exists and
     // File.List for its Plugins tab's `~/.arcology/arcfs/plugins` discovery, System.Open to launch
     // a mounted volume in the desktop file manager.
@@ -2895,6 +2896,27 @@ Runtime::Runtime()
         return WIFEXITED(status) ? WEXITSTATUS(status) == 0 : false;
 #endif
     });
+    // Input/ReadLine previously existed only in arco_shell (src/shell/arcosh.cpp) -- reading one
+    // line from stdin, with an optional printed prompt, is core BASIC capability (classic INPUT),
+    // not shell tooling, so scripts that ask for interactive input (examples/arcomart.abas,
+    // examples/arconav.abas) had no way to do that once run as a plain capsule/arco_cli script
+    // rather than through arcosh. Made universal when arcosh itself was removed, following the
+    // same shape as the ArcoSH.AssetsDir/Directory.Create/File.List/System.Open moves above.
+    auto input_function = [this](const std::vector<Value>& args) -> Value {
+        if (args.size() > 1) {
+            throw std::runtime_error("Input expects 0 or 1 arguments");
+        }
+        if (!args.empty()) {
+            *output_ << args[0].to_string() << std::flush;
+        }
+        std::string answer;
+        if (!std::getline(std::cin, answer)) {
+            return "";
+        }
+        return answer;
+    };
+    register_function("Input", input_function);
+    register_function("ReadLine", input_function);
     // Path.* previously existed only in arco_shell (src/shell/arcosh.cpp) -- plain std::filesystem
     // wrappers with no shell-specific dependency, so a capsule (e.g. arcoflow/arcoflow.abas,
     // which needs Path.BaseName for its window title) had no way to reach them despite File.*
@@ -2929,7 +2951,7 @@ Runtime::Runtime()
     });
     // ArcoSH.AssetsDir had the same Path.*-shaped gap: registered only in arco_shell even though
     // it's a plain std::filesystem search relative to the running executable, no shell state
-    // involved. examples/arconaut.abas calls it to locate its own bundled icon and is now built as
+    // involved. arcfs-utils/apps/arconaut/arconaut.abas calls it to locate its own bundled icon and is now built as
     // a standalone ArcoFission capsule (not run through arcosh) -- "unknown host function:
     // ArcoSH.AssetsDir" at launch, same shape as the Path.* gap above.
     register_function("ArcoSH.AssetsDir", [](const std::vector<Value>& args) -> Value {
@@ -3483,6 +3505,42 @@ Runtime::Runtime()
         if (args.size() != 3) throw std::runtime_error("GUI.Window expects title, width, and height");
         return gui::create_window(args[0].to_string(), static_cast<int>(args[1].as_number()), static_cast<int>(args[2].as_number()));
     });
+    register_function("GUI.WindowShaped", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 5) {
+            throw std::runtime_error("GUI.WindowShaped expects title, width, height, frameless, transparent");
+        }
+        return gui::create_window(args[0].to_string(), static_cast<int>(args[1].as_number()), static_cast<int>(args[2].as_number()),
+                                  args[3].truthy(), args[4].truthy());
+    });
+    register_function("GUI.SupportsShapedWindows", [](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) throw std::runtime_error("GUI.SupportsShapedWindows expects no arguments");
+        return gui::supports_shaped_windows();
+    });
+    register_function("GUI.FillPolygon", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 6) throw std::runtime_error("GUI.FillPolygon expects a window, points, and r, g, b, a");
+        std::vector<std::pair<double, double>> points;
+        for (const auto& point : args[1].as_array()) {
+            points.emplace_back(point.get_property("X").as_number(), point.get_property("Y").as_number());
+        }
+        gui::fill_polygon(static_cast<int>(args[0].as_number()), points,
+                          args[2].as_number(), args[3].as_number(), args[4].as_number(), args[5].as_number());
+        return {};
+    });
+    register_function("GUI.SetInputPassthrough", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 2) throw std::runtime_error("GUI.SetInputPassthrough expects a window and boolean");
+        gui::set_input_passthrough(static_cast<int>(args[0].as_number()), args[1].truthy());
+        return {};
+    });
+    register_function("GUI.Position", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 1) throw std::runtime_error("GUI.Position expects a window");
+        return gui::window_position(static_cast<int>(args[0].as_number()));
+    });
+    register_function("GUI.SetPosition", [](const std::vector<Value>& args) -> Value {
+        if (args.size() != 3) throw std::runtime_error("GUI.SetPosition expects a window, x, and y");
+        gui::set_window_position(static_cast<int>(args[0].as_number()), static_cast<int>(args[1].as_number()),
+                                 static_cast<int>(args[2].as_number()));
+        return {};
+    });
     register_function("GUI.Close", [](const std::vector<Value>& args) -> Value {
         if (args.size() != 1) throw std::runtime_error("GUI.Close expects a window");
         gui::destroy_window(static_cast<int>(args[0].as_number()));
@@ -3664,6 +3722,8 @@ Runtime::Runtime()
         reset_instruction_count();
         return event;
     });
+
+    arcoui::register_arcoui_functions(*this);
 }
 
 std::string Runtime::preprocess_source(const std::string& code) {

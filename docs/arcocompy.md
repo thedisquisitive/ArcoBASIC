@@ -42,17 +42,17 @@ END IF
 
 ## Saving and loading files
 
-In ArcoSH or another host with file helpers:
+With any host that has file helpers:
 
 ```basic
 #IMPORT "compy"
 
-profile = {"Prompt": "arcosh> ", "Mods": ["arcogotchi"]}
+profile = {"Name": "Miso", "Theme": "dark"}
 
 ArcoCompy.Save("profile.acpy", profile)
 loaded = ArcoCompy.Load("profile.acpy")
 
-PRINT loaded.Prompt
+PRINT loaded.Name
 ```
 
 `ArcoCompy.Unpack(payload)` remains the short form. It returns the restored

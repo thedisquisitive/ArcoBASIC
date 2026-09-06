@@ -1,4 +1,4 @@
-' Minimal clickable TUI. Run this in a terminal with ArcoSH.
+' Minimal clickable TUI. Run this in a terminal with arco_cli.
 PRINT TUI.Clear()
 PRINT TUI.Cursor(2, 4) + TUI.Rule("Mouse demo", 32)
 PRINT TUI.Cursor(4, 6) + "[  Count  ]"

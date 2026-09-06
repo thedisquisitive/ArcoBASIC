@@ -1,7 +1,7 @@
 # Arconaut
 
 Arconaut is the graphical ArcFS administrator. It is written in ArcoBASIC at
-`examples/arconaut.abas` and built by ArcoFission into the native `arconaut` capsule.
+`arcfs-utils/apps/arconaut/arconaut.abas` and built by ArcoFission into the native `arconaut` capsule.
 
 Current Linux scope:
 
@@ -19,8 +19,8 @@ Build it directly:
 
 ```sh
 cmake --build build --target arconaut
-build/generated/arconaut
+arcfs-utils/build/generated/arconaut
 ```
 
-The package launcher starts `/usr/bin/arconaut` directly. It does not run the source file through
-`arcosh`.
+The package launcher starts `/usr/bin/arconaut` directly — the compiled native capsule, not the
+`.abas` source file.

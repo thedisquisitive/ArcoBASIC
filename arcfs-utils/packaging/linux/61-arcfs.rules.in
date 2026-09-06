@@ -1,0 +1,26 @@
+# ArcFS filesystem discovery for udev/udisks2.
+#
+# libblkid does not know ArcFS yet, so this rule asks arcfs-linux to validate
+# candidate block devices and import ID_FS_* properties when the ArcFS FMV2
+# superblock ring and checkpoint are valid.
+
+ACTION=="remove", GOTO="arcfs_probe_end"
+SUBSYSTEM!="block", GOTO="arcfs_probe_end"
+ENV{DEVNAME}!="?*", GOTO="arcfs_probe_end"
+ENV{ID_FS_TYPE}=="?*", GOTO="arcfs_probe_end"
+KERNEL=="ram*|zram*|fd*", GOTO="arcfs_probe_end"
+
+IMPORT{program}="/bin/sh -c 'PATH=/usr/bin:/usr/local/bin:/bin:/usr/sbin:/usr/local/sbin exec arcfs-linux probe \"$DEVNAME\"'"
+ENV{ID_FS_TYPE}=="arcfs", ENV{UDISKS_PRESENTATION_NAME}="ArcFS Volume"
+
+# The raw device node otherwise stays root:disk 0660 -- unreadable by an ordinary user, forcing
+# every ArcFS operation (mount, inspect, ls, ...) through pkexec/sudo/udisks2's own root daemon
+# even for a user's own personal removable media. Scoped to devices this rule's own probe above
+# already confirmed are ArcFS (not a blanket disk-group grant to every block device on the
+# system): grants read/write on the device node to the `plugdev` group, the standard Debian/Ubuntu
+# convention for exactly this "let the logged-in user handle their own pluggable media" case, which
+# a normal desktop user account is already a member of -- no logout/login, no new group, no
+# broadened access to unrelated disks.
+ENV{ID_FS_TYPE}=="arcfs", GROUP="plugdev", MODE="0660"
+
+LABEL="arcfs_probe_end"

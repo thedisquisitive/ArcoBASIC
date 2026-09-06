@@ -3,6 +3,8 @@
 #include "arco/value.hpp"
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace arco::gui {
 
@@ -10,6 +12,34 @@ bool available();
 std::string backend();
 void set_application(const std::string& app_id, const std::string& display_name, const std::string& icon_path);
 int create_window(const std::string& title, int width, int height);
+// ArcoUI shaped/frameless surfaces (RFC-ArcoUI section 9/42/M3). `frameless` drops native window
+// decoration (title bar, OS-drawn borders); `transparent` requests a per-pixel-alpha backing
+// framebuffer so fill_polygon() below can leave the outside of a non-rectangular shape fully
+// transparent instead of an opaque rectangle showing through. Both are best-effort: a backend
+// with no such concept (the web/canvas build; RFC section 9.3 does not require every backend
+// implement shape identically) simply ignores them -- see supports_shaped_windows().
+int create_window(const std::string& title, int width, int height, bool frameless, bool transparent);
+// TRUE if create_window's frameless/transparent flags and set_input_passthrough() below actually
+// do something on this backend. The web/canvas build has no OS window to shape or make click-
+// through -- callers use this instead of assuming every backend supports shaped input identically.
+bool supports_shaped_windows();
+// Fills an arbitrary closed polygon (implicit closing edge from the last point back to the
+// first) -- the same shape a caller's own hit-testing (arcoui::point_in_shape, geometry.hpp) is
+// checking against, so a shaped surface's visible fill and its input hit-test can't drift apart.
+void fill_polygon(int id, const std::vector<std::pair<double, double>>& points,
+                  double red, double green, double blue, double alpha);
+// Toggles whole-window mouse click-through (RFC-ArcoUI section 9.3/42's "cheap, portable" tier --
+// see the project's own implementation notes: real per-pixel OS input regions are a documented,
+// deliberate non-goal of this pass). A caller flips this as the pointer crosses in/out of its own
+// shape_polygon() membership test; while TRUE, pointer input passes through to whatever is behind
+// this window instead of reaching it. No-op where supports_shaped_windows() is FALSE.
+void set_input_passthrough(int id, bool passthrough);
+// A frameless window (see create_window above) has no OS-drawn title bar to grab -- these are the
+// primitive a caller's own drag region (RFC-ArcoUI section 10.3/42) is built on: on press inside
+// the region remember the pointer's offset from the window's own position, then on every
+// following pointer-move call set_window_position(current_window_position + pointer_delta).
+Value window_position(int id);
+void set_window_position(int id, int x, int y);
 void destroy_window(int id);
 bool should_close(int id);
 void set_should_close(int id, bool should_close);

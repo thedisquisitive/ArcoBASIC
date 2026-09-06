@@ -653,9 +653,17 @@ struct MethodCallExpr final : Expr {
 // MethodCallExpr/VariableExpr above resolve a *name* (walking get_global's own dotted-path logic);
 // this instead evaluates `object` first and reads `property` off whatever value that produces --
 // needed when the base is not a plain variable, e.g. the result of a call or index expression
-// (`f().Property`, `arr[0].Property`). Interpreter-only: canonical_ast() intentionally uses the
-// Expr base class's default (AstKind::Unsupported) rather than adding new AstKind cases, since the
-// A-MIR/bytecode/native pipeline does not lower this yet.
+// (`f().Property`, `arr[0].Property`).
+//
+// canonical_ast() lowers to plain AstKind::Index (target=object, index=a synthesized STRING
+// literal holding `property`) -- exactly the shape lower_variable's own dotted-identifier-chain
+// fallback already builds by hand for the plain-name case (fission.cpp, `amir_const(property,
+// "\"" + escaped(...) + "\"")` then `amir_index(...)`), so AstKind::Index's EXISTING lowering case
+// picks this up with no A-MIR/bytecode/native changes needed at all. Previously used the Expr base
+// class's default (AstKind::Unsupported), an interpreter-only gap: `arr[0].Property` failed
+// identically on the bytecode VM (`cannot execute unsupported bytecode instruction: nothing`) and
+// this backend's native target both, confirmed directly, not assumed -- see
+// .agents/ARCO_NATIVE_RUNTIME_PROGRESS.md Entry 9 for how it was found and Entry 10 for the fix.
 struct DynamicGetExpr final : Expr {
     DynamicGetExpr(std::unique_ptr<Expr> object, std::string property)
         : object(std::move(object)), property(std::move(property)) {}
@@ -666,6 +674,15 @@ struct DynamicGetExpr final : Expr {
     void dump_ast(std::ostream& output, int indent) const override {
         ast_line(output, indent, "DynamicGet " + property);
         object->dump_ast(output, indent + 1);
+    }
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::Index);
+        node->children.push_back(object->canonical_ast());
+        auto property_node = canonical_node(AstKind::Literal);
+        property_node->literal = Value(property);
+        property_node->text = "\"" + property + "\"";
+        node->children.push_back(property_node);
+        return node;
     }
     std::unique_ptr<Expr> object;
     std::string property;
@@ -691,6 +708,28 @@ struct DynamicMethodCallExpr final : Expr {
         for (const auto& arg : args) {
             arg->dump_ast(output, indent + 1);
         }
+    }
+    // Unlike MethodCallExpr (which always resolves a plain, possibly dotted NAME -- receiver is a
+    // string, never an arbitrary expression), `object` here can be any expression at all
+    // (`f().Method()`, `arr[0].Method()`, `a.b.Method()` when `a.b` doesn't resolve as a simple
+    // local -- see the postfix-chaining loop's own comment on when this node is built instead of
+    // MethodCallExpr). AstKind::MethodCall's own AMIR lowering (lower_call) has no way to represent
+    // "evaluate this expression" as its receiver -- it only ever takes a name string -- so this
+    // needs its own AstKind (children[0] = the object expression, children[1..] = the call
+    // arguments, `name` = the method name) rather than reusing MethodCall's shape the way
+    // DynamicGetExpr reuses AstKind::Index above. See fission.cpp's own lower_expression case for
+    // how it's turned into an ordinary CallValue targeting "<object's own temp>.<method>" --
+    // instance-method dispatch (bytecode VM and this project's native backend both) already treats
+    // ANY name with a stack slot as a valid receiver, a compiler-generated temp included, so this
+    // needed no new dispatch machinery of its own, only a way to feed it one.
+    CanonicalAstNodePtr canonical_ast() const override {
+        auto node = canonical_node(AstKind::DynamicMethodCall);
+        node->name = method;
+        node->children.push_back(object->canonical_ast());
+        for (const auto& arg : args) {
+            node->children.push_back(arg->canonical_ast());
+        }
+        return node;
     }
     std::unique_ptr<Expr> object;
     std::string method;
@@ -2686,25 +2725,53 @@ Parser::StmtPtr Parser::assignment_statement(bool had_let) {
         type_name = parse_type_name("expected type name after AS");
     }
     std::vector<ExprPtr> indexes;
-    while (match(TokenType::LeftBracket)) {
-        ExprPtr first;
-        if (!check(TokenType::Colon)) first = expression();
-        if (match(TokenType::Colon)) {
-            if (had_let || !indexes.empty()) {
-                throw std::runtime_error(token_error(previous(), "slice assignment requires an existing top-level array variable"));
-            }
-            ExprPtr end;
-            if (!check(TokenType::Colon) && !check(TokenType::RightBracket)) end = expression();
+    while (true) {
+        if (match(TokenType::LeftBracket)) {
+            ExprPtr first;
+            if (!check(TokenType::Colon)) first = expression();
             if (match(TokenType::Colon)) {
-                throw std::runtime_error(token_error(previous(), "stepped slice assignment is not supported"));
+                if (had_let || !indexes.empty()) {
+                    throw std::runtime_error(token_error(previous(), "slice assignment requires an existing top-level array variable"));
+                }
+                ExprPtr end;
+                if (!check(TokenType::Colon) && !check(TokenType::RightBracket)) end = expression();
+                if (match(TokenType::Colon)) {
+                    throw std::runtime_error(token_error(previous(), "stepped slice assignment is not supported"));
+                }
+                consume(TokenType::RightBracket, "expected ']' after slice");
+                consume(TokenType::Equal, "expected '=' after array slice");
+                return std::make_unique<SliceAssignStmt>(name.lexeme, std::move(first), std::move(end), expression());
             }
-            consume(TokenType::RightBracket, "expected ']' after slice");
-            consume(TokenType::Equal, "expected '=' after array slice");
-            return std::make_unique<SliceAssignStmt>(name.lexeme, std::move(first), std::move(end), expression());
+            if (!first) throw std::runtime_error(token_error(peek(), "expected index or slice"));
+            indexes.push_back(std::move(first));
+            consume(TokenType::RightBracket, "expected ']' after index");
+            continue;
         }
-        if (!first) throw std::runtime_error(token_error(peek(), "expected index or slice"));
-        indexes.push_back(std::move(first));
-        consume(TokenType::RightBracket, "expected ']' after index");
+        if (match(TokenType::Dot)) {
+            // A `.field` continuation after a `[index]` (`arr[i].field = x`) or between two
+            // brackets (`arr[i].nested[j] = x`) -- reached only when the base identifier's own
+            // dotted-name fusion in identifier() couldn't apply (a `]` broke the run), the same
+            // "standalone Dot token" shape the expression grammar's own postfix-chaining loop
+            // handles (see that loop's identical comment on `f().Bar.Baz`). Each dotted segment is
+            // pushed as an ordinary STRING-literal index, exactly equivalent to writing
+            // `arr[i]["field"]` by hand -- assign_indexed (interpreter/bytecode VM) and this
+            // backend's own Kind::StoreIndex both already treat a String-kind index as a field name
+            // and a Number-kind index as an array position uniformly, regardless of whether the
+            // source spelled it with a dot or a bracket, so no lowering/codegen changes are needed
+            // for this half of the fix -- only the parser previously had no grammar rule for it.
+            const Token member_token = consume(TokenType::Identifier, "expected member name after '.'");
+            std::size_t segment_start = 0;
+            while (true) {
+                const auto next_dot = member_token.lexeme.find('.', segment_start);
+                const std::string segment = member_token.lexeme.substr(
+                    segment_start, next_dot == std::string::npos ? std::string::npos : next_dot - segment_start);
+                indexes.push_back(std::make_unique<LiteralExpr>(segment, ast_quote(segment)));
+                if (next_dot == std::string::npos) break;
+                segment_start = next_dot + 1;
+            }
+            continue;
+        }
+        break;
     }
     consume(TokenType::Equal, "expected '=' after variable name");
     if (!type_name.empty()) {

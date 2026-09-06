@@ -1,0 +1,815 @@
+' ArcoUI: the intent-oriented authoring layer for ArcoBASIC (RFC-ArcoUI, Milestones 1-4).
+'
+' This module is the "Level One" / "Level Two" authoring surface the RFC describes (section 14):
+' plain ArcoBASIC classes and method chaining built on top of two existing layers rather than new
+' parser syntax (RFC section 48 explicitly permits and prefers this) --
+'   - the native ArcoUI.* host functions (src/gui/arcoui/bindings.cpp) for the language-neutral
+'     core: semantic tree, intents with state/blocked-reason, transactions, shapes, gestures;
+'   - the existing GUI.* primitives + stdlib/gui.abas widgets (TextArea/Button/Checkbox/Slider,
+'     all now IMPLEMENTS Widget) for actual pixel drawing, windowing, and input.
+'
+' A widget in this module is anything implementing gui.abas's Widget interface (Draw/HandleEvent);
+' Surface below is the Panel/container that module's own doc comment deferred. An App owns one or
+' more Surfaces and the single WaitEvent/PollIntentEvent loop driving all of them -- see App.Start's
+' own comment for why there can only be one consumer of each of those two shared queues.
+
+#IMPORT "gui"
+
+' Data-driven default look (RFC section 51/52): every color/geometry constant a widget's Draw()
+' needs lives here, not hardcoded per control, so a future alternate theme is a different Theme
+' instance, not a rewrite of every Draw method. ArcologyDarkTheme() below is the reference look;
+' its defaults ARE that look, so the factory function is trivial on purpose.
+CLASS Theme
+    BackgroundR = 0.07
+    BackgroundG = 0.078
+    BackgroundB = 0.094
+    PanelR = 0.09
+    PanelG = 0.10
+    PanelB = 0.125
+    TextR = 0.88
+    TextG = 0.92
+    TextB = 0.98
+    AccentR = 0.35
+    AccentG = 0.75
+    AccentB = 1.0
+    DangerR = 0.85
+    DangerG = 0.32
+    DangerB = 0.34
+    FocusR = 0.45
+    FocusG = 0.85
+    FocusB = 1.0
+    ChamferRadius = 6
+    Spacing = 10
+    FontSize = 15
+END CLASS
+
+FUNCTION ArcologyDarkTheme()
+    RETURN Theme()
+END FUNCTION
+
+' A static line of text -- never focusable (see Surface.Attach's `focusable` flag), never returns TRUE
+' from HandleEvent. Auto-sizes Width/Height from the actual rendered text each Draw() so it can
+' still take part in the same focus-ring bounding-box math every other widget does, without every
+' caller having to measure and set them by hand.
+CLASS Label IMPLEMENTS Widget
+    Text = ""
+    X = 0
+    Y = 0
+    Width = 0
+    Height = 0
+    FontSize = 15
+    TextR = 0.88
+    TextG = 0.92
+    TextB = 0.98
+
+    CONSTRUCTOR(text = "")
+        SELF.Text = text
+    END CONSTRUCTOR
+
+    FUNCTION SetPosition(x, y)
+        SELF.X = x
+        SELF.Y = y
+    END FUNCTION
+
+    FUNCTION Draw(window)
+        measured = GUI.MeasureText(window, SELF.Text, SELF.FontSize)
+        SELF.Width = measured.Width
+        SELF.Height = measured.Height
+        GUI.Text(window, SELF.Text, SELF.X, SELF.Y, SELF.FontSize, SELF.TextR, SELF.TextG, SELF.TextB, 1.0)
+    END FUNCTION
+
+    FUNCTION HandleEvent(window, event)
+        RETURN FALSE
+    END FUNCTION
+END CLASS
+
+' A single-line text field (a note title, a search box, a form field) -- deliberately its own
+' small implementation rather than reusing TextArea's multi-line caret/line math, which doesn't
+' apply here. Gated by the same `Focused` convention TextArea now has (see gui.abas): only inserts/
+' edits when Focused is TRUE, so a TextField and a TextArea can coexist in the same ArcoSurface
+' without every keystroke reaching both at once -- click-to-focus sets it directly; a caller
+' managing several text-capable widgets at once (Milestone 2's Notes benchmark) toggles it itself.
+CLASS TextField IMPLEMENTS Widget
+    Text = ""
+    Caret = 0
+    X = 0
+    Y = 0
+    Width = 240
+    Height = 32
+    FontSize = 15
+    Padding = 8
+    Focused = FALSE
+    BackgroundR = 0.09
+    BackgroundG = 0.105
+    BackgroundB = 0.135
+    FocusedBackgroundR = 0.12
+    FocusedBackgroundG = 0.14
+    FocusedBackgroundB = 0.18
+    TextR = 0.9
+    TextG = 0.92
+    TextB = 0.96
+    CaretR = 0.4
+    CaretG = 0.75
+    CaretB = 1.0
+
+    CONSTRUCTOR(text = "")
+        SELF.Text = text
+        SELF.Caret = String.Length(text)
+    END CONSTRUCTOR
+
+    FUNCTION SetBounds(x, y, width, height)
+        SELF.X = x
+        SELF.Y = y
+        SELF.Width = width
+        SELF.Height = height
+    END FUNCTION
+
+    FUNCTION SetText(text)
+        SELF.Text = text
+        SELF.Caret = String.Length(text)
+    END FUNCTION
+
+    FUNCTION ContainsPoint(px, py)
+        RETURN px >= SELF.X ANDALSO px < SELF.X + SELF.Width ANDALSO py >= SELF.Y ANDALSO py < SELF.Y + SELF.Height
+    END FUNCTION
+
+    FUNCTION Draw(window)
+        r = SELF.BackgroundR
+        g = SELF.BackgroundG
+        b = SELF.BackgroundB
+        IF SELF.Focused THEN
+            r = SELF.FocusedBackgroundR
+            g = SELF.FocusedBackgroundG
+            b = SELF.FocusedBackgroundB
+        END IF
+        GUI.RoundedRectangle(window, SELF.X, SELF.Y, SELF.Width, SELF.Height, 4, r, g, b, 1.0)
+        GUI.SetClip(window, SELF.X, SELF.Y, SELF.Width, SELF.Height)
+        GUI.Text(window, SELF.Text, SELF.X + SELF.Padding, SELF.Y + (SELF.Height - SELF.FontSize) / 2,
+            SELF.FontSize, SELF.TextR, SELF.TextG, SELF.TextB, 1.0)
+        IF SELF.Focused THEN
+            measured = GUI.MeasureText(window, String.Slice(SELF.Text, 0, SELF.Caret), SELF.FontSize)
+            caretX = SELF.X + SELF.Padding + measured.Width
+            GUI.Rectangle(window, caretX, SELF.Y + 6, 2, SELF.Height - 12, SELF.CaretR, SELF.CaretG, SELF.CaretB, 1.0)
+        END IF
+        GUI.ResetClip(window)
+    END FUNCTION
+
+    ' Returns TRUE if the event changed Text. Also grabs/releases Focused on left-click inside/
+    ' outside its own bounds regardless of its current Focused state, so a plain click is enough to
+    ' move text-editing focus onto or off of this field without a caller managing that by hand.
+    FUNCTION HandleEvent(window, event)
+        IF event.Type == "pointer-button" ANDALSO event.Action == "press" ANDALSO event.Button == "left" THEN
+            SELF.Focused = SELF.ContainsPoint(event.X, event.Y)
+        END IF
+        IF NOT SELF.Focused THEN RETURN FALSE
+
+        changed = FALSE
+        IF event.Type == "text" THEN
+            SELF.Text = String.Insert(SELF.Text, SELF.Caret, event.Text)
+            SELF.Caret = SELF.Caret + String.Length(event.Text)
+            changed = TRUE
+        END IF
+        IF event.Type == "key" ANDALSO (event.Action == "press" ORELSE event.Action == "repeat") THEN
+            IF event.Key == "left" ANDALSO SELF.Caret > 0 THEN SELF.Caret = SELF.Caret - 1
+            IF event.Key == "right" ANDALSO SELF.Caret < String.Length(SELF.Text) THEN SELF.Caret = SELF.Caret + 1
+            IF event.Key == "home" THEN SELF.Caret = 0
+            IF event.Key == "end" THEN SELF.Caret = String.Length(SELF.Text)
+            IF event.Key == "backspace" ANDALSO SELF.Caret > 0 THEN
+                SELF.Text = String.Delete(SELF.Text, SELF.Caret - 1, 1)
+                SELF.Caret = SELF.Caret - 1
+                changed = TRUE
+            END IF
+            IF event.Key == "delete" ANDALSO SELF.Caret < String.Length(SELF.Text) THEN
+                SELF.Text = String.Delete(SELF.Text, SELF.Caret, 1)
+                changed = TRUE
+            END IF
+        END IF
+        RETURN changed
+    END FUNCTION
+END CLASS
+
+' The Panel/container gui.abas's own doc comment deferred, plus the ArcoUI wiring gui.abas
+' deliberately has no dependency on: an ArcoUI.Surface core handle (semantic root + shape), a
+' bound GUI window, a Widget list, keyboard focus traversal, and a name->handle Intent table
+' (RFC-ArcoUI's default window intents -- PutAway/FillWorkspace/Restore/Move/Close -- plus any
+' app-defined ones, e.g. Milestone 2's SaveDocument). ArcoBASIC objects have no dynamic-key
+' dictionary indexing (`obj[name] = value` only works on arrays here, not object/record values) --
+' IntentNames/IntentHandles below are deliberately parallel arrays with a linear-scan lookup
+' instead, which is the honest fit for the handful of intents one surface actually has.
+' Named ArcoSurface, not Surface -- "surface" is a reserved native handle-type name in this
+' runtime (see Runtime::value_matches_type, runtime.cpp) shared with GRAPHICS.CreateSurface's
+' image surfaces; a CLASS literally named Surface silently breaks its own methods' implicit SELF
+' type check against that built-in instead of this class.
+CLASS ArcoSurface
+    Title = ""
+    Window = -1
+    CoreHandle = NULL
+    RootSemantic = NULL
+    Theme = NULL
+    Widgets = []
+    WidgetIntents = []
+    WidgetFocusable = []
+    FocusIndex = -1
+    IntentNames = []
+    IntentHandles = []
+    Shape = "Rectangle"
+    ShapeWidth = 0
+    ShapeHeight = 0
+    ShapeSupported = FALSE
+    ShapeActive = FALSE
+    Inside = TRUE
+    DragX = 0
+    DragY = 0
+    DragWidth = 0
+    DragHeight = 0
+    Dragging = FALSE
+    DragStartPointerX = 0
+    DragStartPointerY = 0
+    DragStartWindowX = 0
+    DragStartWindowY = 0
+
+    ' `shape` is one of "Rectangle" (the default; a normal decorated window), "Diamond", or
+    ' "Hexagon" (RFC-ArcoUI section 9.2/42). Non-Rectangle shapes request a frameless, per-pixel-
+    ' transparent window and mask+hit-test themselves to that shape's real geometry every frame
+    ' (see Draw()/HandleEvent() below) -- but only where GUI.SupportsShapedWindows() is TRUE; on a
+    ' backend without that capability (the web/wasm build) it degrades to an ordinary rectangular
+    ' window instead of silently failing, per RFC section 9.3's own allowance.
+    '
+    ' Known, honestly-found platform gap: on this project's own KDE/KWin Wayland test desktop, the
+    ' GLFW_DECORATED/GLFW_TRANSPARENT_FRAMEBUFFER hints this sends (glfw_backend.cpp's
+    ' create_window_impl) do not visually take effect -- the window still gets a title bar and an
+    ' opaque background outside the shape polygon, on both the native-Wayland and Xwayland-forced
+    ' code paths. The polygon fill/hit-test math itself is independently verified (point-in-
+    ' polygon unit tests + a real screenshot showing the correct diamond and hex cells rendered
+    ' at the correct positions/colors) -- what's unconfirmed in this environment specifically is
+    ' whether the OS/compositor honors the frameless+transparent request. This is consistent with
+    ' Wayland's well-documented compositor-decides-decoration behavior; a plain X11 window manager
+    ' (or a Wayland session with working libdecor negotiation) would need to be tested separately
+    ' to confirm real chrome-free/click-through presentation end to end.
+    CONSTRUCTOR(title, width = 800, height = 600, shape = "Rectangle")
+        SELF.Title = title
+        SELF.Shape = shape
+        SELF.ShapeWidth = width
+        SELF.ShapeHeight = height
+        SELF.ShapeSupported = GUI.SupportsShapedWindows()
+        SELF.ShapeActive = (shape <> "Rectangle") ANDALSO SELF.ShapeSupported
+        SELF.Window = GUI.WindowShaped(title, width, height, SELF.ShapeActive, SELF.ShapeActive)
+        SELF.CoreHandle = ArcoUI.CreateSurface(title, shape, width, height)
+        ignored = ArcoUI.BindSurfaceWindow(SELF.CoreHandle, SELF.Window)
+        SELF.RootSemantic = ArcoUI.CreateSemanticNode(title, NULL, "surface:" + title)
+        SELF.Theme = ArcologyDarkTheme()
+        ignored = SELF.DefineDefaultIntents()
+    END CONSTRUCTOR
+
+    ' Declares this surface's own draggable region (RFC-ArcoUI section 10.3/42) -- necessary for a
+    ' frameless window, which has no OS-drawn title bar to grab. A press inside the region starts
+    ' tracking; every following pointer-move repositions the real OS window via GUI.SetPosition.
+    ' Known platform caveat, found by actually running this: GLFW's window-position primitives are
+    ' a documented no-op under native Wayland (the protocol deliberately gives window placement to
+    ' the compositor, not the client) -- dragging works under X11 but silently does nothing on a
+    ' pure Wayland session; there is no portable client-side fix available at this layer.
+    FUNCTION SetDragRegion(x, y, width, height)
+        SELF.DragX = x
+        SELF.DragY = y
+        SELF.DragWidth = width
+        SELF.DragHeight = height
+    END FUNCTION
+
+    FUNCTION InDragRegion(px, py)
+        RETURN px >= SELF.DragX ANDALSO px < SELF.DragX + SELF.DragWidth ANDALSO py >= SELF.DragY ANDALSO py < SELF.DragY + SELF.DragHeight
+    END FUNCTION
+
+    FUNCTION DefineDefaultIntents()
+        ignored = SELF.DefineIntent("PutAway")
+        ignored = SELF.DefineIntent("FillWorkspace")
+        ignored = SELF.DefineIntent("Restore")
+        ignored = SELF.DefineIntent("Move")
+        ignored = SELF.DefineIntent("Close")
+    END FUNCTION
+
+    ' Adds an app-defined intent (e.g. Milestone 2's SaveDocument) semantically anchored to this
+    ' surface's own root semantic node. Returns the new ArcoUI.Intent handle.
+    FUNCTION DefineIntent(name)
+        handle = ArcoUI.DefineIntent(name, SELF.RootSemantic, FALSE)
+        ignored = Array.Add(SELF.IntentNames, name)
+        ignored = Array.Add(SELF.IntentHandles, handle)
+        RETURN handle
+    END FUNCTION
+
+    FUNCTION IntentHandle(name)
+        i = 0
+        FOR n IN SELF.IntentNames
+            IF n == name THEN RETURN SELF.IntentHandles[i]
+            i = i + 1
+        NEXT
+        RETURN NULL
+    END FUNCTION
+
+    FUNCTION Invoke(name, timestamp)
+        handle = SELF.IntentHandle(name)
+        IF handle == NULL THEN RETURN FALSE
+        RETURN ArcoUI.InvokeIntent(handle, timestamp, 0, NULL)
+    END FUNCTION
+
+    ' Registers a widget. `intentName`, when non-empty, is invoked (RFC section 7.3: one intent,
+    ' many presentations) any time this widget's own HandleEvent returns TRUE -- a click, a drag-
+    ' release, a keyboard Enter/Space while focused all resolve through the same ArcoUI.InvokeIntent
+    ' call. `focusable = FALSE` (e.g. for a Label) excludes it from Tab/Shift+Tab traversal.
+    FUNCTION Attach(widget, intentName = "", focusable = TRUE)
+        ignored = Array.Add(SELF.Widgets, widget)
+        ignored = Array.Add(SELF.WidgetIntents, intentName)
+        ignored = Array.Add(SELF.WidgetFocusable, focusable)
+        IF focusable ANDALSO SELF.FocusIndex < 0 THEN SELF.FocusIndex = LEN(SELF.Widgets) - 1
+        RETURN widget
+    END FUNCTION
+
+    FUNCTION FocusNext()
+        IF LEN(SELF.Widgets) == 0 THEN RETURN
+        i = SELF.FocusIndex
+        count = 0
+        WHILE count < LEN(SELF.Widgets)
+            i = (i + 1) MOD LEN(SELF.Widgets)
+            count = count + 1
+            IF SELF.WidgetFocusable[i] THEN
+                SELF.FocusIndex = i
+                RETURN
+            END IF
+        WEND
+    END FUNCTION
+
+    FUNCTION FocusPrevious()
+        IF LEN(SELF.Widgets) == 0 THEN RETURN
+        i = SELF.FocusIndex
+        count = 0
+        WHILE count < LEN(SELF.Widgets)
+            i = (i - 1 + LEN(SELF.Widgets)) MOD LEN(SELF.Widgets)
+            count = count + 1
+            IF SELF.WidgetFocusable[i] THEN
+                SELF.FocusIndex = i
+                RETURN
+            END IF
+        WEND
+    END FUNCTION
+
+    ' Dispatches one GUI event (already confirmed to belong to this surface's own Window -- see
+    ' App.Start) to Tab/Shift+Tab focus traversal, Enter/Space activation of the focused widget, and
+    ' every widget's own HandleEvent. Returns TRUE if anything changed, for a caller that wants a
+    ' redraw-on-change signal (this module's own App.Start redraws unconditionally, matching every
+    ' existing GUI.* example app's convention, but the signal is there for a caller that wants it).
+    ' Known limitation of the "cheap, portable" click-through tier (RFC-ArcoUI section 9.3/42):
+    ' Inside/passthrough are only re-evaluated on an actual pointer-move event reaching this
+    ' window. Once passthrough goes TRUE the OS is routing input to whatever is behind this window
+    ' instead, so if the pointer re-enters the shape without first crossing back over a part of
+    ' this window still capturing input, no further pointer-move event arrives here to notice and
+    ' turn passthrough back off. Real per-pixel OS input regions (documented as future work in the
+    ' project's own implementation notes) don't have this gap; this tier does.
+    FUNCTION HandleEvent(event, timestamp)
+        IF SELF.ShapeActive ANDALSO event.Type == "pointer-move" THEN
+            inside = ArcoUI.SurfacePointInside(SELF.CoreHandle, event.X, event.Y)
+            IF inside <> SELF.Inside THEN
+                SELF.Inside = inside
+                ignored = GUI.SetInputPassthrough(SELF.Window, NOT inside)
+            END IF
+        END IF
+
+        IF SELF.DragWidth > 0 ANDALSO event.Type == "pointer-button" ANDALSO event.Button == "left" THEN
+            IF event.Action == "press" ANDALSO SELF.InDragRegion(event.X, event.Y) THEN
+                SELF.Dragging = TRUE
+                SELF.DragStartPointerX = event.X
+                SELF.DragStartPointerY = event.Y
+                windowPos = GUI.Position(SELF.Window)
+                SELF.DragStartWindowX = windowPos.X
+                SELF.DragStartWindowY = windowPos.Y
+            END IF
+            IF event.Action == "release" THEN SELF.Dragging = FALSE
+        END IF
+
+        IF SELF.Dragging ANDALSO event.Type == "pointer-move" THEN
+            newX = SELF.DragStartWindowX + (event.X - SELF.DragStartPointerX)
+            newY = SELF.DragStartWindowY + (event.Y - SELF.DragStartPointerY)
+            ignored = GUI.SetPosition(SELF.Window, newX, newY)
+        END IF
+
+        IF event.Type == "key" ANDALSO event.Action == "press" ANDALSO event.Key == "tab" THEN
+            IF event.Shift THEN
+                ignored = SELF.FocusPrevious()
+            ELSE
+                ignored = SELF.FocusNext()
+            END IF
+            RETURN TRUE
+        END IF
+
+        IF event.Type == "key" ANDALSO event.Action == "press" ANDALSO (event.Key == "enter" ORELSE event.Key == "space") ANDALSO SELF.FocusIndex >= 0 THEN
+            intentName = SELF.WidgetIntents[SELF.FocusIndex]
+            IF intentName <> "" THEN ignored = SELF.Invoke(intentName, timestamp)
+        END IF
+
+        activatedAny = FALSE
+        i = 0
+        FOR widget IN SELF.Widgets
+            activated = widget.HandleEvent(SELF.Window, event)
+            IF activated THEN
+                activatedAny = TRUE
+                intentName = SELF.WidgetIntents[i]
+                IF intentName <> "" THEN ignored = SELF.Invoke(intentName, timestamp)
+            END IF
+            i = i + 1
+        NEXT
+        RETURN activatedAny
+    END FUNCTION
+
+    ' Draws every widget, with a focus ring (a slightly larger rounded rect in the theme's focus
+    ' color, drawn *underneath* the focused widget so only a colored margin shows through) around
+    ' whichever one currently has keyboard focus -- a real, visible focus indicator built entirely
+    ' from primitives every widget already exposes (X/Y/Width/Height), no per-widget changes needed.
+    ' Non-Rectangle shapes clear to fully transparent (alpha 0) first, then fill only the actual
+    ' shape polygon with the theme background -- the same polygon ArcoUI.SurfacePointInside's hit-
+    ' test above checks against (ArcoUI.ShapePolygon, backed by src/gui/arcoui/geometry.cpp), so
+    ' what's drawn and what's clickable can never drift apart from each other.
+    FUNCTION Draw()
+        IF SELF.ShapeActive THEN
+            GUI.Clear(SELF.Window, 0, 0, 0, 0.0)
+            polygon = ArcoUI.ShapePolygon(SELF.Shape, SELF.ShapeWidth, SELF.ShapeHeight, NULL)
+            ignored = GUI.FillPolygon(SELF.Window, polygon, SELF.Theme.PanelR, SELF.Theme.PanelG, SELF.Theme.PanelB, 1.0)
+        ELSE
+            GUI.Clear(SELF.Window, SELF.Theme.BackgroundR, SELF.Theme.BackgroundG, SELF.Theme.BackgroundB, 1.0)
+        END IF
+        i = 0
+        FOR widget IN SELF.Widgets
+            IF i == SELF.FocusIndex THEN
+                ring = 3
+                GUI.RoundedRectangle(SELF.Window, widget.X - ring, widget.Y - ring, widget.Width + ring * 2, widget.Height + ring * 2,
+                    SELF.Theme.ChamferRadius + ring, SELF.Theme.FocusR, SELF.Theme.FocusG, SELF.Theme.FocusB, 1.0)
+            END IF
+            widget.Draw(SELF.Window)
+            i = i + 1
+        NEXT
+        GUI.Present(SELF.Window)
+    END FUNCTION
+
+    FUNCTION ShouldClose()
+        RETURN GUI.ShouldClose(SELF.Window)
+    END FUNCTION
+
+    FUNCTION Close()
+        GUI.Close(SELF.Window)
+        ignored = ArcoUI.DestroySurface(SELF.CoreHandle)
+    END FUNCTION
+END CLASS
+
+' A geometric intent surface (RFC-ArcoUI section 9.2/10.2/11.2): a handful of intents arranged in
+' a circle (CellShape = "Circle", the default) or as hexagon cells (CellShape = "Hexagon") around
+' a center point, each cell invoking its own bound intent through ArcoSurface.Invoke -- the exact
+' same path a plain Button click or a keyboard shortcut for the same intent would use (RFC section
+' 7.3). Also its own linear/keyboard alternative (RFC section 26's hard requirement for a geometric
+' intent surface: it MUST expose one) -- Left/Right cycle SelectedIndex, Enter/Space invokes it,
+' entirely independent of pointer position, with the selected cell drawn in the theme's focus
+' color so keyboard selection stays visible without a separate spatial layout to show it in.
+CLASS RadialMenu IMPLEMENTS Widget
+    CenterX = 0
+    CenterY = 0
+    Radius = 70
+    ItemRadius = 26
+    CellShape = "Circle"
+    OwnerSurface = NULL
+    Labels = []
+    IntentNames = []
+    SelectedIndex = 0
+    X = 0
+    Y = 0
+    Width = 0
+    Height = 0
+
+    FUNCTION Bind(surface)
+        SELF.OwnerSurface = surface
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION SetCenter(x, y)
+        SELF.CenterX = x
+        SELF.CenterY = y
+        span = (SELF.Radius + SELF.ItemRadius) * 2
+        SELF.X = x - SELF.Radius - SELF.ItemRadius
+        SELF.Y = y - SELF.Radius - SELF.ItemRadius
+        SELF.Width = span
+        SELF.Height = span
+    END FUNCTION
+
+    FUNCTION AddItem(label, intentName)
+        ignored = Array.Add(SELF.Labels, label)
+        ignored = Array.Add(SELF.IntentNames, intentName)
+        RETURN LEN(SELF.Labels) - 1
+    END FUNCTION
+
+    ' Angle (radians) of item i, evenly spaced starting straight up and going clockwise -- matches
+    ' the RFC reference mockup's Put Away / Close / Restore / Fill / Arrange layout.
+    FUNCTION ItemAngle(i)
+        count = LEN(SELF.Labels)
+        IF count == 0 THEN RETURN 0
+        RETURN (0 - PI() / 2) + (2 * PI() * i) / count
+    END FUNCTION
+
+    FUNCTION ItemX(i)
+        RETURN SELF.CenterX + SELF.Radius * COS(SELF.ItemAngle(i))
+    END FUNCTION
+
+    FUNCTION ItemY(i)
+        RETURN SELF.CenterY + SELF.Radius * SIN(SELF.ItemAngle(i))
+    END FUNCTION
+
+    FUNCTION CellPoints(i)
+        RETURN ArcoUI.ShapePolygon(SELF.CellShape, SELF.ItemRadius * 2, SELF.ItemRadius * 2, NULL)
+    END FUNCTION
+
+    FUNCTION ContainsCell(i, px, py)
+        IF SELF.CellShape == "Hexagon" THEN
+            RETURN ArcoUI.PointInShape("Hexagon", SELF.ItemRadius * 2, SELF.ItemRadius * 2, NULL,
+                px - SELF.ItemX(i) + SELF.ItemRadius, py - SELF.ItemY(i) + SELF.ItemRadius)
+        END IF
+        dx = px - SELF.ItemX(i)
+        dy = py - SELF.ItemY(i)
+        RETURN (dx * dx + dy * dy) <= (SELF.ItemRadius * SELF.ItemRadius)
+    END FUNCTION
+
+    FUNCTION ItemAt(px, py)
+        i = 0
+        FOR label IN SELF.Labels
+            IF SELF.ContainsCell(i, px, py) THEN RETURN i
+            i = i + 1
+        NEXT
+        RETURN -1
+    END FUNCTION
+
+    FUNCTION Draw(window)
+        GUI.Circle(window, SELF.CenterX, SELF.CenterY, 8, 0.5, 0.6, 0.75, 0.7)
+        i = 0
+        FOR label IN SELF.Labels
+            x = SELF.ItemX(i)
+            y = SELF.ItemY(i)
+            r = 0.14
+            g = 0.18
+            b = 0.25
+            IF i == SELF.SelectedIndex THEN
+                r = 0.45
+                g = 0.85
+                b = 1.0
+            END IF
+            IF SELF.CellShape == "Hexagon" THEN
+                points = SELF.CellPoints(i)
+                shifted = []
+                FOR point IN points
+                    ignored = Array.Add(shifted, {"X": point.X + x - SELF.ItemRadius, "Y": point.Y + y - SELF.ItemRadius})
+                NEXT
+                ignored = GUI.FillPolygon(window, shifted, r, g, b, 1.0)
+            ELSE
+                GUI.Circle(window, x, y, SELF.ItemRadius, r, g, b, 1.0)
+            END IF
+            measured = GUI.MeasureText(window, label, 12)
+            GUI.Text(window, label, x - measured.Width / 2, y - 6, 12, 0.9, 0.93, 0.98, 1.0)
+            i = i + 1
+        NEXT
+    END FUNCTION
+
+    FUNCTION Invoke(index, timestamp)
+        IF index < 0 ORELSE index >= LEN(SELF.IntentNames) THEN RETURN FALSE
+        IF SELF.OwnerSurface == NULL THEN RETURN FALSE
+        RETURN SELF.OwnerSurface.Invoke(SELF.IntentNames[index], timestamp)
+    END FUNCTION
+
+    FUNCTION HandleEvent(window, event)
+        IF event.Type == "pointer-button" ANDALSO event.Action == "release" ANDALSO event.Button == "left" THEN
+            index = SELF.ItemAt(event.X, event.Y)
+            IF index >= 0 THEN RETURN SELF.Invoke(index, Time.Timestamp())
+        END IF
+
+        IF event.Type == "key" ANDALSO event.Action == "press" ANDALSO LEN(SELF.Labels) > 0 THEN
+            IF event.Key == "left" THEN SELF.SelectedIndex = (SELF.SelectedIndex - 1 + LEN(SELF.Labels)) MOD LEN(SELF.Labels)
+            IF event.Key == "right" THEN SELF.SelectedIndex = (SELF.SelectedIndex + 1) MOD LEN(SELF.Labels)
+            IF event.Key == "enter" ORELSE event.Key == "space" THEN RETURN SELF.Invoke(SELF.SelectedIndex, Time.Timestamp())
+        END IF
+        RETURN FALSE
+    END FUNCTION
+END CLASS
+
+' A spatial surface for continuous freehand drawing (RFC-ArcoUI section 11.7/57 Test B): a
+' continuous stroke intent transaction -- Begin on press, Update on drag, Commit on release --
+' backed directly by the ArcoUI core's own Transaction API (ArcoUI.BeginTransaction/
+' UpdateTransaction/CommitTransaction), with real Undo/Redo (ArcoUI.Undo/Redo) of committed
+' strokes. Bind() takes both the owning ArcoSurface (to reach ArcoUI.Undo/Redo isn't actually
+' needed through it -- those are global -- but matches every other widget's Bind convention) and a
+' pre-defined continuous intent (surface.DefineIntent("Draw", ...) with continuous=TRUE isn't
+' exposed by ArcoSurface.DefineIntent, which always defines discrete intents -- a caller wanting a
+' Canvas passes an intent handle it made directly with ArcoUI.DefineIntent(..., TRUE)).
+'
+' A committed stroke's point list is serialized to one "x1,y1;x2,y2;..." string for
+' ArcoUI.CommitTransaction's data parameter, which -- like ArcoSurface's IntentNames/IntentHandles
+' -- is a plain string->string map, not a place to stash a nested array/object (see that class's
+' own comment on why ArcoBASIC objects don't support that kind of dynamic-key nesting here).
+CLASS Canvas IMPLEMENTS Widget
+    X = 0
+    Y = 0
+    Width = 400
+    Height = 300
+    OwnerSurface = NULL
+    StrokeIntent = NULL
+    Strokes = []
+    CurrentStroke = []
+    Drawing = FALSE
+    ColorR = 0.9
+    ColorG = 0.92
+    ColorB = 0.98
+    LineWidth = 3
+    BackgroundR = 0.09
+    BackgroundG = 0.105
+    BackgroundB = 0.135
+
+    FUNCTION Bind(surface, intentHandle)
+        SELF.OwnerSurface = surface
+        SELF.StrokeIntent = intentHandle
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION SetBounds(x, y, width, height)
+        SELF.X = x
+        SELF.Y = y
+        SELF.Width = width
+        SELF.Height = height
+    END FUNCTION
+
+    FUNCTION ContainsPoint(px, py)
+        RETURN px >= SELF.X ANDALSO px < SELF.X + SELF.Width ANDALSO py >= SELF.Y ANDALSO py < SELF.Y + SELF.Height
+    END FUNCTION
+
+    FUNCTION EncodeStroke(points)
+        parts = []
+        FOR point IN points
+            ignored = Array.Add(parts, point.X + "," + point.Y)
+        NEXT
+        RETURN Array.Join(parts, ";")
+    END FUNCTION
+
+    FUNCTION DecodeStroke(text)
+        points = []
+        IF text == "" THEN RETURN points
+        FOR part IN String.Split(text, ";")
+            coords = String.Split(part, ",")
+            ignored = Array.Add(points, {"X": Number(coords[0]), "Y": Number(coords[1])})
+        NEXT
+        RETURN points
+    END FUNCTION
+
+    FUNCTION DrawStroke(window, points)
+        IF LEN(points) < 2 THEN RETURN
+        i = 1
+        WHILE i < LEN(points)
+            GUI.Line(window, points[i - 1].X, points[i - 1].Y, points[i].X, points[i].Y,
+                SELF.LineWidth, SELF.ColorR, SELF.ColorG, SELF.ColorB, 1.0)
+            i = i + 1
+        WEND
+    END FUNCTION
+
+    FUNCTION Draw(window)
+        GUI.RoundedRectangle(window, SELF.X, SELF.Y, SELF.Width, SELF.Height, 4, SELF.BackgroundR, SELF.BackgroundG, SELF.BackgroundB, 1.0)
+        GUI.SetClip(window, SELF.X, SELF.Y, SELF.Width, SELF.Height)
+        FOR stroke IN SELF.Strokes
+            ignored = SELF.DrawStroke(window, stroke)
+        NEXT
+        IF SELF.Drawing THEN ignored = SELF.DrawStroke(window, SELF.CurrentStroke)
+        GUI.ResetClip(window)
+    END FUNCTION
+
+    FUNCTION HandleEvent(window, event)
+        IF event.Type == "pointer-button" ANDALSO event.Button == "left" ANDALSO event.Action == "press" ANDALSO SELF.ContainsPoint(event.X, event.Y) THEN
+            SELF.Drawing = TRUE
+            SELF.CurrentStroke = [{"X": event.X, "Y": event.Y}]
+            IF SELF.StrokeIntent <> NULL THEN ignored = ArcoUI.BeginTransaction(SELF.StrokeIntent, Time.Timestamp(), 0)
+            RETURN TRUE
+        END IF
+
+        IF event.Type == "pointer-move" ANDALSO SELF.Drawing THEN
+            ignored = Array.Add(SELF.CurrentStroke, {"X": event.X, "Y": event.Y})
+            IF SELF.StrokeIntent <> NULL THEN ignored = ArcoUI.UpdateTransaction(SELF.StrokeIntent, Time.Timestamp(), 0)
+            RETURN TRUE
+        END IF
+
+        IF event.Type == "pointer-button" ANDALSO event.Button == "left" ANDALSO event.Action == "release" ANDALSO SELF.Drawing THEN
+            SELF.Drawing = FALSE
+            IF LEN(SELF.CurrentStroke) >= 2 THEN
+                ignored = Array.Add(SELF.Strokes, SELF.CurrentStroke)
+                IF SELF.StrokeIntent <> NULL THEN
+                    encoded = SELF.EncodeStroke(SELF.CurrentStroke)
+                    ignored = ArcoUI.CommitTransaction(SELF.StrokeIntent, Time.Timestamp(), {"Points": encoded}, "stroke")
+                END IF
+            END IF
+            SELF.CurrentStroke = []
+            RETURN TRUE
+        END IF
+
+        RETURN FALSE
+    END FUNCTION
+
+    ' Removes the most recently committed stroke via the core's own undo record (so a matching
+    ' Redo, driven the same way, can bring it back) rather than just popping SELF.Strokes directly
+    ' -- keeps this widget's own visible history and the ArcoUI core's transaction history in sync.
+    FUNCTION Undo()
+        record = ArcoUI.Undo()
+        IF record.Type == "none" THEN RETURN FALSE
+        IF LEN(SELF.Strokes) > 0 THEN ignored = Array.Pop(SELF.Strokes)
+        RETURN TRUE
+    END FUNCTION
+
+    FUNCTION Redo()
+        record = ArcoUI.Redo()
+        IF record.Type == "none" THEN RETURN FALSE
+        ignored = Array.Add(SELF.Strokes, SELF.DecodeStroke(record.Data.Points))
+        RETURN TRUE
+    END FUNCTION
+END CLASS
+
+' Owns one or more Surfaces and the event loop driving them (RFC section 14.1's ceremony
+' reduction). Both GUI.WaitEvent and ArcoUI.PollIntentEvent are single shared, global queues (no
+' per-window/per-surface variant exists) -- App.Start is deliberately the ONE place that drains
+' either of them, dispatching by each GUI event's own Window field and routing each ArcoUI intent
+' event by matching its Intent handle against every owned Surface's own Close intent. A script
+' with its own separate drain loop for either queue would race this one for the same events.
+CLASS App
+    Name = ""
+    Surfaces = []
+    PendingEvents = []
+
+    CONSTRUCTOR(name)
+        SELF.Name = name
+    END CONSTRUCTOR
+
+    FUNCTION Window(title, width = 800, height = 600, shape = "Rectangle")
+        surface = ArcoSurface(title, width, height, shape)
+        ignored = Array.Add(SELF.Surfaces, surface)
+        RETURN surface
+    END FUNCTION
+
+    FUNCTION SurfaceForWindow(windowId)
+        FOR surface IN SELF.Surfaces
+            IF surface.Window == windowId THEN RETURN surface
+        NEXT
+        RETURN NULL
+    END FUNCTION
+
+    ' TRUE if `event`'s Intent handle is some surface's own Close intent -- if so, that surface's
+    ' underlying GUI window is told to close right here, and the event is NOT also handed to
+    ' PollEvent() (an app script reacting to Close itself would be redundant with this).
+    FUNCTION RouteCloseEvents(event)
+        FOR surface IN SELF.Surfaces
+            IF event.Intent == surface.IntentHandle("Close") THEN
+                ignored = GUI.SetShouldClose(surface.Window, TRUE)
+                RETURN TRUE
+            END IF
+        NEXT
+        RETURN FALSE
+    END FUNCTION
+
+    FUNCTION Pump()
+        event = ArcoUI.PollIntentEvent()
+        WHILE event.Type <> "none"
+            IF NOT SELF.RouteCloseEvents(event) THEN ignored = Array.Add(SELF.PendingEvents, event)
+            event = ArcoUI.PollIntentEvent()
+        WEND
+    END FUNCTION
+
+    ' Drains one custom (non-Close) ArcoUI intent event for app script code to react to, oldest
+    ' first, or NULL if none are pending. Milestone 2's Notes benchmark uses this for SaveDocument.
+    FUNCTION PollEvent()
+        IF LEN(SELF.PendingEvents) == 0 THEN RETURN NULL
+        RETURN Array.Shift(SELF.PendingEvents)
+    END FUNCTION
+
+    FUNCTION AnyOpen()
+        FOR surface IN SELF.Surfaces
+            IF NOT surface.ShouldClose() THEN RETURN TRUE
+        NEXT
+        RETURN FALSE
+    END FUNCTION
+
+    FUNCTION Start()
+        WHILE SELF.AnyOpen()
+            timestamp = Time.Timestamp()
+            event = GUI.WaitEvent(0.02)
+            IF event.Type <> "none" THEN
+                target = SELF.SurfaceForWindow(event.Window)
+                IF target <> NULL THEN
+                    IF event.Type == "close" THEN
+                        ignored = target.Invoke("Close", timestamp)
+                    ELSE
+                        ignored = target.HandleEvent(event, timestamp)
+                    END IF
+                END IF
+            END IF
+            ignored = SELF.Pump()
+            FOR surface IN SELF.Surfaces
+                IF NOT surface.ShouldClose() THEN ignored = surface.Draw()
+            NEXT
+        WEND
+        FOR surface IN SELF.Surfaces
+            ignored = surface.Close()
+        NEXT
+    END FUNCTION
+END CLASS

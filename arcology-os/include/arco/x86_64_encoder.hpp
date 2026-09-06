@@ -21,6 +21,19 @@ inline std::uint8_t reg_index(Reg r) { return static_cast<std::uint8_t>(r); }
 inline std::uint8_t reg_low3(Reg r) { return reg_index(r) & 0x7; }
 inline bool reg_needs_rex_extension(Reg r) { return reg_index(r) >= 8; }
 
+// Scalar-double (SSE2) support, low 8 XMM registers only -- added for the Linux/System V hosted
+// backend (ArcoBASIC numbers are always doubles; unlike the freestanding profile this file was
+// originally scoped to, which represents values as fixed-width integers because it has nothing
+// else to lower "AS U64"-style hardware-facing declarations to). XMM0-7 need no REX.R/X/B
+// extension bit, so every encoding below is a fixed, simple shape -- byte-for-byte the same as
+// include/arco/jit_x86_64.hpp's already nasm-cross-verified encoder (this session's earlier,
+// narrower loop-JIT work), ported here rather than duplicated as a third copy since this file's
+// Assembler is the one generate_x86_64_function actually already threads through for both targets.
+enum class Xmm : std::uint8_t {
+    XMM0 = 0, XMM1 = 1, XMM2 = 2, XMM3 = 3, XMM4 = 4, XMM5 = 5, XMM6 = 6, XMM7 = 7,
+};
+inline std::uint8_t xmm_low3(Xmm r) { return static_cast<std::uint8_t>(r) & 0x7; }
+
 class Assembler {
 public:
     // sub rsp, imm8 -- REX.W 83 /5 ib
@@ -155,6 +168,69 @@ public:
 
     // cmp rax, imm8 -- 48 83 F8 ib. Used for firmware status checks.
     void cmp_rax_imm8(std::uint8_t imm8) { emit(0x48); emit(0x83); emit(0xF8); emit(imm8); }
+
+    // --- Scalar double (SSE2), System V hosted backend only -- see Xmm's own comment above ---
+
+    // movsd xmm, [base+disp32] -- F2 0F 10 /r, mod=10 (disp32 form always; this backend's stack
+    // frames can be up to 4095 bytes -- see generate_x86_64_function's own frame_size check -- so
+    // there is no correctness reason to also add a disp8 form purely to save a few code bytes).
+    // RSP (and R12) as base needs an explicit SIB byte, matching every other disp-addressed load/
+    // store in this file.
+    void movsd_load_disp32(Xmm dst, Reg base, std::uint32_t disp32) { emit_sse_mem_disp32(0xF2, 0x10, xmm_low3(dst), base, disp32); }
+    // movsd [base+disp32], xmm -- F2 0F 11 /r
+    void movsd_store_disp32(Reg base, std::uint32_t disp32, Xmm src) { emit_sse_mem_disp32(0xF2, 0x11, xmm_low3(src), base, disp32); }
+    // movsd xmm, xmm -- F2 0F 10 /r, register-direct
+    void movsd_reg_reg(Xmm dst, Xmm src) { emit_sse_reg_reg(0xF2, 0x10, xmm_low3(dst), xmm_low3(src)); }
+
+    void addsd(Xmm dst, Xmm src) { emit_sse_reg_reg(0xF2, 0x58, xmm_low3(dst), xmm_low3(src)); }
+    void subsd(Xmm dst, Xmm src) { emit_sse_reg_reg(0xF2, 0x5C, xmm_low3(dst), xmm_low3(src)); }
+    void mulsd(Xmm dst, Xmm src) { emit_sse_reg_reg(0xF2, 0x59, xmm_low3(dst), xmm_low3(src)); }
+    void divsd(Xmm dst, Xmm src) { emit_sse_reg_reg(0xF2, 0x5E, xmm_low3(dst), xmm_low3(src)); }
+
+    // ucomisd left, right -- 66 0F 2E /r. Sets ZF/PF/CF the same way an unsigned integer compare
+    // would, EXCEPT PF=1 additionally means "unordered" (either operand was NaN) -- callers must
+    // check that before trusting ZF/CF, matching how every native double comparison in this
+    // codebase (C++'s own `==`/`!=`/`<`/etc, which the tree-walking interpreter and bytecode VM
+    // both compile down to) already treats a NaN comparison: never equal to anything (including
+    // itself), always "!=" true, always "<"/"<="/">"/">=" false.
+    void ucomisd(Xmm left, Xmm right) { emit_sse_reg_reg(0x66, 0x2E, xmm_low3(left), xmm_low3(right)); }
+
+    // movq xmm, r64 -- 66 REX.W 0F 6E /r. Reinterprets a GPR's raw 64 bits as the destination XMM
+    // register's low qword -- the standard way to get an arbitrary double bit pattern (e.g. a
+    // compile-time-constant literal loaded via mov_reg_imm64) into a form addsd/mulsd/etc. can
+    // operate on, with no dependency on any data-section address staying valid.
+    void movq_xmm_reg(Xmm dst, Reg src) {
+        emit(0x66);
+        emit(static_cast<std::uint8_t>(0x48 | (reg_needs_rex_extension(src) ? 0x01 : 0)));
+        emit(0x0F);
+        emit(0x6E);
+        emit(static_cast<std::uint8_t>(0xC0 | (xmm_low3(dst) << 3) | reg_low3(src)));
+    }
+
+    // cvttsd2si r64, xmm -- F2 REX.W 0F 2C /r. TRUNCATING double->int64 conversion (toward zero) --
+    // matches C++'s own `static_cast<long long>(double)` exactly, NOT cvtsd2si's round-per-current-
+    // rounding-mode behavior. This backend's hosted MOD/bitwise codegen (AND/OR/XOR/shifts, which
+    // have no floating-point equivalent) needs precisely this truncating conversion to match
+    // eval_binary's own value_to_int helper (the interpreter/bytecode VM's shared ground truth for
+    // exactly this operation).
+    void cvttsd2si_reg_xmm(Reg dst, Xmm src) {
+        emit(0xF2);
+        emit(static_cast<std::uint8_t>(0x48 | (reg_needs_rex_extension(dst) ? 0x04 : 0)));
+        emit(0x0F);
+        emit(0x2C);
+        emit(static_cast<std::uint8_t>(0xC0 | (reg_low3(dst) << 3) | xmm_low3(src)));
+    }
+
+    // cvtsi2sd xmm, r64 -- F2 REX.W 0F 2A /r. Exact int64->double conversion, the inverse of
+    // cvttsd2si_reg_xmm above -- converts a bitwise op's integer result back to a real double
+    // before it's stored the same way every other hosted-number result is.
+    void cvtsi2sd_xmm_reg(Xmm dst, Reg src) {
+        emit(0xF2);
+        emit(static_cast<std::uint8_t>(0x48 | (reg_needs_rex_extension(src) ? 0x01 : 0)));
+        emit(0x0F);
+        emit(0x2A);
+        emit(static_cast<std::uint8_t>(0xC0 | (xmm_low3(dst) << 3) | reg_low3(src)));
+    }
 
     // lea dst, [rip+disp32]. Returns the buffer offset of the 4-byte disp32 field; the caller
     // must patch it (patch_u32) once both the target address and this instruction's own end
@@ -451,6 +527,24 @@ private:
         emit_rex(Reg::RAX, reg);
         emit(0xD3);
         emit(static_cast<std::uint8_t>(0xC0 | ((group & 0x07) << 3) | reg_low3(reg)));
+    }
+
+    // mod=10 (disp32 form), matching emit_modrm_disp32's own SIB handling for RSP/R12 as base.
+    void emit_sse_mem_disp32(std::uint8_t mandatory_prefix, std::uint8_t opcode, std::uint8_t reg_field, Reg base, std::uint32_t disp32) {
+        emit(mandatory_prefix);
+        if (reg_needs_rex_extension(base)) emit(0x41); // REX.B only -- XMM0-7 never needs REX.R here
+        emit(0x0F);
+        emit(opcode);
+        emit(static_cast<std::uint8_t>(0x80 | (reg_field << 3) | reg_low3(base)));
+        if (reg_low3(base) == 0x4) emit(0x24); // SIB: base=RSP, no index, scale=1
+        emit_u32(disp32);
+    }
+
+    void emit_sse_reg_reg(std::uint8_t mandatory_prefix, std::uint8_t opcode, std::uint8_t reg_field, std::uint8_t rm_field) {
+        emit(mandatory_prefix);
+        emit(0x0F);
+        emit(opcode);
+        emit(static_cast<std::uint8_t>(0xC0 | (reg_field << 3) | rm_field)); // mod=11, register-direct
     }
 
     void emit_imm_reg(std::uint8_t opcode, std::uint8_t group, Reg reg, std::uint32_t value) {

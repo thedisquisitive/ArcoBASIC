@@ -10,14 +10,43 @@ namespace arco::systems {
 // x86-64 UEFI (arcology-os/docs/systems/uefi-target.md section 4). Scope is deliberately limited to
 // integer/pointer-class arguments and returns -- no floating-point argument classification
 // (XMM registers), matching this milestone's non-goals.
+//
+// System V AMD64 (the Linux/hosted ABI -- real gcc/clang/ld all assume it, so any generated code calling
+// into a normally-compiled C++ function, e.g. the native ArcoSH runtime shim, must honor it exactly) was
+// added alongside it below rather than as a separate file: the two conventions differ only in which
+// registers carry arguments and whether the caller reserves shadow space, not in the overall shape of
+// "where does argument N live" -- see CallingConvention/assign_argument_locations below.
 
 constexpr int kShadowSpaceBytes = 32;
 constexpr int kStackAlignmentAtCallBytes = 16;
 constexpr int kEntryRspMod16 = 8;  // RSP % 16 at function entry, after CALL pushes the return address
 
+enum class CallingConvention {
+    MicrosoftX64,  // UEFI and Windows: RCX/RDX/R8/R9, 32-byte caller-reserved shadow space
+    SystemV,       // Linux/hosted: RDI/RSI/RDX/RCX/R8/R9, no shadow space
+};
+
 inline const std::array<std::string, 4>& integer_argument_registers() {
     static const std::array<std::string, 4> registers = {"RCX", "RDX", "R8", "R9"};
     return registers;
+}
+
+inline const std::array<std::string, 6>& sysv_integer_argument_registers() {
+    static const std::array<std::string, 6> registers = {"RDI", "RSI", "RDX", "RCX", "R8", "R9"};
+    return registers;
+}
+
+// Number of integer/pointer argument registers a convention has before it spills to the stack.
+inline int argument_register_count(CallingConvention convention) {
+    return convention == CallingConvention::MicrosoftX64
+        ? static_cast<int>(integer_argument_registers().size())
+        : static_cast<int>(sysv_integer_argument_registers().size());
+}
+
+// Bytes the CALLER must reserve below its outgoing arguments before the CALL instruction --
+// Microsoft x64's mandatory 32-byte shadow space; System V has no equivalent requirement.
+inline int shadow_space_bytes(CallingConvention convention) {
+    return convention == CallingConvention::MicrosoftX64 ? kShadowSpaceBytes : 0;
 }
 
 inline const std::string& integer_return_register() {
@@ -67,6 +96,37 @@ inline std::vector<ArgumentLocation> assign_argument_locations(int argument_coun
         } else {
             location.in_register = false;
             location.stack_offset_bytes = kShadowSpaceBytes + 8 + 8 * (position - register_count);
+        }
+        locations.push_back(location);
+    }
+    return locations;
+}
+
+// Convention-aware overload -- Microsoft x64 delegates to the function above (kept so existing UEFI
+// callers that never pass a convention keep compiling and behaving identically); System V uses its own
+// six-register sequence and has no shadow space to add before the first stack-spilled argument (the
+// caller writes stack arguments starting right where RSP points at the CALL instruction; System V's
+// `stack_offset_bytes` is expressed the same way as Microsoft x64's -- relative to RSP at the CALLEE's
+// entry, i.e. after CALL has pushed the 8-byte return address -- which is why it starts at 8, not 0).
+inline std::vector<ArgumentLocation> assign_argument_locations(CallingConvention convention, int argument_count) {
+    if (convention == CallingConvention::MicrosoftX64) {
+        return assign_argument_locations(argument_count);
+    }
+    std::vector<ArgumentLocation> locations;
+    if (argument_count <= 0) {
+        return locations;
+    }
+    locations.reserve(static_cast<std::size_t>(argument_count));
+    const auto& registers = sysv_integer_argument_registers();
+    const int register_count = static_cast<int>(registers.size());
+    for (int position = 0; position < argument_count; ++position) {
+        ArgumentLocation location;
+        if (position < register_count) {
+            location.in_register = true;
+            location.register_name = registers[static_cast<std::size_t>(position)];
+        } else {
+            location.in_register = false;
+            location.stack_offset_bytes = 8 + 8 * (position - register_count);
         }
         locations.push_back(location);
     }
