@@ -2761,3 +2761,152 @@ to GUI rendering itself.
   Arconaut's own full GUI lifecycle actually runs natively (beyond the isolated `GUI.Size` check
   Entry 21 already confirmed) is still not established.
 - A second, independent full-suite regression pass beyond this entry's own runs.
+
+## Entry 23 — Arconaut's own native App.Start() event loop, made to actually work
+
+**Date:** 2026-09-06
+
+**Agent/work package:** Direct continuation, requested explicitly by the project owner after
+Entry 22's fix landed: "So why can't we get arconaut to run natively" -- Entry 22's own disclosed
+follow-up gap (full native Arconaut opened no window and exited immediately with no output). This
+entry answers that question directly: three more real bugs, found and fixed by actually running the
+compiled binary against a real display and driving it with real clicks, not just compiling it.
+
+**What was found and fixed, in the order they were hit:**
+
+1. **The actual blocker**: `WHILE running ... IF GUI.ShouldClose(window) THEN running = FALSE ...
+   WEND` closed the window after exactly one frame, every time, including the very first check
+   right after window creation. Root cause: `GUI.ShouldClose`'s result is a genuine Boxed
+   `ArcoValue*` (every generic host-bridge call always returns one, see Phase 12's own "arco_call_
+   host ALWAYS returns Boxed" convention), but `Kind::Branch`'s codegen only had two paths --
+   `infer_hosted_value_kind(...) == Number` (AND/OR/XOR-of-bools, `ucomisd` against 0.0) or an
+   ordinary raw 1-byte BOOL (`normalize(RAX, "BOOL")`, i.e. `AND RAX, 0xFF`) -- neither correct for
+   a raw 64-bit Boxed POINTER: masking a heap pointer's own low byte down to 8 bits is essentially
+   unrelated to the actual boolean value, so the branch took the "true" path almost every time by
+   pure chance of pointer alignment. The exact same `AND RAX, 0xFF`-on-a-raw-pointer failure shape
+   Phase 12's own item 7 (the string-literal-in-an-OR-chain SEGV) already found once, now recurring
+   in a THIRD place this session (see Phase 12's own "recurring classifier/codegen disagreement"
+   note). Fixed by widening the Number-only gate to also cover Boxed and routing through
+   `load_double_operand` (already used elsewhere for exactly "unbox a Boxed operand into a real
+   double via `arco_value_as_number`, which itself correctly coerces a boxed Bool to 1.0/0.0")
+   instead of the raw byte-mask path. Isolated repro: a bare `GUI.Application`/`GUI.Window`/loop
+   script with NO Arconaut code at all reproduced it identically, confirming this is a general
+   backend bug, not anything Arconaut-specific.
+
+2. **The "Selected" label flickering between different CJK-range garbage characters every frame**
+   (a LIVE, changing corruption -- confirmed directly by the project owner watching the window,
+   not just a static wrong value): two separate instances of the SAME underlying gap, both variants
+   of "a value has more than one possible physical representation across different code paths, and
+   this backend's own static classifier only ever looked at ONE of them":
+   - `infer_local_kind` (a NAMED local's own classification) used to pick whichever `Kind::Store`
+     it found LAST while scanning a function's blocks in vector order -- not necessarily the one a
+     given execution actually took. Arconaut's own `DrawActions`: `selected = app.SelectedSource`
+     (a genuinely Boxed object-field read) then, inside `IF selected == "" THEN selected = "No
+     ArcFS target selected"`, a raw literal (a DIFFERENT physical representation sharing the same
+     "String" label) -- these two Stores to the SAME local genuinely disagree, and the old code
+     silently picked one answer and stuck with it regardless of which branch actually ran. Fixed by
+     scanning EVERY Store to a name (not just the last one), and answering Boxed whenever they
+     disagree -- the same resolution policy Binary "+"'s own ambiguous-Boxed fix (Phase 12)
+     established, just applied to a NEW site (Store-classification) that had the identical gap.
+     `Kind::Store`'s own codegen already had the matching half of this fix in place from an earlier
+     phase (`quoted = quoted + ch`, ShellQuote's own loop-carried accumulator) -- it already knew
+     how to box a raw-literal source on demand once its target is classified Boxed, so this fix
+     needed only the classifier side, not new codegen.
+   - `infer_function_return_kind` had the exact same "picks whichever RETURN it finds first" bug,
+     one level up: Arconaut's own `NthToken`/`FirstToken` (used to populate the device list's
+     "Selected" text from `lsblk` output), `RETURN token` (genuinely Boxed, an array-indexed/host-
+     function result) on one path inside a `WHILE` loop, `RETURN ""` (a raw literal) on the
+     function's trailing path -- whichever one was laid out FIRST in the function's own block
+     order won the classification for EVERY call site, regardless of which one a given call
+     actually executes. Fixed the same way (scan every RETURN, disagree -> Boxed), but this one
+     genuinely needed a NEW codegen half too: `Kind::Return` didn't have any boxing fallback at
+     all, so it now boxes a literal return value via `box_operand_into_rax` whenever the function's
+     own overall answer is Boxed but THIS particular return's value isn't already -- mirroring
+     Binary "+"'s "box on either branch" discipline at a function's exit points instead of within
+     one expression.
+   Isolated repro for both: a minimal `NthToken`-shaped function completely independent of
+   Arconaut/GUI code reproduced the exact same garbled-CJK-text symptom.
+
+3. **Fixing #2 immediately surfaced its own downstream consequence, breaking Arconaut's own
+   compile** (the same "one fix exposes the next gap" pattern nearly every phase in this backend's
+   history has hit): `infer_local_kind` now correctly classified `visible_rows` (`DrawVolumes`'s own
+   scroll-list sizing local) as Boxed, since `visible_rows = FLOOR(list_h / row_height)` (FLOOR/
+   Math.Floor is a generic host-bridge call, always physically Boxed, though semantically always a
+   real number) genuinely disagrees with `visible_rows = 1` (a raw literal) elsewhere in the same
+   function -- but the untyped-parameter call-site safety check (added in Phase 11/12 to catch a
+   genuinely non-numeric argument reaching an assumed-number parameter, see its own comment)
+   rejected EVERY Boxed argument outright, with no way to tell "ambiguously Boxed-or-Number" apart
+   from "definitely, unambiguously an array/object" (`Foo([1, 2, 3])`, this check's own pre-existing
+   negative test). A blunt fix (accept all Boxed arguments unconditionally) was tried first, rebuilt,
+   and caught by the FULL test suite regressing that exact negative test -- reverted in favor of a
+   new, narrower helper, `value_could_be_hosted_number`, that walks the SAME two shapes
+   (a %tN that's a direct LOAD of a named local, recursing into that local's own Store sites; a %tN
+   that's a direct CallValue result of a user-declared function, recursing into that function's own
+   RETURN operands -- needed for a real, found-the-same-way second case, `v = Compute(...)` then
+   `UsesIt(v)`, where the ambiguity lives one level of indirection deeper than the direct-Store
+   case) to distinguish "genuinely could be a number on some path" from "never a number on any
+   path" -- accepting only the former (routed through the existing `load_double_operand` unboxing
+   path) while the untyped-array-arg negative test keeps passing unchanged.
+
+**Confirmed working, this time for real**: rebuilt native Arconaut after all three fixes, launched
+it against the actual X11 display (no `--smoke`, the full program, `WHILE running` loop and all),
+and drove it with real `xdotool` clicks -- the Volumes tab renders correctly (rail, tabs, Activity
+log, the full unfiltered block-device list with all 7 loop devices), unchecking "Hide non-ArcFS
+volumes" correctly re-filters the list live, and **clicking a device row correctly shows "Selected
+/dev/loop0"** with the row highlighted -- the first time this session (or any prior one) has driven
+the NATIVE `--target linux-x86_64` binary's own actual UI with real interaction and watched it
+respond correctly, not just render a static first frame. Screenshots taken before and after each
+fix directly confirm the progression (garbled "Selected" text -> correct "No ArcFS target
+selected" -> correct "Selected /dev/loop0" after a real click).
+
+**Files changed:** `src/compiler/fission.cpp` (`Kind::Branch`'s widened Number-or-Boxed gate via
+`load_double_operand`; `infer_local_kind`'s and `infer_function_return_kind`'s disagreement-scans-
+every-site rewrite; `Kind::Return`'s new `box_operand_into_rax` fallback; the new `value_could_be_
+hosted_number` helper and its use at the untyped-parameter call-site check). `tests/integration/
+linux_native_backend_smoke.sh` (four new sections: `branch-boxed-bool`, `store-ambiguous-
+representation`, `return-ambiguous-representation`, `untyped-param-ambiguous-number` -- the last
+three each diffed against `compile-run` ground truth, the FOR-EACH/ASan ones run 5x under
+`--sanitize`).
+
+**Commands run:** Minimal, Arconaut-independent repros for each of the three bugs (isolated GUI-
+loop script; `NthToken`-shaped function; `Compute`/`UsesIt`-shaped indirect-Number-through-a-call
+script), each diffed against `compile-run`; the pre-existing `untyped-array-arg` negative test
+specifically re-checked after the `value_could_be_hosted_number` fix (still correctly rejects);
+real native Arconaut rebuilt and driven against a live X11 display with `xdotool` clicks,
+screenshotted with `import` at each stage; targeted `ctest -R "native|linux_native|fission|
+arcofission"` (5/5) after every fix; a full, unfiltered `ctest` pass at the end.
+
+**Tests/build result:** Green -- targeted suite 5/5 repeatedly through the fix iterations; full
+project-wide `ctest`, 123/124 (the one failure, `systems_ps2_keyboard_driver_smoke`, is the
+already-documented pre-existing QEMU keyboard-injection flake unrelated to this backend -- re-run
+in isolation and reproduced the identical "post-exit key not read correctly" failure mode noted
+elsewhere in this project's own history, confirmed not a regression from this entry's work).
+
+**Known failures:** None found this entry beyond what was already fixed and verified working.
+
+**Architectural decisions made:**
+- Every fix in this entry is another instance of the SAME pattern this whole RFC keeps finding:
+  a value's physical representation is genuinely ambiguous across different code paths (Boxed vs.
+  raw-hosted-number, Boxed vs. raw-literal-string), and this backend's classifiers were built
+  assuming a single static answer always holds. The fix is always the same shape once found: make
+  the classifier DETECT disagreement instead of silently picking one answer, and make the codegen
+  BOX whichever representation isn't already Boxed so every consumer's single "it's Boxed" (or
+  "it's a number") expectation is always genuinely true regardless of which path executed. Three
+  more real sites hit this shape this entry (Branch conditions, Store targets, Return values) on
+  top of the four Phase 12 already fixed (CallValue return classification, "==", "+", STRING
+  parameters) -- strongly suggesting this is the single most productive place to keep looking for
+  the NEXT bug in this backend, not a coincidence that happened to recur.
+- The untyped-parameter fix was deliberately NOT "accept all Boxed arguments" (the first attempt,
+  caught by the full suite regressing a real negative test) -- a genuine array/object argument to
+  an assumed-number parameter is still a real bug that should fail to compile, not silently panic
+  at runtime. The narrower `value_could_be_hosted_number` helper preserves that guarantee while
+  still accepting the genuinely-ambiguous case, at the cost of being deliberately less general than
+  a full parallel classifier (documented in its own comment, not hidden).
+
+**Open questions carried forward:**
+- Whether Arconaut's OWN full interactive lifecycle (every tab, every button, Mount/Format/
+  Snapshot actions that shell out to `arcfsctl`) works end to end natively, beyond the Volumes
+  tab's own render+click path this entry directly exercised, is still not established -- a natural
+  next step, not attempted this entry (out of scope for "why can't we get arconaut to run
+  natively," which is now answered).
+- A second, independent full-suite regression pass beyond this entry's own runs.

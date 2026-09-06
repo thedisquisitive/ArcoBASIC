@@ -4325,12 +4325,39 @@ bool hosted_operator_is_boolean(const std::string& op) {
 HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunction& function,
                                          const std::string& name, int depth);
 
-// A declared function's own straight-line return kind, found by taking its first RETURN
-// instruction's operand and running the same inference used everywhere else. Shared by the
+// A declared function's own straight-line return kind, found by running the same inference used
+// everywhere else across EVERY RETURN statement the function has (not just the first one an
+// earlier version of this function stopped at -- see the disagreement handling below for why that
+// was a real, found-by-running-it bug) and reconciling them into one answer. Shared by the
 // Kind::Call general-call branch (to know whether the callee's result comes back in XMM0 or RAX)
 // and by infer_hosted_value_kind's own Call handling just below (so a value that passed through a
 // function call chases the same rule a directly returned value would).
 HostedValueKind infer_function_return_kind(const AmirModule& module, const AmirFunction& callee, int depth = 0) {
+    // A function with MULTIPLE return statements can genuinely disagree on physical
+    // representation across them -- e.g. `IF token <> "" THEN RETURN token ... RETURN ""` (a real
+    // shape, Arconaut's own NthToken/FirstToken helper): `token` is a genuinely Boxed pointer (an
+    // array-indexed/host-function result), but the trailing `RETURN ""` is a raw literal pointer
+    // into .rodata, a DIFFERENT physical representation sharing the same "String" classification
+    // label. An earlier version of this function returned based on whichever RETURN it found
+    // FIRST while walking callee.blocks in vector order -- NOT necessarily the one a given call
+    // actually executes at runtime, since block layout order has no required relationship to
+    // which return statement is semantically "first". When the literal-returning block happened
+    // to be laid out before the Boxed-returning one, every call site classified this function's
+    // return as a raw literal -- so when the ACTUAL executed path returned the genuinely Boxed
+    // `token` instead, the caller misread that live ArcoValueBox* pointer's own raw bytes as if
+    // they were UTF-16 text (or vice versa), producing readable-but-wrong CJK-range garbage that
+    // changed from run to run depending on heap contents -- a real bug, found by actually running
+    // Arconaut natively (RFC-0049 Phase 14) and confirmed with a minimal repro completely
+    // independent of Arconaut/GUI code. Fixed the same "when ambiguous, the caller must be able to
+    // rely on ONE consistent representation" way Binary "+"'s own ambiguous-Boxed fix (Phase 12)
+    // and STRING-typed-parameter boxing (Phase 12) both already established: when every RETURN in
+    // this function agrees, use that answer (unchanged from before); when they disagree, answer
+    // Boxed -- Kind::Return's own codegen (see its comment) then boxes whichever return actually
+    // executes into a real ArcoValue* on every path, so the caller's single "Boxed" expectation is
+    // always genuinely true no matter which RETURN fires at runtime.
+    bool found_any = false;
+    HostedValueKind agreed_kind = HostedValueKind::Unknown;
+    bool disagreement = false;
     for (const auto& block : callee.blocks) {
         for (const auto& instruction : block.instructions) {
             // A literal "nothing" RETURN (a function/method with no explicit RETURN statement --
@@ -4344,12 +4371,19 @@ HostedValueKind infer_function_return_kind(const AmirModule& module, const AmirF
             // has an explicit RETURN, e.g. `FUNCTION Init(x, y): SELF.X = x: SELF.Y = y`) always
             // fell through to Unknown and failed to compile at its OWN call site, a real bug caught
             // by direct testing of a real constructor with arguments.
-            if (instruction.kind == AmirInstruction::Kind::Return && !instruction.operands.empty()) {
-                return infer_hosted_value_kind(module, callee, instruction.operands.front(), depth);
+            if (instruction.kind != AmirInstruction::Kind::Return || instruction.operands.empty()) continue;
+            const HostedValueKind this_kind = infer_hosted_value_kind(module, callee, instruction.operands.front(), depth);
+            if (!found_any) {
+                agreed_kind = this_kind;
+                found_any = true;
+            } else if (this_kind != agreed_kind) {
+                disagreement = true;
             }
         }
     }
-    return HostedValueKind::Unknown;
+    if (!found_any) return HostedValueKind::Unknown;
+    if (disagreement) return HostedValueKind::Boxed;
+    return agreed_kind;
 }
 
 // Phase 2 classes (RFC-0049 Section 4): given a class name and a method name, walks
@@ -4394,16 +4428,40 @@ HostedValueKind infer_local_kind(const AmirModule& module, const AmirFunction& f
     // case in generate_x86_64_function, since SELF genuinely never carries a type annotation to
     // check instead.
     if (local_name == "SELF") return HostedValueKind::Boxed;
-    std::string last_store_source;
+    // Every Store targeting this name is inspected, not just the LAST one found while walking
+    // function.blocks in order (an earlier version of this loop kept overwriting a single
+    // last_store_source and used only that one) -- a local reassigned with a DIFFERENT physical
+    // representation across two conditionally-reached branches (e.g. `selected = app.
+    // SelectedSource` -- a genuinely Boxed object-field read -- then, inside `IF selected == ""
+    // THEN selected = "No ArcFS target selected"`, a raw literal, a DIFFERENT representation
+    // sharing the same "String" label) is a real, found-by-running-it shape (Arconaut's own
+    // DrawActions, RFC-0049 Phase 14): whichever branch runs at runtime decides which
+    // representation "selected" actually holds, but this function has to give every caller
+    // (store_result's own tracks_lifetime gate, PRINT, comparisons, GUI.Text's own argument
+    // marshaling) ONE static answer. Reusing infer_function_return_kind's own disagreement rule:
+    // when every Store agrees, answer that (identical to the old behavior for the overwhelmingly
+    // common single-representation case); when they disagree, answer Boxed, and Kind::Store's own
+    // codegen (see its comment) boxes whichever source actually stores at runtime so that answer
+    // is always genuinely true.
+    bool found_any_store = false;
+    HostedValueKind agreed_store_kind = HostedValueKind::Unknown;
+    bool store_disagreement = false;
     for (const auto& search_block : function.blocks) {
         for (const auto& candidate : search_block.instructions) {
-            if (candidate.kind == AmirInstruction::Kind::Store && candidate.target == local_name &&
-                !candidate.operands.empty()) {
-                last_store_source = candidate.operands.front();
+            if (candidate.kind != AmirInstruction::Kind::Store || candidate.target != local_name ||
+                candidate.operands.empty()) {
+                continue;
+            }
+            const HostedValueKind this_store_kind = infer_hosted_value_kind(module, function, candidate.operands.front(), depth);
+            if (!found_any_store) {
+                agreed_store_kind = this_store_kind;
+                found_any_store = true;
+            } else if (this_store_kind != agreed_store_kind) {
+                store_disagreement = true;
             }
         }
     }
-    if (!last_store_source.empty()) return infer_hosted_value_kind(module, function, last_store_source, depth);
+    if (found_any_store) return store_disagreement ? HostedValueKind::Boxed : agreed_store_kind;
     for (const auto& param : function.params) {
         if (bare_parameter_name(param) != local_name) continue;
         const std::string param_type = declared_parameter_type(param);
@@ -4706,6 +4764,65 @@ HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunc
         }
     }
     return HostedValueKind::Unknown;
+}
+
+// Distinguishes "this operand could genuinely be a hosted number, even though infer_hosted_value_
+// kind's own collapsed answer for it is Boxed" (RFC-0049 Phase 14) from "this operand is
+// unambiguously non-numeric" -- needed specifically because infer_local_kind's own disagreement
+// resolution (see its comment) answers a flat Boxed for a local like `visible_rows` whenever ANY
+// of its Store sites disagree, whether that disagreement is against a genuine Number (`visible_
+// rows = FLOOR(...)` on one path, `visible_rows = 1` on another -- FLOOR/Math.Floor is a generic
+// host-bridge call, always physically Boxed, but semantically always a real number) or the value
+// is simply, unambiguously, never a number at all (a bare array/object literal, e.g. `Foo([1, 2,
+// 3])` -- exactly one classification, Boxed, no disagreement, no Number possibility anywhere).
+// The untyped-parameter call-site safety check (see its own comment) needs exactly this
+// distinction: accept the former (route it through load_double_operand's own Boxed-unboxing path,
+// which correctly calls arco_value_as_number -- panicking loudly at runtime if a genuinely
+// non-numeric value ever actually reaches it) while still rejecting the latter at COMPILE time,
+// preserving this check's own established negative-test contract (an array/object argument to an
+// untyped parameter must never silently compile). Deliberately narrower than a full parallel
+// classifier: only chases the shapes this bug's own repro needs -- a %tN that's a direct LOAD of a
+// named local (recurse into that local's own Store sites, since a chain like `v = Compute(...)`
+// then `UsesIt(v)` needs the SAME question asked transitively, not just one level down) and a %tN
+// that's a direct CallValue result of a user-declared function (recurse into THAT function's own
+// RETURN operands, mirroring infer_function_return_kind's own disagreement scan but asking "could
+// be Number" instead of collapsing to one answer) -- rather than duplicating every dispatch
+// infer_hosted_value_kind itself already handles.
+bool value_could_be_hosted_number(const AmirModule& module, const AmirFunction& function,
+                                   const std::string& operand, int depth) {
+    if (depth > 8) return false; // guards against a pathological reference cycle, same cap as infer_hosted_value_kind
+    if (infer_hosted_value_kind(module, function, operand, depth) == HostedValueKind::Number) return true;
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            if (instruction.result != operand) continue;
+            if (instruction.kind == AmirInstruction::Kind::Load) {
+                const std::string& local_name = instruction.target;
+                for (const auto& search_block : function.blocks) {
+                    for (const auto& candidate : search_block.instructions) {
+                        if (candidate.kind == AmirInstruction::Kind::Store && candidate.target == local_name &&
+                            !candidate.operands.empty() &&
+                            value_could_be_hosted_number(module, function, candidate.operands.front(), depth + 1)) {
+                            return true;
+                        }
+                    }
+                }
+            } else if (instruction.kind == AmirInstruction::Kind::CallValue) {
+                for (const auto& callee : module.functions) {
+                    if (callee.name != instruction.target) continue;
+                    for (const auto& callee_block : callee.blocks) {
+                        for (const auto& callee_instruction : callee_block.instructions) {
+                            if (callee_instruction.kind == AmirInstruction::Kind::Return &&
+                                !callee_instruction.operands.empty() &&
+                                value_could_be_hosted_number(module, callee, callee_instruction.operands.front(), depth + 1)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false;
 }
 
 struct X86_64CodegenResult {
@@ -5629,17 +5746,36 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 // direct testing: `IF n >= 0 AND n < LEN(parts)` took the wrong branch). Checked here
                 // via infer_hosted_value_kind (which already knows this distinction, see its own
                 // Binary-case comment) rather than trusting the AMIR's own "BOOL" label at face value.
-                if (convention == systems::CallingConvention::SystemV &&
-                    infer_hosted_value_kind(module, *target, instruction.operands[0]) == HostedValueKind::Number) {
-                    if (!load_value_double(instruction.operands[0], Xmm::XMM0)) return result;
+                //
+                // A THIRD physical representation shares the same "BOOL" label for the identical
+                // reason: a condition that is really a generic host-function call result (e.g.
+                // `IF GUI.ShouldClose(window) THEN ...`) is, per the Kind::CallValue case's own
+                // "generic host-function bridge fallback always returns a Boxed ArcoValue*" rule,
+                // a real POINTER, not a raw 0/1 byte -- found genuinely blocking Arconaut's own
+                // main loop (`IF GUI.ShouldClose(window) THEN running = FALSE` took the "true"
+                // branch on literally every check, including the very first one right after window
+                // creation, closing the window after a single frame). infer_hosted_value_kind
+                // already classifies this Boxed, exactly like the AND/OR/XOR-of-bools Number case
+                // above; folded into the SAME branch here (both need "unbox to a real double, then
+                // compare against 0.0", not "read N raw bytes") via load_double_operand, which
+                // already knows how to do both (an ordinary hosted-number gets loaded directly,
+                // same as load_value_double alone would; a Boxed value gets unboxed first via
+                // arco_value_as_number, which itself correctly coerces a boxed Bool to 1.0/0.0 --
+                // see include/arco/value.hpp's own Value::as_number()) -- rather than the old
+                // load_value_double-only call, which had no Boxed case at all.
+                const HostedValueKind branch_condition_kind = convention == systems::CallingConvention::SystemV
+                    ? infer_hosted_value_kind(module, *target, instruction.operands[0])
+                    : HostedValueKind::Unknown;
+                if (branch_condition_kind == HostedValueKind::Number || branch_condition_kind == HostedValueKind::Boxed) {
+                    if (!load_double_operand(instruction.operands[0], Xmm::XMM0)) return result;
                     result.text.mov_reg_imm64(Reg::RAX, 0);
                     result.text.movq_xmm_reg(Xmm::XMM1, Reg::RAX);
                     result.text.ucomisd(Xmm::XMM0, Xmm::XMM1);
-                    // JNE (ZF=0): true for anything != 0.0. The only value this path ever actually
-                    // sees is a real AND/OR/XOR-of-bools result (always exactly 0.0 or 1.0, never
-                    // NaN), so ucomisd's own unordered-case quirk (ZF=1 for NaN, same as equal-to-
-                    // zero, which would make a genuine NaN condition read as false here) never
-                    // actually arises for this specific value.
+                    // JNE (ZF=0): true for anything != 0.0. The only values this path ever actually
+                    // sees are a real AND/OR/XOR-of-bools result or an unboxed Bool/Number (always
+                    // exactly 0.0 or 1.0 for the former, never NaN), so ucomisd's own
+                    // unordered-case quirk (ZF=1 for NaN, same as equal-to-zero, which would make a
+                    // genuine NaN condition read as false here) never actually arises for either.
                     const std::size_t true_displacement = result.text.jcc_rel32_placeholder(0x5); // JNE
                     branch_fixups.push_back({true_displacement, instruction.operands[1]});
                     const std::size_t false_displacement = result.text.jmp_rel32_placeholder();
@@ -8070,13 +8206,30 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                             // bits were already a double.
                             if (param_type.empty()) {
                                 const HostedValueKind argument_kind = infer_hosted_value_kind(module, *target, instruction.operands[i]);
-                                // Boxed (an array/object -- see Phase 2, RFC-0049 Section 4) is
-                                // rejected here for the identical reason: an untyped parameter
-                                // assumes hosted-number, and a Boxed argument is a pointer, not a
-                                // raw double, that would otherwise be silently misrouted through
-                                // the XMM/number path the same way a string once was.
-                                if (argument_kind == HostedValueKind::String || argument_kind == HostedValueKind::Bool ||
-                                    argument_kind == HostedValueKind::Boxed) {
+                                // String/Bool are always rejected here: an untyped parameter
+                                // assumes hosted-number, and a raw literal String pointer or a
+                                // 1-byte Bool is not a double load_double_operand (below) could
+                                // safely coerce -- silently misrouting either through the XMM/
+                                // number path is exactly the original bug this whole check exists
+                                // to catch (see its own comment above). Boxed is different: it's
+                                // rejected UNLESS value_could_be_hosted_number says this specific
+                                // Boxed value could genuinely be a number (RFC-0049 Phase 14,
+                                // found the same way infer_local_kind's own ambiguous-Store fix
+                                // was -- see that helper's own much larger comment for the full
+                                // `visible_rows = FLOOR(...)` / `visible_rows = 1` repro). A bare
+                                // array/object argument (`Foo([1, 2, 3])`, this check's own
+                                // existing negative-test contract) is unambiguously never a
+                                // number and stays rejected at compile time; only a genuinely
+                                // ambiguous Number-or-Boxed local/temp is accepted and routed
+                                // through the same load_double_operand call below every other
+                                // accepted case already uses (which itself calls
+                                // arco_value_as_number, panicking loudly at runtime in the
+                                // never-actually-observed case that a given call's own Boxed
+                                // branch turns out non-numeric after all).
+                                const bool boxed_but_could_be_number = argument_kind == HostedValueKind::Boxed &&
+                                    value_could_be_hosted_number(module, *target, instruction.operands[i], 0);
+                                if ((argument_kind == HostedValueKind::Boxed && !boxed_but_could_be_number) ||
+                                    argument_kind == HostedValueKind::String || argument_kind == HostedValueKind::Bool) {
                                     const char* kind_name = argument_kind == HostedValueKind::String ? "string" :
                                         argument_kind == HostedValueKind::Bool ? "bool" : "array/object";
                                     const char* suggested_type = argument_kind == HostedValueKind::String ? "STRING" :
@@ -8444,8 +8597,30 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     // so this can't be gated on that string the way parameters are gated on their
                     // own `AS Type` -- it reuses the same straight-line value-flow inference PRINT's
                     // Call case already relies on instead.
-                    if (convention == systems::CallingConvention::SystemV &&
-                        infer_hosted_value_kind(module, *target, value_ref) == HostedValueKind::Number) {
+                    const HostedValueKind return_value_kind = convention == systems::CallingConvention::SystemV
+                        ? infer_hosted_value_kind(module, *target, value_ref) : HostedValueKind::Unknown;
+                    // Multi-RETURN ambiguity (RFC-0049 Phase 14, found by actually running Arconaut
+                    // natively): infer_function_return_kind now answers Boxed whenever this
+                    // function's own RETURN statements don't all agree on representation (e.g. `IF
+                    // token <> "" THEN RETURN token ... RETURN ""` -- token genuinely Boxed, the
+                    // trailing "" a raw literal .rodata pointer, see that function's own much larger
+                    // comment). Every call site of THIS function trusts that single Boxed answer --
+                    // so whichever RETURN statement actually executes at runtime must ALSO produce a
+                    // genuine ArcoValue* in RAX, never the raw, un-boxed representation this
+                    // operand's OWN kind alone would otherwise use, or the caller misreads live
+                    // pointer/literal bytes as the other representation (readable-but-wrong garbage
+                    // text, confirmed with a minimal repro independent of Arconaut). Boxing here (via
+                    // box_operand_into_rax, the same helper Binary "+"'s own identical ambiguous-
+                    // Boxed fix already uses) only ever fires for a return whose OWN kind isn't
+                    // already Boxed while the function's overall answer is -- an ordinary
+                    // unambiguous function (every RETURN agreeing) is completely unaffected, and an
+                    // already-Boxed return value is never re-boxed.
+                    const bool needs_consistent_boxing = convention == systems::CallingConvention::SystemV &&
+                        return_value_kind != HostedValueKind::Boxed && return_value_kind != HostedValueKind::Unknown &&
+                        infer_function_return_kind(module, *target) == HostedValueKind::Boxed;
+                    if (needs_consistent_boxing) {
+                        if (!box_operand_into_rax(value_ref)) return result;
+                    } else if (return_value_kind == HostedValueKind::Number) {
                         if (!load_value_double(value_ref, Xmm::XMM0)) return result;
                         returns_via_xmm0 = true;
                     } else {

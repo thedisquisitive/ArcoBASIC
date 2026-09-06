@@ -1651,3 +1651,138 @@ done
 diff -u "$TMP_ROOT/foreach-loop-double-release-bytecode-run.txt" "$TMP_ROOT/foreach-loop-double-release-native-run.txt"
 printf 'FALSE\nFALSE\nFiles|suffix\ndone\n' > "$TMP_ROOT/foreach-loop-double-release-expected.txt"
 diff -u "$TMP_ROOT/foreach-loop-double-release-expected.txt" "$TMP_ROOT/foreach-loop-double-release-native-run.txt"
+
+# Entry 23 (RFC-0049 Phase 14): the ACTUAL blocker on Arconaut's own native main loop, found by
+# actually running the compiled binary against a real display -- `IF GUI.ShouldClose(window) THEN
+# running = FALSE` took the "true" branch on literally every check, including immediately after
+# window creation, closing the window after a single frame. GUI.ShouldClose's result is a genuine
+# Boxed ArcoValue* (every generic host-bridge call always returns one), but Kind::Branch's own
+# codegen only had two paths -- a real hosted-number (AND/OR/XOR-of-bools, `ucomisd` against 0.0)
+# or an ordinary 1-byte BOOL (`AND RAX, 0xFF`) -- neither of which is correct for a raw 64-bit
+# Boxed pointer: masking a heap pointer's low byte is essentially a coin flip unrelated to the
+# actual boolean value. Fixed by widening the Number-only gate to also cover Boxed and routing
+# through load_double_operand (which already knows how to unbox via arco_value_as_number, itself
+# correctly coercing a boxed Bool to 1.0/0.0) instead of the raw byte-mask path.
+cat > "$TMP_ROOT/branch-boxed-bool.abas" <<'SCRIPT'
+GUI.Application("branchtest", "Branch Test", "")
+window = GUI.Window("Branch Test", 200, 150)
+IF GUI.ShouldClose(window) THEN
+    PRINT "would close"
+ELSE
+    PRINT "not closing"
+END IF
+GUI.Close(window)
+SCRIPT
+if "$ARCOFISSION" build "$TMP_ROOT/branch-boxed-bool.abas" -o "$TMP_ROOT/branch-boxed-bool" \
+        --target linux-x86_64 > "$TMP_ROOT/branch-boxed-bool-build.txt" 2>&1; then
+    if command -v xdotool >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
+        "$TMP_ROOT/branch-boxed-bool" > "$TMP_ROOT/branch-boxed-bool-run.txt" 2>&1 || true
+        if [ -s "$TMP_ROOT/branch-boxed-bool-run.txt" ]; then
+            grep -q "^not closing$" "$TMP_ROOT/branch-boxed-bool-run.txt"
+        fi
+    fi
+elif grep -q "arco_cli" "$TMP_ROOT/branch-boxed-bool-build.txt"; then
+    echo "note: arco_cli not built in this tree -- Branch-Boxed-Bool test skipped" >&2
+else
+    echo "linux-x86_64 backend failed to compile a GUI.ShouldClose-in-IF program for an unexpected reason:" >&2
+    cat "$TMP_ROOT/branch-boxed-bool-build.txt" >&2
+    exit 1
+fi
+
+# Entry 23 (RFC-0049 Phase 14): a local reassigned with a DIFFERENT physical representation across
+# two conditionally-reached stores -- `selected = app.SelectedSource` (a genuinely Boxed
+# object-field read) then, inside `IF selected == "" THEN selected = "No ArcFS target selected"`,
+# a raw literal (a DIFFERENT representation sharing the same "String" label) -- found via
+# Arconaut's own DrawActions "Selected" label, which flickered between different CJK-range garbage
+# characters frame to frame (a live, changing memory-safety symptom, not a static wrong value):
+# infer_local_kind used to pick whichever Store it found LAST while walking the function in order,
+# not a runtime-accurate answer, so a caller (PRINT/GUI.Text/comparisons) reading "selected" after
+# the literal branch ran would misinterpret the ACTUAL runtime value (the object-field read, if
+# that branch is what really executed) as if it were the OTHER representation. Fixed by having
+# infer_local_kind detect disagreement across every Store to a name (not just the last one found)
+# and answer Boxed when they disagree, paired with Kind::Store's own pre-existing
+# box_operand_into_rax fallback (added earlier for an identical `quoted = quoted + ch` shape) which
+# already knows how to box a raw literal source on demand once the target is classified Boxed.
+cat > "$TMP_ROOT/store-ambiguous-representation.abas" <<'SCRIPT'
+app = {"SelectedSource": ""}
+selected = app.SelectedSource
+IF selected == "" THEN selected = "No ArcFS target selected"
+PRINT selected
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/store-ambiguous-representation.abas" -o "$TMP_ROOT/store-ambiguous-representation" --target linux-x86_64 > /dev/null
+"$TMP_ROOT/store-ambiguous-representation" > "$TMP_ROOT/store-ambiguous-representation-native-run.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/store-ambiguous-representation.abas" > "$TMP_ROOT/store-ambiguous-representation-bytecode-run.txt"
+diff -u "$TMP_ROOT/store-ambiguous-representation-bytecode-run.txt" "$TMP_ROOT/store-ambiguous-representation-native-run.txt"
+printf 'No ArcFS target selected\n' > "$TMP_ROOT/store-ambiguous-representation-expected.txt"
+diff -u "$TMP_ROOT/store-ambiguous-representation-expected.txt" "$TMP_ROOT/store-ambiguous-representation-native-run.txt"
+
+# Entry 23 (RFC-0049 Phase 14): the RETURN-statement counterpart of the Store case just above --
+# `RETURN token` (genuinely Boxed, an array-indexed/host-function result) on one path, `RETURN ""`
+# (a raw literal) on another, in the SAME function (Arconaut's own NthToken/FirstToken helper,
+# `entry = FirstToken(line)`, used to populate the device list's "Selected" text). Fixed the same
+# way: infer_function_return_kind now checks EVERY RETURN in the function (not just the first one
+# found while walking blocks in vector order, which had no required relationship to which RETURN a
+# given call actually executes at runtime) and answers Boxed when they disagree; Kind::Return's own
+# codegen boxes a literal return via box_operand_into_rax whenever the function's own overall
+# answer is Boxed but THIS particular return's value isn't already, so every return path leaves a
+# consistently Boxed pointer in RAX regardless of which one fires.
+cat > "$TMP_ROOT/return-ambiguous-representation.abas" <<'SCRIPT'
+FUNCTION NthToken(line AS STRING, n)
+    parts = String.Split(String.Trim(line), " ")
+    index = 0
+    WHILE index < LEN(parts)
+        token = String.Trim(parts[index])
+        IF token <> "" THEN
+            IF index == n THEN RETURN token
+        END IF
+        index = index + 1
+    WEND
+    RETURN ""
+END FUNCTION
+PRINT NthToken("a b c", 99)
+PRINT NthToken("a b c", 1)
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/return-ambiguous-representation.abas" -o "$TMP_ROOT/return-ambiguous-representation" --target linux-x86_64 --sanitize > /dev/null
+for i in 1 2 3 4 5; do
+    ASAN_OPTIONS=abort_on_error=1:halt_on_error=1 "$TMP_ROOT/return-ambiguous-representation" > "$TMP_ROOT/return-ambiguous-representation-native-run.txt"
+done
+"$ARCOFISSION" compile-run "$TMP_ROOT/return-ambiguous-representation.abas" > "$TMP_ROOT/return-ambiguous-representation-bytecode-run.txt"
+diff -u "$TMP_ROOT/return-ambiguous-representation-bytecode-run.txt" "$TMP_ROOT/return-ambiguous-representation-native-run.txt"
+printf '\nb\n' > "$TMP_ROOT/return-ambiguous-representation-expected.txt"
+diff -u "$TMP_ROOT/return-ambiguous-representation-expected.txt" "$TMP_ROOT/return-ambiguous-representation-native-run.txt"
+
+# Entry 23 (RFC-0049 Phase 14): the untyped-parameter safety check's own necessary widening,
+# alongside the Store/Return fixes above -- once infer_local_kind correctly detects the
+# `visible_rows = FLOOR(...)` / `visible_rows = 1` disagreement (FLOOR/Math.Floor is a generic
+# host-bridge call, always physically Boxed, but semantically always a real number) and answers
+# Boxed, the untyped-parameter call-site check (which used to reject EVERY Boxed argument
+# outright) started rejecting this genuinely-numeric-but-physically-Boxed value too, breaking
+# Arconaut's own compile (`DrawScrollbar(..., visible_rows, ...)`). Fixed with a narrower helper,
+# value_could_be_hosted_number, that distinguishes THIS ambiguous case (accept, route through
+# load_double_operand's existing Boxed-unboxing path) from a genuinely non-numeric Boxed argument
+# like a bare array/object literal (still correctly rejected at compile time -- see the existing
+# untyped-array-arg negative test above, which this fix keeps passing).
+cat > "$TMP_ROOT/untyped-param-ambiguous-number.abas" <<'SCRIPT'
+FUNCTION UsesIt(n)
+    PRINT n
+END FUNCTION
+FUNCTION Compute(pick AS BOOL)
+    IF pick THEN
+        value = FLOOR(7.8)
+    ELSE
+        value = 1
+    END IF
+    IF value < 1 THEN value = 1
+    RETURN value
+END FUNCTION
+v = Compute(TRUE)
+UsesIt(v)
+w = Compute(FALSE)
+UsesIt(w)
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/untyped-param-ambiguous-number.abas" -o "$TMP_ROOT/untyped-param-ambiguous-number" --target linux-x86_64 > /dev/null
+"$TMP_ROOT/untyped-param-ambiguous-number" > "$TMP_ROOT/untyped-param-ambiguous-number-native-run.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/untyped-param-ambiguous-number.abas" > "$TMP_ROOT/untyped-param-ambiguous-number-bytecode-run.txt"
+diff -u "$TMP_ROOT/untyped-param-ambiguous-number-bytecode-run.txt" "$TMP_ROOT/untyped-param-ambiguous-number-native-run.txt"
+printf '7\n1\n' > "$TMP_ROOT/untyped-param-ambiguous-number-expected.txt"
+diff -u "$TMP_ROOT/untyped-param-ambiguous-number-expected.txt" "$TMP_ROOT/untyped-param-ambiguous-number-native-run.txt"

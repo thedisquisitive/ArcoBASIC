@@ -78,9 +78,25 @@ clean AddressSanitizer runs of the repro (previously non-deterministic — somet
 after-free, sometimes a leak, sometimes clean), output byte-identical to `compile-run` across every
 run; the full `linux_native_backend_smoke.sh` (with a new permanent regression section) and the
 complete project-wide test suite (124/124) both pass. Arconaut's own full native run past its first
-frame is still not independently confirmed against a real display — a direct re-run after the fix
-opened no window and exited immediately with no output, not matching a real blocking `App.Start()`
-event loop; flagged as a distinct, undiagnosed gap for future work, not yet investigated. A dotted
+frame was, at that point, still not independently confirmed against a real display — a direct
+re-run opened no window and exited immediately with no output, not matching a real blocking
+`App.Start()` event loop. **That gap is now also closed (Phase 14, Entry 23)**, answering the
+project owner's direct follow-up question ("So why can't we get arconaut to run natively"): three
+more real bugs, every one another instance of the SAME "a value's physical representation is
+ambiguous across different code paths, and the classifier only ever checked one of them" pattern
+Phase 12 already established — `Kind::Branch` masked a genuinely Boxed `GUI.ShouldClose` result
+with a raw 1-byte BOOL mask instead of unboxing it (closed the window after one frame, every time);
+`infer_local_kind`/`infer_function_return_kind` each picked whichever Store/Return they scanned
+first rather than checking all of them, misclassifying a local (`selected`) and a function
+(`NthToken`) that each have two genuinely different representations across different branches
+(live, frame-to-frame-changing garbled text, watched directly by the project owner); and fixing
+those correctly classified a legitimately-numeric-but-physically-Boxed local (`visible_rows =
+FLOOR(...)` vs `= 1`) as Boxed, which the untyped-parameter safety check then wrongly rejected —
+fixed with a narrower `value_could_be_hosted_number` helper that keeps a genuine array/object
+argument correctly rejected while accepting this ambiguous case. Confirmed with real `xdotool`
+clicks against the live native binary: the Volumes tab renders, the device list responds to the
+filter checkbox, and clicking a row correctly shows "Selected /dev/loop0" — the first real,
+interactive confirmation of the native binary's own UI, not just a static first frame. A dotted
 field can't hold or call a callable (only a plain variable can) — a confirmed, genuinely shared
 interpreter/bytecode-VM limitation, not owned by this RFC, see Entry 18. The Windows target and
 freestanding/AOS support not started. See `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` for the full,
@@ -518,6 +534,41 @@ writer was built for this; none was needed.
   `compile-run` every time; a new permanent regression section in
   `linux_native_backend_smoke.sh`; the complete project-wide test suite, 124/124. See
   `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` Entry 22 for the full writeup.
+- **Phase 14** — Arconaut's own native `App.Start()`-shaped event loop, made to actually work end
+  to end, directly answering the project owner's follow-up question ("So why can't we get arconaut
+  to run natively") after Phase 13's fix still left the full app opening no window. Three more real
+  bugs, every one another instance of the SAME representation-ambiguity pattern Phase 12 already
+  established (see that phase's own recurring-bug-pattern note): `Kind::Branch` masked a genuinely
+  Boxed `GUI.ShouldClose` result with a raw 1-byte BOOL mask (`AND RAX, 0xFF` on a heap pointer)
+  instead of unboxing it — the ACTUAL blocker, closing the window after exactly one frame, every
+  time, confirmed with a minimal Arconaut-independent repro; fixed by widening `Kind::Branch`'s
+  existing Number-only unboxing gate to also cover Boxed, via `load_double_operand`. Separately,
+  `infer_local_kind` and `infer_function_return_kind` each used to pick whichever Store/RETURN they
+  scanned first while walking a function in block order — not necessarily the one a given execution
+  actually took — silently misclassifying a local (`selected = app.SelectedSource` then,
+  conditionally, `selected = "literal"`) and a function (`NthToken`'s own `RETURN token` vs
+  trailing `RETURN ""`) that each have two genuinely different physical representations across
+  different branches; the project owner directly watched this as the "Selected" label flickering
+  between different CJK-range garbage characters frame to frame (a live, changing corruption, not a
+  static wrong value). Fixed by making both classifiers scan every Store/RETURN and answer Boxed on
+  disagreement (`Kind::Store` already had the matching box-on-demand codegen from an earlier phase;
+  `Kind::Return` needed a new one, boxing a literal return via `box_operand_into_rax` whenever the
+  function's own overall answer is Boxed). That fix immediately exposed its own downstream
+  consequence (the same "one fix reveals the next gap" pattern this backend's whole history shows):
+  a legitimately-numeric-but-physically-Boxed local (`visible_rows = FLOOR(...)` vs `= 1` --
+  FLOOR/Math.Floor is a generic host-bridge call, always Boxed, but semantically always a number)
+  now correctly classified Boxed, which the untyped-parameter safety check (Phase 11/12) then
+  wrongly rejected outright, breaking Arconaut's own compile. A first attempt (accept all Boxed
+  arguments unconditionally) was caught regressing that check's own pre-existing negative test (a
+  genuine array/object argument must still fail to compile) by the full test suite; replaced with a
+  narrower `value_could_be_hosted_number` helper that distinguishes "genuinely could be a number on
+  some path" from "never a number on any path," preserving the negative test while accepting the
+  ambiguous case. Confirmed with real `xdotool` clicks against the live native binary (not just a
+  static render): the Volumes tab renders, the device-filter checkbox works live, and clicking a
+  device row correctly shows "Selected /dev/loop0" with the row highlighted — the first real,
+  interactive confirmation of the native binary's own UI. Full project-wide test suite, 123/124 (the
+  one failure is the already-documented, unrelated PS/2-driver QEMU flake, re-confirmed not a
+  regression). See `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` Entry 23 for the full writeup.
 
 **Explicitly not attempted yet (disclosed, not silently missing):**
 - The Windows target (`--target windows-x86_64` for this backend does not exist; the *bytecode
@@ -528,12 +579,10 @@ writer was built for this; none was needed.
   design (`arcology-os/docs/systems/uefi-target.md`) — whether to extend that profile with a real
   allocator so `ArcoValue` can exist there too, or accept that AOS gets this capability later than
   Linux/Windows, is a real open decision, not resolved by this RFC.
-- Arconaut's own full native run past its very first frame, against a real display, is still not
-  independently confirmed (see Phase 12/13's own text above) — a direct re-run of the full app
-  after Phase 13's fix opened no window and exited immediately with no output, not matching a real
-  blocking `App.Start()` event loop. Not yet investigated; possibly a distinct gap in how
-  `App.Start()`'s own event loop is bridged natively, separate from GUI rendering itself (which
-  Phase 12 already confirmed working in isolation).
+- Whether Arconaut's OWN full interactive lifecycle (every tab, every button, Mount/Format/
+  Snapshot actions that shell out to `arcfsctl`) works end to end natively, beyond the Volumes
+  tab's own render+click path Phase 14 directly exercised, is still not established — a natural
+  next step, not attempted this phase (out of scope for the specific question Phase 14 answered).
 
 ## 5. Relationship to ArcoSH
 
