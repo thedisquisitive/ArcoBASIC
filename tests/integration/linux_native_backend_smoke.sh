@@ -1615,3 +1615,39 @@ SCRIPT
 diff -u "$TMP_ROOT/string-literal-or-chain-bytecode-run.txt" "$TMP_ROOT/string-literal-or-chain-native-run.txt"
 printf 'yes\ndone\n' > "$TMP_ROOT/string-literal-or-chain-expected.txt"
 diff -u "$TMP_ROOT/string-literal-or-chain-expected.txt" "$TMP_ROOT/string-literal-or-chain-native-run.txt"
+
+# Entry 21's own disclosed open bug, now fixed (Entry 22): Kind::Load's own explicit "release the
+# destination slot's old value" step (added for a class constructor's `RETURN VALUE %t := LOAD
+# __instance` shape) double-releases whenever store_result's OWN, completely independent STRING-
+# gated tracks_lifetime check ALSO fires for the exact same store -- both release the SAME old
+# value, with only one store ever happening. Dormant on a slot's first-ever write (the "old value"
+# is null, releasing null is a no-op) -- only bites once a temp slot has already held a live
+# reference from a PRIOR loop iteration, i.e. a value read/compared more than once inside a
+# `FOR ... IN ...` loop body. This exact repro over-releases `key` (a PARAMETER-derived concat
+# result) once per extra iteration -- a real heap-use-after-free (or, depending on allocator
+# timing, a leak elsewhere as the refcount imbalance cascades) confirmed via AddressSanitizer +
+# a raw objdump of the doubled `call arco_value_release` sequence before the fix. compile-run
+# (the bytecode VM, unaffected -- this is native-backend-only codegen) is the ground truth here.
+cat > "$TMP_ROOT/foreach-loop-double-release.abas" <<'SCRIPT'
+cache = [{"Key": "a"}, {"Key": "b"}]
+
+FUNCTION MakeKey(label AS STRING)
+    key = label + "|suffix"
+    FOR entry IN cache
+        PRINT entry.Key == key
+    NEXT
+    RETURN key
+END FUNCTION
+
+k = MakeKey("Files")
+PRINT k
+PRINT "done"
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/foreach-loop-double-release.abas" -o "$TMP_ROOT/foreach-loop-double-release" --target linux-x86_64 --sanitize > /dev/null
+for i in 1 2 3 4 5; do
+    ASAN_OPTIONS=abort_on_error=1:halt_on_error=1 "$TMP_ROOT/foreach-loop-double-release" > "$TMP_ROOT/foreach-loop-double-release-native-run.txt"
+done
+"$ARCOFISSION" compile-run "$TMP_ROOT/foreach-loop-double-release.abas" > "$TMP_ROOT/foreach-loop-double-release-bytecode-run.txt"
+diff -u "$TMP_ROOT/foreach-loop-double-release-bytecode-run.txt" "$TMP_ROOT/foreach-loop-double-release-native-run.txt"
+printf 'FALSE\nFALSE\nFiles|suffix\ndone\n' > "$TMP_ROOT/foreach-loop-double-release-expected.txt"
+diff -u "$TMP_ROOT/foreach-loop-double-release-expected.txt" "$TMP_ROOT/foreach-loop-double-release-native-run.txt"

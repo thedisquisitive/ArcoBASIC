@@ -4738,6 +4738,24 @@ struct X86_64CodegenResult {
     };
     std::vector<ExternalCallFixup> external_calls;
     std::string entry_symbol;
+    // The Arco native debugger tooling (ArcoFission build ... --debug): one entry per AMIR
+    // instruction, populated only when generate_x86_64_function/_program's own `annotate`
+    // parameter is true (never on an ordinary build -- this is pure overhead with no behavioral
+    // effect otherwise, so it costs nothing when not asked for). `text_offset` is the byte offset
+    // in `text` where THIS instruction's own generated code begins; `comment` is the exact same
+    // rendering `reveal amir`'s own render_instruction produces, prefixed with the owning
+    // function's name, so a raw crash address (from gdb/AddressSanitizer) maps directly back to
+    // the AMIR instruction AND source line responsible -- see render_x86_64_linux_asm, which turns
+    // these into `# ...` comment lines in the generated assembly at the matching offset. Built
+    // specifically because pure address-to-source correlation, done by hand (grep the raw
+    // `.byte`-encoded instruction stream, decode opcodes, count backwards from a known nearby
+    // call), was the single most time-consuming part of every real bug this backend's own "full
+    // Linux support" pass found by actually running generated code (RFC-0049 Entries 20-21).
+    struct InstructionAnnotation {
+        std::size_t text_offset;
+        std::string comment;
+    };
+    std::vector<InstructionAnnotation> annotations;
 };
 
 // Reserved symbol name for the compiler-synthesized exception-entry table (see below). Not a
@@ -4998,7 +5016,8 @@ X86_64CodegenResult generate_exception_vector_table() {
 // Any other instruction kind, or any construct this milestone's UEFI bindings/calling convention
 // do not cover, produces a clear error rather than an incorrect or silently wrong encoding.
 X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std::string& function_name,
-                                              systems::CallingConvention convention = systems::CallingConvention::MicrosoftX64) {
+                                              systems::CallingConvention convention = systems::CallingConvention::MicrosoftX64,
+                                              bool annotate = false) {
     X86_64CodegenResult result;
     result.entry_symbol = function_name;
     using Reg = systems::x86_64::Reg;
@@ -5537,6 +5556,20 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
         if (reachable_blocks.count(current_block.name) == 0) continue;
         block_offsets[current_block.name] = result.text.size();
         for (const auto& instruction : current_block.instructions) {
+        // Arco native debugger tooling (see X86_64CodegenResult::InstructionAnnotation's own
+        // comment) -- records where THIS instruction's own codegen starts, before any of it runs,
+        // so the annotation always points at the first byte actually attributable to it (matches
+        // how block_offsets above already records each block's own start the same way). Reuses
+        // render_instruction verbatim (the exact function `reveal amir` itself calls) so the
+        // annotation text is byte-for-byte identical to what a developer already sees there --
+        // no second, drifting copy of AMIR's own text format to maintain.
+        if (annotate) {
+            std::ostringstream described;
+            render_instruction(described, instruction, module.source_name);
+            std::string comment = described.str();
+            while (!comment.empty() && (comment.back() == '\n' || comment.back() == '\r')) comment.pop_back();
+            result.annotations.push_back({result.text.size(), "[" + function_name + "] " + comment});
+        }
         switch (instruction.kind) {
             case AmirInstruction::Kind::Source:
             case AmirInstruction::Kind::Label:
@@ -5800,7 +5833,27 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     ? "U64" : (instruction.result_type.empty() ? "U64" : instruction.result_type);
                 normalize(Reg::RAX, load_result_type);
                 if (!store_result(instruction.result, load_result_type)) return result;
-                if (tracks_lifetime) {
+                // Double-release bug (RFC-0049 native backend, found via the new --debug/--sanitize
+                // tooling on a genuinely minimal FOR-EACH-loop repro, confirmed via ASan + a raw
+                // objdump of the emitted call sequence): store_result's OWN tracks_lifetime check
+                // (see its comment above) already releases the destination slot's OLD value whenever
+                // load_result_type == "STRING" -- completely independently of this block's tracks_
+                // lifetime flag, which is gated on the DESTINATION's inferred kind, not on the type
+                // string passed to store_result. When both fire (a Boxed destination whose load_
+                // result_type happens to be "STRING"), store_result's own release above and this
+                // block's release below both release the SAME captured R10 value -- the destination
+                // slot is only ever stored to once, so the second release is a genuine extra release
+                // of a still-live reference. Concretely: `key := label + "|suffix"` then `FOR entry IN
+                // cache: entry.Key == key`, on the loop's second iteration, over-released `key`'s own
+                // box (a value the caller's `RETURN VALUE key` still needed) -- confirmed with gdb by
+                // tracing every arco_value_retain/release call's pointer argument across the run and
+                // finding this exact instruction release the same pointer twice with no matching
+                // second retain. Only skip the explicit release here when store_result already did
+                // it (load_result_type == "STRING") -- every other load_result_type (store_result's
+                // own tracks_lifetime is STRING-only) still needs this block's own release, e.g. the
+                // class-constructor `__instance` case this block's own comment documents, where load_
+                // result_type normalizes to "U64" and store_result never touches lifetime at all.
+                if (tracks_lifetime && load_result_type != "STRING") {
                     result.text.mov_reg_reg(Reg::RDI, Reg::R10);
                     const auto release_disp = result.text.call_rel32_placeholder();
                     result.external_calls.push_back({release_disp, "arco_value_release"});
@@ -9008,14 +9061,15 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
 // when a real function with the same name is selected, preserving the existing last-declaration
 // entry rule.
 X86_64CodegenResult generate_x86_64_program(const AmirModule& module, const std::string& entry_function,
-                                             systems::CallingConvention convention = systems::CallingConvention::MicrosoftX64) {
+                                             systems::CallingConvention convention = systems::CallingConvention::MicrosoftX64,
+                                             bool annotate = false) {
     X86_64CodegenResult combined;
     combined.entry_symbol = entry_function;
     std::vector<std::pair<std::string, X86_64CodegenResult>> fragments;
     std::unordered_set<std::string> emitted;
     auto add_fragment = [&](const std::string& name) -> bool {
         if (!emitted.insert(name).second) return true;
-        auto fragment = generate_x86_64_function(module, name, convention);
+        auto fragment = generate_x86_64_function(module, name, convention, annotate);
         if (!fragment.ok) { combined.ok = false; combined.error = fragment.error; return false; }
         fragments.emplace_back(name, std::move(fragment));
         return true;
@@ -9081,6 +9135,9 @@ X86_64CodegenResult generate_x86_64_program(const AmirModule& module, const std:
         }
         for (const auto& call : fragment.second.external_calls) {
             combined.external_calls.push_back({text_base + call.disp_field_offset, call.symbol});
+        }
+        for (const auto& note : fragment.second.annotations) {
+            combined.annotations.push_back({text_base + note.text_offset, note.comment});
         }
     }
     for (const auto& call : combined.internal_calls) {
@@ -9204,6 +9261,17 @@ std::string render_x86_64_linux_asm(const X86_64CodegenResult& codegen) {
         spans[span.start] = span;
     }
 
+    // Arco native debugger tooling (see X86_64CodegenResult::InstructionAnnotation's own comment)
+    // -- a multimap since Kind::Source markers carry no bytes of their own, so a real instruction
+    // and the source-line marker immediately preceding it can legitimately share one offset, and
+    // both comments are worth keeping. Empty (`codegen.annotations` was never populated) whenever
+    // the caller didn't ask for annotated output, so this whole mechanism is a pure no-op then --
+    // the lookup below always misses immediately.
+    std::multimap<std::size_t, std::string> annotations_by_offset;
+    for (const auto& note : codegen.annotations) {
+        annotations_by_offset.emplace(note.text_offset, note.comment);
+    }
+
     std::ostringstream out;
     out << ".intel_syntax noprefix\n";
     for (const auto& call : codegen.external_calls) {
@@ -9225,6 +9293,23 @@ std::string render_x86_64_linux_asm(const X86_64CodegenResult& codegen) {
         }
     };
     while (i < bytes.size()) {
+        const auto annotation_range = annotations_by_offset.equal_range(i);
+        if (annotation_range.first != annotation_range.second) {
+            end_byte_run();
+            // The hex TEXT+offset is the actual point of this: every byte this backend emits is
+            // preserved verbatim by this whole function (external_calls/relocations substitute
+            // same-length real mnemonics for same-length placeholder bytes -- see this function's
+            // own header comment), so a linked binary's `main + text_offset` address is EXACTLY
+            // this instruction's own first byte. A crash's raw PC/return-address (from gdb, ASan,
+            // or a core dump) needs only `nm`'s own `main` base subtracted to become directly
+            // greppable here -- no DWARF line-table trust required at all, which matters because
+            // this generated code has no CFI/frame-pointer chain of its own (see this comment's
+            // own note in the debugger-tooling writeup): a `bt` more than one frame into it is a
+            // heuristic guess, but a raw address is exact.
+            for (auto it = annotation_range.first; it != annotation_range.second; ++it) {
+                out << "    # TEXT+0x" << std::hex << i << std::dec << " " << it->second << "\n";
+            }
+        }
         const auto found = spans.find(i);
         if (found != spans.end()) {
             end_byte_run();
@@ -12089,7 +12174,8 @@ Result build_efi_image_file(const std::string& path, const std::string& entry_fu
 // "shell out to `c++`" mechanism rather than a second one. No bytecode, no embedded VM, no
 // execute_function anywhere in the produced binary.
 Result build_linux_native_image(const std::string& source, const std::string& source_name,
-                                 const std::string& entry_function, const std::string& output_path) {
+                                 const std::string& entry_function, const std::string& output_path,
+                                 NativeDebugOptions debug_options) {
 #if defined(__linux__)
     try {
         Runtime runtime;
@@ -12117,7 +12203,7 @@ Result build_linux_native_image(const std::string& source, const std::string& so
         // unlowerable AMIR shape is still caught downstream by generate_x86_64_program's own
         // extensive per-instruction error checking, the same safety net execute_bytecode implicitly
         // relies on for the exact same reason.
-        auto codegen = generate_x86_64_program(amir, entry_function, systems::CallingConvention::SystemV);
+        auto codegen = generate_x86_64_program(amir, entry_function, systems::CallingConvention::SystemV, debug_options.annotate);
         if (!codegen.ok) {
             return {false, "", codegen.error};
         }
@@ -12239,10 +12325,22 @@ Result build_linux_native_image(const std::string& source, const std::string& so
             compiler,
             "-std=c++17",
             "-O2",
+        };
+        // Arco native debugger tooling (`--sanitize`): AddressSanitizer plus real debug symbols.
+        // This is exactly the workflow that found and fixed a real, AddressSanitizer-confirmed SEGV
+        // and narrowed a real, still-open FOR-EACH-loop reference-counting bug down to a minimal
+        // repro (RFC-0049 Entry 21) -- previously done by hand-patching this exact args list,
+        // rebuilding ArcoFission itself, then reverting the patch afterward. A permanent, supported
+        // CLI flag instead.
+        if (debug_options.sanitize) {
+            args.push_back("-g");
+            args.push_back("-fsanitize=address");
+        }
+        args.insert(args.end(), {
             asm_path.string(),
             shim_path.string(),
             runtime_handles_path.string(),
-        };
+        });
         if (program_needs_host_bridge) args.push_back(host_bridge_path.string());
         args.insert(args.end(), {
             "-o",
@@ -12265,6 +12363,18 @@ Result build_linux_native_image(const std::string& source, const std::string& so
             command << shell_quote(arg);
         }
 
+        // Arco native debugger tooling (`--debug`): the annotated .s file is the actual deliverable
+        // of that flag -- copied out to a stable path BEFORE the temp directory it was built in
+        // gets removed below, regardless of whether the compile itself succeeds (an assembler
+        // error is exactly when seeing the annotated source is most useful).
+        std::filesystem::path saved_asm_path;
+        if (debug_options.annotate) {
+            saved_asm_path = std::filesystem::path(output_path).string() + ".s";
+            std::error_code copy_error;
+            std::filesystem::copy_file(asm_path, saved_asm_path, std::filesystem::copy_options::overwrite_existing, copy_error);
+            if (copy_error) saved_asm_path.clear();
+        }
+
         const int status = std::system(command.str().c_str());
         std::filesystem::remove_all(tmp_dir);
         if (status == -1) {
@@ -12282,6 +12392,12 @@ Result build_linux_native_image(const std::string& source, const std::string& so
         message << "SOURCE ACCEPTED\n";
         message << "STRUCTURE ASSEMBLED\n";
         message << "X86_64 GENERATED (System V, no bytecode VM)\n";
+        if (!saved_asm_path.empty()) {
+            message << "ANNOTATED ASSEMBLY WRITTEN " << saved_asm_path.string() << "\n";
+        }
+        if (debug_options.sanitize) {
+            message << "ADDRESSSANITIZER ENABLED (real debug symbols, -fsanitize=address)\n";
+        }
         // Only mentioned when this specific program actually needed it (and, having reached this
         // point at all, successfully linked it -- the unavailable case already returned a clear
         // error above, before ever invoking the linker). A program that calls no host function
@@ -12297,14 +12413,15 @@ Result build_linux_native_image(const std::string& source, const std::string& so
         return {false, "", error.what()};
     }
 #else
-    (void)source; (void)source_name; (void)entry_function; (void)output_path;
+    (void)source; (void)source_name; (void)entry_function; (void)output_path; (void)debug_options;
     return {false, "", "the native Linux x86-64 backend is only supported on Linux"};
 #endif
 }
 
-Result build_linux_native_image_file(const std::string& path, const std::string& entry_function, const std::string& output_path) {
+Result build_linux_native_image_file(const std::string& path, const std::string& entry_function, const std::string& output_path,
+                                      NativeDebugOptions debug_options) {
     try {
-        return build_linux_native_image(read_file(path), path, entry_function, output_path);
+        return build_linux_native_image(read_file(path), path, entry_function, output_path, debug_options);
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }

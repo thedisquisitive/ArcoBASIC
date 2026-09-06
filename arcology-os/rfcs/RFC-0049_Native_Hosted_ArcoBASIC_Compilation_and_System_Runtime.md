@@ -66,19 +66,26 @@ storage width being corrupted by frontend type-hint noise it was never meant to 
 STRING-typed parameter's ambiguous representation corrupting values passed through multiple levels
 of function calls — see Entry 21 for the full incident-by-incident writeup, including the
 AddressSanitizer-based investigation technique that found the SEGV and the still-open bug below).
-The native GUI-linking mechanism itself is no longer a gap, but Arconaut's own full native run is
-not yet clean end to end (see the open bug below). A dotted field
-can't hold or call a callable (only a plain variable can) — a confirmed, genuinely shared
+The native GUI-linking mechanism itself is no longer a gap. Phase 12's own disclosed open bug — a
+reference-counting double-release in `Kind::Load`'s codegen for a Boxed value re-read inside a
+`FOR ... IN <array>` loop body (its own explicit "release old destination value" step duplicating
+`store_result`'s own independent, STRING-gated release of the same old value) — is now FOUND and
+FIXED (Phase 13, Entry 22), using a new permanent debugging capability built specifically to find
+it: `ArcoFission build ... --target linux-x86_64 --debug`/`--sanitize`, which annotates the
+generated assembly with an exact byte-offset-to-AMIR-instruction map (reusing `reveal amir`'s own
+renderer, so it can't drift) and enables AddressSanitizer with real debug symbols. Verified: 20/20
+clean AddressSanitizer runs of the repro (previously non-deterministic — sometimes a heap-use-
+after-free, sometimes a leak, sometimes clean), output byte-identical to `compile-run` across every
+run; the full `linux_native_backend_smoke.sh` (with a new permanent regression section) and the
+complete project-wide test suite (124/124) both pass. Arconaut's own full native run past its first
+frame is still not independently confirmed against a real display — a direct re-run after the fix
+opened no window and exited immediately with no output, not matching a real blocking `App.Start()`
+event loop; flagged as a distinct, undiagnosed gap for future work, not yet investigated. A dotted
+field can't hold or call a callable (only a plain variable can) — a confirmed, genuinely shared
 interpreter/bytecode-VM limitation, not owned by this RFC, see Entry 18. The Windows target and
-freestanding/AOS support not started. **A real, confirmed, UNRESOLVED reference-counting bug in
-FOR-EACH loop codegen** was found in Phase 12 (a Boxed value produced outside a loop, compared
-against a loop-iterated array element inside it, non-deterministically leaks or double-frees,
-reduced to a minimal repro independent of any GUI code) — root-caused to `lower_for_each`'s own
-loop-variable binding as the likely locus but not yet fixed; see Entry 21's own "UNRESOLVED"
-section for the full repro and elimination process. See `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md`
-for the full, entry-by-entry implementation history (this document records the design and scope;
-that one records what actually happened, in what order, including the real bugs found along the
-way).
+freestanding/AOS support not started. See `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` for the full,
+entry-by-entry implementation history (this document records the design and scope; that one records
+what actually happened, in what order, including the real bugs found along the way).
 **Category:** Compiler / Systems Runtime
 **Related RFCs:** RFC-0012 (ArcoFission Frontend to AMIR Contract — the shared IR this backend
 reads), RFC-0007 (ArcoBASIC Interactive Program Model — the first intended consumer's own
@@ -478,14 +485,39 @@ writer was built for this; none was needed.
   Boxed inside the callee to match. `PRINT` now flushes stdout immediately (kept permanently,
   found mid-investigation: neither an uncaught exception nor a SIGSEGV runs atexit flush handlers,
   so buffered PRINT trace output was silently vanishing and making crashes look earlier than they
-  really were). **One real bug found this phase remains open and unresolved**: a genuine
+  really were). **One real bug found this phase was left open at the time**: a genuine
   reference-counting bug in FOR-EACH loop codegen, reduced via AddressSanitizer to a minimal
-  repro independent of Arconaut, GUI code, or any fix in this RFC (a Boxed value from outside a
-  loop, compared against a loop-iterated array element inside it, non-deterministically leaks or
-  double-frees) — root-caused to `lower_for_each`'s own loop-variable binding as the likely locus
-  but not yet fixed or confirmed by a line-by-line audit; the single highest-priority remaining
-  item for this backend. See `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` Entry 21 for the full
-  incident-by-incident writeup, including the repro and the AddressSanitizer/gdb techniques used.
+  repro independent of Arconaut, GUI code, or any fix in this RFC. Found and fixed in Phase 13
+  (below). See `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` Entry 21 for the full incident-by-incident
+  writeup of this phase, including the repro and the AddressSanitizer/gdb techniques used.
+- **Phase 13** — a permanent native-debugger CLI capability (`ArcoFission build ... --target
+  linux-x86_64 --debug`/`--sanitize`), built specifically to resolve Phase 12's own disclosed open
+  bug, then used to find and fix it. `--debug` annotates the generated assembly with a `# TEXT+
+  0xHEX [Function] <AMIR instruction>` comment directly above the bytes each instruction produced
+  (reusing `reveal amir`'s own renderer, so the two can never drift) and saves it as `<output>.s`;
+  because this backend preserves every byte of its own generated code verbatim into the final
+  binary, `main + text_offset` is exactly that instruction's address in the linked binary — so a
+  raw gdb/ASan/core-dump address maps straight back to source with no dependence on DWARF line-
+  table accuracy or on this backend's own generated code having a reliable deep call stack (it
+  currently has neither real per-function labels beyond the entry point nor CFI/frame-pointer
+  chains — a real, useful characterization surfaced while building this, not previously
+  documented). `--sanitize` adds `-fsanitize=address -g` to the underlying compile. Both default
+  off, zero cost on an ordinary build. Used together on Phase 12's own repro: a gdb trace pairing
+  every `arco_value_retain`/`release` call with its pointer argument, cross-referenced against the
+  annotated `.s` file and confirmed at the machine-code level with `objdump`, found the SAME
+  pointer released twice on a loop's second iteration with only one matching retain. Root cause:
+  `Kind::Load`'s own explicit "release the destination slot's old value" step (added earlier for a
+  class constructor's `RETURN VALUE %t := LOAD __instance` shape) is redundant with `store_result`'s
+  own, completely independent `type == "STRING"`-gated release of the same old value — both fire
+  for a Boxed value re-read (`LOAD`ed) inside a loop body once that slot already holds a live
+  reference from a prior iteration (dormant on a slot's first-ever write, since releasing null is a
+  no-op — exactly why this surfaced only inside a loop). Fixed with a one-line guard: `Kind::Load`'s
+  own release now only runs when `store_result` will not already have handled it. Verified: 20/20
+  clean ASan runs of the repro (previously non-deterministic across exactly this range of symptoms
+  — heap-use-after-free, a leak, or a clean exit depending on the run), output byte-identical to
+  `compile-run` every time; a new permanent regression section in
+  `linux_native_backend_smoke.sh`; the complete project-wide test suite, 124/124. See
+  `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` Entry 22 for the full writeup.
 
 **Explicitly not attempted yet (disclosed, not silently missing):**
 - The Windows target (`--target windows-x86_64` for this backend does not exist; the *bytecode
@@ -496,21 +528,12 @@ writer was built for this; none was needed.
   design (`arcology-os/docs/systems/uefi-target.md`) — whether to extend that profile with a real
   allocator so `ArcoValue` can exist there too, or accept that AOS gets this capability later than
   Linux/Windows, is a real open decision, not resolved by this RFC.
-- **A real, confirmed, UNRESOLVED reference-counting bug in FOR-EACH loop codegen** (found in
-  Phase 12): a Boxed value produced OUTSIDE a `FOR ... IN <array>` loop, then compared against a
-  loop-iterated array element INSIDE the loop body, non-deterministically leaks (AddressSanitizer:
-  a `arco_value_index_get` result, the loop's own `item := INDEX items, index` fetch, never
-  released) or double-frees (`arco_value_release` heap-use-after-free) depending on the exact run.
-  Reduced to a minimal repro with NO dependency on Arconaut, GUI code, or any Phase 11/12 fix —
-  needs the compared value's own source expression to involve a PARAMETER (an identical repro using
-  a plain local instead does not reproduce it) and the comparison to happen inside the loop body
-  specifically (comparing outside the loop, or iterating without touching the value, does not
-  reproduce it either). Most likely locus is `lower_for_each`'s own loop-variable binding
-  interacting with the reference-lifetime tracking Phase 5 added, but this was narrowed to by
-  elimination, not confirmed by a line-by-line audit the way Phase 10's marshaling-loop audit
-  covered every OTHER site. The single highest-priority remaining item before this backend is
-  genuinely production-ready for a real, stateful, loop-heavy program — see
-  `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` Entry 21 for the full repro and investigation.
+- Arconaut's own full native run past its very first frame, against a real display, is still not
+  independently confirmed (see Phase 12/13's own text above) — a direct re-run of the full app
+  after Phase 13's fix opened no window and exited immediately with no output, not matching a real
+  blocking `App.Start()` event loop. Not yet investigated; possibly a distinct gap in how
+  `App.Start()`'s own event loop is bridged natively, separate from GUI rendering itself (which
+  Phase 12 already confirmed working in isolation).
 
 ## 5. Relationship to ArcoSH
 

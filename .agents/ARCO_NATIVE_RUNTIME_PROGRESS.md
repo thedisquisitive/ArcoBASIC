@@ -2638,3 +2638,126 @@ session found across Entries 20 and 21 is fixed and verified.
   exercised against a real display yet, blocked on the reference-counting bug above.
 - A second, independent full-suite regression pass (beyond the targeted 6/6 this entry and Entry 20
   both used) has still not been run since Entry 19.
+
+## Entry 22 — A permanent native debugger, and the FOR-EACH-loop bug found and fixed
+
+**Date:** 2026-09-06
+
+**Agent/work package:** Direct continuation, requested explicitly by the project owner: "Commit.
+Then work on an Arco debugger system so you can find and fix the issue" -- Entry 21's own disclosed
+open bug. Two deliverables: a permanent, reusable debugging capability for this backend (not
+throwaway instrumentation, unlike Entry 21's own temporary logging build), then using it to actually
+resolve the bug.
+
+**What was built: `ArcoFission build ... --target linux-x86_64 --debug`/`--sanitize`.** Entry 21's
+own investigation leaned on a temporary, hand-edited logging build of `runtime_abi.cpp` (fully
+reverted afterward) and manual byte-counting against raw `objdump` output -- real, but slow and
+throwaway. This entry replaces that with a first-class, permanent CLI capability:
+- `X86_64CodegenResult` gained an `annotations` vector (`{text_offset, comment}`); `generate_x86_64_
+  function`/`generate_x86_64_program` gained a trailing `bool annotate = false` parameter that, when
+  true, records one annotation per AMIR instruction at the exact byte offset its own codegen starts,
+  rendered via `render_instruction` -- the SAME function `reveal amir` itself calls, so the comment
+  text is byte-for-byte identical to `reveal amir` output, guaranteeing the two can never drift.
+  Zero-cost when unused (default `false`); the program-level merge pass offset-adjusts each
+  fragment's annotations by its `text_base`, exactly mirroring how relocations/internal_calls/
+  external_calls are already merged there.
+- `render_x86_64_linux_asm` emits each annotation as `# TEXT+0xHEX <comment>` directly above the
+  bytes it describes. The `TEXT+0xHEX` prefix is the load-bearing design choice: since this backend
+  preserves every byte of `codegen.text` verbatim into the final binary (relocations/external calls
+  substitute same-length real mnemonics for same-length placeholder bytes), a linked binary's own
+  `main + text_offset` address is EXACTLY that instruction's first byte -- so a raw crash PC or
+  return address (gdb/ASan/a core dump), after subtracting `main`'s own runtime base (one `nm`
+  lookup), maps STRAIGHT back into the annotated `.s` file with zero reliance on DWARF line-table
+  accuracy or on gdb's own backtrace reliability (see below).
+- `NativeDebugOptions{bool annotate, bool sanitize}` (`include/arco/fission.hpp`), threaded through
+  `build_linux_native_image[_file]`. `annotate` copies the generated `.s` to `<output>.s` BEFORE the
+  temp directory is cleaned up (survives even a failed compile) and prints its path.  `sanitize`
+  inserts `-g -fsanitize=address` into the underlying compiler invocation. Both default off and cost
+  nothing on an ordinary build. `apps/arcofission/main.cpp`'s argument loop was rewritten from a
+  fixed `--flag value` stride to handle these two as bare boolean flags first.
+- **A real, useful finding about this backend's OWN generated code, surfaced while building this**:
+  every function except the entry point ("main") has NO label in the combined `.text` stream, and
+  none of it emits CFI/DWARF unwind directives or uses a real `push rbp; mov rbp, rsp` frame-pointer
+  chain (`sub rsp, frame_size` directly instead) -- meaning gdb's `bt` is fully reliable only ONE
+  level deep (the crash frame -> its direct caller, since a `call` instruction always pushes a real
+  return address regardless of CFI); anything deeper is a heuristic stack-scan. This is exactly why
+  the `TEXT+0xHEX` design sidesteps needing a reliable deep backtrace at all -- every return address
+  gdb reports, reliable or not, is independently checkable against the annotated `.s` file.
+
+**The bug, found and fixed.** Using `--debug --sanitize` together on the Entry 21 repro (reproduced
+verbatim above): a gdb batch script breaking on both `arco_value_retain`/`arco_value_release`,
+printing each call's own pointer argument and its caller's return address, traced every single
+refcount operation across the whole (deterministic-shaped, 2-element-array) run. Cross-referencing
+against the annotated `.s` file's `TEXT+0xHEX` comments (an exact instruction-for-instruction map,
+not a DWARF-line guess) showed the SAME pointer -- `key`'s own box -- released TWICE in a row with
+only one matching retain, on the loop's SECOND iteration specifically (a raw `objdump -d` of the
+address range confirmed two consecutive `call arco_value_release` instructions both loading their
+argument from the SAME register, with no intervening reload). Root cause, confirmed by reading the
+codegen: `Kind::Load`'s own explicit "retain the newly loaded value, release the destination slot's
+old value" block (added earlier for a class constructor's `RETURN VALUE %t := LOAD __instance`
+shape, see its own comment) calls `store_result(instruction.result, load_result_type)` in between --
+and `store_result` has its OWN, completely independent tracks_lifetime check (`type == "STRING"`)
+that ALSO releases the destination slot's old value whenever `load_result_type` happens to be
+`"STRING"`. Both fire for `%t19 := LOAD key` inside the loop body (`key` compared against
+`entry.Key` every iteration): one retain, but two releases of the same old value, only one store.
+Dormant on a slot's first-ever write (the "old value" is null; releasing null is a no-op) -- only
+bites once a temp slot has already held a live reference from a PRIOR iteration, which is exactly
+what "compared inside a loop" means. Fixed with a one-line guard: `Kind::Load`'s own explicit
+release now only runs when `load_result_type != "STRING"`, i.e. exactly when `store_result` will
+NOT already have handled it -- the retain is untouched (store_result never retains, so it was never
+duplicated). Verified: 20/20 clean runs under ASan (was previously non-deterministic, sometimes a
+heap-use-after-free, sometimes a leak, sometimes clean, matching Entry 21's own description of this
+bug's symptoms), output byte-identical to `compile-run` (the bytecode VM, unaffected -- this is
+native-only codegen) across every run.
+
+**Files changed:** `src/compiler/fission.cpp` (`X86_64CodegenResult::InstructionAnnotation` +
+`annotations`; `annotate` parameter on `generate_x86_64_function`/`generate_x86_64_program`; the
+annotation-emission in `render_x86_64_linux_asm`; `NativeDebugOptions` wiring and the saved-`.s`-file
+logic in `build_linux_native_image[_file]`; the one-line `Kind::Load` double-release fix).
+`include/arco/fission.hpp` (`NativeDebugOptions`). `apps/arcofission/main.cpp` (`--debug`/
+`--sanitize` flag parsing, usage text). `tests/integration/linux_native_backend_smoke.sh` (new
+`foreach-loop-double-release` section: the exact Entry 21 repro, built with `--sanitize`, run 5x
+under ASan, diffed against `compile-run`).
+
+**Commands run:** `--debug --sanitize` native builds of the minimal repro; `gdb -batch` with paired
+`arco_value_retain`/`arco_value_release` breakpoints tracing every call's pointer argument across a
+full run (~60 calls); `objdump -d --start-address=... --stop-address=...` to confirm the doubled
+release at the machine-code level, not just inferred from source; `nm` to locate `main`'s runtime
+base for `TEXT+0xHEX` correlation. Post-fix: 20 consecutive ASan runs of the repro (clean); targeted
+`ctest -R "native|linux_native|fission"` (5/5); the full `linux_native_backend_smoke.sh` standalone
+(pass); a full, unfiltered `ctest` pass (see Tests/build result).
+
+**Tests/build result:** Green -- see Commands run above for the specific passes; the full-suite
+`ctest` result is recorded inline where this entry was committed.
+
+**Known failures:** None found this entry beyond what was already fixed. Native GUI support for
+Arconaut's FULL app (past the very first frame) remains unexercised against a real display -- a
+quick re-attempt after this fix (`arconaut_native` run directly, no repro) opened no window and
+exited cleanly with no output in under a second, which does not match a real blocking `App.Start()`
+event loop; not investigated further this entry (out of scope for "find and fix the [FOR-EACH]
+issue" specifically) but flagged here as the next thing to check -- possibly a distinct, so-far-
+undiagnosed gap in how `App.Start()`'s own event loop is bridged natively, not necessarily related
+to GUI rendering itself.
+
+**Architectural decisions made:**
+- Built the debugger as a permanent, opt-in CLI feature reusing `render_instruction` (rather than a
+  parallel, bespoke annotation-text renderer) specifically so it can never silently drift out of
+  sync with `reveal amir`'s own output -- one source of truth for "what does this AMIR instruction
+  mean," two consumers.
+- Chose raw byte-offset (`TEXT+0xHEX`) correlation over relying on DWARF line info for the debugger
+  tooling's own design, after this investigation's own experience: a gdb-reported source line for a
+  return address did not always match intuition (a `call` instruction's own line was reported for
+  what should have been the line AFTER it), and this backend's generated code has no CFI/frame-
+  pointer chain, so a deep backtrace's own reliability can't be assumed either -- an exact byte
+  offset sidesteps needing either to be trustworthy.
+- Fixed the double-release with the narrowest possible guard (skip Load's own release exactly when
+  store_result will already cover it) rather than restructuring the two functions' overlapping
+  responsibility more broadly -- lower risk, and the comment on the fix documents the overlap
+  explicitly so a future change to either function's own tracks_lifetime condition has a chance of
+  noticing the other side.
+
+**Open questions carried forward:**
+- The native `App.Start()` / full-app-event-loop gap noted above under Known failures -- whether
+  Arconaut's own full GUI lifecycle actually runs natively (beyond the isolated `GUI.Size` check
+  Entry 21 already confirmed) is still not established.
+- A second, independent full-suite regression pass beyond this entry's own runs.
