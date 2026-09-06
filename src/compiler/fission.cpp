@@ -4386,6 +4386,43 @@ HostedValueKind infer_function_return_kind(const AmirModule& module, const AmirF
     return agreed_kind;
 }
 
+// A polymorphic dispatch call site's own SET of resolvable candidates -- instance-method
+// override candidates across a class hierarchy (`receiver.Method(...)`, one per class that could
+// supply it), or every ADDRESSOF target a callable variable could plausibly hold -- can disagree
+// on infer_function_return_kind's own answer just as easily as one function's own multiple RETURN
+// statements can (see that function's own comment). This is the SAME gap one level higher: both
+// call sites used to pick "the first candidate found" for their own STATIC classification (see
+// infer_hosted_value_kind's own CallValue handling, both branches previously marked "a real,
+// disclosed simplification"), which crashed for real the moment two candidates actually disagreed
+// at runtime, not just hypothetically (RFC-0049 Phase 15): `arco::Value::to_string()` throwing
+// "value is not an object" mid-call, from `PRINT a.Speak()` inside a `FOR a IN [Animal(), Dog()]`
+// loop where `Animal.Speak` returns a String and `Dog.Speak` returns FLOOR(...) -- a Boxed vs.
+// Number disagreement the classifier (biased toward whichever candidate it found first) and the
+// codegen (which, unlike the classifier, correctly stores EACH call according to ITS OWN actual
+// resolved kind -- see call_resolved_method's own force_boxed parameter) never agreed on, so
+// PRINT read a raw IEEE-754 double's own bit pattern as if it were a live ArcoValue* pointer the
+// moment the Dog branch executed. Reused by both the classifier (this function) and the codegen
+// dispatch loops (to decide whether call_resolved_method needs force_boxed=true) so they can never
+// drift out of sync with each other on the SAME question.
+HostedValueKind candidate_set_return_kind(const AmirModule& module,
+                                           const std::vector<const AmirFunction*>& candidates) {
+    bool found_any = false;
+    HostedValueKind agreed_kind = HostedValueKind::Unknown;
+    bool disagreement = false;
+    for (const AmirFunction* candidate : candidates) {
+        if (!candidate) continue;
+        const HostedValueKind this_kind = infer_function_return_kind(module, *candidate);
+        if (!found_any) {
+            agreed_kind = this_kind;
+            found_any = true;
+        } else if (this_kind != agreed_kind) {
+            disagreement = true;
+        }
+    }
+    if (!found_any) return HostedValueKind::Unknown;
+    return disagreement ? HostedValueKind::Boxed : agreed_kind;
+}
+
 // Phase 2 classes (RFC-0049 Section 4): given a class name and a method name, walks
 // module.class_parents (set once per DECLARE_CLASS by lower_class -- a class's own entry maps to
 // its immediate parent's name, or "" for none) starting at class_name itself, looking for the
@@ -4512,7 +4549,24 @@ HostedValueKind infer_local_kind(const AmirModule& module, const AmirFunction& f
 
 HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunction& function,
                                          const std::string& name, int depth = 0) {
-    if (depth > 8) return HostedValueKind::Unknown; // guards against a pathological reference cycle
+    // Guards against a pathological reference cycle (e.g. a Store cycle this static analysis
+    // would otherwise chase forever). Also, less obviously, bounds a genuine COMBINATORIAL blowup:
+    // this function has more than one self-recursive call site (Binary "+"'s own two-operand
+    // check, the CallValue candidate-set scans, etc.), so raising this cap doesn't just allow
+    // deeper chains -- it multiplies the worst-case call count roughly exponentially in the
+    // branching shape's own depth. Tried raising it to 64 (RFC-0049 Phase 15) specifically to
+    // cover deep EXTENDS chains (each level costs roughly two recursion hops) -- confirmed
+    // covering 10 levels cleanly, but ALSO confirmed, by actually timing it, hanging (30s+, no
+    // end in sight) on an existing, real, already-shipped pattern (`quoted = quoted + ch` inside a
+    // loop, Arconaut's own ShellQuote) that was previously fast: the raised cap let Binary "+"'s
+    // own recursive operand check chase combinatorially further through the SAME loop-carried
+    // variable on every one of its many Store sites. Reverted back to 8 for exactly this reason --
+    // a real, measured regression outweighs the narrower (and rarer) deep-inheritance gap, which
+    // stays a disclosed, NOT-fixed limitation (a hierarchy beyond about 3-4 EXTENDS levels can
+    // fail to compile) until this analysis is memoized per (function, name) rather than re-walked
+    // from scratch on every call, which would let the cap rise safely. See
+    // .agents/ARCO_NATIVE_RUNTIME_PROGRESS.md Entry 24 for the measurement that caught this.
+    if (depth > 8) return HostedValueKind::Unknown;
     // "nothing" (ArcoBASIC's null sentinel) is a bare literal, never a %tN temp reference -- e.g. a
     // synthesized `RETURN VALUE nothing` (a method/function with no explicit RETURN -- see
     // ensure_terminated) or an omitted slice bound. Represented as a plain null pointer, the same
@@ -4679,23 +4733,24 @@ HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunc
                 // comes from the LAST dot (`a.b.c(...)` calls method `c` on receiver path `a.b`,
                 // matching parser.cpp's own MethodCallExpr construction), regardless of how many
                 // dots precede it -- mirrors the codegen's own resolve_class_method walk to find
-                // every class that could supply this method, then uses the FIRST match's own
-                // return kind -- a real, disclosed simplification if different candidates somehow
-                // return different kinds for the same call site (an unusual, arguably malformed
-                // override in the first place), not something this static analysis tries to
-                // reconcile further.
+                // every class that could supply this method, then reconciles ALL of their own
+                // return kinds via candidate_set_return_kind (see its own comment for the real
+                // crash this fixes -- an earlier version returned the FIRST match's own kind alone).
                 const auto dot = instruction.target.rfind('.');
                 if (dot != std::string::npos) {
                     const std::string method_name = instruction.target.substr(dot + 1);
+                    std::vector<const AmirFunction*> method_candidates;
                     for (const auto& entry : module.class_parents) {
                         const auto resolved_name = resolve_class_method(module, entry.first, method_name);
                         if (!resolved_name) continue;
                         for (const auto& resolved_function : module.functions) {
                             if (resolved_function.name == *resolved_name) {
-                                return infer_function_return_kind(module, resolved_function, depth + 1);
+                                method_candidates.push_back(&resolved_function);
+                                break;
                             }
                         }
                     }
+                    if (!method_candidates.empty()) return candidate_set_return_kind(module, method_candidates);
                 }
                 // ADDRESSOF/CALLABLE dispatch (see the Kind::CallValue case's own much larger
                 // comment on this exact pattern): `instruction.target` is a plain (non-dotted)
@@ -4703,15 +4758,14 @@ HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunc
                 // trace to an ADDRESSOF result (infer_local_kind already classifies that as Boxed,
                 // the same way SELF/an untyped-with-explicit-non-hosted-type parameter/etc. all
                 // are), this is almost certainly a call through a callable variable, not a host
-                // function. Uses the FIRST candidate ADDRESSOF target found anywhere in the module
-                // for its return kind -- a real, disclosed simplification (the same one instance
-                // dispatch's own classification above already accepts) if the variable could hold
-                // callables with genuinely different return kinds across different code paths. A
-                // real bug this exact gap caused before it existed: a call through a callable
-                // resolving to a Number-returning function was classified Boxed by the fallback
-                // below, so PRINT skipped boxing entirely and handed the raw double's own bit
-                // pattern to arco_value_print as if it were already a pointer -- a real
-                // segmentation fault, not just a wrong answer. A SECOND real bug, found right
+                // function. Collects EVERY candidate ADDRESSOF target anywhere in the module and
+                // reconciles their own return kinds via candidate_set_return_kind (see its own
+                // comment for the real crash this fixes -- an earlier version returned the FIRST
+                // match's own kind alone). A real bug this exact gap caused before it existed: a
+                // call through a callable resolving to a Number-returning function was classified
+                // Boxed by the fallback below, so PRINT skipped boxing entirely and handed the raw
+                // double's own bit pattern to arco_value_print as if it were already a pointer -- a
+                // real segmentation fault, not just a wrong answer. A SECOND real bug, found right
                 // after fixing the first: with two same-arity candidates in the module (one
                 // untyped, assumed-number; one `AS STRING`), this "first match" search picked
                 // WHICHEVER ONE WAS DECLARED FIRST IN SOURCE ORDER regardless of which one the
@@ -4725,6 +4779,7 @@ HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunc
                 // "Square" (untyped) is correctly passed over in favor of "Shout" (AS STRING) when
                 // the actual argument is provably a string.
                 if (infer_local_kind(module, function, instruction.target, depth + 1) == HostedValueKind::Boxed) {
+                    std::vector<const AmirFunction*> callable_target_candidates;
                     for (const auto& candidate_function : module.functions) {
                         for (const auto& candidate_block : candidate_function.blocks) {
                             for (const auto& candidate_instruction : candidate_block.instructions) {
@@ -4748,11 +4803,12 @@ HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunc
                                         }
                                     }
                                     if (!candidate_could_match) continue;
-                                    return infer_function_return_kind(module, resolved_function, depth + 1);
+                                    callable_target_candidates.push_back(&resolved_function);
                                 }
                             }
                         }
                     }
+                    if (!callable_target_candidates.empty()) return candidate_set_return_kind(module, callable_target_candidates);
                 }
                 // Generic host-function bridge fallback (see the Kind::CallValue case's own much
                 // larger comment on this exact path): once nothing else above has matched,
@@ -4790,7 +4846,7 @@ HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunc
 // infer_hosted_value_kind itself already handles.
 bool value_could_be_hosted_number(const AmirModule& module, const AmirFunction& function,
                                    const std::string& operand, int depth) {
-    if (depth > 8) return false; // guards against a pathological reference cycle, same cap as infer_hosted_value_kind
+    if (depth > 8) return false; // guards against a pathological reference cycle, same cap as infer_hosted_value_kind (see its own comment for why this was tried at 64 and reverted)
     if (infer_hosted_value_kind(module, function, operand, depth) == HostedValueKind::Number) return true;
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) {
@@ -7249,7 +7305,8 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 // definition serves both call shapes.
                 const auto call_resolved_method = [&](const AmirFunction& resolved,
                                                        const std::vector<std::string>& args,
-                                                       std::optional<std::uint32_t> receiver_scratch_offset = std::nullopt) -> bool {
+                                                       std::optional<std::uint32_t> receiver_scratch_offset = std::nullopt,
+                                                       bool force_boxed = false) -> bool {
                     if (args.size() != resolved.params.size()) {
                         result.ok = false;
                         result.error = "call to \"" + resolved.name + "\" expects " +
@@ -7370,7 +7427,34 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     }
                     const HostedValueKind return_kind = infer_function_return_kind(module, resolved);
                     bool return_stored = false;
-                    if (return_kind == HostedValueKind::Number) {
+                    // force_boxed (RFC-0049 Phase 15): set by a polymorphic dispatch site (instance
+                    // method override / ADDRESSOF-callable) whose OWN candidate_set_return_kind
+                    // disagrees across candidates -- this ONE resolved function's own return_kind is
+                    // still correct for THIS specific call, but the SHARED destination slot
+                    // (instruction.result) needs a representation every OTHER candidate at this same
+                    // call site can also produce, or the caller's single static classification (which
+                    // must pick ONE answer for the whole call site) is wrong for whichever candidate
+                    // ISN'T the one that ran. Boxes whatever's already in XMM0/RAX right after the
+                    // internal call returns -- mirrors box_operand_into_rax's own per-kind dispatch,
+                    // just working from a value the call itself just produced rather than a stack
+                    // slot. Never fires for return_kind == Boxed (already a real pointer, nothing to
+                    // box) or when this candidate is the only one / all candidates agree (force_boxed
+                    // false, the ordinary path below, completely unaffected).
+                    if (force_boxed && return_kind == HostedValueKind::Number) {
+                        const auto call_disp = result.text.call_rel32_placeholder();
+                        result.external_calls.push_back({call_disp, "arco_value_new_number"});
+                        return_stored = store_result(instruction.result, "STRING");
+                    } else if (force_boxed && return_kind == HostedValueKind::Bool) {
+                        result.text.mov_reg_reg(Reg::RDI, Reg::RAX);
+                        const auto call_disp = result.text.call_rel32_placeholder();
+                        result.external_calls.push_back({call_disp, "arco_value_new_bool"});
+                        return_stored = store_result(instruction.result, "STRING");
+                    } else if (force_boxed && return_kind == HostedValueKind::String) {
+                        result.text.mov_reg_reg(Reg::RDI, Reg::RAX);
+                        const auto call_disp = result.text.call_rel32_placeholder();
+                        result.external_calls.push_back({call_disp, "arco_value_new_string_utf16"});
+                        return_stored = store_result(instruction.result, "STRING");
+                    } else if (return_kind == HostedValueKind::Number) {
                         return_stored = store_result_double(instruction.result, Xmm::XMM0);
                     } else if (return_kind == HostedValueKind::Bool) {
                         return_stored = store_result(instruction.result, "BOOL");
@@ -7831,6 +7915,28 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                             std::vector<std::string> call_args{""};
                             for (const auto& operand : instruction.operands) call_args.push_back(operand);
 
+                            // RFC-0049 Phase 15: whether THIS call site's own override candidates
+                            // (every class in the hierarchy that could supply this method) disagree
+                            // on return representation -- see candidate_set_return_kind's own
+                            // comment for the real crash this closes. Computed once, up front, so
+                            // every branch below boxes consistently (or none do) rather than each
+                            // branch answering a different question about the same shared slot.
+                            const bool method_candidates_disagree = [&] {
+                                std::vector<const AmirFunction*> resolved_candidates;
+                                for (const auto& [candidate_class_name, candidate_resolved_name] : candidates) {
+                                    (void)candidate_class_name;
+                                    for (const auto& candidate_function : module.functions) {
+                                        if (candidate_function.name == candidate_resolved_name) {
+                                            resolved_candidates.push_back(&candidate_function);
+                                            break;
+                                        }
+                                    }
+                                }
+                                return !resolved_candidates.empty() &&
+                                    candidate_set_return_kind(module, resolved_candidates) == HostedValueKind::Boxed &&
+                                    resolved_candidates.size() > 1;
+                            }();
+
                             std::vector<std::size_t> done_jumps;
                             for (const auto& [class_name, resolved_name] : candidates) {
                                 const AmirFunction* resolved = nullptr;
@@ -7877,7 +7983,7 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                                 // is confirmed -- past this point no other candidate's comparison
                                 // will re-read it, so this is its last use.
                                 release_scratch_temp(static_cast<std::uint32_t>(scratch_base + 8));
-                                if (!call_resolved_method(*resolved, call_args, static_cast<std::uint32_t>(scratch_base + 16))) return result;
+                                if (!call_resolved_method(*resolved, call_args, static_cast<std::uint32_t>(scratch_base + 16), method_candidates_disagree)) return result;
                                 // The resolved receiver itself (scratch_base+16) is released the
                                 // same way -- but ONLY if it's a fresh reference this dispatch's own
                                 // field-read chain created (receiver_fields non-empty); the common,
@@ -7996,6 +8102,26 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                         if (!load_value(instruction.target, "STRING", Reg::RDI)) return result;
                         result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(scratch_base), Reg::RDI);
 
+                        // RFC-0049 Phase 15: same as instance dispatch's own identical computation
+                        // just above -- whether THIS call site's own filtered candidate set
+                        // disagrees on return representation, so call_resolved_method boxes
+                        // consistently across every candidate the callable variable could actually
+                        // hold at runtime. See candidate_set_return_kind's own comment.
+                        const bool callable_candidates_disagree = [&] {
+                            std::vector<const AmirFunction*> resolved_candidates;
+                            for (const auto& candidate_name : callable_candidates) {
+                                for (const auto& candidate_function : module.functions) {
+                                    if (candidate_function.name == candidate_name) {
+                                        resolved_candidates.push_back(&candidate_function);
+                                        break;
+                                    }
+                                }
+                            }
+                            return !resolved_candidates.empty() &&
+                                candidate_set_return_kind(module, resolved_candidates) == HostedValueKind::Boxed &&
+                                resolved_candidates.size() > 1;
+                        }();
+
                         for (const auto& candidate_name : callable_candidates) {
                             const AmirFunction* resolved = nullptr;
                             for (const auto& candidate_function : module.functions) {
@@ -8028,7 +8154,7 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                             result.text.cmp_reg_imm32(Reg::RAX, 0);
                             const std::size_t no_match_disp = result.text.jcc_rel32_placeholder(0x4); // JE -> next candidate
 
-                            if (!call_resolved_method(*resolved, instruction.operands)) return result;
+                            if (!call_resolved_method(*resolved, instruction.operands, std::nullopt, callable_candidates_disagree)) return result;
                             const std::size_t done_disp = result.text.jmp_rel32_placeholder();
                             done_jumps.push_back(done_disp);
 

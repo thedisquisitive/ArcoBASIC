@@ -1786,3 +1786,83 @@ SCRIPT
 diff -u "$TMP_ROOT/untyped-param-ambiguous-number-bytecode-run.txt" "$TMP_ROOT/untyped-param-ambiguous-number-native-run.txt"
 printf '7\n1\n' > "$TMP_ROOT/untyped-param-ambiguous-number-expected.txt"
 diff -u "$TMP_ROOT/untyped-param-ambiguous-number-expected.txt" "$TMP_ROOT/untyped-param-ambiguous-number-native-run.txt"
+
+# Entry 24 (RFC-0049 Phase 15): a polymorphic instance-method dispatch site whose own override
+# candidates disagree on return representation across a class hierarchy -- Animal.Speak returns a
+# provably-String literal, Dog.Speak (EXTENDS Animal) returns FLOOR(...), a Boxed value -- crashed
+# for real (`arco::Value::to_string()` throwing "value is not an object" mid-call, a wild read of a
+# raw IEEE-754 double's own bit pattern misinterpreted as a live ArcoValue* pointer) the moment the
+# call site's SHARED destination slot held the SECOND candidate's own, differently-represented
+# result: the classifier (infer_hosted_value_kind's own CallValue handling) used to answer based on
+# whichever candidate resolve_class_method's own hierarchy walk found FIRST, a "real, disclosed
+# simplification" that PRINT (and every other consumer) trusted as the call site's ONE static
+# answer. Fixed with candidate_set_return_kind, reconciling EVERY override candidate's own return
+# kind (Boxed on disagreement, matching every other "ambiguous representation" fix in this file),
+# paired with a new force_boxed parameter on call_resolved_method's own codegen that boxes
+# whichever candidate ACTUALLY executes into a real ArcoValue* whenever the call site's candidates
+# disagree -- so the shared slot always holds a representation matching the classifier's own answer
+# regardless of which override runs.
+cat > "$TMP_ROOT/polymorphic-dispatch-ambiguous-return.abas" <<'SCRIPT'
+CLASS Animal
+    FUNCTION Speak()
+        RETURN "generic"
+    END FUNCTION
+END CLASS
+CLASS Dog EXTENDS Animal
+    FUNCTION Speak()
+        RETURN FLOOR(1.0)
+    END FUNCTION
+END CLASS
+animals = [Animal(), Dog()]
+FOR a IN animals
+    PRINT a.Speak()
+NEXT
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/polymorphic-dispatch-ambiguous-return.abas" -o "$TMP_ROOT/polymorphic-dispatch-ambiguous-return" --target linux-x86_64 --sanitize > /dev/null
+for i in 1 2 3 4 5; do
+    ASAN_OPTIONS=abort_on_error=1:halt_on_error=1 "$TMP_ROOT/polymorphic-dispatch-ambiguous-return" > "$TMP_ROOT/polymorphic-dispatch-ambiguous-return-native-run.txt"
+done
+"$ARCOFISSION" compile-run "$TMP_ROOT/polymorphic-dispatch-ambiguous-return.abas" > "$TMP_ROOT/polymorphic-dispatch-ambiguous-return-bytecode-run.txt"
+diff -u "$TMP_ROOT/polymorphic-dispatch-ambiguous-return-bytecode-run.txt" "$TMP_ROOT/polymorphic-dispatch-ambiguous-return-native-run.txt"
+printf 'generic\n1\n' > "$TMP_ROOT/polymorphic-dispatch-ambiguous-return-expected.txt"
+diff -u "$TMP_ROOT/polymorphic-dispatch-ambiguous-return-expected.txt" "$TMP_ROOT/polymorphic-dispatch-ambiguous-return-native-run.txt"
+
+# Entry 24's own ADDRESSOF/CALLABLE counterpart -- the identical crash, one dispatch shape over:
+# a callable variable holding EITHER of two same-arity, zero-argument functions with genuinely
+# different return representations (a Boxed-via-host-bridge Number vs a provably-String literal),
+# called through the SAME call site on two separate lines. Fixed the same way, via candidate_set_
+# return_kind reconciling every ADDRESSOF candidate the callable variable could hold and force_
+# boxed on call_resolved_method's own codegen.
+cat > "$TMP_ROOT/addressof-ambiguous-return.abas" <<'SCRIPT'
+FUNCTION GiveNumber()
+    RETURN FLOOR(4.2)
+END FUNCTION
+FUNCTION GiveString()
+    RETURN "hi"
+END FUNCTION
+handler = ADDRESSOF GiveNumber
+PRINT handler()
+handler = ADDRESSOF GiveString
+PRINT handler()
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/addressof-ambiguous-return.abas" -o "$TMP_ROOT/addressof-ambiguous-return" --target linux-x86_64 --sanitize > /dev/null
+for i in 1 2 3 4 5; do
+    ASAN_OPTIONS=abort_on_error=1:halt_on_error=1 "$TMP_ROOT/addressof-ambiguous-return" > "$TMP_ROOT/addressof-ambiguous-return-native-run.txt"
+done
+"$ARCOFISSION" compile-run "$TMP_ROOT/addressof-ambiguous-return.abas" > "$TMP_ROOT/addressof-ambiguous-return-bytecode-run.txt"
+diff -u "$TMP_ROOT/addressof-ambiguous-return-bytecode-run.txt" "$TMP_ROOT/addressof-ambiguous-return-native-run.txt"
+printf '4\nhi\n' > "$TMP_ROOT/addressof-ambiguous-return-expected.txt"
+diff -u "$TMP_ROOT/addressof-ambiguous-return-expected.txt" "$TMP_ROOT/addressof-ambiguous-return-native-run.txt"
+
+# A class hierarchy deeper than about 3-4 EXTENDS levels can still fail to compile ("value ... is
+# not statically classifiable") -- infer_hosted_value_kind's own cycle-guard depth cap (8) is
+# consumed by roughly two recursion hops per EXTENDS level. A fix (raising the cap) was tried and
+# REVERTED during this same investigation (RFC-0049 Phase 15) after actually timing it: the raised
+# cap let a DIFFERENT, unrelated, already-recursive call shape (Binary "+"'s own operand check,
+# re-walked on every Store site of a loop-carried variable) blow up combinatorially, hanging
+# compilation of an existing, real, already-shipped pattern (Arconaut's own ShellQuote,
+# `quoted = quoted + ch` inside a loop) that was previously fast. Left as a disclosed, NOT-fixed
+# limitation rather than trade a rare deep-inheritance gap for a real regression on working code --
+# see infer_hosted_value_kind's own comment for the full reasoning; a proper fix needs memoizing
+# this analysis per (function, name), not just a bigger cap. No regression test added for the
+# gap itself (it's an intentionally-still-open limitation, not a fixed behavior to pin).

@@ -569,6 +569,44 @@ writer was built for this; none was needed.
   interactive confirmation of the native binary's own UI. Full project-wide test suite, 123/124 (the
   one failure is the already-documented, unrelated PS/2-driver QEMU flake, re-confirmed not a
   regression). See `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` Entry 23 for the full writeup.
+- **Phase 15** — proactive bug-hunting with the Phase 13 debugger tooling, on the project owner's
+  own open-ended instruction ("feel free to work on any compiler bugs you can find"), rather than
+  chasing one disclosed gap. Live-drove Arconaut against a real display first (every tab renders;
+  a read-only device Inspect/List action round-trips correctly), then wrote ~20 minimal,
+  Arconaut-independent repros targeting the same "ambiguous physical representation across code
+  paths" pattern every real bug in Phases 12/14 already found, in constructs not yet directly
+  tested. Found and fixed two more real crashes, both the SAME root cause one level up from Phase
+  14's own fixes: a polymorphic instance-method dispatch site (`FOR a IN [Animal(), Dog()]: PRINT
+  a.Speak()`, where the two classes' own `Speak` overrides return genuinely different
+  representations — a String literal vs. a Boxed `FLOOR(...)` result) and the identical shape for
+  ADDRESSOF/callable dispatch, both crashing for real (`arco::Value::to_string()` throwing "value
+  is not an object", a wild read of a raw double's own bit pattern as a live pointer) the moment
+  the SECOND candidate actually ran — root-caused directly with `gdb -batch -ex run -ex bt` on a
+  `--debug --sanitize` build. Root cause: `infer_hosted_value_kind`'s own CallValue classification
+  for both dispatch shapes picked the FIRST candidate it found — already disclosed in its own
+  comment as "a real, disclosed simplification if different candidates somehow return different
+  kinds" — while the codegen (`call_resolved_method`) correctly stored EACH candidate's own return
+  according to its OWN kind into the one shared destination slot every consumer trusted as having
+  ONE representation. Fixed with a new `candidate_set_return_kind` helper (reconciling a WHOLE
+  candidate set the same "agree → that answer, disagree → Boxed" way Phase 14's Store/Return fixes
+  already do) paired with a new `force_boxed` parameter on `call_resolved_method`'s own codegen
+  that boxes whichever candidate actually executes whenever the call site's candidates disagree.
+  Verified against ~20 repros including 2/3-level hierarchies, a 3-way String/Number/Bool diamond
+  disagreement, dispatch results fed into arithmetic/concatenation/IF-conditions, dispatch with
+  arguments, and chained receivers — all matching `compile-run`, the two crash repros 5x clean
+  under ASan. **A third finding — a hardcoded recursion-depth cap (`depth > 8`) silently
+  miscompiling any class hierarchy deeper than about 3-4 `EXTENDS` levels — was investigated,
+  fixed, and then REVERTED before landing**: raising the cap did fix the target case, but a direct
+  timing measurement (not just correctness testing) caught it hanging (30s+) an existing, already-
+  shipped pattern (Arconaut's own `ShellQuote`, `quoted = quoted + ch` in a loop) that compiled in
+  ~2 seconds before the change — the same recursive analysis has more than one self-recursive call
+  site, so a bigger cap multiplies worst-case work roughly exponentially in branching shapes
+  elsewhere, not just depth in the deep-inheritance case it was aimed at. Left as a disclosed,
+  NOT-fixed limitation (a real fix needs memoizing this analysis per (function, name), not a bigger
+  cap) rather than trade a rare gap for a measured regression on working code. Full project-wide
+  test suite green (including a direct re-time of the ShellQuote pattern confirming the revert
+  restored its original speed). See `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` Entry 24 for the full
+  writeup, including the specific timing numbers that caught the regression.
 
 **Explicitly not attempted yet (disclosed, not silently missing):**
 - The Windows target (`--target windows-x86_64` for this backend does not exist; the *bytecode
@@ -583,6 +621,10 @@ writer was built for this; none was needed.
   Snapshot actions that shell out to `arcfsctl`) works end to end natively, beyond the Volumes
   tab's own render+click path Phase 14 directly exercised, is still not established — a natural
   next step, not attempted this phase (out of scope for the specific question Phase 14 answered).
+- A class hierarchy deeper than about 3-4 `EXTENDS` levels can fail to compile ("value ... is not
+  statically classifiable") — Phase 15's own third finding, deliberately left unfixed after the
+  obvious fix (raising a recursion-depth cap) was measured to regress an existing working pattern
+  elsewhere; needs memoizing `infer_hosted_value_kind`'s own analysis, not a bigger cap.
 
 ## 5. Relationship to ArcoSH
 

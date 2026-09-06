@@ -2910,3 +2910,159 @@ elsewhere in this project's own history, confirmed not a regression from this en
   next step, not attempted this entry (out of scope for "why can't we get arconaut to run
   natively," which is now answered).
 - A second, independent full-suite regression pass beyond this entry's own runs.
+
+## Entry 24 — Using the native debugger to hunt for more real bugs, on the project owner's own instruction
+
+**Date:** 2026-09-06
+
+**Agent/work package:** Direct continuation, requested explicitly: "Use our new debugging tools to
+find out [why the rest of Arconaut might not work]. I am going to visit family, feel free to work
+on any compiler bugs you can find out" -- open-ended authorization to keep using the Phase 13
+debugger tooling (`--debug`/`--sanitize`) proactively, not reactively chasing one disclosed gap.
+Live-drove native Arconaut against a real display first (every tab renders correctly, a read-only
+Inspect/List action against a real device round-trips its error text correctly), then pivoted to
+writing minimal, Arconaut-independent repros targeting the SAME "ambiguous physical representation
+across code paths" pattern every real bug this whole RFC keeps finding, in constructs not yet
+directly tested: class-field assignment across methods, ADDRESSOF/polymorphic dispatch, TRY/CATCH,
+chained receivers, deep inheritance -- roughly 20 targeted scripts, each diffed against
+`compile-run`. Two of them crashed for real; a third miscompiled entirely once the first two fixes
+were applied and a deeper hierarchy was tried.
+
+**Bug 1 — polymorphic instance-method dispatch with disagreeing candidates.** `FOR a IN [Animal(),
+Dog()]: PRINT a.Speak(): NEXT` where `Animal.Speak` returns a provably-String literal and `Dog.
+Speak` (EXTENDS Animal, overriding) returns `FLOOR(1.0)`, a Boxed value -- crashed on the SECOND
+iteration: `arco::Value::to_string()` threw `std::runtime_error("value is not an object")`,
+uncaught, aborting the whole process. Root-caused directly with the Phase 13 tooling: `gdb -batch
+-ex run -ex bt` on a `--debug --sanitize` build pointed straight at `arco_value_print ->
+Value::to_string() -> Value::as_object()` throwing on a value at an address that was never a real
+heap pointer at all -- a raw IEEE-754 double's own bit pattern, read as if it were a live
+`ArcoValue*`. Root cause: `infer_hosted_value_kind`'s own instance-dispatch classification walked
+every class that could supply the called method and returned the FIRST candidate's own return
+kind -- already disclosed in its own comment as "a real, disclosed simplification if different
+candidates somehow return different kinds for the same call site" -- while the ACTUAL codegen
+(`call_resolved_method`, invoked once per candidate in a runtime `__class`-comparison chain) always
+correctly stored EACH candidate's OWN kind into the SAME shared destination slot. Two candidates,
+two different physical representations, one classifier answer used by every consumer (PRINT here)
+regardless of which one actually ran.
+
+**Bug 2 — the identical gap, one dispatch shape over: ADDRESSOF/callable dispatch.** `handler =
+ADDRESSOF GiveNumber: PRINT handler(): handler = ADDRESSOF GiveString: PRINT handler()` -- same
+crash, same root cause, in the OTHER "first candidate found" simplification the exact same
+CallValue classification code already disclosed just below the instance-dispatch one.
+
+**Fix (both bugs, one mechanism).** A new `candidate_set_return_kind` helper reconciles a
+call site's WHOLE set of resolvable candidates (every class-hierarchy override for instance
+dispatch, every same-arity/argument-compatible ADDRESSOF target for callable dispatch) via the same
+"agree -> that answer, disagree -> Boxed" policy `infer_local_kind`/`infer_function_return_kind`
+already established (Phase 14) -- both `infer_hosted_value_kind` call sites rewritten to collect
+every candidate first, classify never on just the first found. Paired with a new `force_boxed`
+parameter on `call_resolved_method`'s own codegen (both dispatch loops now pre-compute whether
+their own candidate set disagrees, once, before the runtime branch chain): when true, whatever the
+resolved candidate ACTUALLY produces (a raw double in XMM0, a raw bool in RAX, a raw literal string
+pointer in RAX) is boxed fresh (`arco_value_new_number`/`_bool`/`_string_utf16`) before being
+stored into the shared destination slot -- mirroring `box_operand_into_rax`'s own per-kind dispatch,
+just working from a value the internal call itself just produced rather than a stack-slot operand.
+An already-Boxed candidate, or a call site where every candidate agrees, is completely unaffected
+(force_boxed only ever changes codegen for a return_kind of Number/Bool/String, and is only ever
+true when there's real disagreement to reconcile).
+
+**Bug 3 (attempted, then REVERTED -- left disclosed, not fixed): a hardcoded recursion-depth cap
+silently miscompiling any 4+-level class hierarchy**, found while stress-testing bugs 1-2's own
+fixes against progressively deeper inheritance. `infer_hosted_value_kind`'s own cycle guard
+(`depth > 8`) is consumed by roughly two recursion hops per `EXTENDS` level (a constructor's own
+CallValue lookup, then the `Load` of its own `__instance` local, chasing down to the real
+base-class construction) -- so ANY class hierarchy deeper than about 3-4 levels hits the cap and
+fails to compile ("value ... is not statically classifiable"), reproduced with a bare 4-level
+`EXTENDS` chain and NO method calls or dispatch involved at all (not related to bugs 1-2, a
+separate pre-existing limit). Raising the cap (tried at 64) DID fix this, confirmed clean to 10
+levels -- but this function has more than one self-recursive call site (Binary "+"'s own
+two-operand check among them), so a higher cap doesn't just allow deeper CHAINS, it multiplies the
+worst-case call count roughly exponentially in whatever BRANCHING shape the analysis actually
+walks. Caught before landing by actually TIMING the change against the existing smoke suite, not
+just checking correctness: the raised cap hung (30s+, no end in sight) an already-shipped, working
+pattern -- Arconaut's own `ShellQuote` (`quoted = quoted + ch` inside a loop) -- that compiled in
+about 2 seconds before the change. **Reverted back to 8** in both places it's checked
+(`infer_hosted_value_kind`, `value_could_be_hosted_number`): a real, measured regression on
+existing working code outweighs a narrower, rarer gap. The deep-inheritance limit stays a
+disclosed, NOT-fixed gap -- a proper fix needs memoizing this analysis per (function, name) so
+repeated queries for the same value don't re-walk the same recursive shape from scratch, which
+would let the cap rise safely; out of scope for this pass. No regression test was added for the
+gap itself (deliberately -- it documents an intentional limitation, not a fixed behavior to pin).
+
+**Confirmed working:** ~20 targeted repro scripts (class-field assignment, FOR-loop accumulators,
+ADDRESSOF dispatch at 2 and 3 candidates, TRY/CATCH-ambiguous results, polymorphism at 2/3-level
+hierarchies including a diamond-shaped 3-way String/Number/Bool disagreement, dispatch results fed
+into arithmetic/concatenation/IF-conditions, dispatch WITH arguments, chained receivers), every one
+diffed against `compile-run`, the two crashing repros re-run 5x each under ASan (clean every time
+after the fix). Full `linux_native_backend_smoke.sh` (two new permanent regression sections for
+the two real, LANDED fixes) and the complete project-wide test suite both pass -- including a
+direct re-time of the ShellQuote-shaped pattern after the depth-cap revert (back to ~2s, matching
+pre-Phase-15 behavior). Live-driving Arconaut itself found no NEW bugs beyond what Phase 14 already
+fixed (every tab renders, a read-only device Inspect/List action round-trips correctly) -- this
+entry's two landed bugs were both found by targeted synthetic repros, not by continuing to click
+through the live app, once the app itself stopped surfacing anything new.
+
+**Files changed:** `src/compiler/fission.cpp` (`candidate_set_return_kind`; both `infer_hosted_
+value_kind` CallValue-classification call sites for instance/ADDRESSOF dispatch rewritten to scan
+every candidate; `call_resolved_method`'s new `force_boxed` parameter and its per-kind boxing
+branches; both dispatch loops' own pre-computed disagreement check; the depth-cap comment updated
+to record the 64 attempt and why it was reverted, cap itself unchanged at 8). `tests/integration/
+linux_native_backend_smoke.sh` (two new sections: `polymorphic-dispatch-ambiguous-return`,
+`addressof-ambiguous-return`).
+
+**Commands run:** `gdb -batch -ex run -ex bt` on `--debug --sanitize` builds for both crashes
+(pinpointed the exact throw site through `arco_value_print`); ~20 minimal repro scripts each built
+both native (`--sanitize`, 5x ASan runs for the two crash repros) and via `compile-run`, diffed;
+`time` directly measuring the depth-cap change's own compile-time cost against the ShellQuote
+pattern (the measurement that caught and reverted bug 3); targeted `ctest -R "native|linux_native|
+fission|arcofission"` (5/5) after the dispatch fix; a full, unfiltered `ctest` pass after the final
+(dispatch-fixed, depth-cap-reverted) state landed (see Tests/build result).
+
+**Tests/build result:** Green -- see Commands run above; full-suite result recorded inline where
+this entry was committed.
+
+**Known failures:** None found this entry beyond what was already fixed and verified working. The
+deep-inheritance depth-cap gap (bug 3) is a known, disclosed, NOT-fixed limitation -- see its own
+writeup above.
+
+**Architectural decisions made:**
+- The SAME reconciliation policy (`agree -> that answer, disagree -> Boxed`) now covers FOUR
+  distinct ambiguity sites across this backend (Binary "+"/STRING-parameter boxing from Phase 12,
+  Store/Return from Phase 14, and now polymorphic/ADDRESSOF dispatch here) -- strong, repeated
+  evidence this is the correct general answer to "what should a classifier do when a single AMIR
+  shape's real representation depends on which runtime path executes," not something to keep
+  re-deriving site by site. A future site hitting the same shape should reach for this policy
+  first, not rediscover it.
+- `force_boxed`'s own per-kind boxing branches are written directly against XMM0/RAX rather than
+  reusing `box_operand_into_rax` (which expects a stack-slot operand it can freely reload) -- the
+  value here is a JUST-RETURNED result sitting in a register immediately after an internal call,
+  a different enough shape that forcing it through the existing helper would have meant spilling
+  to a scratch slot solely to satisfy that helper's own calling convention. Kept as a parallel,
+  narrower dispatch instead, at the cost of near-duplicating box_operand_into_rax's own per-kind
+  logic once (documented in its own comment, not hidden).
+- The depth-cap fix was reverted specifically because it was VERIFIED by measurement, not just
+  reasoned about, before it could ship as a silent regression -- "fixed" was confirmed by testing
+  the target case (10-level hierarchy, worked), and "safe" was ALSO confirmed by testing an
+  unrelated existing case (ShellQuote, hung) rather than assumed from "a genuinely cyclic case
+  recurses further than this anyway" reasoning alone, which was true but incomplete -- it didn't
+  account for combinatorial (not just deep-but-linear) recursion shapes elsewhere in the same
+  function. A concrete lesson for the next depth/limit-raising change in this file: time it against
+  the existing suite before trusting reasoning about "the guard's own worst case" alone.
+
+**Open questions carried forward:**
+- Whether Arconaut's OWN full interactive lifecycle (every tab, every button, Mount/Format/
+  Snapshot actions that shell out to `arcfsctl`) works end to end natively is still not
+  established -- live-driving found nothing new this entry, but only the Volumes tab's own
+  render+click path and one read-only action were actually exercised against the real app; the
+  other tabs' own action buttons (Mount, Format, Install/Refresh, Snapshot Create/Rollback/Delete)
+  were deliberately not clicked (real side effects / system mutation risk in this environment), so
+  this remains genuinely unverified, not merely unlikely.
+- A parameter whose type genuinely varies by call site (e.g. a constructor parameter that could
+  receive either a Boxed object/array OR a hosted number depending on the call site) still needs
+  an explicit type annotation (`AS OBJECT`/`AS ARRAY`) on this backend -- confirmed still working
+  exactly as designed, not a new gap, but noted here since it came up directly while writing this
+  entry's own repros.
+- A class hierarchy deeper than about 3-4 `EXTENDS` levels can fail to compile ("value ... is not
+  statically classifiable") -- bug 3 above, attempted and REVERTED this entry after it was found to
+  cause a real compile-time regression elsewhere. The real fix needs memoizing `infer_hosted_value_
+  kind`'s own analysis per (function, name), not just a bigger recursion cap.
