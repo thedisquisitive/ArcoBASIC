@@ -1,0 +1,40 @@
+' The clang/gcc argument-construction adapter (rivet/docs/rivet-rfc.md sections 19/38, M5's own
+' eventual adapter-plugin-registry seam). Deliberately hardcoded for this slice, not pluggable --
+' BuildTarget.Build() (rivet/stdlib/rivet.abas) calls these two well-known function names directly.
+' A later real registry only ever needs to change THAT call site (a capability-based lookup that
+' currently resolves to exactly this one adapter), never build.abas itself, never the native core.
+'
+' Always appends `-MMD -MF <object>.d` (RFC section 23: use the compiler's own dependency output,
+' don't write a brittle include-scanner). rivet/core/toolchain/cxx.cpp's own parse_depfile() reads
+' the resulting file after a successful compile and folds newly-discovered header paths into that
+' action's recorded inputs for the NEXT build -- inert on a project's very first build, since no
+' .d file exists yet (a normal characteristic of depfile-based incremental systems, not a bug).
+
+FUNCTION CxxAdapter_BuildCompileArguments(target, source, objectPath)
+    args = ["-std=" + target.Compiler.Standard, "-MMD", "-MF", objectPath + ".d"]
+    FOR includeDir IN target.Includes.Items
+        ignored = Array.Push(args, "-I" + includeDir)
+    NEXT
+    IF target.Compiler.Warnings == "strict" THEN
+        ignored = Array.Push(args, "-Wall")
+        ignored = Array.Push(args, "-Wextra")
+    END IF
+    ignored = Array.Push(args, "-c")
+    ignored = Array.Push(args, source)
+    ignored = Array.Push(args, "-o")
+    ignored = Array.Push(args, objectPath)
+    RETURN args
+END FUNCTION
+
+FUNCTION CxxAdapter_BuildLinkArguments(target, objectPaths, outputPath)
+    args = []
+    FOR obj IN objectPaths
+        ignored = Array.Push(args, obj)
+    NEXT
+    ignored = Array.Push(args, "-o")
+    ignored = Array.Push(args, outputPath)
+    FOR lib IN target.Libraries.Items
+        ignored = Array.Push(args, "-l" + lib)
+    NEXT
+    RETURN args
+END FUNCTION

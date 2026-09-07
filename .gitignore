@@ -10,6 +10,11 @@ build/
 !scripts/build/
 !fissure/adapters/build/
 build-*/
+# Rivet's own per-project runtime state directory (rivet/docs/rivet-rfc.md section 32) -- a
+# developer will run `rivet build` directly inside rivet/examples/tiny-project/ by hand during
+# development, not just via the tmp-dir-copying integration smoke test, so this needs to be
+# ignored wherever it appears, not just at the repo root.
+.rivet/
 dist/
 /var/
 CMakeFiles/

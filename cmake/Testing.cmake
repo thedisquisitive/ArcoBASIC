@@ -117,3 +117,18 @@ if(TARGET fissure_core)
         ${CMAKE_COMMAND}
     )
 endif()
+
+# Rivet (rivet/docs/rivet-rfc.md) -- guarded on TARGET rivet_core the same way fissure_core above,
+# since rivet/CMakeLists.txt returns early (no targets defined) when sqlite3 isn't available.
+if(TARGET rivet_core)
+    add_executable(rivet_tests tests/unit/rivet_tests.cpp)
+    target_link_libraries(rivet_tests PRIVATE rivet_core)
+    add_test(NAME rivet_tests COMMAND rivet_tests)
+
+    arco_add_script_test(
+        rivet_smoke
+        tests/integration/rivet_smoke.sh
+        $<TARGET_FILE:rivet>
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+endif()

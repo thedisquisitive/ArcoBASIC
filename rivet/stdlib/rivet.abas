@@ -1,0 +1,128 @@
+' Rivet's own rich ArcoBASIC object model (rivet/docs/rivet-rfc.md section 6/46) -- auto-loaded by
+' VM::load_stdlib() before a project's own build.abas, into the SAME arco::Runtime instance, so
+' these classes/functions are visible when build.abas runs next (the same proven pattern
+' fissure/core/vm/vm.cpp already established).
+'
+' Every RFC example in this file uses REAL, verified ArcoBASIC syntax only -- no `:=` named
+' arguments (translated to a single trailing object-literal parameter), no `DIM x AS ARRAY OF T`
+' (translated to plain `x = []`), no bare PROFILE/TARGET block statements. See
+' rivet/RIVET_PROGRESS.md's "Design decisions" for the full rationale.
+'
+' `!`, never bare `NOT`; `&&`/`ANDALSO`/`||`/`ORELSE`, never bare `AND`/`OR` -- both are bitwise,
+' non-short-circuiting operators in this language, not logical ones (see
+' [[project_arcobasic_not_bitwise_footgun]]). `==`, never bare `=`, for comparison. `Object.Get/
+' Set/Has`, never `obj["key"]` bracket-indexing (throws on this interpreter). All mutable state
+' lives on `SELF` inside real class instances -- never a module-level variable mutated from inside
+' a plain FUNCTION (a real, separately-discovered tree-walker limitation this session, see
+' [[project_arcobasic_treewalker_global_mutation_bug]]).
+
+CLASS FileList
+    CONSTRUCTOR()
+        SELF.Items = []
+    END CONSTRUCTOR
+
+    ' `Append`, not `Add` -- `ADD` is a reserved keyword in this language (confirmed:
+    ' src/frontend/lexer.cpp:85 maps it to TokenType::Add, used by some other statement-level
+    ' sugar), so `FUNCTION Add(...)` fails to parse ("expected method name") inside a CLASS. Found
+    ' directly by testing, not assumed -- a real, previously-undocumented reserved-word collision,
+    ' distinct from the NOT/AND/OR bitwise footgun. `AddTree` below is a different identifier
+    ' token entirely and does not collide.
+    FUNCTION Append(path)
+        ignored = Array.Push(SELF.Items, path)
+        RETURN SELF
+    END FUNCTION
+
+    ' RFC section 8's `App.Sources.AddTree("src", Extension := ".cpp")` -- the `:=` named argument
+    ' becomes a single trailing object-literal parameter: `AddTree("src", {Extension: ".cpp"})`.
+    FUNCTION AddTree(directory, options)
+        FOR entry IN DIRECTORY(directory, RECURSIVE)
+            IF entry.Extension == options.Extension THEN ignored = Array.Push(SELF.Items, entry.Path)
+        NEXT
+        RETURN SELF
+    END FUNCTION
+END CLASS
+
+CLASS CompilerOptions
+    CONSTRUCTOR(toolchain)
+        SELF.Path = toolchain.Path
+        SELF.Family = toolchain.Family
+        SELF.Version = toolchain.Version
+        SELF.Standard = "c++17"
+        SELF.Warnings = "normal"
+    END CONSTRUCTOR
+END CLASS
+
+CLASS BuildTarget
+    CONSTRUCTOR(name, kind)
+        SELF.Name = name
+        SELF.Kind = kind
+        SELF.Sources = FileList()
+        SELF.Includes = FileList()
+        SELF.Libraries = FileList()
+        SELF.OutputDirectory = "build"
+        detected = RIVET.Toolchain.DetectCxx()
+        IF !detected.Found THEN
+            ignored = RIVET.Log.Error("no C++ compiler found on PATH (tried clang++, g++, c++)")
+        END IF
+        SELF.Compiler = CompilerOptions(detected)
+    END CONSTRUCTOR
+
+    FUNCTION OutputPath()
+        RETURN SELF.OutputDirectory + "/" + SELF.Name
+    END FUNCTION
+
+    ' Materializes every currently-declared source into one Compile action + one Link action, and
+    ' registers them into the native graph via RIVET.Graph.Action. Real EXECUTION happens later,
+    ' once, natively, after build.abas finishes running (the "two-phase build lifecycle" design
+    ' decision -- see RIVET_PROGRESS.md) -- this method only ever DESCRIBES work, never runs it.
+    FUNCTION Build()
+        objectIds = []
+        objectPaths = []
+        FOR source IN SELF.Sources.Items
+            objectPath = ".rivet/obj/" + SELF.Name + "/" + String.Replace(source, "/", "_") + ".o"
+            args = CxxAdapter_BuildCompileArguments(SELF, source, objectPath)
+            spec = { Type: "Compile", Target: SELF.Name, DisplayName: source,
+                     Inputs: [source], Outputs: [objectPath],
+                     Tool: SELF.Compiler.Path, ToolVersion: SELF.Compiler.Version,
+                     Arguments: args, Dependencies: [], OriginFunction: "BuildTarget.Build" }
+            actionId = RIVET.Graph.Action(spec)
+            ignored = Array.Push(objectIds, actionId)
+            ignored = Array.Push(objectPaths, objectPath)
+        NEXT
+
+        linkArgs = CxxAdapter_BuildLinkArguments(SELF, objectPaths, SELF.OutputPath())
+        linkSpec = { Type: "Link", Target: SELF.Name, DisplayName: SELF.OutputPath(),
+                     Inputs: objectPaths, Outputs: [SELF.OutputPath()],
+                     Tool: SELF.Compiler.Path, ToolVersion: SELF.Compiler.Version,
+                     Arguments: linkArgs, Dependencies: objectIds, OriginFunction: "BuildTarget.Build" }
+        ignored = RIVET.Graph.Action(linkSpec)
+        RETURN SELF
+    END FUNCTION
+END CLASS
+
+CLASS BuildNamespace
+    FUNCTION Executable(name)
+        RETURN BuildTarget(name, "Executable")
+    END FUNCTION
+    FUNCTION StaticLibrary(name)
+        RETURN BuildTarget(name, "StaticLibrary")
+    END FUNCTION
+END CLASS
+
+' RFC section 1/8's own `FOR FILE IN DIRECTORY("src", RECURSIVE)` call shape, preserved exactly --
+' RECURSIVE is a plain global constant (TRUE), not new syntax; DIRECTORY is a plain global
+' function, not a reserved word (confirmed: none of TARGET/PROJECT/PROFILE/BUILD/COMPILER/
+' GENERATE/DIRECTORY are reserved in this language's lexer). No custom iterator protocol exists in
+' this language, so this always eagerly returns a real, fully materialized array -- never a lazy/
+' streaming iterator.
+FUNCTION DIRECTORY(root, recursive = FALSE)
+    IF recursive THEN
+        RETURN RIVET.Filesystem.WalkFiles(root)
+    ELSE
+        RETURN File.List(root)
+    END IF
+END FUNCTION
+
+BUILD = BuildNamespace()
+RECURSIVE = TRUE
+TARGET = { OS: RIVET.Host.OS(), Architecture: RIVET.Host.Architecture() }

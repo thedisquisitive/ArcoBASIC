@@ -1,0 +1,14 @@
+' RFC section 57's own acceptance-test example, translated to real ArcoBASIC syntax (see
+' rivet/stdlib/rivet.abas's own header comment for the full translation notes: `==` not `=`,
+' DIRECTORY(root, RECURSIVE) unchanged since that shape was already real syntax).
+
+App = BUILD.Executable("tinyapp")
+ignored = App.Includes.Append("include")
+
+FOR FILE IN DIRECTORY("src", RECURSIVE)
+    IF FILE.Extension == ".cpp" THEN
+        ignored = App.Sources.Append(FILE.Path)
+    END IF
+NEXT
+
+ignored = App.Build()

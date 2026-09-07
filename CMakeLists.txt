@@ -172,6 +172,11 @@ add_subdirectory(arcfs-utils)
 # (defined above), which it uses the same way arcfs-utils does.
 add_subdirectory(fissure)
 
+# Rivet: build orchestration (rivet/docs/rivet-rfc.md). Self-contained under rivet/ -- see that
+# directory's own CMakeLists.txt. Must come after arco_configure_library (defined above), which
+# it uses the same way arcfs-utils/fissure do.
+add_subdirectory(rivet)
+
 if(BUILD_TESTING)
     include(cmake/Testing.cmake)
 endif()
