@@ -37,7 +37,10 @@ ELSE
         throwGesture = ArcoUI.CreateGesture()
         ignored = ArcoUI.ConfigureGesture(throwGesture, 0.8, 40, 250, 2)
 
-        WHILE NOT win.ShouldClose()
+        ' `!`, not `NOT` -- see [[project_arcobasic_not_bitwise_footgun]] / docs/ARCADE_PROGRESS.md's
+        ' Session 2 entry. This one mattered most: under the bug this WHILE never actually noticed
+        ' ShouldClose() becoming TRUE, so this gadget could never close itself.
+        WHILE !win.ShouldClose()
             timestamp = Time.Timestamp()
             event = GUI.WaitEvent(0.02)
             IF event.Type <> "none" ANDALSO event.Window == win.Window THEN
@@ -72,7 +75,7 @@ ELSE
                 pending = ArcoUI.PollIntentEvent()
             WEND
 
-            IF NOT win.ShouldClose() THEN win.Draw()
+            IF !win.ShouldClose() THEN win.Draw()
         WEND
 
         ignored = win.Close()

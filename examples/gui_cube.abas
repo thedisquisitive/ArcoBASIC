@@ -111,7 +111,14 @@ WHILE running
     IF event.Type == "key" THEN
         IF event.Action == "press" OR event.Action == "repeat" THEN
             IF event.Key == "escape" THEN running = FALSE
-            IF event.Key == "space" THEN auto_spin = NOT auto_spin
+            ' `!`, not `NOT` -- a real, verified bug: auto_spin starts TRUE (+1), and NOT/BITNOT
+            ' is a bitwise complement in this language, not logical negation, so toggling from a
+            ' TRUE-literal start oscillates between -2 and 1 forever, NEVER reaching FALSE (0) --
+            ' pressing space could never actually stop the spin. See
+            ' [[project_arcobasic_not_bitwise_footgun]] / docs/ARCADE_PROGRESS.md's Session 2
+            ' entry (a FALSE-starting toggle like this one happens to self-correct and was left
+            ' alone elsewhere; this one does not, because it starts TRUE).
+            IF event.Key == "space" THEN auto_spin = !auto_spin
             IF event.Key == "left" THEN angle_y = angle_y - 0.12
             IF event.Key == "right" THEN angle_y = angle_y + 0.12
             IF event.Key == "up" THEN angle_x = angle_x - 0.12

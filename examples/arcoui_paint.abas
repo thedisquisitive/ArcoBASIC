@@ -62,7 +62,10 @@ ELSE
             END IF
 
             ignored = app.Pump()
-            IF NOT win.ShouldClose() THEN win.Draw()
+            ' `!`, not `NOT` -- NOT/BITNOT in ArcoBASIC is a bitwise complement, not logical
+            ' negation (see [[project_arcobasic_not_bitwise_footgun]] / docs/ARCADE_PROGRESS.md's
+            ' Session 2 entry). `!` is the real logical-not operator.
+            IF !win.ShouldClose() THEN win.Draw()
         WEND
 
         ignored = win.Close()

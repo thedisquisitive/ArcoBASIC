@@ -420,7 +420,13 @@ FUNCTION Activate(action)
         ignored = ApplyFormat()
         RETURN TRUE
     END IF
-    IF action == "wrap" THEN app.Wrap = NOT app.Wrap : app.Status = "Wrap " + STRING(app.Wrap) : RETURN TRUE
+    ' `!`, not `NOT` -- a real, verified bug: app.Wrap starts TRUE, and NOT/BITNOT is a bitwise
+    ' complement in this language (not logical negation), so toggling from a TRUE-literal start
+    ' oscillates between -2 and 1 forever, never reaching FALSE(0) -- `IF app.Wrap == FALSE THEN`
+    ' below could never actually fire once toggled. See
+    ' [[project_arcobasic_not_bitwise_footgun]] / docs/ARCADE_PROGRESS.md's Session 2 entry (Bold/
+    ' Italic just above start FALSE and happen to self-correct; this one does not).
+    IF action == "wrap" THEN app.Wrap = !app.Wrap : app.Status = "Wrap " + STRING(app.Wrap) : RETURN TRUE
     IF action == "find" THEN RETURN OpenFindBar()
     IF action == "leftalign" THEN RETURN ApplyParagraphAlignment("left")
     IF action == "centeralign" THEN RETURN ApplyParagraphAlignment("center")

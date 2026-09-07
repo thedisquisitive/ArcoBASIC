@@ -96,7 +96,12 @@ ELSE
                         handledSpecial = TRUE
                     END IF
 
-                    IF NOT handledSpecial THEN
+                    ' `!`, not `NOT` -- a real bug (verified: under the old code, an Enter press
+                    ' during a search would BOTH perform the search AND get forwarded to the main
+                    ' window, e.g. inserting a stray newline into the body) -- see
+                    ' [[project_arcobasic_not_bitwise_footgun]] / docs/ARCADE_PROGRESS.md's
+                    ' Session 2 entry.
+                    IF !handledSpecial THEN
                         changed = win.HandleEvent(event, timestamp)
                         IF changed ANDALSO body.Focused ANDALSO (event.Type == "text" ORELSE event.Type == "key") THEN
                             modified = TRUE
@@ -110,7 +115,13 @@ ELSE
             pending = app.PollEvent()
             WHILE pending <> NULL
                 IF pending.Intent == saveIntent THEN
-                    IF NOT modified ANDALSO currentPath <> "" THEN
+                    ' `!`, not `NOT` -- a real, verified bug: under the old code, every save
+                    ' after the first (once currentPath was set) always reported "Nothing to
+                    ' save," even with real unsaved changes -- `NOT modified` was truthy
+                    ' regardless of `modified`'s actual value. See
+                    ' [[project_arcobasic_not_bitwise_footgun]] / docs/ARCADE_PROGRESS.md's
+                    ' Session 2 entry.
+                    IF !modified ANDALSO currentPath <> "" THEN
                         status.Text = "Nothing to save"
                     ELSE
                         path = currentPath
@@ -141,7 +152,9 @@ ELSE
                 pending = app.PollEvent()
             WEND
 
-            IF NOT win.ShouldClose() THEN win.Draw()
+            ' `!`, not `NOT` -- see [[project_arcobasic_not_bitwise_footgun]] / docs/
+            ' ARCADE_PROGRESS.md's Session 2 entry.
+            IF !win.ShouldClose() THEN win.Draw()
         WEND
 
         ignored = win.Close()
