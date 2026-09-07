@@ -1,0 +1,28 @@
+' #FISSURE-PLUGIN 1
+' #NAME "Generic Command Probe Adapter"
+' #TYPE TEST
+' #REQUIRES GRAPH.WRITE
+'
+' RFC section 17 lists this as the reference TEST extension (alongside a more specific ctest.ab,
+' which auto-discovers tests from an existing CTest suite -- real, named future work, not built
+' this session; see AGENT_PROGRESS.md). command.ab is the generic case: any project can register a
+' probe as "run this shell command," with an explicit, human-declared dependency list, without
+' Fissure needing to understand what produced that command at all (RFC section 9's own example:
+' `probe: id / runner / tags`, no test-framework-specific fields).
+'
+' A project's own fissure.ab config calls this instead of the raw FISSURE.Probe.* contracts
+' directly -- e.g.:
+'
+'     ignored = RegisterCommandProbe("compiler.parser.basic", "ctest --test-dir build -R parser_basic", ["parser"], ["src/compiler/parser.cpp"])
+'
+' `dependsOn` is the probe's declared file dependency set (RFC section 5.3 "Declared" evidence,
+' AGENT_PROGRESS.md's Session 1 design decision 1 -- exactly what lets a probe ever be classified
+' UNAFFECTED rather than UNKNOWN). Pass an empty array for a probe with no known dependencies yet;
+' it will simply run every time (UNKNOWN, per the safety invariant) until someone declares one.
+
+FUNCTION RegisterCommandProbe(id, command, tags, dependsOn)
+    ignored = FISSURE.Probe.Register(id, command, tags)
+    FOR path IN dependsOn
+        ignored = FISSURE.Probe.DependsOn(id, path)
+    NEXT
+END FUNCTION

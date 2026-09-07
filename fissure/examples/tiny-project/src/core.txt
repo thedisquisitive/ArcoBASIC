@@ -1,0 +1,1 @@
+a stand-in "source file" for the tiny synthetic example project -- see fissure/examples/tiny-project/fissure.ab

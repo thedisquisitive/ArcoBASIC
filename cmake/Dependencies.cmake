@@ -37,3 +37,15 @@ if(UNIX AND NOT APPLE)
         endif()
     endif()
 endif()
+
+# Fissure's own persistence layer (fissure/CMakeLists.txt, RFC section 16) -- gated the same
+# conservative way FUSE3 is above: build without it (Fissure simply isn't added to the project)
+# rather than hard-failing the whole repository's configure step over one subsystem's dependency.
+set(ARCO_SQLITE3_FOUND FALSE)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(SQLITE3 QUIET IMPORTED_TARGET sqlite3)
+    if(SQLITE3_FOUND)
+        set(ARCO_SQLITE3_FOUND TRUE)
+    endif()
+endif()

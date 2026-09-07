@@ -167,6 +167,11 @@ target_link_libraries(ArcoFission PRIVATE arco_compiler)
 # defined) since it uses both.
 add_subdirectory(arcfs-utils)
 
+# Fissure: adaptive regression impact analysis (fissure/docs/fissure-rfc.md). Self-contained under
+# fissure/ -- see that directory's own CMakeLists.txt. Must come after arco_configure_library
+# (defined above), which it uses the same way arcfs-utils does.
+add_subdirectory(fissure)
+
 if(BUILD_TESTING)
     include(cmake/Testing.cmake)
 endif()

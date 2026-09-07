@@ -1,0 +1,2 @@
+an unrelated file that no probe declares a dependency on -- part of the same tiny synthetic
+example project used by tests/integration/fissure_smoke.sh.

@@ -1,0 +1,22 @@
+' #FISSURE-PLUGIN 1
+' #NAME "Generic Language Adapter"
+' #TYPE LANGUAGE
+' #REQUIRES FILE.READ
+' #REQUIRES GRAPH.WRITE
+'
+' RFC section 7.4: "A built-in reference ArcoBASIC adapter must provide Tier 0 support for
+' languages and DSLs with no dedicated adapter... Fissure must degrade to conservative generic
+' analysis, not declare a language unsupported." Tier 0's own ceiling (section 7.3): "Files,
+' configured probe associations, build links, runtime observations" -- this adapter registers
+' exactly one thing, a File node per tracked file, and nothing about their relationships to each
+' other (no import scanning -- that is Tier 1, a dedicated language adapter's job, not this one's).
+' Every probe's own declared dependencies (fissure.ab's FISSURE.Probe.DependsOn calls) point at
+' the same file ids this adapter creates, which is what lets a plain path-based association work
+' at all without any language-specific parsing.
+
+FUNCTION DiscoverFiles()
+    paths = FISSURE.Filesystem.Walk()
+    FOR path IN paths
+        ignored = FISSURE.Graph.Node(path, "file")
+    NEXT
+END FUNCTION

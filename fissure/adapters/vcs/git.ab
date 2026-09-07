@@ -1,0 +1,43 @@
+' #FISSURE-PLUGIN 1
+' #NAME "Git VCS Adapter"
+' #TYPE VCS
+' #REQUIRES PROCESS.EXEC
+'
+' RFC section 15: "Git support should be first-class through an ArcoBASIC VCS adapter, but Fissure
+' must not depend on Git conceptually." This adapter is the whole of that dependency -- the native
+' core never shells to git itself (see fissure/core/vm/vm.cpp's own comment on FISSURE.Process.Exec:
+' there is no separate native FISSURE.VCS.* contract). If the target directory isn't a git
+' repository at all (or git isn't installed), DetectChanges reports zero changes rather than
+' failing the whole run -- a project may use a different VCS, or none, and the rest of Fissure
+' (declared probe associations, the generic file graph) still works without one.
+
+FUNCTION DetectChanges()
+    since = FISSURE.Change.SinceRef()
+    IF since == "" THEN since = "HEAD"
+
+    result = FISSURE.Process.Exec("git diff --name-only " + since + " 2>/dev/null")
+    ' `!`, not `NOT` -- NOT/BITNOT in ArcoBASIC is a bitwise complement, not logical negation (see
+    ' [[project_arcobasic_not_bitwise_footgun]] / docs/ARCADE_PROGRESS.md's Session 2 entry in the
+    ' main arcobasic repo). `IF NOT result.Ok THEN` would take this branch regardless of Ok's real
+    ' value.
+    IF !result.Ok THEN
+        ' Not a git repo, no commits yet, or git isn't installed -- all legitimate, non-fatal.
+        RETURN
+    END IF
+
+    lines = String.Lines(result.Output)
+    FOR line IN lines
+        trimmed = String.Trim(line)
+        IF trimmed <> "" THEN ignored = FISSURE.Change.Report(trimmed)
+    NEXT
+
+    ' Untracked new files are real disturbances too (a probe could plausibly depend on a file that
+    ' didn't exist at the baseline) -- `git diff` alone never lists these.
+    untracked = FISSURE.Process.Exec("git ls-files --others --exclude-standard 2>/dev/null")
+    IF untracked.Ok THEN
+        FOR line IN String.Lines(untracked.Output)
+            trimmed = String.Trim(line)
+            IF trimmed <> "" THEN ignored = FISSURE.Change.Report(trimmed)
+        NEXT
+    END IF
+END FUNCTION

@@ -1,0 +1,22 @@
+' Project-local Fissure config (RFC section 7.7's own ProjectImpact convention). Registers four
+' probes exercising all three tri-state classification outcomes, plus a real Fracture, for
+' tests/integration/fissure_smoke.sh's own end-to-end assertions:
+'
+'   probe.core             declares a dependency on src/core.txt  -> AFFECTED when it changes
+'   probe.unrelated        declares a dependency on src/docs.txt  -> UNAFFECTED when core.txt changes
+'   probe.nothing_declared declares no dependencies at all        -> always UNKNOWN, always runs
+'   probe.broken           declares a dependency on src/core.txt, always fails -- proves a real
+'                           Fracture surfaces useful diagnostics (RFC section 21 acceptance
+'                           criterion 11), not just that passing probes are reported
+'
+' No #FISSURE-PLUGIN manifest of its own -- a project's own top-level config is trusted by the CLI
+' that loads it (it is, after all, the project's own file, not a third-party extension); the
+' capability model (RFC section 8) exists for adapters, not for the project being analyzed
+' declaring what it wants tested. command.ab (the adapter this config calls into) already declared
+' GRAPH.WRITE for itself; RegisterCommandProbe is exactly the kind of "no privileged operation
+' beyond what the adapter itself already granted" call this is meant to allow.
+
+ignored = RegisterCommandProbe("probe.core", "echo core-probe-ran", ["core"], ["src/core.txt"])
+ignored = RegisterCommandProbe("probe.unrelated", "echo unrelated-probe-ran", ["docs"], ["src/docs.txt"])
+ignored = RegisterCommandProbe("probe.nothing_declared", "echo nothing-declared-ran", [], [])
+ignored = RegisterCommandProbe("probe.broken", "echo diagnostic-detail-line && exit 1", ["core"], ["src/core.txt"])

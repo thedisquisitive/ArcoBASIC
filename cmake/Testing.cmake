@@ -94,3 +94,19 @@ arco_add_script_test(
 
 include(arcology-os/cmake/Testing.cmake)
 include(arcology-commons/cmake/Testing.cmake)
+
+# Fissure (fissure/docs/fissure-rfc.md) -- guarded on TARGET fissure_core the same way arcfs-linux
+# above guards its own tests, since fissure/CMakeLists.txt returns early (no targets defined at
+# all) when sqlite3 isn't available (cmake/Dependencies.cmake).
+if(TARGET fissure_core)
+    add_executable(fissure_tests tests/unit/fissure_tests.cpp)
+    target_link_libraries(fissure_tests PRIVATE fissure_core)
+    add_test(NAME fissure_tests COMMAND fissure_tests)
+
+    arco_add_script_test(
+        fissure_smoke
+        tests/integration/fissure_smoke.sh
+        $<TARGET_FILE:fissure>
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+endif()
