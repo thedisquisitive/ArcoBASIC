@@ -1,0 +1,167 @@
+' #FISSURE-PLUGIN 1
+' #NAME "CMake Build Adapter"
+' #TYPE BUILD
+' #REQUIRES FILE.READ
+' #REQUIRES GRAPH.WRITE
+'
+' RFC section 17 lists this as a reference BUILD extension (alongside ninja.ab, not built this
+' session -- see fissure/AGENT_PROGRESS.md's M2 entry for why compile_commands.json was chosen
+' over ninja-specific introspection: it's generator-agnostic, working the same way whether the
+' target project uses Makefiles or Ninja, matching RFC section 18's own cross-platform spirit one
+' level up -- generator-independence, not just OS-independence).
+'
+' Reads CMAKE_EXPORT_COMPILE_COMMANDS output (a project must already have that flag set and a
+' configured build directory -- this adapter never runs `cmake` itself, deliberately: silently
+' reconfiguring or triggering a build the first time Fissure runs against a large, unfamiliar
+' project would be a surprising, potentially slow side effect completely disproportionate to what
+' a regression-impact tool should be allowed to do uninvited). Absent file -> graceful no-op,
+' exactly git.ab's own "not every project uses this" pattern.
+'
+' Node/edge shape (RFC section 5): one GeneratedArtifact node per compiled object file, one
+' `consumes` edge (Evidence.Build) from that artifact to the source file it was compiled from.
+' Direction matters (see fissure/include/fissure/graph.hpp's own comment): "consumes" here means
+' "the object file's own existence/content depends on the source" -- object -> source, the same
+' dependent -> dependency shape every other edge in this project already uses, so a change to
+' `mathlib.cpp` is found via ordinary backward propagation from a probe that declared a dependency
+' on the OBJECT (or, via TargetSources() below, transitively on every source file that feeds a
+' whole target) without needing per-file knowledge in the project's own fissure.ab.
+
+FUNCTION FindObjectOutput(text, searchFrom)
+    RETURN String.IndexOf(text, "\"output\"", searchFrom)
+END FUNCTION
+
+' Extracts one `"key": "value"` string field starting the search at or after `fromIndex`. Returns
+' "" if the key isn't found (callers treat that as "field absent", matching how "output" is only
+' present on some CMake versions/entries).
+FUNCTION ExtractJsonStringField(text, key, fromIndex)
+    keyPos = String.IndexOf(text, "\"" + key + "\"", fromIndex)
+    IF keyPos < 0 THEN RETURN ""
+    colonPos = String.IndexOf(text, ":", keyPos)
+    quoteStart = String.IndexOf(text, "\"", colonPos + 1)
+    quoteEnd = String.IndexOf(text, "\"", quoteStart + 1)
+    RETURN String.Slice(text, quoteStart + 1, quoteEnd - quoteStart - 1)
+END FUNCTION
+
+' Deliberately not a general JSON parser (RFC section 4.3: extensions may call host contracts for
+' expensive/specialized work rather than reimplementing something substantial in ArcoBASIC -- but
+' there is no native JSON host contract either, and compile_commands.json's own shape is regular
+' enough -- a flat array of single-level objects, CMake always emits it this way -- that scanning
+' for known field labels is robust without one, and keeps this adapter's own native-core footprint
+' at zero new host contracts). Returns an array of {File, Output} objects, one per translation
+' unit; `Output` is "" for an entry with no "output" field (older CMake versions).
+FUNCTION ParseCompileCommands(text)
+    results = []
+    searchFrom = 0
+    WHILE TRUE
+        fileKeyPos = String.IndexOf(text, "\"file\"", searchFrom)
+        IF fileKeyPos < 0 THEN EXIT WHILE
+
+        filePath = ExtractJsonStringField(text, "file", fileKeyPos)
+        nextFilePos = String.IndexOf(text, "\"file\"", fileKeyPos + 1)
+        IF nextFilePos < 0 THEN
+            objectEnd = LEN(text)
+        ELSE
+            objectEnd = nextFilePos
+        END IF
+
+        outputPath = ""
+        outputKeyPos = FindObjectOutput(text, fileKeyPos)
+        IF outputKeyPos >= 0 ANDALSO outputKeyPos < objectEnd THEN
+            outputPath = ExtractJsonStringField(text, "output", fileKeyPos)
+        END IF
+
+        ignored = Array.Push(results, {File: filePath, Output: outputPath})
+        searchFrom = fileKeyPos + 1
+    WEND
+    RETURN results
+END FUNCTION
+
+' CMake's own object-path convention: CMakeFiles/<target>.dir/... . Returns "" if `outputPath`
+' doesn't match it (e.g. it was empty to begin with).
+FUNCTION TargetNameFromOutput(outputPath)
+    marker = "CMakeFiles/"
+    start = String.IndexOf(outputPath, marker, 0)
+    IF start < 0 THEN RETURN ""
+    afterMarker = start + LEN(marker)
+    dirPos = String.IndexOf(outputPath, ".dir/", afterMarker)
+    IF dirPos < 0 THEN RETURN ""
+    RETURN String.Slice(outputPath, afterMarker, dirPos - afterMarker)
+END FUNCTION
+
+' Relativizes an absolute source path against the project root, matching generic.ab's own File
+' node id convention exactly (FISSURE.Filesystem.Walk's own return shape) -- so an edge this
+' adapter registers actually lands on the SAME node generic.ab already created, not a duplicate
+' with a different id scheme.
+FUNCTION RelativeToProjectRoot(absolutePath)
+    root = FISSURE.Filesystem.ProjectRoot()
+    prefix = root + "/"
+    IF String.StartsWith(absolutePath, prefix) THEN
+        RETURN String.Slice(absolutePath, LEN(prefix), LEN(absolutePath) - LEN(prefix))
+    END IF
+    RETURN absolutePath
+END FUNCTION
+
+' NOTE on style: no module-level caching here, deliberately -- found the hard way, by testing
+' directly, that a plain top-level script variable assigned to from inside a FUNCTION does NOT
+' persist that write back to the script-level variable on the tree-walking interpreter
+' (`arco::Runtime::run_string`, what Fissure's own VM embeds -- see vm.hpp): a `built = TRUE`
+' inside a function creates a function-local shadow, invisible to every subsequent call, even
+' though the function's own READ of the same name correctly sees the script-level value first.
+' Confirmed with a 4-line isolated repro before concluding this wasn't a mistake in this file. A
+' real interpreter limitation, out of scope to fix from here -- recorded in
+' fissure/AGENT_PROGRESS.md and [[project_arcobasic_not_bitwise_footgun]]'s sibling note so it
+' doesn't cost the next person the same discovery. The fix here is simply to not rely on it:
+' `ReadCompileCommands()` is a pure function (no graph writes) that reads and reparses the file
+' fresh every call -- cheap enough at this scale -- and `DiscoverBuildTargets()` (called exactly
+' once per CLI run, see apps/fissure/main.cpp) is the ONLY place that writes to the graph, so
+' calling `TargetSources()` more than once (RegisterTargetProbe below does, once per target name)
+' never re-registers duplicate edges.
+
+FUNCTION ReadCompileCommands()
+    root = FISSURE.Filesystem.ProjectRoot()
+    path = root + "/build/compile_commands.json"
+    IF !FISSURE.Filesystem.Exists(path) THEN RETURN []
+    text = FISSURE.Filesystem.Read(path)
+    RETURN ParseCompileCommands(text)
+END FUNCTION
+
+' The only function in this file that writes to the graph -- called exactly once per run.
+FUNCTION DiscoverBuildTargets()
+    FOR entry IN ReadCompileCommands()
+        relFile = RelativeToProjectRoot(entry.File)
+        ignored = FISSURE.Graph.Node(relFile, "file")
+        IF entry.Output <> "" THEN
+            ignored = FISSURE.Graph.Node(entry.Output, "generated-artifact")
+            ignored = FISSURE.Graph.Edge(entry.Output, relFile, "consumes", "build")
+        END IF
+    NEXT
+END FUNCTION
+
+' Real source files for `targetName` (relative to the project root), or an empty array if
+' compile_commands.json doesn't exist or never mentions that target. Project fissure.ab configs
+' call this directly -- the whole reason a probe would want this adapter loaded: declare "this
+' probe covers everything in target X" without hand-listing every source file, and without
+' Fissure needing any C++-specific understanding of what a "target" even is beyond a string key
+' CMake's own object-file naming convention already provides for free. Pure lookup, no graph
+' writes -- see this file's own top note for why.
+FUNCTION TargetSources(targetName)
+    sources = []
+    FOR entry IN ReadCompileCommands()
+        IF TargetNameFromOutput(entry.Output) == targetName THEN
+            ignored = Array.Push(sources, RelativeToProjectRoot(entry.File))
+        END IF
+    NEXT
+    RETURN sources
+END FUNCTION
+
+' Convenience wrapper (mirrors command.ab's own RegisterCommandProbe) -- registers a probe whose
+' declared dependencies are every known source file of each named CMake target, resolved through
+' TargetSources() above, instead of listing files by hand.
+FUNCTION RegisterTargetProbe(id, command, tags, targetNames)
+    ignored = FISSURE.Probe.Register(id, command, tags)
+    FOR targetName IN targetNames
+        FOR path IN TargetSources(targetName)
+            ignored = FISSURE.Probe.DependsOn(id, path)
+        NEXT
+    NEXT
+END FUNCTION

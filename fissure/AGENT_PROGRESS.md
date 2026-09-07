@@ -201,21 +201,120 @@ M0 and M1 (sections 20/22.6), not just the skeleton. Concretely:
   specifically (confirmed with the project owner directly this session, after an earlier
   unrelated full-suite run was flagged as taking too long for what it was actually verifying).
 
+## Session 1, continued — M2 (build awareness), same day
+
+**Agent/operator:** "Proceed" -- direct continuation of the "Exact next action" above, no new
+instruction needed.
+
+### What landed
+
+`fissure/adapters/build/cmake.ab` (RFC section 17's own reference BUILD extension), tested
+end-to-end against a real `cmake` configure, not a hand-crafted fixture:
+
+- Reads `CMAKE_EXPORT_COMPILE_COMMANDS` output (`<project_root>/build/compile_commands.json`) --
+  **never runs `cmake` itself**, deliberately: silently reconfiguring or triggering a build the
+  first time Fissure touches a large, unfamiliar project would be a surprising, disproportionate
+  side effect for a regression-impact tool to take uninvited. Absent file -> graceful no-op, the
+  same pattern `git.ab` already established for "not every project uses this."
+  This was chosen over generator-specific introspection (`ninja -t deps`, which this repository's
+  own `build/` directory can't even exercise -- it's generated with Unix Makefiles, confirmed by
+  the `gmake` prefix in its own build output) specifically because `compile_commands.json` is
+  generator-agnostic: the same adapter works whether a project uses Makefiles or Ninja. `ninja.ab`
+  itself (section 17's other listed reference) is not built this session -- deferred, not silently
+  dropped.
+- No JSON library, native or otherwise -- `ParseCompileCommands` scans for known field labels
+  (`"file"`, `"output"`) rather than parsing general JSON, which is robust enough given CMake's own
+  output shape is always a flat array of single-level objects (RFC section 4.3's own "call a host
+  contract for expensive/specialized work" doesn't apply here; there's no host contract to call,
+  and adding a native JSON dependency for a format this regular would be over-engineering for M2's
+  actual need).
+- One `GeneratedArtifact` node per compiled object, one `consumes` edge (object -> source,
+  Evidence.Build) per translation unit -- the same dependent -> dependency direction every other
+  edge in this project uses (see `graph.hpp`'s own comment).
+- `TargetSources(targetName)` and `RegisterTargetProbe(id, command, tags, targetNames)`: lets a
+  project's own `fissure.ab` declare "this probe covers target X" by CMake TARGET NAME, resolved
+  to real source files through `compile_commands.json`'s own `CMakeFiles/<target>.dir/...` object-
+  path convention -- no per-file hand-listing, no C++-specific understanding baked into the native
+  core (RFC section 4.1's own constraint, upheld: the native core still knows nothing about
+  targets, objects, or CMake at all -- every bit of that understanding lives in this one `.ab`
+  file).
+
+New synthetic example: `fissure/examples/tiny-cmake-project/` (one static lib, one executable,
+`CMAKE_EXPORT_COMPILE_COMMANDS=ON` in its own `CMakeLists.txt`) -- deliberately NOT tested against
+this repository's own huge CMake project, to keep the smoke test fast and avoid any risk of an
+unexpected side effect against the real build tree. New test:
+`tests/integration/fissure_build_smoke.sh`, registered in `cmake/Testing.cmake`, passing (real
+`cmake -S . -B build` configure, then the real `fissure` binary, proving a target-name-declared
+probe correctly becomes `AFFECTED` when a source file of that target changes, with matching
+`explain` output).
+
+### A second real interpreter finding, same shape as the NOT-footgun
+
+While writing `cmake.ab`'s first draft (a version that cached parsed `compile_commands.json` in a
+top-level `CompileCommandsCacheBuilt`/`CompileCommandsByTarget` pair, guarded by a `IF
+CompileCommandsCacheBuilt THEN RETURN` early-exit), the cache never actually took effect --
+`fissure status` showed every edge registered 3 times over (once per call into the caching
+function: one explicit `DiscoverBuildTargets()` call from the CLI, plus two more from
+`RegisterTargetProbe`'s own loop over `["app", "mathlib"]`). Isolated with a 9-line repro script
+before concluding it wasn't a mistake in this file specifically: **a `FUNCTION` assigning to a
+top-level script variable does not persist that write back to the script-level variable, on the
+tree-walking interpreter** (`arco::Runtime::run_string` -- what `arco_cli` uses, and what
+Fissure's own embedded VM is built on). The read side sees the correct current value; the write
+silently creates a function-local shadow instead. Confirmed this does NOT reproduce through
+`ArcoFission compile-run` (the separate bytecode-compiling path) or through a CLASS's own
+`SELF.field = value` (used correctly and extensively elsewhere in this repository, e.g. all of
+ARCADE's work) -- specific to bare top-level variables plus plain functions on the tree-walker.
+Also found, in the same debugging pass: bracket indexing with a STRING key (`obj["key"]`, both
+read and write) throws `"value is not a number"` on the tree-walker, while the identical syntax
+works fine through the bytecode path -- `Object.Get`/`Object.Set`/`Object.Has` work correctly on
+both and are what every adapter in this project uses instead.
+
+Not fixed at the interpreter level (out of scope for this work) -- `cmake.ab` was redesigned
+around it instead (see the file's own top comment): no caching at all, a pure re-parsing lookup
+function plus exactly one graph-writing function called exactly once per run from the native CLI.
+Saved as its own memory note
+(`[[project_arcobasic_treewalker_global_mutation_bug]]`) alongside
+`[[project_arcobasic_not_bitwise_footgun]]`, since it's the same shape of finding: a real,
+previously-undiscovered language-level trap, found by directly testing rather than assuming,
+worth remembering before writing any future ArcoBASIC script in this repository that tries to
+cache state in a top-level variable across function calls.
+
+### Tests executed and results (M2 addition)
+
+- `tests/integration/fissure_build_smoke.sh`: **passes**. A real `cmake` configure of the tiny
+  synthetic project, then the real `fissure` binary: baseline `UNAFFECTED` (declared deps via both
+  targets, empty disturbance), exactly 4 edges in the persisted graph (2 `consumes` + 2
+  `declared-test-association` -- explicitly asserted to be exactly 4, not more, as a direct
+  regression check against the caching bug above recurring silently), `AFFECTED` + `PASS` after
+  changing `src/mathlib.cpp` (a file belonging to the "mathlib" target, not "app" -- proving
+  `TargetSources("mathlib")` really resolved through the target-name declaration, not by accident),
+  matching `explain` output. Registered in `cmake/Testing.cmake`, confirmed passing via `ctest
+  --test-dir build -R fissure` (all three fissure tests together: 0.86s).
+
+### Known issues / disclosed gaps (M2 addition)
+
+- **`ninja.ab` does not exist yet** (RFC section 17's other listed BUILD reference extension) --
+  `compile_commands.json` covers the CMake-generator-agnostic case `cmake.ab` targets; real
+  Ninja-specific introspection (`ninja -t deps`'s own compiler-depfile-derived HEADER dependency
+  edges, a genuinely higher-fidelity Build evidence source than what `compile_commands.json` alone
+  provides) is real, valuable, deferred work, not attempted this session.
+- **No target-to-target (link) dependency edges yet** -- `cmake.ab` registers object -> source
+  edges but not e.g. "app" depending on "mathlib" as a whole (CMake's own `target_link_libraries`
+  relationship). `TargetSources` happens to make this mostly moot for THIS session's own testing
+  (a project simply lists every target a probe cares about, transitively, by hand, in its own
+  `fissure.ab` -- see `tiny-cmake-project/fissure.ab`'s own `["app", "mathlib"]`), but a real
+  project with a deep target dependency chain would want this resolved automatically rather than
+  requiring every transitive target to be listed by hand. Real follow-up work, not attempted here.
+
 ### Exact next action
 
-M0 and M1 are both functionally complete and tested end-to-end against the real CLI. The next real
-forward step is M2 (RFC section 20: "Build Awareness") -- concretely, in order:
-
-1. `adapters/build/cmake.ab` and `adapters/build/ninja.ab` (RFC section 17's own reference
-   extensions) -- register `BuildTarget`/`GeneratedArtifact` nodes and `build-dependency`/
-   `generates` edges from an existing CMake/Ninja project's own dependency graph (`cmake
-   --graphviz=...` or `ninja -t deps`/`ninja -t query` are the natural native contract candidates
-   -- probably needs one new `FISSURE.Build.*` host contract, not yet designed).
-2. Real parallel scheduling (RFC section 12) -- `Scheduler::run`'s current sequential
-   implementation is a real, intentional seam for this, not a rewrite.
-3. Revisit the acceptance-criterion-5 gap (two language adapters contributing to the same graph)
-   sooner rather than later if a second adapter becomes easy to justify before M3's own full scope
-   -- `arcobasic.ab` (this project's own language) is the most natural second adapter to attempt
-   first, since the compiler's own AST-reveal tooling (`ArcoFission reveal FILE --stage AST`,
-   already proven elsewhere in this repository) is a real, existing Tier 2+ analysis primitive
-   Fissure could call into via `FISSURE.Process.Exec`, without needing new native parsing work.
+M0, M1, and M2's own `cmake.ab` slice are all functionally complete and tested end-to-end against
+the real CLI. Real remaining M2 scope (section 20): `ninja.ab`, real parallel scheduling (RFC
+section 12 -- `Scheduler::run`'s current sequential implementation is a real, intentional seam for
+this, not a rewrite), and the target-link-dependency gap just above. After that, M3 (RFC section
+20: "Language Reference Adapters") is next -- revisit the acceptance-criterion-5 gap (two language
+adapters contributing to the same graph) there; `arcobasic.ab` (this project's own language) is the
+most natural second adapter to attempt first, since the compiler's own AST-reveal tooling
+(`ArcoFission reveal FILE --stage AST`, already proven elsewhere in this repository) is a real,
+existing Tier 2+ analysis primitive Fissure could call into via `FISSURE.Process.Exec`, without
+needing new native parsing work.

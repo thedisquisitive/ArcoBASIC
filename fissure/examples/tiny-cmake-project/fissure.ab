@@ -1,0 +1,6 @@
+' Project-local Fissure config exercising cmake.ab's TargetSources()/RegisterTargetProbe() --
+' probe.app depends on the "app" AND "mathlib" targets (app links mathlib, so a change to
+' mathlib.cpp should affect probe.app too), declared by TARGET NAME, not by hand-listing
+' src/main.cpp and src/mathlib.cpp individually.
+
+ignored = RegisterTargetProbe("probe.app", "echo app-probe-ran", ["app"], ["app", "mathlib"])

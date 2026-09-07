@@ -8,6 +8,7 @@ build/
 # lazarus-os/build, etc.) genuinely are build-output directories that should stay ignored.
 !arcology-os/scripts/build/
 !scripts/build/
+!fissure/adapters/build/
 build-*/
 dist/
 /var/

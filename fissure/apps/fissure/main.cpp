@@ -120,6 +120,7 @@ void load_adapters(fissure::VM& vm, const fs::path& adapters_root, const fs::pat
     vm.load_script((adapters_root / "language" / "generic.ab").string());
     vm.load_script((adapters_root / "vcs" / "git.ab").string());
     vm.load_script((adapters_root / "test" / "command.ab").string());
+    vm.load_script((adapters_root / "build" / "cmake.ab").string());
     fs::path project_config = project_root / "fissure.ab";
     if (fs::exists(project_config)) {
         vm.load_script(project_config.string());
@@ -148,6 +149,7 @@ int run_command(const Options& options) {
     // (e.g. command.ab has nothing to discover on its own) is skipped silently, not an error.
     vm.call_if_defined("DiscoverFiles");
     vm.call_if_defined("DetectChanges");
+    vm.call_if_defined("DiscoverBuildTargets");
 
     std::vector<std::string> disturbance = vm.reported_changes();
     events.emit(fissure::EventType::DisturbanceDetected, {{"count", std::to_string(disturbance.size())}});
@@ -214,6 +216,7 @@ int explain_command(const std::string& probe_id) {
     load_adapters(vm, find_adapters_root(), project_root);
     vm.call_if_defined("DiscoverFiles");
     vm.call_if_defined("DetectChanges");
+    vm.call_if_defined("DiscoverBuildTargets");
 
     std::vector<std::string> disturbance = vm.reported_changes();
     fissure::ImpactEngine impact_engine;

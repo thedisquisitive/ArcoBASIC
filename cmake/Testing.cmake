@@ -109,4 +109,11 @@ if(TARGET fissure_core)
         $<TARGET_FILE:fissure>
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
+    arco_add_script_test(
+        fissure_build_smoke
+        tests/integration/fissure_build_smoke.sh
+        $<TARGET_FILE:fissure>
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_COMMAND}
+    )
 endif()
