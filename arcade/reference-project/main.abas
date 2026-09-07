@@ -1,0 +1,125 @@
+' ARCADE reference application (packet Section 35): "Customer Lookup". Deliberately small --
+' exercises layout, labels, input, a button, application state, a data binding, simple behavior,
+' and (once Phase H exists) runtime inspection, without needing a real database. Sample data is
+' fixed, in-memory, and deterministic, per Section 35's own instruction not to connect a real
+' database during early milestones.
+'
+' This file is plain ArcoBASIC using ArcoUI directly -- Level 3 "Source-Only" content by ARCADE's
+' own definition (see docs/arcade/source-roundtrip.md) until ARCADE's Application Model understands
+' enough of this shape to represent it as Surface/Flow too. It is not itself ARCADE; it is the
+' project ARCADE opens to prove Phase B's shell and, later, Phase D's round trip.
+
+#IMPORT "arcoui"
+
+CLASS CustomerRecord
+    Id = ""
+    DisplayName = ""
+    CONSTRUCTOR(id, displayName)
+        SELF.Id = id
+        SELF.DisplayName = displayName
+    END CONSTRUCTOR
+END CLASS
+
+' Deterministic in-memory sample data (packet Section 35: "Do not connect a real database during
+' early milestones").
+FUNCTION SampleCustomers()
+    RETURN [CustomerRecord("1001", "Ada Lovelace"), CustomerRecord("1002", "Grace Hopper"), CustomerRecord("1003", "Margaret Hamilton")]
+END FUNCTION
+
+FUNCTION FindCustomer(customers, id)
+    FOR customer IN customers
+        IF customer.Id == id THEN RETURN customer
+    NEXT
+    RETURN NULL
+END FUNCTION
+
+IF GUI.Available() == FALSE THEN
+    PRINT "Customer Lookup needs a Wayland or X11 desktop session."
+ELSE
+    TRY
+        app = App("CustomerLookup")
+        win = app.Window("Customer Lookup", 420, 220)
+
+        customers = SampleCustomers()
+
+        ' Application states, packet Section 10: DEFAULT / SEARCHING / FOUND / NOT_FOUND / ERROR.
+        ' No state machinery exists in ARCADE's Application Model yet (docs/arcade/application-
+        ' model.md) -- this is a plain ArcoBASIC variable and an IF chain, the honest Level 3
+        ' equivalent until Phase F gives ARCADE a real first-class state system to express this
+        ' with instead.
+        state = "DEFAULT"
+
+        idLabel = Label("Customer ID:")
+        idLabel.SetPosition(win.Theme.Spacing, win.Theme.Spacing)
+        ignored = win.Attach(idLabel, "", FALSE)
+
+        idField = TextField("")
+        idField.SetBounds(win.Theme.Spacing, 40, 180, 32)
+        ignored = win.Attach(idField, "", TRUE)
+
+        ' Every app-defined intent (anything beyond the ArcoSurface default Close/PutAway/
+        ' FillWorkspace/Restore/Move set) must be declared before a widget is Attach()ed against
+        ' its name -- Attach only records the NAME on the widget; ArcoSurface.Invoke resolves it to
+        ' a real handle via IntentHandle(name) at click time, which returns NULL (a silent, non-
+        ' fatal no-op) for an undeclared name. Found by actually running this app and clicking
+        ' Search: the button visually worked (HandleEvent returned TRUE, matching the theme's own
+        ' pressed feedback) but Status never updated, because ArcoUI.InvokeIntent was never called
+        ' at all -- confirmed by reading ArcoSurface.Invoke's own NULL-handle short-circuit.
+        ignored = win.DefineIntent("Search")
+        searchButton = Button("Search")
+        searchButton.SetBounds(win.Theme.Spacing, 84, 100, 34)
+        ignored = win.Attach(searchButton, "Search")
+
+        statusLabel = Label("Status: Ready")
+        statusLabel.SetPosition(win.Theme.Spacing, 140)
+        ignored = win.Attach(statusLabel, "", FALSE)
+
+        WHILE app.AnyOpen()
+            timestamp = Time.Timestamp()
+            event = GUI.WaitEvent(0.02)
+            IF event.Type <> "none" THEN
+                target = app.SurfaceForWindow(event.Window)
+                IF target <> NULL THEN
+                    IF event.Type == "close" THEN
+                        ignored = target.Invoke("Close", timestamp)
+                    ELSE
+                        ignored = target.HandleEvent(event, timestamp)
+                    END IF
+                END IF
+            END IF
+            ignored = app.Pump()
+
+            ' Data binding (packet Section 13): reading Search's own invocation, then writing
+            ' `state`/`statusLabel.Text` in response is the plain-ArcoBASIC shape of what Section
+            ' 13's "Drag ValidationRule onto InputField"-style Surface binding is meant to produce
+            ' eventually. Kept here, by hand, so this app has real, inspectable behavior for Phase
+            ' G (Flow Integration) to eventually point at.
+            searchEvent = app.PollEvent()
+            WHILE searchEvent <> NULL
+                IF idField.Text == "" THEN
+                    state = "ERROR"
+                    statusLabel.Text = "Status: enter a Customer ID"
+                ELSE
+                    found = FindCustomer(customers, idField.Text)
+                    IF found == NULL THEN
+                        state = "NOT_FOUND"
+                        statusLabel.Text = "Status: no customer " + idField.Text
+                    ELSE
+                        state = "FOUND"
+                        statusLabel.Text = "Status: found " + found.DisplayName
+                    END IF
+                END IF
+                searchEvent = app.PollEvent()
+            WEND
+
+            FOR surface IN app.Surfaces
+                IF NOT surface.ShouldClose() THEN ignored = surface.Draw()
+            NEXT
+        WEND
+        FOR surface IN app.Surfaces
+            ignored = surface.Close()
+        NEXT
+    CATCH err
+        PRINT "Customer Lookup failed: " + err
+    END TRY
+END IF

@@ -1,0 +1,240 @@
+' ARCADE -- Arco Runtime Construction & Application Development Environment.
+'
+' Phase B (packet Section 34): the minimum shell that can open a project and show four tabs
+' (Surface / Flow / Source / Run) sharing one project context. No visual design canvas yet -- per
+' the packet's own acceptance criterion, Source is the only functional tab; Surface/Flow/Run show
+' an honest "not yet implemented" placeholder rather than a fake preview (packet Section 39.4/39.8
+' forbid faking a renderer or hot-reload theater; the same "don't pretend" discipline applies here
+' to an empty tab).
+'
+' See docs/arcade/README.md and docs/ARCADE_PROGRESS.md for the architecture this implements and
+' the reasoning behind each decision below.
+
+#IMPORT "arcoui"
+
+' The ARCADE project file format is `.arcoproj` -- a plain ArcoBASIC object-literal expression,
+' already real and already loadable via Project.Load (see docs/arcade/README.md's Session 1
+' finding 8). Recognized fields: Name, Entry, Files, Window. This loading logic mirrors the
+' now-deleted arcoflow.abas prototype's own (proven, working) version of it -- see
+' docs/ARCADE_PROGRESS.md for why that prototype was removed; this loading logic specifically was
+' worth keeping, since the format itself is an existing convention, not something ARCADE invented.
+FUNCTION LoadProject(openedPath)
+    project = {}
+    project.Name = ""
+    project.Root = ""
+    project.Entry = ""
+    project.Files = []
+
+    projectPath = ""
+    IF openedPath <> "" ANDALSO Path.Extension(openedPath) == ".arcoproj" THEN
+        projectPath = openedPath
+    ELSE
+        candidate = Path.Join(Path.DirName(openedPath), "project.arcoproj")
+        IF File.Exists(candidate) THEN projectPath = candidate
+    END IF
+
+    IF projectPath <> "" THEN
+        TRY
+            loaded = Project.Load(projectPath)
+            project.Name = Object.Get(loaded, "Name", "")
+            project.Entry = Object.Get(loaded, "Entry", "")
+            project.Root = Path.DirName(projectPath)
+            project.Files = Object.Get(loaded, "Files", [])
+            ' Deliberately NOT reading the project's own `Window` field here -- that config
+            ' describes the size of the WINDOW THE OPENED PROJECT ITSELF WOULD OPEN AT RUNTIME
+            ' (see arcade/reference-project/project.arcoproj's own 420x220, sized for Customer
+            ' Lookup's own small window, found the hard way: reading it here made ARCADE's OWN
+            ' shell open at 420x220 too, cramped enough to clip the fourth tab). ARCADE's own
+            ' workspace window size is a separate, ARCADE-level concern -- see WindowWidth/
+            ' WindowHeight constants below.
+        CATCH err
+            PRINT "ARCADE could not load " + projectPath + ": " + err.Message
+        END TRY
+    END IF
+
+    RETURN project
+END FUNCTION
+
+' The four canonical views (packet Section 4). "RUN" stays last in both the tab order and this
+' list on purpose -- it is the odd one out (it doesn't show a static representation of the project
+' at all, it launches the real thing), matching the packet's own workspace mockup ordering
+' (Section 33: "SURFACE FLOW SOURCE RUN").
+FUNCTION ViewNames()
+    RETURN ["Surface", "Flow", "Source", "Run"]
+END FUNCTION
+
+' The content area beneath the tab bar: shows the Source editor when active, an honest "not yet
+' implemented" notice for Surface/Flow otherwise, and launches the project's own entry file for
+' Run. A single Widget rather than four separately-attached ones because only one is ever visible
+' at a time and they share the same bounds -- ArcoSurface has no concept of "hidden" widgets, so
+' the alternative (attaching all four and toggling visibility by hand in each Draw/HandleEvent)
+' would just move this same branching into ArcadeShell instead of removing it.
+CLASS ContentArea IMPLEMENTS Widget
+    ActiveTab = "Source"
+    SourceEditor = NULL
+    EntryPath = ""
+    ProjectName = ""
+    X = 0
+    Y = 0
+    Width = 0
+    Height = 0
+    RunStatus = ""
+
+    CONSTRUCTOR(entryPath, projectName)
+        SELF.EntryPath = entryPath
+        SELF.ProjectName = projectName
+        content = ""
+        IF entryPath <> "" ANDALSO File.Exists(entryPath) THEN content = File.ReadText(entryPath)
+        SELF.SourceEditor = TextArea(content)
+    END CONSTRUCTOR
+
+    FUNCTION SetBounds(x, y, width, height)
+        SELF.X = x
+        SELF.Y = y
+        SELF.Width = width
+        SELF.Height = height
+        ignored = SELF.SourceEditor.SetBounds(x, y, width, height)
+    END FUNCTION
+
+    ' Writes the Source editor's current text back to the entry file. Phase B's acceptance is
+    ' "source file can be opened and edited" -- this is the "and saved" half, bound to Ctrl+S
+    ' below, the conventional editor shortcut rather than an ARCADE invention.
+    FUNCTION SaveSource()
+        IF SELF.EntryPath == "" THEN RETURN FALSE
+        File.WriteText(SELF.EntryPath, SELF.SourceEditor.Text)
+        RETURN TRUE
+    END FUNCTION
+
+    FUNCTION RunProject()
+        IF SELF.EntryPath == "" THEN
+            SELF.RunStatus = "No entry file to run."
+            RETURN
+        END IF
+        ' Compiled-and-run each time, not "launch a pre-built binary": Run must reflect whatever
+        ' is actually on disk right now, including an unsaved-to-Source-but-saved-to-disk edit --
+        ' see docs/arcade/runtime-inspection.md's own "no fake hot reload" discipline. This shells
+        ' out the same way the deleted arcoflow.abas prototype did (Process.Run -> ArcoFission
+        ' compile-run), the one piece of its approach worth keeping as-is.
+        arcofission = Process.Env("ARCOFISSION_PATH")
+        IF arcofission == "" THEN arcofission = "ArcoFission"
+        command = ShellQuoteArcade(arcofission) + " compile-run " + ShellQuoteArcade(SELF.EntryPath)
+        result = Process.Run(command)
+        SELF.RunStatus = result.Output
+    END FUNCTION
+
+    FUNCTION Draw(window)
+        IF SELF.ActiveTab == "Source" THEN
+            SELF.SourceEditor.Focused = TRUE
+            ignored = SELF.SourceEditor.Draw(window)
+        ELSE
+            SELF.SourceEditor.Focused = FALSE
+            IF SELF.ActiveTab == "Run" THEN
+                GUI.Text(window, "Run -- " + SELF.EntryPath, SELF.X, SELF.Y, 16, 0.82, 0.86, 0.90, 1.0)
+                GUI.Text(window, "Press R to compile and run through ArcoFission compile-run.", SELF.X, SELF.Y + 26, 13, 0.56, 0.64, 0.66, 1.0)
+                IF SELF.RunStatus <> "" THEN
+                    GUI.Text(window, SELF.RunStatus, SELF.X, SELF.Y + 56, 13, 0.7, 0.85, 0.75, 1.0)
+                END IF
+            ELSE
+                GUI.Text(window, SELF.ActiveTab + " -- not yet implemented.", SELF.X, SELF.Y, 16, 0.6, 0.65, 0.7, 1.0)
+                GUI.Text(window, "See docs/arcade/" + Lower(SELF.ActiveTab) + ".md for direction.", SELF.X, SELF.Y + 26, 13, 0.5, 0.55, 0.58, 1.0)
+            END IF
+        END IF
+    END FUNCTION
+
+    FUNCTION HandleEvent(window, event)
+        changed = FALSE
+        IF SELF.ActiveTab == "Source" THEN
+            changed = SELF.SourceEditor.HandleEvent(window, event)
+            IF event.Type == "key" ANDALSO event.Action == "press" ANDALSO event.Ctrl ANDALSO event.Key == "s" THEN
+                ignored = SELF.SaveSource()
+            END IF
+        END IF
+        IF SELF.ActiveTab == "Run" ANDALSO event.Type == "key" ANDALSO event.Action == "press" ANDALSO event.Key == "r" THEN
+            ignored = SELF.SaveSource()
+            ignored = SELF.RunProject()
+        END IF
+        RETURN changed
+    END FUNCTION
+END CLASS
+
+FUNCTION ShellQuoteArcade(text)
+    RETURN "'" + String.Replace(text, "'", "'\''") + "'"
+END FUNCTION
+
+IF GUI.Available() == FALSE THEN
+    PRINT "ARCADE needs a Wayland or X11 desktop session."
+ELSE
+    TRY
+        openedPath = ""
+        IF LEN(Args) > 0 THEN openedPath = Args[0]
+
+        project = LoadProject(openedPath)
+        entryPath = ""
+        IF project.Entry <> "" THEN entryPath = Path.Join(project.Root, project.Entry)
+
+        windowTitle = "ARCADE"
+        IF project.Name <> "" THEN windowTitle = "ARCADE -- " + project.Name
+
+        ' ARCADE's own workspace window size -- deliberately independent of whatever window size
+        ' the opened project's own app declares for itself (see LoadProject's own comment).
+        shellWidth = 1200
+        shellHeight = 760
+
+        app = App("ARCADE")
+        win = app.Window(windowTitle, shellWidth, shellHeight)
+
+        views = ViewNames()
+        content = ContentArea(entryPath, project.Name)
+
+        ' One intent per tab, one Button per tab -- reusing the same, already-proven Button/Widget/
+        ' Intent machinery ArcoUI's own examples use for every other click target, rather than
+        ' hand-rolling tab-bar hit-testing inside ArcadeShell (packet Section 39.6 forbids a
+        ' Surface-specific event system separate from what ArcoBASIC/ArcoUI already provides; the
+        ' same discipline applies to ARCADE's own UI, not just to applications ARCADE edits).
+        tabX = win.Theme.Spacing
+        FOR viewName IN views
+            ignored = win.DefineIntent("Show" + viewName)
+            tabButton = Button(viewName)
+            tabButton.SetBounds(tabX, win.Theme.Spacing, 110, 34)
+            ignored = win.Attach(tabButton, "Show" + viewName)
+            tabX = tabX + 110 + win.Theme.Spacing
+        NEXT
+
+        contentY = win.Theme.Spacing * 2 + 34
+        ignored = content.SetBounds(win.Theme.Spacing, contentY, shellWidth - win.Theme.Spacing * 2, shellHeight - contentY - win.Theme.Spacing)
+        ignored = win.Attach(content, "", TRUE)
+
+        WHILE app.AnyOpen()
+            timestamp = Time.Timestamp()
+            event = GUI.WaitEvent(0.02)
+            IF event.Type <> "none" THEN
+                target = app.SurfaceForWindow(event.Window)
+                IF target <> NULL THEN
+                    IF event.Type == "close" THEN
+                        ignored = target.Invoke("Close", timestamp)
+                    ELSE
+                        ignored = target.HandleEvent(event, timestamp)
+                    END IF
+                END IF
+            END IF
+            ignored = app.Pump()
+
+            tabEvent = app.PollEvent()
+            WHILE tabEvent <> NULL
+                FOR viewName IN views
+                    IF tabEvent.Intent == win.IntentHandle("Show" + viewName) THEN content.ActiveTab = viewName
+                NEXT
+                tabEvent = app.PollEvent()
+            WEND
+
+            FOR surface IN app.Surfaces
+                IF NOT surface.ShouldClose() THEN ignored = surface.Draw()
+            NEXT
+        WEND
+        FOR surface IN app.Surfaces
+            ignored = surface.Close()
+        NEXT
+    CATCH err
+        PRINT "ARCADE failed: " + err
+    END TRY
+END IF

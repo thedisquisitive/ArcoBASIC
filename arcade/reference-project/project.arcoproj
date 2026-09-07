@@ -1,0 +1,6 @@
+{
+    Name: "Customer Lookup",
+    Entry: "main.abas",
+    Files: ["main.abas"],
+    Window: {Width: 420, Height: 220}
+}

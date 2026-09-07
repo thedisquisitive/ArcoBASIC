@@ -1,0 +1,393 @@
+# ARCADE Progress Ledger
+
+**ARCADE** — Arco Runtime Construction & Application Development Environment. The Arcology
+official IDE: four synchronized views (Surface / Flow / Source / Run) over one application model.
+Full architecture contract: the agent packet quoted in Session 1 below (not yet copied into
+`docs/arcade/` verbatim — see "Exact next action").
+
+This file is not a changelog. Its job is to let another agent (human or AI) enter this repository
+cold and understand the current engineering reality without reconstructing it from commit history.
+Never delete a historical decision because a later one supersedes it — mark it superseded and link
+forward.
+
+---
+
+## Session 1 — 2026-09-06
+
+**Agent/operator:** Direct instruction from the project owner: "Time to start, for real, the
+ArcoFlow Arcology IDE. We had a prototype, we're deleting that and starting over with it... start
+implementing this agent packet" (the full ARCADE packet, Sections 0-50), with a same-message
+correction that the working directory is `arcobasic/arcade/`, not `arcobasic/arcoflow/`.
+
+**Current milestone:** Phase B (ARCADE Shell) complete and verified live against a real display.
+Phase A (Repository Reconnaissance) is complete — see the findings below, unchanged from the first
+pass. Phase C (Minimal Shared Application Model) has not started.
+
+### Files changed
+
+- **Removed** `arcoflow/` in its entirety (`git rm -r`, 9 tracked files: `arcoflow.abas` (443
+  lines, the old prototype — a plain text editor with Run via `Process.Run` → `ArcoFission
+  compile-run`, a project explorer, no graph/Intent view), `README.md`, `build.sh`, `serve.sh`,
+  `concept_render.png`, and `example-project/` (a `.arcoproj` + three `.abas` files)). This was the
+  prototype the project owner explicitly asked to delete and start over from. It was **not** wired
+  into the top-level `CMakeLists.txt` or `cmake/*.cmake` (it had its own self-contained
+  `arcoflow/build.sh`), so removing it needed no build-system changes. A few READMEs elsewhere
+  (`arco3d/README.md`, `games/README.md`, `docs/arcofission.md`) mention `arcoflow/` as an
+  illustrative build-pattern example; those references are now stale pointers to removed example
+  code. Low-priority cleanup, not fixed this session — noted under "Known defects" below.
+- **Created** `docs/arcade/` — the full Section 45 documentation set (`README.md`,
+  `architecture.md`, `application-model.md`, `surface.md`, `flow-integration.md`,
+  `source-roundtrip.md`, `runtime-inspection.md`, `testing.md`), each grounded in the Phase A
+  findings below rather than restating the packet abstractly.
+- **Created** this file, `docs/ARCADE_PROGRESS.md`.
+- **Created** `arcade/` — Phase B's real, working shell:
+  - `arcade/arcade.abas` — the ARCADE shell itself. `#IMPORT "arcoui"`; loads a `.arcoproj` via the
+    existing `Project.Load`; opens one `App`/`Window` (ARCADE's own workspace, sized independently
+    of whatever window size the opened project's own app declares — see the "Known defects" entry
+    this replaced, below); a `ContentArea` class (`IMPLEMENTS Widget`) shows the real Source text
+    (loaded via `File.ReadText` on the project's own `Entry` file) when the Source tab is active, an
+    honest "not yet implemented" notice pointing at the matching `docs/arcade/*.md` file for
+    Surface/Flow, and a real "press R to compile and run through `ArcoFission compile-run`" affordance
+    for Run — four `Button` widgets (one per tab), each wired through a real `ArcoUI` intent
+    (`win.DefineIntent("Show" + viewName)`), not a hand-rolled tab-bar hit-test.
+  - `arcade/reference-project/` — the packet's own Section 35 "Customer Lookup" reference
+    application (`main.abas` + `project.arcoproj`), used as the project ARCADE opens to prove all of
+    the above. Deterministic in-memory sample data (three `CustomerRecord`s), a real `TextField` +
+    `Button` + two `Label`s, and a real (if currently hand-rolled, not yet ARCADE-modeled) DEFAULT/
+    ERROR/FOUND/NOT_FOUND state chain driven by the Search intent.
+  - `arcade/README.md` — a short pointer into `docs/arcade/` and `docs/ARCADE_PROGRESS.md`.
+
+### Behavior added
+
+- **ARCADE shell (Phase B, packet Section 34)**: opens a `.arcoproj` project, shows four tabs
+  (Surface/Flow/Source/Run) sharing one project context, Source shows and can save real project
+  file content (`Ctrl+S`), Run genuinely compiles and launches the real project through
+  `ArcoFission compile-run` in a separate process/window, and returns control to ARCADE's own event
+  loop cleanly once that window closes. All of this was driven live against a real X11 display with
+  real `xdotool` clicks/keypresses and screenshotted at each step, not just read for plausibility —
+  see "Tests added" below for exactly what was verified and how.
+- **Reference application** (packet Section 35): a real, working "Customer Lookup" ArcoUI app,
+  independently confirmed to render and respond to input correctly (Search with an empty ID
+  produces the ERROR-state status text; the underlying `FindCustomer` logic for FOUND/NOT_FOUND
+  could not be exercised live this session — see "Known defects" — but is the same straight-line
+  code path already proven to compile and execute cleanly).
+
+### Behavior removed or superseded
+
+The `arcoflow/` prototype's own behavior (single-file text editing + Run, `.arcoproj` project
+explorer, native + web capsule builds) is gone. Its Source-only-editing niche is now covered (more
+narrowly, so far — no project explorer sidebar yet, no syntax highlighting) by `ContentArea`'s
+Source tab inside the real ARCADE shell above; its `.arcoproj`-loading logic was the one piece
+worth carrying forward as-is (see `LoadProject` in `arcade/arcade.abas`, adapted from the deleted
+prototype's own proven version), everything else was rebuilt fresh rather than resurrected, per the
+project owner's own "starting over" instruction.
+
+### Tests added / currently passing / currently failing
+
+No automated tests yet (packet Section 36's own categories — Model/Round-Trip/Layout/Renderer-
+Parity/Runtime-Protocol/UI-Smoke — all need either the Application Model (Phase C) or a stable
+enough shell to script against; `docs/arcade/testing.md` names the plan). What exists instead is
+real, live, manual verification performed this session, screenshotted at every step:
+
+- ARCADE shell opens `arcade/reference-project/project.arcoproj`, renders all four tabs at a
+  correctly-sized 1200×760 workspace window (see "Known defects" for the bug this replaced), and
+  the Source tab shows the real, current content of `arcade/reference-project/main.abas`.
+- Clicking each of Surface/Flow/Source/Run correctly switches `ContentArea.ActiveTab` and what's
+  drawn — confirmed with four separate screenshots, one per tab, each showing the expected content
+  (Source: real file text; Surface/Flow: the tab-specific "not yet implemented" notice with the
+  correct doc-file pointer; Run: the resolved entry-file path and the Press-R instruction).
+- Pressing `R` on the Run tab genuinely shells out to `ArcoFission compile-run` against the
+  reference project, which opens the real Customer Lookup application in its own window (confirmed
+  by screenshotting that second window directly, showing the real "Customer ID / Search / Status:
+  Ready" UI); closing that window returns control to ARCADE, whose own event loop resumes and
+  redraws correctly (confirmed with a post-close screenshot).
+- The reference application itself, launched directly (bypassing ARCADE, via `arco_cli` directly):
+  clicking into the Customer ID field correctly gains focus (a visible caret/focus-ring change);
+  clicking Search with an empty field correctly transitions to the ERROR state, updating the status
+  label to "Status: enter a Customer ID" — confirmed only after finding and fixing a real bug (see
+  "Known defects"/first bullet below) that silently no-opped the Search button entirely before the
+  fix.
+
+The full pre-existing project-wide test suite was **not** re-run this session (deferred, same
+reasoning as before: no ARCADE-adjacent C++/compiler code changed this session that the existing
+suite would exercise — only new ArcoBASIC application/documentation files were added, nothing in
+`src/`, `include/`, or existing `tests/` was touched). Re-run it before/with the first ARCADE
+change that touches shared C++ code (most likely Phase C, once an Application Model needs its own
+C++ representation).
+
+### Known defects
+
+- **Fixed during this session, not left as a defect, but worth recording as a real bug found**: the
+  reference application's `Search` button was silently inert — clicking it produced no visible
+  effect (`Status: Ready` never changed) because `win.Attach(searchButton, "Search")` was called
+  without first calling `win.DefineIntent("Search")`. `ArcoSurface.Invoke` resolves an intent name
+  to a handle via a linear `IntentNames`/`IntentHandles` scan and silently returns `FALSE` (a
+  no-op, not an error) when the name was never declared — so the button's own `HandleEvent`
+  correctly returned `TRUE` (matching its own visual press feedback) while the actual
+  `ArcoUI.InvokeIntent` call that would have queued a `PollEvent()`-visible event never happened.
+  Found by actually clicking it and watching nothing happen, not by reading the code. Fixed by
+  adding the missing `DefineIntent` call, with a comment on the exact failure mode for the next
+  person who hits this same shape. This is a real, general ArcoUI usage trap (any app-defined
+  intent needs a matching `DefineIntent` before any `Attach` references it by name) worth being
+  aware of, not something specific to ARCADE.
+- **Fixed during this session**: `LoadProject` originally read the opened project's own `Window`
+  field (meant for the SIZE THAT PROJECT'S OWN APP WINDOW OPENS AT, e.g. the reference project's
+  small 420×220) and used it for ARCADE's own shell window size too — opening ARCADE itself at
+  420×220, clipping the fourth tab off-screen. Found by taking a screenshot immediately after first
+  launch and seeing the cramped, clipped layout. Fixed by giving ARCADE's own shell a fixed,
+  independent size (1200×760) and not reading the opened project's `Window` field for that purpose
+  at all.
+- **Real environment gotcha, not an ARCADE bug, documented so the next agent doesn't lose time to
+  it again**: `Process.Env("ARCOFISSION_PATH")` returns empty in this development environment, and
+  the resulting bare `"ArcoFission"` fallback resolves via `PATH` to `/usr/bin/ArcoFission` — a
+  separate, apparently-stale system-wide install, NOT this repository's own actively-built
+  `./build/ArcoFission`. Running Run without `ARCOFISSION_PATH` set produces a real but misleading
+  failure (`unknown host function: GUI.SupportsShapedWindows`) that looks like a bytecode-VM/ArcoUI
+  incompatibility but is not one — `./build/ArcoFission compile-run` against the exact same file,
+  invoked directly, works correctly (confirmed: `GUI.Available()`, `GUI.SupportsShapedWindows()`,
+  and a full `App`/`Window` construction all succeed standalone and inside a class constructor via
+  `compile-run`). Always launch ARCADE (or run its own Run tab) with `ARCOFISSION_PATH` pointed at
+  the repository's own build, e.g. `ARCOFISSION_PATH="$(pwd)/build/ArcoFission"`.
+- Synthetic keyboard **text** input (`xdotool type`) did not register in this session's display
+  environment when tested against the reference application's `TextField` (focus/click DID
+  register correctly; typed characters did not appear). This matches an already-documented,
+  pre-existing environment characteristic (see this project's own `[[project_arcoui]]` memory: "no
+  Wayland input-injection tool" — GLFW's character-input callback path appears not to be reliably
+  reachable via this specific X11/XTest setup). Not investigated further as an ARCADE-specific
+  issue — the FOUND/NOT_FOUND Search states could not be exercised live this session as a direct
+  result (only the ID-empty ERROR state, which needs no typed input, was confirmed). A real gap in
+  test COVERAGE, not a known product defect.
+- Stale `arcoflow/` mentions in `arco3d/README.md`, `games/README.md`, `docs/arcofission.md` (from
+  the earlier deletion) — cosmetic, not functional, low priority, not fixed this session.
+
+### Architectural decisions made (Phase A findings)
+
+These answer the packet's own Section 42 "must remain open until repository inspection" list.
+Every answer below comes from reading the actual current code, not from assumption — file paths
+are given so a future agent can re-verify directly rather than trust this summary blindly.
+
+1. **Is the compiler AST suitable as the persistent shared model, or is an application-level
+   semantic model required above it?**
+   The compiler already has a real, RFC-governed canonical AST: `CanonicalAstNode`
+   (`src/frontend/parser.hpp:87`), part of **RFC-0012** ("ArcoFission Frontend → A-MIR Contract",
+   `arcology-os/rfcs/RFC-0012_ArcoFission_Frontend_to_AMIR_Contract.md`), whose own stated purpose
+   is exactly "one authoritative interpretation" of a program — no duplicated parsing, later stages
+   never reinterpret source text. Every `Expr`/`Stmt` node exposes `canonical_ast()` returning this
+   structure, carrying `source_line`/`source_column` (real position info, not synthesized) plus
+   kind-tagged scalar/child/named-child/group fields general enough to represent every `AstKind`
+   (69 variants — function/class/interface declarations, every statement and expression shape,
+   including hardware-facing constructs the freestanding profile needs). `ArcoFission reveal FILE
+   --stage AST` already renders it as a readable text tree (confirmed by running it directly on a
+   throwaway file). **Finding: this AST is the right foundation for the Source-level shared model**
+   — it is already authoritative, already stable (an RFC guards it against drift), and already
+   carries real source positions. It is NOT by itself a full "Application Model" (Section 18) —
+   Surface/Flow/state/binding/component concepts have no representation in it at all, and it has no
+   machine-readable (e.g. JSON) serialization yet, only the human-readable `reveal ast` text dump.
+   **Decision: build the Application Model as a layer ABOVE this AST** (own object identity, own
+   Surface/Region/Control/Component/State/Binding graph, per Section 18), keeping the AST as the
+   ground truth for anything ARCADE does NOT understand structurally (Section 19's "Level 3 —
+   Source-Only" case) and as the target `CanonicalAstNode` shape Surface/Flow edits must ultimately
+   resolve into when writing Source back out. A machine-readable AST dump (JSON or similar) is a
+   real, disclosed gap ARCADE will need — recorded here, not invented ad hoc later.
+
+2. **How does ArcoGUI currently declare surfaces and controls in ArcoBASIC?**
+   There are **two real, currently-shipping layers**, not one:
+   - `stdlib/gui.abas` (21,959 bytes) + the C++ `arco::gui` backend (`src/gui/glfw_backend.cpp` for
+     Linux desktop, `src/gui/canvas_backend.cpp` for the web/WASM target, `include/arco/gui.hpp`
+     for the shared interface) — an **immediate-mode** API: `GUI.Text`/`GUI.RoundedRectangle`/
+     `GUI.WaitEvent`/etc., a hand-rolled `Widget` interface (`stdlib/gui.abas:28`), and concrete
+     widgets like `Button` (`stdlib/gui.abas:294`) that a program draws explicitly every frame
+     inside its own event loop. This is what Arconaut (`arcfs-utils/apps/arconaut/arconaut.abas`)
+     uses directly, and what most of this session's own immediately-preceding work (the native
+     compiler backend's GUI support, the layout-caching performance fix) touched.
+   - `stdlib/arcoui.abas` (34,593 bytes) + a C++ **ArcoUI** core (`include/arcoui/{core,geometry,
+     gesture,types}.hpp`, `src/gui/arcoui/*.cpp`, per this project's own memory: "RFC-ArcoUI",
+     Milestones 0-4 delivered on this same branch) — a genuinely **intent-oriented, retained**
+     model layered ON TOP of `gui.abas` (`stdlib/arcoui.abas:16` literally `#IMPORT "gui"`, and its
+     own `Button` usage in `examples/arcoui_hello.abas` resolves to `gui.abas`'s class). Its C++
+     `arcoui::Runtime` (`include/arcoui/core.hpp`) already has, independently of anything ARCADE
+     asked for: a **semantic tree separate from a presentation tree** (`SemanticNode`/
+     `PresentationNode`, explicitly split "so an intent be able to belong to a semantic object
+     whose visible control is hosted elsewhere" — `core.hpp:38-41`), **opaque stable handles**
+     (`arco::RuntimeHandle`, not array index or screen position) for every object, **Intents**
+     with real state (`Available`/`Blocked`/`Unavailable`/`Active`) and a `blocked_reason` string
+     (`core.hpp:74-81`), and **Transactions** with `Begin`/`Update`/`Commit`/`Cancel`/`Undo`/`Redo`
+     (`core.hpp:127-134`). It also already models a `Surface` with a `Shape` enum including
+     `Polygon`/custom point lists, not just `Rectangle` (`core.hpp:58-71`).
+   **Finding: this is an unusually strong, load-bearing match for what the packet calls
+   "ArcoGUI."** The semantic/presentation split is section 18's stable-identity requirement almost
+   verbatim; Intent state + `blocked_reason` is section 14's Explainability Overlay's actual data
+   source ("Enabled ← CanSearch ← ..." is directly answerable from `Intent::blocked_reason` once
+   something populates it meaningfully); Transactions are section 23's unified undo/redo
+   substrate; `Shape::Polygon` is section 22's custom-shaped-surface requirement, already real, not
+   theoretical. **Decision: ARCADE's Surface is built on ArcoUI, not on raw `gui.abas`.** Raw
+   `gui.abas` stays reachable underneath (ArcoUI itself depends on it for actual widgets/rendering,
+   and Source-only ArcoBASIC programs using `gui.abas` directly must remain valid Source-only
+   content per Section 19 Level 3), but ARCADE's own object model talks to ArcoUI's handles/
+   intents/transactions, not to raw `GUI.*` calls.
+   **Real, disclosed gap**: ArcoUI does not yet expose the design-time reflection metadata Section
+   21 asks for (control type name, constructible properties, property types/constraints, layout
+   capabilities, binding capabilities — a registry ARCADE's palette/inspector need to avoid a
+   hardcoded per-widget switch statement). This does not exist anywhere in the current `arcoui`
+   core or bindings. Per the packet's own Section 21 instruction ("record the requirement as an
+   ArcoGUI interface dependency rather than embedding a private incompatible substitute"), this is
+   recorded here as required upstream work, not something ARCADE fakes internally.
+
+3. **Does ArcoGUI already expose property/control metadata?** No — see finding 2's gap above.
+   `include/arcoui/bindings.hpp`/`bindings.cpp` bridge the C++ core to ArcoBASIC call sites, but
+   there is no reflection/registration table of widget types and their own property shapes
+   anywhere in the current tree.
+
+4. **What is ArcoFlow's current serialization format?** **There is none. This is the single
+   biggest finding of this session.** A repo-wide search for any graph/node/flow intermediate
+   representation (`FlowGraph`, `FlowNode`, `class Flow`, `struct Flow`, any RFC with "Flow" in
+   its own title) turned up nothing. The only things that have ever been called "ArcoFlow" in this
+   repository are (a) this project's own memory/vision notes (not code), and (b) the just-deleted
+   `arcoflow/arcoflow.abas` prototype itself, whose own README explicitly said "No Intent/graph
+   view yet" — it was a plain text editor with a project explorer, nothing resembling a node/wire
+   canvas or a persisted graph format ever existed on disk.
+
+5. **Does ArcoFlow compile from a graph into ArcoBASIC AST, bytecode, or another IR?** Moot per
+   finding 4 — there is no graph to compile from yet. **Decision, and the packet's own stated
+   ambiguity-resolution rule applied here** (Section 1: "If a material architectural ambiguity
+   blocks implementation... document it... choose the smallest reversible implementation that
+   preserves the packet's architecture"): Flow's own graph IR does not yet exist and must be
+   **designed**, not integrated with a pre-existing format. The design constraint the packet DOES
+   already fix is that Flow must reach parity with real ArcoBASIC control flow (Section 16:
+   bidirectional Source ⇄ Flow navigation, subcharts as first-class functions/classes/behaviors) —
+   which means the new Flow IR's own node vocabulary should be derived from `AstKind` (finding 1)
+   rather than invented independently, so a Flow node and an AST node for the same construct
+   (`If`, `While`, `ForEach`, `Call`, `Assign`, ...) stay in a known, deliberate correspondence
+   instead of drifting into two incompatible models of "what a program is." This is real,
+   unstarted design work — not attempted this session, flagged as a likely Phase G blocker.
+
+6. **What runtime debug/introspection channel already exists, if any?** None. `arcoui::Runtime`
+   (finding 2) is a real, structured, in-process runtime, but nothing exposes it to an EXTERNAL
+   process the way Phase H ("attach ARCADE to a running application... read object identity,
+   current visible/enabled state...") requires. This is real, unstarted work, not a small gap.
+
+7. **How are AEX/capsule application resources represented?** RFC-0046 (this project's own memory:
+   "component-based, interface-resolved deps, capability declarations, ArcoBASIC Binding Table")
+   is real but early — Section 61 Phases 1-4 of 15 are implemented (binary format, manifest/
+   component-graph parsing), Phases 5-15 (capability evaluation, ArcFS-backed loading, native ABI,
+   real hardware) are not started. **Decision: AEX is not mature enough to be ARCADE's project/
+   packaging format today** — it is a real future integration point (an ARCADE project should
+   presumably be able to build/ship as an AEX component eventually) but not a Phase A-D dependency.
+
+8. **What existing project format should ARCADE open?** `.arcoproj` — a plain ArcoBASIC
+   object-literal expression (`{Name: "...", Entry: "main.abas", Files: [...], Window: {...}}`,
+   confirmed by reading the deleted prototype's own `example-project/project.arcoproj` before
+   removal), loaded via a real, already-shipping host function `Project.Load`
+   (`src/runtime/runtime.cpp`, registered alongside `ArcoSH.AssetsDir`/`Path.*` — see this
+   project's own memory note on the `arcoflow`/`arcofission_pipeline` work). It evaluates the
+   object-literal expression in a fresh, throwaway `Runtime` isolated from the caller's own globals
+   specifically so a project's own field names never collide with anything else — already a
+   deliberate, documented design choice, not incidental. **Decision: ARCADE keeps `.arcoproj`** as
+   its project file format (Section 20 explicitly says to inspect existing conventions first
+   rather than invent a new format), extending its schema as needed for Surface/Flow/designer-
+   workspace-state fields (kept separate from semantic fields per Section 20's own instruction:
+   "Designer-only state... must not create noisy source control diffs").
+
+9. **Which UI toolkit currently hosts developer tools outside Arcology OS, if any?** None separate
+   from ArcoGUI itself — and per the packet's own Section 43 ("Do not tie the application model to
+   Win32, GTK, Qt, Cocoa, or browser DOM concepts... intended long-term UI/rendering substrate is
+   ArcoGUI"), none should be introduced. The existing Linux desktop backend (GLFW window/input +
+   Cairo/Pango rendering, `src/gui/glfw_backend.cpp`) is real, working, and was directly exercised
+   and improved this same session (a genuine layout-caching performance fix landed in it earlier
+   today, uncommitted as of this writing — see "Exact next action"). **Decision: ARCADE itself
+   runs as an ArcoUI/ArcoBASIC application on this same backend**, eating its own dog food from day
+   one rather than building a separate host-platform bootstrap tool, which the packet explicitly
+   discourages (Section 43).
+
+10. **What subset can run self-hosted on Arcology OS versus Linux/Windows during bootstrap?** Not
+    resolved this session — Arcology OS's own native GUI story is still early (RFC-0047, Phase 0-1
+    of a 4-phase native display driver, per this project's own memory — no native windowing/
+    compositor yet). **Decision: ARCADE targets Linux first** (the same `linux-x86_64` bytecode-
+    capsule and native compiler targets already proven this session for Arconaut), with an
+    Arcology-OS-hosted ARCADE staying an explicit, out-of-scope-for-now future direction — matching
+    the packet's own Section 43 "isolate host-platform bootstrap concerns" instruction and Section
+    40's non-goals list (no requirement to solve this now).
+
+### Temporary compromises
+
+None yet — no code has been written.
+
+### Questions requiring owner decision
+
+1. **`.arcoproj` schema evolution**: extending it with Surface/Flow-relevant fields (Section 20)
+   will change its shape. No decision needed to START (additive fields are safe, matching how
+   `Window: {...}` was already added on top of the base `{Name, Entry, Files}` shape by whoever
+   built the original prototype), but a real schema-versioning story may be worth a short RFC once
+   the shape stabilizes past Phase D. Not blocking Phase A/B.
+2. **ArcoUI's own missing design-time reflection metadata** (finding 2/3's gap): this is real,
+   necessary upstream work, not something ARCADE can route around cleanly. Worth confirming whether
+   this becomes its own ArcoUI milestone (extending the existing RFC-ArcoUI work already landed on
+   this branch) versus something scoped as ARCADE-owned code that happens to live near ArcoUI. Not
+   blocking Phase B/C (which only need one Label/one Button/one Container — small enough to
+   hand-write metadata for without a registry yet), but will block Phase E (palette/component
+   discovery, Section 30) if not resolved by then.
+3. **Bootstrap platform** (finding 10): confirmed direction (Linux native, ArcoUI-hosted) needs no
+   owner sign-off to proceed with, flagged here only so it's visible, not because it's contested.
+
+### Exact next action
+
+**Phase C — Minimal Shared Application Model** (packet Section 34). Concretely, in order:
+
+1. Design and implement the smallest real Application Model that can represent the reference
+   project's own shape: one surface, one container (or none, if the reference app's flat widget
+   list doesn't need one yet — don't add a Region concept before something needs it), one label,
+   one button, simple properties, **stable IDs** (packet Section 18 — see `docs/arcade/
+   application-model.md` for the identity design direction already recorded). Decide concretely
+   where this lives: a new C++ header/`.cpp` pair (most likely, given the AST and ArcoUI are both
+   C++), or an ArcoBASIC-level structure inside `arcade/` itself if that proves sufficient for this
+   small a model. Determine this by attempting it, not by assuming up front.
+2. Prove **one direction** of round-trip first (packet Section 34's own Phase C acceptance: "model
+   serializes deterministically, objects retain stable identity, Surface and Source can refer to
+   same object") — this does not yet require Surface UI or two-way sync (that's Phase D). A model
+   built from reading `arcade/reference-project/main.abas`'s own AST, referencing the same stable
+   IDs a hypothetical Surface view would use, serialized deterministically, is Phase C's whole bar.
+3. Add the first real automated test (packet Section 36.1, Model Tests) once there's a model to
+   test — likely alongside `tests/unit/arcoui_core_tests.cpp`'s own plain-assert convention (see
+   `docs/arcade/testing.md`). This is the FIRST ARCADE automated test; there are none yet.
+4. Do NOT start on a control palette, property inspector, or Flow canvas before Phase C's model is
+   real and tested, and Phase D's first true round trip (`Window / Label "Hello" / Button "Exit"`,
+   Source ⇄ Surface, packet Section 34) works. The packet is explicit about this ordering (Section
+   39.1 names "a canvas plus draggable buttons" as a failure mode to avoid skipping ahead into).
+5. Revisit the "Questions requiring owner decision" list below, especially #2 (ArcoUI's missing
+   design-time reflection metadata) — Phase C's own minimal scope (one label, one button) doesn't
+   need it, but Phase E (palette) will, and it's worth flagging to ArcoUI's own maintainers/RFC
+   process sooner rather than discovering the blocker mid-Phase-E.
+
+### Build and run commands (packet Section 44)
+
+```sh
+# Build (ARCADE has no C++ code of its own yet — this builds the ArcoFission compiler and the
+# arco_cli interpreter ARCADE currently runs on top of, from the repository root):
+cmake --build build
+
+# Launch ARCADE against the reference project (needs a live X11/Wayland session; on this
+# development box that means DISPLAY=:1 with WAYLAND_DISPLAY unset -- see this project's own
+# [[project_arcoui]] memory for why). ARCOFISSION_PATH must point at this repo's own build, not a
+# bare "ArcoFission" on PATH -- see "Known defects" above for the stale-system-install gotcha this
+# avoids:
+ARCOFISSION_PATH="$(pwd)/build/ArcoFission" \
+WAYLAND_DISPLAY= XDG_SESSION_TYPE=x11 DISPLAY=:1 \
+  ./build/arco_cli arcade/arcade.abas arcade/reference-project/project.arcoproj
+
+# Open a bare .abas file instead of a project (no project explorer/context, matches how the
+# deleted arcoflow.abas prototype's own no-project mode worked):
+./build/arco_cli arcade/arcade.abas some/file.abas
+
+# Run the reference application directly (bypassing ARCADE, for isolated testing of the reference
+# app itself):
+./build/arco_cli arcade/reference-project/main.abas
+
+# Compile-and-run the reference application through the bytecode VM instead of the tree-walking
+# interpreter (this is what ARCADE's own Run tab shells out to):
+./build/ArcoFission compile-run arcade/reference-project/main.abas
+
+# ARCADE has no automated tests yet (see "Tests added" above) -- there is no `ctest` target to run
+# for ARCADE specifically. The general project suite (`ctest --test-dir build`) remains correct for
+# the surrounding ArcoBASIC/ArcoFission/ArcoUI code ARCADE depends on, and should be re-run before/
+# with the first ARCADE change that touches shared C++ code (see "Tests added" above).
+```
