@@ -35,8 +35,18 @@ struct WindowRecord {
     // Set by clear_3d(), read and reset by present() -- see gui.hpp's own comment on clear_3d()
     // for why present() needs to know whether a 3D scene was drawn this frame at all.
     bool scene3d_active = false;
+    // Reused, already-shaped PangoLayout objects, keyed by family+size+text (see get_or_create_
+    // layout's own comment for the real cost this closes: building AND shaping a layout from
+    // scratch on every single text()/text_mono()/measure_text() call, every frame, was a genuine,
+    // measured performance problem in a real app -- Arconaut, this project's own GUI admin tool).
+    // Per-window (not global) since a PangoLayout created via pango_cairo_create_layout is tied to
+    // the specific cairo context it was created from.
+    std::unordered_map<std::string, PangoLayout*> layout_cache;
 
     ~WindowRecord() {
+        for (auto& entry : layout_cache) {
+            if (entry.second) g_object_unref(entry.second);
+        }
         if (context) cairo_destroy(context);
         if (surface) cairo_surface_destroy(surface);
     }
@@ -615,20 +625,51 @@ void circle(int id, double center_x, double center_y, double radius, double r, d
     set_color(item.context, r, g, b, a);
     cairo_fill(item.context);
 }
-void text_family(int id, const std::string& family, const std::string& value, double x, double y, double size,
-                 double r, double g, double b, double a) {
-    auto& item = find_window(id);
+// Above this many distinct cached layouts, the whole per-window cache is dropped and rebuilt from
+// scratch -- a deliberately simple bound (no LRU/age tracking) rather than unbounded growth for a
+// program that draws a lot of genuinely unique, ever-changing text; ordinary UI text (button/tab
+// labels, a bounded list of visible rows) never comes close to this in practice.
+constexpr std::size_t kLayoutCacheCap = 512;
+
+// Building a PangoLayout from scratch -- a fresh font description, pango_layout_set_text running
+// real glyph shaping -- is genuinely expensive, and every visible piece of text in an ordinary
+// immediate-mode GUI gets redrawn (and, before this cache, fully RE-SHAPED) every single frame,
+// including every frame triggered by nothing more than a pointer-move event. Found directly: a
+// real app built on this backend (Arconaut, this project's own GUI admin tool) reported noticeable
+// hover lag even after its own app-level fix (caching MEASURE_TEXT's own result for static button
+// labels) -- that fix never touched actual drawing, and never helped genuinely dynamic per-row
+// text (a device list, a log) at all, since each row's text is a different string every time
+// app-level caching could key on. Shared by text_family and measure_text_family below (a
+// PangoLayout, once shaped, is equally usable for either) so both are covered by one cache.
+// Position (cairo_move_to) and color (set_color) are NOT part of a layout's own shaped state and
+// still must be, and are, applied fresh on every draw regardless of a cache hit.
+PangoLayout* get_or_create_layout(WindowRecord& item, const std::string& family, const std::string& value, double size) {
+    const std::string key = family + '\x1f' + std::to_string(size) + '\x1f' + value;
+    const auto cached = item.layout_cache.find(key);
+    if (cached != item.layout_cache.end()) return cached->second;
+    if (item.layout_cache.size() >= kLayoutCacheCap) {
+        for (auto& entry : item.layout_cache) {
+            if (entry.second) g_object_unref(entry.second);
+        }
+        item.layout_cache.clear();
+    }
     PangoLayout* layout = pango_cairo_create_layout(item.context);
     PangoFontDescription* font = pango_font_description_new();
     pango_font_description_set_family(font, family.c_str());
     pango_font_description_set_absolute_size(font, std::max(1.0, size) * PANGO_SCALE);
     pango_layout_set_font_description(layout, font);
     pango_layout_set_text(layout, value.c_str(), -1);
+    pango_font_description_free(font);
+    item.layout_cache.emplace(key, layout);
+    return layout;
+}
+void text_family(int id, const std::string& family, const std::string& value, double x, double y, double size,
+                 double r, double g, double b, double a) {
+    auto& item = find_window(id);
+    PangoLayout* layout = get_or_create_layout(item, family, value, size);
     cairo_move_to(item.context, x, y);
     set_color(item.context, r, g, b, a);
     pango_cairo_show_layout(item.context, layout);
-    pango_font_description_free(font);
-    g_object_unref(layout);
 }
 void text(int id, const std::string& value, double x, double y, double size, double r, double g, double b, double a) {
     text_family(id, "Sans", value, x, y, size, r, g, b, a);
@@ -664,16 +705,9 @@ void image(int id, const std::string& path, double x, double y, double width, do
 }
 Value measure_text_family(int id, const std::string& family, const std::string& value, double size) {
     auto& item = find_window(id);
-    PangoLayout* layout = pango_cairo_create_layout(item.context);
-    PangoFontDescription* font = pango_font_description_new();
-    pango_font_description_set_family(font, family.c_str());
-    pango_font_description_set_absolute_size(font, std::max(1.0, size) * PANGO_SCALE);
-    pango_layout_set_font_description(layout, font);
-    pango_layout_set_text(layout, value.c_str(), -1);
+    PangoLayout* layout = get_or_create_layout(item, family, value, size);
     int width = 0, height = 0;
     pango_layout_get_pixel_size(layout, &width, &height);
-    pango_font_description_free(font);
-    g_object_unref(layout);
     return Value::Object{{"Width", width}, {"Height", height}};
 }
 Value measure_text(int id, const std::string& value, double size) {
