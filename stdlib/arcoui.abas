@@ -161,7 +161,18 @@ CLASS TextField IMPLEMENTS Widget
         IF event.Type == "pointer-button" ANDALSO event.Action == "press" ANDALSO event.Button == "left" THEN
             SELF.Focused = SELF.ContainsPoint(event.X, event.Y)
         END IF
-        IF NOT SELF.Focused THEN RETURN FALSE
+        ' `!`, not `NOT` -- NOT/BITNOT in this language is a bitwise complement (~), aliased at
+        ' the lexer level (see src/frontend/lexer.cpp), not logical negation. It is
+        ' self-consistent for a TRUE encoded as all-bits-set (-1, the classic BASIC convention:
+        ' NOT FALSE(=0) = -1 = truthy, correct by luck) but this codebase's own TRUE literal/
+        ' comparison results are NOT so encoded (measured: NOT TRUE = -2, itself nonzero, so an
+        ' `IF NOT x THEN` guard is truthy REGARDLESS of x -- it never actually skips when x is
+        ' TRUE). A real, live-reported ARCADE bug (Customer Lookup's Search field never receiving
+        ' typed input, PollRun() never seeing a finished run, ArcoSurface.AnyOpen()/the Draw loop
+        ' never noticing ShouldClose()) traced to this exact footgun across this file. `!` is
+        ' this language's real logical-not operator (src/frontend/parser.cpp's Bang token) and
+        ' was verified correct for both TRUE and FALSE before this fix went in anywhere.
+        IF !SELF.Focused THEN RETURN FALSE
 
         changed = FALSE
         IF event.Type == "text" THEN
@@ -368,7 +379,7 @@ CLASS ArcoSurface
             inside = ArcoUI.SurfacePointInside(SELF.CoreHandle, event.X, event.Y)
             IF inside <> SELF.Inside THEN
                 SELF.Inside = inside
-                ignored = GUI.SetInputPassthrough(SELF.Window, NOT inside)
+                ignored = GUI.SetInputPassthrough(SELF.Window, !inside)
             END IF
         END IF
 
@@ -770,7 +781,7 @@ CLASS App
     FUNCTION Pump()
         event = ArcoUI.PollIntentEvent()
         WHILE event.Type <> "none"
-            IF NOT SELF.RouteCloseEvents(event) THEN ignored = Array.Add(SELF.PendingEvents, event)
+            IF !SELF.RouteCloseEvents(event) THEN ignored = Array.Add(SELF.PendingEvents, event)
             event = ArcoUI.PollIntentEvent()
         WEND
     END FUNCTION
@@ -782,9 +793,17 @@ CLASS App
         RETURN Array.Shift(SELF.PendingEvents)
     END FUNCTION
 
+    ' `!surface.ShouldClose()`, not `NOT` -- see TextField.HandleEvent's comment above for why.
+    ' This one matters most: under the NOT-is-bitwise footgun, this guard was truthy regardless of
+    ' ShouldClose()'s real value, so AnyOpen() always returned TRUE once ANY surface existed --
+    ' the main loop of every ArcoUI app (ARCADE included) could never actually notice a real close
+    ' request and exit on its own. A live test's apparent success closing ARCADE via `xdotool
+    ' windowclose` turned out to be that command force-killing the process at the X level in this
+    ' environment (confirmed via a captured BadWindow X error), not this loop noticing ShouldClose
+    ' and exiting gracefully -- this bug was still live until this fix.
     FUNCTION AnyOpen()
         FOR surface IN SELF.Surfaces
-            IF NOT surface.ShouldClose() THEN RETURN TRUE
+            IF !surface.ShouldClose() THEN RETURN TRUE
         NEXT
         RETURN FALSE
     END FUNCTION
@@ -805,7 +824,7 @@ CLASS App
             END IF
             ignored = SELF.Pump()
             FOR surface IN SELF.Surfaces
-                IF NOT surface.ShouldClose() THEN ignored = surface.Draw()
+                IF !surface.ShouldClose() THEN ignored = surface.Draw()
             NEXT
         WEND
         FOR surface IN SELF.Surfaces

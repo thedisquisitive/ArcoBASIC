@@ -79,6 +79,8 @@ CLASS ContentArea IMPLEMENTS Widget
     Width = 0
     Height = 0
     RunStatus = ""
+    RunInFlight = FALSE
+    RunOutputPath = ""
 
     CONSTRUCTOR(entryPath, projectName)
         SELF.EntryPath = entryPath
@@ -110,16 +112,69 @@ CLASS ContentArea IMPLEMENTS Widget
             SELF.RunStatus = "No entry file to run."
             RETURN
         END IF
+        IF SELF.RunInFlight THEN
+            SELF.RunStatus = "A run is already in progress -- wait for it to finish, or close its window."
+            RETURN
+        END IF
         ' Compiled-and-run each time, not "launch a pre-built binary": Run must reflect whatever
         ' is actually on disk right now, including an unsaved-to-Source-but-saved-to-disk edit --
         ' see docs/arcade/runtime-inspection.md's own "no fake hot reload" discipline. This shells
         ' out the same way the deleted arcoflow.abas prototype did (Process.Run -> ArcoFission
         ' compile-run), the one piece of its approach worth keeping as-is.
+        '
+        ' What changed, and why (a real, live-reported bug): Process.Run is a genuinely BLOCKING
+        ' call (popen()/pclose() in src/runtime/runtime.cpp's process_run) -- it does not return
+        ' until the child process exits. Customer Lookup (like any ArcoUI app) opens its own real
+        ' GUI window and keeps running until a person closes THAT window. A synchronous Process.Run
+        ' here therefore froze ARCADE's ENTIRE event loop -- no redraws, no click handling, not even
+        ' ARCADE's own close button -- for as long as the run stayed open. Confirmed live: pressing
+        ' R made the whole shell unresponsive, reported as "it doesn't let me close the windows...
+        ' nothing." The fix backgrounds the child (a trailing `&` inside a subshell, still launched
+        ' through the same Process.Run/popen path -- the outer shell backgrounds the subshell and
+        ' returns immediately, so Process.Run itself no longer blocks) and appends a sentinel line
+        ' once it truly exits, so ARCADE stays fully responsive while a run is open. PollRun() below
+        ' is the other half: it notices the sentinel and reports the real captured output once the
+        ' child actually finishes, so this stays honest -- real output, just observed
+        ' asynchronously -- rather than a fire-and-forget approximation that would silently swallow
+        ' compile errors (this Run tab's other job).
         arcofission = Process.Env("ARCOFISSION_PATH")
         IF arcofission == "" THEN arcofission = "ArcoFission"
-        command = ShellQuoteArcade(arcofission) + " compile-run " + ShellQuoteArcade(SELF.EntryPath)
-        result = Process.Run(command)
-        SELF.RunStatus = result.Output
+        SELF.RunOutputPath = "/tmp/arcade-run-" + Time.Timestamp() + ".log"
+        ' The redirect MUST be on the outer subshell, not the inner command -- found the hard way,
+        ' by measuring it. Process.Run is popen()/pclose() (src/runtime/runtime.cpp's process_run),
+        ' and popen's read loop blocks until the pipe sees EOF, which does NOT happen just because
+        ' the direct `sh -c` child has exited: a backgrounded grandchild that inherited a copy of
+        ' the pipe's write end before performing its OWN redirection keeps that fd alive until IT
+        ' exits. `(cmd > file 2>&1; ...) &` still measured ~4s for a 4s inner sleep -- the redirect
+        ' happening one level too deep. Moving the redirect onto the whole backgrounded subshell,
+        ' `(cmd; ...) > file 2>&1 &`, closes the pipe's write end immediately at subshell start,
+        ' before anything inside it runs -- measured ~1ms for the same 4s inner sleep. This was the
+        ' actual, full reason ARCADE stayed frozen even after the first attempt at this fix.
+        command = "(" + ShellQuoteArcade(arcofission) + " compile-run " + ShellQuoteArcade(SELF.EntryPath) + "; echo ARCADE_RUN_DONE) > " + ShellQuoteArcade(SELF.RunOutputPath) + " 2>&1 &"
+        ignored = Process.Run(command)
+        SELF.RunInFlight = TRUE
+        SELF.RunStatus = "Running..."
+    END FUNCTION
+
+    ' Cheap (one File.Exists, and only a File.ReadText once that returns TRUE) and a complete no-op
+    ' whenever no run is in flight -- safe to call every main-loop iteration. Returns TRUE the one
+    ' time it notices a run just finished (so the caller knows to force a redraw of the new status).
+    '
+    ' `!`, not `NOT` -- a real bug, found by direct measurement while debugging why this function
+    ' never seemed to fire: NOT/BITNOT in this language is a bitwise complement (~), aliased at the
+    ' lexer level (src/frontend/lexer.cpp), not logical negation. `NOT TRUE` measures as -2, which
+    ' is itself truthy, so `IF NOT x THEN` was taking its branch regardless of x's real value --
+    ' every guard below always returned early. See stdlib/arcoui.abas's TextField.HandleEvent and
+    ' App.AnyOpen for the same fix applied to the wider bug this one led to being found.
+    FUNCTION PollRun()
+        IF !SELF.RunInFlight THEN RETURN FALSE
+        IF !File.Exists(SELF.RunOutputPath) THEN RETURN FALSE
+        text = File.ReadText(SELF.RunOutputPath)
+        marker = "ARCADE_RUN_DONE"
+        IF !String.Contains(text, marker) THEN RETURN FALSE
+        SELF.RunStatus = String.Trim(String.Replace(text, marker, ""))
+        SELF.RunInFlight = FALSE
+        RETURN TRUE
     END FUNCTION
 
     FUNCTION Draw(window)
@@ -191,12 +246,25 @@ ELSE
         ' hand-rolling tab-bar hit-testing inside ArcadeShell (packet Section 39.6 forbids a
         ' Surface-specific event system separate from what ArcoBASIC/ArcoUI already provides; the
         ' same discipline applies to ARCADE's own UI, not just to applications ARCADE edits).
+        '
+        ' Kept in `tabButtons` (parallel to `views`), not just attached and forgotten: the
+        ' keyboard-FOCUS ring ArcoSurface draws around whichever widget was attached first
+        ' (Surface, always, regardless of which tab is actually showing -- Tab/Shift+Tab moves it,
+        ' a click does NOT) is a completely different concept from "which tab is active," and
+        ' conflating them was a real, found-by-a-real-user bug: Surface stayed visually
+        ' highlighted no matter which tab's content was actually showing. Fixed by giving the
+        ' ACTIVE tab its own real color state, applied every frame in the main loop below, the
+        ' same way Arconaut's own Tab() (arcfs-utils/apps/arconaut/arconaut.abas) already
+        ' distinguishes a selected tab from an unselected one via explicit color, not the
+        ' keyboard-focus ring.
+        tabButtons = []
         tabX = win.Theme.Spacing
         FOR viewName IN views
             ignored = win.DefineIntent("Show" + viewName)
             tabButton = Button(viewName)
             tabButton.SetBounds(tabX, win.Theme.Spacing, 110, 34)
             ignored = win.Attach(tabButton, "Show" + viewName)
+            ignored = Array.Push(tabButtons, tabButton)
             tabX = tabX + 110 + win.Theme.Spacing
         NEXT
 
@@ -204,10 +272,28 @@ ELSE
         ignored = content.SetBounds(win.Theme.Spacing, contentY, shellWidth - win.Theme.Spacing * 2, shellHeight - contentY - win.Theme.Spacing)
         ignored = win.Attach(content, "", TRUE)
 
+        ' Redraw gating (packet Section 38: "avoid architectures that require reparsing/rebuilding
+        ' the entire project after every mouse movement" -- the same principle applies to redrawing
+        ' it). ArcoUI's own App.Start() redraws unconditionally every loop iteration, "matching
+        ' every existing GUI.* example app's convention" per its own comment -- fine for a small,
+        ' cheap-to-draw app, but ARCADE's own Source tab draws real, potentially long file content
+        ' every frame, and a single mouse click is at least two GUI.WaitEvent iterations
+        ' (pointer-button press, then release -- Button.HandleEvent only activates on release, see
+        ' stdlib/gui.abas) before the resulting Show* intent even reaches PollEvent() below, plus
+        ' whatever pointer-move events land in between -- every one of which triggered a full,
+        ' otherwise-wasted redraw before this fix, a real, reported "slow to update after clicking
+        ' a button" symptom. `needsRedraw` tracks whether anything actually changed since the last
+        ' draw; a small periodic safety-net redraw (every ~10 idle iterations, ~200ms at this
+        ' loop's own 0.02s poll interval) guards against any repaint this change-tracking doesn't
+        ' account for (e.g. window expose after being uncovered) rather than trusting the tracking
+        ' to be exhaustive.
+        needsRedraw = TRUE
+        idleTicks = 0
         WHILE app.AnyOpen()
             timestamp = Time.Timestamp()
             event = GUI.WaitEvent(0.02)
             IF event.Type <> "none" THEN
+                needsRedraw = TRUE
                 target = app.SurfaceForWindow(event.Window)
                 IF target <> NULL THEN
                     IF event.Type == "close" THEN
@@ -216,20 +302,66 @@ ELSE
                         ignored = target.HandleEvent(event, timestamp)
                     END IF
                 END IF
+                ' Explicit quit affordance (packet Section 27: keyboard access, not just mouse/
+                ' drag-and-drop). A real, reported bug: this environment's window manager adds NO
+                ' visible title bar/close button around an ordinary (non-shaped) ArcoUI window --
+                ' confirmed via `xwininfo -tree`, the WM's own decoration frame is the exact same
+                ' size as the content, zero chrome added -- so there was LITERALLY no way to close
+                ' ARCADE at all before this fix. A real window-manager-level close request (Alt+F4,
+                ' a taskbar close, `xdotool windowclose`) already worked correctly (confirmed
+                ' separately) via the ordinary event.Type == "close" path above; this adds the
+                ' missing IN-APPLICATION affordance, Ctrl+Q, the conventional cross-platform "quit"
+                ' shortcut (Escape is deliberately NOT used for this -- it's a reasonable future
+                ' "cancel the current operation" key inside an editor, and overloading it to also
+                ' mean "quit the whole application" would be a worse trap than the one being fixed).
+                IF event.Type == "key" ANDALSO event.Action == "press" ANDALSO event.Ctrl ANDALSO event.Key == "q" THEN
+                    FOR surface IN app.Surfaces
+                        ignored = surface.Invoke("Close", timestamp)
+                    NEXT
+                END IF
             END IF
             ignored = app.Pump()
 
             tabEvent = app.PollEvent()
             WHILE tabEvent <> NULL
+                needsRedraw = TRUE
                 FOR viewName IN views
                     IF tabEvent.Intent == win.IntentHandle("Show" + viewName) THEN content.ActiveTab = viewName
                 NEXT
                 tabEvent = app.PollEvent()
             WEND
 
-            FOR surface IN app.Surfaces
-                IF NOT surface.ShouldClose() THEN ignored = surface.Draw()
-            NEXT
+            IF content.PollRun() THEN needsRedraw = TRUE
+
+            idleTicks = idleTicks + 1
+            IF idleTicks > 10 THEN
+                needsRedraw = TRUE
+                idleTicks = 0
+            END IF
+
+            IF needsRedraw THEN
+                ' Active-tab color, applied fresh every draw (cheap -- four field assignments, no
+                ' allocation) rather than only on a tab switch, so it stays correct even if a
+                ' button's own color fields were ever touched some other way in the future.
+                i = 0
+                FOR viewName IN views
+                    tabButton = tabButtons[i]
+                    IF viewName == content.ActiveTab THEN
+                        tabButton.BackgroundR = win.Theme.AccentR
+                        tabButton.BackgroundG = win.Theme.AccentG
+                        tabButton.BackgroundB = win.Theme.AccentB
+                    ELSE
+                        tabButton.BackgroundR = 0.14
+                        tabButton.BackgroundG = 0.18
+                        tabButton.BackgroundB = 0.25
+                    END IF
+                    i = i + 1
+                NEXT
+                FOR surface IN app.Surfaces
+                    IF !surface.ShouldClose() THEN ignored = surface.Draw()
+                NEXT
+                needsRedraw = FALSE
+            END IF
         WEND
         FOR surface IN app.Surfaces
             ignored = surface.Close()

@@ -113,7 +113,10 @@ ELSE
             WEND
 
             FOR surface IN app.Surfaces
-                IF NOT surface.ShouldClose() THEN ignored = surface.Draw()
+                ' `!`, not `NOT` -- NOT/BITNOT in this language is a bitwise complement, not
+                ' logical negation (see arcade/arcade.abas's own PollRun/stdlib/arcoui.abas's
+                ' AnyOpen for the full story); `!` is the real logical-not operator.
+                IF !surface.ShouldClose() THEN ignored = surface.Draw()
             NEXT
         WEND
         FOR surface IN app.Surfaces
