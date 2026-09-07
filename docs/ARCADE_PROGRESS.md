@@ -56,6 +56,19 @@ pass. Phase C (Minimal Shared Application Model) has not started.
     `Button` + two `Label`s, and a real (if currently hand-rolled, not yet ARCADE-modeled) DEFAULT/
     ERROR/FOUND/NOT_FOUND state chain driven by the Search intent.
   - `arcade/README.md` — a short pointer into `docs/arcade/` and `docs/ARCADE_PROGRESS.md`.
+  - `arcade/build.sh` — builds a standalone `arcade/build/arcade` capsule (a self-contained ELF64
+    with the bytecode VM embedded, via `ArcoFission native`, the SAME command/convention the
+    deleted `arcoflow/build.sh` prototype established — deliberately the more conservative,
+    already-proven bytecode-capsule path, not the separate `--target linux-x86_64` no-VM native
+    compiler backend this repository's own `fission.cpp` work, Phases 11-15, is about). Defaults
+    to `build-release/ArcoFission` for a real `-O3` build (an unoptimized capsule embeds an
+    unoptimized bytecode VM — a real, previously-measured ~26x slowdown); optionally also builds a
+    web capsule if `ARCOFISSION_WEB_TOOLCHAIN_DIR` is set. Output lands in `arcade/build/`, already
+    correctly gitignored by the existing bare `build/` pattern in the repository's own
+    `.gitignore` (confirmed via `git check-ignore -v`, no new entry needed). Verified end to end:
+    built the capsule, launched it standalone (bypassing `arco_cli`/interpreter mode entirely),
+    screenshotted it showing the real four-tab shell with the reference project's Source content
+    loaded correctly.
 
 ### Behavior added
 
@@ -361,15 +374,16 @@ None yet — no code has been written.
 ### Build and run commands (packet Section 44)
 
 ```sh
-# Build (ARCADE has no C++ code of its own yet — this builds the ArcoFission compiler and the
-# arco_cli interpreter ARCADE currently runs on top of, from the repository root):
+# Build the ArcoFission compiler and the arco_cli interpreter ARCADE currently runs on top of
+# (ARCADE has no C++ code of its own yet), from the repository root:
 cmake --build build
 
-# Launch ARCADE against the reference project (needs a live X11/Wayland session; on this
-# development box that means DISPLAY=:1 with WAYLAND_DISPLAY unset -- see this project's own
-# [[project_arcoui]] memory for why). ARCOFISSION_PATH must point at this repo's own build, not a
-# bare "ArcoFission" on PATH -- see "Known defects" above for the stale-system-install gotcha this
-# avoids:
+# Launch ARCADE against the reference project DURING DEVELOPMENT, straight from source via the
+# tree-walking interpreter -- fastest edit/test loop, no capsule build step. Needs a live X11/
+# Wayland session (on this development box that means DISPLAY=:1 with WAYLAND_DISPLAY unset -- see
+# this project's own [[project_arcoui]] memory for why). ARCOFISSION_PATH must point at this
+# repo's own build, not a bare "ArcoFission" on PATH -- see "Known defects" above for the stale-
+# system-install gotcha this avoids:
 ARCOFISSION_PATH="$(pwd)/build/ArcoFission" \
 WAYLAND_DISPLAY= XDG_SESSION_TYPE=x11 DISPLAY=:1 \
   ./build/arco_cli arcade/arcade.abas arcade/reference-project/project.arcoproj
@@ -377,6 +391,23 @@ WAYLAND_DISPLAY= XDG_SESSION_TYPE=x11 DISPLAY=:1 \
 # Open a bare .abas file instead of a project (no project explorer/context, matches how the
 # deleted arcoflow.abas prototype's own no-project mode worked):
 ./build/arco_cli arcade/arcade.abas some/file.abas
+
+# Build ARCADE as a real, standalone, double-clickable executable (arcade/build.sh, following the
+# deleted arcoflow/build.sh's own established convention exactly): a self-contained ELF64 capsule
+# with the bytecode VM embedded, built via ArcoFission's own "native" (bytecode-capsule) command,
+# NOT the separate --target linux-x86_64 no-VM compiler backend this same repository's own
+# fission.cpp work (Phases 11-15) is about -- deliberately the more conservative, already-proven
+# path, matching what the deleted prototype used. Defaults to build-release/ArcoFission (a real,
+# optimized -O3 build -- an unoptimized capsule embeds an unoptimized bytecode VM, ~26x slower on
+# this project's own past measurement); set ARCOFISSION=/path/to/it to use a different one, or
+# ARCOFISSION_WEB_TOOLCHAIN_DIR to also produce a web capsule. Output lands in arcade/build/
+# (gitignored, matching the top-level build/'s own convention -- confirmed: `git check-ignore -v
+# arcade/build/arcade` resolves via the existing bare `build/` .gitignore pattern, no new entry
+# needed):
+./arcade/build.sh
+ARCOFISSION_PATH="$(pwd)/build-release/ArcoFission" \
+WAYLAND_DISPLAY= XDG_SESSION_TYPE=x11 DISPLAY=:1 \
+  ./arcade/build/arcade arcade/reference-project/project.arcoproj
 
 # Run the reference application directly (bypassing ARCADE, for isolated testing of the reference
 # app itself):
