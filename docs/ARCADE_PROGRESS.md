@@ -423,6 +423,24 @@ expression>`, or renaming/removing the `NOT`→bitwise alias entirely in favor o
 a silent, partial fix buried in one feature's progress ledger. Flagged prominently here and reported
 directly to the project owner in-conversation; not resolved project-wide this session.
 
+**Update, same session, user-directed**: the project-wide audit was done immediately after this
+was written, not left as a future decision. Grepped all 203 `.abas` files repo-wide for `NOT`
+(740 raw hits, 715 were the English word "not" in comments -- real code hits were only 21). Found
+and fixed 8 more real bugs beyond ARCADE/`stdlib/arcoui.abas`: `examples/arcoui_paint.abas`,
+`arcoui_gadget.abas` (x2, including a genuine infinite-loop `WHILE NOT win.ShouldClose()` -- that
+gadget could never close at all), `arcoui_notes.abas` (x3, including a real "every save after the
+first always says Nothing to Save" bug), `gui_cube.abas`, `arcowrite.abas` (two `x = NOT x`
+toggles that start from a `TRUE` literal and can never reach `FALSE` again). Empirically verified
+(standalone repro scripts, not hand-reasoning about bit patterns) that some look-alike patterns
+are actually fine and were left alone: a toggle starting `FALSE` self-corrects into a stable 0/-1
+alternation; the compound `comparisonResult AND NOT boolFn()` shape coincidentally cancels out
+correctly under this language's bitwise AND semantics (`1 AND -2 = 0`); `AS U32`/`AS U8`-typed
+bitmask code in `arcology-os/` (`timer_policy.abas`, `aex_format_policy.abas`, `aps-*.abas`
+fixtures) is genuine, correct, intentional bitwise NOT on hardware registers, not boolean logic.
+Committed as `bb7eedc`. Not formally exhaustive of every conceivable future pattern, but covers
+every real `.abas` NOT usage as of this date. The compiler-warning/rename option above remains
+undecided/not pursued.
+
 ### The three reported symptoms, root-caused and fixed
 
 1. **"It won't let me close the application."** Two real, independent bugs stacked on top of each
