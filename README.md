@@ -101,16 +101,48 @@ Arco Standard Library
 
 ## Linux / macOS
 
+Primary buildchain-tool build path:
+
+```sh
+rivet build
+```
+
+Optional cross-target support archives:
+
+```sh
+RIVET_BUILD_WINDOWS=1 rivet build       # mingw-w64, emits build-rivet-windows/
+RIVET_BUILD_EMSCRIPTEN=1 rivet build    # em++/emar, emits build-rivet-web/
+```
+
+If no `rivet` binary exists yet, bootstrap it once with the legacy CMake path:
+
 ```sh
 cmake -S . -B build
-cmake --build build
+cmake --build build --target rivet
+build/rivet/rivet build
 ctest --test-dir build --output-on-failure
+```
+
+For change-focused regression runs, use the repository-root Fissure config after the build tree
+exists:
+
+```sh
+build/fissure/fissure run
+build/fissure/fissure explain project.core-fast
 ```
 
 Build and install a Debian package:
 
 ```sh
 scripts/build/build-and-install.sh
+```
+
+Install only the system buildchain tools (`ArcoFission`, `fissure`, and `rivet`) from the current
+checkout. The installer prefers Rivet and uses CMake only as a first-time bootstrap fallback when
+no Rivet binary is available:
+
+```sh
+scripts/install/install-system-buildchain.sh
 ```
 
 Build the focused ArcFS Linux support package:
@@ -159,7 +191,7 @@ ArcoFission build examples/hello.bas -o hello
 
 This is the default compiler model for alpha: native executable outside,
 ArcoFission bytecode VM inside. The generated ELF64 embeds the prepared bytecode
-and links it against the ArcoFission runtime from the active CMake build tree,
+and links it against the installed ArcoFission runtime support archives,
 which keeps behavior aligned with `ArcoFission compile-run` and gives the
 project a portable path for future Windows/macOS capsules.
 

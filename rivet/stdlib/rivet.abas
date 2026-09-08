@@ -52,23 +52,57 @@ CLASS CompilerOptions
     END CONSTRUCTOR
 END CLASS
 
+CLASS ArchiverOptions
+    CONSTRUCTOR(toolchain)
+        SELF.Path = toolchain.Path
+        SELF.Family = toolchain.Family
+        SELF.Version = toolchain.Version
+    END CONSTRUCTOR
+END CLASS
+
 CLASS BuildTarget
     CONSTRUCTOR(name, kind)
         SELF.Name = name
         SELF.Kind = kind
         SELF.Sources = FileList()
         SELF.Includes = FileList()
+        SELF.Defines = FileList()
+        SELF.CompileFlags = FileList()
+        SELF.LinkFlags = FileList()
+        SELF.LinkInterfaceFlags = FileList()
+        SELF.LinkInputs = FileList()
         SELF.Libraries = FileList()
         SELF.OutputDirectory = "build"
+        SELF.ActionIds = []
+        SELF.FinalActionId = ""
+        SELF.OutputArtifact = SELF.OutputPath()
         detected = RIVET.Toolchain.DetectCxx()
         IF !detected.Found THEN
             ignored = RIVET.Log.Error("no C++ compiler found on PATH (tried clang++, g++, c++)")
         END IF
         SELF.Compiler = CompilerOptions(detected)
+        archiver = RIVET.Toolchain.DetectArchiver()
+        IF !archiver.Found THEN
+            ignored = RIVET.Log.Error("no static library archiver found (set AR, or ensure llvm-ar/ar is on PATH)")
+        END IF
+        SELF.Archiver = ArchiverOptions(archiver)
     END CONSTRUCTOR
 
     FUNCTION OutputPath()
         RETURN SELF.OutputDirectory + "/" + SELF.Name
+    END FUNCTION
+
+    FUNCTION ObjectDirectoryName()
+        RETURN String.Replace(SELF.OutputDirectory + "_" + SELF.Name, "/", "_")
+    END FUNCTION
+
+    FUNCTION AddDependency(target)
+        ignored = SELF.LinkInputs.Append(target.OutputPath())
+        IF target.FinalActionId != "" THEN ignored = Array.Push(SELF.ActionIds, target.FinalActionId)
+        FOR flag IN target.LinkInterfaceFlags.Items
+            ignored = SELF.LinkFlags.Append(flag)
+        NEXT
+        RETURN SELF
     END FUNCTION
 
     ' Materializes every currently-declared source into one Compile action + one Link action, and
@@ -78,8 +112,9 @@ CLASS BuildTarget
     FUNCTION Build()
         objectIds = []
         objectPaths = []
+        objectDirectoryName = SELF.ObjectDirectoryName()
         FOR source IN SELF.Sources.Items
-            objectPath = ".rivet/obj/" + SELF.Name + "/" + String.Replace(source, "/", "_") + ".o"
+            objectPath = ".rivet/obj/" + objectDirectoryName + "/" + String.Replace(source, "/", "_") + ".o"
             args = CxxAdapter_BuildCompileArguments(SELF, source, objectPath)
             spec = { Type: "Compile", Target: SELF.Name, DisplayName: source,
                      Inputs: [source], Outputs: [objectPath],
@@ -88,14 +123,75 @@ CLASS BuildTarget
             actionId = RIVET.Graph.Action(spec)
             ignored = Array.Push(objectIds, actionId)
             ignored = Array.Push(objectPaths, objectPath)
+            ignored = Array.Push(SELF.ActionIds, actionId)
+        NEXT
+
+        finalDependencies = []
+        FOR actionId IN SELF.ActionIds
+            ignored = Array.Push(finalDependencies, actionId)
+        NEXT
+
+        IF SELF.Kind == "StaticLibrary" THEN
+            archiveArgs = CxxAdapter_BuildArchiveArguments(SELF, objectPaths, SELF.OutputPath())
+            archiveSpec = { Type: "Archive", Target: SELF.Name, DisplayName: SELF.OutputPath(),
+                            Inputs: objectPaths, Outputs: [SELF.OutputPath()],
+                            Tool: SELF.Archiver.Path, ToolVersion: SELF.Archiver.Version,
+                            Arguments: archiveArgs, Dependencies: objectIds, OriginFunction: "BuildTarget.Build" }
+            SELF.FinalActionId = RIVET.Graph.Action(archiveSpec)
+            ignored = Array.Push(SELF.ActionIds, SELF.FinalActionId)
+            SELF.OutputArtifact = SELF.OutputPath()
+            RETURN SELF
+        END IF
+
+        linkInputs = []
+        FOR obj IN objectPaths
+            ignored = Array.Push(linkInputs, obj)
+        NEXT
+        FOR input IN SELF.LinkInputs.Items
+            ignored = Array.Push(linkInputs, input)
         NEXT
 
         linkArgs = CxxAdapter_BuildLinkArguments(SELF, objectPaths, SELF.OutputPath())
         linkSpec = { Type: "Link", Target: SELF.Name, DisplayName: SELF.OutputPath(),
-                     Inputs: objectPaths, Outputs: [SELF.OutputPath()],
+                     Inputs: linkInputs, Outputs: [SELF.OutputPath()],
                      Tool: SELF.Compiler.Path, ToolVersion: SELF.Compiler.Version,
-                     Arguments: linkArgs, Dependencies: objectIds, OriginFunction: "BuildTarget.Build" }
-        ignored = RIVET.Graph.Action(linkSpec)
+                     Arguments: linkArgs, Dependencies: finalDependencies, OriginFunction: "BuildTarget.Build" }
+        SELF.FinalActionId = RIVET.Graph.Action(linkSpec)
+        ignored = Array.Push(SELF.ActionIds, SELF.FinalActionId)
+        SELF.OutputArtifact = SELF.OutputPath()
+        RETURN SELF
+    END FUNCTION
+END CLASS
+
+' RFC section 38's own `CAPSULE app = BUILD.ArcoCapsule("MyApp")` shape. A single-action target --
+' `ArcoFission native ENTRY -o OUTPUT` produces a self-contained capsule directly, no separate
+' Compile-then-Link the way BuildTarget's C++ path needs -- so this reuses ActionType.Compile for
+' the one action (a genuine compile step; there's just nothing to link afterward), rather than
+' inventing a third ActionType for one adapter.
+CLASS ArcoCapsuleTarget
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Entry = ""
+        SELF.OutputDirectory = "build"
+        detected = RIVET.Toolchain.DetectFission()
+        IF !detected.Found THEN
+            ignored = RIVET.Log.Error("no ArcoFission compiler found (set ARCOFISSION_PATH, or ensure ArcoFission is on PATH)")
+        END IF
+        SELF.CompilerPath = detected.Path
+        SELF.CompilerVersion = detected.Version
+    END CONSTRUCTOR
+
+    FUNCTION OutputPath()
+        RETURN SELF.OutputDirectory + "/" + SELF.Name
+    END FUNCTION
+
+    FUNCTION Build()
+        args = FissionAdapter_BuildArguments(SELF.Entry, SELF.OutputPath())
+        spec = { Type: "Compile", Target: SELF.Name, DisplayName: SELF.Entry,
+                 Inputs: [SELF.Entry], Outputs: [SELF.OutputPath()],
+                 Tool: SELF.CompilerPath, ToolVersion: SELF.CompilerVersion,
+                 Arguments: args, Dependencies: [], OriginFunction: "ArcoCapsuleTarget.Build" }
+        ignored = RIVET.Graph.Action(spec)
         RETURN SELF
     END FUNCTION
 END CLASS
@@ -106,6 +202,9 @@ CLASS BuildNamespace
     END FUNCTION
     FUNCTION StaticLibrary(name)
         RETURN BuildTarget(name, "StaticLibrary")
+    END FUNCTION
+    FUNCTION ArcoCapsule(name)
+        RETURN ArcoCapsuleTarget(name)
     END FUNCTION
 END CLASS
 

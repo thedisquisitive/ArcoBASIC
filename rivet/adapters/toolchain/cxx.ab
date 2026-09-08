@@ -15,10 +15,16 @@ FUNCTION CxxAdapter_BuildCompileArguments(target, source, objectPath)
     FOR includeDir IN target.Includes.Items
         ignored = Array.Push(args, "-I" + includeDir)
     NEXT
+    FOR define IN target.Defines.Items
+        ignored = Array.Push(args, "-D" + define)
+    NEXT
     IF target.Compiler.Warnings == "strict" THEN
         ignored = Array.Push(args, "-Wall")
         ignored = Array.Push(args, "-Wextra")
     END IF
+    FOR flag IN target.CompileFlags.Items
+        ignored = Array.Push(args, flag)
+    NEXT
     ignored = Array.Push(args, "-c")
     ignored = Array.Push(args, source)
     ignored = Array.Push(args, "-o")
@@ -31,10 +37,24 @@ FUNCTION CxxAdapter_BuildLinkArguments(target, objectPaths, outputPath)
     FOR obj IN objectPaths
         ignored = Array.Push(args, obj)
     NEXT
+    FOR input IN target.LinkInputs.Items
+        ignored = Array.Push(args, input)
+    NEXT
     ignored = Array.Push(args, "-o")
     ignored = Array.Push(args, outputPath)
+    FOR flag IN target.LinkFlags.Items
+        ignored = Array.Push(args, flag)
+    NEXT
     FOR lib IN target.Libraries.Items
         ignored = Array.Push(args, "-l" + lib)
+    NEXT
+    RETURN args
+END FUNCTION
+
+FUNCTION CxxAdapter_BuildArchiveArguments(target, objectPaths, outputPath)
+    args = ["rcs", outputPath]
+    FOR obj IN objectPaths
+        ignored = Array.Push(args, obj)
     NEXT
     RETURN args
 END FUNCTION

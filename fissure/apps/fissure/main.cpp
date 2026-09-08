@@ -40,6 +40,7 @@ fs::path find_adapters_root() {
     std::vector<fs::path> candidates;
     if (auto exe_dir = executable_directory()) {
         candidates.push_back(*exe_dir / "share" / "fissure" / "adapters");
+        candidates.push_back(*exe_dir / ".." / "share" / "fissure" / "adapters");
         candidates.push_back(*exe_dir / ".." / "fissure" / "adapters");
         candidates.push_back(*exe_dir / ".." / ".." / "fissure" / "adapters");
     }

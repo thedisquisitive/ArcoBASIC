@@ -118,6 +118,31 @@ void test_probe_with_declared_deps_not_intersecting_disturbance_is_unaffected() 
     assert(verdicts[0].classification == Classification::Unaffected);
 }
 
+void test_declared_directory_dependency_matches_child_disturbance() {
+    Graph graph;
+    graph.add_node(make_node("src/compiler/fission.cpp", NodeKind::File));
+    graph.add_node(make_node("probe.compiler", NodeKind::Probe));
+    graph.add_edge(make_edge("probe.compiler", "src/compiler/", EdgeKind::DeclaredTestAssociation, Evidence::Declared));
+
+    ImpactEngine engine;
+    auto verdicts = engine.classify(graph, {"src/compiler/fission.cpp"});
+    assert(verdicts.size() == 1);
+    assert(verdicts[0].classification == Classification::Affected);
+    assert(verdicts[0].reasons[0].find("src/compiler/") != std::string::npos);
+}
+
+void test_declared_prefix_dependency_can_still_prove_unaffected() {
+    Graph graph;
+    graph.add_node(make_node("src/gui/glfw_backend.cpp", NodeKind::File));
+    graph.add_node(make_node("probe.compiler", NodeKind::Probe));
+    graph.add_edge(make_edge("probe.compiler", "src/compiler/", EdgeKind::DeclaredTestAssociation, Evidence::Declared));
+
+    ImpactEngine engine;
+    auto verdicts = engine.classify(graph, {"src/gui/glfw_backend.cpp"});
+    assert(verdicts.size() == 1);
+    assert(verdicts[0].classification == Classification::Unaffected);
+}
+
 void test_observed_only_evidence_does_not_yet_count_as_sufficient_for_unaffected() {
     // M1 has exactly one evidence source strong enough to prove UNAFFECTED: Declared (see
     // impact.cpp's own is_sufficient_for_unaffected). An edge with Observed evidence and no
@@ -246,6 +271,8 @@ int main() {
     test_probe_reachable_from_disturbance_is_affected();
     test_probe_with_no_evidence_at_all_is_unknown_never_unaffected();
     test_probe_with_declared_deps_not_intersecting_disturbance_is_unaffected();
+    test_declared_directory_dependency_matches_child_disturbance();
+    test_declared_prefix_dependency_can_still_prove_unaffected();
     test_observed_only_evidence_does_not_yet_count_as_sufficient_for_unaffected();
     test_full_repo_mixed_verdicts();
     test_manifest_parses_capabilities();

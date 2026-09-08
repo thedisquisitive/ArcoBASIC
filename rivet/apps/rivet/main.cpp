@@ -37,6 +37,7 @@ fs::path find_rivet_root() {
     std::vector<fs::path> candidates;
     if (auto exe_dir = executable_directory()) {
         candidates.push_back(*exe_dir / "share" / "rivet");
+        candidates.push_back(*exe_dir / ".." / "share" / "rivet");
         candidates.push_back(*exe_dir / ".." / "rivet");
         candidates.push_back(*exe_dir / ".." / ".." / "rivet");
     }
@@ -96,7 +97,10 @@ int run_build(unsigned jobs) {
             std::cout << "[CACHE]   " << display << "\n";
             ++cached;
         } else if (kind == "ran") {
-            if (action && action->type == rivet::ActionType::Link) {
+            if (action && action->type == rivet::ActionType::Archive) {
+                std::cout << "[ARCHIVE] " << display << "\n";
+                ++linked;
+            } else if (action && action->type == rivet::ActionType::Link) {
                 std::cout << "[LINK]    " << display << "\n";
                 ++linked;
             } else {

@@ -1,0 +1,28 @@
+' Emscripten web/wasm cross-toolchain adapter.
+
+FUNCTION EmscriptenAdapter_Detect()
+    RETURN RIVET.Toolchain.DetectEmscripten()
+END FUNCTION
+
+FUNCTION EmscriptenAdapter_ConfigureTarget(target, toolchain)
+    target.Compiler.Path = toolchain.CxxPath
+    target.Compiler.Family = toolchain.Family
+    target.Compiler.Version = toolchain.CxxVersion
+    target.Archiver.Path = toolchain.ArchiverPath
+    target.Archiver.Family = toolchain.Family
+    target.Archiver.Version = toolchain.ArchiverVersion
+    target.Compiler.Standard = "c++17"
+    ignored = target.Defines.Append("__EMSCRIPTEN__=1")
+    ignored = target.CompileFlags.Append("-Os")
+    ignored = target.CompileFlags.Append("-fexceptions")
+    RETURN target
+END FUNCTION
+
+FUNCTION EmscriptenAdapter_ConfigureExecutable(target, toolchain)
+    ignored = EmscriptenAdapter_ConfigureTarget(target, toolchain)
+    ignored = target.LinkFlags.Append("-fexceptions")
+    ignored = target.LinkFlags.Append("-sASYNCIFY")
+    ignored = target.LinkFlags.Append("-sALLOW_MEMORY_GROWTH=1")
+    ignored = target.LinkFlags.Append("-sEXPORTED_RUNTIME_METHODS=ccall,cwrap")
+    RETURN target
+END FUNCTION

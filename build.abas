@@ -1,0 +1,285 @@
+' Repository-root Rivet build for the core buildchain tools and first-party host utilities.
+
+FUNCTION ConfigureCoreTarget(target)
+    ignored = target.Includes.Append("include")
+    ignored = target.Includes.Append("src")
+    ignored = target.Includes.Append("arcology-os/include")
+    ignored = target.CompileFlags.Append("-O2")
+    ignored = target.CompileFlags.Append("-g")
+    RETURN target
+END FUNCTION
+
+FUNCTION ConfigureFissureTarget(target)
+    ignored = ConfigureCoreTarget(target)
+    ignored = target.Includes.Append("fissure/include")
+    RETURN target
+END FUNCTION
+
+FUNCTION ConfigureRivetTarget(target)
+    ignored = ConfigureCoreTarget(target)
+    ignored = target.Includes.Append("rivet/include")
+    RETURN target
+END FUNCTION
+
+FUNCTION ConfigureArcfsTarget(target)
+    ignored = ConfigureCoreTarget(target)
+    ignored = target.Includes.Append("arcfs-utils/include")
+    RETURN target
+END FUNCTION
+
+FUNCTION AddPublicLinkFlag(target, flag)
+    ignored = target.LinkFlags.Append(flag)
+    ignored = target.LinkInterfaceFlags.Append(flag)
+    RETURN target
+END FUNCTION
+
+ArcoSourceRoot = RIVET.Env.Get("ARCO_SOURCE_ROOT_OVERRIDE")
+IF ArcoSourceRoot == "" THEN ArcoSourceRoot = RIVET.Filesystem.ProjectRoot()
+
+SQLite3 = PkgConfigAdapter_Find("sqlite3")
+Fuse3 = PkgConfigAdapter_Find("fuse3")
+Curl = PkgConfigAdapter_Find("libcurl")
+Glfw3 = PkgConfigAdapter_Find("glfw3")
+PangoCairo = PkgConfigAdapter_Find("pangocairo")
+Gtk3 = PkgConfigAdapter_Find("gtk+-3.0")
+OpenGL = PkgConfigAdapter_Find("gl")
+GuiBackendAvailable = TARGET.OS == "linux" ANDALSO Glfw3.Found ANDALSO PangoCairo.Found ANDALSO Gtk3.Found ANDALSO OpenGL.Found
+BuildWindows = RIVET.Env.Get("RIVET_BUILD_WINDOWS") == "1"
+BuildEmscripten = RIVET.Env.Get("RIVET_BUILD_EMSCRIPTEN") == "1"
+
+ArcologyOS = BUILD.StaticLibrary("libarcology_os.a")
+ArcologyOS.OutputDirectory = "build-rivet"
+ignored = ArcologyOS.Includes.Append("arcology-os/include")
+ignored = ArcologyOS.CompileFlags.Append("-O2")
+ignored = ArcologyOS.CompileFlags.Append("-g")
+ignored = ArcologyOS.Sources.Append("arcology-os/src/compiler/pe_image.cpp")
+ignored = ArcologyOS.Sources.Append("arcology-os/src/graphics/graphics.cpp")
+ignored = ArcologyOS.Build()
+
+ArcoRuntime = BUILD.StaticLibrary("libarco_runtime.a")
+ArcoRuntime.OutputDirectory = "build-rivet"
+ignored = ConfigureCoreTarget(ArcoRuntime)
+ignored = ArcoRuntime.Sources.Append("src/frontend/lexer.cpp")
+ignored = ArcoRuntime.Sources.Append("src/frontend/parser.cpp")
+ignored = ArcoRuntime.Sources.Append("src/runtime/runtime.cpp")
+ignored = ArcoRuntime.Sources.Append("src/runtime/random.cpp")
+ignored = ArcoRuntime.Sources.Append("src/runtime/runtime_handles.cpp")
+ignored = ArcoRuntime.Sources.Append("src/runtime/resource_registry.cpp")
+ignored = ArcoRuntime.Sources.Append("src/gui/arcoui/geometry.cpp")
+ignored = ArcoRuntime.Sources.Append("src/gui/arcoui/gesture.cpp")
+ignored = ArcoRuntime.Sources.Append("src/gui/arcoui/core.cpp")
+ignored = ArcoRuntime.Sources.Append("src/gui/arcoui/bindings.cpp")
+IF GuiBackendAvailable THEN
+    ignored = ArcoRuntime.Defines.Append("ARCO_GUI_GLFW=1")
+    ignored = ArcoRuntime.Sources.Append("src/gui/glfw_backend.cpp")
+    ignored = PkgConfigAdapter_Apply(ArcoRuntime, Glfw3)
+    ignored = PkgConfigAdapter_Apply(ArcoRuntime, PangoCairo)
+    ignored = PkgConfigAdapter_Apply(ArcoRuntime, Gtk3)
+    ignored = PkgConfigAdapter_Apply(ArcoRuntime, OpenGL)
+ELSE
+    ignored = ArcoRuntime.Sources.Append("src/gui/stub_backend.cpp")
+END IF
+IF Curl.Found THEN
+    ignored = ArcoRuntime.Defines.Append("ARCO_NETWORK_CURL=1")
+    ignored = PkgConfigAdapter_Apply(ArcoRuntime, Curl)
+END IF
+ignored = ArcoRuntime.Build()
+
+ArcoCompiler = BUILD.StaticLibrary("libarco_compiler.a")
+ArcoCompiler.OutputDirectory = "build-rivet"
+ignored = ConfigureCoreTarget(ArcoCompiler)
+ignored = ArcoCompiler.Defines.Append(RIVET.Cxx.DefineString("ARCO_SOURCE_ROOT", ArcoSourceRoot))
+ignored = ArcoCompiler.Sources.Append("src/compiler/fission.cpp")
+ignored = ArcoCompiler.Build()
+
+ArcoRuntimeCore = BUILD.StaticLibrary("libarco_runtime_core.a")
+ArcoRuntimeCore.OutputDirectory = "build-rivet"
+ignored = ConfigureCoreTarget(ArcoRuntimeCore)
+ignored = ArcoRuntimeCore.Sources.Append("src/frontend/lexer.cpp")
+ignored = ArcoRuntimeCore.Sources.Append("src/frontend/parser.cpp")
+ignored = ArcoRuntimeCore.Sources.Append("src/runtime/runtime.cpp")
+ignored = ArcoRuntimeCore.Sources.Append("src/runtime/random.cpp")
+ignored = ArcoRuntimeCore.Sources.Append("src/runtime/runtime_handles.cpp")
+ignored = ArcoRuntimeCore.Sources.Append("src/runtime/resource_registry.cpp")
+ignored = ArcoRuntimeCore.Sources.Append("src/gui/arcoui/geometry.cpp")
+ignored = ArcoRuntimeCore.Sources.Append("src/gui/arcoui/gesture.cpp")
+ignored = ArcoRuntimeCore.Sources.Append("src/gui/arcoui/core.cpp")
+ignored = ArcoRuntimeCore.Sources.Append("src/gui/arcoui/bindings.cpp")
+ignored = ArcoRuntimeCore.Sources.Append("src/gui/stub_backend.cpp")
+ignored = ArcoRuntimeCore.Build()
+
+ArcoCompilerCore = BUILD.StaticLibrary("libarco_compiler_core.a")
+ArcoCompilerCore.OutputDirectory = "build-rivet"
+ignored = ConfigureCoreTarget(ArcoCompilerCore)
+ignored = ArcoCompilerCore.Defines.Append(RIVET.Cxx.DefineString("ARCO_SOURCE_ROOT", ArcoSourceRoot))
+ignored = ArcoCompilerCore.Sources.Append("src/compiler/fission.cpp")
+ignored = ArcoCompilerCore.Build()
+
+FissureCore = BUILD.StaticLibrary("libfissure_core.a")
+FissureCore.OutputDirectory = "build-rivet"
+ignored = ConfigureFissureTarget(FissureCore)
+IF SQLite3.Found THEN ignored = PkgConfigAdapter_Apply(FissureCore, SQLite3)
+ignored = FissureCore.Sources.Append("fissure/core/graph/types.cpp")
+ignored = FissureCore.Sources.Append("fissure/core/graph/graph.cpp")
+ignored = FissureCore.Sources.Append("fissure/core/graph/store.cpp")
+ignored = FissureCore.Sources.Append("fissure/core/events/events.cpp")
+ignored = FissureCore.Sources.Append("fissure/core/impact/impact.cpp")
+ignored = FissureCore.Sources.Append("fissure/core/platform/posix.cpp")
+ignored = FissureCore.Sources.Append("fissure/core/scheduler/scheduler.cpp")
+ignored = FissureCore.Sources.Append("fissure/core/vm/manifest.cpp")
+ignored = FissureCore.Sources.Append("fissure/core/vm/vm.cpp")
+ignored = FissureCore.Build()
+
+RivetCore = BUILD.StaticLibrary("librivet_core.a")
+RivetCore.OutputDirectory = "build-rivet"
+ignored = ConfigureRivetTarget(RivetCore)
+IF SQLite3.Found THEN ignored = PkgConfigAdapter_Apply(RivetCore, SQLite3)
+ignored = RivetCore.CompileFlags.Append("-pthread")
+ignored = AddPublicLinkFlag(RivetCore, "-pthread")
+ignored = RivetCore.Sources.Append("rivet/core/action/action.cpp")
+ignored = RivetCore.Sources.Append("rivet/core/graph/graph.cpp")
+ignored = RivetCore.Sources.Append("rivet/core/fingerprint/fingerprint.cpp")
+ignored = RivetCore.Sources.Append("rivet/core/store/store.cpp")
+ignored = RivetCore.Sources.Append("rivet/core/cache/cache.cpp")
+ignored = RivetCore.Sources.Append("rivet/core/scheduler/scheduler.cpp")
+ignored = RivetCore.Sources.Append("rivet/core/platform/posix.cpp")
+ignored = RivetCore.Sources.Append("rivet/core/toolchain/cxx.cpp")
+ignored = RivetCore.Sources.Append("rivet/core/vm/vm.cpp")
+ignored = RivetCore.Build()
+
+ArcoFission = BUILD.Executable("ArcoFission")
+ArcoFission.OutputDirectory = "build-rivet"
+ignored = ConfigureCoreTarget(ArcoFission)
+ignored = ArcoFission.Sources.Append("apps/arcofission/main.cpp")
+ignored = ArcoFission.AddDependency(ArcoCompiler)
+ignored = ArcoFission.AddDependency(ArcoRuntime)
+ignored = ArcoFission.AddDependency(ArcologyOS)
+ignored = ArcoFission.Build()
+
+ArcoCli = BUILD.Executable("arco_cli")
+ArcoCli.OutputDirectory = "build-rivet"
+ignored = ConfigureCoreTarget(ArcoCli)
+ignored = ArcoCli.Sources.Append("apps/arco/main.cpp")
+ignored = ArcoCli.AddDependency(ArcoRuntime)
+ignored = ArcoCli.AddDependency(ArcologyOS)
+ignored = ArcoCli.Build()
+
+Fissure = BUILD.Executable("fissure")
+Fissure.OutputDirectory = "build-rivet"
+ignored = ConfigureFissureTarget(Fissure)
+ignored = Fissure.Sources.Append("fissure/apps/fissure/main.cpp")
+ignored = Fissure.AddDependency(FissureCore)
+ignored = Fissure.AddDependency(ArcoRuntime)
+ignored = Fissure.AddDependency(ArcologyOS)
+ignored = Fissure.Build()
+
+Rivet = BUILD.Executable("rivet")
+Rivet.OutputDirectory = "build-rivet"
+ignored = ConfigureRivetTarget(Rivet)
+ignored = Rivet.Sources.Append("rivet/apps/rivet/main.cpp")
+ignored = Rivet.AddDependency(RivetCore)
+ignored = Rivet.AddDependency(ArcoRuntime)
+ignored = Rivet.AddDependency(ArcologyOS)
+ignored = Rivet.Build()
+
+ArcfsHost = BUILD.StaticLibrary("libarco_arcfs_host.a")
+ArcfsHost.OutputDirectory = "build-rivet"
+ignored = ConfigureArcfsTarget(ArcfsHost)
+ignored = ArcfsHost.Sources.Append("arcfs-utils/src/host.cpp")
+ignored = ArcfsHost.Build()
+
+IF TARGET.OS == "linux" THEN
+    ArcfsLinux = BUILD.Executable("arcfs-linux")
+    ArcfsLinux.OutputDirectory = "build-rivet"
+    ignored = ConfigureArcfsTarget(ArcfsLinux)
+    IF Fuse3.Found THEN
+        ignored = ArcfsLinux.Defines.Append("ARCO_HAVE_FUSE3=1")
+        ignored = PkgConfigAdapter_Apply(ArcfsLinux, Fuse3)
+    END IF
+    ignored = ArcfsLinux.Sources.Append("arcfs-utils/apps/arcfs-linux/main.cpp")
+    ignored = ArcfsLinux.AddDependency(ArcfsHost)
+    ignored = ArcfsLinux.AddDependency(ArcologyOS)
+    ignored = ArcfsLinux.Build()
+END IF
+
+IF BuildWindows THEN
+    Mingw = WindowsAdapter_DetectMingwX86_64()
+    IF Mingw.Found THEN
+        WinArcologyOS = BUILD.StaticLibrary("libarcology_os.a")
+        WinArcologyOS.OutputDirectory = "build-rivet-windows"
+        ignored = WinArcologyOS.Includes.Append("arcology-os/include")
+        ignored = WinArcologyOS.CompileFlags.Append("-O2")
+        ignored = WindowsAdapter_ConfigureTarget(WinArcologyOS, Mingw)
+        ignored = WinArcologyOS.Sources.Append("arcology-os/src/compiler/pe_image.cpp")
+        ignored = WinArcologyOS.Sources.Append("arcology-os/src/graphics/graphics.cpp")
+        ignored = WinArcologyOS.Build()
+
+        WinRuntime = BUILD.StaticLibrary("libarco_runtime.a")
+        WinRuntime.OutputDirectory = "build-rivet-windows"
+        ignored = ConfigureCoreTarget(WinRuntime)
+        ignored = WindowsAdapter_ConfigureTarget(WinRuntime, Mingw)
+        ignored = WinRuntime.Sources.Append("src/frontend/lexer.cpp")
+        ignored = WinRuntime.Sources.Append("src/frontend/parser.cpp")
+        ignored = WinRuntime.Sources.Append("src/runtime/runtime.cpp")
+        ignored = WinRuntime.Sources.Append("src/runtime/random.cpp")
+        ignored = WinRuntime.Sources.Append("src/runtime/runtime_handles.cpp")
+        ignored = WinRuntime.Sources.Append("src/runtime/resource_registry.cpp")
+        ignored = WinRuntime.Sources.Append("src/gui/arcoui/geometry.cpp")
+        ignored = WinRuntime.Sources.Append("src/gui/arcoui/gesture.cpp")
+        ignored = WinRuntime.Sources.Append("src/gui/arcoui/core.cpp")
+        ignored = WinRuntime.Sources.Append("src/gui/arcoui/bindings.cpp")
+        ignored = WinRuntime.Sources.Append("src/gui/stub_backend.cpp")
+        ignored = WinRuntime.Build()
+
+        WinCompiler = BUILD.StaticLibrary("libarco_compiler.a")
+        WinCompiler.OutputDirectory = "build-rivet-windows"
+        ignored = ConfigureCoreTarget(WinCompiler)
+        ignored = WindowsAdapter_ConfigureTarget(WinCompiler, Mingw)
+        ignored = WinCompiler.Defines.Append(RIVET.Cxx.DefineString("ARCO_SOURCE_ROOT", ArcoSourceRoot))
+        ignored = WinCompiler.Sources.Append("src/compiler/fission.cpp")
+        ignored = WinCompiler.Build()
+    ELSE
+        ignored = RIVET.Log.Warn("RIVET_BUILD_WINDOWS=1 but mingw-w64 x86_64 tools were not found")
+    END IF
+END IF
+
+IF BuildEmscripten THEN
+    Emscripten = EmscriptenAdapter_Detect()
+    IF Emscripten.Found THEN
+        WebArcologyOS = BUILD.StaticLibrary("libarcology_os.a")
+        WebArcologyOS.OutputDirectory = "build-rivet-web"
+        ignored = WebArcologyOS.Includes.Append("arcology-os/include")
+        ignored = EmscriptenAdapter_ConfigureTarget(WebArcologyOS, Emscripten)
+        ignored = WebArcologyOS.Sources.Append("arcology-os/src/compiler/pe_image.cpp")
+        ignored = WebArcologyOS.Sources.Append("arcology-os/src/graphics/graphics.cpp")
+        ignored = WebArcologyOS.Build()
+
+        WebRuntime = BUILD.StaticLibrary("libarco_runtime.a")
+        WebRuntime.OutputDirectory = "build-rivet-web"
+        ignored = ConfigureCoreTarget(WebRuntime)
+        ignored = EmscriptenAdapter_ConfigureTarget(WebRuntime, Emscripten)
+        ignored = WebRuntime.Defines.Append("ARCO_GUI_CANVAS=1")
+        ignored = WebRuntime.Sources.Append("src/frontend/lexer.cpp")
+        ignored = WebRuntime.Sources.Append("src/frontend/parser.cpp")
+        ignored = WebRuntime.Sources.Append("src/runtime/runtime.cpp")
+        ignored = WebRuntime.Sources.Append("src/runtime/random.cpp")
+        ignored = WebRuntime.Sources.Append("src/runtime/runtime_handles.cpp")
+        ignored = WebRuntime.Sources.Append("src/runtime/resource_registry.cpp")
+        ignored = WebRuntime.Sources.Append("src/gui/arcoui/geometry.cpp")
+        ignored = WebRuntime.Sources.Append("src/gui/arcoui/gesture.cpp")
+        ignored = WebRuntime.Sources.Append("src/gui/arcoui/core.cpp")
+        ignored = WebRuntime.Sources.Append("src/gui/arcoui/bindings.cpp")
+        ignored = WebRuntime.Sources.Append("src/gui/canvas_backend.cpp")
+        ignored = WebRuntime.Build()
+
+        WebCompiler = BUILD.StaticLibrary("libarco_compiler.a")
+        WebCompiler.OutputDirectory = "build-rivet-web"
+        ignored = ConfigureCoreTarget(WebCompiler)
+        ignored = EmscriptenAdapter_ConfigureTarget(WebCompiler, Emscripten)
+        ignored = WebCompiler.Defines.Append(RIVET.Cxx.DefineString("ARCO_SOURCE_ROOT", ArcoSourceRoot))
+        ignored = WebCompiler.Sources.Append("src/compiler/fission.cpp")
+        ignored = WebCompiler.Build()
+    ELSE
+        ignored = RIVET.Log.Warn("RIVET_BUILD_EMSCRIPTEN=1 but em++/emar were not found")
+    END IF
+END IF

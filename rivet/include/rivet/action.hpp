@@ -13,7 +13,7 @@
 
 namespace rivet {
 
-enum class ActionType { Compile, Link };
+enum class ActionType { Compile, Archive, Link };
 
 std::string to_string(ActionType type);
 

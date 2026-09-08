@@ -1,7 +1,10 @@
 #include "rivet/vm.hpp"
 
 #include "rivet/toolchain.hpp"
+#include "rivet/platform.hpp"
 
+#include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -43,6 +46,69 @@ std::string string_field(const arco::Value::Object& object, const std::string& k
     return found->second.to_string();
 }
 
+std::string cxx_string_literal(const std::string& value) {
+    std::string escaped = "\"";
+    for (char c : value) {
+        if (c == '\\' || c == '"') {
+            escaped.push_back('\\');
+            escaped.push_back(c);
+        } else if (c == '\n') {
+            escaped += "\\n";
+        } else if (c == '\r') {
+            escaped += "\\r";
+        } else if (c == '\t') {
+            escaped += "\\t";
+        } else {
+            escaped.push_back(c);
+        }
+    }
+    escaped.push_back('"');
+    return escaped;
+}
+
+std::vector<std::string> split_shell_words(const std::string& text) {
+    std::vector<std::string> words;
+    std::string current;
+    bool in_single = false;
+    bool in_double = false;
+    bool escaping = false;
+    for (char c : text) {
+        if (escaping) {
+            current.push_back(c);
+            escaping = false;
+            continue;
+        }
+        if (c == '\\' && !in_single) {
+            escaping = true;
+            continue;
+        }
+        if (c == '\'' && !in_double) {
+            in_single = !in_single;
+            continue;
+        }
+        if (c == '"' && !in_single) {
+            in_double = !in_double;
+            continue;
+        }
+        if (std::isspace(static_cast<unsigned char>(c)) && !in_single && !in_double) {
+            if (!current.empty()) {
+                words.push_back(current);
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(c);
+    }
+    if (!current.empty()) words.push_back(current);
+    return words;
+}
+
+arco::Value string_array_value(const std::vector<std::string>& values) {
+    arco::Value::Array array;
+    for (const auto& value : values) array.emplace_back(value);
+    return arco::Value(std::move(array));
+}
+
 } // namespace
 
 VM::VM(std::string project_root) : project_root_(std::move(project_root)) {
@@ -58,6 +124,30 @@ void VM::load_stdlib(const std::string& rivet_root) {
     std::string adapter_source = read_file((root / "adapters" / "toolchain" / "cxx.ab").string());
     arco::RunResult adapter_result = runtime_.run_string(adapter_source);
     if (!adapter_result.ok) throw std::runtime_error("rivet: internal error loading adapters/toolchain/cxx.ab: " + adapter_result.error);
+
+    std::string fission_adapter_source = read_file((root / "adapters" / "toolchain" / "fission.ab").string());
+    arco::RunResult fission_adapter_result = runtime_.run_string(fission_adapter_source);
+    if (!fission_adapter_result.ok) {
+        throw std::runtime_error("rivet: internal error loading adapters/toolchain/fission.ab: " + fission_adapter_result.error);
+    }
+
+    std::string pkgconfig_adapter_source = read_file((root / "adapters" / "toolchain" / "pkgconfig.ab").string());
+    arco::RunResult pkgconfig_adapter_result = runtime_.run_string(pkgconfig_adapter_source);
+    if (!pkgconfig_adapter_result.ok) {
+        throw std::runtime_error("rivet: internal error loading adapters/toolchain/pkgconfig.ab: " + pkgconfig_adapter_result.error);
+    }
+
+    std::string windows_adapter_source = read_file((root / "adapters" / "toolchain" / "windows.ab").string());
+    arco::RunResult windows_adapter_result = runtime_.run_string(windows_adapter_source);
+    if (!windows_adapter_result.ok) {
+        throw std::runtime_error("rivet: internal error loading adapters/toolchain/windows.ab: " + windows_adapter_result.error);
+    }
+
+    std::string emscripten_adapter_source = read_file((root / "adapters" / "toolchain" / "emscripten.ab").string());
+    arco::RunResult emscripten_adapter_result = runtime_.run_string(emscripten_adapter_source);
+    if (!emscripten_adapter_result.ok) {
+        throw std::runtime_error("rivet: internal error loading adapters/toolchain/emscripten.ab: " + emscripten_adapter_result.error);
+    }
 }
 
 void VM::load_build_script(const std::string& path) {
@@ -79,6 +169,40 @@ void VM::register_host_contracts() {
 
     runtime_.register_function("RIVET.Filesystem.ProjectRoot", [this](const std::vector<arco::Value>&) -> arco::Value {
         return arco::Value(project_root_);
+    });
+
+    runtime_.register_function("RIVET.Env.Get", [](const std::vector<arco::Value>& args) -> arco::Value {
+        std::string name = require_string(args, 0, "RIVET.Env.Get");
+        const char* value = std::getenv(name.c_str());
+        return arco::Value(value ? std::string(value) : std::string());
+    });
+
+    runtime_.register_function("RIVET.Cxx.DefineString", [](const std::vector<arco::Value>& args) -> arco::Value {
+        std::string name = require_string(args, 0, "RIVET.Cxx.DefineString");
+        std::string value = require_string(args, 1, "RIVET.Cxx.DefineString");
+        return arco::Value(name + "=" + cxx_string_literal(value));
+    });
+
+    runtime_.register_function("RIVET.Toolchain.PkgConfig", [](const std::vector<arco::Value>& args) -> arco::Value {
+        std::string package = require_string(args, 0, "RIVET.Toolchain.PkgConfig");
+        platform::ProcessResult exists = platform::run_process({"pkg-config", "--exists", package});
+        if (!exists.ok) {
+            return arco::Value(arco::Value::Object{
+                {"Found", false},
+                {"Name", package},
+                {"Cflags", arco::Value(arco::Value::Array{})},
+                {"Libs", arco::Value(arco::Value::Array{})},
+            });
+        }
+
+        platform::ProcessResult cflags = platform::run_process({"pkg-config", "--cflags", package});
+        platform::ProcessResult libs = platform::run_process({"pkg-config", "--libs", package});
+        return arco::Value(arco::Value::Object{
+            {"Found", cflags.ok && libs.ok},
+            {"Name", package},
+            {"Cflags", string_array_value(cflags.ok ? split_shell_words(cflags.output) : std::vector<std::string>{})},
+            {"Libs", string_array_value(libs.ok ? split_shell_words(libs.output) : std::vector<std::string>{})},
+        });
     });
 
     // Recursive listing rooted at `root` (project-root-relative or absolute), returning
@@ -140,6 +264,50 @@ void VM::register_host_contracts() {
         });
     });
 
+    // RFC section 38 (Fission Integration).
+    runtime_.register_function("RIVET.Toolchain.DetectFission", [](const std::vector<arco::Value>&) -> arco::Value {
+        FissionToolchain toolchain = detect_fission();
+        return arco::Value(arco::Value::Object{
+            {"Found", toolchain.found},
+            {"Path", toolchain.path},
+            {"Version", toolchain.version},
+        });
+    });
+
+    runtime_.register_function("RIVET.Toolchain.DetectArchiver", [](const std::vector<arco::Value>&) -> arco::Value {
+        ArchiverToolchain toolchain = detect_archiver();
+        return arco::Value(arco::Value::Object{
+            {"Found", toolchain.found},
+            {"Path", toolchain.path},
+            {"Family", toolchain.family},
+            {"Version", toolchain.version},
+        });
+    });
+
+    runtime_.register_function("RIVET.Toolchain.DetectMingwX86_64", [](const std::vector<arco::Value>&) -> arco::Value {
+        CrossCxxToolchain toolchain = detect_mingw_x86_64();
+        return arco::Value(arco::Value::Object{
+            {"Found", toolchain.found},
+            {"CxxPath", toolchain.cxx_path},
+            {"CxxVersion", toolchain.cxx_version},
+            {"ArchiverPath", toolchain.archiver_path},
+            {"ArchiverVersion", toolchain.archiver_version},
+            {"Family", toolchain.family},
+        });
+    });
+
+    runtime_.register_function("RIVET.Toolchain.DetectEmscripten", [](const std::vector<arco::Value>&) -> arco::Value {
+        CrossCxxToolchain toolchain = detect_emscripten();
+        return arco::Value(arco::Value::Object{
+            {"Found", toolchain.found},
+            {"CxxPath", toolchain.cxx_path},
+            {"CxxVersion", toolchain.cxx_version},
+            {"ArchiverPath", toolchain.archiver_path},
+            {"ArchiverVersion", toolchain.archiver_version},
+            {"Family", toolchain.family},
+        });
+    });
+
     runtime_.register_function("RIVET.Host.OS", [](const std::vector<arco::Value>&) -> arco::Value {
 #if defined(__linux__)
         return arco::Value(std::string("linux"));
@@ -170,7 +338,13 @@ void VM::register_host_contracts() {
 
         BuildAction action;
         std::string type_text = string_field(spec, "Type", "Compile");
-        action.type = (type_text == "Link") ? ActionType::Link : ActionType::Compile;
+        if (type_text == "Link") {
+            action.type = ActionType::Link;
+        } else if (type_text == "Archive") {
+            action.type = ActionType::Archive;
+        } else {
+            action.type = ActionType::Compile;
+        }
         action.target = string_field(spec, "Target");
         action.display_name = string_field(spec, "DisplayName");
         action.inputs = string_array_field(spec, "Inputs");

@@ -318,3 +318,54 @@ most natural second adapter to attempt first, since the compiler's own AST-revea
 (`ArcoFission reveal FILE --stage AST`, already proven elsewhere in this repository) is a real,
 existing Tier 2+ analysis primitive Fissure could call into via `FISSURE.Process.Exec`, without
 needing new native parsing work.
+
+## Session 2 — 2026-09-07
+
+**Scope:** Hook Fissure up to the integrated Arcology/ArcoBASIC repository so normal development
+can resume change-focused regression testing instead of manually choosing CTest filters every time.
+
+### What landed
+
+- Added repository-root `fissure.ab`. It registers coarse CTest-backed probes:
+  `project.core-fast`, `project.arcoui`, `project.arcfs-utils`, `project.arcology-os`,
+  `project.arcology-commons`, `project.fissure`, `project.rivet`, `project.arcade`, and
+  `project.full-ctest`.
+- Added native declared-dependency prefix matching in `ImpactEngine`: a declared dependency ending
+  in `/` matches any changed path below that directory; one ending in `*` matches that string
+  prefix. Exact file dependencies retain their old behavior.
+- Added unit tests for the new prefix behavior in `tests/unit/fissure_tests.cpp`.
+- Added `tests/integration/fissure_root_config_smoke.sh` and registered it in
+  `cmake/Testing.cmake`. It validates that the root config loads and registers project probes via
+  `fissure explain` without recursively launching the whole suite.
+- Added a short README note showing `build/fissure/fissure run` and `explain`.
+
+### Design notes
+
+- This is intentionally a CTest bridge, not a full `ctest.ab` adapter. Fissure selects probes;
+  CTest still executes the already-registered tests.
+- The first root config is coarse by design. Shared compiler/runtime changes still select broad
+  suites because the dependency graph is not yet precise enough to prove they are safe to skip.
+  Subproject-only changes get narrower probes with explainable declared dependencies.
+- A first attempt to materialize every file dependency from ArcoBASIC hit the hosted instruction
+  limit on this repo. Prefix dependencies are therefore handled in native impact analysis, which
+  is cheaper and less fragile.
+
+### Tests executed
+
+- `cmake --build build --target fissure_tests fissure` — passes.
+- `./build/fissure_tests` — passes.
+- `build/fissure/fissure explain project.rivet` — passes and shows `AFFECTED` in the current dirty
+  tree via the declared `rivet/` prefix.
+- `build/fissure/fissure explain project.arcfs-utils` — passes and shows `UNAFFECTED`, proving
+  unrelated subsystem probes can be skipped.
+- `ctest --test-dir build -R 'fissure' --output-on-failure` — passes all four Fissure tests,
+  including the new root-config smoke.
+
+### Still open
+
+- The root probe map is hand-authored and coarse. The next quality jump is a real CTest adapter
+  that can import test names/labels and dependencies directly instead of hardcoded regex probes.
+- Fissure still lacks ArcoBASIC/C++ language adapters for import/include edges, so shared files are
+  intentionally over-selected.
+- Lazarus remains outside the root CMake build and should get its own subproject `fissure.ab`
+  against `lazarus/build/` once that independent test workflow is being resumed.

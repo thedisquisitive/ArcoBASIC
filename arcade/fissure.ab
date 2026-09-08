@@ -1,0 +1,4 @@
+' Project-local Fissure config for ARCADE's own buildchain. This probe deliberately runs Rivet,
+' not ArcoFission directly; Rivet's ArcoCapsule target is the layer that invokes Fission.
+
+ignored = RegisterCommandProbe("arcade.rivet-build", "\"${RIVET_PATH:-rivet}\" build --jobs 1", ["arcade", "build", "rivet", "fission"], ["arcade.abas", "build.abas", "reference-project/main.abas", "reference-project/project.arcoproj"])

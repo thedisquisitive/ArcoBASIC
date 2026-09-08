@@ -10,6 +10,36 @@ install(TARGETS arco_cli ArcoFission
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
+if(TARGET fissure)
+    install(TARGETS fissure
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(DIRECTORY fissure/adapters/
+        DESTINATION share/fissure/adapters
+        FILES_MATCHING PATTERN "*.ab"
+    )
+    install(FILES fissure/AGENT_PROGRESS.md fissure/docs/fissure-rfc.md
+        DESTINATION share/doc/fissure
+    )
+endif()
+
+if(TARGET rivet)
+    install(TARGETS rivet
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(DIRECTORY rivet/stdlib/
+        DESTINATION share/rivet/stdlib
+        FILES_MATCHING PATTERN "*.abas"
+    )
+    install(DIRECTORY rivet/adapters/
+        DESTINATION share/rivet/adapters
+        FILES_MATCHING PATTERN "*.ab"
+    )
+    install(FILES rivet/RIVET_PROGRESS.md rivet/docs/rivet-rfc.md
+        DESTINATION share/doc/rivet
+    )
+endif()
+
 # arcfsctl/arconaut/arcfs-linux and all of their packaging (desktop entry, icons, udev rules,
 # mount/mkfs wrappers) install themselves from arcfs-utils/CMakeLists.txt -- see that file.
 
@@ -31,7 +61,9 @@ install(DIRECTORY examples/
     FILES_MATCHING PATTERN "*.abas" PATTERN "*.arc" PATTERN "*.bas" PATTERN "*.arcsh"
 )
 
-install(DIRECTORY assets/ DESTINATION share/arcobasic/assets)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/assets)
+    install(DIRECTORY assets/ DESTINATION share/arcobasic/assets)
+endif()
 
 # application-x-arcobasic.xml is the general ArcoBASIC MIME type (any .abas file, not ArcFS-
 # specific), so it stays installed from here rather than arcfs-utils/ -- Arconaut's own .desktop

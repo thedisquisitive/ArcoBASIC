@@ -1,0 +1,23 @@
+' pkg-config adapter for Unix-style package discovery. The native host contract returns argv-safe
+' cflags/libs arrays; this adapter applies them to Rivet targets without shell parsing in BASIC.
+
+FUNCTION PkgConfigAdapter_Find(name)
+    RETURN RIVET.Toolchain.PkgConfig(name)
+END FUNCTION
+
+FUNCTION PkgConfigAdapter_Apply(target, package)
+    FOR flag IN package.Cflags
+        ignored = target.CompileFlags.Append(flag)
+    NEXT
+    FOR flag IN package.Libs
+        ignored = target.LinkFlags.Append(flag)
+        ignored = target.LinkInterfaceFlags.Append(flag)
+    NEXT
+    RETURN target
+END FUNCTION
+
+FUNCTION PkgConfigAdapter_ApplyName(target, name)
+    package = PkgConfigAdapter_Find(name)
+    IF package.Found THEN ignored = PkgConfigAdapter_Apply(target, package)
+    RETURN package.Found
+END FUNCTION

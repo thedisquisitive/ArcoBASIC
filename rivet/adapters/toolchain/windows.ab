@@ -1,0 +1,25 @@
+' Windows x86-64 cross-toolchain adapter for mingw-w64.
+
+FUNCTION WindowsAdapter_DetectMingwX86_64()
+    RETURN RIVET.Toolchain.DetectMingwX86_64()
+END FUNCTION
+
+FUNCTION WindowsAdapter_ConfigureTarget(target, toolchain)
+    target.Compiler.Path = toolchain.CxxPath
+    target.Compiler.Family = toolchain.Family
+    target.Compiler.Version = toolchain.CxxVersion
+    target.Archiver.Path = toolchain.ArchiverPath
+    target.Archiver.Family = toolchain.Family
+    target.Archiver.Version = toolchain.ArchiverVersion
+    ignored = target.Defines.Append("TARGET_WINDOWS=1")
+    RETURN target
+END FUNCTION
+
+FUNCTION WindowsAdapter_ConfigureExecutable(target, toolchain)
+    ignored = WindowsAdapter_ConfigureTarget(target, toolchain)
+    ignored = target.LinkFlags.Append("-static")
+    ignored = target.LinkFlags.Append("-static-libgcc")
+    ignored = target.LinkFlags.Append("-static-libstdc++")
+    ignored = target.LinkFlags.Append("-lws2_32")
+    RETURN target
+END FUNCTION

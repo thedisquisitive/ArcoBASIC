@@ -1,0 +1,19 @@
+' The ArcoBASIC/Fission compiler adapter (rivet/docs/rivet-rfc.md section 38: "Fission should
+' receive a first-party Rivet adapter"). Mirrors cxx.ab's own shape but simpler -- `ArcoFission
+' native ENTRY -o OUTPUT` produces a self-contained capsule directly in one invocation, no
+' separate compile-then-link step the way C++ needs.
+'
+' Known, disclosed limitation (see rivet/RIVET_PROGRESS.md): the fingerprint this produces only
+' covers the entry file itself, not anything it `#IMPORT`s transitively (e.g. `arcade.abas`
+' importing `stdlib/arcoui.abas`). ArcoFission has no depfile-equivalent output the way `-MMD`
+' gives cxx.ab a real dependency list (RFC section 23's own "use the compiler's own dependency
+' output, don't write a brittle universal parser" guidance has nothing to attach to here yet) --
+' a change to an imported stdlib file will NOT currently invalidate a Rivet-built capsule's cache
+' on its own. Real, scoped follow-up work: either ArcoFission grows a way to report its own
+' resolved import list, or this adapter grows its own #IMPORT scanner (the RFC's own guidance
+' argues against that as a first choice, so the former is preferred if ArcoFission ever exposes
+' it).
+
+FUNCTION FissionAdapter_BuildArguments(entry, outputPath)
+    RETURN ["native", entry, "-o", outputPath]
+END FUNCTION

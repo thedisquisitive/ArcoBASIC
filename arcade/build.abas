@@ -1,0 +1,7 @@
+' ARCADE's Rivet build description. The build file is ordinary ArcoBASIC; Rivet records a single
+' fission-backed compile action that invokes `ArcoFission native arcade.abas -o build/arcade`.
+
+Arcade = BUILD.ArcoCapsule("arcade")
+Arcade.Entry = "arcade.abas"
+Arcade.OutputDirectory = "build"
+ignored = Arcade.Build()

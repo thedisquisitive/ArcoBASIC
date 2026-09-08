@@ -11681,6 +11681,41 @@ std::vector<std::string> split_shell_like(const std::string& line) {
     return words;
 }
 
+std::string command_output(const std::string& command) {
+    std::string output;
+#if defined(__linux__)
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) return output;
+    char buffer[4096];
+    while (std::fgets(buffer, sizeof(buffer), pipe)) output += buffer;
+    int status = pclose(pipe);
+    if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return "";
+#endif
+    return output;
+}
+
+bool pkg_config_exists(const std::string& package) {
+#if defined(__linux__)
+    const int status = std::system(("pkg-config --exists " + shell_quote(package)).c_str());
+    return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#else
+    (void)package;
+    return false;
+#endif
+}
+
+std::vector<std::string> pkg_config_libs(const std::string& package) {
+    if (!pkg_config_exists(package)) return {};
+    return split_shell_like(command_output("pkg-config --libs " + shell_quote(package)));
+}
+
+void append_available_pkg_config_libs(std::vector<std::string>& deps, const std::vector<std::string>& packages) {
+    for (const auto& package : packages) {
+        auto libs = pkg_config_libs(package);
+        deps.insert(deps.end(), libs.begin(), libs.end());
+    }
+}
+
 // Reads an executable target's own link.txt and returns everything from the first ArcoBASIC
 // static library onward (relativized against build_dir), i.e. exactly the flags/libraries a
 // native capsule needs to reproduce that target's link behavior. Shared by the full path (reads
@@ -11718,17 +11753,35 @@ std::vector<std::string> native_link_dependencies_from(const std::filesystem::pa
     return deps;
 }
 
+std::vector<std::string> native_link_dependencies_from_archives(const std::filesystem::path& build_dir,
+                                                                const std::vector<std::string>& archive_names) {
+    std::vector<std::string> deps;
+    for (const auto& name : archive_names) {
+        const std::filesystem::path archive = build_dir / name;
+        if (!std::filesystem::exists(archive)) return {};
+        deps.push_back(archive.string());
+    }
+    if (std::find(archive_names.begin(), archive_names.end(), "libarco_runtime.a") != archive_names.end()) {
+        append_available_pkg_config_libs(deps, {"libcurl", "glfw3", "pangocairo", "gtk+-3.0", "gl"});
+    }
+    return deps;
+}
+
 std::vector<std::string> native_link_dependencies(const std::filesystem::path& build_dir) {
-    return native_link_dependencies_from(build_dir, std::filesystem::path("CMakeFiles") / "ArcoFission.dir" / "link.txt",
+    auto deps = native_link_dependencies_from(build_dir, std::filesystem::path("CMakeFiles") / "ArcoFission.dir" / "link.txt",
         {"libarco.a", "libarco_compiler.a"});
+    if (!deps.empty()) return deps;
+    return native_link_dependencies_from_archives(build_dir, {"libarco_compiler.a", "libarco_runtime.a", "libarcology_os.a"});
 }
 
 // Only present when the build tree opted in with `cmake --build . --target
 // ArcoFissionCapsuleCoreProbe` (see CMakeLists.txt); empty otherwise, which callers treat as
 // "the lean core libraries aren't built here yet".
 std::vector<std::string> native_core_link_dependencies(const std::filesystem::path& build_dir) {
-    return native_link_dependencies_from(build_dir,
+    auto deps = native_link_dependencies_from(build_dir,
         std::filesystem::path("CMakeFiles") / "ArcoFissionCapsuleCoreProbe.dir" / "link.txt", {"libarco_compiler_core.a"});
+    if (!deps.empty()) return deps;
+    return native_link_dependencies_from_archives(build_dir, {"libarco_compiler_core.a", "libarco_runtime_core.a", "libarcology_os.a"});
 }
 
 // Same idea, but for arco_runtime_core ALONE (no arco_compiler_core/fission.cpp along for the
@@ -11738,8 +11791,10 @@ std::vector<std::string> native_core_link_dependencies(const std::filesystem::pa
 // build_linux_native_image treats as "host-function support isn't available in this build tree
 // yet" rather than failing every native build outright.
 std::vector<std::string> native_runtime_core_link_dependencies(const std::filesystem::path& build_dir) {
-    return native_link_dependencies_from(build_dir,
+    auto deps = native_link_dependencies_from(build_dir,
         std::filesystem::path("CMakeFiles") / "ArcoNativeRuntimeCoreProbe.dir" / "link.txt", {"libarco_runtime_core.a"});
+    if (!deps.empty()) return deps;
+    return native_link_dependencies_from_archives(build_dir, {"libarco_runtime_core.a", "libarcology_os.a"});
 }
 
 // The FULL, GUI-capable runtime library (`arco_runtime` -- the exact same one `arco_cli`, the
@@ -11759,8 +11814,10 @@ std::vector<std::string> native_runtime_core_link_dependencies(const std::filesy
 // link.txt doesn't exist yet (this build tree hasn't been built at all), which callers treat as
 // "the GUI-capable runtime isn't available here yet" rather than failing outright.
 std::vector<std::string> native_gui_runtime_link_dependencies(const std::filesystem::path& build_dir) {
-    return native_link_dependencies_from(build_dir,
+    auto deps = native_link_dependencies_from(build_dir,
         std::filesystem::path("CMakeFiles") / "arco_cli.dir" / "link.txt", {"libarco_runtime.a"});
+    if (!deps.empty()) return deps;
+    return native_link_dependencies_from_archives(build_dir, {"libarco_runtime.a", "libarcology_os.a"});
 }
 
 // True if `module` calls a `GUI.*` host function anywhere (a plain `Kind::CallValue` whose target
@@ -11882,12 +11939,28 @@ std::string native_launcher_source(const std::string& bytecode_binary, std::opti
 // Not auto-discovered from the running ArcoFission's own build tree the way the Linux path is,
 // since that tree was built for the host, not for Windows -- callers must point at one via
 // ARCOFISSION_WINDOWS_TOOLCHAIN_DIR.
+std::filesystem::path cross_arcology_library_path(const std::filesystem::path& build_dir);
+
 std::optional<std::filesystem::path> windows_toolchain_build_dir() {
     const char* env = std::getenv("ARCOFISSION_WINDOWS_TOOLCHAIN_DIR");
     if (!env || !*env) {
+        const std::filesystem::path exe_dir = current_executable_dir();
+        for (const auto& candidate : {exe_dir / "windows-x86_64", exe_dir.parent_path() / "build-rivet-windows"}) {
+            if (std::filesystem::exists(candidate / "libarco_compiler.a") &&
+                std::filesystem::exists(candidate / "libarco_runtime.a") &&
+                std::filesystem::exists(cross_arcology_library_path(candidate))) {
+                return candidate;
+            }
+        }
         return std::nullopt;
     }
     return std::filesystem::path(env);
+}
+
+std::filesystem::path cross_arcology_library_path(const std::filesystem::path& build_dir) {
+    const std::filesystem::path flat = build_dir / "libarcology_os.a";
+    if (std::filesystem::exists(flat)) return flat;
+    return build_dir / "arcology-os" / "libarcology_os.a";
 }
 
 Result build_native_windows_bytecode(const std::string& bytecode_binary, const std::string& output_path,
@@ -11903,7 +11976,7 @@ Result build_native_windows_bytecode(const std::string& bytecode_binary, const s
         const std::filesystem::path source_root = source_root_path();
         const std::filesystem::path compiler_lib = *windows_build_dir / "libarco_compiler.a";
         const std::filesystem::path runtime_lib = *windows_build_dir / "libarco_runtime.a";
-        const std::filesystem::path arcology_lib = *windows_build_dir / "arcology-os" / "libarcology_os.a";
+        const std::filesystem::path arcology_lib = cross_arcology_library_path(*windows_build_dir);
         for (const auto& lib : {compiler_lib, runtime_lib, arcology_lib}) {
             if (!std::filesystem::exists(lib)) {
                 return {false, "", "missing " + lib.string() +
@@ -11987,6 +12060,14 @@ Result build_native_windows_bytecode(const std::string& bytecode_binary, const s
 std::optional<std::filesystem::path> web_toolchain_build_dir() {
     const char* env = std::getenv("ARCOFISSION_WEB_TOOLCHAIN_DIR");
     if (!env || !*env) {
+        const std::filesystem::path exe_dir = current_executable_dir();
+        for (const auto& candidate : {exe_dir / "web-wasm32", exe_dir.parent_path() / "build-rivet-web"}) {
+            if (std::filesystem::exists(candidate / "libarco_compiler.a") &&
+                std::filesystem::exists(candidate / "libarco_runtime.a") &&
+                std::filesystem::exists(cross_arcology_library_path(candidate))) {
+                return candidate;
+            }
+        }
         return std::nullopt;
     }
     return std::filesystem::path(env);
@@ -12005,7 +12086,7 @@ Result build_web_bytecode(const std::string& bytecode_binary, const std::string&
         const std::filesystem::path source_root = source_root_path();
         const std::filesystem::path compiler_lib = *web_build_dir / "libarco_compiler.a";
         const std::filesystem::path runtime_lib = *web_build_dir / "libarco_runtime.a";
-        const std::filesystem::path arcology_lib = *web_build_dir / "arcology-os" / "libarcology_os.a";
+        const std::filesystem::path arcology_lib = cross_arcology_library_path(*web_build_dir);
         for (const auto& lib : {compiler_lib, runtime_lib, arcology_lib}) {
             if (!std::filesystem::exists(lib)) {
                 return {false, "", "missing " + lib.string() +
@@ -12211,7 +12292,7 @@ Result build_native_bytecode(const std::string& bytecode_binary, const std::stri
             link_dependencies = native_link_dependencies(build_dir);
         }
         if (link_dependencies.empty()) {
-            return {false, "", "native build needs the ArcoBASIC libraries beside ArcoFission; run from a CMake build tree"};
+            return {false, "", "native build needs the ArcoBASIC libraries beside ArcoFission; run from a complete buildchain directory"};
         }
 
         const std::filesystem::path tmp_dir = std::filesystem::temp_directory_path() /
@@ -12588,11 +12669,11 @@ Result build_linux_native_image(const std::string& source, const std::string& so
             if (host_bridge_link_dependencies.empty() || any_archive_missing) {
                 return {false, "", program_needs_gui_runtime
                     ? "this program calls a GUI.* function; the full, GUI-capable runtime isn't "
-                      "available in this build tree -- run `cmake --build . --target arco_cli` "
+                      "available in this buildchain directory -- build `arco_cli` "
                       "first, then rebuild"
                     : "this program calls a host function this backend doesn't have "
                       "dedicated native codegen for; the generic host-function bridge isn't available "
-                      "in this build tree -- run `cmake --build . --target ArcoNativeRuntimeCoreProbe` "
+                      "in this buildchain directory -- build `libarco_runtime_core.a` "
                       "first, then rebuild"};
             }
             host_bridge_path = source_root / "src" / "native" / "host_bridge.cpp";

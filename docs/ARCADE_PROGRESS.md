@@ -575,18 +575,13 @@ WAYLAND_DISPLAY= XDG_SESSION_TYPE=x11 DISPLAY=:1 \
 # deleted arcoflow.abas prototype's own no-project mode worked):
 ./build/arco_cli arcade/arcade.abas some/file.abas
 
-# Build ARCADE as a real, standalone, double-clickable executable (arcade/build.sh, following the
-# deleted arcoflow/build.sh's own established convention exactly): a self-contained ELF64 capsule
-# with the bytecode VM embedded, built via ArcoFission's own "native" (bytecode-capsule) command,
-# NOT the separate --target linux-x86_64 no-VM compiler backend this same repository's own
-# fission.cpp work (Phases 11-15) is about -- deliberately the more conservative, already-proven
-# path, matching what the deleted prototype used. Defaults to build-release/ArcoFission (a real,
-# optimized -O3 build -- an unoptimized capsule embeds an unoptimized bytecode VM, ~26x slower on
-# this project's own past measurement); set ARCOFISSION=/path/to/it to use a different one, or
-# ARCOFISSION_WEB_TOOLCHAIN_DIR to also produce a web capsule. Output lands in arcade/build/
-# (gitignored, matching the top-level build/'s own convention -- confirmed: `git check-ignore -v
-# arcade/build/arcade` resolves via the existing bare `build/` .gitignore pattern, no new entry
-# needed):
+# Build ARCADE as a real, standalone, double-clickable executable. As of Session 3 below, native
+# builds go through the real project chain: `arcade/build.sh` -> `fissure run --full` ->
+# `arcade/fissure.ab` -> `rivet build` -> `arcade/build.abas` -> ArcoFission's bytecode-capsule
+# `native` command. Defaults to build-release/ArcoFission for the compiler and build/{fissure,
+# rivet}/ for orchestration; set ARCOFISSION=/path, FISSURE=/path, or RIVET=/path to override.
+# The optional web capsule still builds directly with ArcoFission when ARCOFISSION_WEB_TOOLCHAIN_DIR
+# is set, because Rivet's current fission adapter only models native capsules.
 ./arcade/build.sh
 ARCOFISSION_PATH="$(pwd)/build-release/ArcoFission" \
 WAYLAND_DISPLAY= XDG_SESSION_TYPE=x11 DISPLAY=:1 \
@@ -600,8 +595,52 @@ WAYLAND_DISPLAY= XDG_SESSION_TYPE=x11 DISPLAY=:1 \
 # interpreter (this is what ARCADE's own Run tab shells out to):
 ./build/ArcoFission compile-run arcade/reference-project/main.abas
 
-# ARCADE has no automated tests yet (see "Tests added" above) -- there is no `ctest` target to run
-# for ARCADE specifically. The general project suite (`ctest --test-dir build`) remains correct for
-# the surrounding ArcoBASIC/ArcoFission/ArcoUI code ARCADE depends on, and should be re-run before/
-# with the first ARCADE change that touches shared C++ code (see "Tests added" above).
+# ARCADE now has one buildchain smoke test:
+ctest --test-dir build -R arcade_buildchain_smoke --output-on-failure
 ```
+
+## Session 3 — 2026-09-07
+
+**Agent/operator:** Direct instruction from the project owner: "Read the entire project. Then
+finish converting the `arcade` subproject to the fission->fissure->rivet buildchain."
+
+**Current milestone:** Phase B remains the product milestone; build orchestration is now converted.
+Phase C (Minimal Shared Application Model) is still the next product feature.
+
+### Files changed (Session 3)
+
+- `arcade/build.abas` — new Rivet build description. Declares `BUILD.ArcoCapsule("arcade")`,
+  `Entry = "arcade.abas"`, and `OutputDirectory = "build"`.
+- `arcade/fissure.ab` — new Fissure project config. Registers `arcade.rivet-build`, a command
+  probe that runs `rivet build --jobs 1`; dependencies include the shell, build file, and reference
+  project files.
+- `arcade/build.sh` — native build now runs `Fissure -> Rivet -> ArcoFission`; tool paths can be
+  overridden via `FISSURE`, `RIVET`, and `ARCOFISSION`. `ARCOBASIC_STDLIB` is exported so copied or
+  non-installed projects still resolve `#IMPORT "arcoui"`.
+- `arcade/README.md` — updated to name `build.abas`, `fissure.ab`, and the new chain.
+- `.gitignore` — added `.fissure/`, matching existing `.rivet/` state ignore.
+- `tests/integration/arcade_buildchain_smoke.sh` and `cmake/Testing.cmake` — new automated smoke
+  registered when `fissure`, `rivet`, and `ArcoFission` targets exist.
+- Rivet fission support was completed by loading `rivet/adapters/toolchain/fission.ab` from
+  `rivet/core/vm/vm.cpp`; the underlying fission target/API additions were already present in the
+  worktree and are tracked in `rivet/RIVET_PROGRESS.md`.
+
+### Tests executed and results (Session 3)
+
+- `tests/integration/arcade_buildchain_smoke.sh build/fissure/fissure build/rivet/rivet
+  build/ArcoFission .` — passes. Verifies `arcade/build.sh` reaches Fissure, Fissure runs the
+  `arcade.rivet-build` probe, Rivet produces `build/arcade`, and a second direct `rivet build`
+  reports `[CACHE] arcade.abas` with zero recompiles.
+- `./arcade/build.sh` — passes in the real checkout, producing `arcade/build/arcade` through the
+  converted chain.
+- `ctest --test-dir build -R 'arcade_buildchain_smoke|rivet' --output-on-failure` — passes
+  (`rivet_tests`, `rivet_smoke`, `arcade_buildchain_smoke`).
+
+### Known limits after Session 3
+
+- Rivet's fission adapter fingerprints only the entry file, not transitive `#IMPORT`s such as
+  `stdlib/arcoui.abas`. This is already documented in `rivet/adapters/toolchain/fission.ab`; a
+  future ArcoFission dependency-reporting mode or dedicated import scanner is needed for precise
+  invalidation.
+- Optional web capsule output remains outside Rivet for now because `ArcoCapsuleTarget` has no web
+  target option yet.

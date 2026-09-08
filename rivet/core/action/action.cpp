@@ -5,6 +5,7 @@ namespace rivet {
 std::string to_string(ActionType type) {
     switch (type) {
         case ActionType::Compile: return "Compile";
+        case ActionType::Archive: return "Archive";
         case ActionType::Link: return "Link";
     }
     return "Compile";

@@ -20,6 +20,19 @@ bool is_sufficient_for_unaffected(Evidence evidence) {
     return evidence == Evidence::Declared;
 }
 
+bool dependency_matches_disturbance(const std::string& dependency, const std::string& changed) {
+    if (dependency == changed) return true;
+    if (dependency.empty()) return false;
+
+    if (dependency.back() == '/') {
+        return changed.rfind(dependency, 0) == 0;
+    }
+    if (dependency.back() == '*') {
+        return changed.rfind(dependency.substr(0, dependency.size() - 1), 0) == 0;
+    }
+    return false;
+}
+
 } // namespace
 
 std::vector<ProbeVerdict> ImpactEngine::classify(const Graph& graph, const std::vector<std::string>& disturbance) const {
@@ -40,6 +53,26 @@ std::vector<ProbeVerdict> ImpactEngine::classify(const Graph& graph, const std::
 
         ProbeVerdict verdict;
         verdict.probe_id = id;
+
+        bool matched_declared_dependency = false;
+        for (const Edge* edge : graph.outgoing(id)) {
+            if (!is_sufficient_for_unaffected(edge->evidence)) continue;
+            for (const auto& changed : disturbance) {
+                if (!dependency_matches_disturbance(edge->to, changed)) continue;
+                verdict.classification = Classification::Affected;
+                verdict.reasons.push_back(
+                    id + " --[" + fissure::to_string(edge->kind) + ", " +
+                    fissure::to_string(edge->evidence) + "]--> " + edge->to +
+                    " matched disturbance " + changed);
+                matched_declared_dependency = true;
+                break;
+            }
+            if (matched_declared_dependency) break;
+        }
+        if (matched_declared_dependency) {
+            verdicts.push_back(std::move(verdict));
+            continue;
+        }
 
         auto it = reached_by_id.find(id);
         if (it != reached_by_id.end() && it->second->depth > 0) {

@@ -70,4 +70,74 @@ if [ -f build/tinyapp ]; then
     exit 1
 fi
 
+echo "=== static library target feeds executable target ==="
+STATIC_PROJECT="$TMP_ROOT/static-project"
+mkdir -p "$STATIC_PROJECT/include" "$STATIC_PROJECT/src"
+cat > "$STATIC_PROJECT/include/mathcore.hpp" <<'EOF'
+#pragma once
+int triple(int value);
+EOF
+cat > "$STATIC_PROJECT/src/mathcore.cpp" <<'EOF'
+#include "mathcore.hpp"
+int triple(int value) { return value * 3; }
+EOF
+cat > "$STATIC_PROJECT/src/main.cpp" <<'EOF'
+#include "mathcore.hpp"
+int main() { return triple(7) == 21 ? 0 : 1; }
+EOF
+cat > "$STATIC_PROJECT/build.abas" <<'EOF'
+Core = BUILD.StaticLibrary("libmathcore.a")
+ignored = Core.Includes.Append("include")
+ignored = Core.Sources.Append("src/mathcore.cpp")
+ignored = Core.Build()
+
+App = BUILD.Executable("uses-static")
+ignored = App.Includes.Append("include")
+ignored = App.Sources.Append("src/main.cpp")
+ignored = App.AddDependency(Core)
+ignored = App.Build()
+EOF
+(
+    cd "$STATIC_PROJECT"
+    "$RIVET" build --jobs 1 | tee static1.log
+    grep -q "\[ARCHIVE\] build/libmathcore.a" static1.log
+    grep -q "\[LINK\]    build/uses-static" static1.log
+    test -f build/libmathcore.a
+    test -x build/uses-static
+    ./build/uses-static
+
+    "$RIVET" build --jobs 1 | tee static2.log
+    grep -q "\[CACHE\]" static2.log
+    if grep -q "\[ARCHIVE\]" static2.log || grep -q "\[LINK\]" static2.log || grep -q "\[COMPILE\]" static2.log; then
+        echo "FAIL: static project rebuilt despite no changes" >&2
+        exit 1
+    fi
+)
+
+if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists sqlite3; then
+    echo "=== pkg-config adapter applies package link flags ==="
+    PKG_PROJECT="$TMP_ROOT/pkg-project"
+    mkdir -p "$PKG_PROJECT/src"
+    cat > "$PKG_PROJECT/src/main.cpp" <<'EOF'
+#include <sqlite3.h>
+int main() {
+    sqlite3* db = nullptr;
+    return sqlite3_open(":memory:", &db) == SQLITE_OK && sqlite3_close(db) == SQLITE_OK ? 0 : 1;
+}
+EOF
+    cat > "$PKG_PROJECT/build.abas" <<'EOF'
+Sqlite3 = PkgConfigAdapter_Find("sqlite3")
+App = BUILD.Executable("uses-sqlite")
+ignored = App.Sources.Append("src/main.cpp")
+IF Sqlite3.Found THEN ignored = PkgConfigAdapter_Apply(App, Sqlite3)
+ignored = App.Build()
+EOF
+    (
+        cd "$PKG_PROJECT"
+        "$RIVET" build --jobs 1 | tee pkg.log
+        grep -q "\[LINK\]    build/uses-sqlite" pkg.log
+        ./build/uses-sqlite
+    )
+fi
+
 echo "rivet_smoke: all checks passed"

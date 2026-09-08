@@ -15,6 +15,7 @@ build-*/
 # development, not just via the tmp-dir-copying integration smoke test, so this needs to be
 # ignored wherever it appears, not just at the repo root.
 .rivet/
+.fissure/
 dist/
 /var/
 CMakeFiles/

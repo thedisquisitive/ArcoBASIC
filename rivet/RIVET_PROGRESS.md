@@ -182,3 +182,127 @@ environment-variable fingerprinting; real `Script:Line` provenance (only `Script
 target-link-dependency model (a probe/target must currently list every transitive dependency by
 hand, matching how `RegisterTargetProbe`'s own tiny-cmake-project example in Fissure needed the
 same thing).
+
+## Session 2 — 2026-09-07
+
+**Scope:** Finish the Fission adapter path far enough for ARCADE to consume Rivet as its build
+system.
+
+### Files changed
+
+- `rivet/core/vm/vm.cpp` now loads `adapters/toolchain/fission.ab` after `cxx.ab`. Before this,
+  `BUILD.ArcoCapsule(...)` existed in `stdlib/rivet.abas` but failed at runtime because
+  `FissionAdapter_BuildArguments` was never defined.
+- The already-present worktree additions for `FissionToolchain`, `DetectFission`, and
+  `ArcoCapsuleTarget` are now exercised by `arcade/build.abas`.
+- `tests/integration/arcade_buildchain_smoke.sh` covers the consumer path: Fissure invokes Rivet,
+  Rivet schedules the `ArcoCapsuleTarget`, and ArcoFission emits `build/arcade`.
+
+### Tests executed
+
+- `cmake --build build --target rivet` — passes.
+- `ctest --test-dir build -R 'arcade_buildchain_smoke|rivet' --output-on-failure` — passes.
+
+### Still open
+
+- Fission capsule inputs still include only the entry file. Imported `.abas` dependencies are not
+  in the Rivet fingerprint yet.
+- The fission adapter still models native capsules only; web output remains a direct ArcoFission
+  step in `arcade/build.sh`.
+
+## Session 3 — 2026-09-07
+
+**Scope:** Add the Rivet adapter support needed to start replacing CMake for the buildchain tools
+themselves.
+
+### Files changed
+
+- `rivet/adapters/toolchain/cxx.ab` now supports `Defines`, `CompileFlags`, `LinkFlags`, explicit
+  `LinkInputs`, and static archive argument construction (`ar rcs ...`).
+- `rivet/adapters/toolchain/pkgconfig.ab` adds the first package-discovery adapter, backed by the
+  native `RIVET.Toolchain.PkgConfig` host contract.
+- `rivet/stdlib/rivet.abas` now makes `BUILD.StaticLibrary(...)` real: static targets produce an
+  `Archive` action, record `FinalActionId`, and can feed executables through `AddDependency`.
+  Static-library link interface flags now propagate to executable consumers.
+- `rivet/core/toolchain/cxx.cpp`, `rivet/include/rivet/toolchain.hpp`, `rivet/core/vm/vm.cpp`, and
+  `rivet/include/rivet/action.hpp` add archiver detection, `Archive` action identity/logging, env
+  reads, pkg-config probing, and safe C++ string-define construction for build scripts.
+- Root `build.abas` builds the buildchain graph with Rivet: `ArcoFission`, `arco_cli`,
+  `fissure`, `rivet`, `arcfs-linux`, and their static support archives under `build-rivet/`,
+  applying optional GUI (`glfw3`/`pangocairo`/`gtk+-3.0`/`gl`), network (`libcurl`), SQLite, and
+  FUSE (`fuse3`) flags through adapters when available.
+- `scripts/install/install-system-buildchain.sh` now prefers `rivet build` and uses CMake only to
+  bootstrap an initial Rivet binary when none exists. It installs Rivet-built tools plus
+  compatibility metadata/source support so current `ArcoFission native` keeps working.
+- `src/compiler/fission.cpp` now falls back to Rivet-built archives beside `ArcoFission` when
+  CMake `link.txt` metadata is absent, so `build-rivet/ArcoFission native ...` works directly.
+- `tests/integration/rivet_smoke.sh` now proves a static library target feeds an executable target
+  through the actual Rivet CLI.
+
+### Tests executed
+
+- `cmake --build build --target rivet rivet_tests -j$(nproc)` — passes.
+- `./build/rivet_tests` — passes.
+- `ctest --test-dir build -R rivet_smoke --output-on-failure` — passes.
+- `build/rivet/rivet build --jobs 1` at repository root — passes, producing `build-rivet/`.
+- A second root `build/rivet/rivet build --jobs 1` — passes with 59 cache hits and zero rebuilds.
+- `ctest --test-dir build -R system_buildchain_install_smoke --output-on-failure` — passes through
+  the Rivet installer path and installed `ArcoFission native`.
+- Direct `build-rivet/ArcoFission native <hello.abas> -o <hello>` smoke — passes without any
+  `CMakeFiles/*/link.txt` under `build-rivet/`.
+- `ctest --test-dir build -R 'system_buildchain_install_smoke|arcfsctl_smoke|mount_arcfs_helper_smoke'
+  --output-on-failure` — passes.
+
+### Still open
+
+- Optional GUI/CURL/FUSE package discovery is now encoded for the hosted Linux path. Cross-platform
+  framework discovery (macOS frameworks, Windows SDK/library discovery, Emscripten flags) remains
+  future adapter work.
+- The installer still writes CMake-shaped `link.txt` compatibility files for older/native paths,
+  but `ArcoFission native` no longer requires them when the Rivet-built support archives are beside
+  the compiler.
+
+## Session 4 — 2026-09-07
+
+**Scope:** Add Windows and Emscripten cross-toolchain adapters.
+
+### Files changed
+
+- `rivet/adapters/toolchain/windows.ab` configures `BuildTarget` instances for mingw-w64 x86-64:
+  cross compiler, cross archiver, `TARGET_WINDOWS=1`, and static executable link flags.
+- `rivet/adapters/toolchain/emscripten.ab` configures `BuildTarget` instances for Emscripten:
+  `em++`, `emar`, `__EMSCRIPTEN__=1`, exceptions, Asyncify, memory growth, and ccall/cwrap export
+  flags.
+- `rivet/core/toolchain/cxx.cpp`, `rivet/include/rivet/toolchain.hpp`, and `rivet/core/vm/vm.cpp`
+  expose `RIVET.Toolchain.DetectMingwX86_64` and `RIVET.Toolchain.DetectEmscripten`.
+- `rivet/stdlib/rivet.abas` now carries a per-target `Archiver`, so cross static libraries use the
+  matching cross archive tool instead of host `ar`.
+- Root `build.abas` supports opt-in cross archive builds:
+  `RIVET_BUILD_WINDOWS=1` emits `build-rivet-windows/`; `RIVET_BUILD_EMSCRIPTEN=1` emits
+  `build-rivet-web/` when `em++`/`emar` are installed.
+- `src/compiler/fission.cpp` now auto-discovers sibling `build-rivet-windows/` and
+  `build-rivet-web/` directories, plus installed `windows-x86_64/` and `web-wasm32/` support dirs.
+- `scripts/install/install-system-buildchain.sh` installs optional cross archive directories when
+  present.
+- `tests/integration/rivet_cross_adapters_smoke.sh` covers real MinGW when available and uses fake
+  `em++`/`emar` shims for adapter-level Emscripten coverage.
+
+### Tests executed
+
+- `cmake -S . -B build` — passes.
+- `cmake --build build --target ArcoFission rivet rivet_tests -j$(nproc)` — passes.
+- `./build/rivet_tests` — passes.
+- `ctest --test-dir build -R rivet_cross_adapters_smoke --output-on-failure` — passes.
+- `RIVET_BUILD_WINDOWS=1 build/rivet/rivet build --jobs 1` — passes, producing
+  `build-rivet-windows/libarco_compiler.a`, `libarco_runtime.a`, and `libarcology_os.a`.
+- Direct `build-rivet/ArcoFission native <hello.abas> -o <hello.exe> --target windows-x86_64`
+  smoke — passes and produces a PE32+ x86-64 executable without setting
+  `ARCOFISSION_WINDOWS_TOOLCHAIN_DIR`.
+- `RIVET_BUILD_EMSCRIPTEN=1 build/rivet/rivet build --jobs 1` on this host — passes with a clear
+  warning because `em++`/`emar` are not installed.
+
+### Still open
+
+- A real Emscripten compile/link smoke still needs the SDK installed in the test environment. The
+  adapter-level coverage is present through fake `em++`/`emar`, but wasm production was not
+  executable here.

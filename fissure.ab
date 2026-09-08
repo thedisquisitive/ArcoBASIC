@@ -1,0 +1,118 @@
+' Root Fissure config for the integrated Arcology/ArcoBASIC checkout. This intentionally starts as
+' a conservative CTest bridge: Fissure selects coarse subsystem probes from declared file
+' dependencies, and CTest remains the runner that knows the exact built test commands.
+'
+' Run from the repository root after configuring/building `build/`:
+'
+'     build/fissure/fissure run
+'     build/fissure/fissure explain project.rivet
+
+FUNCTION ShellQuote(value)
+    RETURN "'" + String.Replace(value, "'", "'\''") + "'"
+END FUNCTION
+
+FUNCTION CTestCommand(regex)
+    RETURN "ctest --test-dir build -R " + ShellQuote("^(" + regex + ")$") + " --output-on-failure"
+END FUNCTION
+
+FUNCTION WithFiles(prefixes, extraFiles)
+    result = []
+    FOR prefix IN prefixes
+        ignored = Array.Push(result, prefix)
+    NEXT
+    FOR path IN extraFiles
+        ignored = Array.Push(result, path)
+    NEXT
+    RETURN result
+END FUNCTION
+
+FUNCTION RegisterCtestProbe(id, regex, tags, prefixes, extraFiles)
+    deps = WithFiles(prefixes, extraFiles)
+    ignored = RegisterCommandProbe(id, CTestCommand(regex), tags, deps)
+END FUNCTION
+
+sharedCore = ["CMakeLists.txt", "cmake/", "include/arco/", "include/arco.hpp", "include/arco_c_api.h",
+              "src/frontend/", "src/runtime/", "src/compiler/", "src/bindings/", "apps/arco/",
+              "apps/arcofission/", "stdlib/"]
+
+ignored = RegisterCtestProbe(
+    "project.core-fast",
+    "arco_runtime_tests|resource_registry_tests|random_tests|jit_x86_64_tests|arcofission_alpha_smoke|arcofission_windows_capsule_smoke|jit_loop_smoke|linux_native_backend_smoke|random_integration_smoke",
+    ["core", "compiler", "runtime"],
+    sharedCore,
+    ["tests/unit/runtime_tests.cpp", "tests/unit/resource_registry_tests.cpp", "tests/unit/random_tests.cpp",
+     "tests/unit/jit_x86_64_tests.cpp", "tests/integration/arcofission_alpha_smoke.sh",
+     "tests/integration/arcofission_windows_capsule_smoke.sh", "tests/integration/jit_loop_smoke.sh",
+     "tests/integration/linux_native_backend_smoke.sh", "tests/integration/random_smoke.sh"]
+)
+
+ignored = RegisterCtestProbe(
+    "project.arcoui",
+    "arcoui_core_tests",
+    ["gui", "arcoui"],
+    ["include/arcoui/", "src/gui/", "stdlib/gui.abas", "stdlib/arcoui.abas", "examples/arcoui_*", "examples/gui_*", "arcade/"],
+    ["tests/unit/arcoui_core_tests.cpp"]
+)
+
+ignored = RegisterCtestProbe(
+    "project.arcfs-utils",
+    "arcfs_host_tests|mount_arcfs_helper_smoke|arcfsctl_smoke|arconaut_capsule_smoke",
+    ["arcfs", "host-tools"],
+    ["arcfs-utils/", "stdlib/arcodb.abas", "stdlib/compydb.abas", "stdlib/files.abas"],
+    ["tests/unit/arcfs_host_tests.cpp", "tests/integration/arcfsctl_smoke.sh",
+     "tests/integration/mount_arcfs_helper_smoke.sh"]
+)
+
+ignored = RegisterCtestProbe(
+    "project.arcology-os",
+    "arcology_os_unit_tests|systems_.*",
+    ["arcology-os", "systems"],
+    ["arcology-os/", "books/Arcology OS/", "include/arco/fission.hpp", "include/arco/fixed_width_types.hpp",
+     "include/arco/pe_image.hpp", "include/arco/uefi_bindings.hpp", "include/arco/utf16.hpp",
+     "include/arco/x86_64_encoder.hpp", "src/compiler/", "src/frontend/"],
+    ["tests/unit/runtime_tests.cpp"]
+)
+
+ignored = RegisterCtestProbe(
+    "project.arcology-commons",
+    "arcology_commons_unit_tests",
+    ["arcology-commons"],
+    ["arcology-commons/"],
+    []
+)
+
+ignored = RegisterCtestProbe(
+    "project.fissure",
+    "fissure_tests|fissure_smoke|fissure_build_smoke",
+    ["fissure"],
+    ["fissure/"],
+    ["tests/unit/fissure_tests.cpp", "tests/integration/fissure_smoke.sh",
+     "tests/integration/fissure_build_smoke.sh"]
+)
+
+ignored = RegisterCtestProbe(
+    "project.rivet",
+    "rivet_tests|rivet_smoke",
+    ["rivet"],
+    ["rivet/"],
+    ["tests/unit/rivet_tests.cpp", "tests/integration/rivet_smoke.sh"]
+)
+
+ignored = RegisterCtestProbe(
+    "project.arcade",
+    "arcade_buildchain_smoke",
+    ["arcade"],
+    ["arcade/", "rivet/adapters/toolchain/fission.ab", "rivet/stdlib/rivet.abas"],
+    ["tests/integration/arcade_buildchain_smoke.sh"]
+)
+
+' Structural build/test registration changes can affect any suite. This is intentionally broad and
+' should stay rare in normal edit loops.
+ignored = RegisterCommandProbe(
+    "project.full-ctest",
+    "ctest --test-dir build --output-on-failure",
+    ["full", "cmake"],
+    ["CMakeLists.txt", "cmake/Testing.cmake", "cmake/Dependencies.cmake", "cmake/Install.cmake",
+     "arcology-os/cmake/Testing.cmake", "arcology-commons/cmake/Testing.cmake",
+     "arcfs-utils/CMakeLists.txt", "fissure/CMakeLists.txt", "rivet/CMakeLists.txt"]
+)

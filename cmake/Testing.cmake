@@ -116,6 +116,12 @@ if(TARGET fissure_core)
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_COMMAND}
     )
+    arco_add_script_test(
+        fissure_root_config_smoke
+        tests/integration/fissure_root_config_smoke.sh
+        $<TARGET_FILE:fissure>
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
 endif()
 
 # Rivet (rivet/docs/rivet-rfc.md) -- guarded on TARGET rivet_core the same way fissure_core above,
@@ -131,4 +137,30 @@ if(TARGET rivet_core)
         $<TARGET_FILE:rivet>
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
+
+    arco_add_script_test(
+        rivet_cross_adapters_smoke
+        tests/integration/rivet_cross_adapters_smoke.sh
+        $<TARGET_FILE:rivet>
+    )
+
+    if(TARGET fissure AND TARGET ArcoFission)
+        arco_add_script_test(
+            arcade_buildchain_smoke
+            tests/integration/arcade_buildchain_smoke.sh
+            $<TARGET_FILE:fissure>
+            $<TARGET_FILE:rivet>
+            $<TARGET_FILE:ArcoFission>
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+    endif()
+
+    if(TARGET fissure AND TARGET ArcoFission)
+        arco_add_script_test(
+            system_buildchain_install_smoke
+            tests/integration/system_buildchain_install_smoke.sh
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_BINARY_DIR}
+        )
+    endif()
 endif()
