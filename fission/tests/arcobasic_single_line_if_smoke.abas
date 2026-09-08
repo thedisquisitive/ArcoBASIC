@@ -1,0 +1,12 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Source = "IF score >= 90 THEN grade = 3 ELSE IF score >= 80 THEN grade = 2 ELSE grade = 1"
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "single-line-if-smoke.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Ast.Render()
+PRINT "---"
+PRINT Sir.Diagnostics.HasErrors()
+PRINT Sir.Render()

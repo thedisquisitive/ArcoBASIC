@@ -1,0 +1,12 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Source = "INTERFACE Named\nFUNCTION Name() AS String\nEND FUNCTION\nEND INTERFACE\nPUBLIC ABSTRACT CLASS Widget EXTENDS Base IMPLEMENTS Named\nPRIVATE value AS U64 = 0\nPUBLIC FUNCTION Name() AS String\nRETURN \"widget\"\nEND FUNCTION\nEND CLASS"
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "access-interface-smoke.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Ast.Render()
+PRINT "---"
+PRINT Sir.Diagnostics.HasErrors()
+PRINT Sir.Render()

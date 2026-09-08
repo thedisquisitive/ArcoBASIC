@@ -1,0 +1,12 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Source = "DO WHILE value > 0\nvalue = value SHR 1\nLOOP\nDO\nvalue = value | 1\nLOOP UNTIL value CONTAINS 3"
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "do-bitwise-smoke.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Ast.Render()
+PRINT "---"
+PRINT Sir.Diagnostics.HasErrors()
+PRINT Sir.Render()

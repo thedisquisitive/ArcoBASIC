@@ -1,0 +1,9 @@
+#IMPORT "fission/language/arcobasic/preprocess.abas"
+
+Source = "#DEFINE DEBUG\n#IFDEF DEBUG\nPRINT \"debug\"\n#ELSE\nPRINT \"release\"\n#ENDIF\n#IF FALSE\nPRINT 0\n#ELSEIF DEBUG\nPRINT 2\n#ELSE\nPRINT 3\n#ENDIF\n#IFNDEF MISSING\nPRINT 1\n#ENDIF\n#IF FALSE\n#ERROR inactive\n#ENDIF"
+Result = Fission_ArcoBasicPreprocess(Source, [])
+
+PRINT Result.Diagnostics.HasErrors()
+PRINT Result.Source
+PRINT "---"
+PRINT Array.Join(Result.Defines, ",")

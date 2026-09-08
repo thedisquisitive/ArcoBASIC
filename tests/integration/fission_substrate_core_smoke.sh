@@ -55,6 +55,38 @@ grep -q "^Symbol:>=@4:10$" <<<"$lexer_output"
 grep -q "^Number:1@4:13$" <<<"$lexer_output"
 grep -q "^EOF:@4:19$" <<<"$lexer_output"
 
+preprocess_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_preprocess_smoke.abas)"
+
+grep -q "^FALSE$" <<<"$preprocess_output"
+grep -q "^PRINT \"debug\"$" <<<"$preprocess_output"
+grep -q "^PRINT 2$" <<<"$preprocess_output"
+grep -q "^PRINT 1$" <<<"$preprocess_output"
+grep -q "^DEBUG$" <<<"$preprocess_output"
+
+preprocess_compile_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_preprocess_compile_smoke.abas)"
+
+grep -q "^TRUE$" <<<"$preprocess_compile_output"
+grep -q "^PRINT \"debug\"$" <<<"$preprocess_compile_output"
+grep -q "^SIR preprocess-compile.abas v0.1$" <<<"$preprocess_compile_output"
+grep -q "^    Literal(Value=debug, LiteralKind=String)$" <<<"$preprocess_compile_output"
+
+preprocess_error_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_preprocess_error_smoke.abas)"
+
+grep -q "^FALSE$" <<<"$preprocess_error_output"
+grep -q "^TRUE$" <<<"$preprocess_error_output"
+grep -q "FISSION_ARCOBASIC_ACTIVE_ERROR_DIRECTIVE" <<<"$preprocess_error_output"
+
+include_metadata_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_include_metadata_smoke.abas)"
+
+grep -q "^TRUE$" <<<"$include_metadata_output"
+grep -q "^FALSE$" <<<"$include_metadata_output"
+grep -q "^1.2.3$" <<<"$include_metadata_output"
+grep -q "^Arcology$" <<<"$include_metadata_output"
+grep -q "^careful$" <<<"$include_metadata_output"
+grep -q "^PRINT included$" <<<"$include_metadata_output"
+grep -q "^PRINT after$" <<<"$include_metadata_output"
+grep -q "^SIR include-metadata-smoke.abas v0.1$" <<<"$include_metadata_output"
+
 parser_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_parser_smoke.abas)"
 
 grep -q "^FALSE$" <<<"$parser_output"
@@ -141,6 +173,26 @@ grep -q "^            MemberRead(Name=value)$" <<<"$class_output"
 grep -q "^SIR class-smoke.abas v0.1$" <<<"$class_output"
 grep -q "^  Class(Name=Counter)$" <<<"$class_output"
 
+access_interface_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_access_interface_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$access_interface_output")" = "2"
+grep -q "^ArcoBASIC AST access-interface-smoke.abas$" <<<"$access_interface_output"
+grep -q "^  Interface(Name=Named)$" <<<"$access_interface_output"
+grep -q "^  Modifier(Name=PUBLIC)$" <<<"$access_interface_output"
+grep -q "^    Modifier(Name=ABSTRACT)$" <<<"$access_interface_output"
+grep -q "^      Class(Name=Widget, Extends=Base, Implements=Named)$" <<<"$access_interface_output"
+grep -q "^        Modifier(Name=PRIVATE)$" <<<"$access_interface_output"
+grep -q "^SIR access-interface-smoke.abas v0.1$" <<<"$access_interface_output"
+
+call_statement_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_call_statement_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$call_statement_output")" = "2"
+grep -q "^ArcoBASIC AST call-statement-smoke.abas$" <<<"$call_statement_output"
+grep -q "^      ExprStmt$" <<<"$call_statement_output"
+grep -q "^  ExprStmt$" <<<"$call_statement_output"
+grep -q "^  Set$" <<<"$call_statement_output"
+grep -q "^SIR call-statement-smoke.abas v0.1$" <<<"$call_statement_output"
+
 control_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_control_smoke.abas)"
 
 test "$(grep -c "^FALSE$" <<<"$control_output")" = "2"
@@ -151,6 +203,25 @@ grep -q "^      LoopControl(Action=CONTINUE, Target=FOR)$" <<<"$control_output"
 grep -q "^  Try(Catch=err)$" <<<"$control_output"
 grep -q "^      Throw$" <<<"$control_output"
 grep -q "^SIR control-smoke.abas v0.1$" <<<"$control_output"
+
+callable_comprehension_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_callable_comprehension_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$callable_comprehension_output")" = "2"
+grep -q "^ArcoBASIC AST callable-comprehension-smoke.abas$" <<<"$callable_comprehension_output"
+grep -q "^    AddressOf(Name=Demo.Run)$" <<<"$callable_comprehension_output"
+grep -q "^    Copy$" <<<"$callable_comprehension_output"
+grep -q "^    ArrayComprehension(Name=i)$" <<<"$callable_comprehension_output"
+grep -q "^SIR callable-comprehension-smoke.abas v0.1$" <<<"$callable_comprehension_output"
+
+do_bitwise_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_do_bitwise_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$do_bitwise_output")" = "2"
+grep -q "^ArcoBASIC AST do-bitwise-smoke.abas$" <<<"$do_bitwise_output"
+grep -q "^  Do(PreMode=WHILE, PostMode=)$" <<<"$do_bitwise_output"
+grep -q "^  Do(PreMode=, PostMode=UNTIL)$" <<<"$do_bitwise_output"
+grep -q "^        Binary(Operator=SHR)$" <<<"$do_bitwise_output"
+grep -q "^    Binary(Operator=CONTAINS)$" <<<"$do_bitwise_output"
+grep -q "^SIR do-bitwise-smoke.abas v0.1$" <<<"$do_bitwise_output"
 
 type_compound_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_type_compound_smoke.abas)"
 
@@ -167,11 +238,29 @@ logic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_logic_smoke.a
 
 test "$(grep -c "^FALSE$" <<<"$logic_output")" = "2"
 grep -q "^ArcoBASIC AST logic-smoke.abas$" <<<"$logic_output"
-grep -q "^    Binary(Operator=OR)$" <<<"$logic_output"
-grep -q "^      Binary(Operator=ANDALSO)$" <<<"$logic_output"
-grep -q "^          Binary(Operator=%)$" <<<"$logic_output"
+grep -q "^    Binary(Operator=ANDALSO)$" <<<"$logic_output"
+grep -q "^      Binary(Operator=OR)$" <<<"$logic_output"
+grep -q "^        Binary(Operator=%)$" <<<"$logic_output"
 grep -q "^    Binary(Operator=MOD)$" <<<"$logic_output"
 grep -q "^SIR logic-smoke.abas v0.1$" <<<"$logic_output"
+
+named_defaults_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_named_defaults_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$named_defaults_output")" = "2"
+grep -q "^ArcoBASIC AST named-defaults-smoke.abas$" <<<"$named_defaults_output"
+grep -q "^  Function(Name=clamp, Arguments=value:U64,minimum:U64=0,maximum:U64=255, Returns=U64)$" <<<"$named_defaults_output"
+grep -q "^      NamedArg(Name=value)$" <<<"$named_defaults_output"
+grep -q "^      NamedArg(Name=maximum)$" <<<"$named_defaults_output"
+grep -q "^SIR named-defaults-smoke.abas v0.1$" <<<"$named_defaults_output"
+
+single_line_if_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_single_line_if_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$single_line_if_output")" = "2"
+grep -q "^ArcoBASIC AST single-line-if-smoke.abas$" <<<"$single_line_if_output"
+grep -q "^  If$" <<<"$single_line_if_output"
+grep -q "^      If$" <<<"$single_line_if_output"
+grep -q "^SIR single-line-if-smoke.abas v0.1$" <<<"$single_line_if_output"
+grep -q "^      Branch$" <<<"$single_line_if_output"
 
 diagnostics_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_diagnostics_smoke.abas)"
 

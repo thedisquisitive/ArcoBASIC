@@ -26,6 +26,9 @@ FUNCTION Fission_ArcoBasicAstExpressionToSir(builder, ast)
         WEND
         RETURN builder.CallExpression(callee, args)
     END IF
+    IF ast.Kind == "NamedArg" THEN
+        RETURN builder.NamedArgument(Object.Get(ast.Fields, "Name", ""), Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
+    END IF
     IF ast.Kind == "IndexRead" THEN
         value = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
         index = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[1])
@@ -42,6 +45,13 @@ FUNCTION Fission_ArcoBasicAstExpressionToSir(builder, ast)
         NEXT
         RETURN builder.ArrayValue(items)
     END IF
+    IF ast.Kind == "ArrayComprehension" THEN
+        resultValue = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        iterable = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[1])
+        filterValue = NULL
+        IF LEN(ast.Children) > 2 THEN filterValue = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[2])
+        RETURN builder.ArrayComprehension(resultValue, Object.Get(ast.Fields, "Name", ""), iterable, filterValue)
+    END IF
     IF ast.Kind == "Object" THEN
         fields = []
         FOR child IN ast.Children
@@ -54,6 +64,8 @@ FUNCTION Fission_ArcoBasicAstExpressionToSir(builder, ast)
         value = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
         RETURN builder.UnaryValue(Object.Get(ast.Fields, "Operator", ""), value)
     END IF
+    IF ast.Kind == "AddressOf" THEN RETURN builder.CallableAddress(Object.Get(ast.Fields, "Name", ""))
+    IF ast.Kind == "Copy" THEN RETURN builder.CopyExpression(Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
     ignored = builder.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_UNSUPPORTED_EXPRESSION", "Unsupported AST expression kind: " + ast.Kind)
     RETURN builder.Literal("0")
 END FUNCTION
@@ -69,6 +81,7 @@ END FUNCTION
 
 FUNCTION Fission_ArcoBasicAstStatementToSir(builder, ast)
     IF ast.Kind == "Print" THEN RETURN builder.PrintValue(Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
+    IF ast.Kind == "ExprStmt" THEN RETURN builder.ExpressionStatement(Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
     IF ast.Kind == "Assign" THEN RETURN builder.AssignValue(Object.Get(ast.Fields, "Name", ""), Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
     IF ast.Kind == "Set" THEN RETURN builder.SetValue(Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]), Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[1]))
     IF ast.Kind == "Declare" THEN
@@ -79,7 +92,11 @@ FUNCTION Fission_ArcoBasicAstStatementToSir(builder, ast)
     IF ast.Kind == "Const" THEN RETURN builder.ConstValue(Object.Get(ast.Fields, "Name", ""), Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
     IF ast.Kind == "Import" THEN RETURN builder.ImportModule(Object.Get(ast.Fields, "Path", ""), Object.Get(ast.Fields, "Alias", ""))
     IF ast.Kind == "Directive" THEN RETURN builder.Directive(Object.Get(ast.Fields, "Name", ""), Object.Get(ast.Fields, "Value", ""))
-    IF ast.Kind == "Return" THEN RETURN builder.ReturnValue(Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
+    IF ast.Kind == "Return" THEN
+        value = NULL
+        IF LEN(ast.Children) > 0 THEN value = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        RETURN builder.ReturnValue(value)
+    END IF
     IF ast.Kind == "Function" THEN
         body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[0])
         argsText = Object.Get(ast.Fields, "Arguments", "")
@@ -99,7 +116,24 @@ FUNCTION Fission_ArcoBasicAstStatementToSir(builder, ast)
     END IF
     IF ast.Kind == "Class" THEN
         body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[0])
-        RETURN builder.ClassDecl(Object.Get(ast.Fields, "Name", ""), body)
+        classNode = builder.ClassDecl(Object.Get(ast.Fields, "Name", ""), body)
+        extendsName = Object.Get(ast.Fields, "Extends", "")
+        implementsNames = Object.Get(ast.Fields, "Implements", "")
+        IF extendsName != "" THEN ignored = classNode.WithField("Extends", extendsName)
+        IF implementsNames != "" THEN ignored = classNode.WithField("Implements", implementsNames)
+        RETURN classNode
+    END IF
+    IF ast.Kind == "Interface" THEN
+        body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[0])
+        RETURN builder.InterfaceDecl(Object.Get(ast.Fields, "Name", ""), body)
+    END IF
+    IF ast.Kind == "Modifier" THEN
+        node = builder.Modifier(Object.Get(ast.Fields, "Name", ""))
+        IF LEN(ast.Children) > 0 THEN
+            lowered = Fission_ArcoBasicAstStatementToSir(builder, ast.Children[0])
+            IF lowered != NULL THEN ignored = node.AppendChild(lowered)
+        END IF
+        RETURN node
     END IF
     IF ast.Kind == "If" THEN
         condition = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
@@ -111,6 +145,21 @@ FUNCTION Fission_ArcoBasicAstStatementToSir(builder, ast)
         condition = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
         body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[1])
         RETURN builder.WhileLoop(condition, body)
+    END IF
+    IF ast.Kind == "Do" THEN
+        preMode = Object.Get(ast.Fields, "PreMode", "")
+        postMode = Object.Get(ast.Fields, "PostMode", "")
+        childIndex = 0
+        preCondition = NULL
+        IF preMode != "" THEN
+            preCondition = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[childIndex])
+            childIndex = childIndex + 1
+        END IF
+        body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[childIndex])
+        childIndex = childIndex + 1
+        postCondition = NULL
+        IF postMode != "" THEN postCondition = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[childIndex])
+        RETURN builder.DoLoop(preMode, preCondition, postMode, postCondition, body)
     END IF
     IF ast.Kind == "ForEach" THEN
         iterable = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])

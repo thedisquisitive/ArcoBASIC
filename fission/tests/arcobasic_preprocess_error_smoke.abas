@@ -1,0 +1,17 @@
+#IMPORT "fission/core/fission.abas"
+#IMPORT "fission/language/arcobasic/register.abas"
+
+Fission = Fission_New()
+ignored = Fission_RegisterArcoBasic(Fission)
+
+Request = Fission.Request()
+Request.Source = "#IF TRUE\n#ERROR active failure\n#ENDIF\nPRINT 1"
+Request.SourceName = "preprocess-error.abas"
+ignored = Request.WithLanguage("arcobasic")
+ignored = Request.ToArtifact("SIR")
+
+Result = Fission.Compiler().Compile(Request)
+
+PRINT Result.Ok
+PRINT Result.Diagnostics.HasErrors()
+PRINT Result.Diagnostics.Render()

@@ -15,8 +15,8 @@ frontend.
 WP-002 is active on top of the initial WP-001 core, with WP-003 SIR scaffolding
 started where needed by ArcoBASIC. The current slice adds the public ArcoBASIC
 language-definition surface, a first SIR model/builder/validator, and an initial
-`language.arcobasic` registration that lexes/parses a growing ArcoBASIC subset
-and lowers it into structured SIR.
+`language.arcobasic` registration that preprocesses/lexes/parses a growing
+ArcoBASIC subset and lowers it into structured SIR.
 
 ## Completed Components
 
@@ -71,6 +71,15 @@ and lowers it into structured SIR.
 - Initial ArcoBASIC lexer added under `fission/language/arcobasic/lexer.abas`.
   It recognizes identifiers, keywords, numbers, comments, newlines, EOF, and
   basic one/two-character symbols.
+- Initial ArcoBASIC preprocessor added under
+  `fission/language/arcobasic/preprocess.abas`.
+  It supports `#DEFINE`, `#UNDEF`, `#IF`, `#IFDEF`, `#IFNDEF`, `#ELSE`,
+  `#ELSEIF`, `#ENDIF`, active `#ERROR`, inactive-source filtering, and
+  line-preserving output.
+- The preprocessor now supports `#INCLUDE` expansion and captures compile
+  metadata for `#VERSION`, `#AUTHOR`, `#DESCRIPTION`, `#ENTRY`, `#TARGET`,
+  `#REQUIRE`, `#FEATURE`, `#STRICT`, `#EXPERIMENTAL`, `#DEPRECATED`,
+  `#WARNING`, `#TODO`, `#NOTE`, `#PACK`, `#ALIGN`, `#ENDIAN`, and `#IMPORT`.
 - ArcoBASIC Source-to-SIR now emits a structured `FissionSirModule` for the
   initial `PRINT value` slice and records token count/SIR render metadata.
 - Initial ArcoBASIC parser and AST model added:
@@ -81,27 +90,34 @@ and lowers it into structured SIR.
   - typed declarations
   - assignment statements
   - compound assignments
+  - expression/call statements
   - `PRINT`
-  - `RETURN`
+  - bare and value `RETURN`
   - function declarations with positional arguments
-  - typed function arguments and return annotations
+  - typed/default function arguments and return annotations
   - class declarations
   - constructors
-  - call expressions
+  - interfaces
+  - access/abstract modifiers
+  - class `EXTENDS` and `IMPLEMENTS` metadata
+  - call expressions with positional and named arguments
   - method-style/postfix call expressions
-  - arithmetic/comparison binary expressions
-  - `AND`, `ANDALSO`, `OR`, `ORELSE`, `%`, and `MOD`
-  - unary `-` and `NOT`
+  - arithmetic/comparison/bitwise/shift/membership binary expressions
+  - `AND`, `ANDALSO`, `OR`, `ORELSE`, `%`, `MOD`, `BITAND`, `BITOR`,
+    `BITXOR`, `SHL`, `SHR`, `SAR`, `IN`, `HAS`, and `CONTAINS`
+  - unary `-`, `NOT`, `ADDRESSOF`, and `COPY`
   - boolean/null/number literals
   - parenthesized expressions
   - simple `IF`/`ELSE`/`END IF`
+  - single-line nested `IF ... THEN ... ELSE IF ...`
   - simple `WHILE`/`WEND` and `END WHILE`
+  - `DO WHILE`/`DO UNTIL` and post-condition `LOOP WHILE`/`LOOP UNTIL`
   - simple numeric `FOR` and collection `FOR IN`
   - loop `EXIT`/`CONTINUE`
   - `TRY`/`CATCH`/`END TRY`
   - `THROW`
   - member reads and index reads
-  - array and object literals
+  - array literals, array comprehensions, and object literals
 - AST-to-SIR lowering added for the current ArcoBASIC parser subset.
 - Top-level `FissionCompiler.Compile()` now propagates artifact-carried
   diagnostics, allowing ArcoBASIC parser/SIR diagnostics to fail compilation.
@@ -136,9 +152,8 @@ and lowers it into structured SIR.
 - SIR is currently structural and renderable, but not yet typed, canonicalized,
   serialized, or lowered to real A-MIR.
 - ArcoBASIC `Source.arcobasic -> SIR` supports a growing structural subset, but
-  not yet full preprocessor conditionals, access modifiers, inheritance,
-  interfaces, lambdas, `ADDRESSOF`, `DO` loops, comprehensions, named/optional
-  arguments, full call/member assignment semantics, host interop, or complete
+  not yet real import expansion, full directive metadata semantics, lambdas,
+  complete generic type syntax, full host interop, or complete
   legacy-compatible syntax/semantics.
 - Unsupported ArcoBASIC statements are now surfaced into the top-level compile
   result diagnostics.
@@ -164,17 +179,35 @@ and lowers it into structured SIR.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_function_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_access_interface_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_call_statement_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_callable_comprehension_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_class_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_control_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_directive_decl_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_do_bitwise_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_postfix_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_literal_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_logic_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_named_defaults_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_preprocess_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_preprocess_compile_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_preprocess_error_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_include_metadata_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_string_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
@@ -183,6 +216,8 @@ and lowers it into structured SIR.
   fission/tests/arcobasic_diagnostics_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_reveal_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_single_line_if_smoke.abas` passed.
 - `tests/integration/fission_substrate_core_smoke.sh build-rivet/ArcoFission
   /home/daedalus/projects/arcobasic` passed.
 - `(cd fission && ../build-rivet/fissure run)` passed.
@@ -217,6 +252,7 @@ and lowers it into structured SIR.
 - `fission/core/compiler.abas`
 - `fission/core/fission.abas`
 - `fission/language/api/language.abas`
+- `fission/language/arcobasic/preprocess.abas`
 - `fission/language/arcobasic/lexer.abas`
 - `fission/language/arcobasic/parser.abas`
 - `fission/language/arcobasic/lower_sir.abas`
@@ -227,19 +263,29 @@ and lowers it into structured SIR.
 - `fission/cli/fission.abas`
 - `fission/tests/core_smoke.abas`
 - `fission/tests/arcobasic_language_smoke.abas`
+- `fission/tests/arcobasic_access_interface_smoke.abas`
 - `fission/tests/arcobasic_class_smoke.abas`
+- `fission/tests/arcobasic_call_statement_smoke.abas`
+- `fission/tests/arcobasic_callable_comprehension_smoke.abas`
 - `fission/tests/arcobasic_control_smoke.abas`
 - `fission/tests/arcobasic_diagnostics_smoke.abas`
 - `fission/tests/arcobasic_directive_decl_smoke.abas`
+- `fission/tests/arcobasic_do_bitwise_smoke.abas`
 - `fission/tests/arcobasic_expression_smoke.abas`
 - `fission/tests/arcobasic_function_smoke.abas`
+- `fission/tests/arcobasic_include_metadata_smoke.abas`
 - `fission/tests/arcobasic_lexer_smoke.abas`
 - `fission/tests/arcobasic_literal_smoke.abas`
 - `fission/tests/arcobasic_logic_smoke.abas`
+- `fission/tests/arcobasic_named_defaults_smoke.abas`
+- `fission/tests/arcobasic_preprocess_smoke.abas`
+- `fission/tests/arcobasic_preprocess_compile_smoke.abas`
+- `fission/tests/arcobasic_preprocess_error_smoke.abas`
 - `fission/tests/sir_builder_smoke.abas`
 - `fission/tests/arcobasic_parser_smoke.abas`
 - `fission/tests/arcobasic_postfix_smoke.abas`
 - `fission/tests/arcobasic_reveal_smoke.abas`
+- `fission/tests/arcobasic_single_line_if_smoke.abas`
 - `fission/tests/arcobasic_string_smoke.abas`
 - `fission/tests/arcobasic_type_compound_smoke.abas`
 - `tests/integration/fission_substrate_core_smoke.sh`
@@ -285,13 +331,18 @@ and lowers it into structured SIR.
   functions, method calls, and future callable values can share one path.
 - Member/index assignment lowers to `Set`; simple variable assignment remains
   `Assign`.
+- Preprocessing is a first-party ArcoBASIC frontend phase before lexing, not
+  Fission Core behavior. Its initial behavior intentionally preserves line count
+  to keep future diagnostics/reveal output stable.
+- `#INCLUDE` expansion is implemented in the preprocessor. `#IMPORT` is recorded
+  as metadata and represented as an import node, but package/source expansion is
+  deferred until package discovery rules exist.
 
 ## Next Recommended Work
 
-1. Add preprocessor conditional/directive handling (`#DEFINE`, `#IFDEF`,
-   `#IFNDEF`, `#ELSE`, `#ENDIF`, `#ERROR`, etc.) in a frontend component.
-2. Add access modifiers, inheritance, interfaces, abstract methods, lambdas,
-   `ADDRESSOF`, `DO` loops, comprehensions, and named/optional arguments.
+1. Add real import expansion once package/source discovery rules are available.
+2. Add lambdas, `ADDRESSOF`, `DO` loops, comprehensions, named/optional
+   arguments, and more complete access/inheritance semantic validation.
 3. Add typed SIR values, scopes, symbols, and function signatures.
 4. Replace metadata-carried reveal payloads with typed reveal artifacts.
 5. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal

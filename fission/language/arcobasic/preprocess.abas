@@ -1,0 +1,241 @@
+#IMPORT "fission/core/diagnostics.abas"
+
+FUNCTION Fission_ArcoBasicDirectiveName(line)
+    trimmed = String.Trim(line)
+    IF String.StartsWith(trimmed, "#") == FALSE THEN RETURN ""
+    rest = String.Trim(String.Slice(trimmed, 1))
+    index = 0
+    WHILE index < String.Length(rest)
+        ch = String.Slice(rest, index, 1)
+        IF ch == " " OR ch == "\t" THEN RETURN Upper(String.Slice(rest, 0, index))
+        index = index + 1
+    WEND
+    RETURN Upper(rest)
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicDirectiveArgs(line)
+    trimmed = String.Trim(line)
+    IF String.StartsWith(trimmed, "#") == FALSE THEN RETURN ""
+    rest = String.Trim(String.Slice(trimmed, 1))
+    index = 0
+    WHILE index < String.Length(rest)
+        ch = String.Slice(rest, index, 1)
+        IF ch == " " OR ch == "\t" THEN RETURN String.Trim(String.Slice(rest, index))
+        index = index + 1
+    WEND
+    RETURN ""
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicSymbolEnabled(defines, name)
+    RETURN Fission_ListContains(defines, Upper(String.Trim(name)))
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicDirectiveTruthy(defines, value)
+    trimmed = String.Trim(value)
+    upperValue = Upper(trimmed)
+    RETURN upperValue == "TRUE" OR trimmed == "1" OR Fission_ArcoBasicSymbolEnabled(defines, trimmed)
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicUnquote(value)
+    trimmed = String.Trim(value)
+    IF String.Length(trimmed) >= 2 AND String.Slice(trimmed, 0, 1) == "\"" AND String.Slice(trimmed, String.Length(trimmed) - 1, 1) == "\"" THEN
+        RETURN String.Slice(trimmed, 1, String.Length(trimmed) - 2)
+    END IF
+    RETURN trimmed
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicNewMetadata()
+    RETURN {
+        Version: "",
+        Author: "",
+        Description: "",
+        Entry: "",
+        Targets: [],
+        Requirements: [],
+        Features: [],
+        Strict: FALSE,
+        Experimental: FALSE,
+        Deprecated: FALSE,
+        Warnings: [],
+        Todos: [],
+        Notes: [],
+        Imports: [],
+        Pack: "",
+        Align: "",
+        Endian: ""
+    }
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicRecordDirective(metadata, diagnostics, name, args)
+    clean = Fission_ArcoBasicUnquote(args)
+    IF name == "VERSION" THEN metadata.Version = clean
+    IF name == "AUTHOR" THEN metadata.Author = clean
+    IF name == "DESCRIPTION" THEN metadata.Description = clean
+    IF name == "ENTRY" THEN metadata.Entry = clean
+    IF name == "TARGET" THEN metadata.Targets = String.Split(args, ",")
+    IF name == "REQUIRE" THEN ignored = Array.Push(metadata.Requirements, args)
+    IF name == "FEATURE" THEN ignored = Array.Push(metadata.Features, args)
+    IF name == "STRICT" THEN metadata.Strict = args == "" OR Upper(args) == "ON" OR Upper(args) == "TRUE"
+    IF name == "EXPERIMENTAL" THEN
+        metadata.Experimental = TRUE
+        IF clean != "" THEN ignored = Array.Push(metadata.Notes, "experimental: " + clean)
+    END IF
+    IF name == "DEPRECATED" THEN
+        metadata.Deprecated = TRUE
+        IF clean != "" THEN ignored = Array.Push(metadata.Warnings, "deprecated: " + clean)
+    END IF
+    IF name == "WARNING" THEN
+        ignored = Array.Push(metadata.Warnings, clean)
+        ignored = diagnostics.ReportWarning("FISSION_ARCOBASIC_WARNING_DIRECTIVE", clean)
+    END IF
+    IF name == "TODO" THEN ignored = Array.Push(metadata.Todos, clean)
+    IF name == "NOTE" THEN ignored = Array.Push(metadata.Notes, clean)
+    IF name == "PACK" THEN metadata.Pack = args
+    IF name == "ALIGN" THEN metadata.Align = args
+    IF name == "ENDIAN" THEN metadata.Endian = args
+    RETURN metadata
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicPreprocess(source, initialDefines)
+    diagnostics = FissionDiagnosticBag()
+    defines = Fission_ListCopy(initialDefines)
+    frames = []
+    output = []
+    metadata = Fission_ArcoBasicNewMetadata()
+
+    lines = String.Split(source, "\n")
+    lineNumber = 1
+    FOR line IN lines
+        trimmed = String.Trim(line)
+        active = TRUE
+        FOR frame IN frames
+            IF frame.Active == FALSE THEN active = FALSE
+        NEXT
+
+        IF String.StartsWith(trimmed, "#") == FALSE THEN
+            IF active THEN
+                ignored = Array.Push(output, line)
+            ELSE
+                ignored = Array.Push(output, "")
+            END IF
+            lineNumber = lineNumber + 1
+            CONTINUE FOR
+        END IF
+
+        name = Fission_ArcoBasicDirectiveName(trimmed)
+        args = Fission_ArcoBasicDirectiveArgs(trimmed)
+
+        IF name == "IFDEF" OR name == "IFNDEF" OR name == "IF" THEN
+            parentActive = active
+            enabled = FALSE
+            IF name == "IFDEF" THEN enabled = Fission_ArcoBasicSymbolEnabled(defines, args)
+            IF name == "IFNDEF" THEN enabled = Fission_ArcoBasicSymbolEnabled(defines, args) == FALSE
+            IF name == "IF" THEN enabled = Fission_ArcoBasicDirectiveTruthy(defines, args)
+            ignored = Array.Push(frames, {ParentActive: parentActive, Active: parentActive AND enabled, BranchTaken: parentActive AND enabled})
+            ignored = Array.Push(output, "")
+            lineNumber = lineNumber + 1
+            CONTINUE FOR
+        END IF
+
+        IF name == "ELSE" THEN
+            IF LEN(frames) == 0 THEN
+                ignored = diagnostics.ReportError("FISSION_ARCOBASIC_ELSE_WITHOUT_IF", "#ELSE without #IF at line " + String(lineNumber))
+            ELSE
+                index = LEN(frames) - 1
+                frame = frames[index]
+                frame.Active = frame.ParentActive AND (frame.BranchTaken == FALSE)
+                frame.BranchTaken = TRUE
+                frames[index] = frame
+            END IF
+            ignored = Array.Push(output, "")
+            lineNumber = lineNumber + 1
+            CONTINUE FOR
+        END IF
+
+        IF name == "ELSEIF" THEN
+            IF LEN(frames) == 0 THEN
+                ignored = diagnostics.ReportError("FISSION_ARCOBASIC_ELSEIF_WITHOUT_IF", "#ELSEIF without #IF at line " + String(lineNumber))
+            ELSE
+                index = LEN(frames) - 1
+                frame = frames[index]
+                enabled = frame.BranchTaken == FALSE AND Fission_ArcoBasicDirectiveTruthy(defines, args)
+                frame.Active = frame.ParentActive AND enabled
+                frame.BranchTaken = frame.BranchTaken OR frame.Active
+                frames[index] = frame
+            END IF
+            ignored = Array.Push(output, "")
+            lineNumber = lineNumber + 1
+            CONTINUE FOR
+        END IF
+
+        IF name == "ENDIF" THEN
+            IF LEN(frames) == 0 THEN
+                ignored = diagnostics.ReportError("FISSION_ARCOBASIC_ENDIF_WITHOUT_IF", "#ENDIF without #IF at line " + String(lineNumber))
+            ELSE
+                ignored = Array.Pop(frames)
+            END IF
+            ignored = Array.Push(output, "")
+            lineNumber = lineNumber + 1
+            CONTINUE FOR
+        END IF
+
+        IF active == FALSE THEN
+            ignored = Array.Push(output, "")
+            lineNumber = lineNumber + 1
+            CONTINUE FOR
+        END IF
+
+        IF name == "DEFINE" THEN
+            symbol = Upper(String.Trim(args))
+            parts = String.Split(symbol, " ")
+            IF LEN(parts) > 0 THEN symbol = parts[0]
+            IF symbol != "" AND Fission_ListContains(defines, symbol) == FALSE THEN ignored = Array.Push(defines, symbol)
+            ignored = Array.Push(output, "")
+            lineNumber = lineNumber + 1
+            CONTINUE FOR
+        END IF
+
+        IF name == "UNDEF" THEN
+            nextDefines = []
+            symbol = Upper(String.Trim(args))
+            FOR item IN defines
+                IF item != symbol THEN ignored = Array.Push(nextDefines, item)
+            NEXT
+            defines = nextDefines
+            ignored = Array.Push(output, "")
+            lineNumber = lineNumber + 1
+            CONTINUE FOR
+        END IF
+
+        IF name == "ERROR" THEN
+            ignored = diagnostics.ReportError("FISSION_ARCOBASIC_ACTIVE_ERROR_DIRECTIVE", args)
+        END IF
+
+        IF name == "INCLUDE" THEN
+            includePath = Fission_ArcoBasicUnquote(args)
+            IF File.Exists(includePath) THEN
+                included = Fission_ArcoBasicPreprocess(File.ReadText(includePath), defines)
+                ignored = diagnostics.AppendMany(included.Diagnostics)
+                FOR includedDefine IN included.Defines
+                    IF Fission_ListContains(defines, includedDefine) == FALSE THEN ignored = Array.Push(defines, includedDefine)
+                NEXT
+                ignored = Array.Push(output, included.Source)
+            ELSE
+                ignored = diagnostics.ReportError("FISSION_ARCOBASIC_INCLUDE_NOT_FOUND", "#INCLUDE file not found: " + includePath)
+                ignored = Array.Push(output, "")
+            END IF
+            lineNumber = lineNumber + 1
+            CONTINUE FOR
+        END IF
+
+        IF name == "IMPORT" THEN ignored = Array.Push(metadata.Imports, args)
+        ignored = Fission_ArcoBasicRecordDirective(metadata, diagnostics, name, args)
+
+        ignored = Array.Push(output, line)
+        lineNumber = lineNumber + 1
+    NEXT
+
+    IF LEN(frames) > 0 THEN ignored = diagnostics.ReportError("FISSION_ARCOBASIC_UNTERMINATED_CONDITIONAL", "unterminated conditional directive")
+
+    RETURN {Source: Array.Join(output, "\n"), Diagnostics: diagnostics, Defines: defines, Metadata: metadata}
+END FUNCTION

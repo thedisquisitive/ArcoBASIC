@@ -1,7 +1,7 @@
 #IMPORT "fission/sir/model.abas"
 
 FUNCTION FissionSir_IsKnownNodeKind(kind)
-    known = ["Literal", "Read", "Assign", "Set", "Declare", "Const", "Print", "Call", "CallExpr", "IndexRead", "MemberRead", "Array", "Object", "Field", "Import", "Directive", "Return", "Binary", "Unary", "While", "ForEach", "ForRange", "Throw", "Try", "TryBody", "CatchBody", "LoopControl", "Branch", "Then", "Else", "Function", "Constructor", "Class"]
+    known = ["Literal", "Read", "Assign", "Set", "Declare", "Const", "Print", "ExprStmt", "Call", "CallExpr", "NamedArg", "IndexRead", "MemberRead", "Array", "ArrayComprehension", "Object", "Field", "Import", "Directive", "Return", "Binary", "Unary", "AddressOf", "Copy", "While", "Do", "Body", "ForEach", "ForRange", "Throw", "Try", "TryBody", "CatchBody", "LoopControl", "Branch", "Then", "Else", "Function", "Constructor", "Class", "Interface", "Modifier"]
     RETURN Fission_ListContains(known, kind)
 END FUNCTION
 

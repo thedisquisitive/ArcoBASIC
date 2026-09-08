@@ -1,15 +1,20 @@
 #IMPORT "fission/language/api/language.abas"
+#IMPORT "fission/language/arcobasic/preprocess.abas"
 #IMPORT "fission/language/arcobasic/lexer.abas"
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 
 FUNCTION Fission_ArcoBasicSourceToSir(artifact, context)
-    tokens = Fission_ArcoBasicLex(artifact.Value)
+    preprocessed = Fission_ArcoBasicPreprocess(artifact.Value, [])
+    tokens = Fission_ArcoBasicLex(preprocessed.Source)
     ast = Fission_ArcoBasicParse(tokens, artifact.Name)
     module = Fission_ArcoBasicAstToSir(ast)
+    ignored = module.Diagnostics.AppendMany(preprocessed.Diagnostics)
     sir = FissionArtifact("SIR", artifact.Name + ".sir", module)
     ignored = sir.WithMetadata("Language", "arcobasic")
     ignored = sir.WithMetadata("SourceType", artifact.Type)
     ignored = sir.WithMetadata("TokenCount", String(LEN(tokens)))
+    ignored = sir.WithMetadata("Preprocessed.Source", preprocessed.Source)
+    ignored = sir.WithMetadata("CompileMetadata", preprocessed.Metadata)
     ignored = sir.WithMetadata("AST.Render", ast.Render())
     ignored = sir.WithMetadata("SIR.Render", module.Render())
     RETURN sir

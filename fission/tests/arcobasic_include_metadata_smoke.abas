@@ -1,0 +1,26 @@
+#IMPORT "fission/core/fission.abas"
+#IMPORT "fission/language/arcobasic/register.abas"
+
+IncludePath = "/tmp/fission_include_metadata_smoke.abas"
+ignored = File.WriteText(IncludePath, "PRINT included\n#DEFINE INCLUDED_SYMBOL\n")
+
+Fission = Fission_New()
+ignored = Fission_RegisterArcoBasic(Fission)
+
+Request = Fission.Request()
+Request.Source = "#VERSION \"1.2.3\"\n#AUTHOR \"Arcology\"\n#WARNING \"careful\"\n#INCLUDE \"" + IncludePath + "\"\n#IFDEF INCLUDED_SYMBOL\nPRINT after\n#ENDIF"
+Request.SourceName = "include-metadata-smoke.abas"
+ignored = Request.WithLanguage("arcobasic")
+ignored = Request.ToArtifact("SIR")
+
+Result = Fission.Compiler().Compile(Request)
+Metadata = Result.Artifact.MetadataValue("CompileMetadata", {})
+
+PRINT Result.Ok
+PRINT Result.Diagnostics.HasErrors()
+PRINT Metadata.Version
+PRINT Metadata.Author
+PRINT Metadata.Warnings[0]
+PRINT Result.Artifact.MetadataValue("Preprocessed.Source", "")
+PRINT "---"
+PRINT Result.Artifact.MetadataValue("SIR.Render", "")

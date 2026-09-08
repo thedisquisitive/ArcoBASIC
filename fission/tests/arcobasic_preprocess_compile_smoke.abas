@@ -1,0 +1,18 @@
+#IMPORT "fission/core/fission.abas"
+#IMPORT "fission/language/arcobasic/register.abas"
+
+Fission = Fission_New()
+ignored = Fission_RegisterArcoBasic(Fission)
+
+Request = Fission.Request()
+Request.Source = "#DEFINE DEBUG\n#IFDEF DEBUG\nPRINT \"debug\"\n#ELSE\nPRINT \"release\"\n#ENDIF"
+Request.SourceName = "preprocess-compile.abas"
+ignored = Request.WithLanguage("arcobasic")
+ignored = Request.ToArtifact("SIR")
+
+Result = Fission.Compiler().Compile(Request)
+
+PRINT Result.Ok
+PRINT Result.Artifact.MetadataValue("Preprocessed.Source", "")
+PRINT "---"
+PRINT Result.Artifact.MetadataValue("SIR.Render", "")

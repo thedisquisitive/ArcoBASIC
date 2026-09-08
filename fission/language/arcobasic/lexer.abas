@@ -26,7 +26,7 @@ FUNCTION Fission_ArcoBasicIsIdent(ch)
 END FUNCTION
 
 FUNCTION Fission_ArcoBasicIsKeyword(text)
-    keywords = ["and", "andalso", "as", "catch", "class", "const", "constructor", "continue", "do", "else", "end", "exit", "false", "for", "function", "if", "import", "in", "mod", "next", "not", "null", "or", "orelse", "print", "return", "self", "step", "then", "throw", "to", "true", "try", "wend", "while"]
+    keywords = ["abstract", "add", "addressof", "and", "andalso", "as", "bitand", "bitnot", "bitor", "bitxor", "catch", "class", "const", "constructor", "contains", "continue", "copy", "do", "else", "end", "exit", "extends", "false", "flags", "for", "function", "goto", "has", "if", "implements", "import", "in", "interface", "loop", "mod", "next", "not", "null", "or", "orelse", "print", "private", "protected", "public", "remove", "return", "run", "sar", "self", "shared", "shl", "shr", "step", "stop", "super", "then", "throw", "to", "toggle", "true", "try", "until", "wend", "while", "xor"]
     RETURN Fission_ListContains(keywords, Lower(text))
 END FUNCTION
 
@@ -169,8 +169,16 @@ FUNCTION Fission_ArcoBasicLex(source)
         END IF
 
         startColumn = column
+        three = String.Slice(source, index, 3)
+        IF Fission_ListContains(["<<=", ">>="], three) THEN
+            ignored = Array.Push(tokens, FissionArcoBasicToken("Symbol", three, line, startColumn))
+            index = index + 3
+            column = column + 3
+            CONTINUE WHILE
+        END IF
+
         two = String.Slice(source, index, 2)
-        IF Fission_ListContains(["==", "!=", "<=", ">=", "<>", "&&", "||", "+=", "-=", "*=", "/="], two) THEN
+        IF Fission_ListContains(["==", "!=", "<=", ">=", "<>", "&&", "||", "+=", "-=", "*=", "/=", "&=", "|=", "^=", "<<", ">>"], two) THEN
             ignored = Array.Push(tokens, FissionArcoBasicToken("Symbol", two, line, startColumn))
             index = index + 2
             column = column + 2

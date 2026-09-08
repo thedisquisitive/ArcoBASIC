@@ -60,6 +60,12 @@ CLASS FissionSirBuilder
         RETURN node
     END FUNCTION
 
+    FUNCTION ExpressionStatement(value)
+        node = FissionSirNode("ExprStmt")
+        ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
     FUNCTION CallValue(name, args)
         node = FissionSirNode("Call")
         ignored = node.WithField("Name", name)
@@ -75,6 +81,13 @@ CLASS FissionSirBuilder
         FOR arg IN args
             ignored = node.AppendChild(arg)
         NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION NamedArgument(name, value)
+        node = FissionSirNode("NamedArg")
+        ignored = node.WithField("Name", name)
+        ignored = node.AppendChild(value)
         RETURN node
     END FUNCTION
 
@@ -97,6 +110,15 @@ CLASS FissionSirBuilder
         FOR item IN items
             ignored = node.AppendChild(item)
         NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ArrayComprehension(resultValue, name, iterable, filterValue)
+        node = FissionSirNode("ArrayComprehension")
+        ignored = node.WithField("Name", name)
+        ignored = node.AppendChild(resultValue)
+        ignored = node.AppendChild(iterable)
+        IF filterValue != NULL THEN ignored = node.AppendChild(filterValue)
         RETURN node
     END FUNCTION
 
@@ -131,7 +153,7 @@ CLASS FissionSirBuilder
 
     FUNCTION ReturnValue(value)
         node = FissionSirNode("Return")
-        ignored = node.AppendChild(value)
+        IF value != NULL THEN ignored = node.AppendChild(value)
         RETURN node
     END FUNCTION
 
@@ -150,12 +172,36 @@ CLASS FissionSirBuilder
         RETURN node
     END FUNCTION
 
+    FUNCTION CallableAddress(name)
+        RETURN FissionSirNode("AddressOf").WithField("Name", name)
+    END FUNCTION
+
+    FUNCTION CopyExpression(value)
+        node = FissionSirNode("Copy")
+        ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
     FUNCTION WhileLoop(condition, body)
         node = FissionSirNode("While")
         ignored = node.AppendChild(condition)
         FOR statement IN body
             ignored = node.AppendChild(statement)
         NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION DoLoop(preMode, preCondition, postMode, postCondition, body)
+        node = FissionSirNode("Do")
+        ignored = node.WithField("PreMode", preMode)
+        ignored = node.WithField("PostMode", postMode)
+        IF preCondition != NULL THEN ignored = node.AppendChild(preCondition)
+        bodyNode = FissionSirNode("Body")
+        FOR statement IN body
+            ignored = bodyNode.AppendChild(statement)
+        NEXT
+        ignored = node.AppendChild(bodyNode)
+        IF postCondition != NULL THEN ignored = node.AppendChild(postCondition)
         RETURN node
     END FUNCTION
 
@@ -252,6 +298,19 @@ CLASS FissionSirBuilder
             ignored = node.AppendChild(statement)
         NEXT
         RETURN node
+    END FUNCTION
+
+    FUNCTION InterfaceDecl(name, body)
+        node = FissionSirNode("Interface")
+        ignored = node.WithField("Name", name)
+        FOR statement IN body
+            ignored = node.AppendChild(statement)
+        NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION Modifier(name)
+        RETURN FissionSirNode("Modifier").WithField("Name", name)
     END FUNCTION
 
     FUNCTION Append(statement)
