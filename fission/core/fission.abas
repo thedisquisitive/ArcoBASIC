@@ -1,0 +1,63 @@
+#IMPORT "fission/core/compiler.abas"
+#IMPORT "fission/language/api/language.abas"
+
+CLASS FissionHost
+    CONSTRUCTOR()
+        SELF.Registry = FissionRegistry()
+    END CONSTRUCTOR
+
+    FUNCTION Component(name, componentClass)
+        RETURN FissionComponent(name, componentClass)
+    END FUNCTION
+
+    FUNCTION Language(name)
+        RETURN FissionLanguageDefinition(name)
+    END FUNCTION
+
+    FUNCTION Pass(name)
+        RETURN FissionComponent("pass." + name, "Optimizer")
+    END FUNCTION
+
+    FUNCTION Target(name)
+        RETURN FissionComponent("target." + name, "Target")
+    END FUNCTION
+
+    FUNCTION ABI(name)
+        RETURN FissionComponent("abi." + name, "ABI")
+    END FUNCTION
+
+    FUNCTION Runtime(name)
+        RETURN FissionComponent("runtime." + name, "Runtime")
+    END FUNCTION
+
+    FUNCTION ArtifactWriter(name)
+        RETURN FissionComponent("artifact." + name, "ArtifactWriter")
+    END FUNCTION
+
+    FUNCTION Register(component)
+        IF Object.Has(component, "Component") THEN
+            RETURN SELF.Registry.Register(component.AsComponent())
+        END IF
+        RETURN SELF.Registry.Register(component)
+    END FUNCTION
+
+    FUNCTION Compiler()
+        RETURN FissionCompiler(SELF.Registry)
+    END FUNCTION
+
+    FUNCTION Request()
+        RETURN FissionCompileRequest()
+    END FUNCTION
+
+    FUNCTION Resolve(inputType, outputType)
+        RETURN FissionPipelineResolver(SELF.Registry).Resolve(inputType, outputType)
+    END FUNCTION
+
+    FUNCTION Components()
+        RETURN SELF.Registry.Describe()
+    END FUNCTION
+END CLASS
+
+FUNCTION Fission_New()
+    RETURN FissionHost()
+END FUNCTION

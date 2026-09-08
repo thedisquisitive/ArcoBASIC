@@ -1,0 +1,9 @@
+#IMPORT "fission/core/fission.abas"
+
+FUNCTION FissionCli_NewHost()
+    RETURN Fission_New()
+END FUNCTION
+
+FUNCTION FissionCli_PrintComponentList(host)
+    PRINT host.Components()
+END FUNCTION

@@ -1,0 +1,34 @@
+#IMPORT "fission/sir/model.abas"
+
+FUNCTION FissionSir_IsKnownNodeKind(kind)
+    known = ["Literal", "Read", "Assign", "Set", "Declare", "Const", "Print", "Call", "CallExpr", "IndexRead", "MemberRead", "Array", "Object", "Field", "Import", "Directive", "Return", "Binary", "Unary", "While", "ForEach", "ForRange", "Throw", "Try", "TryBody", "CatchBody", "LoopControl", "Branch", "Then", "Else", "Function", "Constructor", "Class"]
+    RETURN Fission_ListContains(known, kind)
+END FUNCTION
+
+FUNCTION FissionSir_ValidateNode(node, diagnostics, path)
+    IF node.Kind == "" THEN
+        ignored = diagnostics.ReportError("FISSION_SIR_EMPTY_NODE_KIND", "SIR node at " + path + " has no kind")
+        RETURN
+    END IF
+    IF FissionSir_IsKnownNodeKind(node.Kind) == FALSE THEN
+        ignored = diagnostics.ReportError("FISSION_SIR_UNKNOWN_NODE_KIND", "SIR node at " + path + " has unknown kind: " + node.Kind)
+    END IF
+    index = 0
+    FOR child IN node.Children
+        ignored = FissionSir_ValidateNode(child, diagnostics, path + "." + String(index))
+        index = index + 1
+    NEXT
+END FUNCTION
+
+FUNCTION FissionSir_ValidateModule(module)
+    diagnostics = FissionDiagnosticBag()
+    IF module.Name == "" THEN
+        ignored = diagnostics.ReportError("FISSION_SIR_EMPTY_MODULE_NAME", "SIR module has no name")
+    END IF
+    index = 0
+    FOR statement IN module.Statements
+        ignored = FissionSir_ValidateNode(statement, diagnostics, "statement." + String(index))
+        index = index + 1
+    NEXT
+    RETURN diagnostics
+END FUNCTION

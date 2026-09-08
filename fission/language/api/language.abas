@@ -1,0 +1,93 @@
+#IMPORT "fission/core/component.abas"
+
+CLASS FissionLanguageDefinition
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Component = FissionComponent("language." + name, "Language")
+        SELF.Extensions = []
+        SELF.Symbols = []
+        SELF.Pairs = []
+        SELF.Statements = []
+        SELF.Expressions = []
+        SELF.Operations = []
+        SELF.SemanticHandlers = []
+        ignored = SELF.Component.Produce("SIR")
+    END CONSTRUCTOR
+
+    FUNCTION Extension(extension)
+        ignored = Array.Push(SELF.Extensions, extension)
+        ignored = SELF.Component.Configure("extension:" + extension, "true")
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Symbol(symbolText, semanticName)
+        item = {Symbol: symbolText, Semantic: semanticName}
+        ignored = Array.Push(SELF.Symbols, item)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Pair(openSymbol, closeSymbol, semanticName)
+        item = {Open: openSymbol, Close: closeSymbol, Semantic: semanticName}
+        ignored = Array.Push(SELF.Pairs, item)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Statement(name, pattern)
+        item = {Name: name, Pattern: pattern}
+        ignored = Array.Push(SELF.Statements, item)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Expression(name, pattern)
+        item = {Name: name, Pattern: pattern}
+        ignored = Array.Push(SELF.Expressions, item)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Operation(name, semanticName)
+        item = {Name: name, Semantic: semanticName}
+        ignored = Array.Push(SELF.Operations, item)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION On(semanticName, callback)
+        item = {Name: semanticName, Handler: callback}
+        ignored = Array.Push(SELF.SemanticHandlers, item)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Consume(artifactType)
+        ignored = SELF.Component.Consume(artifactType)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Produce(artifactType)
+        SELF.Component.Produces = []
+        ignored = SELF.Component.Produce(artifactType)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Capability(name)
+        ignored = SELF.Component.Capability(name)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Require(name)
+        ignored = SELF.Component.Require(name)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION TransformWith(callback)
+        ignored = SELF.Component.TransformWith(callback)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION AsComponent()
+        ignored = SELF.Component.Configure("language:name", SELF.Name)
+        ignored = SELF.Component.Configure("language:extensions", Array.Join(SELF.Extensions, ","))
+        ignored = SELF.Component.Configure("language:symbol-count", String(LEN(SELF.Symbols)))
+        ignored = SELF.Component.Configure("language:statement-count", String(LEN(SELF.Statements)))
+        ignored = SELF.Component.Configure("language:expression-count", String(LEN(SELF.Expressions)))
+        RETURN SELF.Component
+    END FUNCTION
+END CLASS

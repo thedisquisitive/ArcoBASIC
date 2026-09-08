@@ -1,0 +1,80 @@
+#IMPORT "fission/core/artifact.abas"
+#IMPORT "fission/core/diagnostics.abas"
+
+CLASS FissionComponent
+    CONSTRUCTOR(name, componentClass)
+        SELF.Name = name
+        SELF.Version = "0.1"
+        SELF.ComponentClass = componentClass
+        SELF.Consumes = []
+        SELF.Produces = []
+        SELF.Capabilities = FissionCapabilitySet()
+        SELF.Requirements = FissionCapabilitySet()
+        SELF.Compatibility = []
+        SELF.Configuration = {}
+        SELF.TransformHandler = NULL
+    END CONSTRUCTOR
+
+    FUNCTION Versioned(version)
+        SELF.Version = version
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Consume(artifactType)
+        IF !Fission_ListContains(SELF.Consumes, artifactType) THEN ignored = Array.Push(SELF.Consumes, artifactType)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Produce(artifactType)
+        IF !Fission_ListContains(SELF.Produces, artifactType) THEN ignored = Array.Push(SELF.Produces, artifactType)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Capability(name)
+        ignored = SELF.Capabilities.Append(name)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Require(name)
+        ignored = SELF.Requirements.Append(name)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION CompatibleWith(name)
+        IF !Fission_ListContains(SELF.Compatibility, name) THEN ignored = Array.Push(SELF.Compatibility, name)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Configure(key, value)
+        SELF.Configuration = Object.Set(SELF.Configuration, key, value)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION TransformWith(callback)
+        SELF.TransformHandler = callback
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION CanConsume(artifactType)
+        RETURN Fission_ListContains(SELF.Consumes, artifactType)
+    END FUNCTION
+
+    FUNCTION CanProduce(artifactType)
+        RETURN Fission_ListContains(SELF.Produces, artifactType)
+    END FUNCTION
+
+    FUNCTION Summary()
+        RETURN SELF.Name + " [" + SELF.ComponentClass + "] " + Array.Join(SELF.Consumes, ",") + " -> " + Array.Join(SELF.Produces, ",")
+    END FUNCTION
+
+    FUNCTION TransformArtifact(artifact, context, outputType)
+        IF SELF.TransformHandler == NULL THEN
+            output = FissionArtifact(outputType, artifact.Name, artifact.Value)
+            ignored = output.WithMetadata("PreviousType", artifact.Type)
+            ignored = output.WithMetadata("ProducedBy", SELF.Name)
+            RETURN output
+        END IF
+        handler = SELF.TransformHandler
+        RETURN handler(artifact, context)
+    END FUNCTION
+END CLASS

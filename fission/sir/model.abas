@@ -1,0 +1,65 @@
+FUNCTION FissionSir_Indent(text, prefix)
+    lines = String.Split(text, "\n")
+    rendered = []
+    FOR line IN lines
+        ignored = Array.Push(rendered, prefix + line)
+    NEXT
+    RETURN Array.Join(rendered, "\n")
+END FUNCTION
+
+CLASS FissionSirNode
+    CONSTRUCTOR(kind)
+        SELF.Kind = kind
+        SELF.Fields = {}
+        SELF.FieldNames = []
+        SELF.Children = []
+    END CONSTRUCTOR
+
+    FUNCTION WithField(name, value)
+        IF Fission_ListContains(SELF.FieldNames, name) == FALSE THEN
+            ignored = Array.Push(SELF.FieldNames, name)
+        END IF
+        SELF.Fields = Object.Set(SELF.Fields, name, value)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION AppendChild(node)
+        ignored = Array.Push(SELF.Children, node)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Render()
+        text = SELF.Kind
+        pairs = []
+        FOR name IN SELF.FieldNames
+            ignored = Array.Push(pairs, name + "=" + String(Object.Get(SELF.Fields, name, "")))
+        NEXT
+        IF LEN(pairs) > 0 THEN text = text + "(" + Array.Join(pairs, ", ") + ")"
+        FOR child IN SELF.Children
+            text = text + "\n" + FissionSir_Indent(child.Render(), "  ")
+        NEXT
+        RETURN text
+    END FUNCTION
+END CLASS
+
+CLASS FissionSirModule
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Version = "0.1"
+        SELF.Statements = []
+        SELF.Diagnostics = FissionDiagnosticBag()
+    END CONSTRUCTOR
+
+    FUNCTION AppendStatement(node)
+        ignored = Array.Push(SELF.Statements, node)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Render()
+        lines = ["SIR " + SELF.Name + " v" + SELF.Version]
+        FOR statement IN SELF.Statements
+            ignored = Array.Push(lines, FissionSir_Indent(statement.Render(), "  "))
+        NEXT
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS

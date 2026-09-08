@@ -1,0 +1,130 @@
+#IMPORT "fission/core/resolver.abas"
+
+FUNCTION FissionCompiler_AppendArtifactDiagnostics(result, artifact)
+    IF TYPEOF(artifact.Value) != "Object" THEN RETURN
+    IF Object.Has(artifact.Value, "Diagnostics") == FALSE THEN RETURN
+    diagnostics = Object.Get(artifact.Value, "Diagnostics")
+    ignored = result.Diagnostics.AppendMany(diagnostics)
+END FUNCTION
+
+CLASS FissionCompileRequest
+    CONSTRUCTOR()
+        SELF.Source = ""
+        SELF.SourceName = ""
+        SELF.Language = ""
+        SELF.InputType = ""
+        SELF.OutputType = ""
+        SELF.Target = ""
+        SELF.Options = {}
+    END CONSTRUCTOR
+
+    FUNCTION FromArtifact(artifactType)
+        SELF.InputType = artifactType
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION ToArtifact(artifactType)
+        SELF.OutputType = artifactType
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION WithLanguage(name)
+        SELF.Language = name
+        IF SELF.InputType == "" THEN SELF.InputType = "Source." + name
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION WithTarget(name)
+        SELF.Target = name
+        RETURN SELF
+    END FUNCTION
+END CLASS
+
+CLASS FissionCompileResult
+    CONSTRUCTOR(ok)
+        SELF.Ok = ok
+        SELF.Artifact = NULL
+        SELF.Pipeline = FissionPipeline()
+        SELF.Diagnostics = FissionDiagnosticBag()
+        SELF.Output = ""
+    END CONSTRUCTOR
+
+    FUNCTION WithPipeline(pipeline)
+        SELF.Pipeline = pipeline
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION WithDiagnostics(diagnostics)
+        SELF.Diagnostics = diagnostics
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION WithOutput(output)
+        SELF.Output = output
+        RETURN SELF
+    END FUNCTION
+END CLASS
+
+CLASS FissionCompiler
+    CONSTRUCTOR(registry)
+        SELF.Registry = registry
+        SELF.Resolver = FissionPipelineResolver(registry)
+    END CONSTRUCTOR
+
+    FUNCTION Compile(request)
+        resolved = SELF.Resolver.Resolve(request.InputType, request.OutputType)
+        result = FissionCompileResult(resolved.Ok)
+        ignored = result.WithPipeline(resolved.Pipeline)
+        ignored = result.WithDiagnostics(resolved.Diagnostics)
+        IF !resolved.Ok THEN
+            ignored = result.WithOutput(resolved.Diagnostics.Render())
+            RETURN result
+        END IF
+
+        artifact = FissionArtifact(request.InputType, request.SourceName, request.Source)
+        context = {Request: request, Registry: SELF.Registry}
+        FOR stage IN resolved.Pipeline.Steps
+            artifact = stage.Component.TransformArtifact(artifact, context, stage.OutputType)
+            ignored = FissionCompiler_AppendArtifactDiagnostics(result, artifact)
+            IF result.Diagnostics.HasErrors() THEN
+                result.Ok = FALSE
+                result.Artifact = artifact
+                ignored = result.WithOutput(result.Diagnostics.Render())
+                RETURN result
+            END IF
+            IF artifact.Type != stage.OutputType THEN
+                ignored = result.Diagnostics.ReportError(
+                    "FISSION_COMPONENT_OUTPUT_TYPE_MISMATCH",
+                    stage.Component.Name + " produced " + artifact.Type + " but pipeline expected " + stage.OutputType)
+                result.Ok = FALSE
+                ignored = result.WithOutput(result.Diagnostics.Render())
+                RETURN result
+            END IF
+        NEXT
+
+        result.Artifact = artifact
+        IF resolved.Pipeline.IsEmpty() THEN
+            ignored = result.WithOutput("PIPELINE RESOLVED\n" + request.InputType)
+        ELSE
+            ignored = result.WithOutput("PIPELINE RESOLVED\n" + resolved.Pipeline.Render())
+        END IF
+        RETURN result
+    END FUNCTION
+
+    FUNCTION RevealPipeline(request)
+        RETURN SELF.Compile(request).Output
+    END FUNCTION
+
+    FUNCTION Reveal(request, stageName)
+        stage = Upper(stageName)
+        IF stage == "PIPELINE" THEN RETURN SELF.RevealPipeline(request)
+        originalOutput = request.OutputType
+        IF stage == "AST" OR stage == "SIR" THEN request.OutputType = "SIR"
+        result = SELF.Compile(request)
+        request.OutputType = originalOutput
+        IF result.Artifact == NULL THEN RETURN result.Diagnostics.Render()
+        IF stage == "AST" THEN RETURN result.Artifact.MetadataValue("AST.Render", "")
+        IF stage == "SIR" THEN RETURN result.Artifact.MetadataValue("SIR.Render", "")
+        RETURN result.Output
+    END FUNCTION
+END CLASS

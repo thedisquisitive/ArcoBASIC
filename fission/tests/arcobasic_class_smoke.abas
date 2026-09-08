@@ -1,0 +1,12 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Source = "CLASS Counter\nvalue AS U64 = 0\nCONSTRUCTOR(start AS U64)\nSELF.value = start\nEND CONSTRUCTOR\nFUNCTION Next()\nSELF.value = SELF.value + 1\nRETURN SELF.value\nEND FUNCTION\nEND CLASS"
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "class-smoke.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Ast.Render()
+PRINT "---"
+PRINT Sir.Diagnostics.HasErrors()
+PRINT Sir.Render()

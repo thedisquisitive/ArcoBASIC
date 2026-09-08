@@ -1,0 +1,69 @@
+#IMPORT "fission/core/capability.abas"
+
+CLASS FissionDiagnostic
+    CONSTRUCTOR(severity, code, message)
+        SELF.Severity = severity
+        SELF.Code = code
+        SELF.Message = message
+        SELF.Component = ""
+        SELF.ArtifactType = ""
+    END CONSTRUCTOR
+
+    FUNCTION FromComponent(componentName)
+        SELF.Component = componentName
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION ForArtifact(artifactType)
+        SELF.ArtifactType = artifactType
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Render()
+        prefix = SELF.Severity + " " + SELF.Code
+        IF SELF.Component != "" THEN prefix = prefix + " [" + SELF.Component + "]"
+        IF SELF.ArtifactType != "" THEN prefix = prefix + " <" + SELF.ArtifactType + ">"
+        RETURN prefix + ": " + SELF.Message
+    END FUNCTION
+END CLASS
+
+CLASS FissionDiagnosticBag
+    CONSTRUCTOR()
+        SELF.Items = []
+    END CONSTRUCTOR
+
+    FUNCTION Append(diagnostic)
+        ignored = Array.Push(SELF.Items, diagnostic)
+        RETURN diagnostic
+    END FUNCTION
+
+    FUNCTION AppendMany(diagnostics)
+        FOR diagnostic IN diagnostics.Items
+            ignored = SELF.Append(diagnostic)
+        NEXT
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION ReportError(code, message)
+        RETURN SELF.Append(FissionDiagnostic("ERROR", code, message))
+    END FUNCTION
+
+    FUNCTION ReportWarning(code, message)
+        RETURN SELF.Append(FissionDiagnostic("WARNING", code, message))
+    END FUNCTION
+
+    FUNCTION HasErrors()
+        FOR item IN SELF.Items
+            IF item.Severity == "ERROR" THEN RETURN TRUE
+        NEXT
+        RETURN FALSE
+    END FUNCTION
+
+    FUNCTION Render()
+        lines = []
+        FOR item IN SELF.Items
+            ignored = Array.Push(lines, item.Render())
+        NEXT
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS

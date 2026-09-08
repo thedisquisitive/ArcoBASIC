@@ -1,0 +1,12 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Source = "FOR i = 1 TO 3 STEP 1\nPRINT i\nNEXT\nFOR item IN [1, 2]\nCONTINUE FOR\nNEXT\nTRY\nTHROW \"boom\"\nCATCH err\nPRINT err.Message\nEND TRY"
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "control-smoke.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Ast.Render()
+PRINT "---"
+PRINT Sir.Diagnostics.HasErrors()
+PRINT Sir.Render()

@@ -1,0 +1,13 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Source = "PRINT \"hello\"\nPRINT \"line\\nnext\"\nPRINT $\"name\""
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "string-smoke.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+
+PRINT Tokens[1].Render()
+PRINT Tokens[4].Kind
+PRINT String.Contains(Tokens[4].Text, "\n")
+PRINT Tokens[7].Render()
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Sir.Render()

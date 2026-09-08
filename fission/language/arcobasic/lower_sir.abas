@@ -1,0 +1,153 @@
+#IMPORT "fission/language/arcobasic/parser.abas"
+#IMPORT "fission/sir/builder.abas"
+
+FUNCTION Fission_ArcoBasicAstExpressionToSir(builder, ast)
+    IF ast.Kind == "Read" THEN RETURN builder.Variable(Object.Get(ast.Fields, "Name", ""))
+    IF ast.Kind == "Literal" THEN RETURN builder.LiteralTyped(Object.Get(ast.Fields, "Value", ""), Object.Get(ast.Fields, "LiteralKind", ""))
+    IF ast.Kind == "Binary" THEN
+        left = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        right = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[1])
+        RETURN builder.Binary(Object.Get(ast.Fields, "Operator", ""), left, right)
+    END IF
+    IF ast.Kind == "Call" THEN
+        args = []
+        FOR child IN ast.Children
+            ignored = Array.Push(args, Fission_ArcoBasicAstExpressionToSir(builder, child))
+        NEXT
+        RETURN builder.CallValue(Object.Get(ast.Fields, "Name", ""), args)
+    END IF
+    IF ast.Kind == "CallExpr" THEN
+        callee = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        args = []
+        index = 1
+        WHILE index < LEN(ast.Children)
+            ignored = Array.Push(args, Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[index]))
+            index = index + 1
+        WEND
+        RETURN builder.CallExpression(callee, args)
+    END IF
+    IF ast.Kind == "IndexRead" THEN
+        value = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        index = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[1])
+        RETURN builder.IndexRead(value, index)
+    END IF
+    IF ast.Kind == "MemberRead" THEN
+        value = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        RETURN builder.MemberRead(value, Object.Get(ast.Fields, "Name", ""))
+    END IF
+    IF ast.Kind == "Array" THEN
+        items = []
+        FOR child IN ast.Children
+            ignored = Array.Push(items, Fission_ArcoBasicAstExpressionToSir(builder, child))
+        NEXT
+        RETURN builder.ArrayValue(items)
+    END IF
+    IF ast.Kind == "Object" THEN
+        fields = []
+        FOR child IN ast.Children
+            value = Fission_ArcoBasicAstExpressionToSir(builder, child.Children[0])
+            ignored = Array.Push(fields, builder.ObjectField(Object.Get(child.Fields, "Name", ""), value))
+        NEXT
+        RETURN builder.ObjectValue(fields)
+    END IF
+    IF ast.Kind == "Unary" THEN
+        value = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        RETURN builder.UnaryValue(Object.Get(ast.Fields, "Operator", ""), value)
+    END IF
+    ignored = builder.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_UNSUPPORTED_EXPRESSION", "Unsupported AST expression kind: " + ast.Kind)
+    RETURN builder.Literal("0")
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicAstBlockToSir(builder, blockNode)
+    body = []
+    FOR child IN blockNode.Children
+        statement = Fission_ArcoBasicAstStatementToSir(builder, child)
+        IF statement != NULL THEN ignored = Array.Push(body, statement)
+    NEXT
+    RETURN body
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicAstStatementToSir(builder, ast)
+    IF ast.Kind == "Print" THEN RETURN builder.PrintValue(Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
+    IF ast.Kind == "Assign" THEN RETURN builder.AssignValue(Object.Get(ast.Fields, "Name", ""), Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
+    IF ast.Kind == "Set" THEN RETURN builder.SetValue(Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]), Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[1]))
+    IF ast.Kind == "Declare" THEN
+        value = NULL
+        IF LEN(ast.Children) > 0 THEN value = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        RETURN builder.DeclareValue(Object.Get(ast.Fields, "Name", ""), Object.Get(ast.Fields, "Type", ""), value)
+    END IF
+    IF ast.Kind == "Const" THEN RETURN builder.ConstValue(Object.Get(ast.Fields, "Name", ""), Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
+    IF ast.Kind == "Import" THEN RETURN builder.ImportModule(Object.Get(ast.Fields, "Path", ""), Object.Get(ast.Fields, "Alias", ""))
+    IF ast.Kind == "Directive" THEN RETURN builder.Directive(Object.Get(ast.Fields, "Name", ""), Object.Get(ast.Fields, "Value", ""))
+    IF ast.Kind == "Return" THEN RETURN builder.ReturnValue(Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
+    IF ast.Kind == "Function" THEN
+        body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[0])
+        argsText = Object.Get(ast.Fields, "Arguments", "")
+        args = []
+        IF argsText != "" THEN args = String.Split(argsText, ",")
+        functionNode = builder.FunctionDecl(Object.Get(ast.Fields, "Name", ""), args, body)
+        returnType = Object.Get(ast.Fields, "Returns", "")
+        IF returnType != "" THEN ignored = functionNode.WithField("Returns", returnType)
+        RETURN functionNode
+    END IF
+    IF ast.Kind == "Constructor" THEN
+        body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[0])
+        argsText = Object.Get(ast.Fields, "Arguments", "")
+        args = []
+        IF argsText != "" THEN args = String.Split(argsText, ",")
+        RETURN builder.ConstructorDecl(args, body)
+    END IF
+    IF ast.Kind == "Class" THEN
+        body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[0])
+        RETURN builder.ClassDecl(Object.Get(ast.Fields, "Name", ""), body)
+    END IF
+    IF ast.Kind == "If" THEN
+        condition = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        thenBody = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[1])
+        elseBody = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[2])
+        RETURN builder.Conditional(condition, thenBody, elseBody)
+    END IF
+    IF ast.Kind == "While" THEN
+        condition = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[1])
+        RETURN builder.WhileLoop(condition, body)
+    END IF
+    IF ast.Kind == "ForEach" THEN
+        iterable = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[1])
+        RETURN builder.ForEachLoop(Object.Get(ast.Fields, "Name", ""), iterable, body)
+    END IF
+    IF ast.Kind == "ForRange" THEN
+        startValue = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
+        endValue = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[1])
+        stepValue = NULL
+        bodyIndex = 2
+        IF LEN(ast.Children) > 3 THEN
+            stepValue = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[2])
+            bodyIndex = 3
+        END IF
+        body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[bodyIndex])
+        RETURN builder.ForRangeLoop(Object.Get(ast.Fields, "Name", ""), startValue, endValue, stepValue, body)
+    END IF
+    IF ast.Kind == "Throw" THEN RETURN builder.ThrowValue(Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
+    IF ast.Kind == "Try" THEN
+        tryBody = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[0])
+        catchBody = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[1])
+        RETURN builder.TryCatch(tryBody, Object.Get(ast.Fields, "Catch", ""), catchBody)
+    END IF
+    IF ast.Kind == "LoopControl" THEN RETURN builder.LoopControl(Object.Get(ast.Fields, "Action", ""), Object.Get(ast.Fields, "Target", ""))
+    ignored = builder.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_UNSUPPORTED_AST", "Unsupported AST statement kind: " + ast.Kind)
+    RETURN NULL
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicAstToSir(astModule)
+    builder = FissionSirBuilder(astModule.Name)
+    FOR statement IN astModule.Statements
+        sirStatement = Fission_ArcoBasicAstStatementToSir(builder, statement)
+        IF sirStatement != NULL THEN ignored = builder.Append(sirStatement)
+    NEXT
+    FOR diagnostic IN astModule.Diagnostics.Items
+        ignored = builder.Module.Diagnostics.Append(diagnostic)
+    NEXT
+    RETURN builder.Build()
+END FUNCTION

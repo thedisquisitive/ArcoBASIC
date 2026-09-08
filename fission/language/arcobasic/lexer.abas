@@ -1,0 +1,186 @@
+#IMPORT "fission/core/capability.abas"
+
+CLASS FissionArcoBasicToken
+    CONSTRUCTOR(kind, text, line, column)
+        SELF.Kind = kind
+        SELF.Text = text
+        SELF.Line = line
+        SELF.Column = column
+    END CONSTRUCTOR
+
+    FUNCTION Render()
+        RETURN SELF.Kind + ":" + SELF.Text + "@" + String(SELF.Line) + ":" + String(SELF.Column)
+    END FUNCTION
+END CLASS
+
+FUNCTION Fission_ArcoBasicIsAlpha(ch)
+    RETURN String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_", ch)
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicIsDigit(ch)
+    RETURN String.Contains("0123456789", ch)
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicIsIdent(ch)
+    RETURN Fission_ArcoBasicIsAlpha(ch) OR Fission_ArcoBasicIsDigit(ch)
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicIsKeyword(text)
+    keywords = ["and", "andalso", "as", "catch", "class", "const", "constructor", "continue", "do", "else", "end", "exit", "false", "for", "function", "if", "import", "in", "mod", "next", "not", "null", "or", "orelse", "print", "return", "self", "step", "then", "throw", "to", "true", "try", "wend", "while"]
+    RETURN Fission_ListContains(keywords, Lower(text))
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicTokenRender(tokens)
+    lines = []
+    FOR token IN tokens
+        ignored = Array.Push(lines, token.Render())
+    NEXT
+    RETURN Array.Join(lines, "\n")
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicEscapedChar(ch)
+    IF ch == "n" THEN RETURN "\n"
+    IF ch == "r" THEN RETURN "\r"
+    IF ch == "t" THEN RETURN "\t"
+    IF ch == "0" THEN RETURN "\0"
+    RETURN ch
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicReadStringToken(source, startIndex, line, column, interpolated)
+    index = startIndex
+    startColumn = column
+    IF interpolated THEN
+        index = index + 2
+        column = column + 2
+    ELSE
+        index = index + 1
+        column = column + 1
+    END IF
+    value = ""
+    closed = FALSE
+    WHILE index < String.Length(source)
+        ch = String.Slice(source, index, 1)
+        IF ch == "\n" THEN
+            token = FissionArcoBasicToken("Error", "unterminated string", line, startColumn)
+            RETURN {Token: token, Index: index, Column: column}
+        END IF
+        IF ch == "\"" THEN
+            closed = TRUE
+            index = index + 1
+            column = column + 1
+            EXIT WHILE
+        END IF
+        IF ch == "\\" THEN
+            index = index + 1
+            column = column + 1
+            IF index >= String.Length(source) THEN
+                token = FissionArcoBasicToken("Error", "unterminated string", line, startColumn)
+                RETURN {Token: token, Index: index, Column: column}
+            END IF
+            escaped = String.Slice(source, index, 1)
+            value = value + Fission_ArcoBasicEscapedChar(escaped)
+            index = index + 1
+            column = column + 1
+            CONTINUE WHILE
+        END IF
+        value = value + ch
+        index = index + 1
+        column = column + 1
+    WEND
+    IF closed == FALSE THEN
+        token = FissionArcoBasicToken("Error", "unterminated string", line, startColumn)
+        RETURN {Token: token, Index: index, Column: column}
+    END IF
+    kind = "String"
+    IF interpolated THEN kind = "InterpolatedString"
+    token = FissionArcoBasicToken(kind, value, line, startColumn)
+    RETURN {Token: token, Index: index, Column: column}
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicLex(source)
+    tokens = []
+    index = 0
+    line = 1
+    column = 1
+    WHILE index < String.Length(source)
+        ch = String.Slice(source, index, 1)
+
+        IF ch == " " OR ch == "\t" OR ch == "\r" THEN
+            index = index + 1
+            column = column + 1
+            CONTINUE WHILE
+        END IF
+
+        IF ch == "\n" THEN
+            ignored = Array.Push(tokens, FissionArcoBasicToken("Newline", "\n", line, column))
+            index = index + 1
+            line = line + 1
+            column = 1
+            CONTINUE WHILE
+        END IF
+
+        IF ch == "'" THEN
+            WHILE index < String.Length(source) AND String.Slice(source, index, 1) != "\n"
+                index = index + 1
+                column = column + 1
+            WEND
+            CONTINUE WHILE
+        END IF
+
+        IF ch == "\"" THEN
+            read = Fission_ArcoBasicReadStringToken(source, index, line, column, FALSE)
+            ignored = Array.Push(tokens, read.Token)
+            index = read.Index
+            column = read.Column
+            CONTINUE WHILE
+        END IF
+
+        IF ch == "$" AND String.Slice(source, index, 2) == "$\"" THEN
+            read = Fission_ArcoBasicReadStringToken(source, index, line, column, TRUE)
+            ignored = Array.Push(tokens, read.Token)
+            index = read.Index
+            column = read.Column
+            CONTINUE WHILE
+        END IF
+
+        IF Fission_ArcoBasicIsAlpha(ch) THEN
+            start = index
+            startColumn = column
+            WHILE index < String.Length(source) AND Fission_ArcoBasicIsIdent(String.Slice(source, index, 1))
+                index = index + 1
+                column = column + 1
+            WEND
+            text = String.Slice(source, start, index - start)
+            kind = "Identifier"
+            IF Fission_ArcoBasicIsKeyword(text) THEN kind = "Keyword"
+            ignored = Array.Push(tokens, FissionArcoBasicToken(kind, text, line, startColumn))
+            CONTINUE WHILE
+        END IF
+
+        IF Fission_ArcoBasicIsDigit(ch) THEN
+            start = index
+            startColumn = column
+            WHILE index < String.Length(source) AND Fission_ArcoBasicIsDigit(String.Slice(source, index, 1))
+                index = index + 1
+                column = column + 1
+            WEND
+            ignored = Array.Push(tokens, FissionArcoBasicToken("Number", String.Slice(source, start, index - start), line, startColumn))
+            CONTINUE WHILE
+        END IF
+
+        startColumn = column
+        two = String.Slice(source, index, 2)
+        IF Fission_ListContains(["==", "!=", "<=", ">=", "<>", "&&", "||", "+=", "-=", "*=", "/="], two) THEN
+            ignored = Array.Push(tokens, FissionArcoBasicToken("Symbol", two, line, startColumn))
+            index = index + 2
+            column = column + 2
+            CONTINUE WHILE
+        END IF
+
+        ignored = Array.Push(tokens, FissionArcoBasicToken("Symbol", ch, line, startColumn))
+        index = index + 1
+        column = column + 1
+    WEND
+    ignored = Array.Push(tokens, FissionArcoBasicToken("EOF", "", line, column))
+    RETURN tokens
+END FUNCTION

@@ -1,0 +1,10 @@
+' Project-local Fissure config for the new Fission Compiler Substrate.
+' The implementation under this directory is ArcoBASIC; this probe uses the legacy
+' C++ ArcoFission binary only as the G0 bootstrap runner.
+
+ignored = RegisterCommandProbe(
+    "fission.substrate-core",
+    "ROOT=\"$(pwd)/..\" && cd \"$ROOT\" && tests/integration/fission_substrate_core_smoke.sh \"${ARCOFISSION_PATH:-$ROOT/build-rivet/ArcoFission}\" \"$ROOT\"",
+    ["fission", "substrate", "core", "wp-001"],
+    ["core/", "language/", "sir/", "tests/core_smoke.abas", "tests/arcobasic_language_smoke.abas", "tests/arcobasic_class_smoke.abas", "tests/arcobasic_control_smoke.abas", "tests/arcobasic_diagnostics_smoke.abas", "tests/arcobasic_directive_decl_smoke.abas", "tests/arcobasic_expression_smoke.abas", "tests/arcobasic_function_smoke.abas", "tests/arcobasic_lexer_smoke.abas", "tests/arcobasic_literal_smoke.abas", "tests/arcobasic_logic_smoke.abas", "tests/arcobasic_parser_smoke.abas", "tests/arcobasic_postfix_smoke.abas", "tests/arcobasic_reveal_smoke.abas", "tests/arcobasic_string_smoke.abas", "tests/arcobasic_type_compound_smoke.abas", "tests/sir_builder_smoke.abas"]
+)

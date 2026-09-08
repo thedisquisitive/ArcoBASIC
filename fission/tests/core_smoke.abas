@@ -1,0 +1,71 @@
+#IMPORT "fission/core/fission.abas"
+
+FUNCTION BrainfuckToSir(artifact, context)
+    RETURN FissionArtifact("SIR", artifact.Name + ".sir", "sir:" + artifact.Value)
+END FUNCTION
+
+FUNCTION SirToAmir(artifact, context)
+    RETURN FissionArtifact("AMIR", artifact.Name + ".amir", "amir:" + artifact.Value)
+END FUNCTION
+
+FUNCTION AmirToLinuxExecutable(artifact, context)
+    RETURN FissionArtifact("Executable.Linux.X86_64", artifact.Name + ".elf", "elf:" + artifact.Value)
+END FUNCTION
+
+Fission = Fission_New()
+
+Brainfuck = Fission.Language("brainfuck")
+ignored = Brainfuck.Consume("Source.brainfuck")
+ignored = Brainfuck.Produce("SIR")
+ignored = Brainfuck.Capability("TAPE_MEMORY")
+ignored = Brainfuck.TransformWith(ADDRESSOF BrainfuckToSir)
+ignored = Fission.Register(Brainfuck)
+
+BlockedLower = Fission.Component("sir.to.amir.blocked", "IR Transformer")
+ignored = BlockedLower.Consume("SIR")
+ignored = BlockedLower.Produce("AMIR")
+ignored = BlockedLower.Require("HOST_CALLS")
+ignored = Fission.Register(BlockedLower)
+
+SirLower = Fission.Component("sir.to.amir", "IR Transformer")
+ignored = SirLower.Consume("SIR")
+ignored = SirLower.Produce("AMIR")
+ignored = SirLower.TransformWith(ADDRESSOF SirToAmir)
+ignored = Fission.Register(SirLower)
+
+AlternativeLower = Fission.Component("sir.to.amir.alternative", "IR Transformer")
+ignored = AlternativeLower.Consume("SIR")
+ignored = AlternativeLower.Produce("AMIR")
+ignored = Fission.Register(AlternativeLower)
+
+LinuxTarget = Fission.Target("linux-x86_64")
+ignored = LinuxTarget.Consume("AMIR")
+ignored = LinuxTarget.Produce("Executable.Linux.X86_64")
+ignored = LinuxTarget.Require("TAPE_MEMORY")
+ignored = LinuxTarget.Capability("FILES")
+ignored = LinuxTarget.Capability("PROCESS")
+ignored = LinuxTarget.TransformWith(ADDRESSOF AmirToLinuxExecutable)
+ignored = Fission.Register(LinuxTarget)
+
+Request = Fission.Request()
+Request.Source = "+."
+Request.SourceName = "hello.bf"
+ignored = Request.WithLanguage("brainfuck")
+ignored = Request.ToArtifact("Executable.Linux.X86_64")
+
+Result = Fission.Compiler().Compile(Request)
+IF !Result.Ok THEN
+    PRINT Result.Output
+    STOP
+END IF
+
+PRINT "resolved"
+PRINT Array.Join(Result.Pipeline.ComponentNames(), " -> ")
+PRINT Result.Artifact.Type
+PRINT Result.Artifact.Value
+PRINT String.Contains(Result.Diagnostics.Render(), "FISSION_COMPONENT_REQUIREMENTS_UNMET")
+PRINT String.Contains(Result.Diagnostics.Render(), "FISSION_PIPELINE_AMBIGUOUS")
+
+Missing = Fission.Resolve("Source.brainfuck", "WebArtifact")
+PRINT Missing.Ok
+PRINT String.Contains(Missing.Diagnostics.Render(), "FISSION_PIPELINE_UNRESOLVED")

@@ -1,0 +1,76 @@
+#IMPORT "fission/core/pipeline.abas"
+
+CLASS FissionPipelineResolver
+    CONSTRUCTOR(registry)
+        SELF.Registry = registry
+    END CONSTRUCTOR
+
+    FUNCTION Resolve(inputType, outputType)
+        diagnostics = FissionDiagnosticBag()
+        IF inputType == outputType THEN
+            RETURN {Ok: TRUE, Pipeline: FissionPipeline(), Diagnostics: diagnostics}
+        END IF
+
+        startingCapabilities = FissionCapabilitySet()
+        queue = [{Type: inputType, Pipeline: FissionPipeline(), Seen: [inputType], Capabilities: startingCapabilities}]
+        cursor = 0
+        selectedPipeline = NULL
+        selectedCount = 0
+        selectedLength = -1
+        WHILE cursor < LEN(queue)
+            state = queue[cursor]
+            cursor += 1
+            IF selectedLength >= 0 && state.Pipeline.StepCount() >= selectedLength THEN
+                CONTINUE WHILE
+            END IF
+
+            FOR component IN SELF.Registry.Components
+                IF !component.CanConsume(state.Type) THEN
+                    CONTINUE FOR
+                END IF
+                missing = component.Requirements.MissingFrom(state.Capabilities)
+                IF LEN(missing) > 0 THEN
+                    ignored = diagnostics.ReportWarning(
+                        "FISSION_COMPONENT_REQUIREMENTS_UNMET",
+                        component.Name + " skipped; missing capabilities: " + Array.Join(missing, ","))
+                    CONTINUE FOR
+                END IF
+
+                FOR produced IN component.Produces
+                    IF Fission_ListContains(state.Seen, produced) THEN
+                        CONTINUE FOR
+                    END IF
+
+                    nextPipeline = state.Pipeline.Clone()
+                    ignored = nextPipeline.Append(component, state.Type, produced)
+                    nextCapabilities = state.Capabilities.Clone()
+                    ignored = nextCapabilities.AppendMany(component.Capabilities.Items)
+                    IF produced == outputType THEN
+                        selectedCount += 1
+                        IF selectedPipeline == NULL THEN
+                            selectedPipeline = nextPipeline
+                            selectedLength = nextPipeline.StepCount()
+                        END IF
+                        CONTINUE FOR
+                    END IF
+
+                    nextSeen = Fission_ListCopy(state.Seen)
+                    ignored = Array.Push(nextSeen, produced)
+                    ignored = Array.Push(queue, {Type: produced, Pipeline: nextPipeline, Seen: nextSeen, Capabilities: nextCapabilities})
+                NEXT
+            NEXT
+        WEND
+
+        IF selectedPipeline != NULL THEN
+            IF selectedCount > 1 THEN
+                ignored = diagnostics.ReportWarning(
+                    "FISSION_PIPELINE_AMBIGUOUS",
+                    "multiple shortest routes from " + inputType + " to " + outputType + "; selected first registered route")
+            END IF
+            RETURN {Ok: TRUE, Pipeline: selectedPipeline, Diagnostics: diagnostics}
+        END IF
+
+        ignored = diagnostics.ReportError("FISSION_PIPELINE_UNRESOLVED", "no component route from " + inputType + " to " + outputType)
+        RETURN {Ok: FALSE, Pipeline: FissionPipeline(), Diagnostics: diagnostics}
+    END FUNCTION
+END CLASS

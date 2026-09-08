@@ -37,13 +37,14 @@ sharedCore = ["CMakeLists.txt", "cmake/", "include/arco/", "include/arco.hpp", "
 
 ignored = RegisterCtestProbe(
     "project.core-fast",
-    "arco_runtime_tests|resource_registry_tests|random_tests|jit_x86_64_tests|arcofission_alpha_smoke|arcofission_windows_capsule_smoke|jit_loop_smoke|linux_native_backend_smoke|random_integration_smoke",
+    "arco_runtime_tests|resource_registry_tests|random_tests|jit_x86_64_tests|arcofission_alpha_smoke|arcofission_windows_capsule_smoke|jit_loop_smoke|linux_native_backend_smoke|fission_substrate_core_smoke|random_integration_smoke",
     ["core", "compiler", "runtime"],
-    sharedCore,
+    WithFiles(sharedCore, ["fission/"]),
     ["tests/unit/runtime_tests.cpp", "tests/unit/resource_registry_tests.cpp", "tests/unit/random_tests.cpp",
      "tests/unit/jit_x86_64_tests.cpp", "tests/integration/arcofission_alpha_smoke.sh",
      "tests/integration/arcofission_windows_capsule_smoke.sh", "tests/integration/jit_loop_smoke.sh",
-     "tests/integration/linux_native_backend_smoke.sh", "tests/integration/random_smoke.sh"]
+     "tests/integration/linux_native_backend_smoke.sh", "tests/integration/fission_substrate_core_smoke.sh",
+     "tests/integration/random_smoke.sh"]
 )
 
 ignored = RegisterCtestProbe(

@@ -1,0 +1,52 @@
+' Fission core capability helpers. First-party Fission substrate code is ArcoBASIC.
+
+FUNCTION Fission_ListContains(items, value)
+    FOR item IN items
+        IF item == value THEN RETURN TRUE
+    NEXT
+    RETURN FALSE
+END FUNCTION
+
+FUNCTION Fission_ListCopy(items)
+    copy = []
+    FOR item IN items
+        ignored = Array.Push(copy, item)
+    NEXT
+    RETURN copy
+END FUNCTION
+
+CLASS FissionCapabilitySet
+    CONSTRUCTOR()
+        SELF.Items = []
+    END CONSTRUCTOR
+
+    FUNCTION Append(name)
+        IF !Fission_ListContains(SELF.Items, name) THEN ignored = Array.Push(SELF.Items, name)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION AppendMany(items)
+        FOR item IN items
+            ignored = SELF.Append(item)
+        NEXT
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Includes(name)
+        RETURN Fission_ListContains(SELF.Items, name)
+    END FUNCTION
+
+    FUNCTION MissingFrom(available)
+        missing = []
+        FOR item IN SELF.Items
+            IF !available.Includes(item) THEN ignored = Array.Push(missing, item)
+        NEXT
+        RETURN missing
+    END FUNCTION
+
+    FUNCTION Clone()
+        clone = FissionCapabilitySet()
+        ignored = clone.AppendMany(SELF.Items)
+        RETURN clone
+    END FUNCTION
+END CLASS

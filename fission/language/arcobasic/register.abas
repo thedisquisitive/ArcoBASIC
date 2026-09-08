@@ -1,0 +1,68 @@
+#IMPORT "fission/language/api/language.abas"
+#IMPORT "fission/language/arcobasic/lexer.abas"
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+FUNCTION Fission_ArcoBasicSourceToSir(artifact, context)
+    tokens = Fission_ArcoBasicLex(artifact.Value)
+    ast = Fission_ArcoBasicParse(tokens, artifact.Name)
+    module = Fission_ArcoBasicAstToSir(ast)
+    sir = FissionArtifact("SIR", artifact.Name + ".sir", module)
+    ignored = sir.WithMetadata("Language", "arcobasic")
+    ignored = sir.WithMetadata("SourceType", artifact.Type)
+    ignored = sir.WithMetadata("TokenCount", String(LEN(tokens)))
+    ignored = sir.WithMetadata("AST.Render", ast.Render())
+    ignored = sir.WithMetadata("SIR.Render", module.Render())
+    RETURN sir
+END FUNCTION
+
+FUNCTION Fission_RegisterArcoBasic(host)
+    language = host.Language("arcobasic")
+    ignored = language.Extension(".abas")
+    ignored = language.Extension(".bas")
+    ignored = language.Consume("Source.arcobasic")
+    ignored = language.Produce("SIR")
+
+    ignored = language.Statement("IMPORT", "IMPORT path")
+    ignored = language.Statement("CONST", "CONST name = expression")
+    ignored = language.Statement("LET", "name = expression")
+    ignored = language.Statement("PRINT", "PRINT expression")
+    ignored = language.Statement("IF", "IF condition THEN block")
+    ignored = language.Statement("WHILE", "WHILE condition")
+    ignored = language.Statement("FOR", "FOR name IN expression")
+    ignored = language.Statement("FUNCTION", "FUNCTION name(arguments)")
+    ignored = language.Statement("CLASS", "CLASS name")
+    ignored = language.Statement("RETURN", "RETURN expression")
+    ignored = language.Statement("TRY", "TRY block")
+    ignored = language.Statement("THROW", "THROW expression")
+
+    ignored = language.Expression("Literal", "number|string|boolean|null")
+    ignored = language.Expression("Variable", "identifier")
+    ignored = language.Expression("Call", "callee(arguments)")
+    ignored = language.Expression("Index", "value[index]")
+    ignored = language.Expression("Member", "value.name")
+    ignored = language.Expression("Binary", "left operator right")
+    ignored = language.Expression("Unary", "operator value")
+    ignored = language.Expression("Array", "[values]")
+    ignored = language.Expression("Object", "{fields}")
+
+    ignored = language.Operation("Assign", "VariableWrite")
+    ignored = language.Operation("Call", "Call")
+    ignored = language.Operation("Return", "Return")
+    ignored = language.Operation("Branch", "Branch")
+    ignored = language.Operation("Loop", "Loop")
+    ignored = language.Operation("Import", "ModuleImport")
+    ignored = language.Operation("Throw", "Throw")
+
+    ignored = language.Capability("ARCOBASIC_SOURCE")
+    ignored = language.Capability("CONTROL_FLOW")
+    ignored = language.Capability("FUNCTIONS")
+    ignored = language.Capability("CLASSES")
+    ignored = language.Capability("ARRAYS")
+    ignored = language.Capability("OBJECTS")
+    ignored = language.Capability("EXCEPTIONS")
+    ignored = language.Capability("MODULE_IMPORTS")
+    ignored = language.TransformWith(ADDRESSOF Fission_ArcoBasicSourceToSir)
+
+    ignored = host.Register(language)
+    RETURN language
+END FUNCTION

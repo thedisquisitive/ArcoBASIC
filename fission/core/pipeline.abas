@@ -1,0 +1,66 @@
+#IMPORT "fission/core/registry.abas"
+
+CLASS FissionPipelineStep
+    CONSTRUCTOR(component, inputType, outputType)
+        SELF.Component = component
+        SELF.InputType = inputType
+        SELF.OutputType = outputType
+    END CONSTRUCTOR
+
+    FUNCTION Render()
+        RETURN SELF.Component.Name + ": " + SELF.InputType + " -> " + SELF.OutputType
+    END FUNCTION
+END CLASS
+
+CLASS FissionPipeline
+    CONSTRUCTOR()
+        SELF.Steps = []
+    END CONSTRUCTOR
+
+    FUNCTION Append(component, inputType, outputType)
+        ignored = Array.Push(SELF.Steps, FissionPipelineStep(component, inputType, outputType))
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Clone()
+        clone = FissionPipeline()
+        FOR stage IN SELF.Steps
+            ignored = clone.Append(stage.Component, stage.InputType, stage.OutputType)
+        NEXT
+        RETURN clone
+    END FUNCTION
+
+    FUNCTION IsEmpty()
+        RETURN LEN(SELF.Steps) == 0
+    END FUNCTION
+
+    FUNCTION FirstInput()
+        IF LEN(SELF.Steps) == 0 THEN RETURN ""
+        RETURN SELF.Steps[0].InputType
+    END FUNCTION
+
+    FUNCTION FinalOutput()
+        IF LEN(SELF.Steps) == 0 THEN RETURN ""
+        RETURN SELF.Steps[LEN(SELF.Steps) - 1].OutputType
+    END FUNCTION
+
+    FUNCTION StepCount()
+        RETURN LEN(SELF.Steps)
+    END FUNCTION
+
+    FUNCTION ComponentNames()
+        names = []
+        FOR stage IN SELF.Steps
+            ignored = Array.Push(names, stage.Component.Name)
+        NEXT
+        RETURN names
+    END FUNCTION
+
+    FUNCTION Render()
+        lines = []
+        FOR stage IN SELF.Steps
+            ignored = Array.Push(lines, stage.Render())
+        NEXT
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS

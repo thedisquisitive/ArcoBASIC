@@ -85,6 +85,13 @@ arco_add_script_test(
 )
 
 arco_add_script_test(
+    fission_substrate_core_smoke
+    tests/integration/fission_substrate_core_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+arco_add_script_test(
     random_integration_smoke
     tests/integration/random_smoke.sh
     $<TARGET_FILE:arco_cli>

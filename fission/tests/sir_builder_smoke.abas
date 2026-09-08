@@ -1,0 +1,23 @@
+#IMPORT "fission/sir/builder.abas"
+#IMPORT "fission/sir/validate.abas"
+
+Builder = FissionSirBuilder("sir-smoke")
+
+ignored = Builder.Append(
+    Builder.PrintValue(
+        Builder.UnaryValue(
+            "-",
+            Builder.Binary(
+                "+",
+                Builder.Variable("left"),
+                Builder.Literal("1")
+            )
+        )
+    )
+)
+
+Module = Builder.Build()
+Diagnostics = FissionSir_ValidateModule(Module)
+
+PRINT Diagnostics.HasErrors()
+PRINT Module.Render()

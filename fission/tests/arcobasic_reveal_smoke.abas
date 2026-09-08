@@ -1,0 +1,19 @@
+#IMPORT "fission/core/fission.abas"
+#IMPORT "fission/language/arcobasic/register.abas"
+
+Fission = Fission_New()
+ignored = Fission_RegisterArcoBasic(Fission)
+
+Request = Fission.Request()
+Request.Source = "value = 1 + count\nPRINT value"
+Request.SourceName = "reveal.abas"
+ignored = Request.WithLanguage("arcobasic")
+ignored = Request.ToArtifact("SIR")
+
+Compiler = Fission.Compiler()
+
+PRINT Compiler.Reveal(Request, "AST")
+PRINT "---"
+PRINT Compiler.Reveal(Request, "SIR")
+PRINT "---"
+PRINT Compiler.Reveal(Request, "PIPELINE")

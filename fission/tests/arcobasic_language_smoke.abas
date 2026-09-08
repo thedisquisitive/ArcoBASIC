@@ -1,0 +1,61 @@
+#IMPORT "fission/core/fission.abas"
+#IMPORT "fission/language/arcobasic/register.abas"
+
+FUNCTION ArcobasicSirToAmir(artifact, context)
+    sirText = artifact.Value.Render()
+    result = FissionArtifact("AMIR", artifact.Name + ".amir", "amir:" + sirText)
+    ignored = result.WithMetadata("ProducedBy", "sir.to.amir.arcobasic-smoke")
+    ignored = result.WithMetadata("AST.Render", artifact.MetadataValue("AST.Render", ""))
+    ignored = result.WithMetadata("SIR.Render", sirText)
+    ignored = result.WithMetadata("TokenCount", artifact.MetadataValue("TokenCount", ""))
+    RETURN result
+END FUNCTION
+
+FUNCTION ArcobasicAmirToLinuxExecutable(artifact, context)
+    result = FissionArtifact("Executable.Linux.X86_64", artifact.Name + ".elf", "elf:" + artifact.Value)
+    ignored = result.WithMetadata("ProducedBy", "target.linux-x86_64.arcobasic-smoke")
+    ignored = result.WithMetadata("AST.Render", artifact.MetadataValue("AST.Render", ""))
+    ignored = result.WithMetadata("SIR.Render", artifact.MetadataValue("SIR.Render", ""))
+    ignored = result.WithMetadata("TokenCount", artifact.MetadataValue("TokenCount", ""))
+    RETURN result
+END FUNCTION
+
+Fission = Fission_New()
+
+ArcoBasic = Fission_RegisterArcoBasic(Fission)
+
+SirLower = Fission.Pass("sir.to.amir.arcobasic-smoke")
+ignored = SirLower.Consume("SIR")
+ignored = SirLower.Produce("AMIR")
+ignored = SirLower.TransformWith(ADDRESSOF ArcobasicSirToAmir)
+ignored = Fission.Register(SirLower)
+
+LinuxTarget = Fission.Target("linux-x86_64.arcobasic-smoke")
+ignored = LinuxTarget.Consume("AMIR")
+ignored = LinuxTarget.Produce("Executable.Linux.X86_64")
+ignored = LinuxTarget.Require("ARCOBASIC_SOURCE")
+ignored = LinuxTarget.Capability("FILES")
+ignored = LinuxTarget.Capability("PROCESS")
+ignored = LinuxTarget.TransformWith(ADDRESSOF ArcobasicAmirToLinuxExecutable)
+ignored = Fission.Register(LinuxTarget)
+
+Request = Fission.Request()
+Request.Source = "value = 2 + 3 * count\nPRINT value"
+Request.SourceName = "hello.abas"
+ignored = Request.WithLanguage("arcobasic")
+ignored = Request.ToArtifact("Executable.Linux.X86_64")
+
+Result = Fission.Compiler().Compile(Request)
+
+PRINT Result.Ok
+PRINT Array.Join(Result.Pipeline.ComponentNames(), " -> ")
+PRINT Result.Artifact.Type
+PRINT Result.Artifact.Value
+PRINT Result.Artifact.MetadataValue("AST.Render", "")
+PRINT Result.Artifact.MetadataValue("SIR.Render", "")
+PRINT Result.Artifact.MetadataValue("TokenCount", "")
+PRINT Fission_ListContains(ArcoBasic.Extensions, ".abas")
+PRINT Fission_ListContains(ArcoBasic.Extensions, ".bas")
+PRINT String(LEN(ArcoBasic.Statements))
+PRINT String(LEN(ArcoBasic.Expressions))
+PRINT String(LEN(ArcoBasic.Operations))

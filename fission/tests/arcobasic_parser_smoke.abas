@@ -1,0 +1,8 @@
+#IMPORT "fission/language/arcobasic/parser.abas"
+
+Source = "value = 2 + 3 * count\nPRINT value\nIF value >= 5 THEN\nPRINT value\nELSE\nPRINT 0\nEND IF\nWHILE value > 0\nvalue = value - 1\nWEND"
+Tokens = Fission_ArcoBasicLex(Source)
+Module = Fission_ArcoBasicParse(Tokens, "parser-smoke.abas")
+
+PRINT Module.Diagnostics.HasErrors()
+PRINT Module.Render()

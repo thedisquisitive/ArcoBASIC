@@ -1,0 +1,68 @@
+#IMPORT "fission/core/component.abas"
+
+CLASS FissionRegistry
+    CONSTRUCTOR()
+        SELF.Components = []
+        SELF.Diagnostics = FissionDiagnosticBag()
+    END CONSTRUCTOR
+
+    FUNCTION Register(component)
+        IF component.Name == "" THEN
+            ignored = SELF.Diagnostics.ReportError("FISSION_COMPONENT_NAME_EMPTY", "component name must not be empty")
+            RETURN component
+        END IF
+        FOR existing IN SELF.Components
+            IF existing.Name == component.Name THEN
+                ignored = SELF.Diagnostics.ReportError("FISSION_COMPONENT_DUPLICATE", "component already registered: " + component.Name)
+                RETURN component
+            END IF
+        NEXT
+        ignored = Array.Push(SELF.Components, component)
+        RETURN component
+    END FUNCTION
+
+    FUNCTION RegisterMany(components)
+        FOR component IN components
+            ignored = SELF.Register(component)
+        NEXT
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION HasComponent(name)
+        FOR component IN SELF.Components
+            IF component.Name == name THEN RETURN TRUE
+        NEXT
+        RETURN FALSE
+    END FUNCTION
+
+    FUNCTION FindByName(name)
+        FOR component IN SELF.Components
+            IF component.Name == name THEN RETURN component
+        NEXT
+        RETURN NULL
+    END FUNCTION
+
+    FUNCTION ComponentsProducing(artifactType)
+        found = []
+        FOR component IN SELF.Components
+            IF component.CanProduce(artifactType) THEN ignored = Array.Push(found, component)
+        NEXT
+        RETURN found
+    END FUNCTION
+
+    FUNCTION ComponentsConsuming(artifactType)
+        found = []
+        FOR component IN SELF.Components
+            IF component.CanConsume(artifactType) THEN ignored = Array.Push(found, component)
+        NEXT
+        RETURN found
+    END FUNCTION
+
+    FUNCTION Describe()
+        lines = []
+        FOR component IN SELF.Components
+            ignored = Array.Push(lines, component.Summary())
+        NEXT
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS

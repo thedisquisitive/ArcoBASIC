@@ -1,0 +1,14 @@
+#IMPORT "fission/language/arcobasic/lexer.abas"
+
+Source = "PRINT hello\nvalue = 42\n' comment\nIF value >= 1 THEN"
+Tokens = Fission_ArcoBasicLex(Source)
+
+PRINT String(LEN(Tokens))
+PRINT Tokens[0].Render()
+PRINT Tokens[1].Render()
+PRINT Tokens[3].Render()
+PRINT Tokens[4].Render()
+PRINT Tokens[8].Render()
+PRINT Tokens[10].Render()
+PRINT Tokens[11].Render()
+PRINT Tokens[LEN(Tokens) - 1].Render()

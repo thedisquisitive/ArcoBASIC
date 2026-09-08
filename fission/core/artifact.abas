@@ -1,0 +1,35 @@
+#IMPORT "fission/core/capability.abas"
+
+CLASS FissionArtifact
+    CONSTRUCTOR(artifactType, name, value)
+        SELF.Type = artifactType
+        SELF.Name = name
+        SELF.Value = value
+        SELF.Metadata = {}
+    END CONSTRUCTOR
+
+    FUNCTION WithMetadata(key, value)
+        SELF.Metadata = Object.Set(SELF.Metadata, key, value)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION HasMetadata(key)
+        RETURN Object.Has(SELF.Metadata, key)
+    END FUNCTION
+
+    FUNCTION MetadataValue(key, fallback = "")
+        RETURN Object.Get(SELF.Metadata, key, fallback)
+    END FUNCTION
+END CLASS
+
+CLASS FissionArtifactType
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Capabilities = FissionCapabilitySet()
+    END CONSTRUCTOR
+
+    FUNCTION Capability(name)
+        ignored = SELF.Capabilities.Append(name)
+        RETURN SELF
+    END FUNCTION
+END CLASS

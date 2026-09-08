@@ -1,0 +1,265 @@
+#IMPORT "fission/core/diagnostics.abas"
+#IMPORT "fission/sir/model.abas"
+
+CLASS FissionSirBuilder
+    CONSTRUCTOR(moduleName)
+        SELF.Module = FissionSirModule(moduleName)
+    END CONSTRUCTOR
+
+    FUNCTION Node(kind)
+        RETURN FissionSirNode(kind)
+    END FUNCTION
+
+    FUNCTION Literal(value)
+        RETURN FissionSirNode("Literal").WithField("Value", value)
+    END FUNCTION
+
+    FUNCTION LiteralTyped(value, literalKind)
+        node = FissionSirNode("Literal")
+        ignored = node.WithField("Value", value)
+        IF literalKind != "" THEN ignored = node.WithField("LiteralKind", literalKind)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION Variable(name)
+        RETURN FissionSirNode("Read").WithField("Name", name)
+    END FUNCTION
+
+    FUNCTION AssignValue(name, value)
+        node = FissionSirNode("Assign")
+        ignored = node.WithField("Name", name)
+        ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION SetValue(target, value)
+        node = FissionSirNode("Set")
+        ignored = node.AppendChild(target)
+        ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION DeclareValue(name, typeName, value)
+        node = FissionSirNode("Declare")
+        ignored = node.WithField("Name", name)
+        ignored = node.WithField("Type", typeName)
+        IF value != NULL THEN ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ConstValue(name, value)
+        node = FissionSirNode("Const")
+        ignored = node.WithField("Name", name)
+        ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION PrintValue(value)
+        node = FissionSirNode("Print")
+        ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION CallValue(name, args)
+        node = FissionSirNode("Call")
+        ignored = node.WithField("Name", name)
+        FOR arg IN args
+            ignored = node.AppendChild(arg)
+        NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION CallExpression(callee, args)
+        node = FissionSirNode("CallExpr")
+        ignored = node.AppendChild(callee)
+        FOR arg IN args
+            ignored = node.AppendChild(arg)
+        NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION IndexRead(value, index)
+        node = FissionSirNode("IndexRead")
+        ignored = node.AppendChild(value)
+        ignored = node.AppendChild(index)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION MemberRead(value, name)
+        node = FissionSirNode("MemberRead")
+        ignored = node.WithField("Name", name)
+        ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ArrayValue(items)
+        node = FissionSirNode("Array")
+        FOR item IN items
+            ignored = node.AppendChild(item)
+        NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ObjectField(name, value)
+        node = FissionSirNode("Field")
+        ignored = node.WithField("Name", name)
+        ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ObjectValue(fields)
+        node = FissionSirNode("Object")
+        FOR field IN fields
+            ignored = node.AppendChild(field)
+        NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ImportModule(path, aliasName)
+        node = FissionSirNode("Import")
+        ignored = node.WithField("Path", path)
+        IF aliasName != "" THEN ignored = node.WithField("Alias", aliasName)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION Directive(name, value)
+        node = FissionSirNode("Directive")
+        ignored = node.WithField("Name", name)
+        ignored = node.WithField("Value", value)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ReturnValue(value)
+        node = FissionSirNode("Return")
+        ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION Binary(operatorName, left, right)
+        node = FissionSirNode("Binary")
+        ignored = node.WithField("Operator", operatorName)
+        ignored = node.AppendChild(left)
+        ignored = node.AppendChild(right)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION UnaryValue(operatorName, value)
+        node = FissionSirNode("Unary")
+        ignored = node.WithField("Operator", operatorName)
+        ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION WhileLoop(condition, body)
+        node = FissionSirNode("While")
+        ignored = node.AppendChild(condition)
+        FOR statement IN body
+            ignored = node.AppendChild(statement)
+        NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ForEachLoop(name, iterable, body)
+        node = FissionSirNode("ForEach")
+        ignored = node.WithField("Name", name)
+        ignored = node.AppendChild(iterable)
+        FOR statement IN body
+            ignored = node.AppendChild(statement)
+        NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ForRangeLoop(name, startValue, endValue, stepValue, body)
+        node = FissionSirNode("ForRange")
+        ignored = node.WithField("Name", name)
+        ignored = node.AppendChild(startValue)
+        ignored = node.AppendChild(endValue)
+        IF stepValue != NULL THEN ignored = node.AppendChild(stepValue)
+        FOR statement IN body
+            ignored = node.AppendChild(statement)
+        NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ThrowValue(value)
+        node = FissionSirNode("Throw")
+        ignored = node.AppendChild(value)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION TryCatch(tryBody, catchName, catchBody)
+        node = FissionSirNode("Try")
+        ignored = node.WithField("Catch", catchName)
+        tryNode = FissionSirNode("TryBody")
+        FOR statement IN tryBody
+            ignored = tryNode.AppendChild(statement)
+        NEXT
+        ignored = node.AppendChild(tryNode)
+        catchNode = FissionSirNode("CatchBody")
+        FOR statement IN catchBody
+            ignored = catchNode.AppendChild(statement)
+        NEXT
+        ignored = node.AppendChild(catchNode)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION LoopControl(action, target)
+        node = FissionSirNode("LoopControl")
+        ignored = node.WithField("Action", action)
+        ignored = node.WithField("Target", target)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION Conditional(condition, thenBody, elseBody)
+        node = FissionSirNode("Branch")
+        ignored = node.AppendChild(condition)
+        thenNode = FissionSirNode("Then")
+        FOR statement IN thenBody
+            ignored = thenNode.AppendChild(statement)
+        NEXT
+        ignored = node.AppendChild(thenNode)
+        elseNode = FissionSirNode("Else")
+        FOR statement IN elseBody
+            ignored = elseNode.AppendChild(statement)
+        NEXT
+        ignored = node.AppendChild(elseNode)
+        RETURN node
+    END FUNCTION
+
+    FUNCTION FunctionDecl(name, args, body)
+        node = FissionSirNode("Function")
+        ignored = node.WithField("Name", name)
+        ignored = node.WithField("Arguments", Array.Join(args, ","))
+        FOR statement IN body
+            ignored = node.AppendChild(statement)
+        NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ConstructorDecl(args, body)
+        node = FissionSirNode("Constructor")
+        ignored = node.WithField("Arguments", Array.Join(args, ","))
+        FOR statement IN body
+            ignored = node.AppendChild(statement)
+        NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ClassDecl(name, body)
+        node = FissionSirNode("Class")
+        ignored = node.WithField("Name", name)
+        FOR statement IN body
+            ignored = node.AppendChild(statement)
+        NEXT
+        RETURN node
+    END FUNCTION
+
+    FUNCTION Append(statement)
+        ignored = SELF.Module.AppendStatement(statement)
+        RETURN statement
+    END FUNCTION
+
+    FUNCTION Build()
+        RETURN SELF.Module
+    END FUNCTION
+END CLASS
