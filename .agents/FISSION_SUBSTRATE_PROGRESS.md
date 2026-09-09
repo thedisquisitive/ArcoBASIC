@@ -133,7 +133,12 @@ ArcoBASIC subset and lowers it into structured SIR.
   - array literals, array comprehensions, and object literals
   - contextual built-in/keyword-like identifiers used by real project code,
     including `copy` variables and `STRING(...)` calls
+  - token-kind-aware punctuation and keyword operator recognition so string
+    literals such as `"addressof"`, `"or"`, and `"mod"` are not parsed as
+    syntax
+  - logical bang unary expressions (`!value`)
   - multi-line call, argument, array, and object literal lists
+  - the Fission ArcoBASIC parser source itself as an input fixture
 - AST-to-SIR lowering added for the current ArcoBASIC parser subset.
 - Initial ArcoBASIC semantic report pass added. It walks SIR, records imports,
   variables, constants, functions, parameters, classes, interfaces, constructor
@@ -275,6 +280,13 @@ ArcoBASIC subset and lowers it into structured SIR.
   fission/tests/arcobasic_real_timer_parse_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_real_project_parse_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_expression_smoke.abas` passed with both `NOT` and
+  `!` unary operators.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_real_project_parse_smoke.abas` passed with 10 real
+  project files, including ArcoUI, ArcoWrite, Arconaut, and the Fission
+  ArcoBASIC parser itself.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_include_metadata_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
@@ -461,6 +473,10 @@ ArcoBASIC subset and lowers it into structured SIR.
   - `arco3d/stdlib/arco3d_rig.abas`
   - `arco3d/stdlib/arco3d_scene.abas`
   - `examples/gui_window.abas`
+  - `stdlib/arcoui.abas`
+  - `examples/arcowrite.abas`
+  - `arcfs-utils/apps/arconaut/arconaut.abas`
+  - `fission/language/arcobasic/parser.abas`
 - Fission now carries 25 smaller Arcology OS stdlib modules through ArcoBASIC
   lex/parse/SIR lowering without diagnostics, including graphics, descriptor
   table, block device, volume, timer, keyboard, FAT32, namespace, UEFI memory,

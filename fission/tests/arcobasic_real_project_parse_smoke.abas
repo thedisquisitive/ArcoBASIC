@@ -6,7 +6,11 @@ Files = [
     "arcology-os/stdlib/uefi_memory_manager.abas",
     "arco3d/stdlib/arco3d_rig.abas",
     "arco3d/stdlib/arco3d_scene.abas",
-    "examples/gui_window.abas"
+    "examples/gui_window.abas",
+    "stdlib/arcoui.abas",
+    "examples/arcowrite.abas",
+    "arcfs-utils/apps/arconaut/arconaut.abas",
+    "fission/language/arcobasic/parser.abas"
 ]
 
 Failures = 0

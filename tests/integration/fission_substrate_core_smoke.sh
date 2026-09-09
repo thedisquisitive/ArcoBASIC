@@ -121,6 +121,7 @@ expression_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_expressi
 test "$(grep -c "^FALSE$" <<<"$expression_output")" = "2"
 grep -q "^ArcoBASIC AST expression-smoke.abas$" <<<"$expression_output"
 grep -q "^    Unary(Operator=NOT)$" <<<"$expression_output"
+grep -q "^    Unary(Operator=!)$" <<<"$expression_output"
 grep -q "^    Literal(Value=NULL)$" <<<"$expression_output"
 grep -q "^    Binary(Operator=\\*)$" <<<"$expression_output"
 grep -q "^      Unary(Operator=-)$" <<<"$expression_output"
@@ -372,7 +373,7 @@ grep -q "^14$" <<<"$real_timer_output"
 
 real_project_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_real_project_parse_smoke.abas)"
 
-grep -q "^6$" <<<"$real_project_output"
+grep -q "^10$" <<<"$real_project_output"
 grep -q "^0$" <<<"$real_project_output"
 
 os_stdlib_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_os_stdlib_parse_smoke.abas)"
