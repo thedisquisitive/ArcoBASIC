@@ -147,6 +147,15 @@ grep -q "^      Declare(Name=mapSizeAddress, Type=PTR)$" <<<"$let_output"
 grep -q "^      Declare(Name=status, Type=)$" <<<"$let_output"
 grep -q "^SIR let-smoke.abas v0.1$" <<<"$let_output"
 
+legacy_operator_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_legacy_operator_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$legacy_operator_output")" = "2"
+grep -q "^ArcoBASIC AST legacy-operator-smoke.abas$" <<<"$legacy_operator_output"
+grep -q "^    Binary(Operator==)$" <<<"$legacy_operator_output"
+grep -q "^    Binary(Operator=\\\\)$" <<<"$legacy_operator_output"
+grep -q "^  Set$" <<<"$legacy_operator_output"
+grep -q "^SIR legacy-operator-smoke.abas v0.1$" <<<"$legacy_operator_output"
+
 string_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_string_smoke.abas)"
 
 grep -q "^String:hello@1:7$" <<<"$string_output"

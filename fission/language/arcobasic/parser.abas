@@ -220,7 +220,7 @@ CLASS FissionArcoBasicParser
     END FUNCTION
 
     FUNCTION ParseExpressionOrTargetStmt()
-        expression = SELF.ParseExpression()
+        expression = SELF.ParsePostfix()
         operatorText = SELF.PeekToken().Text
         IF Fission_ListContains(["=", "+=", "-=", "*=", "/="], operatorText) THEN
             ignored = SELF.ReadToken()
@@ -393,14 +393,34 @@ CLASS FissionArcoBasicParser
         ignored = SELF.ReadToken()
         condition = SELF.ParseExpression()
         ignored = SELF.MatchText("then")
-        ignored = SELF.SkipSeparators()
         thenBody = FissionArcoBasicAstNode("Then")
+        elseBody = FissionArcoBasicAstNode("Else")
+
+        IF SELF.PeekToken().Kind != "Newline" AND SELF.PeekToken().Text != ":" THEN
+            statement = SELF.ParseStmt()
+            IF statement != NULL THEN ignored = thenBody.AppendChild(statement)
+            IF SELF.MatchText("else") THEN
+                IF SELF.CheckText("if") THEN
+                    statement = SELF.ParseConditionalStmt()
+                    IF statement != NULL THEN ignored = elseBody.AppendChild(statement)
+                ELSE
+                    statement = SELF.ParseStmt()
+                    IF statement != NULL THEN ignored = elseBody.AppendChild(statement)
+                END IF
+            END IF
+            node = FissionArcoBasicAstNode("If")
+            ignored = node.AppendChild(condition)
+            ignored = node.AppendChild(thenBody)
+            ignored = node.AppendChild(elseBody)
+            RETURN node
+        END IF
+
+        ignored = SELF.SkipSeparators()
         WHILE SELF.Done() == FALSE AND SELF.CheckText("else") == FALSE AND SELF.CheckText("end") == FALSE
             statement = SELF.ParseStmt()
             IF statement != NULL THEN ignored = thenBody.AppendChild(statement)
             ignored = SELF.SkipSeparators()
         WEND
-        elseBody = FissionArcoBasicAstNode("Else")
         IF SELF.MatchText("else") THEN
             ignored = SELF.SkipSeparators()
             WHILE SELF.Done() == FALSE AND SELF.CheckText("end") == FALSE
@@ -590,7 +610,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseEquality()
         expression = SELF.ParseComparison()
-        WHILE Fission_ListContains(["==", "!=", "<>"], SELF.PeekToken().Text) OR SELF.CheckText("in") OR SELF.CheckText("has")
+        WHILE Fission_ListContains(["=", "==", "!=", "<>"], SELF.PeekToken().Text) OR SELF.CheckText("in") OR SELF.CheckText("has")
             operatorText = Upper(SELF.ReadToken().Text)
             right = SELF.ParseComparison()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
@@ -630,7 +650,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseMultiply()
         expression = SELF.ParseUnaryExpr()
-        WHILE SELF.PeekToken().Text == "*" OR SELF.PeekToken().Text == "/" OR SELF.PeekToken().Text == "%" OR SELF.CheckText("mod")
+        WHILE SELF.PeekToken().Text == "*" OR SELF.PeekToken().Text == "/" OR SELF.PeekToken().Text == "\\" OR SELF.PeekToken().Text == "%" OR SELF.CheckText("mod")
             operatorText = SELF.ReadToken().Text
             IF Lower(operatorText) == "mod" THEN operatorText = "MOD"
             right = SELF.ParseUnaryExpr()

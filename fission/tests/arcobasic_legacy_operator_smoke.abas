@@ -1,0 +1,12 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Source = "IF mapSize = 0 THEN RETURN 0\nreload = (1193182 + (tickRateHz \\ 2)) \\ tickRateHz\nSELF.total = reload"
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "legacy-operator-smoke.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Ast.Render()
+PRINT "---"
+PRINT Sir.Diagnostics.HasErrors()
+PRINT Sir.Render()

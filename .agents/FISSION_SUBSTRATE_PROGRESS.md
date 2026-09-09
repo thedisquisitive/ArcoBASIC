@@ -105,12 +105,14 @@ ArcoBASIC subset and lowers it into structured SIR.
   - method-style/postfix call expressions
   - arithmetic/comparison/bitwise/shift/membership binary expressions
   - `AND`, `ANDALSO`, `OR`, `ORELSE`, `%`, `MOD`, `BITAND`, `BITOR`,
-    `BITXOR`, `SHL`, `SHR`, `SAR`, `IN`, `HAS`, and `CONTAINS`
+    `BITXOR`, `SHL`, `SHR`, `SAR`, `IN`, `HAS`, `CONTAINS`, single-token
+    `=` equality, and `\` integer division
   - unary `-`, `NOT`, `ADDRESSOF`, and `COPY`
   - boolean/null/number literals
   - parenthesized expressions
   - simple `IF`/`ELSE`/`END IF`
-  - single-line nested `IF ... THEN ... ELSE IF ...`
+  - single-line nested `IF ... THEN ... ELSE IF ...`, with newline termination
+    so following statements are not absorbed into the `Then` body
   - simple `WHILE`/`WEND` and `END WHILE`
   - `DO WHILE`/`DO UNTIL` and post-condition `LOOP WHILE`/`LOOP UNTIL`
   - simple numeric `FOR` and collection `FOR IN`
@@ -224,6 +226,8 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_include_metadata_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_legacy_operator_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_let_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_string_smoke.abas` passed.
@@ -302,6 +306,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_expression_smoke.abas`
 - `fission/tests/arcobasic_function_smoke.abas`
 - `fission/tests/arcobasic_include_metadata_smoke.abas`
+- `fission/tests/arcobasic_legacy_operator_smoke.abas`
 - `fission/tests/arcobasic_let_smoke.abas`
 - `fission/tests/arcobasic_lexer_smoke.abas`
 - `fission/tests/arcobasic_literal_smoke.abas`
