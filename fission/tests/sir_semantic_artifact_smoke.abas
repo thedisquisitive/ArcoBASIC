@@ -1,0 +1,19 @@
+#IMPORT "fission/language/arcobasic/semantic.abas"
+
+LibraryPath = "/tmp/fission_sir_semantics_library.abas"
+MainPath = "/tmp/fission_sir_semantics_main.abas"
+
+ignored = File.WriteText(LibraryPath, "FUNCTION triple(value AS U64) AS U64\nRETURN value + value + value\nEND FUNCTION\n")
+ignored = File.WriteText(MainPath, "#IMPORT \"" + LibraryPath + "\"\nanswer = triple(7)\n")
+
+Program = Fission_ArcoBasicAnalyzeProgramFiles([LibraryPath, MainPath], TRUE)
+Semantics = Program.ToSirSemantics()
+
+PRINT Program.Diagnostics.HasErrors()
+PRINT Semantics.ModuleName
+PRINT LEN(Semantics.Symbols)
+PRINT LEN(Semantics.References)
+PRINT LEN(Semantics.Bindings)
+PRINT String.Contains(Semantics.Render(), "Function /tmp/fission_sir_semantics_library.abas::module::triple AS U64 [triple(value:U64) AS U64]")
+PRINT String.Contains(Semantics.Render(), "Call /tmp/fission_sir_semantics_main.abas::module::triple -> ResolvedImport /tmp/fission_sir_semantics_library.abas::module::triple")
+PRINT String.Contains(Semantics.Render(), "/tmp/fission_sir_semantics_main.abas::module::triple => /tmp/fission_sir_semantics_library.abas::module::triple [Function] AS U64 (triple(value:U64) AS U64)")

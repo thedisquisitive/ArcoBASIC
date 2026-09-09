@@ -379,14 +379,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_parse_smoke.abas)"
 
-grep -q "^73$" <<<"$fission_self_output"
+grep -q "^75$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_semantic_smoke.abas)"
 
-grep -q "^73$" <<<"$fission_self_semantic_output"
-grep -q "^105$" <<<"$fission_self_semantic_output"
-grep -q "^1957$" <<<"$fission_self_semantic_output"
+grep -q "^75$" <<<"$fission_self_semantic_output"
+grep -q "^108$" <<<"$fission_self_semantic_output"
+grep -q "^2033$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_import_semantic_smoke.abas)"
@@ -436,6 +436,13 @@ grep -q "^Function$" <<<"$binding_semantic_output"
 grep -q "^U64$" <<<"$binding_semantic_output"
 grep -q "^twice(value:U64) AS U64$" <<<"$binding_semantic_output"
 grep -q "^Call /tmp/fission_binding_main.abas::module::twice => Function /tmp/fission_binding_library.abas::module::twice AS U64 \\[twice(value:U64) AS U64\\]$" <<<"$binding_semantic_output"
+
+sir_semantic_output="$("$ARCOFISSION" compile-run fission/tests/sir_semantic_artifact_smoke.abas)"
+
+grep -q "^FALSE$" <<<"$sir_semantic_output"
+grep -q "^program$" <<<"$sir_semantic_output"
+grep -q "^4$" <<<"$sir_semantic_output"
+test "$(grep -c "^TRUE$" <<<"$sir_semantic_output")" = "3"
 
 self_loop_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_loop_semantic_smoke.abas)"
 

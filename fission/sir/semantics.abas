@@ -1,0 +1,116 @@
+#IMPORT "fission/core/diagnostics.abas"
+
+CLASS FissionSirSemanticSymbol
+    CONSTRUCTOR(canonicalName, symbolKind)
+        SELF.CanonicalName = canonicalName
+        SELF.Kind = symbolKind
+        SELF.TypeName = ""
+        SELF.Signature = ""
+    END CONSTRUCTOR
+
+    FUNCTION Typed(typeName)
+        SELF.TypeName = typeName
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION WithSignature(signature)
+        SELF.Signature = signature
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Render()
+        text = SELF.Kind + " " + SELF.CanonicalName
+        IF SELF.TypeName != "" THEN text = text + " AS " + SELF.TypeName
+        IF SELF.Signature != "" THEN text = text + " [" + SELF.Signature + "]"
+        RETURN text
+    END FUNCTION
+END CLASS
+
+CLASS FissionSirSemanticReference
+    CONSTRUCTOR(canonicalName, referenceKind)
+        SELF.CanonicalName = canonicalName
+        SELF.Kind = referenceKind
+        SELF.Status = "Unresolved"
+        SELF.Target = ""
+    END CONSTRUCTOR
+
+    FUNCTION Resolve(target)
+        SELF.Status = "Resolved"
+        SELF.Target = target
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Render()
+        text = SELF.Kind + " " + SELF.CanonicalName + " -> " + SELF.Status
+        IF SELF.Target != "" THEN text = text + " " + SELF.Target
+        RETURN text
+    END FUNCTION
+END CLASS
+
+CLASS FissionSirSemanticBinding
+    CONSTRUCTOR(referenceName, targetName)
+        SELF.Reference = referenceName
+        SELF.Target = targetName
+        SELF.ReferenceKind = ""
+        SELF.TargetKind = ""
+        SELF.TargetType = ""
+        SELF.TargetSignature = ""
+    END CONSTRUCTOR
+
+    FUNCTION Render()
+        text = SELF.Reference + " => " + SELF.Target
+        IF SELF.TargetKind != "" THEN text = text + " [" + SELF.TargetKind + "]"
+        IF SELF.TargetType != "" THEN text = text + " AS " + SELF.TargetType
+        IF SELF.TargetSignature != "" THEN text = text + " (" + SELF.TargetSignature + ")"
+        RETURN text
+    END FUNCTION
+END CLASS
+
+CLASS FissionSirSemanticArtifact
+    CONSTRUCTOR(moduleName)
+        SELF.ModuleName = moduleName
+        SELF.Version = "0.1"
+        SELF.Symbols = []
+        SELF.References = []
+        SELF.Bindings = []
+        SELF.Diagnostics = FissionDiagnosticBag()
+    END CONSTRUCTOR
+
+    FUNCTION AddSymbol(symbol)
+        ignored = Array.Push(SELF.Symbols, symbol)
+        RETURN symbol
+    END FUNCTION
+
+    FUNCTION AddReference(reference)
+        ignored = Array.Push(SELF.References, reference)
+        RETURN reference
+    END FUNCTION
+
+    FUNCTION AddBinding(binding)
+        ignored = Array.Push(SELF.Bindings, binding)
+        RETURN binding
+    END FUNCTION
+
+    FUNCTION Render()
+        lines = ["SIR Semantics " + SELF.ModuleName + " v" + SELF.Version]
+        IF LEN(SELF.Symbols) > 0 THEN
+            ignored = Array.Push(lines, "  Symbols")
+            FOR symbol IN SELF.Symbols
+                ignored = Array.Push(lines, "    " + symbol.Render())
+            NEXT
+        END IF
+        IF LEN(SELF.References) > 0 THEN
+            ignored = Array.Push(lines, "  References")
+            FOR reference IN SELF.References
+                ignored = Array.Push(lines, "    " + reference.Render())
+            NEXT
+        END IF
+        IF LEN(SELF.Bindings) > 0 THEN
+            ignored = Array.Push(lines, "  Bindings")
+            FOR binding IN SELF.Bindings
+                ignored = Array.Push(lines, "    " + binding.Render())
+            NEXT
+        END IF
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS

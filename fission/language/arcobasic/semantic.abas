@@ -1,5 +1,6 @@
 #IMPORT "fission/core/diagnostics.abas"
 #IMPORT "fission/sir/model.abas"
+#IMPORT "fission/sir/semantics.abas"
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 
 CLASS FissionArcoBasicSemanticSymbol
@@ -315,6 +316,34 @@ CLASS FissionArcoBasicProgramReport
             IF symbol != NULL THEN ignored = SELF.AddBinding(FissionArcoBasicProgramBinding(reference, symbol))
         NEXT
         RETURN SELF
+    END FUNCTION
+
+    FUNCTION ToSirSemantics()
+        semantics = FissionSirSemanticArtifact("program")
+        FOR symbol IN SELF.Symbols
+            sirSymbol = FissionSirSemanticSymbol(symbol.CanonicalName(), symbol.Kind)
+            ignored = sirSymbol.Typed(symbol.TypeName)
+            ignored = sirSymbol.WithSignature(symbol.Signature)
+            ignored = semantics.AddSymbol(sirSymbol)
+        NEXT
+        FOR reference IN SELF.References
+            sirReference = FissionSirSemanticReference(reference.CanonicalName(), reference.Kind)
+            sirReference.Status = reference.Status
+            sirReference.Target = reference.Target
+            targetSymbol = SELF.FindReferenceTargetSymbol(reference)
+            IF targetSymbol != NULL THEN sirReference.Target = targetSymbol.CanonicalName()
+            ignored = semantics.AddReference(sirReference)
+        NEXT
+        FOR binding IN SELF.Bindings
+            sirBinding = FissionSirSemanticBinding(binding.Reference, binding.Target)
+            sirBinding.ReferenceKind = binding.ReferenceKind
+            sirBinding.TargetKind = binding.TargetKind
+            sirBinding.TargetType = binding.TargetType
+            sirBinding.TargetSignature = binding.TargetSignature
+            ignored = semantics.AddBinding(sirBinding)
+        NEXT
+        ignored = semantics.Diagnostics.AppendMany(SELF.Diagnostics)
+        RETURN semantics
     END FUNCTION
 
     FUNCTION EnforceReferences()

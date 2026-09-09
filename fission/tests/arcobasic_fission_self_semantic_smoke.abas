@@ -23,6 +23,7 @@ Files = [
     "fission/modules/arcobasic_frontend/main.abas",
     "fission/sir/builder.abas",
     "fission/sir/model.abas",
+    "fission/sir/semantics.abas",
     "fission/sir/serialize.abas",
     "fission/sir/validate.abas",
     "fission/tests/arcobasic_access_interface_smoke.abas",
@@ -73,7 +74,8 @@ Files = [
     "fission/tests/core_smoke.abas",
     "fission/tests/language_authoring_kit_smoke.abas",
     "fission/tests/module_smoke.abas",
-    "fission/tests/sir_builder_smoke.abas"
+    "fission/tests/sir_builder_smoke.abas",
+    "fission/tests/sir_semantic_artifact_smoke.abas"
 ]
 
 Program = Fission_ArcoBasicAnalyzeProgramFiles(Files, TRUE)
