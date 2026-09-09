@@ -55,6 +55,15 @@ ArcoBASIC subset and lowers it into structured SIR.
   - operations
   - semantic callbacks
   - component export through `AsComponent()`
+- Initial language authoring kit added in ArcoBASIC:
+  - `Fission.LanguageKit()`
+  - `BeginLanguage`
+  - `SourceLanguage`
+  - `BeginnerCompiledLanguage`
+  - `SymbolLanguage`
+  - language validation for name, extension, input, output, and missing
+    semantic handlers
+  - registration through the normal Fission host/component registry
 - `FissionHost.Language(name)` now returns a language definition object, and
   `Fission.Register(Language)` registers its underlying component.
 - Initial `language.arcobasic` package registration added under
@@ -146,6 +155,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - WP-002 needs broader parser/semantic integration for ArcoBASIC; the current
   parser subset is enough for early regression scaffolding but not yet full
   ArcoBASIC.
+- The language authoring kit is an early facade over `FissionLanguageDefinition`;
+  it still needs reusable tokenizer/parser helpers, semantic construction
+  recipes, fixture scaffolding, package metadata helpers, and generated editor
+  metadata before it is enough for third-party language packs.
 - WP-003 SIR exists as a minimal model/builder/validator with an initial
   ArcoBASIC semantic report sidecar. It still needs typed values, canonical
   symbol references, resolved scopes, function signatures, control-flow
@@ -184,6 +197,8 @@ ArcoBASIC subset and lowers it into structured SIR.
 ## Regression Status
 
 - `build-rivet/ArcoFission compile-run fission/tests/core_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/language_authoring_kit_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_language_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
@@ -288,6 +303,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/core/compiler.abas`
 - `fission/core/fission.abas`
 - `fission/language/api/language.abas`
+- `fission/language/api/authoring_kit.abas`
 - `fission/language/arcobasic/preprocess.abas`
 - `fission/language/arcobasic/lexer.abas`
 - `fission/language/arcobasic/parser.abas`
@@ -299,6 +315,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/sir/validate.abas`
 - `fission/cli/fission.abas`
 - `fission/tests/core_smoke.abas`
+- `fission/tests/language_authoring_kit_smoke.abas`
 - `fission/tests/arcobasic_language_smoke.abas`
 - `fission/tests/arcobasic_access_interface_smoke.abas`
 - `fission/tests/arcobasic_class_smoke.abas`
@@ -386,19 +403,25 @@ ArcoBASIC subset and lowers it into structured SIR.
 - Fission now carries at least one real Arcology OS source file,
   `arcology-os/stdlib/timer_policy.abas`, through ArcoBASIC lex/parse/SIR
   lowering without diagnostics as a standing compatibility smoke.
+- The language authoring kit is a convenience facade over ordinary ArcoBASIC
+  Fission APIs, not a compiler-definition DSL. It must remain layered on the same
+  public component contracts used by first-party language packages.
 
 ## Next Recommended Work
 
 1. Add real import expansion once package/source discovery rules are available.
-2. Add lambdas, richer type syntax, and more complete access/inheritance
+2. Expand the language authoring kit with reusable tokenizer/parser helpers,
+   semantic construction recipes, package metadata helpers, and generated
+   tooling metadata.
+3. Add lambdas, richer type syntax, and more complete access/inheritance
    semantic validation.
-3. Promote semantic report data into typed SIR scopes, symbol references, and
+4. Promote semantic report data into typed SIR scopes, symbol references, and
    function signatures.
-4. Replace metadata-carried reveal payloads with typed reveal artifacts.
-5. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal
+5. Replace metadata-carried reveal payloads with typed reveal artifacts.
+6. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal
    output as the oracle.
-6. Add route ambiguity policy controls and richer `explain pipeline` output.
-7. Add version negotiation for component contracts.
-8. Add component package discovery/loading conventions under `fission/`.
-9. Keep all legacy compiler calls behind explicitly named bootstrap bridge
+7. Add route ambiguity policy controls and richer `explain pipeline` output.
+8. Add version negotiation for component contracts.
+9. Add component package discovery/loading conventions under `fission/`.
+10. Keep all legacy compiler calls behind explicitly named bootstrap bridge
    components.

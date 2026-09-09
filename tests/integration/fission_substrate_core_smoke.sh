@@ -15,6 +15,14 @@ grep -q "^elf:amir:sir:+\\.$" <<<"$output"
 test "$(grep -c "^TRUE$" <<<"$output")" = "3"
 grep -q "^FALSE$" <<<"$output"
 
+kit_output="$("$ARCOFISSION" compile-run fission/tests/language_authoring_kit_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$kit_output")" = "2"
+grep -q "^TRUE$" <<<"$kit_output"
+grep -q "^language.brainfuck-kit -> sir.to.amir.kit -> target.linux-x86_64.kit$" <<<"$kit_output"
+grep -q "^Executable.Linux.X86_64$" <<<"$kit_output"
+grep -q "^elf:amir:sir:+$" <<<"$kit_output"
+
 arcobasic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_language_smoke.abas)"
 
 grep -q "^TRUE$" <<<"$arcobasic_output"

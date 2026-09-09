@@ -1,0 +1,58 @@
+#IMPORT "fission/core/fission.abas"
+
+FUNCTION BfToSir(artifact, context)
+    RETURN FissionArtifact("SIR", artifact.Name + ".sir", "sir:" + artifact.Value)
+END FUNCTION
+
+FUNCTION SirToAmir(artifact, context)
+    RETURN FissionArtifact("AMIR", artifact.Name + ".amir", "amir:" + artifact.Value)
+END FUNCTION
+
+FUNCTION AmirToLinuxExecutable(artifact, context)
+    RETURN FissionArtifact("Executable.Linux.X86_64", artifact.Name + ".elf", "elf:" + artifact.Value)
+END FUNCTION
+
+FUNCTION HandleIncrement(node, context)
+    RETURN "increment"
+END FUNCTION
+
+Fission = Fission_New()
+Kit = Fission.LanguageKit()
+
+Brainfuck = Kit.SymbolLanguage("brainfuck-kit", ".bf")
+ignored = Brainfuck.Symbol("+", "Increment")
+ignored = Brainfuck.Symbol("-", "Decrement")
+ignored = Brainfuck.On("Increment", ADDRESSOF HandleIncrement)
+ignored = Brainfuck.TransformWith(ADDRESSOF BfToSir)
+
+Diagnostics = Kit.ValidateLanguage(Brainfuck)
+ignored = Kit.Register(Brainfuck)
+
+SirLower = Fission.Component("sir.to.amir.kit", "IR Transformer")
+ignored = SirLower.Consume("SIR")
+ignored = SirLower.Produce("AMIR")
+ignored = SirLower.TransformWith(ADDRESSOF SirToAmir)
+ignored = Fission.Register(SirLower)
+
+LinuxTarget = Fission.Target("linux-x86_64.kit")
+ignored = LinuxTarget.Consume("AMIR")
+ignored = LinuxTarget.Produce("Executable.Linux.X86_64")
+ignored = LinuxTarget.Require("LANGUAGE_PACK")
+ignored = LinuxTarget.TransformWith(ADDRESSOF AmirToLinuxExecutable)
+ignored = Fission.Register(LinuxTarget)
+
+Request = Fission.Request()
+Request.Source = "+"
+Request.SourceName = "kit.bf"
+ignored = Request.WithLanguage("brainfuck-kit")
+ignored = Request.ToArtifact("Executable.Linux.X86_64")
+
+Result = Fission.Compiler().Compile(Request)
+
+PRINT Diagnostics.HasErrors()
+PRINT String.Contains(Diagnostics.Render(), "FISSION_LANGUAGE_KIT_NO_SEMANTICS")
+PRINT Result.Ok
+PRINT Array.Join(Result.Pipeline.ComponentNames(), " -> ")
+PRINT Result.Artifact.Type
+PRINT Result.Artifact.Value
+PRINT Brainfuck.Component.Capabilities.Includes("TARGET_INHERITANCE")

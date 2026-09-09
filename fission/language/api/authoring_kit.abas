@@ -1,0 +1,54 @@
+#IMPORT "fission/language/api/language.abas"
+
+CLASS FissionLanguageAuthoringKit
+    CONSTRUCTOR(host)
+        SELF.Host = host
+        SELF.Diagnostics = FissionDiagnosticBag()
+    END CONSTRUCTOR
+
+    FUNCTION BeginLanguage(name)
+        language = SELF.Host.Language(name)
+        ignored = language.Produce("SIR")
+        ignored = language.Capability("LANGUAGE_PACK")
+        RETURN language
+    END FUNCTION
+
+    FUNCTION SourceLanguage(name, extension)
+        language = SELF.BeginLanguage(name)
+        ignored = language.Extension(extension)
+        ignored = language.Consume("Source." + name)
+        RETURN language
+    END FUNCTION
+
+    FUNCTION BeginnerCompiledLanguage(name, extension)
+        language = SELF.SourceLanguage(name, extension)
+        ignored = language.Capability("SIR_OUTPUT")
+        ignored = language.Capability("TARGET_INHERITANCE")
+        RETURN language
+    END FUNCTION
+
+    FUNCTION SymbolLanguage(name, extension)
+        language = SELF.BeginnerCompiledLanguage(name, extension)
+        ignored = language.Expression("Symbol", "single source symbol")
+        ignored = language.Operation("EmitSemantic", "SemanticConstruction")
+        RETURN language
+    END FUNCTION
+
+    FUNCTION Register(language)
+        RETURN SELF.Host.Register(language)
+    END FUNCTION
+
+    FUNCTION ValidateLanguage(language)
+        SELF.Diagnostics = FissionDiagnosticBag()
+        IF language.Name == "" THEN ignored = SELF.Diagnostics.ReportError("FISSION_LANGUAGE_KIT_EMPTY_NAME", "Language name is required")
+        IF LEN(language.Extensions) == 0 THEN ignored = SELF.Diagnostics.ReportError("FISSION_LANGUAGE_KIT_NO_EXTENSION", "Language " + language.Name + " has no file extension")
+        IF LEN(language.Component.Consumes) == 0 THEN ignored = SELF.Diagnostics.ReportError("FISSION_LANGUAGE_KIT_NO_INPUT", "Language " + language.Name + " has no input artifact")
+        IF LEN(language.Component.Produces) == 0 THEN ignored = SELF.Diagnostics.ReportError("FISSION_LANGUAGE_KIT_NO_OUTPUT", "Language " + language.Name + " has no output artifact")
+        IF LEN(language.SemanticHandlers) == 0 THEN ignored = SELF.Diagnostics.ReportWarning("FISSION_LANGUAGE_KIT_NO_SEMANTICS", "Language " + language.Name + " has no semantic handlers")
+        RETURN SELF.Diagnostics
+    END FUNCTION
+END CLASS
+
+FUNCTION Fission_LanguageKit(host)
+    RETURN FissionLanguageAuthoringKit(host)
+END FUNCTION
