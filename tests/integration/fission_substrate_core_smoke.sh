@@ -346,4 +346,9 @@ grep -q "^SIR reveal.abas v0.1$" <<<"$reveal_output"
 grep -q "^PIPELINE RESOLVED$" <<<"$reveal_output"
 grep -q "^language.arcobasic: Source.arcobasic -> SIR$" <<<"$reveal_output"
 
+real_timer_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_real_timer_parse_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$real_timer_output")" = "2"
+grep -q "^14$" <<<"$real_timer_output"
+
 echo "fission_substrate_core_smoke: all checks passed"

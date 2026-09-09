@@ -96,6 +96,7 @@ ArcoBASIC subset and lowers it into structured SIR.
   - bare and value `RETURN`
   - function declarations with positional arguments
   - typed/default function arguments and return annotations
+  - qualified function names and qualified type names
   - class declarations
   - constructors
   - interfaces
@@ -226,6 +227,8 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_preprocess_error_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_real_timer_parse_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_include_metadata_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_legacy_operator_smoke.abas` passed.
@@ -318,6 +321,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_preprocess_smoke.abas`
 - `fission/tests/arcobasic_preprocess_compile_smoke.abas`
 - `fission/tests/arcobasic_preprocess_error_smoke.abas`
+- `fission/tests/arcobasic_real_timer_parse_smoke.abas`
 - `fission/tests/sir_builder_smoke.abas`
 - `fission/tests/arcobasic_parser_smoke.abas`
 - `fission/tests/arcobasic_postfix_smoke.abas`
@@ -379,6 +383,9 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `#INCLUDE` expansion is implemented in the preprocessor. `#IMPORT` is recorded
   as metadata and represented as an import node, but package/source expansion is
   deferred until package discovery rules exist.
+- Fission now carries at least one real Arcology OS source file,
+  `arcology-os/stdlib/timer_policy.abas`, through ArcoBASIC lex/parse/SIR
+  lowering without diagnostics as a standing compatibility smoke.
 
 ## Next Recommended Work
 

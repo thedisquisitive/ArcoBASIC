@@ -1,0 +1,12 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Source = File.ReadText("arcology-os/stdlib/timer_policy.abas")
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "timer_policy.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Sir.Diagnostics.HasErrors()
+PRINT String(LEN(Ast.Statements))
+PRINT String(LEN(Sir.Statements))
+PRINT Ast.Diagnostics.Render()
