@@ -378,8 +378,17 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_parse_smoke.abas)"
 
-grep -q "^65$" <<<"$fission_self_output"
+grep -q "^66$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
+
+self_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_self_semantic_smoke.abas)"
+
+grep -q "^TRUE$" <<<"$self_semantic_output"
+grep -q "^FALSE$" <<<"$self_semantic_output"
+grep -q "^5$" <<<"$self_semantic_output"
+grep -q "^  Field module::Counter::Value$" <<<"$self_semantic_output"
+grep -q "^    Field module::Counter::Value -> Resolved module::Counter::Value$" <<<"$self_semantic_output"
+grep -q "^    Call module::Counter::Current -> Resolved module::Counter::Current$" <<<"$self_semantic_output"
 
 os_stdlib_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_os_stdlib_parse_smoke.abas)"
 

@@ -148,6 +148,10 @@ ArcoBASIC subset and lowers it into structured SIR.
   It also resolves reads and direct calls against enclosing scopes, records
   resolved/external/unresolved references, and enforces unresolved-reference
   diagnostics when `#STRICT` is active.
+- The semantic pass now records class-body declarations as fields, infers class
+  fields from `SELF.Field = ...`, resolves `SELF.Field` references against the
+  enclosing class scope, and resolves `SELF.Method(...)` calls against class
+  methods.
 - `language.arcobasic` now attaches `Semantics.Render` and
   `SemanticSymbolCount`/`SemanticReferenceCount` metadata to produced SIR
   artifacts and propagates semantic diagnostics into the compile result.
@@ -292,6 +296,12 @@ ArcoBASIC subset and lowers it into structured SIR.
   fission/tests/arcobasic_fission_self_parse_smoke.abas` passed with 65 current
   first-party Fission `.abas` files and zero parse/lowering failures.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_fission_self_parse_smoke.abas` passed with 66 current
+  first-party Fission `.abas` files and zero parse/lowering failures.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_self_semantic_smoke.abas` passed, proving strict
+  `SELF` field/method resolution for a class-local fixture.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_include_metadata_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_legacy_operator_smoke.abas` passed.
@@ -412,6 +422,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_parser_smoke.abas`
 - `fission/tests/arcobasic_postfix_smoke.abas`
 - `fission/tests/arcobasic_reveal_smoke.abas`
+- `fission/tests/arcobasic_self_semantic_smoke.abas`
 - `fission/tests/arcobasic_semantic_smoke.abas`
 - `fission/tests/arcobasic_semantic_diagnostics_smoke.abas`
 - `fission/tests/arcobasic_semantic_reference_smoke.abas`
@@ -492,6 +503,9 @@ ArcoBASIC subset and lowers it into structured SIR.
 - Fission now carries every current first-party Fission `.abas` source through
   ArcoBASIC lex/parse/SIR lowering without diagnostics, including the executable
   module entrypoint and all Fission smoke fixtures.
+- The first self-compilation semantic pressure point is covered: class fields and
+  self-method calls are represented in the semantic report instead of falling
+  through as unresolved or external `SELF` reads.
 - The language authoring kit is a convenience facade over ordinary ArcoBASIC
   Fission APIs, not a compiler-definition DSL. It must remain layered on the same
   public component contracts used by first-party language packages.
@@ -504,22 +518,25 @@ ArcoBASIC subset and lowers it into structured SIR.
 
 1. Continue expanding ArcoBASIC frontend compatibility against real Arcology
    source files until the Fission parser can ingest the primary ABAS corpus.
-2. Add real import expansion once package/source discovery rules are available.
-3. Add lambdas, richer type syntax, and more complete access/inheritance
+2. Keep advancing Fission self-compilation by moving from structural self-parse
+   to strict whole-Fission semantic analysis: imports, host globals, class
+   fields, methods, and function signatures must resolve cleanly.
+3. Add real import expansion once package/source discovery rules are available.
+4. Add lambdas, richer type syntax, and more complete access/inheritance
    semantic validation.
-4. Promote semantic report data into typed SIR scopes, symbol references, and
+5. Promote semantic report data into typed SIR scopes, symbol references, and
    function signatures.
-5. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal
+6. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal
    output as the oracle.
-6. Add A-MIR and diagnostics artifact codecs so executable modules can pass the
+7. Add A-MIR and diagnostics artifact codecs so executable modules can pass the
    next compiler representations structurally.
-7. Replace metadata-carried reveal payloads with typed reveal artifacts.
-8. Add route ambiguity policy controls and richer `explain pipeline` output.
-9. Add version negotiation for component contracts.
-10. Add component package discovery/loading conventions under `fission/`.
-11. After ArcoBASIC frontend support is substantially complete, expand the
+8. Replace metadata-carried reveal payloads with typed reveal artifacts.
+9. Add route ambiguity policy controls and richer `explain pipeline` output.
+10. Add version negotiation for component contracts.
+11. Add component package discovery/loading conventions under `fission/`.
+12. After ArcoBASIC frontend support is substantially complete, expand the
    language authoring kit with reusable tokenizer/parser helpers, semantic
    construction recipes, package metadata helpers, and generated tooling
    metadata.
-12. Keep all legacy compiler calls behind explicitly named bootstrap bridge
+13. Keep all legacy compiler calls behind explicitly named bootstrap bridge
    components.

@@ -54,6 +54,7 @@ Files = [
     "fission/tests/arcobasic_real_project_parse_smoke.abas",
     "fission/tests/arcobasic_real_timer_parse_smoke.abas",
     "fission/tests/arcobasic_reveal_smoke.abas",
+    "fission/tests/arcobasic_self_semantic_smoke.abas",
     "fission/tests/arcobasic_semantic_diagnostics_smoke.abas",
     "fission/tests/arcobasic_semantic_reference_smoke.abas",
     "fission/tests/arcobasic_semantic_smoke.abas",

@@ -132,6 +132,34 @@ FUNCTION Fission_ArcoBasicSemanticAddArguments(report, scope, argsText)
     NEXT
 END FUNCTION
 
+FUNCTION Fission_ArcoBasicSemanticEnclosingClassScope(report, scope)
+    best = ""
+    FOR symbol IN report.Symbols
+        IF symbol.Kind == "Class" THEN
+            candidate = symbol.Scope + "::" + symbol.Name
+            IF scope == candidate OR String.StartsWith(scope, candidate + "::") THEN
+                IF LEN(candidate) > LEN(best) THEN best = candidate
+            END IF
+        END IF
+    NEXT
+    RETURN best
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicSemanticEnsureField(report, classScope, name)
+    IF classScope == "" OR name == "" THEN RETURN NULL
+    existing = report.FindSymbol(classScope, name)
+    IF existing != NULL THEN RETURN existing
+    RETURN report.AddSymbol(FissionArcoBasicSemanticSymbol(name, "Field", classScope))
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicSemanticIsSelfMember(node)
+    IF node.Kind != "MemberRead" THEN RETURN FALSE
+    IF LEN(node.Children) == 0 THEN RETURN FALSE
+    base = node.Children[0]
+    IF base.Kind != "Read" THEN RETURN FALSE
+    RETURN Upper(Object.Get(base.Fields, "Name", "")) == "SELF"
+END FUNCTION
+
 FUNCTION Fission_ArcoBasicAnalyzeSirNode(report, node, scope)
     IF node.Kind == "Import" THEN
         symbol = FissionArcoBasicSemanticSymbol(Object.Get(node.Fields, "Path", ""), "Import", scope)
@@ -144,13 +172,22 @@ FUNCTION Fission_ArcoBasicAnalyzeSirNode(report, node, scope)
         ignored = report.AddSymbol(symbol)
     END IF
     IF node.Kind == "Declare" THEN
-        symbol = FissionArcoBasicSemanticSymbol(Object.Get(node.Fields, "Name", ""), "Variable", scope)
+        kind = "Variable"
+        IF Fission_ArcoBasicSemanticEnclosingClassScope(report, scope) == scope THEN kind = "Field"
+        symbol = FissionArcoBasicSemanticSymbol(Object.Get(node.Fields, "Name", ""), kind, scope)
         symbol.TypeName = Object.Get(node.Fields, "Type", "")
         ignored = report.AddSymbol(symbol)
     END IF
     IF node.Kind == "Assign" THEN
         name = Object.Get(node.Fields, "Name", "")
         IF report.HasSymbol(scope, name) == FALSE THEN ignored = report.AddSymbol(FissionArcoBasicSemanticSymbol(name, "Variable", scope))
+    END IF
+    IF node.Kind == "Set" AND LEN(node.Children) > 0 THEN
+        target = node.Children[0]
+        IF Fission_ArcoBasicSemanticIsSelfMember(target) THEN
+            classScope = Fission_ArcoBasicSemanticEnclosingClassScope(report, scope)
+            ignored = Fission_ArcoBasicSemanticEnsureField(report, classScope, Object.Get(target.Fields, "Name", ""))
+        END IF
     END IF
     IF node.Kind == "Function" THEN
         name = Object.Get(node.Fields, "Name", "")
@@ -229,7 +266,12 @@ FUNCTION Fission_ArcoBasicResolveSirNode(report, node, scope)
             IF callee.Kind == "Read" THEN
                 ignored = Fission_ArcoBasicResolveReference(report, "Call", Object.Get(callee.Fields, "Name", ""), scope)
             ELSE
-                ignored = Fission_ArcoBasicResolveSirNode(report, callee, scope)
+                IF Fission_ArcoBasicSemanticIsSelfMember(callee) THEN
+                    classScope = Fission_ArcoBasicSemanticEnclosingClassScope(report, scope)
+                    ignored = Fission_ArcoBasicResolveReference(report, "Call", Object.Get(callee.Fields, "Name", ""), classScope)
+                ELSE
+                    ignored = Fission_ArcoBasicResolveSirNode(report, callee, scope)
+                END IF
             END IF
         END IF
         index = 1
@@ -237,6 +279,11 @@ FUNCTION Fission_ArcoBasicResolveSirNode(report, node, scope)
             ignored = Fission_ArcoBasicResolveSirNode(report, node.Children[index], scope)
             index = index + 1
         WEND
+        RETURN
+    END IF
+    IF Fission_ArcoBasicSemanticIsSelfMember(node) THEN
+        classScope = Fission_ArcoBasicSemanticEnclosingClassScope(report, scope)
+        ignored = Fission_ArcoBasicResolveReference(report, "Field", Object.Get(node.Fields, "Name", ""), classScope)
         RETURN
     END IF
     IF node.Kind == "Function" THEN
