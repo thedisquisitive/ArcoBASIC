@@ -164,6 +164,14 @@ FUNCTION Fission_ArcoBasicLex(source)
                 index = index + 1
                 column = column + 1
             WEND
+            IF index + 1 < String.Length(source) AND String.Slice(source, index, 1) == "." AND Fission_ArcoBasicIsDigit(String.Slice(source, index + 1, 1)) THEN
+                index = index + 1
+                column = column + 1
+                WHILE index < String.Length(source) AND Fission_ArcoBasicIsDigit(String.Slice(source, index, 1))
+                    index = index + 1
+                    column = column + 1
+                WEND
+            END IF
             ignored = Array.Push(tokens, FissionArcoBasicToken("Number", String.Slice(source, start, index - start), line, startColumn))
             CONTINUE WHILE
         END IF

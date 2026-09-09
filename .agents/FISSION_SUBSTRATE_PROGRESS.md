@@ -108,7 +108,7 @@ ArcoBASIC subset and lowers it into structured SIR.
     `BITXOR`, `SHL`, `SHR`, `SAR`, `IN`, `HAS`, `CONTAINS`, single-token
     `=` equality, and `\` integer division
   - unary `-`, `NOT`, `ADDRESSOF`, and `COPY`
-  - boolean/null/number literals
+  - boolean/null/integer/decimal number literals
   - parenthesized expressions
   - simple `IF`/`ELSE`/`END IF`
   - single-line nested `IF ... THEN ... ELSE IF ...`, with newline termination
@@ -206,6 +206,8 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_control_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_decimal_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_directive_decl_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_do_bitwise_smoke.abas` passed.
@@ -300,6 +302,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_call_statement_smoke.abas`
 - `fission/tests/arcobasic_callable_comprehension_smoke.abas`
 - `fission/tests/arcobasic_control_smoke.abas`
+- `fission/tests/arcobasic_decimal_smoke.abas`
 - `fission/tests/arcobasic_diagnostics_smoke.abas`
 - `fission/tests/arcobasic_directive_decl_smoke.abas`
 - `fission/tests/arcobasic_do_bitwise_smoke.abas`

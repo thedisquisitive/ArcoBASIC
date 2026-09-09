@@ -179,6 +179,16 @@ grep -q "^    CallExpr$" <<<"$directive_decl_output"
 grep -q "^SIR directive-decl-smoke.abas v0.1$" <<<"$directive_decl_output"
 grep -q "^  Import(Path=text, Alias=Txt)$" <<<"$directive_decl_output"
 
+decimal_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_decimal_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$decimal_output")" = "2"
+grep -q "^Number:0.07@1:19$" <<<"$decimal_output"
+grep -q "^Number:0.08@1:25$" <<<"$decimal_output"
+grep -q "^ArcoBASIC AST decimal-smoke.abas$" <<<"$decimal_output"
+grep -q "^      Literal(Value=0.07)$" <<<"$decimal_output"
+grep -q "^      Literal(Value=1.0)$" <<<"$decimal_output"
+grep -q "^SIR decimal-smoke.abas v0.1$" <<<"$decimal_output"
+
 class_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_class_smoke.abas)"
 
 test "$(grep -c "^FALSE$" <<<"$class_output")" = "2"

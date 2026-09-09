@@ -1,0 +1,14 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Source = "GUI.Clear(window, 0.07, 0.08, 1.0)\nvalue = 0.125 + 2"
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "decimal-smoke.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+
+PRINT Tokens[6].Render()
+PRINT Tokens[8].Render()
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Ast.Render()
+PRINT "---"
+PRINT Sir.Diagnostics.HasErrors()
+PRINT Sir.Render()
