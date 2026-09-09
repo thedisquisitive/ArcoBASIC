@@ -163,6 +163,11 @@ ArcoBASIC subset and lowers it into structured SIR.
   index across modules. Program symbols retain module name, scope, kind, type,
   default value, and a stable canonical name for future cross-file reference and
   signature resolution.
+- Import-aware program semantic analysis now records canonical program
+  references and resolves imported module-level calls/reads through the program
+  symbol index. Strict whole-program diagnostics are enforced after this
+  cross-file resolution step so lowercase imported ArcoBASIC helpers can be
+  proven before A-MIR lowering.
 - `language.arcobasic` now attaches `Semantics.Render` and
   `SemanticSymbolCount`/`SemanticReferenceCount` metadata to produced SIR
   artifacts and propagates semantic diagnostics into the compile result.
@@ -222,12 +227,12 @@ ArcoBASIC subset and lowers it into structured SIR.
 
 ## Known Failures
 
-- SIR is currently structural and renderable, but not yet typed, canonicalized,
-  serialized, or lowered to real A-MIR.
+- SIR is currently structural and renderable, but not yet typed, semantically
+  bound, canonicalized, or lowered to real A-MIR.
 - ArcoBASIC `Source.arcobasic -> SIR` supports a growing structural subset, but
   not yet real import expansion, full directive metadata semantics, lambdas,
-  complete generic type syntax, full host interop, resolved symbols/types, or
-  complete legacy-compatible syntax/semantics.
+  complete generic type syntax, full host interop, complete resolved
+  symbols/types, or complete legacy-compatible syntax/semantics.
 - Non-strict ArcoBASIC currently records unresolved references without failing
   compilation so existing host/global-heavy code can keep flowing through the
   substrate. `#STRICT` converts unresolved references into diagnostics.
@@ -335,6 +340,10 @@ ArcoBASIC subset and lowers it into structured SIR.
   program symbols for module-level constants, classes, class fields, and typed
   functions.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_cross_file_semantic_smoke.abas` passed, proving
+  strict whole-program semantic resolution for imported lowercase functions and
+  variables through the canonical program symbol index.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_fission_self_semantic_smoke.abas` passed with 69
   modules, 99 import edges, and zero diagnostics using strict import-aware
   program semantic analysis.
@@ -342,9 +351,13 @@ ArcoBASIC subset and lowers it into structured SIR.
   fission/tests/arcobasic_fission_self_parse_smoke.abas` passed with 70 current
   first-party Fission `.abas` files and zero parse/lowering failures.
 - `build-rivet/ArcoFission compile-run
-  fission/tests/arcobasic_fission_self_semantic_smoke.abas` passed with 70
-  modules, 100 import edges, 1835 program symbols, and zero diagnostics using
-  strict import-aware program semantic analysis.
+  fission/tests/arcobasic_fission_self_parse_smoke.abas` passed with 71 current
+  first-party Fission `.abas` files and zero parse/lowering failures.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_fission_self_semantic_smoke.abas` passed with 71
+  modules, 101 import edges, 1873 program symbols, and zero diagnostics using
+  strict import-aware program semantic analysis with cross-file reference
+  resolution.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_self_semantic_smoke.abas` passed, proving strict
   `SELF` field/method resolution for a class-local fixture.
@@ -381,6 +394,8 @@ ArcoBASIC subset and lowers it into structured SIR.
   included.
 - `(cd fission && ../build-rivet/fissure run)` passed.
 - `(cd fission && ../build-rivet/fissure run --full)` passed.
+- `(cd fission && ../build-rivet/fissure run --full)` passed after
+  cross-file ArcoBASIC semantic reference resolution was added.
 - `ctest --test-dir build -R '^fission_substrate_core_smoke$'
   --output-on-failure` passed.
 - `build-rivet/rivet build` passed and produced
@@ -445,6 +460,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_call_statement_smoke.abas`
 - `fission/tests/arcobasic_callable_comprehension_smoke.abas`
 - `fission/tests/arcobasic_control_smoke.abas`
+- `fission/tests/arcobasic_cross_file_semantic_smoke.abas`
 - `fission/tests/arcobasic_decimal_smoke.abas`
 - `fission/tests/arcobasic_diagnostics_smoke.abas`
 - `fission/tests/arcobasic_directive_decl_smoke.abas`
@@ -565,9 +581,10 @@ ArcoBASIC subset and lowers it into structured SIR.
   strict import-aware program semantic analysis without diagnostics. This
   validates the current import graph exists but does not yet merge exported
   symbols across modules.
-- Fission now indexes 1835 canonical program symbols across the current
-  first-party Fission source set. This is analysis-only; cross-file references
-  are not resolved through that index yet.
+- Fission now indexes 1873 canonical program symbols and resolves canonical
+  program references across explicit imports for the current first-party Fission
+  source set. This is still analysis-only until the bindings are promoted into
+  typed SIR.
 - The first self-compilation semantic pressure point is covered: class fields and
   self-method calls are represented in the semantic report instead of falling
   through as unresolved or external `SELF` reads.
@@ -578,15 +595,17 @@ ArcoBASIC subset and lowers it into structured SIR.
   They advertise normal component metadata through a stable stdio manifest
   protocol and are registered into the same host registry as in-process
   components, so the compiler still behaves as one composed substrate.
+- Strict ArcoBASIC program semantics intentionally analyze each file non-strict
+  first, build the full import/symbol/reference index, resolve imported symbols,
+  and only then enforce unresolved-reference diagnostics at the program boundary.
 
 ## Next Recommended Work
 
 1. Continue expanding ArcoBASIC frontend compatibility against real Arcology
    source files until the Fission parser can ingest the primary ABAS corpus.
-2. Keep advancing Fission self-compilation by using the canonical program symbol
-   index for cross-file reference resolution, then promote exported functions,
-   classes, fields, imports, host globals, and function signatures into typed
-   SIR.
+2. Keep advancing Fission self-compilation by promoting resolved program
+   symbols/references, exported functions, classes, fields, imports, host
+   globals, and function signatures into typed SIR.
 3. Add real import expansion once package/source discovery rules are available.
 4. Add lambdas, richer type syntax, and more complete access/inheritance
    semantic validation.

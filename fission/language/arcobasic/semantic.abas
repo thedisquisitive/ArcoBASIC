@@ -140,11 +140,29 @@ CLASS FissionArcoBasicProgramSymbol
     END FUNCTION
 END CLASS
 
+CLASS FissionArcoBasicProgramReference
+    CONSTRUCTOR(moduleName, reference)
+        SELF.ModuleName = moduleName
+        SELF.Kind = reference.Kind
+        SELF.Name = reference.Name
+        SELF.Scope = reference.Scope
+        SELF.Target = reference.Target
+        SELF.Status = reference.Status
+    END CONSTRUCTOR
+
+    FUNCTION Render()
+        text = SELF.Kind + " " + SELF.ModuleName + "::" + SELF.Scope + "::" + SELF.Name + " -> " + SELF.Status
+        IF SELF.Target != "" THEN text = text + " " + SELF.Target
+        RETURN text
+    END FUNCTION
+END CLASS
+
 CLASS FissionArcoBasicProgramReport
     CONSTRUCTOR()
         SELF.Modules = []
         SELF.Imports = []
         SELF.Symbols = []
+        SELF.References = []
         SELF.Diagnostics = FissionDiagnosticBag()
     END CONSTRUCTOR
 
@@ -154,6 +172,9 @@ CLASS FissionArcoBasicProgramReport
         FOR symbol IN module.Report.Symbols
             ignored = SELF.AddProgramSymbol(module.Name, symbol)
         NEXT
+        FOR reference IN module.Report.References
+            ignored = SELF.AddProgramReference(module.Name, reference)
+        NEXT
         RETURN module
     END FUNCTION
 
@@ -161,6 +182,12 @@ CLASS FissionArcoBasicProgramReport
         programSymbol = FissionArcoBasicProgramSymbol(moduleName, symbol)
         ignored = Array.Push(SELF.Symbols, programSymbol)
         RETURN programSymbol
+    END FUNCTION
+
+    FUNCTION AddProgramReference(moduleName, reference)
+        programReference = FissionArcoBasicProgramReference(moduleName, reference)
+        ignored = Array.Push(SELF.References, programReference)
+        RETURN programReference
     END FUNCTION
 
     FUNCTION HasModule(name)
@@ -181,6 +208,16 @@ CLASS FissionArcoBasicProgramReport
         RETURN SELF.FindSymbol(moduleName, "module", name)
     END FUNCTION
 
+    FUNCTION FindImportedModuleSymbol(fromName, name)
+        FOR importEdge IN SELF.Imports
+            IF importEdge.From == fromName THEN
+                symbol = SELF.FindModuleSymbol(importEdge.Path, name)
+                IF symbol != NULL THEN RETURN symbol
+            END IF
+        NEXT
+        RETURN NULL
+    END FUNCTION
+
     FUNCTION AddImport(fromName, path)
         ignored = Array.Push(SELF.Imports, {From: fromName, Path: path})
         RETURN SELF
@@ -191,6 +228,32 @@ CLASS FissionArcoBasicProgramReport
             path = importEdge.Path
             IF SELF.HasModule(path) == FALSE AND File.Exists(path) == FALSE THEN
                 ignored = SELF.Diagnostics.ReportError("FISSION_ARCOBASIC_IMPORT_UNRESOLVED", "Import " + importEdge.From + " -> " + path + " was not found in the program set or on disk")
+            END IF
+        NEXT
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION ResolveReference(reference)
+        IF reference.Status == "Resolved" THEN RETURN reference
+        symbol = SELF.FindImportedModuleSymbol(reference.ModuleName, reference.Name)
+        IF symbol != NULL THEN
+            reference.Status = "ResolvedImport"
+            reference.Target = symbol.CanonicalName()
+        END IF
+        RETURN reference
+    END FUNCTION
+
+    FUNCTION ResolveReferences()
+        FOR reference IN SELF.References
+            ignored = SELF.ResolveReference(reference)
+        NEXT
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION EnforceReferences()
+        FOR reference IN SELF.References
+            IF reference.Status == "Unresolved" THEN
+                ignored = SELF.Diagnostics.ReportError("FISSION_ARCOBASIC_UNRESOLVED_SYMBOL", "Unresolved " + Lower(reference.Kind) + " " + reference.ModuleName + "::" + reference.Scope + "::" + reference.Name)
             END IF
         NEXT
         RETURN SELF
@@ -211,6 +274,12 @@ CLASS FissionArcoBasicProgramReport
             ignored = Array.Push(lines, "  Imports")
             FOR importEdge IN SELF.Imports
                 ignored = Array.Push(lines, "    " + importEdge.From + " -> " + importEdge.Path)
+            NEXT
+        END IF
+        IF LEN(SELF.References) > 0 THEN
+            ignored = Array.Push(lines, "  References")
+            FOR reference IN SELF.References
+                ignored = Array.Push(lines, "    " + reference.Render())
             NEXT
         END IF
         RETURN Array.Join(lines, "\n")
@@ -243,11 +312,13 @@ END FUNCTION
 FUNCTION Fission_ArcoBasicAnalyzeProgramFiles(paths, strict = FALSE)
     program = FissionArcoBasicProgramReport()
     FOR path IN paths
-        module = Fission_ArcoBasicAnalyzeFile(path, strict)
+        module = Fission_ArcoBasicAnalyzeFile(path, FALSE)
         ignored = program.AddModule(module)
         ignored = Fission_ArcoBasicCollectImportsFromSir(program, module.Sir)
     NEXT
     ignored = program.ValidateImports()
+    ignored = program.ResolveReferences()
+    IF strict THEN ignored = program.EnforceReferences()
     RETURN program
 END FUNCTION
 

@@ -1,0 +1,16 @@
+#IMPORT "fission/language/arcobasic/semantic.abas"
+
+LibraryPath = "/tmp/fission_cross_file_library.abas"
+MainPath = "/tmp/fission_cross_file_main.abas"
+
+ignored = File.WriteText(LibraryPath, "FUNCTION helper()\nRETURN 7\nEND FUNCTION\nsharedValue = 5\n")
+ignored = File.WriteText(MainPath, "#IMPORT \"" + LibraryPath + "\"\nresult = helper() + sharedValue\n")
+
+Program = Fission_ArcoBasicAnalyzeProgramFiles([LibraryPath, MainPath], TRUE)
+
+PRINT Program.Diagnostics.HasErrors()
+PRINT LEN(Program.Modules)
+PRINT LEN(Program.Imports)
+PRINT LEN(Program.Symbols)
+PRINT LEN(Program.References)
+PRINT Program.Render()

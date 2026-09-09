@@ -30,6 +30,7 @@ Files = [
     "fission/tests/arcobasic_callable_comprehension_smoke.abas",
     "fission/tests/arcobasic_class_smoke.abas",
     "fission/tests/arcobasic_control_smoke.abas",
+    "fission/tests/arcobasic_cross_file_semantic_smoke.abas",
     "fission/tests/arcobasic_decimal_smoke.abas",
     "fission/tests/arcobasic_diagnostics_smoke.abas",
     "fission/tests/arcobasic_directive_decl_smoke.abas",
