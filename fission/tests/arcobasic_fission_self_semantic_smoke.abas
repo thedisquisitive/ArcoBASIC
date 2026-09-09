@@ -46,6 +46,7 @@ Files = [
     "fission/tests/arcobasic_lexer_smoke.abas",
     "fission/tests/arcobasic_literal_smoke.abas",
     "fission/tests/arcobasic_logic_smoke.abas",
+    "fission/tests/arcobasic_loop_semantic_smoke.abas",
     "fission/tests/arcobasic_named_defaults_smoke.abas",
     "fission/tests/arcobasic_os_stdlib_parse_smoke.abas",
     "fission/tests/arcobasic_parser_smoke.abas",
@@ -79,7 +80,7 @@ FOR path IN Files
     Tokens = Fission_ArcoBasicLex(Source)
     Ast = Fission_ArcoBasicParse(Tokens, path)
     Sir = Fission_ArcoBasicAstToSir(Ast)
-    Report = Fission_ArcoBasicAnalyzeSir(Sir)
+    Report = Fission_ArcoBasicAnalyzeSirStrict(Sir)
     IF Ast.Diagnostics.HasErrors() OR Sir.Diagnostics.HasErrors() OR Report.Diagnostics.HasErrors() THEN
         Failures = Failures + 1
         PRINT path

@@ -1,0 +1,19 @@
+#IMPORT "fission/core/fission.abas"
+#IMPORT "fission/language/arcobasic/register.abas"
+
+Fission = Fission_New()
+ignored = Fission_RegisterArcoBasic(Fission)
+
+Request = Fission.Request()
+Request.Source = "#STRICT\nvalues = [1, 2, 3]\ntotal = 0\nFOR item IN values\ntotal = total + item\nNEXT\nFOR index = 1 TO 3\ntotal = total + index\nNEXT\nPRINT total"
+Request.SourceName = "loop-semantic.abas"
+ignored = Request.WithLanguage("arcobasic")
+ignored = Request.ToArtifact("SIR")
+
+Result = Fission.Compiler().Compile(Request)
+
+PRINT Result.Ok
+PRINT Result.Diagnostics.HasErrors()
+PRINT Result.Artifact.MetadataValue("SemanticSymbolCount", "")
+PRINT Result.Artifact.MetadataValue("SemanticReferenceCount", "")
+PRINT Result.Artifact.MetadataValue("Semantics.Render", "")

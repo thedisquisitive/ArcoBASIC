@@ -378,13 +378,22 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_parse_smoke.abas)"
 
-grep -q "^67$" <<<"$fission_self_output"
+grep -q "^68$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_semantic_smoke.abas)"
 
-grep -q "^67$" <<<"$fission_self_semantic_output"
+grep -q "^68$" <<<"$fission_self_semantic_output"
 grep -q "^0$" <<<"$fission_self_semantic_output"
+
+self_loop_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_loop_semantic_smoke.abas)"
+
+grep -q "^TRUE$" <<<"$self_loop_output"
+grep -q "^FALSE$" <<<"$self_loop_output"
+grep -q "^  Variable module::item$" <<<"$self_loop_output"
+grep -q "^  Variable module::index$" <<<"$self_loop_output"
+grep -q "^    Read module::item -> Resolved module::item$" <<<"$self_loop_output"
+grep -q "^    Read module::index -> Resolved module::index$" <<<"$self_loop_output"
 
 self_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_self_semantic_smoke.abas)"
 

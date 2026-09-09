@@ -45,6 +45,7 @@ Files = [
     "fission/tests/arcobasic_lexer_smoke.abas",
     "fission/tests/arcobasic_literal_smoke.abas",
     "fission/tests/arcobasic_logic_smoke.abas",
+    "fission/tests/arcobasic_loop_semantic_smoke.abas",
     "fission/tests/arcobasic_named_defaults_smoke.abas",
     "fission/tests/arcobasic_os_stdlib_parse_smoke.abas",
     "fission/tests/arcobasic_parser_smoke.abas",

@@ -227,6 +227,10 @@ FUNCTION Fission_ArcoBasicAnalyzeSirNode(report, node, scope)
         NEXT
         RETURN
     END IF
+    IF node.Kind == "ForEach" OR node.Kind == "ForRange" THEN
+        name = Object.Get(node.Fields, "Name", "")
+        IF name != "" AND report.HasSymbol(scope, name) == FALSE THEN ignored = report.AddSymbol(FissionArcoBasicSemanticSymbol(name, "Variable", scope))
+    END IF
     FOR child IN node.Children
         ignored = Fission_ArcoBasicAnalyzeSirNode(report, child, scope)
     NEXT

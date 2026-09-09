@@ -152,6 +152,9 @@ ArcoBASIC subset and lowers it into structured SIR.
   fields from `SELF.Field = ...`, resolves `SELF.Field` references against the
   enclosing class scope, and resolves `SELF.Method(...)` calls against class
   methods.
+- Loop variables from `FOR item IN values` and `FOR index = start TO end` are
+  now recorded as semantic variables in the active scope before loop body
+  resolution.
 - `language.arcobasic` now attaches `Semantics.Render` and
   `SemanticSymbolCount`/`SemanticReferenceCount` metadata to produced SIR
   artifacts and propagates semantic diagnostics into the compile result.
@@ -306,6 +309,16 @@ ArcoBASIC subset and lowers it into structured SIR.
   current first-party Fission `.abas` files and zero parse/lowering/semantic
   diagnostics.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_fission_self_parse_smoke.abas` passed with 68 current
+  first-party Fission `.abas` files and zero parse/lowering failures.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_fission_self_semantic_smoke.abas` passed with 68
+  current first-party Fission `.abas` files and zero strict
+  parse/lowering/semantic diagnostics.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_loop_semantic_smoke.abas` passed, proving strict
+  semantic resolution for `FOR IN` and numeric `FOR` loop variables.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_self_semantic_smoke.abas` passed, proving strict
   `SELF` field/method resolution for a class-local fixture.
 - `build-rivet/ArcoFission compile-run
@@ -419,6 +432,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_lexer_smoke.abas`
 - `fission/tests/arcobasic_literal_smoke.abas`
 - `fission/tests/arcobasic_logic_smoke.abas`
+- `fission/tests/arcobasic_loop_semantic_smoke.abas`
 - `fission/tests/arcobasic_named_defaults_smoke.abas`
 - `fission/tests/arcobasic_os_stdlib_parse_smoke.abas`
 - `fission/tests/arcobasic_preprocess_smoke.abas`
@@ -514,6 +528,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - Fission now carries every current first-party Fission `.abas` source through
   non-strict ArcoBASIC semantic analysis without diagnostics. This is not
   self-compilation yet, but it is the next rung above structural self-parse.
+- Fission now carries every current first-party Fission `.abas` source through
+  strict per-file ArcoBASIC semantic analysis without diagnostics. This still
+  analyzes files independently; whole-program import-aware semantics is the next
+  self-compilation step.
 - The first self-compilation semantic pressure point is covered: class fields and
   self-method calls are represented in the semantic report instead of falling
   through as unresolved or external `SELF` reads.
@@ -529,9 +547,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 
 1. Continue expanding ArcoBASIC frontend compatibility against real Arcology
    source files until the Fission parser can ingest the primary ABAS corpus.
-2. Keep advancing Fission self-compilation by moving from structural self-parse
-   to strict whole-Fission semantic analysis: imports, host globals, class
-   fields, methods, and function signatures must resolve cleanly.
+2. Keep advancing Fission self-compilation by moving from strict per-file
+   semantic analysis to import-aware whole-program semantic analysis: imports,
+   host globals, class fields, methods, and function signatures must resolve
+   cleanly across files.
 3. Add real import expansion once package/source discovery rules are available.
 4. Add lambdas, richer type syntax, and more complete access/inheritance
    semantic validation.
