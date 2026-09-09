@@ -98,7 +98,7 @@ ArcoBASIC subset and lowers it into structured SIR.
   - class declarations
   - constructors
   - interfaces
-  - access/abstract modifiers
+  - access/abstract/shared modifiers
   - class `EXTENDS` and `IMPLEMENTS` metadata
   - call expressions with positional and named arguments
   - method-style/postfix call expressions
@@ -123,9 +123,12 @@ ArcoBASIC subset and lowers it into structured SIR.
   variables, constants, functions, parameters, classes, interfaces, constructor
   scopes, inferred assignment-created locals, return types, and parameter
   defaults, and reports duplicate symbols through normal diagnostics.
+  It also resolves reads and direct calls against enclosing scopes, records
+  resolved/external/unresolved references, and enforces unresolved-reference
+  diagnostics when `#STRICT` is active.
 - `language.arcobasic` now attaches `Semantics.Render` and
-  `SemanticSymbolCount` metadata to produced SIR artifacts and propagates
-  semantic diagnostics into the compile result.
+  `SemanticSymbolCount`/`SemanticReferenceCount` metadata to produced SIR
+  artifacts and propagates semantic diagnostics into the compile result.
 - Top-level `FissionCompiler.Compile()` now propagates artifact-carried
   diagnostics, allowing ArcoBASIC parser/SIR diagnostics to fail compilation.
 - `FissionCompiler.Reveal(request, "AST"|"SIR"|"PIPELINE")` added for the
@@ -163,6 +166,9 @@ ArcoBASIC subset and lowers it into structured SIR.
   not yet real import expansion, full directive metadata semantics, lambdas,
   complete generic type syntax, full host interop, resolved symbols/types, or
   complete legacy-compatible syntax/semantics.
+- Non-strict ArcoBASIC currently records unresolved references without failing
+  compilation so existing host/global-heavy code can keep flowing through the
+  substrate. `#STRICT` converts unresolved references into diagnostics.
 - Unsupported ArcoBASIC statements are now surfaced into the top-level compile
   result diagnostics.
 - No Brainfuck reference language exists yet.
@@ -229,7 +235,13 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_semantic_diagnostics_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_semantic_reference_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_shared_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_single_line_if_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_strict_semantic_smoke.abas` passed.
 - `tests/integration/fission_substrate_core_smoke.sh build-rivet/ArcoFission
   /home/daedalus/projects/arcobasic` passed.
 - `(cd fission && ../build-rivet/fissure run)` passed.
@@ -300,7 +312,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_reveal_smoke.abas`
 - `fission/tests/arcobasic_semantic_smoke.abas`
 - `fission/tests/arcobasic_semantic_diagnostics_smoke.abas`
+- `fission/tests/arcobasic_semantic_reference_smoke.abas`
+- `fission/tests/arcobasic_shared_smoke.abas`
 - `fission/tests/arcobasic_single_line_if_smoke.abas`
+- `fission/tests/arcobasic_strict_semantic_smoke.abas`
 - `fission/tests/arcobasic_string_smoke.abas`
 - `fission/tests/arcobasic_type_compound_smoke.abas`
 - `tests/integration/fission_substrate_core_smoke.sh`
@@ -356,9 +371,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 ## Next Recommended Work
 
 1. Add real import expansion once package/source discovery rules are available.
-2. Add lambdas, `ADDRESSOF`, `DO` loops, comprehensions, named/optional
-   arguments, and more complete access/inheritance semantic validation.
-3. Add typed SIR values, scopes, symbols, and function signatures.
+2. Add lambdas, richer type syntax, and more complete access/inheritance
+   semantic validation.
+3. Promote semantic report data into typed SIR scopes, symbol references, and
+   function signatures.
 4. Replace metadata-carried reveal payloads with typed reveal artifacts.
 5. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal
    output as the oracle.

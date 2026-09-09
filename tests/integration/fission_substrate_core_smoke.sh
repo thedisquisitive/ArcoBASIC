@@ -278,6 +278,32 @@ grep -q "^FALSE$" <<<"$semantic_diagnostics_output"
 grep -q "^TRUE$" <<<"$semantic_diagnostics_output"
 grep -q "FISSION_ARCOBASIC_DUPLICATE_SYMBOL" <<<"$semantic_diagnostics_output"
 
+semantic_reference_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_semantic_reference_smoke.abas)"
+
+grep -q "^TRUE$" <<<"$semantic_reference_output"
+grep -q "^FALSE$" <<<"$semantic_reference_output"
+grep -q "^4$" <<<"$semantic_reference_output"
+grep -q "^5$" <<<"$semantic_reference_output"
+grep -q "^    Call module::Paint::Helper -> Resolved module::Helper$" <<<"$semantic_reference_output"
+grep -q "^    Read module::Paint::GUI -> External$" <<<"$semantic_reference_output"
+grep -q "^    Read module::Paint::missing -> Unresolved$" <<<"$semantic_reference_output"
+
+strict_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_strict_semantic_smoke.abas)"
+
+grep -q "^FALSE$" <<<"$strict_semantic_output"
+grep -q "^TRUE$" <<<"$strict_semantic_output"
+grep -q "FISSION_ARCOBASIC_UNRESOLVED_SYMBOL" <<<"$strict_semantic_output"
+grep -q "^    Read module::Paint::GUI -> External$" <<<"$strict_semantic_output"
+grep -q "^    Read module::Paint::missing -> Unresolved$" <<<"$strict_semantic_output"
+
+shared_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_shared_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$shared_output")" = "2"
+grep -q "^ArcoBASIC AST shared-smoke.abas$" <<<"$shared_output"
+grep -q "^      Modifier(Name=SHARED)$" <<<"$shared_output"
+grep -q "^        Function(Name=Issue, Arguments=prefix:String, Returns=String)$" <<<"$shared_output"
+grep -q "^SIR shared-smoke.abas v0.1$" <<<"$shared_output"
+
 diagnostics_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_diagnostics_smoke.abas)"
 
 grep -q "^FALSE$" <<<"$diagnostics_output"

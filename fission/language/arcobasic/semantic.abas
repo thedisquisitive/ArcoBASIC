@@ -18,10 +18,27 @@ CLASS FissionArcoBasicSemanticSymbol
     END FUNCTION
 END CLASS
 
+CLASS FissionArcoBasicSemanticReference
+    CONSTRUCTOR(kind, name, scope)
+        SELF.Kind = kind
+        SELF.Name = name
+        SELF.Scope = scope
+        SELF.Target = ""
+        SELF.Status = "Unresolved"
+    END CONSTRUCTOR
+
+    FUNCTION Render()
+        text = SELF.Kind + " " + SELF.Scope + "::" + SELF.Name + " -> " + SELF.Status
+        IF SELF.Target != "" THEN text = text + " " + SELF.Target
+        RETURN text
+    END FUNCTION
+END CLASS
+
 CLASS FissionArcoBasicSemanticReport
     CONSTRUCTOR(moduleName)
         SELF.ModuleName = moduleName
         SELF.Symbols = []
+        SELF.References = []
         SELF.Diagnostics = FissionDiagnosticBag()
     END CONSTRUCTOR
 
@@ -30,6 +47,26 @@ CLASS FissionArcoBasicSemanticReport
             IF symbol.Scope == scope AND Lower(symbol.Name) == Lower(name) THEN RETURN TRUE
         NEXT
         RETURN FALSE
+    END FUNCTION
+
+    FUNCTION FindSymbol(scope, name)
+        searchScope = scope
+        WHILE TRUE
+            FOR symbol IN SELF.Symbols
+                IF symbol.Scope == searchScope AND Lower(symbol.Name) == Lower(name) THEN RETURN symbol
+            NEXT
+            IF searchScope == "module" THEN EXIT WHILE
+            IF String.Contains(searchScope, "::") == FALSE THEN EXIT WHILE
+            parts = String.Split(searchScope, "::")
+            parentParts = []
+            index = 0
+            WHILE index < LEN(parts) - 1
+                ignored = Array.Push(parentParts, parts[index])
+                index = index + 1
+            WEND
+            searchScope = Array.Join(parentParts, "::")
+        WEND
+        RETURN NULL
     END FUNCTION
 
     FUNCTION AddSymbol(symbol)
@@ -41,14 +78,31 @@ CLASS FissionArcoBasicSemanticReport
         RETURN symbol
     END FUNCTION
 
+    FUNCTION AddReference(reference)
+        ignored = Array.Push(SELF.References, reference)
+        RETURN reference
+    END FUNCTION
+
     FUNCTION Render()
         lines = ["ArcoBASIC Semantics " + SELF.ModuleName]
         FOR symbol IN SELF.Symbols
             ignored = Array.Push(lines, "  " + symbol.Render())
         NEXT
+        IF LEN(SELF.References) > 0 THEN
+            ignored = Array.Push(lines, "  References")
+            FOR reference IN SELF.References
+                ignored = Array.Push(lines, "    " + reference.Render())
+            NEXT
+        END IF
         RETURN Array.Join(lines, "\n")
     END FUNCTION
 END CLASS
+
+FUNCTION Fission_ArcoBasicSemanticExternalName(name)
+    IF name == "" THEN RETURN FALSE
+    first = String.Slice(name, 0, 1)
+    RETURN first == Upper(first)
+END FUNCTION
 
 FUNCTION Fission_ArcoBasicSemanticSplitArgument(argumentText)
     symbol = FissionArcoBasicSemanticSymbol(argumentText, "Parameter", "")
@@ -141,10 +195,105 @@ FUNCTION Fission_ArcoBasicAnalyzeSirNode(report, node, scope)
     NEXT
 END FUNCTION
 
+FUNCTION Fission_ArcoBasicResolveReference(report, kind, name, scope)
+    reference = FissionArcoBasicSemanticReference(kind, name, scope)
+    symbol = report.FindSymbol(scope, name)
+    IF symbol != NULL THEN
+        reference.Status = "Resolved"
+        reference.Target = symbol.Scope + "::" + symbol.Name
+        RETURN report.AddReference(reference)
+    END IF
+    IF Fission_ArcoBasicSemanticExternalName(name) THEN
+        reference.Status = "External"
+        RETURN report.AddReference(reference)
+    END IF
+    ignored = report.AddReference(reference)
+    RETURN reference
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicResolveSirNode(report, node, scope)
+    IF node.Kind == "Read" THEN
+        ignored = Fission_ArcoBasicResolveReference(report, "Read", Object.Get(node.Fields, "Name", ""), scope)
+        RETURN
+    END IF
+    IF node.Kind == "Call" THEN
+        ignored = Fission_ArcoBasicResolveReference(report, "Call", Object.Get(node.Fields, "Name", ""), scope)
+        FOR child IN node.Children
+            ignored = Fission_ArcoBasicResolveSirNode(report, child, scope)
+        NEXT
+        RETURN
+    END IF
+    IF node.Kind == "CallExpr" THEN
+        IF LEN(node.Children) > 0 THEN
+            callee = node.Children[0]
+            IF callee.Kind == "Read" THEN
+                ignored = Fission_ArcoBasicResolveReference(report, "Call", Object.Get(callee.Fields, "Name", ""), scope)
+            ELSE
+                ignored = Fission_ArcoBasicResolveSirNode(report, callee, scope)
+            END IF
+        END IF
+        index = 1
+        WHILE index < LEN(node.Children)
+            ignored = Fission_ArcoBasicResolveSirNode(report, node.Children[index], scope)
+            index = index + 1
+        WEND
+        RETURN
+    END IF
+    IF node.Kind == "Function" THEN
+        functionScope = scope + "::" + Object.Get(node.Fields, "Name", "")
+        FOR child IN node.Children
+            ignored = Fission_ArcoBasicResolveSirNode(report, child, functionScope)
+        NEXT
+        RETURN
+    END IF
+    IF node.Kind == "Constructor" THEN
+        constructorScope = scope + "::CONSTRUCTOR"
+        FOR child IN node.Children
+            ignored = Fission_ArcoBasicResolveSirNode(report, child, constructorScope)
+        NEXT
+        RETURN
+    END IF
+    IF node.Kind == "Class" THEN
+        classScope = scope + "::" + Object.Get(node.Fields, "Name", "")
+        FOR child IN node.Children
+            ignored = Fission_ArcoBasicResolveSirNode(report, child, classScope)
+        NEXT
+        RETURN
+    END IF
+    IF node.Kind == "Interface" THEN
+        interfaceScope = scope + "::" + Object.Get(node.Fields, "Name", "")
+        FOR child IN node.Children
+            ignored = Fission_ArcoBasicResolveSirNode(report, child, interfaceScope)
+        NEXT
+        RETURN
+    END IF
+    FOR child IN node.Children
+        ignored = Fission_ArcoBasicResolveSirNode(report, child, scope)
+    NEXT
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicEnforceStrictReferences(report)
+    FOR reference IN report.References
+        IF reference.Status == "Unresolved" THEN
+            ignored = report.Diagnostics.ReportError("FISSION_ARCOBASIC_UNRESOLVED_SYMBOL", "Unresolved " + Lower(reference.Kind) + " " + reference.Scope + "::" + reference.Name)
+        END IF
+    NEXT
+    RETURN report
+END FUNCTION
+
 FUNCTION Fission_ArcoBasicAnalyzeSir(module)
     report = FissionArcoBasicSemanticReport(module.Name)
     FOR statement IN module.Statements
         ignored = Fission_ArcoBasicAnalyzeSirNode(report, statement, "module")
     NEXT
+    FOR statement IN module.Statements
+        ignored = Fission_ArcoBasicResolveSirNode(report, statement, "module")
+    NEXT
+    RETURN report
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicAnalyzeSirStrict(module)
+    report = Fission_ArcoBasicAnalyzeSir(module)
+    ignored = Fission_ArcoBasicEnforceStrictReferences(report)
     RETURN report
 END FUNCTION

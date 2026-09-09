@@ -144,7 +144,7 @@ CLASS FissionArcoBasicParser
         IF token.Kind == "Keyword" AND Lower(token.Text) == "constructor" THEN RETURN SELF.ParseConstructorStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "class" THEN RETURN SELF.ParseClassStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "interface" THEN RETURN SELF.ParseInterfaceStmt()
-        IF token.Kind == "Keyword" AND Fission_ListContains(["public", "private", "protected", "abstract"], Lower(token.Text)) THEN RETURN SELF.ParseModifierStmt()
+        IF token.Kind == "Keyword" AND Fission_ListContains(["public", "private", "protected", "abstract", "shared"], Lower(token.Text)) THEN RETURN SELF.ParseModifierStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "if" THEN RETURN SELF.ParseConditionalStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "while" THEN RETURN SELF.ParseWhileStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "do" THEN RETURN SELF.ParseDoStmt()

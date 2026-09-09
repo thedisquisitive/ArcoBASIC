@@ -9,7 +9,11 @@ FUNCTION Fission_ArcoBasicSourceToSir(artifact, context)
     tokens = Fission_ArcoBasicLex(preprocessed.Source)
     ast = Fission_ArcoBasicParse(tokens, artifact.Name)
     module = Fission_ArcoBasicAstToSir(ast)
-    semantics = Fission_ArcoBasicAnalyzeSir(module)
+    IF preprocessed.Metadata.Strict THEN
+        semantics = Fission_ArcoBasicAnalyzeSirStrict(module)
+    ELSE
+        semantics = Fission_ArcoBasicAnalyzeSir(module)
+    END IF
     ignored = module.Diagnostics.AppendMany(preprocessed.Diagnostics)
     ignored = module.Diagnostics.AppendMany(semantics.Diagnostics)
     sir = FissionArtifact("SIR", artifact.Name + ".sir", module)
@@ -22,6 +26,7 @@ FUNCTION Fission_ArcoBasicSourceToSir(artifact, context)
     ignored = sir.WithMetadata("SIR.Render", module.Render())
     ignored = sir.WithMetadata("Semantics.Render", semantics.Render())
     ignored = sir.WithMetadata("SemanticSymbolCount", String(LEN(semantics.Symbols)))
+    ignored = sir.WithMetadata("SemanticReferenceCount", String(LEN(semantics.References)))
     RETURN sir
 END FUNCTION
 

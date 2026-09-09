@@ -1,0 +1,19 @@
+#IMPORT "fission/core/fission.abas"
+#IMPORT "fission/language/arcobasic/register.abas"
+
+Fission = Fission_New()
+ignored = Fission_RegisterArcoBasic(Fission)
+
+Request = Fission.Request()
+Request.Source = "#STRICT\nFUNCTION Paint(window)\nGUI.Clear(window)\nvalue = missing + 1\nRETURN value\nEND FUNCTION"
+Request.SourceName = "strict-semantic.abas"
+ignored = Request.WithLanguage("arcobasic")
+ignored = Request.ToArtifact("SIR")
+
+Result = Fission.Compiler().Compile(Request)
+
+PRINT Result.Ok
+PRINT Result.Diagnostics.HasErrors()
+PRINT Result.Diagnostics.Render()
+PRINT "---"
+PRINT Result.Artifact.MetadataValue("Semantics.Render", "")
