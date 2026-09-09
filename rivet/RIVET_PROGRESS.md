@@ -258,6 +258,37 @@ themselves.
 - Optional GUI/CURL/FUSE package discovery is now encoded for the hosted Linux path. Cross-platform
   framework discovery (macOS frameworks, Windows SDK/library discovery, Emscripten flags) remains
   future adapter work.
+
+## Session 4 — 2026-09-09
+
+**Scope:** Add high-verbosity build output and poke-at-any-time status interrogation for long
+Rivet builds.
+
+### Files changed
+
+- `rivet/apps/rivet/main.cpp` now supports `rivet build -v`, `rivet build --verbose`,
+  `rivet build --verbosity N`, and `RIVET_VERBOSITY`.
+- Verbosity level 1 reports project/action/job counts, action starts, cache reasons, and action
+  durations. Verbosity level 2 also reports action ids, target names, tools, argv, dependencies,
+  provenance, and successful tool output.
+- `rivet build` writes `.rivet/state/current-build.txt` as a text heartbeat with pid, phase,
+  total action count, compiled/linked/cached/failed counts, active actions, and the last event.
+- `rivet status` reads that heartbeat, so another terminal can inspect an in-progress or last
+  completed build without touching SQLite state.
+- `tests/integration/rivet_smoke.sh` now covers high verbosity and live status interrogation using
+  a deterministic fake `clang++` wrapper that sleeps long enough for the status command to inspect
+  the running build.
+
+### Tests executed
+
+- `cmake --build build --target rivet rivet_tests -j$(nproc)` — passes.
+- `./build/rivet_tests` — passes.
+- `ctest --test-dir build -R '^rivet_smoke$' --output-on-failure` — passes.
+
+### Still open
+
+- `rivet status` is text-only and heartbeat-file based. JSON output, richer graph inspection, and
+  interactive cancellation remain future CLI work.
 - The installer still writes CMake-shaped `link.txt` compatibility files for older/native paths,
   but `ArcoFission native` no longer requires them when the Rivet-built support archives are beside
   the compiler.

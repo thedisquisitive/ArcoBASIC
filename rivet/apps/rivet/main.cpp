@@ -12,10 +12,15 @@
 #include "rivet/toolchain.hpp"
 #include "rivet/vm.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <optional>
+#include <sstream>
 #include <thread>
 #include <unistd.h>
 
@@ -67,7 +72,67 @@ std::string relative_to(const fs::path& path, const fs::path& base) {
     return error ? path.string() : result.generic_string();
 }
 
-int run_build(unsigned jobs) {
+std::string display_name_for(const rivet::BuildAction& action, const fs::path& project_root) {
+    fs::path display(action.display_name);
+    if (display.is_absolute()) return relative_to(display, project_root);
+    return display.generic_string();
+}
+
+struct BuildOptions {
+    unsigned jobs = std::max(1u, std::thread::hardware_concurrency());
+    unsigned verbosity = 0;
+};
+
+std::string shellish_join(const std::vector<std::string>& args) {
+    std::ostringstream out;
+    bool first = true;
+    for (const auto& arg : args) {
+        if (!first) out << ' ';
+        first = false;
+        if (arg.find_first_of(" \t\n'\"$\\") == std::string::npos) {
+            out << arg;
+        } else {
+            out << '\'';
+            for (char ch : arg) {
+                if (ch == '\'') out << "'\\''";
+                else out << ch;
+            }
+            out << '\'';
+        }
+    }
+    return out.str();
+}
+
+void write_build_status(const fs::path& status_path, int pid, const std::string& phase,
+                        std::size_t total, int compiled, int linked, int cached, int failed,
+                        const std::vector<std::string>& active, const std::string& last_event) {
+    fs::create_directories(status_path.parent_path());
+    std::ofstream file(status_path);
+    file << "pid: " << pid << "\n"
+         << "phase: " << phase << "\n"
+         << "total-actions: " << total << "\n"
+         << "compiled: " << compiled << "\n"
+         << "linked: " << linked << "\n"
+         << "cached: " << cached << "\n"
+         << "failed: " << failed << "\n"
+         << "active: " << active.size() << "\n";
+    for (const auto& item : active) file << "  " << item << "\n";
+    if (!last_event.empty()) file << "last: " << last_event << "\n";
+}
+
+int run_status() {
+    fs::path project_root = find_project_root();
+    fs::path status_path = project_root / ".rivet" / "state" / "current-build.txt";
+    if (!fs::exists(status_path)) {
+        std::cout << "rivet: no build status recorded for " << project_root.generic_string() << "\n";
+        return 0;
+    }
+    std::ifstream file(status_path);
+    std::cout << file.rdbuf();
+    return 0;
+}
+
+int run_build(const BuildOptions& options) {
     fs::path project_root = find_project_root();
     // RFC section 31: "Invoking rivet build from a child directory should locate the project
     // root" -- locating it isn't enough on its own. Every relative path this VM's contracts
@@ -87,15 +152,47 @@ int run_build(unsigned jobs) {
 
     rivet::StateStore store = rivet::StateStore::open((state_dir / "rivet.db").string());
     rivet::CacheManager cache(store);
-    rivet::Scheduler scheduler(cache, jobs);
+    rivet::Scheduler scheduler(cache, options.jobs);
 
     int compiled = 0, linked = 0, cached = 0, failed = 0;
+    std::mutex event_mutex;
+    std::vector<std::string> active;
+    fs::path status_path = state_dir / "current-build.txt";
+    const std::size_t total_actions = vm.graph().actions().size();
+
+    write_build_status(status_path, static_cast<int>(getpid()), "starting", total_actions,
+                       compiled, linked, cached, failed, active, "loaded build graph");
+
+    if (options.verbosity >= 1) {
+        std::cout << "[RIVET] project " << project_root.generic_string() << "\n"
+                  << "[RIVET] actions " << total_actions << ", jobs " << options.jobs
+                  << ", verbosity " << options.verbosity << "\n";
+    }
+
     auto on_event = [&](const std::string& kind, const rivet::ActionResult& result) {
+        std::lock_guard<std::mutex> lock(event_mutex);
         const rivet::BuildAction* action = vm.graph().find(result.identity);
-        std::string display = action ? relative_to(action->display_name, project_root) : result.identity;
-        if (kind == "cache") {
+        std::string display = action ? display_name_for(*action, project_root) : result.identity;
+        std::string last_event;
+        if (kind == "start") {
+            active.push_back(display);
+            last_event = "start " + display;
+            if (options.verbosity >= 1) {
+                std::cout << "[START]   " << display << "\n";
+                if (options.verbosity >= 2 && action) {
+                    std::cout << "  id:     " << action->identity << "\n"
+                              << "  target: " << action->target << "\n"
+                              << "  tool:   " << action->tool << "\n"
+                              << "  argv:   " << shellish_join(action->arguments) << "\n"
+                              << "  origin: " << action->origin.script << ":" << action->origin.function << "\n";
+                    if (!action->dependencies.empty()) std::cout << "  deps:   " << shellish_join(action->dependencies) << "\n";
+                }
+            }
+        } else if (kind == "cache") {
             std::cout << "[CACHE]   " << display << "\n";
             ++cached;
+            last_event = "cache " + display;
+            if (options.verbosity >= 1) std::cout << "  reason: " << result.reason << "\n";
         } else if (kind == "ran") {
             if (action && action->type == rivet::ActionType::Archive) {
                 std::cout << "[ARCHIVE] " << display << "\n";
@@ -107,6 +204,9 @@ int run_build(unsigned jobs) {
                 std::cout << "[COMPILE] " << display << "\n";
                 ++compiled;
             }
+            last_event = "ran " + display;
+            if (options.verbosity >= 1) std::cout << "  duration: " << result.duration_seconds << "s\n";
+            if (options.verbosity >= 2 && !result.output.empty()) std::cout << result.output << "\n";
         } else if (kind == "failed") {
             std::cout << "[FAIL]    " << display << " (exit " << result.exit_code << ")\n";
             if (!result.output.empty()) std::cout << result.output << "\n";
@@ -115,9 +215,17 @@ int run_build(unsigned jobs) {
                           << "  origin: " << action->origin.script << ":" << action->origin.function << "\n";
             }
             ++failed;
+            last_event = "failed " + display;
         } else if (kind == "skipped") {
             std::cout << "[SKIP]    " << display << " (" << result.reason << ")\n";
+            last_event = "skipped " + display;
         }
+        if (kind != "start") {
+            active.erase(std::remove(active.begin(), active.end(), display), active.end());
+        }
+        write_build_status(status_path, static_cast<int>(getpid()),
+                           kind == "start" ? "running" : "running", total_actions,
+                           compiled, linked, cached, failed, active, last_event);
     };
 
     std::vector<rivet::ActionResult> results = scheduler.run(vm.graph(), on_event);
@@ -125,6 +233,8 @@ int run_build(unsigned jobs) {
 
     std::cout << "[DONE] " << compiled << " compiled, " << linked << " linked, " << cached
               << " cached, " << failed << " failed\n";
+    write_build_status(status_path, static_cast<int>(getpid()), failed > 0 ? "failed" : "complete",
+                       total_actions, compiled, linked, cached, failed, active, "build finished");
     return failed > 0 ? 1 : 0;
 }
 
@@ -226,6 +336,8 @@ int run_clean(bool all) {
 void print_usage() {
     std::cerr << "usage: rivet <command> [options]\n\n"
                  "  build [--jobs N]        build the project rooted at the nearest build.abas\n"
+                 "        [-v|--verbose] [--verbosity N]\n"
+                 "  status                  show the current or last build heartbeat\n"
                  "  why rebuild <file>      explain why a file's dependent actions would rebuild\n"
                  "  clean [--all]           remove Rivet-owned build outputs (--all also clears state)\n\n"
                  "not yet implemented (see rivet/RIVET_PROGRESS.md):\n"
@@ -242,16 +354,25 @@ int main(int argc, char** argv) {
     std::string command = argv[1];
     try {
         if (command == "build") {
-            unsigned jobs = std::max(1u, std::thread::hardware_concurrency());
+            BuildOptions options;
+            if (const char* env_verbosity = std::getenv("RIVET_VERBOSITY")) {
+                options.verbosity = static_cast<unsigned>(std::stoul(env_verbosity));
+            }
             for (int i = 2; i < argc; ++i) {
                 std::string arg = argv[i];
-                if (arg == "--jobs" && i + 1 < argc) jobs = static_cast<unsigned>(std::stoul(argv[++i]));
+                if (arg == "--jobs" && i + 1 < argc) options.jobs = static_cast<unsigned>(std::stoul(argv[++i]));
+                else if (arg == "-v" || arg == "--verbose") ++options.verbosity;
+                else if (arg == "--verbosity" && i + 1 < argc) options.verbosity = static_cast<unsigned>(std::stoul(argv[++i]));
                 else {
                     std::cerr << "rivet build: unrecognized option '" << arg << "'\n";
                     return 2;
                 }
             }
-            return run_build(jobs);
+            options.jobs = std::max(1u, options.jobs);
+            return run_build(options);
+        }
+        if (command == "status") {
+            return run_status();
         }
         if (command == "why") {
             if (argc < 4 || std::string(argv[2]) != "rebuild") {

@@ -376,6 +376,11 @@ real_project_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_real_p
 grep -q "^10$" <<<"$real_project_output"
 grep -q "^0$" <<<"$real_project_output"
 
+fission_self_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_parse_smoke.abas)"
+
+grep -q "^65$" <<<"$fission_self_output"
+grep -q "^0$" <<<"$fission_self_output"
+
 os_stdlib_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_os_stdlib_parse_smoke.abas)"
 
 grep -q "^25$" <<<"$os_stdlib_output"

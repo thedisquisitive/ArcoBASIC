@@ -157,6 +157,10 @@ CLASS FissionSirBuilder
         RETURN node
     END FUNCTION
 
+    FUNCTION StopExecution()
+        RETURN FissionSirNode("Stop")
+    END FUNCTION
+
     FUNCTION Binary(operatorName, left, right)
         node = FissionSirNode("Binary")
         ignored = node.WithField("Operator", operatorName)

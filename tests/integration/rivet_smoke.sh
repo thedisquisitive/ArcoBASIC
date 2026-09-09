@@ -70,6 +70,67 @@ if [ -f build/tinyapp ]; then
     exit 1
 fi
 
+echo "=== verbose build and live status interrogation ==="
+VERBOSE_PROJECT="$TMP_ROOT/verbose-project"
+FAKE_BIN="$TMP_ROOT/fake-bin"
+mkdir -p "$VERBOSE_PROJECT/include" "$VERBOSE_PROJECT/src" "$FAKE_BIN"
+cat > "$FAKE_BIN/clang++" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--version" ]; then
+    echo "fake clang++ 1.0"
+    exit 0
+fi
+out=""
+dep=""
+compile=0
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "-o" ]; then out="$arg"; fi
+    if [ "$prev" = "-MF" ]; then dep="$arg"; fi
+    if [ "$arg" = "-c" ]; then compile=1; fi
+    prev="$arg"
+done
+sleep 2
+mkdir -p "$(dirname "$out")"
+if [ "$compile" = "1" ]; then
+    printf 'fake object\n' > "$out"
+    if [ -n "$dep" ]; then printf '%s: src/slow.cpp\n' "$out" > "$dep"; fi
+else
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$out"
+    chmod +x "$out"
+fi
+EOF
+chmod +x "$FAKE_BIN/clang++"
+cat > "$VERBOSE_PROJECT/src/slow.cpp" <<'EOF'
+int main() { return 0; }
+EOF
+cat > "$VERBOSE_PROJECT/build.abas" <<'EOF'
+App = BUILD.Executable("slowapp")
+ignored = App.Sources.Append("src/slow.cpp")
+ignored = App.Build()
+EOF
+(
+    cd "$VERBOSE_PROJECT"
+    PATH="$FAKE_BIN:$PATH" "$RIVET" build --jobs 1 --verbosity 2 > verbose.log 2>&1 &
+    build_pid=$!
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if "$RIVET" status > live-status.log 2>&1 && grep -q "^phase: running" live-status.log; then
+            break
+        fi
+        sleep 0.3
+    done
+    grep -q "^phase: running" live-status.log
+    grep -q "^active: 1" live-status.log
+    wait "$build_pid"
+    grep -q "^\[RIVET\] actions 2, jobs 1, verbosity 2" verbose.log
+    grep -q "^\[START\]   src/slow.cpp" verbose.log
+    grep -q "^  argv:   " verbose.log
+    "$RIVET" status | tee final-status.log
+    grep -q "^phase: complete" final-status.log
+    grep -q "^active: 0" final-status.log
+)
+
 echo "=== static library target feeds executable target ==="
 STATIC_PROJECT="$TMP_ROOT/static-project"
 mkdir -p "$STATIC_PROJECT/include" "$STATIC_PROJECT/src"

@@ -184,6 +184,7 @@ CLASS FissionArcoBasicParser
         IF token.Kind == "Keyword" AND Lower(token.Text) == "let" THEN RETURN SELF.ParseLetStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "const" THEN RETURN SELF.ParseConstStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "return" THEN RETURN SELF.ParseReturnStmt()
+        IF token.Kind == "Keyword" AND Lower(token.Text) == "stop" THEN RETURN SELF.ParseStopStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "function" THEN RETURN SELF.ParseFunctionStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "constructor" THEN RETURN SELF.ParseConstructorStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "class" THEN RETURN SELF.ParseClassStmt()
@@ -309,6 +310,11 @@ CLASS FissionArcoBasicParser
         IF SELF.PeekToken().Kind == "Newline" OR SELF.PeekToken().Kind == "EOF" OR SELF.CheckText("end") OR SELF.CheckText("else") THEN RETURN FissionArcoBasicAstNode("Return")
         expression = SELF.ParseExpression()
         RETURN FissionArcoBasicAstNode("Return").AppendChild(expression)
+    END FUNCTION
+
+    FUNCTION ParseStopStmt()
+        ignored = SELF.ReadToken()
+        RETURN FissionArcoBasicAstNode("Stop")
     END FUNCTION
 
     FUNCTION ParseFunctionStmt()

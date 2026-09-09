@@ -137,8 +137,9 @@ ArcoBASIC subset and lowers it into structured SIR.
     literals such as `"addressof"`, `"or"`, and `"mod"` are not parsed as
     syntax
   - logical bang unary expressions (`!value`)
+  - `STOP` statements as structural SIR
   - multi-line call, argument, array, and object literal lists
-  - the Fission ArcoBASIC parser source itself as an input fixture
+  - every current first-party Fission `.abas` source as an input fixture
 - AST-to-SIR lowering added for the current ArcoBASIC parser subset.
 - Initial ArcoBASIC semantic report pass added. It walks SIR, records imports,
   variables, constants, functions, parameters, classes, interfaces, constructor
@@ -288,6 +289,9 @@ ArcoBASIC subset and lowers it into structured SIR.
   project files, including ArcoUI, ArcoWrite, Arconaut, and the Fission
   ArcoBASIC parser itself.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_fission_self_parse_smoke.abas` passed with 65 current
+  first-party Fission `.abas` files and zero parse/lowering failures.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_include_metadata_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_legacy_operator_smoke.abas` passed.
@@ -315,6 +319,9 @@ ArcoBASIC subset and lowers it into structured SIR.
   fission/tests/arcobasic_strict_semantic_smoke.abas` passed.
 - `tests/integration/fission_substrate_core_smoke.sh build-rivet/ArcoFission
   /home/daedalus/projects/arcobasic` passed.
+- `tests/integration/fission_substrate_core_smoke.sh build-rivet/ArcoFission
+  /home/daedalus/projects/arcobasic` passed with the Fission self-parse fixture
+  included.
 - `(cd fission && ../build-rivet/fissure run)` passed.
 - `(cd fission && ../build-rivet/fissure run --full)` passed.
 - `ctest --test-dir build -R '^fission_substrate_core_smoke$'
@@ -386,6 +393,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_directive_decl_smoke.abas`
 - `fission/tests/arcobasic_do_bitwise_smoke.abas`
 - `fission/tests/arcobasic_expression_smoke.abas`
+- `fission/tests/arcobasic_fission_self_parse_smoke.abas`
 - `fission/tests/arcobasic_function_smoke.abas`
 - `fission/tests/arcobasic_include_metadata_smoke.abas`
 - `fission/tests/arcobasic_legacy_operator_smoke.abas`
@@ -481,6 +489,9 @@ ArcoBASIC subset and lowers it into structured SIR.
   lex/parse/SIR lowering without diagnostics, including graphics, descriptor
   table, block device, volume, timer, keyboard, FAT32, namespace, UEFI memory,
   and virtio-net policy sources.
+- Fission now carries every current first-party Fission `.abas` source through
+  ArcoBASIC lex/parse/SIR lowering without diagnostics, including the executable
+  module entrypoint and all Fission smoke fixtures.
 - The language authoring kit is a convenience facade over ordinary ArcoBASIC
   Fission APIs, not a compiler-definition DSL. It must remain layered on the same
   public component contracts used by first-party language packages.

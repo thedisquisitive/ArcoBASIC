@@ -97,6 +97,7 @@ FUNCTION Fission_ArcoBasicAstStatementToSir(builder, ast)
         IF LEN(ast.Children) > 0 THEN value = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
         RETURN builder.ReturnValue(value)
     END IF
+    IF ast.Kind == "Stop" THEN RETURN builder.StopExecution()
     IF ast.Kind == "Function" THEN
         body = Fission_ArcoBasicAstBlockToSir(builder, ast.Children[0])
         argsText = Object.Get(ast.Fields, "Arguments", "")
