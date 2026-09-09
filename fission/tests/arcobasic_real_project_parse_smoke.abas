@@ -1,0 +1,31 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Files = [
+    "arcology-os/stdlib/timer_policy.abas",
+    "arcology-os/stdlib/uefi_bootstrap.abas",
+    "arcology-os/stdlib/uefi_memory_manager.abas",
+    "arco3d/stdlib/arco3d_rig.abas",
+    "arco3d/stdlib/arco3d_scene.abas",
+    "examples/gui_window.abas"
+]
+
+Failures = 0
+Parsed = 0
+
+FOR path IN Files
+    Source = File.ReadText(path)
+    Tokens = Fission_ArcoBasicLex(Source)
+    Ast = Fission_ArcoBasicParse(Tokens, path)
+    Sir = Fission_ArcoBasicAstToSir(Ast)
+    IF Ast.Diagnostics.HasErrors() OR Sir.Diagnostics.HasErrors() THEN
+        Failures = Failures + 1
+        PRINT path
+        PRINT Ast.Diagnostics.Render()
+        PRINT Sir.Diagnostics.Render()
+    ELSE
+        Parsed = Parsed + 1
+    END IF
+NEXT
+
+PRINT String(Parsed)
+PRINT String(Failures)

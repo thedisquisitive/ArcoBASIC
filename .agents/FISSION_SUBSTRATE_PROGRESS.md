@@ -131,6 +131,9 @@ ArcoBASIC subset and lowers it into structured SIR.
   - `THROW`
   - member reads and index reads
   - array literals, array comprehensions, and object literals
+  - contextual built-in/keyword-like identifiers used by real project code,
+    including `copy` variables and `STRING(...)` calls
+  - multi-line call, argument, array, and object literal lists
 - AST-to-SIR lowering added for the current ArcoBASIC parser subset.
 - Initial ArcoBASIC semantic report pass added. It walks SIR, records imports,
   variables, constants, functions, parameters, classes, interfaces, constructor
@@ -244,6 +247,8 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_real_timer_parse_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_real_project_parse_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_include_metadata_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_legacy_operator_smoke.abas` passed.
@@ -339,6 +344,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_preprocess_compile_smoke.abas`
 - `fission/tests/arcobasic_preprocess_error_smoke.abas`
 - `fission/tests/arcobasic_real_timer_parse_smoke.abas`
+- `fission/tests/arcobasic_real_project_parse_smoke.abas`
 - `fission/tests/sir_builder_smoke.abas`
 - `fission/tests/arcobasic_parser_smoke.abas`
 - `fission/tests/arcobasic_postfix_smoke.abas`
@@ -403,25 +409,36 @@ ArcoBASIC subset and lowers it into structured SIR.
 - Fission now carries at least one real Arcology OS source file,
   `arcology-os/stdlib/timer_policy.abas`, through ArcoBASIC lex/parse/SIR
   lowering without diagnostics as a standing compatibility smoke.
+- Fission now carries a broader real-project fixture through ArcoBASIC
+  lex/parse/SIR lowering without diagnostics:
+  - `arcology-os/stdlib/timer_policy.abas`
+  - `arcology-os/stdlib/uefi_bootstrap.abas`
+  - `arcology-os/stdlib/uefi_memory_manager.abas`
+  - `arco3d/stdlib/arco3d_rig.abas`
+  - `arco3d/stdlib/arco3d_scene.abas`
+  - `examples/gui_window.abas`
 - The language authoring kit is a convenience facade over ordinary ArcoBASIC
   Fission APIs, not a compiler-definition DSL. It must remain layered on the same
   public component contracts used by first-party language packages.
 
 ## Next Recommended Work
 
-1. Add real import expansion once package/source discovery rules are available.
-2. Expand the language authoring kit with reusable tokenizer/parser helpers,
-   semantic construction recipes, package metadata helpers, and generated
-   tooling metadata.
+1. Continue expanding ArcoBASIC frontend compatibility against real Arcology
+   source files until the Fission parser can ingest the primary ABAS corpus.
+2. Add real import expansion once package/source discovery rules are available.
 3. Add lambdas, richer type syntax, and more complete access/inheritance
    semantic validation.
 4. Promote semantic report data into typed SIR scopes, symbol references, and
    function signatures.
-5. Replace metadata-carried reveal payloads with typed reveal artifacts.
-6. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal
+5. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal
    output as the oracle.
+6. Replace metadata-carried reveal payloads with typed reveal artifacts.
 7. Add route ambiguity policy controls and richer `explain pipeline` output.
 8. Add version negotiation for component contracts.
 9. Add component package discovery/loading conventions under `fission/`.
-10. Keep all legacy compiler calls behind explicitly named bootstrap bridge
+10. After ArcoBASIC frontend support is substantially complete, expand the
+   language authoring kit with reusable tokenizer/parser helpers, semantic
+   construction recipes, package metadata helpers, and generated tooling
+   metadata.
+11. Keep all legacy compiler calls behind explicitly named bootstrap bridge
    components.

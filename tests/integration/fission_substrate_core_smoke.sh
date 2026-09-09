@@ -359,4 +359,9 @@ real_timer_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_real_tim
 test "$(grep -c "^FALSE$" <<<"$real_timer_output")" = "2"
 grep -q "^14$" <<<"$real_timer_output"
 
+real_project_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_real_project_parse_smoke.abas)"
+
+grep -q "^6$" <<<"$real_project_output"
+grep -q "^0$" <<<"$real_project_output"
+
 echo "fission_substrate_core_smoke: all checks passed"

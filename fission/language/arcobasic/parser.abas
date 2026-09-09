@@ -5,7 +5,13 @@
 FUNCTION Fission_ArcoBasicCanName(token)
     IF token.Kind == "Identifier" THEN RETURN TRUE
     IF token.Kind != "Keyword" THEN RETURN FALSE
-    RETURN Fission_ListContains(["add", "remove", "toggle", "flags", "mod", "run", "implements"], Lower(token.Text))
+    RETURN Fission_ListContains(["add", "remove", "toggle", "flags", "mod", "run", "implements", "copy", "string"], Lower(token.Text))
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicCopyActsUnary(nextToken)
+    IF nextToken.Kind == "Newline" OR nextToken.Kind == "EOF" THEN RETURN FALSE
+    IF Fission_ListContains([")", "]", "}", ",", ".", ":", "=", "+", "-", "*", "/", "\\", "%", "<", ">", "<=", ">=", "==", "!=", "<>"], nextToken.Text) THEN RETURN FALSE
+    RETURN TRUE
 END FUNCTION
 
 FUNCTION Fission_ArcoBasicArgumentDefaultText(node)
@@ -102,6 +108,10 @@ CLASS FissionArcoBasicParser
         RETURN Lower(SELF.PeekToken().Text) == Lower(text)
     END FUNCTION
 
+    FUNCTION CheckSymbol(text)
+        RETURN SELF.PeekToken().Kind == "Symbol" AND SELF.PeekToken().Text == text
+    END FUNCTION
+
     FUNCTION MatchText(text)
         IF SELF.CheckText(text) THEN
             ignored = SELF.ReadToken()
@@ -130,6 +140,12 @@ CLASS FissionArcoBasicParser
 
     FUNCTION SkipSeparators()
         WHILE SELF.PeekToken().Kind == "Newline" OR SELF.PeekToken().Text == ":"
+            ignored = SELF.ReadToken()
+        WEND
+    END FUNCTION
+
+    FUNCTION SkipExpressionNewlines()
+        WHILE SELF.PeekToken().Kind == "Newline"
             ignored = SELF.ReadToken()
         WEND
     END FUNCTION
@@ -376,6 +392,7 @@ CLASS FissionArcoBasicParser
     FUNCTION ParseArgumentList()
         args = []
         IF SELF.MatchText("(") THEN
+            ignored = SELF.SkipExpressionNewlines()
             WHILE SELF.Done() == FALSE AND SELF.CheckText(")") == FALSE
                 argToken = SELF.ReadToken()
                 IF Fission_ArcoBasicCanName(argToken) THEN
@@ -391,8 +408,10 @@ CLASS FissionArcoBasicParser
                     ignored = Array.Push(args, argText)
                 END IF
                 IF SELF.MatchText(",") == FALSE THEN
-                    IF SELF.CheckText(")") == FALSE THEN ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_COMMA", "Expected comma in argument list")
+                    ignored = SELF.SkipExpressionNewlines()
+                    IF SELF.CheckText(")") == FALSE THEN ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_COMMA", "Expected comma in argument list before " + SELF.PeekToken().Render())
                 END IF
+                ignored = SELF.SkipExpressionNewlines()
             WEND
             ignored = SELF.MatchText(")")
         END IF
@@ -570,7 +589,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseOrExpr()
         expression = SELF.ParseAndExpr()
-        WHILE SELF.CheckText("or") OR SELF.CheckText("orelse") OR SELF.PeekToken().Text == "||"
+        WHILE SELF.CheckText("or") OR SELF.CheckText("orelse") OR SELF.CheckSymbol("||")
             operatorText = Upper(SELF.ReadToken().Text)
             right = SELF.ParseAndExpr()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
@@ -590,7 +609,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseBitOr()
         expression = SELF.ParseBitXor()
-        WHILE SELF.PeekToken().Text == "|" OR SELF.CheckText("bitor") OR SELF.CheckText("or")
+        WHILE SELF.CheckSymbol("|") OR SELF.CheckText("bitor") OR SELF.CheckText("or")
             operatorText = Upper(SELF.ReadToken().Text)
             right = SELF.ParseBitXor()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
@@ -600,7 +619,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseBitXor()
         expression = SELF.ParseBitAnd()
-        WHILE SELF.PeekToken().Text == "^" OR SELF.CheckText("bitxor") OR SELF.CheckText("xor")
+        WHILE SELF.CheckSymbol("^") OR SELF.CheckText("bitxor") OR SELF.CheckText("xor")
             operatorText = Upper(SELF.ReadToken().Text)
             right = SELF.ParseBitAnd()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
@@ -610,7 +629,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseBitAnd()
         expression = SELF.ParseEquality()
-        WHILE SELF.PeekToken().Text == "&" OR SELF.CheckText("bitand") OR SELF.CheckText("and")
+        WHILE SELF.CheckSymbol("&") OR SELF.CheckText("bitand") OR SELF.CheckText("and")
             operatorText = Upper(SELF.ReadToken().Text)
             right = SELF.ParseEquality()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
@@ -620,7 +639,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseEquality()
         expression = SELF.ParseComparison()
-        WHILE Fission_ListContains(["=", "==", "!=", "<>"], SELF.PeekToken().Text) OR SELF.CheckText("in") OR SELF.CheckText("has")
+        WHILE (SELF.PeekToken().Kind == "Symbol" AND Fission_ListContains(["=", "==", "!=", "<>"], SELF.PeekToken().Text)) OR SELF.CheckText("in") OR SELF.CheckText("has")
             operatorText = Upper(SELF.ReadToken().Text)
             right = SELF.ParseComparison()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
@@ -630,7 +649,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseComparison()
         expression = SELF.ParseShift()
-        WHILE Fission_ListContains(["<", ">", "<=", ">="], SELF.PeekToken().Text) OR SELF.CheckText("contains")
+        WHILE (SELF.PeekToken().Kind == "Symbol" AND Fission_ListContains(["<", ">", "<=", ">="], SELF.PeekToken().Text)) OR SELF.CheckText("contains")
             operatorText = Upper(SELF.ReadToken().Text)
             right = SELF.ParseShift()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
@@ -640,7 +659,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseShift()
         expression = SELF.ParseAddition()
-        WHILE Fission_ListContains(["<<", ">>"], SELF.PeekToken().Text) OR SELF.CheckText("shl") OR SELF.CheckText("shr") OR SELF.CheckText("sar")
+        WHILE (SELF.PeekToken().Kind == "Symbol" AND Fission_ListContains(["<<", ">>"], SELF.PeekToken().Text)) OR SELF.CheckText("shl") OR SELF.CheckText("shr") OR SELF.CheckText("sar")
             operatorText = Upper(SELF.ReadToken().Text)
             right = SELF.ParseAddition()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
@@ -650,7 +669,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseAddition()
         expression = SELF.ParseMultiply()
-        WHILE SELF.PeekToken().Text == "+" OR SELF.PeekToken().Text == "-"
+        WHILE SELF.CheckSymbol("+") OR SELF.CheckSymbol("-")
             operatorText = SELF.ReadToken().Text
             right = SELF.ParseMultiply()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
@@ -660,7 +679,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseMultiply()
         expression = SELF.ParseUnaryExpr()
-        WHILE SELF.PeekToken().Text == "*" OR SELF.PeekToken().Text == "/" OR SELF.PeekToken().Text == "\\" OR SELF.PeekToken().Text == "%" OR SELF.CheckText("mod")
+        WHILE SELF.CheckSymbol("*") OR SELF.CheckSymbol("/") OR SELF.CheckSymbol("\\") OR SELF.CheckSymbol("%") OR SELF.CheckText("mod")
             operatorText = SELF.ReadToken().Text
             IF Lower(operatorText) == "mod" THEN operatorText = "MOD"
             right = SELF.ParseUnaryExpr()
@@ -680,12 +699,12 @@ CLASS FissionArcoBasicParser
             WEND
             RETURN FissionArcoBasicAstNode("AddressOf").WithField("Name", qualifiedName)
         END IF
-        IF SELF.CheckText("copy") THEN
+        IF SELF.CheckText("copy") AND Fission_ArcoBasicCopyActsUnary(SELF.TokenAt(1)) THEN
             ignored = SELF.ReadToken()
             value = SELF.ParseUnaryExpr()
             RETURN FissionArcoBasicAstNode("Copy").AppendChild(value)
         END IF
-        IF SELF.PeekToken().Text == "-" OR SELF.CheckText("not") THEN
+        IF SELF.CheckSymbol("-") OR SELF.CheckText("not") THEN
             operatorText = SELF.ReadToken().Text
             value = SELF.ParseUnaryExpr()
             RETURN FissionArcoBasicAstNode("Unary").WithField("Operator", operatorText).AppendChild(value)
@@ -709,6 +728,7 @@ CLASS FissionArcoBasicParser
             END IF
             IF SELF.MatchText("(") THEN
                 callNode = FissionArcoBasicAstNode("CallExpr").AppendChild(expression)
+                ignored = SELF.SkipExpressionNewlines()
                 WHILE SELF.Done() == FALSE AND SELF.CheckText(")") == FALSE
                     IF Fission_ArcoBasicCanName(SELF.PeekToken()) AND SELF.TokenAt(1).Text == "=" THEN
                         argumentName = SELF.ReadToken().Text
@@ -719,8 +739,10 @@ CLASS FissionArcoBasicParser
                         ignored = callNode.AppendChild(SELF.ParseExpression())
                     END IF
                     IF SELF.MatchText(",") == FALSE THEN
-                        IF SELF.CheckText(")") == FALSE THEN ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_COMMA", "Expected comma in call argument list")
+                        ignored = SELF.SkipExpressionNewlines()
+                        IF SELF.CheckText(")") == FALSE THEN ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_COMMA", "Expected comma in call argument list before " + SELF.PeekToken().Render())
                     END IF
+                    ignored = SELF.SkipExpressionNewlines()
                 WEND
                 ignored = SELF.MatchText(")")
                 expression = callNode
@@ -747,6 +769,7 @@ CLASS FissionArcoBasicParser
         END IF
         IF token.Text == "[" THEN
             arrayNode = FissionArcoBasicAstNode("Array")
+            ignored = SELF.SkipExpressionNewlines()
             WHILE SELF.Done() == FALSE AND SELF.CheckText("]") == FALSE
                 first = SELF.ParseExpression()
                 IF SELF.CheckText("for") THEN
@@ -768,22 +791,27 @@ CLASS FissionArcoBasicParser
                 END IF
                 ignored = arrayNode.AppendChild(first)
                 IF SELF.MatchText(",") == FALSE THEN
-                    IF SELF.CheckText("]") == FALSE THEN ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_COMMA", "Expected comma in array literal")
+                    ignored = SELF.SkipExpressionNewlines()
+                    IF SELF.CheckText("]") == FALSE THEN ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_COMMA", "Expected comma in array literal before " + SELF.PeekToken().Render())
                 END IF
+                ignored = SELF.SkipExpressionNewlines()
             WEND
             ignored = SELF.MatchText("]")
             RETURN arrayNode
         END IF
         IF token.Text == "{" THEN
             objectNode = FissionArcoBasicAstNode("Object")
+            ignored = SELF.SkipExpressionNewlines()
             WHILE SELF.Done() == FALSE AND SELF.CheckText("}") == FALSE
                 keyToken = SELF.ReadToken()
                 ignored = SELF.MatchText(":")
                 field = FissionArcoBasicAstNode("Field").WithField("Name", keyToken.Text).AppendChild(SELF.ParseExpression())
                 ignored = objectNode.AppendChild(field)
                 IF SELF.MatchText(",") == FALSE THEN
-                    IF SELF.CheckText("}") == FALSE THEN ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_COMMA", "Expected comma in object literal")
+                    ignored = SELF.SkipExpressionNewlines()
+                    IF SELF.CheckText("}") == FALSE THEN ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_COMMA", "Expected comma in object literal before " + SELF.PeekToken().Render())
                 END IF
+                ignored = SELF.SkipExpressionNewlines()
             WEND
             ignored = SELF.MatchText("}")
             RETURN objectNode
