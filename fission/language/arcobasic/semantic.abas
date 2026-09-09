@@ -1,5 +1,6 @@
 #IMPORT "fission/core/diagnostics.abas"
 #IMPORT "fission/sir/model.abas"
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
 
 CLASS FissionArcoBasicSemanticSymbol
     CONSTRUCTOR(name, kind, scope)
@@ -97,6 +98,109 @@ CLASS FissionArcoBasicSemanticReport
         RETURN Array.Join(lines, "\n")
     END FUNCTION
 END CLASS
+
+CLASS FissionArcoBasicSourceSemanticResult
+    CONSTRUCTOR(name, source, strict)
+        SELF.Name = name
+        SELF.Source = source
+        SELF.Tokens = Fission_ArcoBasicLex(source)
+        SELF.Ast = Fission_ArcoBasicParse(SELF.Tokens, name)
+        SELF.Sir = Fission_ArcoBasicAstToSir(SELF.Ast)
+        IF strict THEN
+            SELF.Report = Fission_ArcoBasicAnalyzeSirStrict(SELF.Sir)
+        ELSE
+            SELF.Report = Fission_ArcoBasicAnalyzeSir(SELF.Sir)
+        END IF
+        SELF.Diagnostics = FissionDiagnosticBag()
+        ignored = SELF.Diagnostics.AppendMany(SELF.Ast.Diagnostics)
+        ignored = SELF.Diagnostics.AppendMany(SELF.Sir.Diagnostics)
+        ignored = SELF.Diagnostics.AppendMany(SELF.Report.Diagnostics)
+    END CONSTRUCTOR
+END CLASS
+
+CLASS FissionArcoBasicProgramReport
+    CONSTRUCTOR()
+        SELF.Modules = []
+        SELF.Imports = []
+        SELF.Diagnostics = FissionDiagnosticBag()
+    END CONSTRUCTOR
+
+    FUNCTION AddModule(module)
+        ignored = Array.Push(SELF.Modules, module)
+        ignored = SELF.Diagnostics.AppendMany(module.Diagnostics)
+        RETURN module
+    END FUNCTION
+
+    FUNCTION HasModule(name)
+        FOR module IN SELF.Modules
+            IF module.Name == name THEN RETURN TRUE
+        NEXT
+        RETURN FALSE
+    END FUNCTION
+
+    FUNCTION AddImport(fromName, path)
+        ignored = Array.Push(SELF.Imports, {From: fromName, Path: path})
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION ValidateImports()
+        FOR importEdge IN SELF.Imports
+            path = importEdge.Path
+            IF SELF.HasModule(path) == FALSE AND File.Exists(path) == FALSE THEN
+                ignored = SELF.Diagnostics.ReportError("FISSION_ARCOBASIC_IMPORT_UNRESOLVED", "Import " + importEdge.From + " -> " + path + " was not found in the program set or on disk")
+            END IF
+        NEXT
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Render()
+        lines = ["ArcoBASIC Program Semantics"]
+        FOR module IN SELF.Modules
+            ignored = Array.Push(lines, "  Module " + module.Name)
+        NEXT
+        IF LEN(SELF.Imports) > 0 THEN
+            ignored = Array.Push(lines, "  Imports")
+            FOR importEdge IN SELF.Imports
+                ignored = Array.Push(lines, "    " + importEdge.From + " -> " + importEdge.Path)
+            NEXT
+        END IF
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS
+
+FUNCTION Fission_ArcoBasicCollectImportsFromSirNode(program, moduleName, node)
+    IF node.Kind == "Import" THEN
+        ignored = program.AddImport(moduleName, Object.Get(node.Fields, "Path", ""))
+    END IF
+    FOR child IN node.Children
+        ignored = Fission_ArcoBasicCollectImportsFromSirNode(program, moduleName, child)
+    NEXT
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicCollectImportsFromSir(program, module)
+    FOR statement IN module.Statements
+        ignored = Fission_ArcoBasicCollectImportsFromSirNode(program, module.Name, statement)
+    NEXT
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicAnalyzeSource(name, source, strict = FALSE)
+    RETURN FissionArcoBasicSourceSemanticResult(name, source, strict)
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicAnalyzeFile(path, strict = FALSE)
+    RETURN Fission_ArcoBasicAnalyzeSource(path, File.ReadText(path), strict)
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicAnalyzeProgramFiles(paths, strict = FALSE)
+    program = FissionArcoBasicProgramReport()
+    FOR path IN paths
+        module = Fission_ArcoBasicAnalyzeFile(path, strict)
+        ignored = program.AddModule(module)
+        ignored = Fission_ArcoBasicCollectImportsFromSir(program, module.Sir)
+    NEXT
+    ignored = program.ValidateImports()
+    RETURN program
+END FUNCTION
 
 FUNCTION Fission_ArcoBasicSemanticExternalName(name)
     IF name == "" THEN RETURN FALSE

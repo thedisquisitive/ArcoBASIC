@@ -155,6 +155,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - Loop variables from `FOR item IN values` and `FOR index = start TO end` are
   now recorded as semantic variables in the active scope before loop body
   resolution.
+- Initial import-aware ArcoBASIC program semantic analysis added. It analyzes
+  multiple source files as a program set, records import edges, validates that
+  imported paths are either in the program set or present on disk, and reports
+  missing imports through normal diagnostics.
 - `language.arcobasic` now attaches `Semantics.Render` and
   `SemanticSymbolCount`/`SemanticReferenceCount` metadata to produced SIR
   artifacts and propagates semantic diagnostics into the compile result.
@@ -319,6 +323,14 @@ ArcoBASIC subset and lowers it into structured SIR.
   fission/tests/arcobasic_loop_semantic_smoke.abas` passed, proving strict
   semantic resolution for `FOR IN` and numeric `FOR` loop variables.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_import_semantic_smoke.abas` passed, proving
+  import-aware program analysis accepts known imports and reports missing
+  imports.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_fission_self_semantic_smoke.abas` passed with 69
+  modules, 99 import edges, and zero diagnostics using strict import-aware
+  program semantic analysis.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_self_semantic_smoke.abas` passed, proving strict
   `SELF` field/method resolution for a class-local fixture.
 - `build-rivet/ArcoFission compile-run
@@ -427,6 +439,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_fission_self_semantic_smoke.abas`
 - `fission/tests/arcobasic_function_smoke.abas`
 - `fission/tests/arcobasic_include_metadata_smoke.abas`
+- `fission/tests/arcobasic_import_semantic_smoke.abas`
 - `fission/tests/arcobasic_legacy_operator_smoke.abas`
 - `fission/tests/arcobasic_let_smoke.abas`
 - `fission/tests/arcobasic_lexer_smoke.abas`
@@ -532,6 +545,10 @@ ArcoBASIC subset and lowers it into structured SIR.
   strict per-file ArcoBASIC semantic analysis without diagnostics. This still
   analyzes files independently; whole-program import-aware semantics is the next
   self-compilation step.
+- Fission now carries every current first-party Fission `.abas` source through
+  strict import-aware program semantic analysis without diagnostics. This
+  validates the current import graph exists but does not yet merge exported
+  symbols across modules.
 - The first self-compilation semantic pressure point is covered: class fields and
   self-method calls are represented in the semantic report instead of falling
   through as unresolved or external `SELF` reads.
@@ -547,9 +564,9 @@ ArcoBASIC subset and lowers it into structured SIR.
 
 1. Continue expanding ArcoBASIC frontend compatibility against real Arcology
    source files until the Fission parser can ingest the primary ABAS corpus.
-2. Keep advancing Fission self-compilation by moving from strict per-file
-   semantic analysis to import-aware whole-program semantic analysis: imports,
-   host globals, class fields, methods, and function signatures must resolve
+2. Keep advancing Fission self-compilation by moving from import-aware program
+   semantic analysis to typed/canonical program symbols: exported functions,
+   classes, fields, imports, host globals, and function signatures must resolve
    cleanly across files.
 3. Add real import expansion once package/source discovery rules are available.
 4. Add lambdas, richer type syntax, and more complete access/inheritance

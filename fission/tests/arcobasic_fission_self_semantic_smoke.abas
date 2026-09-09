@@ -1,5 +1,4 @@
 #IMPORT "fission/language/arcobasic/semantic.abas"
-#IMPORT "fission/language/arcobasic/lower_sir.abas"
 
 Files = [
     "fission/cli/fission.abas",
@@ -40,6 +39,7 @@ Files = [
     "fission/tests/arcobasic_fission_self_semantic_smoke.abas",
     "fission/tests/arcobasic_function_smoke.abas",
     "fission/tests/arcobasic_include_metadata_smoke.abas",
+    "fission/tests/arcobasic_import_semantic_smoke.abas",
     "fission/tests/arcobasic_language_smoke.abas",
     "fission/tests/arcobasic_legacy_operator_smoke.abas",
     "fission/tests/arcobasic_let_smoke.abas",
@@ -72,25 +72,9 @@ Files = [
     "fission/tests/sir_builder_smoke.abas"
 ]
 
-Failures = 0
-Analyzed = 0
+Program = Fission_ArcoBasicAnalyzeProgramFiles(Files, TRUE)
 
-FOR path IN Files
-    Source = File.ReadText(path)
-    Tokens = Fission_ArcoBasicLex(Source)
-    Ast = Fission_ArcoBasicParse(Tokens, path)
-    Sir = Fission_ArcoBasicAstToSir(Ast)
-    Report = Fission_ArcoBasicAnalyzeSirStrict(Sir)
-    IF Ast.Diagnostics.HasErrors() OR Sir.Diagnostics.HasErrors() OR Report.Diagnostics.HasErrors() THEN
-        Failures = Failures + 1
-        PRINT path
-        PRINT Ast.Diagnostics.Render()
-        PRINT Sir.Diagnostics.Render()
-        PRINT Report.Diagnostics.Render()
-    ELSE
-        Analyzed = Analyzed + 1
-    END IF
-NEXT
-
-PRINT String(Analyzed)
-PRINT String(Failures)
+IF Program.Diagnostics.HasErrors() THEN PRINT Program.Diagnostics.Render()
+PRINT String(LEN(Program.Modules))
+PRINT String(LEN(Program.Imports))
+PRINT Program.Diagnostics.HasErrors()

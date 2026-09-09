@@ -1,0 +1,20 @@
+#IMPORT "fission/language/arcobasic/semantic.abas"
+
+DependencyPath = "/tmp/fission_import_dependency.abas"
+MainPath = "/tmp/fission_import_main.abas"
+MissingPath = "/tmp/fission_import_missing.abas"
+
+ignored = File.WriteText(DependencyPath, "DependencyValue = 1\n")
+ignored = File.WriteText(MainPath, "#IMPORT \"" + DependencyPath + "\"\nMainValue = 2\n")
+ignored = File.WriteText(MissingPath, "#IMPORT \"/tmp/fission_import_does_not_exist.abas\"\n")
+
+Program = Fission_ArcoBasicAnalyzeProgramFiles([DependencyPath, MainPath], TRUE)
+MissingProgram = Fission_ArcoBasicAnalyzeProgramFiles([MissingPath], TRUE)
+
+PRINT Program.Diagnostics.HasErrors()
+PRINT LEN(Program.Modules)
+PRINT LEN(Program.Imports)
+PRINT Program.Render()
+PRINT "---"
+PRINT MissingProgram.Diagnostics.HasErrors()
+PRINT MissingProgram.Diagnostics.Render()
