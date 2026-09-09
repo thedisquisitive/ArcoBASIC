@@ -378,13 +378,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_parse_smoke.abas)"
 
-grep -q "^69$" <<<"$fission_self_output"
+grep -q "^70$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_semantic_smoke.abas)"
 
-grep -q "^69$" <<<"$fission_self_semantic_output"
-grep -q "^99$" <<<"$fission_self_semantic_output"
+grep -q "^70$" <<<"$fission_self_semantic_output"
+grep -q "^100$" <<<"$fission_self_semantic_output"
+grep -q "^1835$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_import_semantic_smoke.abas)"
@@ -394,6 +395,15 @@ grep -q "^2$" <<<"$import_semantic_output"
 grep -q "^1$" <<<"$import_semantic_output"
 grep -q "^TRUE$" <<<"$import_semantic_output"
 grep -q "FISSION_ARCOBASIC_IMPORT_UNRESOLVED" <<<"$import_semantic_output"
+
+program_symbol_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_program_symbol_smoke.abas)"
+
+grep -q "^FALSE$" <<<"$program_symbol_output"
+grep -q "^8$" <<<"$program_symbol_output"
+grep -q "^Const /tmp/fission_program_symbol_library.abas::module::Answer$" <<<"$program_symbol_output"
+grep -q "^Class /tmp/fission_program_symbol_library.abas::module::Box$" <<<"$program_symbol_output"
+grep -q "^Field /tmp/fission_program_symbol_library.abas::module::Box::Value AS U64$" <<<"$program_symbol_output"
+grep -q "^Function /tmp/fission_program_symbol_library.abas::module::MakeBox AS Box$" <<<"$program_symbol_output"
 
 self_loop_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_loop_semantic_smoke.abas)"
 

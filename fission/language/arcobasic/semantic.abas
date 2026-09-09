@@ -118,17 +118,49 @@ CLASS FissionArcoBasicSourceSemanticResult
     END CONSTRUCTOR
 END CLASS
 
+CLASS FissionArcoBasicProgramSymbol
+    CONSTRUCTOR(moduleName, symbol)
+        SELF.ModuleName = moduleName
+        SELF.Name = symbol.Name
+        SELF.Kind = symbol.Kind
+        SELF.Scope = symbol.Scope
+        SELF.TypeName = symbol.TypeName
+        SELF.DefaultValue = symbol.DefaultValue
+    END CONSTRUCTOR
+
+    FUNCTION CanonicalName()
+        RETURN SELF.ModuleName + "::" + SELF.Scope + "::" + SELF.Name
+    END FUNCTION
+
+    FUNCTION Render()
+        text = SELF.Kind + " " + SELF.CanonicalName()
+        IF SELF.TypeName != "" THEN text = text + " AS " + SELF.TypeName
+        IF SELF.DefaultValue != "" THEN text = text + " = " + SELF.DefaultValue
+        RETURN text
+    END FUNCTION
+END CLASS
+
 CLASS FissionArcoBasicProgramReport
     CONSTRUCTOR()
         SELF.Modules = []
         SELF.Imports = []
+        SELF.Symbols = []
         SELF.Diagnostics = FissionDiagnosticBag()
     END CONSTRUCTOR
 
     FUNCTION AddModule(module)
         ignored = Array.Push(SELF.Modules, module)
         ignored = SELF.Diagnostics.AppendMany(module.Diagnostics)
+        FOR symbol IN module.Report.Symbols
+            ignored = SELF.AddProgramSymbol(module.Name, symbol)
+        NEXT
         RETURN module
+    END FUNCTION
+
+    FUNCTION AddProgramSymbol(moduleName, symbol)
+        programSymbol = FissionArcoBasicProgramSymbol(moduleName, symbol)
+        ignored = Array.Push(SELF.Symbols, programSymbol)
+        RETURN programSymbol
     END FUNCTION
 
     FUNCTION HasModule(name)
@@ -136,6 +168,17 @@ CLASS FissionArcoBasicProgramReport
             IF module.Name == name THEN RETURN TRUE
         NEXT
         RETURN FALSE
+    END FUNCTION
+
+    FUNCTION FindSymbol(moduleName, scope, name)
+        FOR symbol IN SELF.Symbols
+            IF symbol.ModuleName == moduleName AND symbol.Scope == scope AND Lower(symbol.Name) == Lower(name) THEN RETURN symbol
+        NEXT
+        RETURN NULL
+    END FUNCTION
+
+    FUNCTION FindModuleSymbol(moduleName, name)
+        RETURN SELF.FindSymbol(moduleName, "module", name)
     END FUNCTION
 
     FUNCTION AddImport(fromName, path)
@@ -158,6 +201,12 @@ CLASS FissionArcoBasicProgramReport
         FOR module IN SELF.Modules
             ignored = Array.Push(lines, "  Module " + module.Name)
         NEXT
+        IF LEN(SELF.Symbols) > 0 THEN
+            ignored = Array.Push(lines, "  Symbols")
+            FOR symbol IN SELF.Symbols
+                ignored = Array.Push(lines, "    " + symbol.Render())
+            NEXT
+        END IF
         IF LEN(SELF.Imports) > 0 THEN
             ignored = Array.Push(lines, "  Imports")
             FOR importEdge IN SELF.Imports

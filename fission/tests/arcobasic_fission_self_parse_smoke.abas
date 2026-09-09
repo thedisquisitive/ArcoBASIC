@@ -54,6 +54,7 @@ Files = [
     "fission/tests/arcobasic_preprocess_compile_smoke.abas",
     "fission/tests/arcobasic_preprocess_error_smoke.abas",
     "fission/tests/arcobasic_preprocess_smoke.abas",
+    "fission/tests/arcobasic_program_symbol_smoke.abas",
     "fission/tests/arcobasic_real_project_parse_smoke.abas",
     "fission/tests/arcobasic_real_timer_parse_smoke.abas",
     "fission/tests/arcobasic_reveal_smoke.abas",

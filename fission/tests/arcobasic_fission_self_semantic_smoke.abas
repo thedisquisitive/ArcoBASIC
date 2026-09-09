@@ -54,6 +54,7 @@ Files = [
     "fission/tests/arcobasic_preprocess_compile_smoke.abas",
     "fission/tests/arcobasic_preprocess_error_smoke.abas",
     "fission/tests/arcobasic_preprocess_smoke.abas",
+    "fission/tests/arcobasic_program_symbol_smoke.abas",
     "fission/tests/arcobasic_real_project_parse_smoke.abas",
     "fission/tests/arcobasic_real_timer_parse_smoke.abas",
     "fission/tests/arcobasic_reveal_smoke.abas",
@@ -77,4 +78,5 @@ Program = Fission_ArcoBasicAnalyzeProgramFiles(Files, TRUE)
 IF Program.Diagnostics.HasErrors() THEN PRINT Program.Diagnostics.Render()
 PRINT String(LEN(Program.Modules))
 PRINT String(LEN(Program.Imports))
+PRINT String(LEN(Program.Symbols))
 PRINT Program.Diagnostics.HasErrors()

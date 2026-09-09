@@ -1,0 +1,18 @@
+#IMPORT "fission/language/arcobasic/semantic.abas"
+
+LibraryPath = "/tmp/fission_program_symbol_library.abas"
+MainPath = "/tmp/fission_program_symbol_main.abas"
+
+ignored = File.WriteText(LibraryPath, "CONST Answer = 42\nCLASS Box\nValue AS U64\nFUNCTION ReadValue() AS U64\nRETURN SELF.Value\nEND FUNCTION\nEND CLASS\nFUNCTION MakeBox(value AS U64) AS Box\nRETURN Box(value)\nEND FUNCTION\n")
+ignored = File.WriteText(MainPath, "#IMPORT \"" + LibraryPath + "\"\nresult = MakeBox(Answer)\n")
+
+Program = Fission_ArcoBasicAnalyzeProgramFiles([LibraryPath, MainPath], TRUE)
+
+PRINT Program.Diagnostics.HasErrors()
+PRINT LEN(Program.Modules)
+PRINT LEN(Program.Imports)
+PRINT LEN(Program.Symbols)
+PRINT Program.FindModuleSymbol(LibraryPath, "Answer").Render()
+PRINT Program.FindModuleSymbol(LibraryPath, "Box").Render()
+PRINT Program.FindSymbol(LibraryPath, "module::Box", "Value").Render()
+PRINT Program.FindModuleSymbol(LibraryPath, "MakeBox").Render()
