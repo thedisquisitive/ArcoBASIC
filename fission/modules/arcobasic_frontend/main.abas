@@ -1,4 +1,36 @@
 #IMPORT "fission/build/rivet_modules.abas"
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
 
 module = Fission_ArcoBasicFrontendModule()
-PRINT module.RenderManifest()
+args = Runtime.Args()
+
+IF LEN(args) > 0 AND args[0] == "transform" THEN
+    IF LEN(args) < 5 THEN
+        PRINT "ERROR missing transform arguments"
+        STOP
+    END IF
+
+    requestPath = args[1]
+    responsePath = args[2]
+    outputType = args[3]
+    sourceName = args[4]
+
+    source = File.ReadText(requestPath)
+    tokens = Fission_ArcoBasicLex(source)
+    ast = Fission_ArcoBasicParse(tokens, sourceName)
+    sir = Fission_ArcoBasicAstToSir(ast)
+    IF ast.Diagnostics.HasErrors() OR sir.Diagnostics.HasErrors() THEN
+        File.WriteText(responsePath, ast.Diagnostics.Render() + "\n" + sir.Diagnostics.Render())
+        PRINT "ERROR diagnostics"
+        STOP
+    END IF
+    IF outputType != "SIR" THEN
+        File.WriteText(responsePath, "unsupported output type: " + outputType)
+        PRINT "ERROR unsupported output type"
+        STOP
+    END IF
+    ignored = File.WriteText(responsePath, sir.Render())
+    PRINT "OK"
+ELSE
+    PRINT module.RenderManifest()
+END IF

@@ -1,6 +1,70 @@
 #IMPORT "fission/core/artifact.abas"
 #IMPORT "fission/core/diagnostics.abas"
 
+FUNCTION Fission_ShellQuote(value)
+    text = STRING(value)
+    quoted = "'"
+    index = 0
+    WHILE index < String.Length(text)
+        ch = String.Slice(text, index, 1)
+        IF ch == "'" THEN
+            quoted = quoted + "'\''"
+        ELSE
+            quoted = quoted + ch
+        END IF
+        index = index + 1
+    WEND
+    RETURN quoted + "'"
+END FUNCTION
+
+FUNCTION Fission_FileSafeName(value)
+    text = STRING(value)
+    safe = ""
+    index = 0
+    WHILE index < String.Length(text)
+        ch = String.Slice(text, index, 1)
+        IF String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-", ch) THEN
+            safe = safe + ch
+        ELSE
+            safe = safe + "_"
+        END IF
+        index = index + 1
+    WEND
+    IF safe == "" THEN safe = "artifact"
+    RETURN safe
+END FUNCTION
+
+FUNCTION Fission_ModuleTransformArtifact(component, artifact, context, outputType)
+    executable = Object.Get(component.Configuration, "ModuleExecutable", "")
+    IF executable == "" THEN RETURN NULL
+    requestName = Fission_FileSafeName(component.Name + "_" + artifact.Name)
+    requestPath = ".fission/tmp/" + requestName + ".request"
+    responsePath = ".fission/tmp/" + requestName + ".response"
+    ignored = Directory.Create(".fission")
+    ignored = Directory.Create(".fission/tmp")
+    ignored = File.WriteText(requestPath, STRING(artifact.Value))
+    command = Fission_ShellQuote(executable) + " transform " + Fission_ShellQuote(requestPath) + " " + Fission_ShellQuote(responsePath) + " " + Fission_ShellQuote(outputType) + " " + Fission_ShellQuote(artifact.Name)
+    runResult = Process.Run(command)
+    output = FissionArtifact(outputType, artifact.Name, "")
+    ignored = output.WithMetadata("PreviousType", artifact.Type)
+    ignored = output.WithMetadata("ProducedBy", component.Name)
+    ignored = output.WithMetadata("ModuleExecutable", executable)
+    IF !runResult.Ok THEN
+        diagnostics = FissionDiagnosticBag()
+        ignored = diagnostics.ReportError("FISSION_MODULE_TRANSFORM_FAILED", component.Name + " module transform failed: " + Object.Get(runResult, "Output", ""))
+        ignored = output.WithMetadata("Diagnostics", diagnostics)
+        RETURN output
+    END IF
+    IF File.Exists(responsePath) == FALSE THEN
+        diagnostics = FissionDiagnosticBag()
+        ignored = diagnostics.ReportError("FISSION_MODULE_RESPONSE_MISSING", component.Name + " did not produce response file " + responsePath)
+        ignored = output.WithMetadata("Diagnostics", diagnostics)
+        RETURN output
+    END IF
+    output.Value = File.ReadText(responsePath)
+    RETURN output
+END FUNCTION
+
 CLASS FissionComponent
     CONSTRUCTOR(name, componentClass)
         SELF.Name = name
@@ -69,6 +133,8 @@ CLASS FissionComponent
 
     FUNCTION TransformArtifact(artifact, context, outputType)
         IF SELF.TransformHandler == NULL THEN
+            moduleOutput = Fission_ModuleTransformArtifact(SELF, artifact, context, outputType)
+            IF moduleOutput != NULL THEN RETURN moduleOutput
             output = FissionArtifact(outputType, artifact.Name, artifact.Value)
             ignored = output.WithMetadata("PreviousType", artifact.Type)
             ignored = output.WithMetadata("ProducedBy", SELF.Name)

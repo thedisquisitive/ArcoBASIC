@@ -16,6 +16,7 @@ build-*/
 # ignored wherever it appears, not just at the repo root.
 .rivet/
 .fissure/
+.fission/
 dist/
 /var/
 CMakeFiles/

@@ -158,6 +158,10 @@ ArcoBASIC subset and lowers it into structured SIR.
     `fission/modules/arcobasic_frontend/main.abas`
 - Rivet can now build Fission module capsules with an explicit dependency on
   the in-graph `ArcoFission` bootstrap compiler target.
+- Executable module transform invocation added for the first component boundary:
+  `language.arcobasic` can now run as a built module capsule and transform
+  `Source.arcobasic -> SIR` through the normal `FissionCompiler.Compile()`
+  pipeline.
 
 ## In-Progress Components
 
@@ -183,8 +187,9 @@ ArcoBASIC subset and lowers it into structured SIR.
 - Current Rivet `ArcoCapsuleTarget` invokes legacy `ArcoFission native`.
 - Windows and Web capsule support remain legacy C++ ArcoFission bridge paths.
 - Fission executable modules are currently native ArcoCapsule binaries produced
-  by legacy C++ ArcoFission. The initial host integration registers advertised
-  component metadata; cross-process transform invocation is not implemented yet.
+  by legacy C++ ArcoFission. The initial transform protocol uses request and
+  response files plus `Process.Run`; richer in-process/shared-library loading is
+  deferred.
 - `fission/tests/core_smoke.abas` is run by legacy C++ ArcoFission during G0
   bootstrap testing.
 - `fission/tests/arcobasic_language_smoke.abas` is run by legacy C++
@@ -208,8 +213,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - The WP-001 compiler facade executes simple transform callbacks, but there is no
   persistent component package discovery, advanced artifact storage, version
   negotiation, or real target backend yet.
-- Executable module manifests can be rendered and registered, but the substrate
-  does not yet spawn module binaries to execute component transforms.
+- Executable module transforms currently return textual SIR render output for
+  the ArcoBASIC frontend boundary. Typed artifact serialization/deserialization
+  is still needed before executable modules can exchange full structural IR
+  objects across process boundaries.
 
 ## Regression Status
 
@@ -292,12 +299,15 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `tests/integration/fission_substrate_core_smoke.sh build-rivet/ArcoFission
   /home/daedalus/projects/arcobasic` passed.
 - `(cd fission && ../build-rivet/fissure run)` passed.
+- `(cd fission && ../build-rivet/fissure run --full)` passed.
 - `ctest --test-dir build -R '^fission_substrate_core_smoke$'
   --output-on-failure` passed.
 - `build-rivet/rivet build` passed and produced
   `build-rivet/fission/modules/fission-arcobasic-frontend`.
 - `build-rivet/fission/modules/fission-arcobasic-frontend` printed its module
   manifest successfully.
+- `build-rivet/fission/modules/fission-arcobasic-frontend transform ...`
+  produced SIR successfully.
 - `git diff --check` passed.
 - Resolver smoke now covers accumulated capabilities, unmet requirements, and
   ambiguous shortest-route diagnostics.
@@ -314,6 +324,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 ## Files Changed
 
 - `docs/RFC-AP-FISSION-001_Fission_Compiler_Substrate.md`
+- `.gitignore`
 - `.agents/FISSION_SUBSTRATE_PROGRESS.md`
 - `fission/README.md`
 - `fission/fissure.ab`
@@ -460,9 +471,8 @@ ArcoBASIC subset and lowers it into structured SIR.
    function signatures.
 5. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal
    output as the oracle.
-6. Implement module-process transform invocation for executable module
-   components, starting with the ArcoBASIC frontend Source.arcobasic -> SIR
-   boundary.
+6. Add typed artifact serialization/deserialization so executable modules can
+   pass structural SIR/A-MIR data, not just textual render output.
 7. Replace metadata-carried reveal payloads with typed reveal artifacts.
 8. Add route ambiguity policy controls and richer `explain pipeline` output.
 9. Add version negotiation for component contracts.

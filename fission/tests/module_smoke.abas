@@ -13,3 +13,20 @@ PRINT Fission.Registry.HasComponent("language.arcobasic")
 Registered = Fission.Registry.FindByName("language.arcobasic")
 PRINT Object.Get(Registered.Configuration, "ModuleExecutable", "")
 PRINT Object.Get(Registered.Configuration, "ModuleProtocol", "")
+
+Source = "value = 1\nPRINT value"
+Artifact = FissionArtifact("Source.arcobasic", "module-demo.abas", Source)
+SirArtifact = Registered.TransformArtifact(Artifact, {Registry: Fission.Registry}, "SIR")
+PRINT SirArtifact.Type
+PRINT String.Contains(SirArtifact.Value, "SIR module-demo.abas v0.1")
+PRINT String.Contains(SirArtifact.Value, "  Print")
+
+Request = Fission.Request()
+Request.Source = Source
+Request.SourceName = "module-pipeline.abas"
+ignored = Request.WithLanguage("arcobasic")
+ignored = Request.ToArtifact("SIR")
+
+Result = Fission.Compiler().Compile(Request)
+PRINT Result.Ok
+PRINT String.Contains(Result.Artifact.Value, "SIR module-pipeline.abas v0.1")
