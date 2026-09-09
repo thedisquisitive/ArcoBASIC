@@ -1,0 +1,120 @@
+#IMPORT "fission/core/component.abas"
+
+CLASS FissionModuleComponentDescriptor
+    CONSTRUCTOR(name, componentClass)
+        SELF.Name = name
+        SELF.ComponentClass = componentClass
+        SELF.Consumes = []
+        SELF.Produces = []
+        SELF.Capabilities = FissionCapabilitySet()
+        SELF.Requirements = FissionCapabilitySet()
+    END CONSTRUCTOR
+
+    FUNCTION Consume(artifactType)
+        IF !Fission_ListContains(SELF.Consumes, artifactType) THEN ignored = Array.Push(SELF.Consumes, artifactType)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Produce(artifactType)
+        IF !Fission_ListContains(SELF.Produces, artifactType) THEN ignored = Array.Push(SELF.Produces, artifactType)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Capability(name)
+        ignored = SELF.Capabilities.Append(name)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Require(name)
+        ignored = SELF.Requirements.Append(name)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Render()
+        RETURN "COMPONENT " + SELF.Name + " [" + SELF.ComponentClass + "] " + Array.Join(SELF.Consumes, ",") + " -> " + Array.Join(SELF.Produces, ",")
+    END FUNCTION
+END CLASS
+
+CLASS FissionExecutableModule
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Version = "0.1"
+        SELF.Protocol = "fission-module-stdio-v0.1"
+        SELF.Entry = ""
+        SELF.OutputName = name
+        SELF.OutputDirectory = "build-rivet/fission/modules"
+        SELF.Components = []
+        SELF.Capabilities = FissionCapabilitySet()
+    END CONSTRUCTOR
+
+    FUNCTION Versioned(version)
+        SELF.Version = version
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION WithEntry(path)
+        SELF.Entry = path
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION WithOutputName(name)
+        SELF.OutputName = name
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION OutputPath()
+        RETURN SELF.OutputDirectory + "/" + SELF.OutputName
+    END FUNCTION
+
+    FUNCTION Capability(name)
+        ignored = SELF.Capabilities.Append(name)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Component(name, componentClass)
+        descriptor = FissionModuleComponentDescriptor(name, componentClass)
+        ignored = Array.Push(SELF.Components, descriptor)
+        RETURN descriptor
+    END FUNCTION
+
+    FUNCTION RegisterInto(host)
+        FOR descriptor IN SELF.Components
+            component = host.Component(descriptor.Name, descriptor.ComponentClass)
+            FOR consumed IN descriptor.Consumes
+                ignored = component.Consume(consumed)
+            NEXT
+            FOR produced IN descriptor.Produces
+                ignored = component.Produce(produced)
+            NEXT
+            FOR capability IN descriptor.Capabilities.Items
+                ignored = component.Capability(capability)
+            NEXT
+            FOR requirement IN descriptor.Requirements.Items
+                ignored = component.Require(requirement)
+            NEXT
+            ignored = component.Configure("ModuleName", SELF.Name)
+            ignored = component.Configure("ModuleVersion", SELF.Version)
+            ignored = component.Configure("ModuleProtocol", SELF.Protocol)
+            ignored = component.Configure("ModuleExecutable", SELF.OutputPath())
+            ignored = component.Configure("ModuleEntry", SELF.Entry)
+            ignored = host.Register(component)
+        NEXT
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION RenderManifest()
+        lines = []
+        ignored = Array.Push(lines, "FISSION MODULE " + SELF.Name + " " + SELF.Version)
+        ignored = Array.Push(lines, "PROTOCOL " + SELF.Protocol)
+        ignored = Array.Push(lines, "ENTRY " + SELF.Entry)
+        ignored = Array.Push(lines, "OUTPUT " + SELF.OutputPath())
+        FOR capability IN SELF.Capabilities.Items
+            ignored = Array.Push(lines, "CAPABILITY " + capability)
+        NEXT
+        FOR descriptor IN SELF.Components
+            ignored = Array.Push(lines, descriptor.Render())
+        NEXT
+        ignored = Array.Push(lines, "END MODULE")
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS

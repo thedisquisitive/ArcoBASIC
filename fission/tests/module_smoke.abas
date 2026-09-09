@@ -1,0 +1,15 @@
+#IMPORT "fission/core/fission.abas"
+#IMPORT "fission/build/rivet_modules.abas"
+
+Fission = Fission_New()
+Module = Fission_ArcoBasicFrontendModule()
+ignored = Fission.RegisterModule(Module)
+
+PRINT Module.OutputPath()
+PRINT String.Contains(Module.RenderManifest(), "FISSION MODULE fission.arcobasic.frontend 0.1")
+PRINT String.Contains(Module.RenderManifest(), "COMPONENT language.arcobasic [Language] Source.arcobasic -> SIR")
+PRINT Fission.Registry.HasComponent("language.arcobasic")
+
+Registered = Fission.Registry.FindByName("language.arcobasic")
+PRINT Object.Get(Registered.Configuration, "ModuleExecutable", "")
+PRINT Object.Get(Registered.Configuration, "ModuleProtocol", "")

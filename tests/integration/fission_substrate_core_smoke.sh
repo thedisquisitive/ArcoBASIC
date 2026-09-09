@@ -23,6 +23,12 @@ grep -q "^language.brainfuck-kit -> sir.to.amir.kit -> target.linux-x86_64.kit$"
 grep -q "^Executable.Linux.X86_64$" <<<"$kit_output"
 grep -q "^elf:amir:sir:+$" <<<"$kit_output"
 
+module_output="$("$ARCOFISSION" compile-run fission/tests/module_smoke.abas)"
+
+grep -q "^build-rivet/fission/modules/fission-arcobasic-frontend$" <<<"$module_output"
+test "$(grep -c "^TRUE$" <<<"$module_output")" = "3"
+grep -q "^fission-module-stdio-v0.1$" <<<"$module_output"
+
 arcobasic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_language_smoke.abas)"
 
 grep -q "^TRUE$" <<<"$arcobasic_output"

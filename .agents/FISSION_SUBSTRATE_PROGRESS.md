@@ -149,6 +149,15 @@ ArcoBASIC subset and lowers it into structured SIR.
   diagnostics, allowing ArcoBASIC parser/SIR diagnostics to fail compilation.
 - `FissionCompiler.Reveal(request, "AST"|"SIR"|"PIPELINE")` added for the
   initial reveal workflow.
+- Initial executable module substrate added:
+  - `FissionExecutableModule`
+  - `FissionModuleComponentDescriptor`
+  - host-side module registration through `Fission.RegisterModule(module)`
+  - stdio manifest protocol marker `fission-module-stdio-v0.1`
+  - first ArcoBASIC frontend component capsule entrypoint under
+    `fission/modules/arcobasic_frontend/main.abas`
+- Rivet can now build Fission module capsules with an explicit dependency on
+  the in-graph `ArcoFission` bootstrap compiler target.
 
 ## In-Progress Components
 
@@ -173,6 +182,9 @@ ArcoBASIC subset and lowers it into structured SIR.
   oracle.
 - Current Rivet `ArcoCapsuleTarget` invokes legacy `ArcoFission native`.
 - Windows and Web capsule support remain legacy C++ ArcoFission bridge paths.
+- Fission executable modules are currently native ArcoCapsule binaries produced
+  by legacy C++ ArcoFission. The initial host integration registers advertised
+  component metadata; cross-process transform invocation is not implemented yet.
 - `fission/tests/core_smoke.abas` is run by legacy C++ ArcoFission during G0
   bootstrap testing.
 - `fission/tests/arcobasic_language_smoke.abas` is run by legacy C++
@@ -196,12 +208,15 @@ ArcoBASIC subset and lowers it into structured SIR.
 - The WP-001 compiler facade executes simple transform callbacks, but there is no
   persistent component package discovery, advanced artifact storage, version
   negotiation, or real target backend yet.
+- Executable module manifests can be rendered and registered, but the substrate
+  does not yet spawn module binaries to execute component transforms.
 
 ## Regression Status
 
 - `build-rivet/ArcoFission compile-run fission/tests/core_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/language_authoring_kit_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run fission/tests/module_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_language_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
@@ -279,6 +294,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `(cd fission && ../build-rivet/fissure run)` passed.
 - `ctest --test-dir build -R '^fission_substrate_core_smoke$'
   --output-on-failure` passed.
+- `build-rivet/rivet build` passed and produced
+  `build-rivet/fission/modules/fission-arcobasic-frontend`.
+- `build-rivet/fission/modules/fission-arcobasic-frontend` printed its module
+  manifest successfully.
 - `git diff --check` passed.
 - Resolver smoke now covers accumulated capabilities, unmet requirements, and
   ambiguous shortest-route diagnostics.
@@ -307,6 +326,8 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/core/resolver.abas`
 - `fission/core/compiler.abas`
 - `fission/core/fission.abas`
+- `fission/core/module.abas`
+- `fission/build/rivet_modules.abas`
 - `fission/language/api/language.abas`
 - `fission/language/api/authoring_kit.abas`
 - `fission/language/arcobasic/preprocess.abas`
@@ -319,8 +340,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/sir/builder.abas`
 - `fission/sir/validate.abas`
 - `fission/cli/fission.abas`
+- `fission/modules/arcobasic_frontend/main.abas`
 - `fission/tests/core_smoke.abas`
 - `fission/tests/language_authoring_kit_smoke.abas`
+- `fission/tests/module_smoke.abas`
 - `fission/tests/arcobasic_language_smoke.abas`
 - `fission/tests/arcobasic_access_interface_smoke.abas`
 - `fission/tests/arcobasic_class_smoke.abas`
@@ -358,6 +381,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_string_smoke.abas`
 - `fission/tests/arcobasic_type_compound_smoke.abas`
 - `tests/integration/fission_substrate_core_smoke.sh`
+- `rivet/stdlib/rivet.abas`
 - `cmake/Testing.cmake`
 - `fissure.ab`
 
@@ -420,6 +444,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - The language authoring kit is a convenience facade over ordinary ArcoBASIC
   Fission APIs, not a compiler-definition DSL. It must remain layered on the same
   public component contracts used by first-party language packages.
+- Fission modules should be buildable executable ArcoCapsule binaries during G0.
+  They advertise normal component metadata through a stable stdio manifest
+  protocol and are registered into the same host registry as in-process
+  components, so the compiler still behaves as one composed substrate.
 
 ## Next Recommended Work
 
@@ -432,13 +460,16 @@ ArcoBASIC subset and lowers it into structured SIR.
    function signatures.
 5. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal
    output as the oracle.
-6. Replace metadata-carried reveal payloads with typed reveal artifacts.
-7. Add route ambiguity policy controls and richer `explain pipeline` output.
-8. Add version negotiation for component contracts.
-9. Add component package discovery/loading conventions under `fission/`.
-10. After ArcoBASIC frontend support is substantially complete, expand the
+6. Implement module-process transform invocation for executable module
+   components, starting with the ArcoBASIC frontend Source.arcobasic -> SIR
+   boundary.
+7. Replace metadata-carried reveal payloads with typed reveal artifacts.
+8. Add route ambiguity policy controls and richer `explain pipeline` output.
+9. Add version negotiation for component contracts.
+10. Add component package discovery/loading conventions under `fission/`.
+11. After ArcoBASIC frontend support is substantially complete, expand the
    language authoring kit with reusable tokenizer/parser helpers, semantic
    construction recipes, package metadata helpers, and generated tooling
    metadata.
-11. Keep all legacy compiler calls behind explicitly named bootstrap bridge
+12. Keep all legacy compiler calls behind explicitly named bootstrap bridge
    components.

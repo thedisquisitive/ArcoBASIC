@@ -1,6 +1,7 @@
 #IMPORT "fission/core/compiler.abas"
 #IMPORT "fission/language/api/language.abas"
 #IMPORT "fission/language/api/authoring_kit.abas"
+#IMPORT "fission/core/module.abas"
 
 CLASS FissionHost
     CONSTRUCTOR()
@@ -17,6 +18,10 @@ CLASS FissionHost
 
     FUNCTION LanguageKit()
         RETURN Fission_LanguageKit(SELF)
+    END FUNCTION
+
+    FUNCTION Module(name)
+        RETURN FissionExecutableModule(name)
     END FUNCTION
 
     FUNCTION Pass(name)
@@ -44,6 +49,10 @@ CLASS FissionHost
             RETURN SELF.Registry.Register(component.AsComponent())
         END IF
         RETURN SELF.Registry.Register(component)
+    END FUNCTION
+
+    FUNCTION RegisterModule(module)
+        RETURN module.RegisterInto(SELF)
     END FUNCTION
 
     FUNCTION Compiler()

@@ -1,0 +1,4 @@
+#IMPORT "fission/build/rivet_modules.abas"
+
+module = Fission_ArcoBasicFrontendModule()
+PRINT module.RenderManifest()

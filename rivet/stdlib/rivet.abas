@@ -179,10 +179,22 @@ CLASS ArcoCapsuleTarget
         END IF
         SELF.CompilerPath = detected.Path
         SELF.CompilerVersion = detected.Version
+        SELF.DependencyActionIds = []
     END CONSTRUCTOR
 
     FUNCTION OutputPath()
         RETURN SELF.OutputDirectory + "/" + SELF.Name
+    END FUNCTION
+
+    FUNCTION AddDependency(target)
+        IF target.FinalActionId != "" THEN ignored = Array.Push(SELF.DependencyActionIds, target.FinalActionId)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION UseCompilerTarget(target)
+        SELF.CompilerPath = target.OutputPath()
+        ignored = SELF.AddDependency(target)
+        RETURN SELF
     END FUNCTION
 
     FUNCTION Build()
@@ -190,7 +202,7 @@ CLASS ArcoCapsuleTarget
         spec = { Type: "Compile", Target: SELF.Name, DisplayName: SELF.Entry,
                  Inputs: [SELF.Entry], Outputs: [SELF.OutputPath()],
                  Tool: SELF.CompilerPath, ToolVersion: SELF.CompilerVersion,
-                 Arguments: args, Dependencies: [], OriginFunction: "ArcoCapsuleTarget.Build" }
+                 Arguments: args, Dependencies: SELF.DependencyActionIds, OriginFunction: "ArcoCapsuleTarget.Build" }
         ignored = RIVET.Graph.Action(spec)
         RETURN SELF
     END FUNCTION
