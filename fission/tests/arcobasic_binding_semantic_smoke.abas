@@ -1,0 +1,23 @@
+#IMPORT "fission/language/arcobasic/semantic.abas"
+
+LibraryPath = "/tmp/fission_binding_library.abas"
+MainPath = "/tmp/fission_binding_main.abas"
+
+ignored = File.WriteText(LibraryPath, "FUNCTION twice(value AS U64) AS U64\nRETURN value + value\nEND FUNCTION\n")
+ignored = File.WriteText(MainPath, "#IMPORT \"" + LibraryPath + "\"\nanswer = twice(21)\n")
+
+Program = Fission_ArcoBasicAnalyzeProgramFiles([LibraryPath, MainPath], TRUE)
+FunctionBinding = NULL
+
+FOR binding IN Program.Bindings
+    IF binding.TargetKind == "Function" THEN FunctionBinding = binding
+NEXT
+
+PRINT Program.Diagnostics.HasErrors()
+PRINT LEN(Program.References)
+PRINT LEN(Program.Bindings)
+PRINT FunctionBinding.Target
+PRINT FunctionBinding.TargetKind
+PRINT FunctionBinding.TargetType
+PRINT FunctionBinding.TargetSignature
+PRINT FunctionBinding.Render()

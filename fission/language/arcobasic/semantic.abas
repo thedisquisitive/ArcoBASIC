@@ -164,6 +164,28 @@ CLASS FissionArcoBasicProgramReference
         IF SELF.Target != "" THEN text = text + " " + SELF.Target
         RETURN text
     END FUNCTION
+
+    FUNCTION CanonicalName()
+        RETURN SELF.ModuleName + "::" + SELF.Scope + "::" + SELF.Name
+    END FUNCTION
+END CLASS
+
+CLASS FissionArcoBasicProgramBinding
+    CONSTRUCTOR(reference, symbol)
+        SELF.Reference = reference.CanonicalName()
+        SELF.ReferenceKind = reference.Kind
+        SELF.Target = symbol.CanonicalName()
+        SELF.TargetKind = symbol.Kind
+        SELF.TargetType = symbol.TypeName
+        SELF.TargetSignature = symbol.Signature
+    END CONSTRUCTOR
+
+    FUNCTION Render()
+        text = SELF.ReferenceKind + " " + SELF.Reference + " => " + SELF.TargetKind + " " + SELF.Target
+        IF SELF.TargetType != "" THEN text = text + " AS " + SELF.TargetType
+        IF SELF.TargetSignature != "" THEN text = text + " [" + SELF.TargetSignature + "]"
+        RETURN text
+    END FUNCTION
 END CLASS
 
 CLASS FissionArcoBasicProgramReport
@@ -172,6 +194,7 @@ CLASS FissionArcoBasicProgramReport
         SELF.Imports = []
         SELF.Symbols = []
         SELF.References = []
+        SELF.Bindings = []
         SELF.Diagnostics = FissionDiagnosticBag()
     END CONSTRUCTOR
 
@@ -217,6 +240,27 @@ CLASS FissionArcoBasicProgramReport
         RETURN SELF.FindSymbol(moduleName, "module", name)
     END FUNCTION
 
+    FUNCTION FindCanonicalSymbol(canonicalName)
+        FOR symbol IN SELF.Symbols
+            IF symbol.CanonicalName() == canonicalName THEN RETURN symbol
+        NEXT
+        RETURN NULL
+    END FUNCTION
+
+    FUNCTION FindLocalTargetSymbol(reference)
+        FOR symbol IN SELF.Symbols
+            localTarget = symbol.Scope + "::" + symbol.Name
+            IF symbol.ModuleName == reference.ModuleName AND localTarget == reference.Target THEN RETURN symbol
+        NEXT
+        RETURN NULL
+    END FUNCTION
+
+    FUNCTION FindReferenceTargetSymbol(reference)
+        IF reference.Status == "ResolvedImport" THEN RETURN SELF.FindCanonicalSymbol(reference.Target)
+        IF reference.Status == "Resolved" THEN RETURN SELF.FindLocalTargetSymbol(reference)
+        RETURN NULL
+    END FUNCTION
+
     FUNCTION FindImportedModuleSymbol(fromName, name)
         FOR importEdge IN SELF.Imports
             IF importEdge.From == fromName THEN
@@ -259,6 +303,20 @@ CLASS FissionArcoBasicProgramReport
         RETURN SELF
     END FUNCTION
 
+    FUNCTION AddBinding(binding)
+        ignored = Array.Push(SELF.Bindings, binding)
+        RETURN binding
+    END FUNCTION
+
+    FUNCTION BuildBindings()
+        SELF.Bindings = []
+        FOR reference IN SELF.References
+            symbol = SELF.FindReferenceTargetSymbol(reference)
+            IF symbol != NULL THEN ignored = SELF.AddBinding(FissionArcoBasicProgramBinding(reference, symbol))
+        NEXT
+        RETURN SELF
+    END FUNCTION
+
     FUNCTION EnforceReferences()
         FOR reference IN SELF.References
             IF reference.Status == "Unresolved" THEN
@@ -289,6 +347,12 @@ CLASS FissionArcoBasicProgramReport
             ignored = Array.Push(lines, "  References")
             FOR reference IN SELF.References
                 ignored = Array.Push(lines, "    " + reference.Render())
+            NEXT
+        END IF
+        IF LEN(SELF.Bindings) > 0 THEN
+            ignored = Array.Push(lines, "  Bindings")
+            FOR binding IN SELF.Bindings
+                ignored = Array.Push(lines, "    " + binding.Render())
             NEXT
         END IF
         RETURN Array.Join(lines, "\n")
@@ -327,6 +391,7 @@ FUNCTION Fission_ArcoBasicAnalyzeProgramFiles(paths, strict = FALSE)
     NEXT
     ignored = program.ValidateImports()
     ignored = program.ResolveReferences()
+    ignored = program.BuildBindings()
     IF strict THEN ignored = program.EnforceReferences()
     RETURN program
 END FUNCTION

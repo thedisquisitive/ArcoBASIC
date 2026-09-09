@@ -378,14 +378,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_parse_smoke.abas)"
 
-grep -q "^72$" <<<"$fission_self_output"
+grep -q "^73$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_semantic_smoke.abas)"
 
-grep -q "^72$" <<<"$fission_self_semantic_output"
-grep -q "^102$" <<<"$fission_self_semantic_output"
-grep -q "^1903$" <<<"$fission_self_semantic_output"
+grep -q "^73$" <<<"$fission_self_semantic_output"
+grep -q "^103$" <<<"$fission_self_semantic_output"
+grep -q "^1940$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_import_semantic_smoke.abas)"
@@ -425,6 +425,16 @@ grep -q "^U64$" <<<"$signature_semantic_output"
 grep -q "^0$" <<<"$signature_semantic_output"
 grep -q "^255$" <<<"$signature_semantic_output"
 grep -q "^/tmp/fission_signature_semantic.abas::module::clamp clamp(value:U64,minimum:U64=0,maximum:U64=255) AS U64$" <<<"$signature_semantic_output"
+
+binding_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_binding_semantic_smoke.abas)"
+
+grep -q "^FALSE$" <<<"$binding_semantic_output"
+grep -q "^3$" <<<"$binding_semantic_output"
+grep -q "^/tmp/fission_binding_library.abas::module::twice$" <<<"$binding_semantic_output"
+grep -q "^Function$" <<<"$binding_semantic_output"
+grep -q "^U64$" <<<"$binding_semantic_output"
+grep -q "^twice(value:U64) AS U64$" <<<"$binding_semantic_output"
+grep -q "^Call /tmp/fission_binding_main.abas::module::twice => Function /tmp/fission_binding_library.abas::module::twice AS U64 \\[twice(value:U64) AS U64\\]$" <<<"$binding_semantic_output"
 
 self_loop_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_loop_semantic_smoke.abas)"
 

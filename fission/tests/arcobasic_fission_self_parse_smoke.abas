@@ -26,6 +26,7 @@ Files = [
     "fission/sir/serialize.abas",
     "fission/sir/validate.abas",
     "fission/tests/arcobasic_access_interface_smoke.abas",
+    "fission/tests/arcobasic_binding_semantic_smoke.abas",
     "fission/tests/arcobasic_call_statement_smoke.abas",
     "fission/tests/arcobasic_callable_comprehension_smoke.abas",
     "fission/tests/arcobasic_class_smoke.abas",
