@@ -162,6 +162,10 @@ ArcoBASIC subset and lowers it into structured SIR.
   `language.arcobasic` can now run as a built module capsule and transform
   `Source.arcobasic -> SIR` through the normal `FissionCompiler.Compile()`
   pipeline.
+- Initial SIR module serialization added. Executable modules now return
+  structural SIR data through `FissionSir+ArcoCompy`, and the host reconstructs
+  `FissionSirModule` / `FissionSirNode` class instances before continuing the
+  pipeline.
 
 ## In-Progress Components
 
@@ -213,10 +217,9 @@ ArcoBASIC subset and lowers it into structured SIR.
 - The WP-001 compiler facade executes simple transform callbacks, but there is no
   persistent component package discovery, advanced artifact storage, version
   negotiation, or real target backend yet.
-- Executable module transforms currently return textual SIR render output for
-  the ArcoBASIC frontend boundary. Typed artifact serialization/deserialization
-  is still needed before executable modules can exchange full structural IR
-  objects across process boundaries.
+- Executable module transforms currently support structural SIR exchange for the
+  ArcoBASIC frontend boundary only. A-MIR and other artifact codecs are still
+  needed.
 
 ## Regression Status
 
@@ -308,6 +311,8 @@ ArcoBASIC subset and lowers it into structured SIR.
   manifest successfully.
 - `build-rivet/fission/modules/fission-arcobasic-frontend transform ...`
   produced SIR successfully.
+- `FissionCompiler.Compile()` invoked `language.arcobasic` as an executable
+  module and received a reconstructed structural SIR module successfully.
 - `git diff --check` passed.
 - Resolver smoke now covers accumulated capabilities, unmet requirements, and
   ambiguous shortest-route diagnostics.
@@ -350,6 +355,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/sir/model.abas`
 - `fission/sir/builder.abas`
 - `fission/sir/validate.abas`
+- `fission/sir/serialize.abas`
 - `fission/cli/fission.abas`
 - `fission/modules/arcobasic_frontend/main.abas`
 - `fission/tests/core_smoke.abas`
@@ -471,8 +477,8 @@ ArcoBASIC subset and lowers it into structured SIR.
    function signatures.
 5. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal
    output as the oracle.
-6. Add typed artifact serialization/deserialization so executable modules can
-   pass structural SIR/A-MIR data, not just textual render output.
+6. Add A-MIR and diagnostics artifact codecs so executable modules can pass the
+   next compiler representations structurally.
 7. Replace metadata-carried reveal payloads with typed reveal artifacts.
 8. Add route ambiguity policy controls and richer `explain pipeline` output.
 9. Add version negotiation for component contracts.

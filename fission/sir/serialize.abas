@@ -1,0 +1,61 @@
+#IMPORT "fission/sir/model.abas"
+#IMPORT "stdlib/compy.abas"
+
+FUNCTION FissionSir_NodeToData(node)
+    children = []
+    FOR child IN node.Children
+        ignored = Array.Push(children, FissionSir_NodeToData(child))
+    NEXT
+    RETURN {
+        Kind: "SIR.Node",
+        NodeKind: node.Kind,
+        Fields: node.Fields,
+        FieldNames: node.FieldNames,
+        Children: children
+    }
+END FUNCTION
+
+FUNCTION FissionSir_ModuleToData(module)
+    statements = []
+    FOR statement IN module.Statements
+        ignored = Array.Push(statements, FissionSir_NodeToData(statement))
+    NEXT
+    RETURN {
+        Kind: "SIR.Module",
+        Name: module.Name,
+        Version: module.Version,
+        Statements: statements
+    }
+END FUNCTION
+
+FUNCTION FissionSir_DataToNode(data)
+    node = FissionSirNode(Object.Get(data, "NodeKind", ""))
+    fieldNames = Object.Get(data, "FieldNames", [])
+    fields = Object.Get(data, "Fields", {})
+    FOR fieldName IN fieldNames
+        ignored = node.WithField(fieldName, Object.Get(fields, fieldName, ""))
+    NEXT
+    FOR child IN Object.Get(data, "Children", [])
+        ignored = node.AppendChild(FissionSir_DataToNode(child))
+    NEXT
+    RETURN node
+END FUNCTION
+
+FUNCTION FissionSir_DataToModule(data)
+    module = FissionSirModule(Object.Get(data, "Name", ""))
+    module.Version = Object.Get(data, "Version", "0.1")
+    FOR statement IN Object.Get(data, "Statements", [])
+        ignored = module.AppendStatement(FissionSir_DataToNode(statement))
+    NEXT
+    RETURN module
+END FUNCTION
+
+FUNCTION FissionSir_PackModule(module)
+    RETURN ArcoCompy.Pack(FissionSir_ModuleToData(module))
+END FUNCTION
+
+FUNCTION FissionSir_UnpackModule(payload)
+    data = ArcoCompy.Unpack(payload)
+    IF Object.Get(data, "Kind", "") != "SIR.Module" THEN RETURN FissionSirModule("")
+    RETURN FissionSir_DataToModule(data)
+END FUNCTION

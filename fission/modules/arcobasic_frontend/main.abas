@@ -1,5 +1,6 @@
 #IMPORT "fission/build/rivet_modules.abas"
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/sir/serialize.abas"
 
 module = Fission_ArcoBasicFrontendModule()
 args = Runtime.Args()
@@ -29,7 +30,7 @@ IF LEN(args) > 0 AND args[0] == "transform" THEN
         PRINT "ERROR unsupported output type"
         STOP
     END IF
-    ignored = File.WriteText(responsePath, sir.Render())
+    ignored = File.WriteText(responsePath, FissionSir_PackModule(sir))
     PRINT "OK"
 ELSE
     PRINT module.RenderManifest()

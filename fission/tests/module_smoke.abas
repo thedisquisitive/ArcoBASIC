@@ -18,8 +18,10 @@ Source = "value = 1\nPRINT value"
 Artifact = FissionArtifact("Source.arcobasic", "module-demo.abas", Source)
 SirArtifact = Registered.TransformArtifact(Artifact, {Registry: Fission.Registry}, "SIR")
 PRINT SirArtifact.Type
-PRINT String.Contains(SirArtifact.Value, "SIR module-demo.abas v0.1")
-PRINT String.Contains(SirArtifact.Value, "  Print")
+PRINT SirArtifact.Value.Name
+PRINT String.Contains(SirArtifact.Value.Render(), "SIR module-demo.abas v0.1")
+PRINT String.Contains(SirArtifact.Value.Render(), "  Print")
+PRINT SirArtifact.MetadataValue("SerializedAs", "")
 
 Request = Fission.Request()
 Request.Source = Source
@@ -29,4 +31,5 @@ ignored = Request.ToArtifact("SIR")
 
 Result = Fission.Compiler().Compile(Request)
 PRINT Result.Ok
-PRINT String.Contains(Result.Artifact.Value, "SIR module-pipeline.abas v0.1")
+PRINT Result.Artifact.Value.Name
+PRINT String.Contains(Result.Artifact.Value.Render(), "SIR module-pipeline.abas v0.1")

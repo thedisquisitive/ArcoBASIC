@@ -1,5 +1,6 @@
 #IMPORT "fission/core/artifact.abas"
 #IMPORT "fission/core/diagnostics.abas"
+#IMPORT "fission/sir/serialize.abas"
 
 FUNCTION Fission_ShellQuote(value)
     text = STRING(value)
@@ -61,7 +62,13 @@ FUNCTION Fission_ModuleTransformArtifact(component, artifact, context, outputTyp
         ignored = output.WithMetadata("Diagnostics", diagnostics)
         RETURN output
     END IF
-    output.Value = File.ReadText(responsePath)
+    packed = File.ReadText(responsePath)
+    IF outputType == "SIR" THEN
+        output.Value = FissionSir_UnpackModule(packed)
+        ignored = output.WithMetadata("SerializedAs", "FissionSir+ArcoCompy")
+    ELSE
+        output.Value = packed
+    END IF
     RETURN output
 END FUNCTION
 

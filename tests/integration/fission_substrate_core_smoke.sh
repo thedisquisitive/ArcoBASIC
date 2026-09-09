@@ -30,6 +30,9 @@ grep -q "^build-rivet/fission/modules/fission-arcobasic-frontend$" <<<"$module_o
 test "$(grep -c "^TRUE$" <<<"$module_output")" = "7"
 grep -q "^fission-module-stdio-v0.1$" <<<"$module_output"
 grep -q "^SIR$" <<<"$module_output"
+grep -q "^module-demo.abas$" <<<"$module_output"
+grep -q "^module-pipeline.abas$" <<<"$module_output"
+grep -q "^FissionSir+ArcoCompy$" <<<"$module_output"
 
 arcobasic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_language_smoke.abas)"
 
