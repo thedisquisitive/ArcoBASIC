@@ -1,0 +1,50 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Files = [
+    "arcology-os/stdlib/address_space_policy.abas",
+    "arcology-os/stdlib/graphics_color.abas",
+    "arcology-os/stdlib/graphics_substrate.abas",
+    "arcology-os/stdlib/prd_firmware_translation.abas",
+    "arcology-os/stdlib/graphics_primitives.abas",
+    "arcology-os/stdlib/uefi_bootstrap.abas",
+    "arcology-os/stdlib/physical_region_database.abas",
+    "arcology-os/stdlib/physical_region_allocator.abas",
+    "arcology-os/stdlib/x86_64_paging_policy.abas",
+    "arcology-os/stdlib/uefi_memory_manager.abas",
+    "arcology-os/stdlib/virtual_region_manager.abas",
+    "arcology-os/stdlib/block_device_policy.abas",
+    "arcology-os/stdlib/descriptor_table_policy.abas",
+    "arcology-os/stdlib/gpu_discovery_policy.abas",
+    "arcology-os/stdlib/network_discovery_policy.abas",
+    "arcology-os/stdlib/volumes_policy.abas",
+    "arcology-os/stdlib/timer_policy.abas",
+    "arcology-os/stdlib/network_interface_contract.abas",
+    "arcology-os/stdlib/loop_policy.abas",
+    "arcology-os/stdlib/ps2_keyboard_policy.abas",
+    "arcology-os/stdlib/physical_region_database_runtime.abas",
+    "arcology-os/stdlib/uefi_block_device_policy.abas",
+    "arcology-os/stdlib/fat32_policy.abas",
+    "arcology-os/stdlib/system_namespace_policy.abas",
+    "arcology-os/stdlib/virtio_net_policy.abas"
+]
+
+Failures = 0
+Parsed = 0
+
+FOR path IN Files
+    Source = File.ReadText(path)
+    Tokens = Fission_ArcoBasicLex(Source)
+    Ast = Fission_ArcoBasicParse(Tokens, path)
+    Sir = Fission_ArcoBasicAstToSir(Ast)
+    IF Ast.Diagnostics.HasErrors() OR Sir.Diagnostics.HasErrors() THEN
+        Failures = Failures + 1
+        PRINT path
+        PRINT Ast.Diagnostics.Render()
+        PRINT Sir.Diagnostics.Render()
+    ELSE
+        Parsed = Parsed + 1
+    END IF
+NEXT
+
+PRINT String(Parsed)
+PRINT String(Failures)

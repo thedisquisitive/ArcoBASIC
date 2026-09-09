@@ -264,6 +264,8 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_named_defaults_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_os_stdlib_parse_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_preprocess_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_preprocess_compile_smoke.abas` passed.
@@ -380,6 +382,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_literal_smoke.abas`
 - `fission/tests/arcobasic_logic_smoke.abas`
 - `fission/tests/arcobasic_named_defaults_smoke.abas`
+- `fission/tests/arcobasic_os_stdlib_parse_smoke.abas`
 - `fission/tests/arcobasic_preprocess_smoke.abas`
 - `fission/tests/arcobasic_preprocess_compile_smoke.abas`
 - `fission/tests/arcobasic_preprocess_error_smoke.abas`
@@ -458,6 +461,10 @@ ArcoBASIC subset and lowers it into structured SIR.
   - `arco3d/stdlib/arco3d_rig.abas`
   - `arco3d/stdlib/arco3d_scene.abas`
   - `examples/gui_window.abas`
+- Fission now carries 25 smaller Arcology OS stdlib modules through ArcoBASIC
+  lex/parse/SIR lowering without diagnostics, including graphics, descriptor
+  table, block device, volume, timer, keyboard, FAT32, namespace, UEFI memory,
+  and virtio-net policy sources.
 - The language authoring kit is a convenience facade over ordinary ArcoBASIC
   Fission APIs, not a compiler-definition DSL. It must remain layered on the same
   public component contracts used by first-party language packages.

@@ -375,4 +375,9 @@ real_project_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_real_p
 grep -q "^6$" <<<"$real_project_output"
 grep -q "^0$" <<<"$real_project_output"
 
+os_stdlib_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_os_stdlib_parse_smoke.abas)"
+
+grep -q "^25$" <<<"$os_stdlib_output"
+grep -q "^0$" <<<"$os_stdlib_output"
+
 echo "fission_substrate_core_smoke: all checks passed"
