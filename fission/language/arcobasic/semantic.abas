@@ -9,6 +9,8 @@ CLASS FissionArcoBasicSemanticSymbol
         SELF.Scope = scope
         SELF.TypeName = ""
         SELF.DefaultValue = ""
+        SELF.Parameters = []
+        SELF.Signature = ""
     END CONSTRUCTOR
 
     FUNCTION Render()
@@ -126,6 +128,8 @@ CLASS FissionArcoBasicProgramSymbol
         SELF.Scope = symbol.Scope
         SELF.TypeName = symbol.TypeName
         SELF.DefaultValue = symbol.DefaultValue
+        SELF.Parameters = symbol.Parameters
+        SELF.Signature = symbol.Signature
     END CONSTRUCTOR
 
     FUNCTION CanonicalName()
@@ -137,6 +141,11 @@ CLASS FissionArcoBasicProgramSymbol
         IF SELF.TypeName != "" THEN text = text + " AS " + SELF.TypeName
         IF SELF.DefaultValue != "" THEN text = text + " = " + SELF.DefaultValue
         RETURN text
+    END FUNCTION
+
+    FUNCTION RenderSignature()
+        IF SELF.Signature == "" THEN RETURN SELF.Render()
+        RETURN SELF.CanonicalName() + " " + SELF.Signature
     END FUNCTION
 END CLASS
 
@@ -346,6 +355,38 @@ FUNCTION Fission_ArcoBasicSemanticSplitArgument(argumentText)
     RETURN symbol
 END FUNCTION
 
+FUNCTION Fission_ArcoBasicSemanticArgumentDescriptor(argumentText)
+    symbol = Fission_ArcoBasicSemanticSplitArgument(argumentText)
+    RETURN {Name: symbol.Name, Type: symbol.TypeName, Default: symbol.DefaultValue}
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicSemanticArgumentDescriptors(argsText)
+    descriptors = []
+    IF argsText == "" THEN RETURN descriptors
+    args = String.Split(argsText, ",")
+    FOR argText IN args
+        ignored = Array.Push(descriptors, Fission_ArcoBasicSemanticArgumentDescriptor(argText))
+    NEXT
+    RETURN descriptors
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicSemanticRenderArgumentDescriptors(descriptors)
+    parts = []
+    FOR descriptor IN descriptors
+        text = descriptor.Name
+        IF descriptor.Type != "" THEN text = text + ":" + descriptor.Type
+        IF descriptor.Default != "" THEN text = text + "=" + descriptor.Default
+        ignored = Array.Push(parts, text)
+    NEXT
+    RETURN Array.Join(parts, ",")
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicSemanticRenderSignature(name, descriptors, returnType)
+    text = name + "(" + Fission_ArcoBasicSemanticRenderArgumentDescriptors(descriptors) + ")"
+    IF returnType != "" THEN text = text + " AS " + returnType
+    RETURN text
+END FUNCTION
+
 FUNCTION Fission_ArcoBasicSemanticAddArguments(report, scope, argsText)
     IF argsText == "" THEN RETURN
     args = String.Split(argsText, ",")
@@ -417,6 +458,8 @@ FUNCTION Fission_ArcoBasicAnalyzeSirNode(report, node, scope)
         name = Object.Get(node.Fields, "Name", "")
         symbol = FissionArcoBasicSemanticSymbol(name, "Function", scope)
         symbol.TypeName = Object.Get(node.Fields, "Returns", "")
+        symbol.Parameters = Fission_ArcoBasicSemanticArgumentDescriptors(Object.Get(node.Fields, "Arguments", ""))
+        symbol.Signature = Fission_ArcoBasicSemanticRenderSignature(name, symbol.Parameters, symbol.TypeName)
         ignored = report.AddSymbol(symbol)
         functionScope = scope + "::" + name
         ignored = Fission_ArcoBasicSemanticAddArguments(report, functionScope, Object.Get(node.Fields, "Arguments", ""))

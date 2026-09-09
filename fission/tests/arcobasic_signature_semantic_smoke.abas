@@ -1,0 +1,17 @@
+#IMPORT "fission/language/arcobasic/semantic.abas"
+
+SourcePath = "/tmp/fission_signature_semantic.abas"
+
+ignored = File.WriteText(SourcePath, "FUNCTION clamp(value AS U64, minimum AS U64 = 0, maximum AS U64 = 255) AS U64\nRETURN value\nEND FUNCTION\n")
+
+Program = Fission_ArcoBasicAnalyzeProgramFiles([SourcePath], TRUE)
+Symbol = Program.FindModuleSymbol(SourcePath, "clamp")
+
+PRINT Program.Diagnostics.HasErrors()
+PRINT Symbol.Signature
+PRINT LEN(Symbol.Parameters)
+PRINT Symbol.Parameters[0].Name
+PRINT Symbol.Parameters[0].Type
+PRINT Symbol.Parameters[1].Default
+PRINT Symbol.Parameters[2].Default
+PRINT Symbol.RenderSignature()

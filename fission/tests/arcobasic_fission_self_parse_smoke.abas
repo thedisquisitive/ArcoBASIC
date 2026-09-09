@@ -64,6 +64,7 @@ Files = [
     "fission/tests/arcobasic_semantic_reference_smoke.abas",
     "fission/tests/arcobasic_semantic_smoke.abas",
     "fission/tests/arcobasic_shared_smoke.abas",
+    "fission/tests/arcobasic_signature_semantic_smoke.abas",
     "fission/tests/arcobasic_single_line_if_smoke.abas",
     "fission/tests/arcobasic_strict_semantic_smoke.abas",
     "fission/tests/arcobasic_string_smoke.abas",

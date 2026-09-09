@@ -378,14 +378,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_parse_smoke.abas)"
 
-grep -q "^71$" <<<"$fission_self_output"
+grep -q "^72$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_semantic_smoke.abas)"
 
-grep -q "^71$" <<<"$fission_self_semantic_output"
-grep -q "^101$" <<<"$fission_self_semantic_output"
-grep -q "^1873$" <<<"$fission_self_semantic_output"
+grep -q "^72$" <<<"$fission_self_semantic_output"
+grep -q "^102$" <<<"$fission_self_semantic_output"
+grep -q "^1903$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_import_semantic_smoke.abas)"
@@ -414,6 +414,17 @@ grep -q "^4$" <<<"$cross_file_semantic_output"
 grep -q "^2$" <<<"$cross_file_semantic_output"
 grep -q "^    Call /tmp/fission_cross_file_main.abas::module::helper -> ResolvedImport /tmp/fission_cross_file_library.abas::module::helper$" <<<"$cross_file_semantic_output"
 grep -q "^    Read /tmp/fission_cross_file_main.abas::module::sharedValue -> ResolvedImport /tmp/fission_cross_file_library.abas::module::sharedValue$" <<<"$cross_file_semantic_output"
+
+signature_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_signature_semantic_smoke.abas)"
+
+grep -q "^FALSE$" <<<"$signature_semantic_output"
+grep -q "^clamp(value:U64,minimum:U64=0,maximum:U64=255) AS U64$" <<<"$signature_semantic_output"
+grep -q "^3$" <<<"$signature_semantic_output"
+grep -q "^value$" <<<"$signature_semantic_output"
+grep -q "^U64$" <<<"$signature_semantic_output"
+grep -q "^0$" <<<"$signature_semantic_output"
+grep -q "^255$" <<<"$signature_semantic_output"
+grep -q "^/tmp/fission_signature_semantic.abas::module::clamp clamp(value:U64,minimum:U64=0,maximum:U64=255) AS U64$" <<<"$signature_semantic_output"
 
 self_loop_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_loop_semantic_smoke.abas)"
 
