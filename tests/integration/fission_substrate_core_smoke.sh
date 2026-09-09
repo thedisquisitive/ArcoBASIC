@@ -29,7 +29,7 @@ grep -q "^  Print$" <<<"$arcobasic_output"
 grep -q "^    Read(Name=value)$" <<<"$arcobasic_output"
 grep -q "^11$" <<<"$arcobasic_output"
 test "$(grep -c "^TRUE$" <<<"$arcobasic_output")" = "3"
-grep -q "^12$" <<<"$arcobasic_output"
+grep -q "^13$" <<<"$arcobasic_output"
 grep -q "^9$" <<<"$arcobasic_output"
 grep -q "^7$" <<<"$arcobasic_output"
 
@@ -137,6 +137,15 @@ grep -q "^    Object$" <<<"$literal_output"
 grep -q "^      Field(Name=Name)$" <<<"$literal_output"
 grep -q "^SIR literal-smoke.abas v0.1$" <<<"$literal_output"
 grep -q "^    MemberRead(Name=Name)$" <<<"$literal_output"
+
+let_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_let_smoke.abas)"
+
+test "$(grep -c "^FALSE$" <<<"$let_output")" = "2"
+grep -q "^ArcoBASIC AST let-smoke.abas$" <<<"$let_output"
+grep -q "^      Declare(Name=mapSize, Type=U64)$" <<<"$let_output"
+grep -q "^      Declare(Name=mapSizeAddress, Type=PTR)$" <<<"$let_output"
+grep -q "^      Declare(Name=status, Type=)$" <<<"$let_output"
+grep -q "^SIR let-smoke.abas v0.1$" <<<"$let_output"
 
 string_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_string_smoke.abas)"
 

@@ -87,6 +87,7 @@ ArcoBASIC subset and lowers it into structured SIR.
   - `#IMPORT` directives with optional aliases
   - generic directive capture
   - constants
+  - `LET` declarations with optional type and initializer
   - typed declarations
   - assignment statements
   - compound assignments
@@ -223,6 +224,8 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_include_metadata_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_let_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_string_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_type_compound_smoke.abas` passed.
@@ -299,6 +302,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_expression_smoke.abas`
 - `fission/tests/arcobasic_function_smoke.abas`
 - `fission/tests/arcobasic_include_metadata_smoke.abas`
+- `fission/tests/arcobasic_let_smoke.abas`
 - `fission/tests/arcobasic_lexer_smoke.abas`
 - `fission/tests/arcobasic_literal_smoke.abas`
 - `fission/tests/arcobasic_logic_smoke.abas`

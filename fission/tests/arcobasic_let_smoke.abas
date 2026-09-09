@@ -1,0 +1,12 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+
+Source = "FUNCTION Acquire(systemTable)\nLET mapSize AS U64 = 0\nLET mapSizeAddress AS PTR = ADDRESS.Local(mapSize)\nLET status = systemTable.BootServices.GetMemoryMap(mapSizeAddress, 0, 0, 0, 0)\nRETURN status\nEND FUNCTION"
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "let-smoke.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Ast.Render()
+PRINT "---"
+PRINT Sir.Diagnostics.HasErrors()
+PRINT Sir.Render()

@@ -138,6 +138,7 @@ CLASS FissionArcoBasicParser
         token = SELF.PeekToken()
         IF token.Text == "#" THEN RETURN SELF.ParseDirectiveStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "print" THEN RETURN SELF.ParsePrintStmt()
+        IF token.Kind == "Keyword" AND Lower(token.Text) == "let" THEN RETURN SELF.ParseLetStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "const" THEN RETURN SELF.ParseConstStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "return" THEN RETURN SELF.ParseReturnStmt()
         IF token.Kind == "Keyword" AND Lower(token.Text) == "function" THEN RETURN SELF.ParseFunctionStmt()
@@ -238,6 +239,16 @@ CLASS FissionArcoBasicParser
         ignored = SELF.MatchText("as")
         typeToken = SELF.ReadToken()
         node = FissionArcoBasicAstNode("Declare").WithField("Name", name).WithField("Type", typeToken.Text)
+        IF SELF.MatchText("=") THEN ignored = node.AppendChild(SELF.ParseExpression())
+        RETURN node
+    END FUNCTION
+
+    FUNCTION ParseLetStmt()
+        ignored = SELF.ReadToken()
+        nameToken = SELF.ReadToken()
+        typeName = ""
+        IF SELF.MatchText("as") THEN typeName = SELF.ReadToken().Text
+        node = FissionArcoBasicAstNode("Declare").WithField("Name", nameToken.Text).WithField("Type", typeName)
         IF SELF.MatchText("=") THEN ignored = node.AppendChild(SELF.ParseExpression())
         RETURN node
     END FUNCTION

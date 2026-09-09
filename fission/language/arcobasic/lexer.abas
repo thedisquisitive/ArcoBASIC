@@ -26,7 +26,7 @@ FUNCTION Fission_ArcoBasicIsIdent(ch)
 END FUNCTION
 
 FUNCTION Fission_ArcoBasicIsKeyword(text)
-    keywords = ["abstract", "add", "addressof", "and", "andalso", "as", "bitand", "bitnot", "bitor", "bitxor", "catch", "class", "const", "constructor", "contains", "continue", "copy", "do", "else", "end", "exit", "extends", "false", "flags", "for", "function", "goto", "has", "if", "implements", "import", "in", "interface", "loop", "mod", "next", "not", "null", "or", "orelse", "print", "private", "protected", "public", "remove", "return", "run", "sar", "self", "shared", "shl", "shr", "step", "stop", "super", "then", "throw", "to", "toggle", "true", "try", "until", "wend", "while", "xor"]
+    keywords = ["abstract", "add", "addressof", "and", "andalso", "as", "bitand", "bitnot", "bitor", "bitxor", "catch", "class", "const", "constructor", "contains", "continue", "copy", "do", "else", "end", "exit", "extends", "false", "flags", "for", "function", "goto", "has", "if", "implements", "import", "in", "interface", "let", "loop", "mod", "next", "not", "null", "or", "orelse", "print", "private", "protected", "public", "remove", "return", "run", "sar", "self", "shared", "shl", "shr", "step", "stop", "super", "then", "throw", "to", "toggle", "true", "try", "until", "wend", "while", "xor"]
     RETURN Fission_ListContains(keywords, Lower(text))
 END FUNCTION
 
