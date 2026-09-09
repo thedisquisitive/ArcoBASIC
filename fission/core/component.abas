@@ -64,8 +64,12 @@ FUNCTION Fission_ModuleTransformArtifact(component, artifact, context, outputTyp
     END IF
     packed = File.ReadText(responsePath)
     IF outputType == "SIR" THEN
-        output.Value = FissionSir_UnpackModule(packed)
+        response = FissionSir_UnpackModuleResponse(packed)
+        output.Value = response.Module
         ignored = output.WithMetadata("SerializedAs", "FissionSir+ArcoCompy")
+        FOR metadataName IN Object.Keys(response.Metadata)
+            ignored = output.WithMetadata(metadataName, Object.Get(response.Metadata, metadataName))
+        NEXT
     ELSE
         output.Value = packed
     END IF

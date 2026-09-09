@@ -22,6 +22,9 @@ PRINT SirArtifact.Value.Name
 PRINT String.Contains(SirArtifact.Value.Render(), "SIR module-demo.abas v0.1")
 PRINT String.Contains(SirArtifact.Value.Render(), "  Print")
 PRINT SirArtifact.MetadataValue("SerializedAs", "")
+PRINT SirArtifact.MetadataValue("SemanticSymbolCount", "")
+PRINT SirArtifact.MetadataValue("SemanticReferenceCount", "")
+PRINT String.Contains(SirArtifact.MetadataValue("Semantics.Render", ""), "Read module::value -> Resolved module::value")
 
 Request = Fission.Request()
 Request.Source = Source
@@ -33,3 +36,6 @@ Result = Fission.Compiler().Compile(Request)
 PRINT Result.Ok
 PRINT Result.Artifact.Value.Name
 PRINT String.Contains(Result.Artifact.Value.Render(), "SIR module-pipeline.abas v0.1")
+PRINT Result.Artifact.MetadataValue("SemanticSymbolCount", "")
+PRINT Result.Artifact.MetadataValue("SemanticReferenceCount", "")
+PRINT String.Contains(Result.Artifact.MetadataValue("Semantics.Render", ""), "Read module::value -> Resolved module::value")

@@ -28,6 +28,14 @@ FUNCTION FissionSir_ModuleToData(module)
     }
 END FUNCTION
 
+FUNCTION FissionSir_ModuleResponseToData(module, metadata)
+    RETURN {
+        Kind: "SIR.ModuleResponse",
+        Module: FissionSir_ModuleToData(module),
+        Metadata: metadata
+    }
+END FUNCTION
+
 FUNCTION FissionSir_DataToNode(data)
     node = FissionSirNode(Object.Get(data, "NodeKind", ""))
     fieldNames = Object.Get(data, "FieldNames", [])
@@ -58,4 +66,29 @@ FUNCTION FissionSir_UnpackModule(payload)
     data = ArcoCompy.Unpack(payload)
     IF Object.Get(data, "Kind", "") != "SIR.Module" THEN RETURN FissionSirModule("")
     RETURN FissionSir_DataToModule(data)
+END FUNCTION
+
+FUNCTION FissionSir_PackModuleResponse(module, metadata)
+    RETURN ArcoCompy.Pack(FissionSir_ModuleResponseToData(module, metadata))
+END FUNCTION
+
+FUNCTION FissionSir_UnpackModuleResponse(payload)
+    data = ArcoCompy.Unpack(payload)
+    kind = Object.Get(data, "Kind", "")
+    IF kind == "SIR.ModuleResponse" THEN
+        RETURN {
+            Module: FissionSir_DataToModule(Object.Get(data, "Module", {})),
+            Metadata: Object.Get(data, "Metadata", {})
+        }
+    END IF
+    IF kind == "SIR.Module" THEN
+        RETURN {
+            Module: FissionSir_DataToModule(data),
+            Metadata: {}
+        }
+    END IF
+    RETURN {
+        Module: FissionSirModule(""),
+        Metadata: {}
+    }
 END FUNCTION

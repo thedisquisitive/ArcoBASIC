@@ -1,5 +1,7 @@
 #IMPORT "fission/build/rivet_modules.abas"
+#IMPORT "fission/language/arcobasic/preprocess.abas"
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/language/arcobasic/semantic.abas"
 #IMPORT "fission/sir/serialize.abas"
 
 module = Fission_ArcoBasicFrontendModule()
@@ -17,11 +19,17 @@ IF LEN(args) > 0 AND args[0] == "transform" THEN
     sourceName = args[4]
 
     source = File.ReadText(requestPath)
-    tokens = Fission_ArcoBasicLex(source)
+    preprocessed = Fission_ArcoBasicPreprocess(source, [])
+    tokens = Fission_ArcoBasicLex(preprocessed.Source)
     ast = Fission_ArcoBasicParse(tokens, sourceName)
     sir = Fission_ArcoBasicAstToSir(ast)
-    IF ast.Diagnostics.HasErrors() OR sir.Diagnostics.HasErrors() THEN
-        File.WriteText(responsePath, ast.Diagnostics.Render() + "\n" + sir.Diagnostics.Render())
+    IF preprocessed.Metadata.Strict THEN
+        semantics = Fission_ArcoBasicAnalyzeSirStrict(sir)
+    ELSE
+        semantics = Fission_ArcoBasicAnalyzeSir(sir)
+    END IF
+    IF preprocessed.Diagnostics.HasErrors() OR ast.Diagnostics.HasErrors() OR sir.Diagnostics.HasErrors() OR semantics.Diagnostics.HasErrors() THEN
+        File.WriteText(responsePath, preprocessed.Diagnostics.Render() + "\n" + ast.Diagnostics.Render() + "\n" + sir.Diagnostics.Render() + "\n" + semantics.Diagnostics.Render())
         PRINT "ERROR diagnostics"
         STOP
     END IF
@@ -30,7 +38,18 @@ IF LEN(args) > 0 AND args[0] == "transform" THEN
         PRINT "ERROR unsupported output type"
         STOP
     END IF
-    ignored = File.WriteText(responsePath, FissionSir_PackModule(sir))
+    metadata = {}
+    metadata = Object.Set(metadata, "Language", "arcobasic")
+    metadata = Object.Set(metadata, "SourceType", "Source.arcobasic")
+    metadata = Object.Set(metadata, "TokenCount", String(LEN(tokens)))
+    metadata = Object.Set(metadata, "Preprocessed.Source", preprocessed.Source)
+    metadata = Object.Set(metadata, "CompileMetadata", preprocessed.Metadata)
+    metadata = Object.Set(metadata, "AST.Render", ast.Render())
+    metadata = Object.Set(metadata, "SIR.Render", sir.Render())
+    metadata = Object.Set(metadata, "Semantics.Render", semantics.Render())
+    metadata = Object.Set(metadata, "SemanticSymbolCount", String(LEN(semantics.Symbols)))
+    metadata = Object.Set(metadata, "SemanticReferenceCount", String(LEN(semantics.References)))
+    ignored = File.WriteText(responsePath, FissionSir_PackModuleResponse(sir, metadata))
     PRINT "OK"
 ELSE
     PRINT module.RenderManifest()

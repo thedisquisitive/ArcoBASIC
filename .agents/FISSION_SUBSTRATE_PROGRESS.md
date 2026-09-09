@@ -199,6 +199,11 @@ ArcoBASIC subset and lowers it into structured SIR.
   structural SIR data through `FissionSir+ArcoCompy`, and the host reconstructs
   `FissionSirModule` / `FissionSirNode` class instances before continuing the
   pipeline.
+- SIR module executable responses now support a metadata envelope while
+  remaining backward-compatible with plain packed SIR modules. The ArcoBASIC
+  frontend capsule now returns semantic metadata (`Semantics.Render`,
+  `SemanticSymbolCount`, `SemanticReferenceCount`, reveal renders, compile
+  metadata) through the module boundary.
 
 ## In-Progress Components
 
@@ -251,8 +256,8 @@ ArcoBASIC subset and lowers it into structured SIR.
   persistent component package discovery, advanced artifact storage, version
   negotiation, or real target backend yet.
 - Executable module transforms currently support structural SIR exchange for the
-  ArcoBASIC frontend boundary only. A-MIR and other artifact codecs are still
-  needed.
+  ArcoBASIC frontend boundary and SIR metadata exchange for semantic/reveal
+  data. A-MIR and other artifact codecs are still needed.
 
 ## Regression Status
 
@@ -388,6 +393,17 @@ ArcoBASIC subset and lowers it into structured SIR.
   modules, 103 import edges, 1940 program symbols, and zero diagnostics using
   strict import-aware program semantic analysis with semantic binding records.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/module_smoke.abas` passed after the executable ArcoBASIC
+  frontend capsule began returning semantic metadata through the SIR response
+  envelope.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_fission_self_parse_smoke.abas` passed with 73 current
+  first-party Fission `.abas` files and zero parse/lowering failures.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_fission_self_semantic_smoke.abas` passed with 73
+  modules, 105 import edges, 1957 program symbols, and zero diagnostics after
+  module metadata envelope support was added.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_self_semantic_smoke.abas` passed, proving strict
   `SELF` field/method resolution for a class-local fixture.
 - `build-rivet/ArcoFission compile-run
@@ -429,6 +445,8 @@ ArcoBASIC subset and lowers it into structured SIR.
   ArcoBASIC function signature capture was added.
 - `(cd fission && ../build-rivet/fissure run --full)` passed after
   ArcoBASIC semantic binding records were added.
+- `(cd fission && ../build-rivet/fissure run --full)` passed after SIR module
+  metadata response envelopes were added.
 - `ctest --test-dir build -R '^fission_substrate_core_smoke$'
   --output-on-failure` passed.
 - `build-rivet/rivet build` passed and produced
@@ -439,6 +457,9 @@ ArcoBASIC subset and lowers it into structured SIR.
   produced SIR successfully.
 - `FissionCompiler.Compile()` invoked `language.arcobasic` as an executable
   module and received a reconstructed structural SIR module successfully.
+- `FissionCompiler.Compile()` invoked `language.arcobasic` as an executable
+  module and received semantic metadata on the returned SIR artifact
+  successfully.
 - `git diff --check` passed.
 - Resolver smoke now covers accumulated capabilities, unmet requirements, and
   ambiguous shortest-route diagnostics.
@@ -626,6 +647,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - Fission now indexes 1940 canonical program symbols across 73 current
   first-party Fission `.abas` files and produces stable semantic binding records
   for resolved references.
+- The executable ArcoBASIC frontend module must preserve the same public
+  semantic metadata keys as the in-process frontend so reveal, diagnostics, and
+  future SIR/A-MIR lowering do not depend on whether a component runs in-process
+  or as an ArcoCapsule.
 - The first self-compilation semantic pressure point is covered: class fields and
   self-method calls are represented in the semantic report instead of falling
   through as unresolved or external `SELF` reads.
@@ -644,9 +669,9 @@ ArcoBASIC subset and lowers it into structured SIR.
 
 1. Continue expanding ArcoBASIC frontend compatibility against real Arcology
    source files until the Fission parser can ingest the primary ABAS corpus.
-2. Keep advancing Fission self-compilation by serializing semantic bindings
-   through the executable module boundary, then attaching them to typed SIR nodes
-   or a stable SIR semantic artifact.
+2. Keep advancing Fission self-compilation by formalizing semantic bindings as a
+   typed SIR semantic artifact and carrying program-level binding data through
+   module/component boundaries.
 3. Add real import expansion once package/source discovery rules are available.
 4. Add lambdas, richer type syntax, and more complete access/inheritance
    semantic validation.

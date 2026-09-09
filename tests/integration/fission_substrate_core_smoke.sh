@@ -27,12 +27,13 @@ grep -q "^elf:amir:sir:+$" <<<"$kit_output"
 module_output="$("$ARCOFISSION" compile-run fission/tests/module_smoke.abas)"
 
 grep -q "^build-rivet/fission/modules/fission-arcobasic-frontend$" <<<"$module_output"
-test "$(grep -c "^TRUE$" <<<"$module_output")" = "7"
+test "$(grep -c "^TRUE$" <<<"$module_output")" = "9"
 grep -q "^fission-module-stdio-v0.1$" <<<"$module_output"
 grep -q "^SIR$" <<<"$module_output"
 grep -q "^module-demo.abas$" <<<"$module_output"
 grep -q "^module-pipeline.abas$" <<<"$module_output"
 grep -q "^FissionSir+ArcoCompy$" <<<"$module_output"
+test "$(grep -c "^1$" <<<"$module_output")" = "4"
 
 arcobasic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_language_smoke.abas)"
 
@@ -384,8 +385,8 @@ grep -q "^0$" <<<"$fission_self_output"
 fission_self_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_semantic_smoke.abas)"
 
 grep -q "^73$" <<<"$fission_self_semantic_output"
-grep -q "^103$" <<<"$fission_self_semantic_output"
-grep -q "^1940$" <<<"$fission_self_semantic_output"
+grep -q "^105$" <<<"$fission_self_semantic_output"
+grep -q "^1957$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_import_semantic_smoke.abas)"
