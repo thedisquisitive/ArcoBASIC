@@ -262,6 +262,22 @@ grep -q "^      If$" <<<"$single_line_if_output"
 grep -q "^SIR single-line-if-smoke.abas v0.1$" <<<"$single_line_if_output"
 grep -q "^      Branch$" <<<"$single_line_if_output"
 
+semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_semantic_smoke.abas)"
+
+grep -q "^FALSE$" <<<"$semantic_output"
+grep -q "^ArcoBASIC Semantics semantic-smoke.abas$" <<<"$semantic_output"
+grep -q "^  Import module::Txt$" <<<"$semantic_output"
+grep -q "^  Variable module::count AS U64$" <<<"$semantic_output"
+grep -q "^  Function module::Add AS U64$" <<<"$semantic_output"
+grep -q "^  Parameter module::Add::right AS U64 = 1$" <<<"$semantic_output"
+grep -q "^  Class module::Box$" <<<"$semantic_output"
+
+semantic_diagnostics_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_semantic_diagnostics_smoke.abas)"
+
+grep -q "^FALSE$" <<<"$semantic_diagnostics_output"
+grep -q "^TRUE$" <<<"$semantic_diagnostics_output"
+grep -q "FISSION_ARCOBASIC_DUPLICATE_SYMBOL" <<<"$semantic_diagnostics_output"
+
 diagnostics_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_diagnostics_smoke.abas)"
 
 grep -q "^FALSE$" <<<"$diagnostics_output"

@@ -119,6 +119,13 @@ ArcoBASIC subset and lowers it into structured SIR.
   - member reads and index reads
   - array literals, array comprehensions, and object literals
 - AST-to-SIR lowering added for the current ArcoBASIC parser subset.
+- Initial ArcoBASIC semantic report pass added. It walks SIR, records imports,
+  variables, constants, functions, parameters, classes, interfaces, constructor
+  scopes, inferred assignment-created locals, return types, and parameter
+  defaults, and reports duplicate symbols through normal diagnostics.
+- `language.arcobasic` now attaches `Semantics.Render` and
+  `SemanticSymbolCount` metadata to produced SIR artifacts and propagates
+  semantic diagnostics into the compile result.
 - Top-level `FissionCompiler.Compile()` now propagates artifact-carried
   diagnostics, allowing ArcoBASIC parser/SIR diagnostics to fail compilation.
 - `FissionCompiler.Reveal(request, "AST"|"SIR"|"PIPELINE")` added for the
@@ -132,9 +139,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - WP-002 needs broader parser/semantic integration for ArcoBASIC; the current
   parser subset is enough for early regression scaffolding but not yet full
   ArcoBASIC.
-- WP-003 SIR exists as a minimal model/builder/validator and needs typed values,
-  scopes, symbols, function signatures, control-flow structure, and canonical
-  serialization.
+- WP-003 SIR exists as a minimal model/builder/validator with an initial
+  ArcoBASIC semantic report sidecar. It still needs typed values, canonical
+  symbol references, resolved scopes, function signatures, control-flow
+  structure, and canonical serialization.
 
 ## Legacy Bridges
 
@@ -153,8 +161,8 @@ ArcoBASIC subset and lowers it into structured SIR.
   serialized, or lowered to real A-MIR.
 - ArcoBASIC `Source.arcobasic -> SIR` supports a growing structural subset, but
   not yet real import expansion, full directive metadata semantics, lambdas,
-  complete generic type syntax, full host interop, or complete
-  legacy-compatible syntax/semantics.
+  complete generic type syntax, full host interop, resolved symbols/types, or
+  complete legacy-compatible syntax/semantics.
 - Unsupported ArcoBASIC statements are now surfaced into the top-level compile
   result diagnostics.
 - No Brainfuck reference language exists yet.
@@ -217,6 +225,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_reveal_smoke.abas` passed.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_semantic_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_semantic_diagnostics_smoke.abas` passed.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_single_line_if_smoke.abas` passed.
 - `tests/integration/fission_substrate_core_smoke.sh build-rivet/ArcoFission
   /home/daedalus/projects/arcobasic` passed.
@@ -256,6 +268,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/language/arcobasic/lexer.abas`
 - `fission/language/arcobasic/parser.abas`
 - `fission/language/arcobasic/lower_sir.abas`
+- `fission/language/arcobasic/semantic.abas`
 - `fission/language/arcobasic/register.abas`
 - `fission/sir/model.abas`
 - `fission/sir/builder.abas`
@@ -285,6 +298,8 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_parser_smoke.abas`
 - `fission/tests/arcobasic_postfix_smoke.abas`
 - `fission/tests/arcobasic_reveal_smoke.abas`
+- `fission/tests/arcobasic_semantic_smoke.abas`
+- `fission/tests/arcobasic_semantic_diagnostics_smoke.abas`
 - `fission/tests/arcobasic_single_line_if_smoke.abas`
 - `fission/tests/arcobasic_string_smoke.abas`
 - `fission/tests/arcobasic_type_compound_smoke.abas`

@@ -1,0 +1,150 @@
+#IMPORT "fission/core/diagnostics.abas"
+#IMPORT "fission/sir/model.abas"
+
+CLASS FissionArcoBasicSemanticSymbol
+    CONSTRUCTOR(name, kind, scope)
+        SELF.Name = name
+        SELF.Kind = kind
+        SELF.Scope = scope
+        SELF.TypeName = ""
+        SELF.DefaultValue = ""
+    END CONSTRUCTOR
+
+    FUNCTION Render()
+        text = SELF.Kind + " " + SELF.Scope + "::" + SELF.Name
+        IF SELF.TypeName != "" THEN text = text + " AS " + SELF.TypeName
+        IF SELF.DefaultValue != "" THEN text = text + " = " + SELF.DefaultValue
+        RETURN text
+    END FUNCTION
+END CLASS
+
+CLASS FissionArcoBasicSemanticReport
+    CONSTRUCTOR(moduleName)
+        SELF.ModuleName = moduleName
+        SELF.Symbols = []
+        SELF.Diagnostics = FissionDiagnosticBag()
+    END CONSTRUCTOR
+
+    FUNCTION HasSymbol(scope, name)
+        FOR symbol IN SELF.Symbols
+            IF symbol.Scope == scope AND Lower(symbol.Name) == Lower(name) THEN RETURN TRUE
+        NEXT
+        RETURN FALSE
+    END FUNCTION
+
+    FUNCTION AddSymbol(symbol)
+        IF SELF.HasSymbol(symbol.Scope, symbol.Name) THEN
+            ignored = SELF.Diagnostics.ReportError("FISSION_ARCOBASIC_DUPLICATE_SYMBOL", "Duplicate symbol " + symbol.Scope + "::" + symbol.Name)
+            RETURN symbol
+        END IF
+        ignored = Array.Push(SELF.Symbols, symbol)
+        RETURN symbol
+    END FUNCTION
+
+    FUNCTION Render()
+        lines = ["ArcoBASIC Semantics " + SELF.ModuleName]
+        FOR symbol IN SELF.Symbols
+            ignored = Array.Push(lines, "  " + symbol.Render())
+        NEXT
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS
+
+FUNCTION Fission_ArcoBasicSemanticSplitArgument(argumentText)
+    symbol = FissionArcoBasicSemanticSymbol(argumentText, "Parameter", "")
+    remaining = argumentText
+    IF String.Contains(remaining, "=") THEN
+        parts = String.Split(remaining, "=")
+        remaining = parts[0]
+        symbol.DefaultValue = parts[1]
+    END IF
+    IF String.Contains(remaining, ":") THEN
+        parts = String.Split(remaining, ":")
+        symbol.Name = parts[0]
+        symbol.TypeName = parts[1]
+    ELSE
+        symbol.Name = remaining
+    END IF
+    RETURN symbol
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicSemanticAddArguments(report, scope, argsText)
+    IF argsText == "" THEN RETURN
+    args = String.Split(argsText, ",")
+    FOR argText IN args
+        argument = Fission_ArcoBasicSemanticSplitArgument(argText)
+        argument.Scope = scope
+        ignored = report.AddSymbol(argument)
+    NEXT
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicAnalyzeSirNode(report, node, scope)
+    IF node.Kind == "Import" THEN
+        symbol = FissionArcoBasicSemanticSymbol(Object.Get(node.Fields, "Path", ""), "Import", scope)
+        aliasName = Object.Get(node.Fields, "Alias", "")
+        IF aliasName != "" THEN symbol.Name = aliasName
+        ignored = report.AddSymbol(symbol)
+    END IF
+    IF node.Kind == "Const" THEN
+        symbol = FissionArcoBasicSemanticSymbol(Object.Get(node.Fields, "Name", ""), "Const", scope)
+        ignored = report.AddSymbol(symbol)
+    END IF
+    IF node.Kind == "Declare" THEN
+        symbol = FissionArcoBasicSemanticSymbol(Object.Get(node.Fields, "Name", ""), "Variable", scope)
+        symbol.TypeName = Object.Get(node.Fields, "Type", "")
+        ignored = report.AddSymbol(symbol)
+    END IF
+    IF node.Kind == "Assign" THEN
+        name = Object.Get(node.Fields, "Name", "")
+        IF report.HasSymbol(scope, name) == FALSE THEN ignored = report.AddSymbol(FissionArcoBasicSemanticSymbol(name, "Variable", scope))
+    END IF
+    IF node.Kind == "Function" THEN
+        name = Object.Get(node.Fields, "Name", "")
+        symbol = FissionArcoBasicSemanticSymbol(name, "Function", scope)
+        symbol.TypeName = Object.Get(node.Fields, "Returns", "")
+        ignored = report.AddSymbol(symbol)
+        functionScope = scope + "::" + name
+        ignored = Fission_ArcoBasicSemanticAddArguments(report, functionScope, Object.Get(node.Fields, "Arguments", ""))
+        FOR child IN node.Children
+            ignored = Fission_ArcoBasicAnalyzeSirNode(report, child, functionScope)
+        NEXT
+        RETURN
+    END IF
+    IF node.Kind == "Constructor" THEN
+        constructorScope = scope + "::CONSTRUCTOR"
+        ignored = Fission_ArcoBasicSemanticAddArguments(report, constructorScope, Object.Get(node.Fields, "Arguments", ""))
+        FOR child IN node.Children
+            ignored = Fission_ArcoBasicAnalyzeSirNode(report, child, constructorScope)
+        NEXT
+        RETURN
+    END IF
+    IF node.Kind == "Class" THEN
+        name = Object.Get(node.Fields, "Name", "")
+        ignored = report.AddSymbol(FissionArcoBasicSemanticSymbol(name, "Class", scope))
+        classScope = scope + "::" + name
+        FOR child IN node.Children
+            ignored = Fission_ArcoBasicAnalyzeSirNode(report, child, classScope)
+        NEXT
+        RETURN
+    END IF
+    IF node.Kind == "Interface" THEN
+        name = Object.Get(node.Fields, "Name", "")
+        ignored = report.AddSymbol(FissionArcoBasicSemanticSymbol(name, "Interface", scope))
+        interfaceScope = scope + "::" + name
+        FOR child IN node.Children
+            ignored = Fission_ArcoBasicAnalyzeSirNode(report, child, interfaceScope)
+        NEXT
+        RETURN
+    END IF
+    FOR child IN node.Children
+        ignored = Fission_ArcoBasicAnalyzeSirNode(report, child, scope)
+    NEXT
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicAnalyzeSir(module)
+    report = FissionArcoBasicSemanticReport(module.Name)
+    FOR statement IN module.Statements
+        ignored = Fission_ArcoBasicAnalyzeSirNode(report, statement, "module")
+    NEXT
+    RETURN report
+END FUNCTION
