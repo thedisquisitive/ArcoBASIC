@@ -1,3 +1,4 @@
+#IMPORT "fission/language/arcobasic/semantic.abas"
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 
 Files = [
@@ -71,22 +72,24 @@ Files = [
 ]
 
 Failures = 0
-Parsed = 0
+Analyzed = 0
 
 FOR path IN Files
     Source = File.ReadText(path)
     Tokens = Fission_ArcoBasicLex(Source)
     Ast = Fission_ArcoBasicParse(Tokens, path)
     Sir = Fission_ArcoBasicAstToSir(Ast)
-    IF Ast.Diagnostics.HasErrors() OR Sir.Diagnostics.HasErrors() THEN
+    Report = Fission_ArcoBasicAnalyzeSir(Sir)
+    IF Ast.Diagnostics.HasErrors() OR Sir.Diagnostics.HasErrors() OR Report.Diagnostics.HasErrors() THEN
         Failures = Failures + 1
         PRINT path
         PRINT Ast.Diagnostics.Render()
         PRINT Sir.Diagnostics.Render()
+        PRINT Report.Diagnostics.Render()
     ELSE
-        Parsed = Parsed + 1
+        Analyzed = Analyzed + 1
     END IF
 NEXT
 
-PRINT String(Parsed)
+PRINT String(Analyzed)
 PRINT String(Failures)

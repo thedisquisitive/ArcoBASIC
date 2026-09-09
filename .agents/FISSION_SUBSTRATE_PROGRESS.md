@@ -299,6 +299,13 @@ ArcoBASIC subset and lowers it into structured SIR.
   fission/tests/arcobasic_fission_self_parse_smoke.abas` passed with 66 current
   first-party Fission `.abas` files and zero parse/lowering failures.
 - `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_fission_self_parse_smoke.abas` passed with 67 current
+  first-party Fission `.abas` files and zero parse/lowering failures.
+- `build-rivet/ArcoFission compile-run
+  fission/tests/arcobasic_fission_self_semantic_smoke.abas` passed with 67
+  current first-party Fission `.abas` files and zero parse/lowering/semantic
+  diagnostics.
+- `build-rivet/ArcoFission compile-run
   fission/tests/arcobasic_self_semantic_smoke.abas` passed, proving strict
   `SELF` field/method resolution for a class-local fixture.
 - `build-rivet/ArcoFission compile-run
@@ -404,6 +411,7 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_do_bitwise_smoke.abas`
 - `fission/tests/arcobasic_expression_smoke.abas`
 - `fission/tests/arcobasic_fission_self_parse_smoke.abas`
+- `fission/tests/arcobasic_fission_self_semantic_smoke.abas`
 - `fission/tests/arcobasic_function_smoke.abas`
 - `fission/tests/arcobasic_include_metadata_smoke.abas`
 - `fission/tests/arcobasic_legacy_operator_smoke.abas`
@@ -503,6 +511,9 @@ ArcoBASIC subset and lowers it into structured SIR.
 - Fission now carries every current first-party Fission `.abas` source through
   ArcoBASIC lex/parse/SIR lowering without diagnostics, including the executable
   module entrypoint and all Fission smoke fixtures.
+- Fission now carries every current first-party Fission `.abas` source through
+  non-strict ArcoBASIC semantic analysis without diagnostics. This is not
+  self-compilation yet, but it is the next rung above structural self-parse.
 - The first self-compilation semantic pressure point is covered: class fields and
   self-method calls are represented in the semantic report instead of falling
   through as unresolved or external `SELF` reads.

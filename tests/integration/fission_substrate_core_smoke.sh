@@ -378,8 +378,13 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_parse_smoke.abas)"
 
-grep -q "^66$" <<<"$fission_self_output"
+grep -q "^67$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
+
+fission_self_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_fission_self_semantic_smoke.abas)"
+
+grep -q "^67$" <<<"$fission_self_semantic_output"
+grep -q "^0$" <<<"$fission_self_semantic_output"
 
 self_semantic_output="$("$ARCOFISSION" compile-run fission/tests/arcobasic_self_semantic_smoke.abas)"
 
