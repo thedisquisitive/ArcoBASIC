@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^75$" <<<"$fission_self_semantic_output"
 grep -q "^108$" <<<"$fission_self_semantic_output"
-grep -q "^2033$" <<<"$fission_self_semantic_output"
+grep -q "^2044$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"

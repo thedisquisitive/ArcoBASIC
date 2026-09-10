@@ -46,7 +46,29 @@ FUNCTION Fission_ArcoBasicEscapedChar(ch)
     RETURN ch
 END FUNCTION
 
-FUNCTION Fission_ArcoBasicReadStringToken(source, startIndex, line, column, interpolated)
+' `chars`/`sourceLength` are the whole source exploded once via String.ToChars (see
+' Fission_ArcoBasicLex) rather than a bare source string -- String.Length/String.Slice are both a
+' full byte-0 rescan per call (needed to answer "what UTF-8 codepoint is at byte N" without any
+' cross-call state), so calling them per character over a whole file is O(file length) work per
+' character, O(n^2) for the whole scan. A real ~4800-line source file measured at 4+ minutes to
+' lex, well past what linear extrapolation from a smaller file predicted, confirmed this exact
+' loop as the cause. `chars[index]` below is a plain O(1) array index (this language already
+' array-indexes with brackets everywhere, e.g. parser.abas's `SELF.Tokens[SELF.Index]`) --
+' `Fission_ArcoBasicCharsSlice` is the only place multiple characters are joined, and each
+' character it touches belongs to exactly one token, so total substring work across the whole
+' file stays O(n), not O(n^2).
+FUNCTION Fission_ArcoBasicCharsSlice(chars, sourceLength, start, length)
+    text = ""
+    endIndex = start + length
+    index = start
+    WHILE index < endIndex AND index < sourceLength
+        text = text + chars[index]
+        index = index + 1
+    WEND
+    RETURN text
+END FUNCTION
+
+FUNCTION Fission_ArcoBasicReadStringToken(chars, sourceLength, startIndex, line, column, interpolated)
     index = startIndex
     startColumn = column
     IF interpolated THEN
@@ -58,8 +80,8 @@ FUNCTION Fission_ArcoBasicReadStringToken(source, startIndex, line, column, inte
     END IF
     value = ""
     closed = FALSE
-    WHILE index < String.Length(source)
-        ch = String.Slice(source, index, 1)
+    WHILE index < sourceLength
+        ch = chars[index]
         IF ch == "\n" THEN
             token = FissionArcoBasicToken("Error", "unterminated string", line, startColumn)
             RETURN {Token: token, Index: index, Column: column}
@@ -73,11 +95,11 @@ FUNCTION Fission_ArcoBasicReadStringToken(source, startIndex, line, column, inte
         IF ch == "\\" THEN
             index = index + 1
             column = column + 1
-            IF index >= String.Length(source) THEN
+            IF index >= sourceLength THEN
                 token = FissionArcoBasicToken("Error", "unterminated string", line, startColumn)
                 RETURN {Token: token, Index: index, Column: column}
             END IF
-            escaped = String.Slice(source, index, 1)
+            escaped = chars[index]
             value = value + Fission_ArcoBasicEscapedChar(escaped)
             index = index + 1
             column = column + 1
@@ -98,12 +120,14 @@ FUNCTION Fission_ArcoBasicReadStringToken(source, startIndex, line, column, inte
 END FUNCTION
 
 FUNCTION Fission_ArcoBasicLex(source)
+    chars = String.ToChars(source)
+    sourceLength = LEN(chars)
     tokens = []
     index = 0
     line = 1
     column = 1
-    WHILE index < String.Length(source)
-        ch = String.Slice(source, index, 1)
+    WHILE index < sourceLength
+        ch = chars[index]
 
         IF ch == " " OR ch == "\t" OR ch == "\r" THEN
             index = index + 1
@@ -120,7 +144,7 @@ FUNCTION Fission_ArcoBasicLex(source)
         END IF
 
         IF ch == "'" THEN
-            WHILE index < String.Length(source) AND String.Slice(source, index, 1) != "\n"
+            WHILE index < sourceLength ANDALSO chars[index] != "\n"
                 index = index + 1
                 column = column + 1
             WEND
@@ -128,15 +152,15 @@ FUNCTION Fission_ArcoBasicLex(source)
         END IF
 
         IF ch == "\"" THEN
-            read = Fission_ArcoBasicReadStringToken(source, index, line, column, FALSE)
+            read = Fission_ArcoBasicReadStringToken(chars, sourceLength, index, line, column, FALSE)
             ignored = Array.Push(tokens, read.Token)
             index = read.Index
             column = read.Column
             CONTINUE WHILE
         END IF
 
-        IF ch == "$" AND String.Slice(source, index, 2) == "$\"" THEN
-            read = Fission_ArcoBasicReadStringToken(source, index, line, column, TRUE)
+        IF ch == "$" AND Fission_ArcoBasicCharsSlice(chars, sourceLength, index, 2) == "$\"" THEN
+            read = Fission_ArcoBasicReadStringToken(chars, sourceLength, index, line, column, TRUE)
             ignored = Array.Push(tokens, read.Token)
             index = read.Index
             column = read.Column
@@ -146,11 +170,11 @@ FUNCTION Fission_ArcoBasicLex(source)
         IF Fission_ArcoBasicIsAlpha(ch) THEN
             start = index
             startColumn = column
-            WHILE index < String.Length(source) AND Fission_ArcoBasicIsIdent(String.Slice(source, index, 1))
+            WHILE index < sourceLength ANDALSO Fission_ArcoBasicIsIdent(chars[index])
                 index = index + 1
                 column = column + 1
             WEND
-            text = String.Slice(source, start, index - start)
+            text = Fission_ArcoBasicCharsSlice(chars, sourceLength, start, index - start)
             kind = "Identifier"
             IF Fission_ArcoBasicIsKeyword(text) THEN kind = "Keyword"
             ignored = Array.Push(tokens, FissionArcoBasicToken(kind, text, line, startColumn))
@@ -160,24 +184,24 @@ FUNCTION Fission_ArcoBasicLex(source)
         IF Fission_ArcoBasicIsDigit(ch) THEN
             start = index
             startColumn = column
-            WHILE index < String.Length(source) AND Fission_ArcoBasicIsDigit(String.Slice(source, index, 1))
+            WHILE index < sourceLength ANDALSO Fission_ArcoBasicIsDigit(chars[index])
                 index = index + 1
                 column = column + 1
             WEND
-            IF index + 1 < String.Length(source) AND String.Slice(source, index, 1) == "." AND Fission_ArcoBasicIsDigit(String.Slice(source, index + 1, 1)) THEN
+            IF index + 1 < sourceLength ANDALSO chars[index] == "." ANDALSO Fission_ArcoBasicIsDigit(chars[index + 1]) THEN
                 index = index + 1
                 column = column + 1
-                WHILE index < String.Length(source) AND Fission_ArcoBasicIsDigit(String.Slice(source, index, 1))
+                WHILE index < sourceLength ANDALSO Fission_ArcoBasicIsDigit(chars[index])
                     index = index + 1
                     column = column + 1
                 WEND
             END IF
-            ignored = Array.Push(tokens, FissionArcoBasicToken("Number", String.Slice(source, start, index - start), line, startColumn))
+            ignored = Array.Push(tokens, FissionArcoBasicToken("Number", Fission_ArcoBasicCharsSlice(chars, sourceLength, start, index - start), line, startColumn))
             CONTINUE WHILE
         END IF
 
         startColumn = column
-        three = String.Slice(source, index, 3)
+        three = Fission_ArcoBasicCharsSlice(chars, sourceLength, index, 3)
         IF Fission_ListContains(["<<=", ">>="], three) THEN
             ignored = Array.Push(tokens, FissionArcoBasicToken("Symbol", three, line, startColumn))
             index = index + 3
@@ -185,7 +209,7 @@ FUNCTION Fission_ArcoBasicLex(source)
             CONTINUE WHILE
         END IF
 
-        two = String.Slice(source, index, 2)
+        two = Fission_ArcoBasicCharsSlice(chars, sourceLength, index, 2)
         IF Fission_ListContains(["==", "!=", "<=", ">=", "<>", "&&", "||", "+=", "-=", "*=", "/=", "&=", "|=", "^=", "<<", ">>"], two) THEN
             ignored = Array.Push(tokens, FissionArcoBasicToken("Symbol", two, line, startColumn))
             index = index + 2

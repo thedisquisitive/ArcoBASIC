@@ -2152,6 +2152,36 @@ Value string_join_function(const std::vector<Value>& args) {
     return output.str();
 }
 
+// String.Length and String.Slice are both, by necessity, O(text length) per call -- correctly
+// answering "what UTF-8 codepoint is at byte N" requires walking from byte 0 counting
+// non-continuation bytes, and neither call carries any state from the last call on the same
+// string. A hot loop of the shape `WHILE index < String.Length(source)` combined with
+// `String.Slice(source, index, 1)` per iteration -- the ordinary, natural way to write a
+// character-at-a-time scanner (see fission/language/arcobasic/lexer.abas, which did exactly
+// this) -- is therefore O(n) work per character times n characters: O(n^2) for the whole scan.
+// Found directly by profiling a real ~4800-line ArcoBASIC source file taking 4+ minutes to lex
+// where linear extrapolation from a smaller file predicted well under two.
+//
+// String.ToChars is the fix: one real O(n) pass that explodes a string into an array of
+// individual-codepoint substrings once, so a caller can index the result (O(1) per Array access)
+// instead of re-deriving a byte offset from scratch on every character. It does not change
+// String.Length or String.Slice at all -- both keep their exact existing behavior for every
+// existing caller; this is a new, additive function only, so it carries no regression risk to
+// anything that does not opt into calling it.
+Value string_to_chars_function(const std::vector<Value>& args) {
+    expect_arg_count(args, "String.ToChars", 1, 1);
+    const std::string text = args[0].to_string();
+    Value::Array chars;
+    std::size_t i = 0;
+    while (i < text.size()) {
+        const std::size_t start = i;
+        ++i;
+        while (i < text.size() && (static_cast<unsigned char>(text[i]) & 0xc0) == 0x80) ++i;
+        chars.emplace_back(text.substr(start, i - start));
+    }
+    return chars;
+}
+
 Value string_split_function(const std::vector<Value>& args) {
     expect_arg_count(args, "String.Split", 2, 2);
     const std::string text = args[0].to_string();
@@ -3046,6 +3076,7 @@ Runtime::Runtime()
     register_function("String.Delete", string_delete_function);
     register_function("String.Join", string_join_function);
     register_function("String.Split", string_split_function);
+    register_function("String.ToChars", string_to_chars_function);
     register_function("String.Replace", string_replace_function);
     register_function("String.Contains", [](const std::vector<Value>& args) -> Value {
         expect_arg_count(args, "String.Contains", 2, 2);
