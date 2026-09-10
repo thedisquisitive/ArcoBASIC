@@ -7,16 +7,35 @@ it before completion.
 
 ## Current Milestone
 
-WP-002 - Language Construction API, with ArcoBASIC as the primary first-party
-frontend.
+WP-001/002/003 are substantially delivered (component system, ArcoBASIC
+language construction, structural SIR). WP-004 (A-MIR) and WP-007 (bytecode)
+now have real, working first slices with genuine end-to-end execution
+verified (Source.arcobasic -> SIR -> A-MIR -> bytecode -> real `ArcoFission
+run` output, checked against expected program output, not just rendered
+text). WP-006 (ArcoBASIC -> SIR/A-MIR) is the RFC's own "Tiny BASIC-like"
+acceptance subset (RFC section 8 Test B): variables, numeric expressions,
+PRINT, IF, WHILE, FOR-range, function declarations/calls, string literals --
+not the full current SIR surface (no classes, arrays, TRY/CATCH, DO loops,
+ForEach in A-MIR/bytecode yet; the ArcoBASIC frontend itself understands all
+of those at the SIR level already, per WP-002/003).
+
+**Not yet started: WP-012 (ELF64 artifact writer) and WP-009/010/011
+(x86-64 architecture / SysV ABI / Linux runtime, i.e. real native codegen).**
+Both are real, separately-sized undertakings -- see "Next Recommended Work"
+for the concrete, scoped next steps. `ArcoFission run FILE.arcof` (the legacy
+bytecode VM, a sanctioned Legacy Bridge) is currently how the Fission-
+produced bytecode actually executes; there is no existing legacy tool that
+packages an existing `.arcof` file into a standalone ELF64 capsule the way
+`ArcoFission build`/`native` do from ArcoBASIC source directly, so a real
+ArcoCapsule output target needs that writer built, not just borrowed.
 
 ## Current Work Package
 
-WP-002 is active on top of the initial WP-001 core, with WP-003 SIR scaffolding
-started where needed by ArcoBASIC. The current slice adds the public ArcoBASIC
-language-definition surface, a first SIR model/builder/validator, and an initial
-`language.arcobasic` registration that preprocesses/lexes/parses a growing
-ArcoBASIC subset and lowers it into structured SIR.
+Building out the pipeline below SIR: WP-004 A-MIR model + SIR->A-MIR
+lowering, then WP-007 bytecode model + A-MIR->bytecode lowering, both
+validated directly against the legacy compiler as the equivalence-testing
+oracle (RFC section 41) -- structural/text comparison for A-MIR, real
+`ArcoFission run` execution-output comparison for bytecode.
 
 ## Completed Components
 
@@ -842,6 +861,52 @@ ArcoBASIC subset and lowers it into structured SIR.
 
 ## Next Recommended Work
 
+**Highest priority -- the concrete path toward the ArcoCapsule/native output
+targets (RFC sections 20/28, WP-012/009/010/011), in order:**
+
+A. Extend SIR->A-MIR->bytecode coverage to the rest of the ArcoBASIC subset
+   the frontend already understands at the SIR level: classes/fields/
+   methods, arrays and array/object literals, member/index read+write,
+   TRY/CATCH, DO loops, ForEach. Each addition should be validated the same
+   way this session's slices were: compare against
+   `ArcoFission reveal ... at A-MIR`/`at BYTECODE` for a real program using
+   that construct, then confirm real `ArcoFission run` execution output, not
+   just that rendering doesn't crash.
+B. Implement the bytecode fusion optimizer this session deliberately skipped
+   (STORE_CONST, BINARY_LOCAL_LOCAL, BINARY_LOCAL_CONST, INDEX_LOCAL_CONST) --
+   current bytecode is correct but always takes the unfused CONST+STORE /
+   LOAD+LOAD+BINARY+STORE path. Not required for correctness, real for
+   output size/speed once this substrate's bytecode is used for anything at
+   scale.
+C. Binary bytecode serialization. Current output is only `.arcof-text`
+   (matches `ArcoFission reveal ... at BYTECODE`'s own text form and is
+   accepted directly by `ArcoFission run`); a true standalone artifact needs
+   the binary `.arcof` encoding legacy ArcoFission itself produces via
+   `ArcoFission bytecode FILE -o OUT.arcof`. Inspect that binary format
+   (likely a serialized version of the same instruction stream --
+   `src/compiler/fission.cpp`'s bytecode writer is the ground truth) before
+   implementing.
+D. ELF64 artifact writer (WP-012) -- the real remaining gap for an actual
+   standalone ArcoCapsule binary. No existing legacy tool packages an
+   existing `.arcof` into a capsule; `ArcoFission build`/`native` only
+   compile from ArcoBASIC source. This is a genuinely new, sizeable
+   subsystem (ELF64 header/section/segment layout, linking the VM's own
+   execution entry point, matching whatever `libarco_runtime.a` already
+   exposes) -- budget real, dedicated time for it, with the same
+   validate-by-running discipline as everything else in this ledger.
+E. Only after D: native x86-64 codegen (WP-009 architecture, WP-010 SysV
+   ABI, WP-011 Linux runtime) -- substantially larger again than D. The
+   existing experimental legacy native backend
+   (`ArcoFission build FILE -o OUT --target linux-x86_64`,
+   `.agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md`) is worth reading
+   first as a second oracle/reference alongside the bytecode VM, though it
+   is itself Phase 1 scope only (see [[project_arcology_os_rfc_0049]]-style
+   caveats -- it rejected an untyped-parameter program outright when this
+   session tried it directly).
+
+**Everything below was already queued before this session and remains real,
+un-reprioritized backlog:**
+
 1. Continue expanding ArcoBASIC frontend compatibility against real Arcology
    source files until the Fission parser can ingest the primary ABAS corpus.
 2. Keep advancing Fission self-compilation by serializing
@@ -852,8 +917,9 @@ ArcoBASIC subset and lowers it into structured SIR.
    semantic validation.
 5. Promote semantic report data into typed SIR scopes, symbol references, and
    function signatures.
-6. Start the real SIR-to-A-MIR lowering contract using legacy ArcoFission reveal
-   output as the oracle.
+6. DONE -- see item A above and Completed Components: the real SIR->A-MIR
+   lowering contract exists now, using legacy ArcoFission reveal output as
+   the oracle, for the RFC's own Tiny-BASIC-like acceptance subset.
 7. Add A-MIR and diagnostics artifact codecs so executable modules can pass the
    next compiler representations structurally.
 8. Replace metadata-carried reveal payloads with typed reveal artifacts.
