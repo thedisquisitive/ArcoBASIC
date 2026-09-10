@@ -213,6 +213,71 @@ ArcoBASIC subset and lowers it into structured SIR.
   bindings, target types, and function signatures into this substrate-level
   model.
 
+- Measured real-world ArcoBASIC frontend coverage against the full non-Fission
+  corpus (207 `.abas` files across Arcology OS, Arco3D, ARCADE, examples,
+  stdlib, games, arcfs-utils): 188/207 (90.8%) structurally clean (lex/parse/
+  lower-to-SIR, zero diagnostics); the remaining 19 are all large (4800-7200
+  line) Arcology OS files that were slow, not incorrect -- zero real parse/
+  lowering failures found anywhere in the corpus.
+- Fixed a real Rivet correctness bug: `ArcoCapsuleTarget.Build()` fingerprinted
+  only the entry file (`Inputs: [SELF.Entry]`), completely ignoring ArcoBASIC's
+  own `#IMPORT` closure -- editing an imported file (e.g. `parser.abas`) did
+  not invalidate a cached capsule built from an entry that imports it. Fixed
+  in `rivet/stdlib/rivet.abas` via `ArcoCapsule_ImportClosure` (a plain BFS
+  line-scanner over `#IMPORT "path"` directives -- deliberately not the real
+  ArcoBASIC lexer/preprocessor, since Rivet must not depend on Fission to
+  build Fission). Verified both directions: unchanged inputs stay a full cache
+  hit; editing an imported (non-entry) file now correctly triggers a rebuild.
+- Every `fission/tests/*.abas` smoke fixture (50 files) is now built as its
+  own cached Rivet `ArcoCapsule` target (`fission/build/rivet_test_capsules.abas`,
+  auto-discovered via `DIRECTORY("fission/tests", FALSE)`, so new test files
+  need no registration). `tests/integration/fission_substrate_core_smoke.sh`
+  now runs the prebuilt capsules instead of `ArcoFission compile-run` per
+  fixture, eliminating redundant from-source frontend recompilation on every
+  run. Confirmed byte-identical output between a prebuilt capsule and
+  `compile-run` for the same fixture. Full suite: 363s -> ~205s on this
+  change alone, all 50 golden-output checks still passing.
+- Fixed a real instruction-limit bug blocking the above: Rivet's own embedded
+  `arco::Runtime` (in `rivet/core/vm/vm.cpp`, used to run `build.abas` itself)
+  inherited the default 100000-instruction hosted-execution safety cap, which
+  a build script walking dozens of `#IMPORT` closures for 50+ capsule targets
+  legitimately exceeds. Fixed via `runtime_.set_instruction_limit_override(0)`
+  in `VM::VM()`, matching `src/native/host_bridge.cpp`'s identical existing
+  rationale for native-embedding contexts. Required a one-time manual
+  bootstrap compile of the `rivet` binary (clang++ direct invocation linking
+  against the already-built `libarco_runtime.a`/`libarcology_os.a`) to escape
+  the chicken-and-egg problem of the old (uncapped-less) binary being unable
+  to even register the action that rebuilds itself.
+- Found and partially fixed a real O(n^2) performance bug in the ArcoBASIC
+  frontend's hot lexing path. Root cause: native `String.Length`/`String.Slice`
+  (`src/runtime/runtime.cpp`) are both, of necessity, O(current string length)
+  per call (a full byte-0 rescan to answer "what UTF-8 codepoint is at byte
+  N", with no state carried between calls) -- and
+  `fission/language/arcobasic/lexer.abas` called `String.Length(source)` as a
+  `WHILE` loop condition (recomputed every iteration) plus
+  `String.Slice(source, index, 1)` per character, over the entire source
+  file. A real ~4800-line file measured at 4m7s to lex+parse+lower, ~3.2x
+  worse than linear extrapolation from a smaller file predicted. Added
+  `String.ToChars` (new, purely additive native function, zero behavior change
+  to existing `String.Length`/`String.Slice` callers) that explodes a string
+  into an array of codepoint-substrings in one real O(n) pass, then rewrote
+  `lexer.abas` to call it once per file and index the result (O(1) per
+  character) instead. Cut the measured worst-case file from 4m7s to 2m42s
+  (~34% faster) -- real, but confirms a second, distinct O(n)-per-lookup
+  pattern remains elsewhere (see Known Failures) and is now the larger
+  remaining cost for whole-program semantic analysis specifically.
+  Caught and fixed a real regression while validating this: `WHILE index <
+  sourceLength AND chars[index] != ...`-style guards used bare `AND`, which is
+  bitwise/non-short-circuiting in this language (see
+  [[project_arcobasic_not_bitwise_footgun]]) -- `chars[index]` was being
+  evaluated even when `index` was out of range, throwing "array index out of
+  range" where the old `String.Slice`-based code had silently degraded
+  instead. Fixed by using `ANDALSO` for every such guard. Also updated one
+  now-stale golden symbol count in the integration smoke script (2033 ->
+  2044) -- an expected, correct change since the rewrite added a new function
+  (`Fission_ArcoBasicCharsSlice`) and new parameters/locals to `lexer.abas`
+  itself, one of the 75 files under whole-program self-semantic analysis.
+
 ## In-Progress Components
 
 - WP-001 needs expansion beyond skeleton route resolution:
@@ -247,6 +312,16 @@ ArcoBASIC subset and lowers it into structured SIR.
 
 ## Known Failures
 
+- `FissionArcoBasicSemanticReport`/`FissionArcoBasicProgramReport` symbol
+  lookup (`HasSymbol`, `FindSymbol`, `FindCanonicalSymbol`,
+  `FindLocalTargetSymbol` in `fission/language/arcobasic/semantic.abas`) is a
+  linear `FOR symbol IN SELF.Symbols` scan per call, called once per
+  reference. With 2044 program symbols and hundreds of references (the
+  current Fission self-semantic corpus), this is now the largest remaining
+  performance cost for whole-program strict semantic analysis -- distinct
+  from, and not fixed by, the lexer's O(n^2) fix above. Needs an actual index
+  (an `Object`-keyed map from `scope::name` or canonical name to symbol)
+  instead of a scan.
 - SIR is currently structural and renderable, but not yet typed, semantically
   bound, canonicalized, or lowered to real A-MIR.
 - ArcoBASIC `Source.arcobasic -> SIR` supports a growing structural subset, but
@@ -486,6 +561,27 @@ ArcoBASIC subset and lowers it into structured SIR.
 - Core smoke now executes a callback pipeline and validates final artifact type
   and value for `Source.brainfuck -> SIR -> AMIR -> Executable.Linux.X86_64`.
 - Full CTest/Fissure suite not run for this initial substrate slice.
+- `tests/integration/fission_substrate_core_smoke.sh build-rivet/ArcoFission
+  /home/daedalus/projects/arcobasic` passed (all 50 fixtures, prebuilt Rivet
+  capsules) after switching from `ArcoFission compile-run` per fixture to a
+  cached `rivet build` + direct capsule execution: 363s -> ~205s.
+  `arcobasic_lexer_smoke` initially failed ("array index out of range") after
+  the `String.ToChars` lexer rewrite -- root cause was bare `AND` (bitwise,
+  non-short-circuiting) guarding `chars[index]` array access, fixed with
+  `ANDALSO`; full suite re-passed after the fix, including the updated
+  program-symbol-count golden value (2033 -> 2044).
+- Directly re-timed the worst-case large file
+  (`arcology-os/tests/fixtures/aex-manifest-probe/aex-manifest-probe.abas`,
+  4808 lines) alone, isolated from suite/system noise: 4m7s before the
+  `String.ToChars` lexer fix, 2m42s after (~34% faster), confirming the fix
+  is real but that whole-program semantic analysis's O(n) symbol-lookup scan
+  (see Known Failures) is now the larger remaining cost.
+- Verified the Rivet `#IMPORT`-closure fingerprint fix both directions:
+  `rivet build` run twice with no source changes stays a full cache hit
+  (0 compiled); appending a comment to an *imported* (non-entry) file
+  (`fission/language/arcobasic/lexer.abas`, imported by the
+  `fission-arcobasic-frontend` module) correctly triggers a rebuild where the
+  unfixed `Inputs: [SELF.Entry]` behavior would have silently stayed cached.
 
 ## Bootstrap Generation
 
@@ -578,6 +674,10 @@ ArcoBASIC subset and lowers it into structured SIR.
 - `fission/tests/arcobasic_type_compound_smoke.abas`
 - `tests/integration/fission_substrate_core_smoke.sh`
 - `rivet/stdlib/rivet.abas`
+- `rivet/core/vm/vm.cpp`
+- `src/runtime/runtime.cpp`
+- `build.abas`
+- `fission/build/rivet_test_capsules.abas`
 - `cmake/Testing.cmake`
 - `fissure.ab`
 
@@ -692,6 +792,22 @@ ArcoBASIC subset and lowers it into structured SIR.
 - Strict ArcoBASIC program semantics intentionally analyze each file non-strict
   first, build the full import/symbol/reference index, resolve imported symbols,
   and only then enforce unresolved-reference diagnostics at the program boundary.
+- Fission smoke tests run as prebuilt, Rivet-cached `ArcoCapsule` targets, not
+  `ArcoFission compile-run` from source -- a test's own logic is unchanged and
+  its output is required to be byte-identical either way (verified); only the
+  dispatch mechanism changed, specifically to stop paying a from-source
+  recompile of the shared frontend on every single test invocation. Any new
+  Rivet `ArcoCapsuleTarget`-based target must fingerprint the full `#IMPORT`
+  closure (`ArcoCapsule_ImportClosure`), never just the entry file, or its
+  cache goes silently stale on an edit to an imported file.
+- Native runtime primitives that are correctly O(current string length) per
+  call by necessity (`String.Length`, `String.Slice` -- UTF-8 codepoint
+  indexing with no cross-call state) must not be called in a per-character
+  loop over a whole file; that is an O(n^2) trap regardless of how fast any
+  single call is. `String.ToChars` exists so hot per-character scanners
+  explode a string once (real O(n)) and then index (O(1)), and is additive
+  only -- it must never change the existing behavior of `String.Length`/
+  `String.Slice` for their existing callers.
 
 ## Next Recommended Work
 
@@ -719,3 +835,17 @@ ArcoBASIC subset and lowers it into structured SIR.
    metadata.
 13. Keep all legacy compiler calls behind explicitly named bootstrap bridge
    components.
+14. Fix the O(n) linear symbol-lookup scan in
+   `fission/language/arcobasic/semantic.abas` (`HasSymbol`/`FindSymbol`/
+   `FindCanonicalSymbol`/`FindLocalTargetSymbol`) with a real index -- this is
+   now the largest remaining performance cost for whole-program strict
+   semantic analysis, confirmed by direct measurement after the lexer's
+   O(n^2) fix landed. See Known Failures for detail.
+15. Extend the same `#IMPORT`-closure-fingerprinted, cached-capsule pattern
+   (`fission/build/rivet_test_capsules.abas`) to any other repeated
+   `ArcoFission compile-run` call sites that recompile shared frontend source
+   from scratch on every invocation.
+16. Re-run the full 207-file real-corpus frontend scan (see Regression Status
+   history) once the semantic-lookup and remaining large-file performance
+   fixes land, to get a clean up-to-date completion number for the 19 files
+   that previously could not be confirmed within a 240s cap.
