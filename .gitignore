@@ -9,6 +9,7 @@ build/
 !arcology-os/scripts/build/
 !scripts/build/
 !fissure/adapters/build/
+!fission/build/
 build-*/
 # Rivet's own per-project runtime state directory (rivet/docs/rivet-rfc.md section 32) -- a
 # developer will run `rivet build` directly inside rivet/examples/tiny-project/ by hand during

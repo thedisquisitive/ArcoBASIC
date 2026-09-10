@@ -1,6 +1,7 @@
 ' Repository-root Rivet build for the core buildchain tools and first-party host utilities.
 
 #IMPORT "fission/build/rivet_modules.abas"
+#IMPORT "fission/build/rivet_test_capsules.abas"
 
 FUNCTION ConfigureCoreTarget(target)
     ignored = target.Includes.Append("include")
@@ -159,6 +160,7 @@ ignored = ArcoFission.AddDependency(ArcologyOS)
 ignored = ArcoFission.Build()
 
 FissionModules = Fission_RivetBuildDefaultModules(ArcoFission)
+FissionTestCapsules = Fission_RivetBuildAllTestCapsules(ArcoFission)
 
 ArcoCli = BUILD.Executable("arco_cli")
 ArcoCli.OutputDirectory = "build-rivet"

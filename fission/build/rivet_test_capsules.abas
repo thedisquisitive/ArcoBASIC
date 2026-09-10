@@ -1,0 +1,56 @@
+' Builds every fission/tests/*.abas smoke fixture as its own cached Rivet ArcoCapsule target,
+' instead of leaving them to be invoked via `ArcoFission compile-run` from source.
+'
+' The problem this fixes: `ArcoFission compile-run FILE.abas` re-lexes/re-parses/re-lowers the
+' ENTIRE shared Fission frontend (fission/core, fission/sir, fission/language/arcobasic -- several
+' thousand lines of ArcoBASIC) from source on every single invocation, because compile-run always
+' compiles fresh. tests/integration/fission_substrate_core_smoke.sh calls compile-run once per
+' fixture -- 50 separate processes, 50 separate from-source recompiles of the same shared frontend,
+' every single run, whether or not anything changed. That is the dominant cost in `fissure run
+' --full` (observed: 363s for what is otherwise a small amount of real test-body work).
+'
+' The fix is the same "build once, reuse" pattern already proven for language.arcobasic's own
+' executable module in rivet_modules.abas: each fixture becomes a real Rivet Compile action with
+' proper fingerprinting (via ArcoCapsuleTarget's now-fixed transitive #IMPORT closure -- see
+' rivet/stdlib/rivet.abas), so `rivet build` only recompiles a fixture when its own source or
+' anything it imports actually changed, and running the prebuilt capsule directly pays only VM
+' startup + the fixture's own tiny test body -- no frontend recompilation at all.
+'
+' `ArcoFission build` and `ArcoFission compile-run` both execute on the same bytecode VM (see
+' `ArcoFission --help`: compile-run and the default `build` both target the ELF64/bytecode-VM
+' path), so a prebuilt capsule's stdout is expected to be byte-identical to compile-run's -- this
+' is a build/dispatch change only, not a behavior change, and the integration smoke script's exact
+' golden-output greps should not need to change.
+
+#IMPORT "fission/build/rivet_modules.abas"
+
+FUNCTION Fission_RivetTestBaseName(entryPath)
+    segments = String.Split(entryPath, "/")
+    last = segments[LEN(segments) - 1]
+    RETURN String.Slice(last, 0, String.Length(last) - String.Length(".abas"))
+END FUNCTION
+
+FUNCTION Fission_RivetTestEntries()
+    entries = []
+    FOR entry IN DIRECTORY("fission/tests", FALSE)
+        IF entry.Extension == ".abas" THEN ignored = Array.Push(entries, entry.Path)
+    NEXT
+    RETURN entries
+END FUNCTION
+
+FUNCTION Fission_RivetBuildTestCapsule(entryPath, compilerTarget)
+    target = BUILD.ArcoCapsule(Fission_RivetTestBaseName(entryPath))
+    target.Entry = entryPath
+    target.OutputDirectory = "build-rivet/fission/tests"
+    ignored = target.UseCompilerTarget(compilerTarget)
+    ignored = target.Build()
+    RETURN target
+END FUNCTION
+
+FUNCTION Fission_RivetBuildAllTestCapsules(compilerTarget)
+    targets = []
+    FOR entryPath IN Fission_RivetTestEntries()
+        ignored = Array.Push(targets, Fission_RivetBuildTestCapsule(entryPath, compilerTarget))
+    NEXT
+    RETURN targets
+END FUNCTION
