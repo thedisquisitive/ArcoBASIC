@@ -18,13 +18,13 @@
 FUNCTION FissionCli_Fail(stage, diagnostics)
     PRINT "FISSION COMPILE FAILED at " + stage
     PRINT diagnostics.Render()
-    Exit(1)
+    ignored = Exit(1)
 END FUNCTION
 
 appArgs = Runtime.Args()
 IF LEN(appArgs) < 2 THEN
     PRINT "usage: compile_to_bytecode.abas ENTRY OUTPUT.arcof"
-    Exit(2)
+    ignored = Exit(2)
 END IF
 entryPath = appArgs[0]
 outputPath = appArgs[1]

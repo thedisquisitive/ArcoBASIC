@@ -386,14 +386,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_parse_smoke")"
 
-grep -q "^87$" <<<"$fission_self_output"
+grep -q "^91$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_semantic_smoke")"
 
-grep -q "^87$" <<<"$fission_self_semantic_output"
-grep -q "^131$" <<<"$fission_self_semantic_output"
-grep -q "^2592$" <<<"$fission_self_semantic_output"
+grep -q "^91$" <<<"$fission_self_semantic_output"
+grep -q "^138$" <<<"$fission_self_semantic_output"
+grep -q "^2698$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -610,5 +610,17 @@ expected_stack_sum_output="$(printf '5\n55\n25\n4')"
 test "$stack_sum_output" = "$expected_stack_sum_output"
 oracle_stack_sum_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/substrate_programs/stack_sum.abas")"
 test "$stack_sum_output" = "$oracle_stack_sum_output"
+
+# fission/tests/native_programs/hello_native.abas is compiled entirely by the Fission Compiler
+# Substrate's own native x86-64 codegen (fission/amir/lower_x86_64.abas) via
+# fission/cli/compile_to_x86_64.abas + the system `as`/`ld` toolchain -- NO embedded bytecode VM,
+# and no legacy ArcoFission involvement in the compilation itself (only as the source of the
+# equivalence-testing oracle below). Built above by the same `rivet build` this script already
+# runs (FissionNativeCapsuleTarget, rivet/stdlib/rivet.abas).
+hello_native_output="$("$SOURCE_DIR/build/fission-native-programs/hello_native")"
+expected_hello_native_output="Hello, native!"
+test "$hello_native_output" = "$expected_hello_native_output"
+oracle_hello_native_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/hello_native.abas")"
+test "$hello_native_output" = "$oracle_hello_native_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

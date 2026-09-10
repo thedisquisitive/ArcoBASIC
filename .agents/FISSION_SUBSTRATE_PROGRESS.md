@@ -47,10 +47,23 @@ identical source exactly. See Completed Components for the full writeup,
 including the real binary-vs-text bytecode format distinction this
 uncovered, and three genuine Rivet bugs found and fixed along the way (a
 caching bug and two target-wiring bugs).
-**Still not started: WP-009/010/011 (x86-64 architecture / SysV ABI / Linux
-runtime, i.e. real native codegen with no embedded bytecode VM at all)** --
-see "Next Recommended Work" item E, now the sole remaining large item in
-this family.
+**WP-009/013 first real slice landed: genuine x86-64 native codegen with NO
+embedded bytecode VM at all.** `fission/amir/lower_x86_64.abas` lowers A-MIR
+straight to GAS assembly text (delegating instruction encoding and linking
+to the system `as`/`ld` toolchain, the same "reuse mechanical tooling"
+scope decision this ledger already made for WP-012); `fission/cli/
+compile_to_x86_64.abas` + `FissionNativeCapsuleTarget` (rivet/stdlib/
+rivet.abas) turn that into a real, cached `rivet build` target producing a
+genuinely standalone, freestanding (`_start`, no libc/CRT) ELF64. Verified
+via real execution -- `fission/tests/native_programs/hello_native.abas`
+runs correctly with output matching legacy `ArcoFission compile-run`.
+Current scope is deliberately small and fully disclosed: PRINT of a string
+literal only (see lower_x86_64.abas's own header comment). **WP-010 (SysV
+ABI -- real calling convention across more than one function) and WP-011
+(Linux Runtime -- everything beyond hand-rolled codegen: variables,
+arithmetic, control flow, strings/arrays/objects, function calls) are still
+both real, almost entirely untouched, separately-sized follow-on work** --
+see "Next Recommended Work" item E.
 
 ## Current Work Package
 
@@ -540,6 +553,87 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   unaffected (87 files, 0 failures -- the new driver/program files are
   deliberately outside that corpus, since they are not substrate
   implementation files).
+- WP-009/013 first real slice: genuine x86-64 native codegen with NO
+  embedded bytecode VM at all, requested directly ("Native codegen.") after
+  item D closed. `fission/amir/lower_x86_64.abas` lowers A-MIR straight to
+  GAS (GNU assembler) TEXT and delegates instruction encoding/linking to the
+  system `as`/`ld` toolchain -- a deliberate, disclosed scope decision, not
+  an oversight: legacy ArcoFission's own native backend
+  (`generate_x86_64_program`, `src/compiler/fission.cpp`) hand-encodes real
+  instruction bytes itself (REX prefixes, ModRM/SIB, relocations -- ~4500
+  lines on its own), a fundamentally larger undertaking that is not what
+  makes this substrate's own architecture-layer codegen decisions (which
+  registers/instructions/stack shape represent a construct) real or
+  valuable, and legacy's own backend ends up funneling through `as`/`ld`
+  too for exactly the parts a hand-rolled encoder still can't fully own.
+  Same reasoning this session already applied to WP-012.
+  Phase 1 scope, matching this ledger's own recurring "smallest real
+  vertical slice, execution-verified" pattern: `PRINT` of a string literal
+  only, in a freestanding (`_start`, no libc/CRT) program using raw Linux
+  `write`/`exit` syscalls. `fission/cli/compile_to_x86_64.abas` (a generic
+  file-based driver, mirroring `compile_to_bytecode.abas`'s own shape) does
+  Source -> AST -> SIR -> A-MIR -> x86_64 assembly -> `as` -> `ld` in one
+  shot -- unlike the bytecode path, no legacy ArcoFission involvement at
+  all in producing the final binary, only `as`/`ld`.
+  `FissionNativeCapsuleTarget` (`rivet/stdlib/rivet.abas`, exposed as
+  `BUILD.FissionNativeCapsule`) wires this into a real, cached `rivet
+  build` target, mirroring `FissionSubstrateCapsuleTarget`'s shape but as a
+  single action (the driver produces the final ELF64 itself). Verified via
+  real execution: `fission/tests/native_programs/hello_native.abas`
+  (`PRINT "Hello, native!"`) builds to a real standalone ELF64 and runs
+  correctly, output matching legacy `ArcoFission compile-run` on the same
+  source exactly. A construct outside Phase 1's scope (e.g. `x = 1 + 2`)
+  correctly reports a diagnostic instead of emitting silently-wrong
+  assembly, matching every other lowering pass in this substrate.
+  Two more real bugs found and fixed while building this, both outside the
+  new code itself:
+  1. A genuine substrate PARSER gap: `EXIT` is unconditionally lexed as a
+     reserved keyword (`fission/language/arcobasic/lexer.abas`'s flat
+     keyword list), and the parser's primary-expression grammar had no path
+     for a Keyword token to resolve as a callable identifier except for a
+     small existing allowlist (`copy`, `string`, etc. --
+     `Fission_ArcoBasicCanName`, `fission/language/arcobasic/parser.abas`).
+     `exit` was missing from it, so the real `Exit(code)` runtime host
+     function -- needed by both new CLI drivers' own error paths -- could
+     not be called at all through this substrate's own parser, found only
+     because these driver files were added to the self-parse corpus and it
+     failed. Fixed by adding `"exit"` to that allowlist; confirmed the
+     loop-control `EXIT WHILE`/`EXIT FOR`/etc. statement forms are
+     unaffected (a different code path, dispatched only when `exit` is the
+     very first token of a statement, never reached by `ignored =
+     Exit(1)`).
+  2. A real Rivet cache-staleness bug in this SESSION's own newly-added
+     `FissionSubstrateCapsuleTarget`/`FissionNativeCapsuleTarget` code
+     (landed with item D, not previously exercised): each target's own
+     `ToolVersion` field is a fixed string (`"fission-substrate/1"`/
+     `"fission-native/1"`), not a real per-build version the way a real
+     compiler's `--version` output is for an ordinary `BuildTarget` --
+     editing the driver capsule's own source (`compile_to_bytecode.abas`/
+     `compile_to_x86_64.abas`) did NOT invalidate anything built through it,
+     since neither the driver's own content nor a changed `ToolVersion` was
+     ever part of the fingerprint. The exact same "only the entry/primary
+     file gets fingerprinted, not what it actually depends on" bug class
+     already found and fixed twice elsewhere this session (Rivet's C++
+     header depfile tracking; `ArcoCapsuleTarget`'s own `#IMPORT` closure).
+     Fixed by having `UseDriverTarget` also remember the driver's own Entry
+     path, and `Build()` fold `ArcoCapsule_ImportClosure(SELF.DriverEntry)`
+     into `Inputs` alongside `SELF.Entry`'s own closure. Verified both
+     directions: a driver-source edit now correctly triggers a downstream
+     rebuild (confirmed with a real trivial edit); an unrelated edit stays a
+     cache hit.
+  `fission/tests/amir_x86_64_smoke.abas` (new regression test, covers both
+  multi-PRINT lowering and the unsupported-construct diagnostic path) and
+  the two new CLI driver scripts were added to the self-parse/self-semantic
+  corpus (91 files, 138 import edges, 2698 symbols, 0 diagnostics -- up from
+  87/131/2592). The two target program fixtures
+  (`fission/tests/native_programs/hello_native.abas`,
+  `fission/tests/substrate_programs/stack_sum.abas`) remain deliberately
+  outside that corpus, same reasoning as before (real ArcoBASIC programs
+  meant to be compiled BY the substrate, not substrate implementation).
+  `tests/integration/fission_substrate_core_smoke.sh` golden counts updated
+  to match (87->91 etc.) and a new assertion added for the native capsule's
+  real output against the oracle. Full suite and `fissure run --full`
+  (13 changed files, correctly marked AFFECTED and re-run) both passing.
 
 ## In-Progress Components
 
@@ -962,6 +1056,11 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/cli/compile_to_bytecode.abas`
 - `fission/build/rivet_substrate_capsules.abas`
 - `fission/tests/substrate_programs/stack_sum.abas`
+- `fission/amir/lower_x86_64.abas`
+- `fission/cli/compile_to_x86_64.abas`
+- `fission/build/rivet_native_capsules.abas`
+- `fission/tests/native_programs/hello_native.abas`
+- `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
 - `build.abas`
 - `fission/build/rivet_test_capsules.abas`
@@ -1168,15 +1267,42 @@ D. DONE, including the Rivet build-graph target -- see Completed Components.
    Compiler Substrate become a real standalone executable"), the answer is
    now genuinely yes.
 E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
-   runtime, i.e. no embedded bytecode VM at all) -- now the sole remaining
-   large item in this family, substantially bigger than everything above.
+   runtime, i.e. no embedded bytecode VM at all). **Phase 1 (WP-009/013's
+   own first real slice) DONE -- see Completed Components**:
+   `fission/amir/lower_x86_64.abas` + `fission/cli/compile_to_x86_64.abas` +
+   `FissionNativeCapsuleTarget` produce a real, standalone, execution-
+   verified freestanding ELF64 for `PRINT` of a string literal, no embedded
+   bytecode VM, no legacy ArcoFission involvement in the compile itself
+   (only `as`/`ld`). Everything past that is still real, almost entirely
+   untouched, and each step below is its own substantial undertaking on its
+   own, roughly in the order a Tiny-BASIC-like acceptance subset would need
+   them (mirroring how A-MIR/bytecode grew this session):
+   - Variables and arithmetic: stack-slot (or register) allocation for
+     locals, `mov`/`add`/`sub`/`imul`/`cmp` lowering for `BinOp`, `LOAD`/
+     `STORE` against real memory instead of a temp map. The natural next
+     slice (`PRINT 1 + 2`, then `x = 1; PRINT x`).
+   - Control flow: real GAS labels/`jmp`/`je`/etc. for `Branch`/`Jump`
+     (IF/WHILE/DO/FOR).
+   - WP-010 SysV ABI: real function calls -- argument registers (RDI/RSI/
+     RDX/RCX/R8/R9), stack alignment, prologue/epilogue, return values.
+     Needed the moment a program declares more than just Main.
+   - WP-011 Linux Runtime: everything this backend cannot hand-roll itself
+     -- strings beyond a literal (concatenation, length, slicing), arrays,
+     objects/classes, and a real fallback to the existing ~244-entry host-
+     function dispatch table for anything else (legacy's own
+     `arco_call_host`/`host_bridge.cpp` bridge is the reference for this,
+     though porting it into the substrate rather than linking against it
+     directly is itself a real design decision to make, not just a port).
    The existing experimental legacy native backend
    (`ArcoFission build FILE -o OUT --target linux-x86_64`,
    `.agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md`) is worth reading
-   first as a second oracle/reference alongside the bytecode VM, though it
-   is itself Phase 1 scope only (see [[project_arcology_os_rfc_0049]]-style
-   caveats -- it rejected an untyped-parameter program outright when this
-   session tried it directly).
+   as a second oracle/reference alongside the bytecode VM for each of these,
+   though it is itself Phase 1 scope only (see
+   [[project_arcology_os_rfc_0049]]-style caveats -- it rejected an
+   untyped-parameter program outright when this session tried it directly).
+   Validate each addition the same way every other slice in this ledger
+   was: a real program using the construct, assembled/linked/run for real,
+   output checked, not just that assembly text renders without crashing.
 
 **Everything below was already queued before this session and remains real,
 un-reprioritized backlog:**

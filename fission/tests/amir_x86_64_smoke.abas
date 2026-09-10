@@ -1,0 +1,31 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/amir/lower_x86_64.abas"
+
+' fission/amir/lower_x86_64.abas's own header comment records the deliberate
+' Phase 1 scope this checks: PRINT of a string literal, GAS assembly text
+' output, real execution verified separately by
+' fission/tests/native_programs/hello_native.abas (built as a real ELF64 via
+' FissionNativeCapsuleTarget and run directly -- see
+' tests/integration/fission_substrate_core_smoke.sh).
+Source = "PRINT \"Hello, native!\"\nPRINT \"Second line\""
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "x86-64-smoke.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+Amir = Fission_SirToAmir(Sir)
+Program = Fission_AmirToX86_64(Amir)
+
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Amir.Diagnostics.HasErrors()
+PRINT Program.Diagnostics.HasErrors()
+PRINT Program.Render()
+
+' A construct this backend does not yet support (Phase 1: only PRINT of a
+' string literal) must report a diagnostic, not silently emit wrong assembly
+' -- matching every other lowering pass in this substrate.
+UnsupportedSource = "x = 1 + 2\nPRINT x"
+UnsupportedTokens = Fission_ArcoBasicLex(UnsupportedSource)
+UnsupportedAst = Fission_ArcoBasicParse(UnsupportedTokens, "x86-64-unsupported-smoke.abas")
+UnsupportedSir = Fission_ArcoBasicAstToSir(UnsupportedAst)
+UnsupportedAmir = Fission_SirToAmir(UnsupportedSir)
+UnsupportedProgram = Fission_AmirToX86_64(UnsupportedAmir)
+PRINT UnsupportedProgram.Diagnostics.HasErrors()

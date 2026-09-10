@@ -5,7 +5,15 @@
 FUNCTION Fission_ArcoBasicCanName(token)
     IF token.Kind == "Identifier" THEN RETURN TRUE
     IF token.Kind != "Keyword" THEN RETURN FALSE
-    RETURN Fission_ListContains(["add", "remove", "toggle", "flags", "mod", "run", "implements", "copy", "string"], Lower(token.Text))
+    ' "exit" is reserved for loop-control statements (EXIT WHILE/FOR/DO), but
+    ' statement dispatch only ever routes to ParseLoopControlStmt when "exit"
+    ' is the FIRST token of a statement -- mid-expression (e.g. the real
+    ' `Exit(code)` runtime host function used as `ignored = Exit(1)`, a
+    ' genuine gap found via fission/cli/compile_to_x86_64.abas failing this
+    ' substrate's own self-parse corpus) it needs to resolve as an ordinary
+    ' callable identifier, the same contextual-keyword pattern this allowlist
+    ' already carries "copy"/"string"/etc for.
+    RETURN Fission_ListContains(["add", "remove", "toggle", "flags", "mod", "run", "implements", "copy", "string", "exit"], Lower(token.Text))
 END FUNCTION
 
 FUNCTION Fission_ArcoBasicCopyActsUnary(nextToken)

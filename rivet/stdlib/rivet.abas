@@ -285,6 +285,7 @@ CLASS FissionSubstrateCapsuleTarget
         SELF.Entry = ""
         SELF.OutputDirectory = "build"
         SELF.DriverPath = ""
+        SELF.DriverEntry = ""
         detected = RIVET.Toolchain.DetectFission()
         IF !detected.Found THEN
             ignored = RIVET.Log.Error("no ArcoFission compiler found (set ARCOFISSION_PATH, or ensure ArcoFission is on PATH)")
@@ -309,9 +310,17 @@ CLASS FissionSubstrateCapsuleTarget
 
     ' `target` is an ordinary ArcoCapsuleTarget built from fission/cli/compile_to_bytecode.abas --
     ' see this class's own header comment for why that driver is legacy-compiled infrastructure,
-    ' not a claim that legacy ArcoFission compiles SELF.Entry.
+    ' not a claim that legacy ArcoFission compiles SELF.Entry. Also remembers the driver's own
+    ' Entry so Build() below can fingerprint ITS import closure too, not just SELF.Entry's -- a real
+    ' bug found this session: `Tool`/`ToolVersion` alone do not fingerprint tool CONTENT (ToolVersion
+    ' here is a fixed "fission-substrate/1" string, not a real per-build compiler --version the way
+    ' a real cxx toolchain's is), so without this, editing the driver's own source (e.g. fixing a
+    ' real lowering bug in it) would silently NOT invalidate any capsule built through it -- the
+    ' same class of staleness this session already found and fixed twice elsewhere (Rivet's C++
+    ' header depfile tracking, ArcoCapsuleTarget's own #IMPORT closure).
     FUNCTION UseDriverTarget(target)
         SELF.DriverPath = target.OutputPath()
+        SELF.DriverEntry = target.Entry
         ignored = SELF.AddDependency(target)
         RETURN SELF
     END FUNCTION
@@ -330,8 +339,12 @@ CLASS FissionSubstrateCapsuleTarget
 
     FUNCTION Build()
         bytecodePath = SELF.BytecodePath()
+        compileInputs = ArcoCapsule_ImportClosure(SELF.Entry)
+        FOR driverInput IN ArcoCapsule_ImportClosure(SELF.DriverEntry)
+            ignored = Array.Push(compileInputs, driverInput)
+        NEXT
         compileSpec = { Type: "Compile", Target: SELF.Name, DisplayName: SELF.Entry,
-                        Inputs: ArcoCapsule_ImportClosure(SELF.Entry), Outputs: [bytecodePath],
+                        Inputs: compileInputs, Outputs: [bytecodePath],
                         Tool: SELF.DriverPath, ToolVersion: "fission-substrate/1",
                         Arguments: [SELF.Entry, bytecodePath], Dependencies: SELF.DependencyActionIds,
                         OriginFunction: "FissionSubstrateCapsuleTarget.Build" }
@@ -343,6 +356,67 @@ CLASS FissionSubstrateCapsuleTarget
                         Arguments: ["package", bytecodePath, "-o", SELF.OutputPath()],
                         Dependencies: [compileActionId], OriginFunction: "FissionSubstrateCapsuleTarget.Build" }
         SELF.FinalActionId = RIVET.Graph.Action(packageSpec)
+        RETURN SELF
+    END FUNCTION
+END CLASS
+
+' A real Linux x86-64 executable with NO embedded bytecode VM at all (WP-009/
+' 013's own "Linux Native Target" composition) -- the substrate-native
+' equivalent of ArcoCapsuleTarget/FissionSubstrateCapsuleTarget above. A
+' single Compile action, like ArcoCapsuleTarget's own shape: SELF.DriverPath
+' (set via UseDriverTarget -- an ordinary ArcoCapsuleTarget pointed at
+' fission/cli/compile_to_x86_64.abas) does Source -> AST -> SIR -> A-MIR ->
+' x86_64 assembly -> `as` -> `ld` in one invocation and writes the final
+' ELF64 itself; unlike FissionSubstrateCapsuleTarget's two-action bytecode
+' + `ArcoFission package` chain, there is no legacy ArcoFission involvement
+' at all here, not even for the final link -- `as`/`ld` are the only
+' external tools this path uses. See fission/amir/lower_x86_64.abas's own
+' header comment for this backend's current (deliberately small, disclosed)
+' supported construct subset.
+CLASS FissionNativeCapsuleTarget
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Entry = ""
+        SELF.OutputDirectory = "build"
+        SELF.DriverPath = ""
+        SELF.DriverEntry = ""
+        SELF.DependencyActionIds = []
+    END CONSTRUCTOR
+
+    FUNCTION OutputPath()
+        RETURN SELF.OutputDirectory + "/" + SELF.Name
+    END FUNCTION
+
+    FUNCTION AddDependency(target)
+        IF target.FinalActionId != "" THEN ignored = Array.Push(SELF.DependencyActionIds, target.FinalActionId)
+        RETURN SELF
+    END FUNCTION
+
+    ' `target` is an ordinary ArcoCapsuleTarget built from
+    ' fission/cli/compile_to_x86_64.abas -- see this class's own header
+    ' comment for why that driver is legacy-compiled infrastructure, not a
+    ' claim that legacy ArcoFission compiles SELF.Entry or its output. Also
+    ' remembers the driver's own Entry so Build() below can fingerprint its
+    ' import closure too -- see FissionSubstrateCapsuleTarget.UseDriverTarget's
+    ' own comment for the real staleness bug this avoids.
+    FUNCTION UseDriverTarget(target)
+        SELF.DriverPath = target.OutputPath()
+        SELF.DriverEntry = target.Entry
+        ignored = SELF.AddDependency(target)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Build()
+        inputs = ArcoCapsule_ImportClosure(SELF.Entry)
+        FOR driverInput IN ArcoCapsule_ImportClosure(SELF.DriverEntry)
+            ignored = Array.Push(inputs, driverInput)
+        NEXT
+        spec = { Type: "Compile", Target: SELF.Name, DisplayName: SELF.Entry,
+                 Inputs: inputs, Outputs: [SELF.OutputPath()],
+                 Tool: SELF.DriverPath, ToolVersion: "fission-native/1",
+                 Arguments: [SELF.Entry, SELF.OutputPath()], Dependencies: SELF.DependencyActionIds,
+                 OriginFunction: "FissionNativeCapsuleTarget.Build" }
+        SELF.FinalActionId = RIVET.Graph.Action(spec)
         RETURN SELF
     END FUNCTION
 END CLASS
@@ -359,6 +433,9 @@ CLASS BuildNamespace
     END FUNCTION
     FUNCTION FissionSubstrateCapsule(name)
         RETURN FissionSubstrateCapsuleTarget(name)
+    END FUNCTION
+    FUNCTION FissionNativeCapsule(name)
+        RETURN FissionNativeCapsuleTarget(name)
     END FUNCTION
 END CLASS
 

@@ -1,0 +1,215 @@
+#IMPORT "fission/sir/lower_amir.abas"
+
+' WP-009/010/011/013 first slice (RFC-AP-FISSION-001): real x86-64 machine
+' code for a Fission-substrate-compiled ArcoBASIC program, with NO embedded
+' bytecode VM at all -- the genuinely separate, much larger item this
+' project's own ledger (.agents/FISSION_SUBSTRATE_PROGRESS.md) had left
+' entirely untouched after WP-004/007/012 (A-MIR, bytecode, ArcoCapsule
+' packaging) all landed.
+'
+' Deliberate scope decision, disclosed here rather than left implicit: this
+' pass emits GAS (GNU assembler) TEXT -- real x86-64 mnemonics -- and hands
+' that to the system `as`/`ld` toolchain to encode into actual machine code
+' and link into a final ELF64, instead of hand-encoding raw instruction bytes
+' the way legacy ArcoFission's own native backend does
+' (X86_64CodegenResult/generate_x86_64_program in src/compiler/fission.cpp,
+' a real low-level instruction encoder -- REX prefixes, ModRM/SIB bytes,
+' immediate/relocation handling -- roughly 4500 lines on its own). That is a
+' fundamentally different, much larger undertaking than everything else this
+' ledger has built so far, and is not what makes this substrate's own
+' architecture-layer codegen decisions (which registers, which instructions,
+' what stack/calling-convention shape represents an ArcoBASIC construct) real
+' or valuable -- exactly the same reasoning this session already applied to
+' WP-012 (ELF64 artifact writer: reused legacy's own bytecode-embedding
+' linker step, `ArcoFission package`, rather than writing a from-scratch
+' ELF64 writer). Legacy's own `render_x86_64_linux_asm` ends up funneling
+' through `as`/`ld` too, for exactly the parts a hand-rolled encoder still
+' can't fully own (external symbol resolution, final section layout) -- this
+' pass simply starts from GAS text instead of arriving at it as a secondary
+' rendering of already-encoded bytes.
+'
+' Scope of this first slice, matching the RFC's own recurring "smallest real
+' vertical slice, oracle/execution-verified" pattern used for A-MIR and
+' bytecode: a freestanding (`_start`, no libc, no CRT) ELF64 that supports
+' exactly `PRINT "string literal"` -- real Linux x86-64 syscalls (`write`,
+' `exit`), assembled and linked via the system `as`/`ld`, real execution
+' verified. WP-010 (SysV ABI -- real calling convention across more than one
+' function) and WP-011 (Linux Runtime -- the host-function bridge legacy's
+' own backend needs for everything beyond hand-rolled codegen, e.g. strings/
+' arrays/objects) are still both real, entirely untouched, separately-sized
+' follow-on work -- see .agents/FISSION_SUBSTRATE_PROGRESS.md.
+
+CLASS FissionX86_64Program
+    CONSTRUCTOR()
+        SELF.Diagnostics = FissionDiagnosticBag()
+        SELF.Assembly = ""
+    END CONSTRUCTOR
+
+    FUNCTION Render()
+        RETURN SELF.Assembly
+    END FUNCTION
+END CLASS
+
+' Escapes `text` (already unescaped to its real runtime content by the
+' ArcoBASIC frontend, e.g. a literal newline is a real newline character, not
+' the two characters "\" "n") for a GAS `.ascii "..."` directive. Only the
+' characters that would otherwise break GAS's own quoted-string syntax are
+' escaped (backslash, double-quote, newline, tab, carriage return); every
+' other byte passes through literally -- GAS itself places no restriction on
+' raw bytes inside a quoted string beyond those.
+FUNCTION Fission_X86_64EscapeAscii(text)
+    chars = String.ToChars(text)
+    parts = []
+    FOR ch IN chars
+        IF ch == "\"" THEN
+            ignored = Array.Push(parts, "\\\"")
+            CONTINUE FOR
+        END IF
+        IF ch == "\\" THEN
+            ignored = Array.Push(parts, "\\\\")
+            CONTINUE FOR
+        END IF
+        IF ch == "\n" THEN
+            ignored = Array.Push(parts, "\\n")
+            CONTINUE FOR
+        END IF
+        IF ch == "\t" THEN
+            ignored = Array.Push(parts, "\\t")
+            CONTINUE FOR
+        END IF
+        IF ch == "\r" THEN
+            ignored = Array.Push(parts, "\\r")
+            CONTINUE FOR
+        END IF
+        ignored = Array.Push(parts, ch)
+    NEXT
+    RETURN Array.Join(parts, "")
+END FUNCTION
+
+' Strips the surrounding quotes an A-MIR string CONST's own Value field
+' always carries (`CONST "text"`, confirmed via fission/sir/lower_amir.abas's
+' own Literal handling: `IF literalKind == "String" THEN constText = "\"" +
+' value + "\""`) so this pass gets the raw runtime string content back.
+FUNCTION Fission_X86_64UnquoteConstValue(value)
+    IF LEN(value) < 2 THEN RETURN value
+    IF String.Slice(value, 0, 1) != "\"" THEN RETURN value
+    RETURN String.Slice(value, 1, LEN(value) - 2)
+END FUNCTION
+
+' Real Linux x86-64 syscall numbers (man syscalls(2)) -- the only two this
+' first slice needs.
+FUNCTION Fission_X86_64SyscallWrite()
+    RETURN "1"
+END FUNCTION
+FUNCTION Fission_X86_64SyscallExit()
+    RETURN "60"
+END FUNCTION
+
+FUNCTION Fission_X86_64LowerMain(diagnostics, mainFunction)
+    ' Const values are always materialized into a temp before use (see
+    ' Fission_AmirLowerExpr's own comment) -- track each temp's own literal
+    ' Value/Type as it's emitted so a later `CallVoid Runtime.Print %tN` can
+    ' resolve %tN back to the string it actually holds, the same way a real
+    ' register/stack allocator would need a def-use map, just for constants
+    ' only in this first slice.
+    tempValues = {}
+    rodataLines = []
+    textLines = []
+    stringCount = 0
+
+    FOR block IN mainFunction.Blocks
+        FOR instruction IN block.Instructions
+            kind = instruction.Kind
+            IF kind == "Const" THEN
+                tempValues = Object.Set(tempValues, instruction.Field("Dest"), instruction.Field("Value"))
+                CONTINUE FOR
+            END IF
+            isArgsCall = kind == "Call" ANDALSO instruction.Field("Callee") == "Runtime.Args"
+            IF isArgsCall THEN CONTINUE FOR
+            isArgsStore = kind == "Store" ANDALSO instruction.Field("Name") == "Args"
+            IF isArgsStore THEN CONTINUE FOR
+            isPrintCall = kind == "CallVoid" ANDALSO instruction.Field("Callee") == "Runtime.Print"
+            IF isPrintCall THEN
+                argRef = instruction.Field("Args")
+                hasValue = Object.Has(tempValues, argRef)
+                IF hasValue == FALSE THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "PRINT operand is not a constant known to native codegen (Phase 1 only supports PRINT of a string literal): " + argRef)
+                    CONTINUE FOR
+                END IF
+                rawValue = Object.Get(tempValues, argRef, "")
+                isStringConst = LEN(rawValue) > 0 ANDALSO String.Slice(rawValue, 0, 1) == "\""
+                IF isStringConst == FALSE THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "PRINT of a non-string constant is not yet supported by native codegen (Phase 1 only supports PRINT of a string literal): " + rawValue)
+                    CONTINUE FOR
+                END IF
+                text = Fission_X86_64UnquoteConstValue(rawValue) + "\n"
+                label = "str" + String(stringCount)
+                stringCount = stringCount + 1
+                ignored = Array.Push(rodataLines, label + ":")
+                ignored = Array.Push(rodataLines, "    .ascii \"" + Fission_X86_64EscapeAscii(text) + "\"")
+                ignored = Array.Push(rodataLines, "    .set " + label + "_len, . - " + label)
+                ignored = Array.Push(textLines, "    mov $" + Fission_X86_64SyscallWrite() + ", %rax")
+                ignored = Array.Push(textLines, "    mov $1, %rdi")
+                ignored = Array.Push(textLines, "    lea " + label + "(%rip), %rsi")
+                ignored = Array.Push(textLines, "    mov $" + label + "_len, %rdx")
+                ignored = Array.Push(textLines, "    syscall")
+                CONTINUE FOR
+            END IF
+            isReturn = kind == "Return"
+            IF isReturn THEN
+                ' Fission_SirToAmir always synthesizes exactly `RETURN I32 0`
+                ' as Main's own closing instruction (a raw literal "0", not a
+                ' lowered expression -- see that function's own comment) --
+                ' the only Return shape that can appear here in this first
+                ' slice, since Main never returns a user expression yet.
+                exitCode = instruction.Field("Value")
+                IF exitCode != "0" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "native codegen Phase 1 only supports RETURN 0 from Main, got: " + exitCode)
+                    CONTINUE FOR
+                END IF
+                ignored = Array.Push(textLines, "    mov $" + Fission_X86_64SyscallExit() + ", %rax")
+                ignored = Array.Push(textLines, "    xor %rdi, %rdi")
+                ignored = Array.Push(textLines, "    syscall")
+                CONTINUE FOR
+            END IF
+            ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Unsupported A-MIR instruction for native x86-64 codegen (Phase 1 supports only PRINT of string literals): " + kind)
+        NEXT
+    NEXT
+
+    RETURN {RodataLines: rodataLines, TextLines: textLines}
+END FUNCTION
+
+FUNCTION Fission_AmirToX86_64(amirModule)
+    program = FissionX86_64Program()
+    mainFunction = 0
+    found = FALSE
+    FOR fn IN amirModule.Functions
+        IF fn.Name == "Main" THEN
+            mainFunction = fn
+            found = TRUE
+        END IF
+    NEXT
+    IF found == FALSE THEN
+        ignored = program.Diagnostics.ReportError("FISSION_X86_64_NO_MAIN", "A-MIR module has no Main function")
+        RETURN program
+    END IF
+
+    lowered = Fission_X86_64LowerMain(program.Diagnostics, mainFunction)
+    ignored = program.Diagnostics.AppendMany(amirModule.Diagnostics)
+
+    lines = ["    .section .rodata"]
+    FOR line IN lowered.RodataLines
+        ignored = Array.Push(lines, line)
+    NEXT
+    ignored = Array.Push(lines, "")
+    ignored = Array.Push(lines, "    .section .text")
+    ignored = Array.Push(lines, "    .globl _start")
+    ignored = Array.Push(lines, "_start:")
+    FOR line IN lowered.TextLines
+        ignored = Array.Push(lines, line)
+    NEXT
+    ignored = Array.Push(lines, "")
+
+    program.Assembly = Array.Join(lines, "\n")
+    RETURN program
+END FUNCTION

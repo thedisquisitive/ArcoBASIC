@@ -1,0 +1,48 @@
+' Builds every fission/tests/native_programs/*.abas fixture as a real,
+' standalone Linux x86-64 executable with NO embedded bytecode VM at all --
+' compiled entirely by the Fission Compiler Substrate's own native codegen
+' (fission/amir/lower_x86_64.abas), not legacy ArcoFission. See that file's
+' own header comment for the current (deliberately small, disclosed)
+' supported construct subset, and fission/tests/native_programs/ itself for
+' why these fixtures are kept separate from fission/tests/substrate_programs/
+' (whose bytecode-VM-embedded path supports a much larger subset already).
+FUNCTION Fission_RivetBuildNativeDriver(compilerTarget)
+    target = BUILD.ArcoCapsule("fission-compile-to-x86-64")
+    target.Entry = "fission/cli/compile_to_x86_64.abas"
+    target.OutputDirectory = ".rivet/fission-native"
+    ignored = target.UseCompilerTarget(compilerTarget)
+    ignored = target.Build()
+    RETURN target
+END FUNCTION
+
+FUNCTION Fission_RivetNativeProgramBaseName(entryPath)
+    segments = String.Split(entryPath, "/")
+    last = segments[LEN(segments) - 1]
+    RETURN String.Slice(last, 0, String.Length(last) - String.Length(".abas"))
+END FUNCTION
+
+FUNCTION Fission_RivetNativeProgramEntries()
+    entries = []
+    FOR entry IN DIRECTORY("fission/tests/native_programs", FALSE)
+        IF entry.Extension == ".abas" THEN ignored = Array.Push(entries, entry.Path)
+    NEXT
+    RETURN entries
+END FUNCTION
+
+FUNCTION Fission_RivetBuildNativeCapsule(entryPath, driverTarget)
+    target = BUILD.FissionNativeCapsule(Fission_RivetNativeProgramBaseName(entryPath))
+    target.Entry = entryPath
+    target.OutputDirectory = "build/fission-native-programs"
+    ignored = target.UseDriverTarget(driverTarget)
+    ignored = target.Build()
+    RETURN target
+END FUNCTION
+
+FUNCTION Fission_RivetBuildAllNativeCapsules(compilerTarget)
+    driverTarget = Fission_RivetBuildNativeDriver(compilerTarget)
+    targets = []
+    FOR entryPath IN Fission_RivetNativeProgramEntries()
+        ignored = Array.Push(targets, Fission_RivetBuildNativeCapsule(entryPath, driverTarget))
+    NEXT
+    RETURN targets
+END FUNCTION

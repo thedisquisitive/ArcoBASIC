@@ -2,7 +2,10 @@
 
 Files = [
     "fission/amir/lower_bytecode.abas",
+    "fission/amir/lower_x86_64.abas",
     "fission/amir/model.abas",
+    "fission/cli/compile_to_bytecode.abas",
+    "fission/cli/compile_to_x86_64.abas",
     "fission/cli/fission.abas",
     "fission/core/artifact.abas",
     "fission/core/capability.abas",
@@ -34,6 +37,7 @@ Files = [
     "fission/tests/amir_bytecode_class_smoke.abas",
     "fission/tests/amir_bytecode_object_try_smoke.abas",
     "fission/tests/amir_to_bytecode_smoke.abas",
+    "fission/tests/amir_x86_64_smoke.abas",
     "fission/tests/arcobasic_access_interface_smoke.abas",
     "fission/tests/arcobasic_binding_semantic_smoke.abas",
     "fission/tests/arcobasic_call_statement_smoke.abas",
