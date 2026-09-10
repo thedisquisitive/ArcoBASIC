@@ -277,6 +277,20 @@ ArcoBASIC subset and lowers it into structured SIR.
   2044) -- an expected, correct change since the rewrite added a new function
   (`Fission_ArcoBasicCharsSlice`) and new parameters/locals to `lexer.abas`
   itself, one of the 75 files under whole-program self-semantic analysis.
+- Indexed `FissionArcoBasicSemanticReport`/`FissionArcoBasicProgramReport`
+  symbol lookup (`Object`-keyed maps in `fission/language/arcobasic/
+  semantic.abas`, replacing linear `FOR` scans) and fixed a real capability
+  gap it exposed: `TRY ... CATCH err` never registered `err` as a symbol at
+  all, so a real catch body referencing its own bound variable falsely
+  reported "unresolved read". Both confirmed via
+  `arcfs-utils/apps/arconaut/arconaut.abas` (a real 968-line production app):
+  semantic analysis 90s timeout -> 34s (index fix) -> 29s and clean (catch
+  fix). New regression test `fission/tests/arcobasic_catch_semantic_smoke.abas`
+  (76th first-party Fission file). Batch-verified strict single-file semantic
+  analysis against all 188 real non-Fission project files that structurally
+  parse clean: zero genuine semantic diagnostics found; only the largest
+  Arcology OS files (4800+ lines) remain unconfirmed within a 90s budget, a
+  known, separate performance item (see Known Failures).
 
 ## In-Progress Components
 
@@ -312,16 +326,23 @@ ArcoBASIC subset and lowers it into structured SIR.
 
 ## Known Failures
 
-- `FissionArcoBasicSemanticReport`/`FissionArcoBasicProgramReport` symbol
-  lookup (`HasSymbol`, `FindSymbol`, `FindCanonicalSymbol`,
-  `FindLocalTargetSymbol` in `fission/language/arcobasic/semantic.abas`) is a
-  linear `FOR symbol IN SELF.Symbols` scan per call, called once per
-  reference. With 2044 program symbols and hundreds of references (the
-  current Fission self-semantic corpus), this is now the largest remaining
-  performance cost for whole-program strict semantic analysis -- distinct
-  from, and not fixed by, the lexer's O(n^2) fix above. Needs an actual index
-  (an `Object`-keyed map from `scope::name` or canonical name to symbol)
-  instead of a scan.
+- FIXED (see Completed Components): `FissionArcoBasicSemanticReport`/
+  `FissionArcoBasicProgramReport` symbol lookup used to be a linear
+  `FOR symbol IN SELF.Symbols` scan per call; now `Object`-keyed indexes.
+  Confirmed real (`arcfs-utils/apps/arconaut/arconaut.abas` semantic analysis:
+  90s timeout -> 34s). The largest remaining real Arcology OS files (4800+
+  lines) still don't complete within a 90s single-file budget -- that
+  residual cost is the lexer's own O(n) (down from O(n^2), not O(1)) per-file
+  work on huge files, a distinct, already-diagnosed item -- not this scan.
+- Real capability gap found and fixed via the above: `TRY ... CATCH err`
+  never registered `err` as a symbol at all (no Try/Catch handling existed
+  in the semantic collection pass), so a real catch body referencing its own
+  bound variable falsely reported "unresolved read". Fixed; see
+  `fission/tests/arcobasic_catch_semantic_smoke.abas`.
+- Batch-verified strict single-file semantic analysis against 188 real
+  non-Fission project files: zero genuine semantic diagnostics found
+  anywhere. The only unconfirmed files are the largest Arcology OS fixtures
+  (performance, not correctness -- see above).
 - SIR is currently structural and renderable, but not yet typed, semantically
   bound, canonicalized, or lowered to real A-MIR.
 - ArcoBASIC `Source.arcobasic -> SIR` supports a growing structural subset, but
@@ -845,12 +866,13 @@ ArcoBASIC subset and lowers it into structured SIR.
    metadata.
 13. Keep all legacy compiler calls behind explicitly named bootstrap bridge
    components.
-14. Fix the O(n) linear symbol-lookup scan in
-   `fission/language/arcobasic/semantic.abas` (`HasSymbol`/`FindSymbol`/
-   `FindCanonicalSymbol`/`FindLocalTargetSymbol`) with a real index -- this is
-   now the largest remaining performance cost for whole-program strict
-   semantic analysis, confirmed by direct measurement after the lexer's
-   O(n^2) fix landed. See Known Failures for detail.
+14. DONE -- symbol-lookup index fix landed, see Completed Components/Known
+   Failures. Remaining performance work on the largest Arcology OS files is
+   the lexer's own O(n) cost on very large single files (already reduced from
+   O(n^2), not eliminated) -- profile lexer.abas/parser.abas/lower_sir.abas
+   directly against one of those files (e.g.
+   `arcology-os/stdlib/aex_format_policy.abas`) to find the next concrete
+   hot spot, rather than guessing.
 15. Extend the same `#IMPORT`-closure-fingerprinted, cached-capsule pattern
    (`fission/build/rivet_test_capsules.abas`) to any other repeated
    `ArcoFission compile-run` call sites that recompile shared frontend source
