@@ -106,12 +106,18 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
     IF node.Kind == "Literal" THEN
         literalKind = Object.Get(node.Fields, "LiteralKind", "")
         value = Object.Get(node.Fields, "Value", "")
-        IF literalKind == "String" OR literalKind == "InterpolatedString" THEN RETURN Fission_AmirUnsupportedExpr(builder, "string literal")
+        IF literalKind == "InterpolatedString" THEN RETURN Fission_AmirUnsupportedExpr(builder, "interpolated string literal")
         IF value == "TRUE" THEN RETURN {Value: "1", Type: "BOOL"}
         IF value == "FALSE" THEN RETURN {Value: "0", Type: "BOOL"}
         IF value == "NULL" THEN RETURN Fission_AmirUnsupportedExpr(builder, "null literal")
         temp = builder.NewTemp()
-        ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", temp).WithField("Value", value))
+        constText = value
+        ' A plain string literal's CONST operand is quoted in the legacy
+        ' oracle's own A-MIR (`CONST "hello"`), unlike a bare numeric CONST --
+        ' confirmed via `ArcoFission reveal ... at A-MIR` on a real
+        ' `s = "hello"` program.
+        IF literalKind == "String" THEN constText = "\"" + value + "\""
+        ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", temp).WithField("Value", constText))
         RETURN {Value: temp, Type: ""}
     END IF
     IF node.Kind == "Read" THEN
@@ -225,6 +231,112 @@ FUNCTION Fission_AmirLowerWhile(builder, node)
     builder.CurrentBlock = endBlock
 END FUNCTION
 
+' SIR "ForRange" nodes have no field marking whether an explicit STEP was
+' given: children are [start, end, (step?), ...body statements spread
+' directly] (see FissionSirBuilder.ForRangeLoop), so a step expression at
+' children[2] is not distinguishable from the first body statement by
+' position alone. Disambiguated here by SIR node Kind instead -- these two
+' sets are disjoint in the current SIR vocabulary (an expression-shaped node
+' can only be a step; a statement-shaped node can only be a body statement),
+' which is reliable for every SIR shape this lowering pass already handles.
+FUNCTION Fission_AmirIsAmirExpressionKind(kind)
+    RETURN Fission_ListContains(["Literal", "Read", "CallExpr", "Call", "NamedArg", "IndexRead", "MemberRead", "Array", "ArrayComprehension", "Field", "Object", "Binary", "Unary", "AddressOf", "Copy"], kind)
+END FUNCTION
+
+' Matches the legacy oracle's own real desugaring (confirmed via
+' `ArcoFission reveal ... at A-MIR` on a real `FOR i = 1 TO 3 ... NEXT`):
+' the end and step values are stored once into hidden loop-local variables,
+' then the loop tests BOTH ascending (step >= 0, `i <= end`) and descending
+' (step < 0, `i >= end`) conditions via a branch on the step's own sign --
+' ArcoBASIC's `STEP` can be negative, so which comparison direction is
+' correct cannot be decided at lowering time from a constant step alone.
+FUNCTION Fission_AmirLowerForRange(builder, node)
+    name = Object.Get(node.Fields, "Name", "")
+    startValue = Fission_AmirLowerExpr(builder, node.Children[0])
+    endValue = Fission_AmirLowerExpr(builder, node.Children[1])
+    bodyIndex = 2
+    stepValue = NULL
+    IF LEN(node.Children) > 2 AND Fission_AmirIsAmirExpressionKind(node.Children[2].Kind) THEN
+        stepValue = Fission_AmirLowerExpr(builder, node.Children[2])
+        bodyIndex = 3
+    END IF
+
+    endName = "__fission_for_end" + String(builder.NewBlockName(""))
+    stepName = "__fission_for_step" + String(builder.NewBlockName(""))
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", name).WithField("Value", startValue.Value))
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", endName).WithField("Value", endValue.Value))
+    IF stepValue == NULL THEN
+        oneTemp = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", oneTemp).WithField("Value", "1"))
+        ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", stepName).WithField("Value", oneTemp))
+    ELSE
+        ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", stepName).WithField("Value", stepValue.Value))
+    END IF
+
+    condName = builder.NewBlockName("ForCond")
+    posName = builder.NewBlockName("ForCondPos")
+    negName = builder.NewBlockName("ForCondNeg")
+    bodyName = builder.NewBlockName("ForBody")
+    incName = builder.NewBlockName("ForInc")
+    forEndName = builder.NewBlockName("ForEnd")
+    currentFunction = builder.CurrentFunction
+
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", condName))
+
+    condBlock = currentFunction.AddBlock(FissionAmirBlock(condName))
+    builder.CurrentBlock = condBlock
+    stepLoad = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", stepLoad).WithField("Name", stepName))
+    zeroTemp = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", zeroTemp).WithField("Value", "0"))
+    signDest = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("BinOp").WithField("Dest", signDest).WithField("Op", ">=").WithField("Left", stepLoad).WithField("Right", zeroTemp).WithField("LeftType", "").WithField("RightType", ""))
+    ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", signDest).WithField("Then", posName).WithField("Else", negName))
+
+    posBlock = currentFunction.AddBlock(FissionAmirBlock(posName))
+    builder.CurrentBlock = posBlock
+    iLoadPos = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", iLoadPos).WithField("Name", name))
+    endLoadPos = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", endLoadPos).WithField("Name", endName))
+    posDest = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("BinOp").WithField("Dest", posDest).WithField("Op", "<=").WithField("Left", iLoadPos).WithField("Right", endLoadPos).WithField("LeftType", "").WithField("RightType", ""))
+    ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", posDest).WithField("Then", bodyName).WithField("Else", forEndName))
+
+    negBlock = currentFunction.AddBlock(FissionAmirBlock(negName))
+    builder.CurrentBlock = negBlock
+    iLoadNeg = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", iLoadNeg).WithField("Name", name))
+    endLoadNeg = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", endLoadNeg).WithField("Name", endName))
+    negDest = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("BinOp").WithField("Dest", negDest).WithField("Op", ">=").WithField("Left", iLoadNeg).WithField("Right", endLoadNeg).WithField("LeftType", "").WithField("RightType", ""))
+    ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", negDest).WithField("Then", bodyName).WithField("Else", forEndName))
+
+    bodyBlock = currentFunction.AddBlock(FissionAmirBlock(bodyName))
+    builder.CurrentBlock = bodyBlock
+    index = bodyIndex
+    WHILE index < LEN(node.Children)
+        ignored = Fission_AmirLowerStatement(builder, node.Children[index])
+        index = index + 1
+    WEND
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", incName))
+
+    incBlock = currentFunction.AddBlock(FissionAmirBlock(incName))
+    builder.CurrentBlock = incBlock
+    iLoadInc = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", iLoadInc).WithField("Name", name))
+    stepLoadInc = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", stepLoadInc).WithField("Name", stepName))
+    sumDest = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("BinOp").WithField("Dest", sumDest).WithField("Op", "+").WithField("Left", iLoadInc).WithField("Right", stepLoadInc).WithField("LeftType", "").WithField("RightType", ""))
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", name).WithField("Value", sumDest))
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", condName))
+
+    endBlock = currentFunction.AddBlock(FissionAmirBlock(forEndName))
+    builder.CurrentBlock = endBlock
+END FUNCTION
+
 FUNCTION Fission_AmirParseArguments(argsText)
     descriptors = []
     IF argsText == "" THEN RETURN descriptors
@@ -332,6 +444,10 @@ FUNCTION Fission_AmirLowerStatement(builder, node)
     END IF
     IF node.Kind == "While" THEN
         ignored = Fission_AmirLowerWhile(builder, node)
+        RETURN
+    END IF
+    IF node.Kind == "ForRange" THEN
+        ignored = Fission_AmirLowerForRange(builder, node)
         RETURN
     END IF
     IF node.Kind == "Function" THEN

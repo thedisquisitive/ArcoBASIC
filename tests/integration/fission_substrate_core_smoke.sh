@@ -386,14 +386,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_parse_smoke")"
 
-grep -q "^79$" <<<"$fission_self_output"
+grep -q "^80$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_semantic_smoke")"
 
-grep -q "^79$" <<<"$fission_self_semantic_output"
-grep -q "^116$" <<<"$fission_self_semantic_output"
-grep -q "^2253$" <<<"$fission_self_semantic_output"
+grep -q "^80$" <<<"$fission_self_semantic_output"
+grep -q "^118$" <<<"$fission_self_semantic_output"
+grep -q "^2301$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -467,6 +467,26 @@ grep -q "^    %t17 := + %t15, %t16$" <<<"$amir_output"
 grep -q "^FUNCTION Sum(a AS U64, b AS U64) RETURNS U64$" <<<"$amir_output"
 grep -q "^    %t3 :U64 := INT.ADD %t1, %t2 \[U64,U64\]$" <<<"$amir_output"
 grep -q "^    RETURN U64 %t3$" <<<"$amir_output"
+
+amir_for_output="$("$SOURCE_DIR/build-rivet/fission/tests/sir_to_amir_for_smoke")"
+
+test "$(grep -c "^FALSE$" <<<"$amir_for_output")" = "2"
+grep -q "^A-MIR MODULE \"amir-for-smoke.abas\"$" <<<"$amir_for_output"
+grep -q "^    STORE i, %t1$" <<<"$amir_for_output"
+grep -q "^    STORE __fission_for_end0, %t2$" <<<"$amir_for_output"
+grep -q "^    STORE __fission_for_step1, %t3$" <<<"$amir_for_output"
+grep -q "^BLOCK ForCond2$" <<<"$amir_for_output"
+grep -q "^    BRANCH %t6, ForCondPos3, ForCondNeg4$" <<<"$amir_for_output"
+grep -q "^BLOCK ForCondPos3$" <<<"$amir_for_output"
+grep -q "^    %t9 := <= %t7, %t8$" <<<"$amir_for_output"
+grep -q "^    BRANCH %t9, ForBody5, ForEnd7$" <<<"$amir_for_output"
+grep -q "^BLOCK ForCondNeg4$" <<<"$amir_for_output"
+grep -q "^    %t12 := >= %t10, %t11$" <<<"$amir_for_output"
+grep -q "^BLOCK ForBody5$" <<<"$amir_for_output"
+grep -q "^BLOCK ForInc6$" <<<"$amir_for_output"
+grep -q "^    %t16 := + %t14, %t15$" <<<"$amir_for_output"
+grep -q "^BLOCK ForEnd7$" <<<"$amir_for_output"
+grep -q "^    %t17 := CONST \"hello\"$" <<<"$amir_for_output"
 
 self_loop_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_loop_semantic_smoke")"
 

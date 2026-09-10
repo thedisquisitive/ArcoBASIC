@@ -79,6 +79,7 @@ Files = [
     "fission/tests/module_smoke.abas",
     "fission/tests/sir_builder_smoke.abas",
     "fission/tests/sir_semantic_artifact_smoke.abas",
+    "fission/tests/sir_to_amir_for_smoke.abas",
     "fission/tests/sir_to_amir_smoke.abas"
 ]
 
