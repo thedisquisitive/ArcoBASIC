@@ -1,0 +1,45 @@
+' A real, ordinary ArcoBASIC program -- NOT a Fission-substrate test fixture like everything else
+' under fission/tests/. This file is deliberately just a normal ArcoBASIC program (a class with
+' methods, array push/pop, a standalone function, a WHILE loop, a FOR-IN loop) exercising several
+' constructs together, meant to be COMPILED BY the Fission Compiler Substrate (via
+' fission/cli/compile_to_bytecode.abas + `ArcoFission package`, wired together by
+' FissionSubstrateCapsuleTarget in rivet/stdlib/rivet.abas) rather than compiled INTO it. Its
+' expected output is verified against legacy ArcoFission (`compile-run`) as the equivalence-testing
+' oracle: 5 / 55 / 25 / 4.
+CLASS Stack
+    CONSTRUCTOR()
+        SELF.Items = []
+    END CONSTRUCTOR
+
+    FUNCTION Push(value)
+        ignored = Array.Push(SELF.Items, value)
+    END FUNCTION
+
+    FUNCTION Pop()
+        RETURN Array.Pop(SELF.Items)
+    END FUNCTION
+
+    FUNCTION Size()
+        RETURN LEN(SELF.Items)
+    END FUNCTION
+END CLASS
+
+FUNCTION Sum(values)
+    total = 0
+    FOR value IN values
+        total = total + value
+    NEXT
+    RETURN total
+END FUNCTION
+
+stack = Stack()
+i = 1
+WHILE i <= 5
+    ignored = stack.Push(i * i)
+    i = i + 1
+WEND
+
+PRINT stack.Size()
+PRINT Sum(stack.Items)
+PRINT stack.Pop()
+PRINT stack.Size()

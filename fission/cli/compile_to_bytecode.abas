@@ -1,0 +1,45 @@
+' Generic file-based Fission Compiler Substrate driver (WP-004/WP-007's own
+' natural CLI surface): takes a real ArcoBASIC source path on disk and runs
+' it through the substrate's actual Source -> AST -> SIR -> A-MIR -> bytecode
+' pipeline, exactly like every fission/tests/*.abas smoke fixture does with an
+' inline `Source = "..."` string -- the only difference here is reading an
+' arbitrary file instead. This is what turns the substrate from "a pipeline
+' only its own test fixtures can invoke" into something a Rivet target (see
+' FissionSubstrateCapsuleTarget in rivet/stdlib/rivet.abas) can point at a
+' real program.
+'
+' Usage: ArcoFission compile-run fission/cli/compile_to_bytecode.abas -- ENTRY OUTPUT
+' Diagnostics from any stage abort with a non-zero exit and a printed report
+' instead of writing a bytecode file -- never silently emit bytecode for a
+' program this substrate could not actually validate.
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/amir/lower_bytecode.abas"
+
+FUNCTION FissionCli_Fail(stage, diagnostics)
+    PRINT "FISSION COMPILE FAILED at " + stage
+    PRINT diagnostics.Render()
+    Exit(1)
+END FUNCTION
+
+appArgs = Runtime.Args()
+IF LEN(appArgs) < 2 THEN
+    PRINT "usage: compile_to_bytecode.abas ENTRY OUTPUT.arcof"
+    Exit(2)
+END IF
+entryPath = appArgs[0]
+outputPath = appArgs[1]
+
+source = File.ReadText(entryPath)
+tokens = Fission_ArcoBasicLex(source)
+ast = Fission_ArcoBasicParse(tokens, entryPath)
+IF ast.Diagnostics.HasErrors() THEN ignored = FissionCli_Fail("AST", ast.Diagnostics)
+
+sir = Fission_ArcoBasicAstToSir(ast)
+amir = Fission_SirToAmir(sir)
+IF amir.Diagnostics.HasErrors() THEN ignored = FissionCli_Fail("A-MIR", amir.Diagnostics)
+
+bytecode = Fission_AmirToBytecode(amir)
+IF bytecode.Diagnostics.HasErrors() THEN ignored = FissionCli_Fail("BYTECODE", bytecode.Diagnostics)
+
+ignored = File.WriteText(outputPath, bytecode.Render())
+PRINT "BYTECODE WRITTEN " + outputPath

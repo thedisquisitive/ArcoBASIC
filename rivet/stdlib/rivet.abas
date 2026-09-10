@@ -252,7 +252,97 @@ CLASS ArcoCapsuleTarget
                  Inputs: ArcoCapsule_ImportClosure(SELF.Entry), Outputs: [SELF.OutputPath()],
                  Tool: SELF.CompilerPath, ToolVersion: SELF.CompilerVersion,
                  Arguments: args, Dependencies: SELF.DependencyActionIds, OriginFunction: "ArcoCapsuleTarget.Build" }
-        ignored = RIVET.Graph.Action(spec)
+        ' Found this session: nothing previously read this, so every existing caller of
+        ' UseCompilerTarget/AddDependency happened to only ever pass a BuildTarget (whose own
+        ' Build() already sets this) as the dependency -- never an ArcoCapsuleTarget itself.
+        ' FissionSubstrateCapsuleTarget's UseDriverTarget is the first caller that chains an
+        ' ArcoCapsuleTarget (the compile_to_bytecode driver) as another target's dependency, and it
+        ' crashed with "undefined property: FinalActionId" until this was added. Purely additive --
+        ' every existing ArcoCapsuleTarget caller ignored this field already.
+        SELF.FinalActionId = RIVET.Graph.Action(spec)
+        RETURN SELF
+    END FUNCTION
+END CLASS
+
+' Builds a real standalone ArcoCapsule out of a program compiled by the Fission Compiler
+' Substrate itself, not by legacy ArcoFission -- the substrate-equivalent of ArcoCapsuleTarget
+' above. Two chained Compile actions instead of ArcoCapsuleTarget's one, since (unlike legacy
+' `ArcoFission native ENTRY -o OUTPUT`) this needs a real intermediate artifact: SELF.Entry is
+' compiled to `.arcof-text` bytecode by a *driver capsule* (SELF.DriverPath, set via
+' UseDriverTarget -- an ordinary ArcoCapsuleTarget pointed at
+' fission/cli/compile_to_bytecode.abas, itself legacy-compiled infrastructure that RUNS the
+' substrate's own SIR->A-MIR->bytecode pipeline against an arbitrary file, see that file's own
+' header comment), then that bytecode is packaged into an ELF64 capsule by legacy ArcoFission's
+' `package` command (SELF.CompilerPath, added this session specifically to make this target
+' possible -- see .agents/FISSION_SUBSTRATE_PROGRESS.md). "Legacy ArcoFission produced this
+' binary" would be a misleading way to describe the result: legacy ArcoFission only ever
+' contributes the driver capsule (infrastructure) and the final ELF64-linking step (a sanctioned
+' Legacy Bridge); every actual compiler decision about SELF.Entry -- lexing, parsing, SIR/A-MIR/
+' bytecode lowering -- happens inside the driver capsule, i.e. inside this substrate.
+CLASS FissionSubstrateCapsuleTarget
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Entry = ""
+        SELF.OutputDirectory = "build"
+        SELF.DriverPath = ""
+        detected = RIVET.Toolchain.DetectFission()
+        IF !detected.Found THEN
+            ignored = RIVET.Log.Error("no ArcoFission compiler found (set ARCOFISSION_PATH, or ensure ArcoFission is on PATH)")
+        END IF
+        SELF.CompilerPath = detected.Path
+        SELF.CompilerVersion = detected.Version
+        SELF.DependencyActionIds = []
+    END CONSTRUCTOR
+
+    FUNCTION OutputPath()
+        RETURN SELF.OutputDirectory + "/" + SELF.Name
+    END FUNCTION
+
+    FUNCTION BytecodePath()
+        RETURN ".rivet/fission-substrate/" + SELF.Name + ".arcof"
+    END FUNCTION
+
+    FUNCTION AddDependency(target)
+        IF target.FinalActionId != "" THEN ignored = Array.Push(SELF.DependencyActionIds, target.FinalActionId)
+        RETURN SELF
+    END FUNCTION
+
+    ' `target` is an ordinary ArcoCapsuleTarget built from fission/cli/compile_to_bytecode.abas --
+    ' see this class's own header comment for why that driver is legacy-compiled infrastructure,
+    ' not a claim that legacy ArcoFission compiles SELF.Entry.
+    FUNCTION UseDriverTarget(target)
+        SELF.DriverPath = target.OutputPath()
+        ignored = SELF.AddDependency(target)
+        RETURN SELF
+    END FUNCTION
+
+    ' Points the final `package` step at a freshly-built in-graph ArcoFission (mirrors
+    ' ArcoCapsuleTarget.UseCompilerTarget exactly) instead of the constructor's own PATH/
+    ' ARCOFISSION_PATH auto-detection -- without this, `package` silently runs whatever
+    ' ArcoFission happens to be installed system-wide, which may predate the `package` command
+    ' entirely (found this session: it does, on this machine -- the build failed with a bare
+    ' usage/help dump until this was wired in).
+    FUNCTION UseCompilerTarget(target)
+        SELF.CompilerPath = target.OutputPath()
+        ignored = SELF.AddDependency(target)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Build()
+        bytecodePath = SELF.BytecodePath()
+        compileSpec = { Type: "Compile", Target: SELF.Name, DisplayName: SELF.Entry,
+                        Inputs: ArcoCapsule_ImportClosure(SELF.Entry), Outputs: [bytecodePath],
+                        Tool: SELF.DriverPath, ToolVersion: "fission-substrate/1",
+                        Arguments: [SELF.Entry, bytecodePath], Dependencies: SELF.DependencyActionIds,
+                        OriginFunction: "FissionSubstrateCapsuleTarget.Build" }
+        compileActionId = RIVET.Graph.Action(compileSpec)
+
+        packageSpec = { Type: "Compile", Target: SELF.Name, DisplayName: SELF.OutputPath(),
+                        Inputs: [bytecodePath], Outputs: [SELF.OutputPath()],
+                        Tool: SELF.CompilerPath, ToolVersion: SELF.CompilerVersion,
+                        Arguments: ["package", bytecodePath, "-o", SELF.OutputPath()],
+                        Dependencies: [compileActionId], OriginFunction: "FissionSubstrateCapsuleTarget.Build" }
+        SELF.FinalActionId = RIVET.Graph.Action(packageSpec)
         RETURN SELF
     END FUNCTION
 END CLASS
@@ -266,6 +356,9 @@ CLASS BuildNamespace
     END FUNCTION
     FUNCTION ArcoCapsule(name)
         RETURN ArcoCapsuleTarget(name)
+    END FUNCTION
+    FUNCTION FissionSubstrateCapsule(name)
+        RETURN FissionSubstrateCapsuleTarget(name)
     END FUNCTION
 END CLASS
 

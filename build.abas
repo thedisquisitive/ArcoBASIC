@@ -2,6 +2,7 @@
 
 #IMPORT "fission/build/rivet_modules.abas"
 #IMPORT "fission/build/rivet_test_capsules.abas"
+#IMPORT "fission/build/rivet_substrate_capsules.abas"
 
 FUNCTION ConfigureCoreTarget(target)
     ignored = target.Includes.Append("include")
@@ -161,6 +162,7 @@ ignored = ArcoFission.Build()
 
 FissionModules = Fission_RivetBuildDefaultModules(ArcoFission)
 FissionTestCapsules = Fission_RivetBuildAllTestCapsules(ArcoFission)
+FissionSubstrateCapsules = Fission_RivetBuildAllSubstrateCapsules(ArcoFission)
 
 ArcoCli = BUILD.Executable("arco_cli")
 ArcoCli.OutputDirectory = "build-rivet"

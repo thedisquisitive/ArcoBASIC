@@ -1,0 +1,48 @@
+' Builds every fission/tests/substrate_programs/*.abas fixture (a real, ordinary ArcoBASIC
+' program, not a Fission-substrate test fixture -- see that directory's own convention) as a real
+' standalone ArcoCapsule, compiled entirely through the Fission Compiler Substrate's own
+' SIR->A-MIR->bytecode pipeline instead of legacy ArcoFission's compiler. See
+' FissionSubstrateCapsuleTarget's own header comment in rivet/stdlib/rivet.abas for exactly which
+' part of this is legacy-compiled infrastructure (the driver capsule, the final ELF64 link) versus
+' which part is this substrate actually compiling the program (all of it).
+FUNCTION Fission_RivetBuildSubstrateDriver(compilerTarget)
+    target = BUILD.ArcoCapsule("fission-compile-to-bytecode")
+    target.Entry = "fission/cli/compile_to_bytecode.abas"
+    target.OutputDirectory = ".rivet/fission-substrate"
+    ignored = target.UseCompilerTarget(compilerTarget)
+    ignored = target.Build()
+    RETURN target
+END FUNCTION
+
+FUNCTION Fission_RivetSubstrateProgramBaseName(entryPath)
+    segments = String.Split(entryPath, "/")
+    last = segments[LEN(segments) - 1]
+    RETURN String.Slice(last, 0, String.Length(last) - String.Length(".abas"))
+END FUNCTION
+
+FUNCTION Fission_RivetSubstrateProgramEntries()
+    entries = []
+    FOR entry IN DIRECTORY("fission/tests/substrate_programs", FALSE)
+        IF entry.Extension == ".abas" THEN ignored = Array.Push(entries, entry.Path)
+    NEXT
+    RETURN entries
+END FUNCTION
+
+FUNCTION Fission_RivetBuildSubstrateCapsule(entryPath, driverTarget, compilerTarget)
+    target = BUILD.FissionSubstrateCapsule(Fission_RivetSubstrateProgramBaseName(entryPath))
+    target.Entry = entryPath
+    target.OutputDirectory = "build/fission-substrate-programs"
+    ignored = target.UseDriverTarget(driverTarget)
+    ignored = target.UseCompilerTarget(compilerTarget)
+    ignored = target.Build()
+    RETURN target
+END FUNCTION
+
+FUNCTION Fission_RivetBuildAllSubstrateCapsules(compilerTarget)
+    driverTarget = Fission_RivetBuildSubstrateDriver(compilerTarget)
+    targets = []
+    FOR entryPath IN Fission_RivetSubstrateProgramEntries()
+        ignored = Array.Push(targets, Fission_RivetBuildSubstrateCapsule(entryPath, driverTarget, compilerTarget))
+    NEXT
+    RETURN targets
+END FUNCTION

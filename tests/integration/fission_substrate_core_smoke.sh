@@ -599,4 +599,16 @@ os_stdlib_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_os_stdlib_p
 grep -q "^25$" <<<"$os_stdlib_output"
 grep -q "^0$" <<<"$os_stdlib_output"
 
+# fission/tests/substrate_programs/stack_sum.abas is a real ArcoBASIC program compiled entirely by
+# the Fission Compiler Substrate (via fission/cli/compile_to_bytecode.abas, not legacy ArcoFission)
+# and packaged into a standalone ArcoCapsule by FissionSubstrateCapsuleTarget (rivet/stdlib/
+# rivet.abas), built above by the same `rivet build` this script already runs. Run the resulting
+# ELF64 directly -- no ArcoFission CLI involved at all -- and check its output against legacy
+# ArcoFission's own `compile-run` on the identical source as the equivalence-testing oracle.
+stack_sum_output="$("$SOURCE_DIR/build/fission-substrate-programs/stack_sum")"
+expected_stack_sum_output="$(printf '5\n55\n25\n4')"
+test "$stack_sum_output" = "$expected_stack_sum_output"
+oracle_stack_sum_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/substrate_programs/stack_sum.abas")"
+test "$stack_sum_output" = "$oracle_stack_sum_output"
+
 echo "fission_substrate_core_smoke: all checks passed"
