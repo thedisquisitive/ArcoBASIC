@@ -1,0 +1,12 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/sir/lower_amir.abas"
+
+Source = "FUNCTION Sum(a AS U64, b AS U64) AS U64\nRETURN a + b\nEND FUNCTION\n\nx = 0\nIF x == 0 THEN\nx = Sum(1, 2)\nELSE\nx = 5\nEND IF\n\nWHILE x < 10\nx = x + 1\nWEND\n\nPRINT x"
+Tokens = Fission_ArcoBasicLex(Source)
+Ast = Fission_ArcoBasicParse(Tokens, "amir-smoke.abas")
+Sir = Fission_ArcoBasicAstToSir(Ast)
+Amir = Fission_SirToAmir(Sir)
+
+PRINT Ast.Diagnostics.HasErrors()
+PRINT Amir.Diagnostics.HasErrors()
+PRINT Amir.Render()

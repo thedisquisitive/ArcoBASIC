@@ -1,0 +1,371 @@
+#IMPORT "fission/amir/model.abas"
+#IMPORT "fission/sir/model.abas"
+
+' SIR -> A-MIR lowering for the RFC's own "Tiny BASIC-like" acceptance subset
+' (RFC-AP-FISSION-001 section 8, Test B: variables, numeric expressions,
+' PRINT, IF, WHILE, functions) -- not the full current SIR surface. Real,
+' honestly-scoped: unsupported SIR node kinds report a diagnostic and lower to
+' a CONST 0 placeholder rather than silently producing wrong A-MIR or
+' crashing, the same pattern the ArcoBASIC frontend itself already uses for
+' unsupported syntax (see FISSION_ARCOBASIC_UNSUPPORTED_STATEMENT /
+' _EXPRESSION). Every construct this file DOES lower was checked against
+' `ArcoFission reveal FILE at A-MIR` (the legacy compiler, this project's own
+' equivalence-testing oracle per RFC section 41) for the shape of temporaries,
+' typed operators, block control flow, and function calls -- not for exact
+' temp-number/block-name equivalence, which depends on the legacy allocator's
+' own incidental processing order and is not attempted here.
+'
+' Type inference is intentionally minimal: a variable's type is known only
+' when declared explicitly (`LET x AS U64` / a function parameter's own
+' `AS type`) and tracked in a flat per-function scope stack (this project's
+' scope model has no finer block scoping elsewhere either, see semantic.abas).
+' A binary operation between two knowns of the same type lowers to a typed
+' `INT.*` opcode; anything else lowers to the untyped generic-operator form
+' the legacy compiler itself falls back to for untyped operands.
+
+FUNCTION Fission_AmirBinaryTypedOp(operatorName)
+    IF operatorName == "+" THEN RETURN "INT.ADD"
+    IF operatorName == "-" THEN RETURN "INT.SUB"
+    IF operatorName == "*" THEN RETURN "INT.MUL"
+    IF operatorName == "==" THEN RETURN "INT.CMP_EQ"
+    IF operatorName == "!=" THEN RETURN "INT.CMP_NE"
+    IF operatorName == "<" THEN RETURN "INT.CMP_LT_UNSIGNED"
+    IF operatorName == "<=" THEN RETURN "INT.CMP_LE_UNSIGNED"
+    IF operatorName == ">" THEN RETURN "INT.CMP_GT_UNSIGNED"
+    IF operatorName == ">=" THEN RETURN "INT.CMP_GE_UNSIGNED"
+    RETURN ""
+END FUNCTION
+
+FUNCTION Fission_AmirIsComparison(operatorName)
+    RETURN Fission_ListContains(["==", "!=", "<", "<=", ">", ">="], operatorName)
+END FUNCTION
+
+CLASS FissionAmirScope
+    CONSTRUCTOR()
+        SELF.Types = {}
+    END CONSTRUCTOR
+
+    FUNCTION Declare(name, typeName)
+        IF typeName != "" THEN SELF.Types = Object.Set(SELF.Types, name, typeName)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION TypeOf(name)
+        RETURN Object.Get(SELF.Types, name, "")
+    END FUNCTION
+END CLASS
+
+CLASS FissionAmirBuilder
+    CONSTRUCTOR(moduleName)
+        SELF.Module = FissionAmirModule(moduleName)
+        SELF.TempCounter = 0
+        SELF.BlockCounter = 0
+        SELF.CurrentBlock = NULL
+        ' Explicitly tracked rather than inferred as "the module's last
+        ' function" -- a real bug caught by comparing against the legacy
+        ' oracle: inferring it that way silently reattached every block from
+        ' an IF/WHILE encountered in Main, after a nested FUNCTION
+        ' declaration had already been lowered, onto that nested function
+        ' instead (since it had become the module's last-added function),
+        ' producing a well-formed-looking but structurally wrong A-MIR module.
+        SELF.CurrentFunction = NULL
+        SELF.Scope = FissionAmirScope()
+        SELF.Diagnostics = FissionDiagnosticBag()
+    END CONSTRUCTOR
+
+    FUNCTION NewTemp()
+        name = "%t" + String(SELF.TempCounter)
+        SELF.TempCounter = SELF.TempCounter + 1
+        RETURN name
+    END FUNCTION
+
+    FUNCTION NewBlockName(prefix)
+        name = prefix + String(SELF.BlockCounter)
+        SELF.BlockCounter = SELF.BlockCounter + 1
+        RETURN name
+    END FUNCTION
+
+    FUNCTION Emit(instruction)
+        RETURN SELF.CurrentBlock.Append(instruction)
+    END FUNCTION
+
+    FUNCTION Unsupported(kind, detail)
+        ignored = SELF.Diagnostics.ReportError("FISSION_AMIR_UNSUPPORTED", "Unsupported SIR " + kind + " for A-MIR lowering: " + detail)
+        temp = SELF.NewTemp()
+        ignored = SELF.Emit(FissionAmirInstruction("Const").WithField("Dest", temp).WithField("Value", "0"))
+        RETURN {Value: temp, Type: ""}
+    END FUNCTION
+END CLASS
+
+' Lowers a SIR expression node into (a) the A-MIR operand referring to its
+' result (a temp name, or a literal's own text for a bare CONST) and (b) the
+' operand's known type ("" when not statically known). Every non-trivial
+' result is materialized into a fresh temp via CONST/LOAD/BinOp/CALL, matching
+' the legacy oracle's own three-address-code shape.
+FUNCTION Fission_AmirLowerExpr(builder, node)
+    IF node.Kind == "Literal" THEN
+        literalKind = Object.Get(node.Fields, "LiteralKind", "")
+        value = Object.Get(node.Fields, "Value", "")
+        IF literalKind == "String" OR literalKind == "InterpolatedString" THEN RETURN Fission_AmirUnsupportedExpr(builder, "string literal")
+        IF value == "TRUE" THEN RETURN {Value: "1", Type: "BOOL"}
+        IF value == "FALSE" THEN RETURN {Value: "0", Type: "BOOL"}
+        IF value == "NULL" THEN RETURN Fission_AmirUnsupportedExpr(builder, "null literal")
+        temp = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", temp).WithField("Value", value))
+        RETURN {Value: temp, Type: ""}
+    END IF
+    IF node.Kind == "Read" THEN
+        name = Object.Get(node.Fields, "Name", "")
+        temp = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", temp).WithField("Name", name))
+        RETURN {Value: temp, Type: builder.Scope.TypeOf(name)}
+    END IF
+    IF node.Kind == "Binary" THEN
+        operatorName = Object.Get(node.Fields, "Operator", "")
+        left = Fission_AmirLowerExpr(builder, node.Children[0])
+        right = Fission_AmirLowerExpr(builder, node.Children[1])
+        typedOp = Fission_AmirBinaryTypedOp(operatorName)
+        isComparison = Fission_AmirIsComparison(operatorName)
+        dest = builder.NewTemp()
+        instruction = FissionAmirInstruction("BinOp").WithField("Dest", dest).WithField("Left", left.Value).WithField("Right", right.Value).WithField("LeftType", left.Type).WithField("RightType", right.Type)
+        resultType = ""
+        ' A real, oracle-confirmed asymmetry: comparisons ALWAYS lower to the
+        ' typed INT.CMP_* opcode with a BOOL result and a `[LeftType,
+        ' RightType]` bracket, even when both operand types are unknown
+        ' (`%t7 :BOOL := INT.CMP_EQ %t5, %t6 [,]` -- empty bracket, still
+        ' shown). Arithmetic only gets the typed INT.* form -- bracket
+        ' included -- when both operand types are concretely known and match;
+        ' otherwise it falls back to the bare untyped operator with no
+        ' bracket at all (`%t17 := + %t15, %t16`). Both confirmed directly
+        ' against `ArcoFission reveal ... at A-MIR`, not assumed.
+        arithmeticTyped = typedOp != "" AND isComparison == FALSE AND left.Type != "" AND left.Type == right.Type
+        IF isComparison THEN resultType = "BOOL"
+        IF arithmeticTyped THEN resultType = left.Type
+        IF isComparison OR arithmeticTyped THEN
+            ignored = instruction.WithField("Op", typedOp)
+            ignored = instruction.WithField("Type", resultType)
+            ignored = instruction.WithField("ShowBracket", "TRUE")
+        END IF
+        IF (isComparison OR arithmeticTyped) == FALSE THEN
+            ignored = instruction.WithField("Op", operatorName)
+        END IF
+        ignored = builder.Emit(instruction)
+        RETURN {Value: dest, Type: resultType}
+    END IF
+    IF node.Kind == "CallExpr" THEN
+        callee = node.Children[0]
+        IF callee.Kind != "Read" THEN RETURN Fission_AmirUnsupportedExpr(builder, "indirect call target")
+        calleeName = Object.Get(callee.Fields, "Name", "")
+        argValues = []
+        index = 1
+        WHILE index < LEN(node.Children)
+            argResult = Fission_AmirLowerExpr(builder, node.Children[index])
+            ignored = Array.Push(argValues, argResult.Value)
+            index = index + 1
+        WEND
+        dest = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Call").WithField("Dest", dest).WithField("Callee", calleeName).WithField("Args", Array.Join(argValues, " ")))
+        RETURN {Value: dest, Type: ""}
+    END IF
+    RETURN Fission_AmirUnsupportedExpr(builder, node.Kind)
+END FUNCTION
+
+FUNCTION Fission_AmirUnsupportedExpr(builder, detail)
+    RETURN builder.Unsupported("expression", detail)
+END FUNCTION
+
+FUNCTION Fission_AmirLowerIf(builder, node)
+    condition = Fission_AmirLowerExpr(builder, node.Children[0])
+    thenName = builder.NewBlockName("IfThen")
+    elseName = builder.NewBlockName("IfElse")
+    endName = builder.NewBlockName("IfEnd")
+    ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", condition.Value).WithField("Then", thenName).WithField("Else", elseName))
+
+    thenBlock = builder.CurrentFunction.AddBlock(FissionAmirBlock(thenName))
+    builder.CurrentBlock = thenBlock
+    FOR statement IN node.Children[1].Children
+        ignored = Fission_AmirLowerStatement(builder, statement)
+    NEXT
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", endName))
+
+    elseBlock = builder.CurrentFunction.AddBlock(FissionAmirBlock(elseName))
+    builder.CurrentBlock = elseBlock
+    FOR statement IN node.Children[2].Children
+        ignored = Fission_AmirLowerStatement(builder, statement)
+    NEXT
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", endName))
+
+    endBlock = builder.CurrentFunction.AddBlock(FissionAmirBlock(endName))
+    builder.CurrentBlock = endBlock
+END FUNCTION
+
+FUNCTION Fission_AmirLowerWhile(builder, node)
+    condName = builder.NewBlockName("WhileCond")
+    bodyName = builder.NewBlockName("WhileBody")
+    endName = builder.NewBlockName("WhileEnd")
+    currentFunction = builder.CurrentFunction
+
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", condName))
+
+    condBlock = currentFunction.AddBlock(FissionAmirBlock(condName))
+    builder.CurrentBlock = condBlock
+    condition = Fission_AmirLowerExpr(builder, node.Children[0])
+    ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", condition.Value).WithField("Then", bodyName).WithField("Else", endName))
+
+    bodyBlock = currentFunction.AddBlock(FissionAmirBlock(bodyName))
+    builder.CurrentBlock = bodyBlock
+    index = 1
+    WHILE index < LEN(node.Children)
+        ignored = Fission_AmirLowerStatement(builder, node.Children[index])
+        index = index + 1
+    WEND
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", condName))
+
+    endBlock = currentFunction.AddBlock(FissionAmirBlock(endName))
+    builder.CurrentBlock = endBlock
+END FUNCTION
+
+FUNCTION Fission_AmirParseArguments(argsText)
+    descriptors = []
+    IF argsText == "" THEN RETURN descriptors
+    FOR part IN String.Split(argsText, ",")
+        name = part
+        typeName = ""
+        IF String.Contains(part, ":") THEN
+            pieces = String.Split(part, ":")
+            name = pieces[0]
+            typeName = pieces[1]
+        END IF
+        IF String.Contains(name, "=") THEN name = String.Split(name, "=")[0]
+        ignored = Array.Push(descriptors, {Name: name, Type: typeName})
+    NEXT
+    RETURN descriptors
+END FUNCTION
+
+FUNCTION Fission_AmirLowerFunctionDecl(builder, node)
+    name = Object.Get(node.Fields, "Name", "")
+    returnType = Object.Get(node.Fields, "Returns", "")
+    IF returnType == "" THEN returnType = "VOID"
+    params = Fission_AmirParseArguments(Object.Get(node.Fields, "Arguments", ""))
+
+    outerFunction = builder.CurrentFunction
+    outerBlock = builder.CurrentBlock
+    outerScope = builder.Scope
+
+    paramText = []
+    FOR param IN params
+        ignored = Array.Push(paramText, param.Name + " AS " + param.Type)
+    NEXT
+    ignored = builder.Emit(FissionAmirInstruction("DeclareFunction").WithField("Name", name).WithField("Params", Array.Join(paramText, ",")).WithField("Returns", returnType))
+
+    fn = FissionAmirFunction(name)
+    fn.ReturnType = returnType
+    FOR param IN params
+        ignored = fn.AddParam(param.Name, param.Type)
+    NEXT
+    ignored = builder.Module.AddFunction(fn)
+    entryBlock = fn.AddBlock(FissionAmirBlock("Entry"))
+    builder.CurrentBlock = entryBlock
+    builder.CurrentFunction = fn
+    builder.Scope = FissionAmirScope()
+    FOR param IN params
+        ignored = builder.Scope.Declare(param.Name, param.Type)
+    NEXT
+
+    ' SIR "Function" nodes carry their body statements as direct children (see
+    ' FissionSirBuilder.FunctionDecl -- there is no intermediate "Body" wrapper
+    ' node, unlike the AST-level Function node this was lowered from). A real
+    ' bug caught here: indexing node.Children[0] as if it were a Body wrapper
+    ' picked out the function's first STATEMENT instead (e.g. its own Return
+    ' node), then iterated *that* node's children -- silently lowering a
+    ' Binary expression as if it were a top-level statement, producing an
+    ' empty function body plus a spurious "unsupported statement: Binary"
+    ' diagnostic. Caught by comparing this file's own output against a real
+    ' `ArcoFission reveal ... at A-MIR` run, not by reasoning about the code.
+    FOR statement IN node.Children
+        ignored = Fission_AmirLowerStatement(builder, statement)
+    NEXT
+
+    builder.CurrentBlock = outerBlock
+    builder.CurrentFunction = outerFunction
+    builder.Scope = outerScope
+END FUNCTION
+
+FUNCTION Fission_AmirLowerStatement(builder, node)
+    IF node.Kind == "Declare" THEN
+        name = Object.Get(node.Fields, "Name", "")
+        typeName = Object.Get(node.Fields, "Type", "")
+        ignored = builder.Scope.Declare(name, typeName)
+        IF LEN(node.Children) > 0 THEN
+            value = Fission_AmirLowerExpr(builder, node.Children[0])
+            ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", name).WithField("Value", value.Value))
+        END IF
+        RETURN
+    END IF
+    IF node.Kind == "Assign" THEN
+        name = Object.Get(node.Fields, "Name", "")
+        value = Fission_AmirLowerExpr(builder, node.Children[0])
+        ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", name).WithField("Value", value.Value))
+        RETURN
+    END IF
+    IF node.Kind == "Print" THEN
+        value = Fission_AmirLowerExpr(builder, node.Children[0])
+        ignored = builder.Emit(FissionAmirInstruction("CallVoid").WithField("Callee", "Runtime.Print").WithField("Args", value.Value))
+        RETURN
+    END IF
+    IF node.Kind == "ExprStmt" THEN
+        ignored = Fission_AmirLowerExpr(builder, node.Children[0])
+        RETURN
+    END IF
+    IF node.Kind == "Return" THEN
+        IF LEN(node.Children) > 0 THEN
+            value = Fission_AmirLowerExpr(builder, node.Children[0])
+            ignored = builder.Emit(FissionAmirInstruction("Return").WithField("Type", value.Type).WithField("Value", value.Value))
+        ELSE
+            ignored = builder.Emit(FissionAmirInstruction("Return").WithField("Type", "VOID"))
+        END IF
+        RETURN
+    END IF
+    IF node.Kind == "Branch" THEN
+        ignored = Fission_AmirLowerIf(builder, node)
+        RETURN
+    END IF
+    IF node.Kind == "While" THEN
+        ignored = Fission_AmirLowerWhile(builder, node)
+        RETURN
+    END IF
+    IF node.Kind == "Function" THEN
+        ignored = Fission_AmirLowerFunctionDecl(builder, node)
+        RETURN
+    END IF
+    IF node.Kind == "Stop" OR node.Kind == "Import" OR node.Kind == "Directive" OR node.Kind == "Const" THEN RETURN
+    ignored = builder.Diagnostics.ReportError("FISSION_AMIR_UNSUPPORTED", "Unsupported SIR statement for A-MIR lowering: " + node.Kind)
+END FUNCTION
+
+FUNCTION Fission_SirToAmir(sirModule)
+    builder = FissionAmirBuilder(sirModule.Name)
+    mainFunction = FissionAmirFunction("Main")
+    mainFunction.ReturnType = "I32"
+    ignored = builder.Module.AddFunction(mainFunction)
+    entryBlock = mainFunction.AddBlock(FissionAmirBlock("Entry"))
+    builder.CurrentBlock = entryBlock
+    builder.CurrentFunction = mainFunction
+
+    ' Every Main entry block starts by capturing the process's own argv into the
+    ' `Args` global, matching the legacy oracle's own unconditional prelude
+    ' (confirmed via `ArcoFission reveal ... at A-MIR`) -- real programs (e.g.
+    ' examples/arconote.abas) read `Args` directly, so this is required for
+    ' functional equivalence, not just cosmetic.
+    argsTemp = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Call").WithField("Dest", argsTemp).WithField("Callee", "Runtime.Args").WithField("Args", ""))
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", "Args").WithField("Value", argsTemp))
+
+    FOR statement IN sirModule.Statements
+        ignored = Fission_AmirLowerStatement(builder, statement)
+    NEXT
+
+    ignored = builder.Emit(FissionAmirInstruction("Return").WithField("Type", "I32").WithField("Value", "0"))
+    ignored = builder.Module.Diagnostics.AppendMany(builder.Diagnostics)
+    ignored = builder.Module.Diagnostics.AppendMany(sirModule.Diagnostics)
+    RETURN builder.Module
+END FUNCTION

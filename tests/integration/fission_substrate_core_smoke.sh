@@ -386,14 +386,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_parse_smoke")"
 
-grep -q "^76$" <<<"$fission_self_output"
+grep -q "^79$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_semantic_smoke")"
 
-grep -q "^76$" <<<"$fission_self_semantic_output"
-grep -q "^110$" <<<"$fission_self_semantic_output"
-grep -q "^2055$" <<<"$fission_self_semantic_output"
+grep -q "^79$" <<<"$fission_self_semantic_output"
+grep -q "^116$" <<<"$fission_self_semantic_output"
+grep -q "^2253$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -450,6 +450,23 @@ grep -q "^FALSE$" <<<"$sir_semantic_output"
 grep -q "^program$" <<<"$sir_semantic_output"
 grep -q "^4$" <<<"$sir_semantic_output"
 test "$(grep -c "^TRUE$" <<<"$sir_semantic_output")" = "3"
+
+amir_output="$("$SOURCE_DIR/build-rivet/fission/tests/sir_to_amir_smoke")"
+
+test "$(grep -c "^FALSE$" <<<"$amir_output")" = "2"
+grep -q "^A-MIR MODULE \"amir-smoke.abas\"$" <<<"$amir_output"
+grep -q "^FUNCTION Main RETURNS I32$" <<<"$amir_output"
+grep -q "^    %t0 := CALL Runtime.Args$" <<<"$amir_output"
+grep -q "^    STORE Args, %t0$" <<<"$amir_output"
+grep -q "^    DECLARE_FUNCTION Sum params=a AS U64,b AS U64 returns=U64$" <<<"$amir_output"
+grep -q "^    %t7 :BOOL := INT.CMP_EQ %t5, %t6 \[,\]$" <<<"$amir_output"
+grep -q "^    BRANCH %t7, IfThen0, IfElse1$" <<<"$amir_output"
+grep -q "^    %t10 := CALL Sum %t8 %t9$" <<<"$amir_output"
+grep -q "^    %t14 :BOOL := INT.CMP_LT_UNSIGNED %t12, %t13 \[,\]$" <<<"$amir_output"
+grep -q "^    %t17 := + %t15, %t16$" <<<"$amir_output"
+grep -q "^FUNCTION Sum(a AS U64, b AS U64) RETURNS U64$" <<<"$amir_output"
+grep -q "^    %t3 :U64 := INT.ADD %t1, %t2 \[U64,U64\]$" <<<"$amir_output"
+grep -q "^    RETURN U64 %t3$" <<<"$amir_output"
 
 self_loop_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_loop_semantic_smoke")"
 

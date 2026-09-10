@@ -1,6 +1,7 @@
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 
 Files = [
+    "fission/amir/model.abas",
     "fission/cli/fission.abas",
     "fission/core/artifact.abas",
     "fission/core/capability.abas",
@@ -22,6 +23,7 @@ Files = [
     "fission/language/arcobasic/semantic.abas",
     "fission/modules/arcobasic_frontend/main.abas",
     "fission/sir/builder.abas",
+    "fission/sir/lower_amir.abas",
     "fission/sir/model.abas",
     "fission/sir/semantics.abas",
     "fission/sir/serialize.abas",
@@ -76,7 +78,8 @@ Files = [
     "fission/tests/language_authoring_kit_smoke.abas",
     "fission/tests/module_smoke.abas",
     "fission/tests/sir_builder_smoke.abas",
-    "fission/tests/sir_semantic_artifact_smoke.abas"
+    "fission/tests/sir_semantic_artifact_smoke.abas",
+    "fission/tests/sir_to_amir_smoke.abas"
 ]
 
 Failures = 0

@@ -1,0 +1,167 @@
+#IMPORT "fission/core/diagnostics.abas"
+#IMPORT "fission/sir/model.abas"
+
+' A-MIR (RFC-AP-FISSION-001 section 15.2/section 4 "A-MIR remains the canonical
+' lower compiler representation"). Mirrors the shape of legacy ArcoFission's own
+' `ArcoFission reveal FILE at A-MIR` output closely enough to read side by side
+' (SSA-ish %tN temporaries, typed BLOCK/FUNCTION/MODULE structure, STORE/LOAD to
+' named variables, typed binary ops like `INT.ADD a, b [U64,U64]`) without
+' attempting byte-identical equivalence to the legacy allocator's own incidental
+' temp/block numbering -- this session's SIR->A-MIR lowering (fission/sir/
+' lower_amir.abas) covers the RFC's own "Tiny BASIC-like" acceptance subset
+' (variables, numeric expressions, PRINT, IF, WHILE, functions), not the full
+' current SIR surface. Real Known Failures/next-work items are recorded in
+' .agents/FISSION_SUBSTRATE_PROGRESS.md, not silently left out here.
+
+FUNCTION Fission_AmirCallArgsSuffix(argsText)
+    IF argsText == "" THEN RETURN ""
+    RETURN " " + argsText
+END FUNCTION
+
+' The legacy oracle shows the `[LeftType,RightType]` bracket exactly when the
+' instruction used a typed INT.* opcode at all -- including a typed
+' comparison whose operand types are BOTH unknown (`INT.CMP_EQ %t5, %t6
+' [,]`, empty but still present) -- and omits it entirely for the untyped
+' generic-operator fallback form (`+ %t15, %t16`, no bracket). Bracket
+' presence is therefore NOT simply "are the type strings non-empty" -- it is
+' the lowering pass's own ShowBracket field, set only when it chose the typed
+' opcode. Confirmed by direct comparison against
+' `ArcoFission reveal ... at A-MIR`.
+FUNCTION Fission_AmirBinOpTypeSuffix(showBracket, leftType, rightType)
+    IF showBracket != "TRUE" THEN RETURN ""
+    RETURN " [" + leftType + "," + rightType + "]"
+END FUNCTION
+
+CLASS FissionAmirInstruction
+    CONSTRUCTOR(kind)
+        SELF.Kind = kind
+        SELF.Fields = {}
+        SELF.FieldNames = []
+    END CONSTRUCTOR
+
+    FUNCTION WithField(name, value)
+        IF Fission_ListContains(SELF.FieldNames, name) == FALSE THEN
+            ignored = Array.Push(SELF.FieldNames, name)
+        END IF
+        SELF.Fields = Object.Set(SELF.Fields, name, value)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Field(name)
+        RETURN Object.Get(SELF.Fields, name, "")
+    END FUNCTION
+
+    ' Every instruction kind renders its own line shape (matching the legacy
+    ' oracle's own per-opcode text layout) rather than a single generic
+    ' "Kind(field=value, ...)" line the way SIR nodes do -- A-MIR is meant to
+    ' read like real three-address code, not a generic tree dump.
+    FUNCTION Render()
+        dest = SELF.Field("Dest")
+        typeName = SELF.Field("Type")
+        destPart = ""
+        IF dest != "" THEN
+            IF typeName != "" THEN
+                destPart = dest + " :" + typeName + " := "
+            ELSE
+                destPart = dest + " := "
+            END IF
+        END IF
+        IF SELF.Kind == "Const" THEN RETURN destPart + "CONST " + SELF.Field("Value")
+        IF SELF.Kind == "Load" THEN RETURN destPart + "LOAD " + SELF.Field("Name")
+        IF SELF.Kind == "Store" THEN RETURN "STORE " + SELF.Field("Name") + ", " + SELF.Field("Value")
+        IF SELF.Kind == "BinOp" THEN RETURN destPart + SELF.Field("Op") + " " + SELF.Field("Left") + ", " + SELF.Field("Right") + Fission_AmirBinOpTypeSuffix(SELF.Field("ShowBracket"), SELF.Field("LeftType"), SELF.Field("RightType"))
+        IF SELF.Kind == "Call" THEN RETURN destPart + "CALL " + SELF.Field("Callee") + Fission_AmirCallArgsSuffix(SELF.Field("Args"))
+        IF SELF.Kind == "CallVoid" THEN RETURN "CALL " + SELF.Field("Callee") + Fission_AmirCallArgsSuffix(SELF.Field("Args"))
+        IF SELF.Kind == "Branch" THEN RETURN "BRANCH " + SELF.Field("Condition") + ", " + SELF.Field("Then") + ", " + SELF.Field("Else")
+        IF SELF.Kind == "Jump" THEN RETURN "JUMP " + SELF.Field("Target")
+        IF SELF.Kind == "Return" THEN
+            IF SELF.Field("Value") == "" THEN RETURN "RETURN " + SELF.Field("Type")
+            RETURN "RETURN " + SELF.Field("Type") + " " + SELF.Field("Value")
+        END IF
+        IF SELF.Kind == "DeclareFunction" THEN RETURN "DECLARE_FUNCTION " + SELF.Field("Name") + " params=" + SELF.Field("Params") + " returns=" + SELF.Field("Returns")
+        RETURN SELF.Kind + " " + String(SELF.Fields)
+    END FUNCTION
+END CLASS
+
+CLASS FissionAmirBlock
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Instructions = []
+    END CONSTRUCTOR
+
+    FUNCTION Append(instruction)
+        ignored = Array.Push(SELF.Instructions, instruction)
+        RETURN instruction
+    END FUNCTION
+
+    FUNCTION Render()
+        lines = ["BLOCK " + SELF.Name]
+        FOR instruction IN SELF.Instructions
+            ignored = Array.Push(lines, "    " + instruction.Render())
+        NEXT
+        ignored = Array.Push(lines, "END BLOCK")
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS
+
+CLASS FissionAmirFunction
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Params = []
+        SELF.ReturnType = "I32"
+        SELF.Blocks = []
+    END CONSTRUCTOR
+
+    FUNCTION AddParam(name, typeName)
+        ignored = Array.Push(SELF.Params, {Name: name, Type: typeName})
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION AddBlock(block)
+        ignored = Array.Push(SELF.Blocks, block)
+        RETURN block
+    END FUNCTION
+
+    FUNCTION RenderParams()
+        parts = []
+        FOR param IN SELF.Params
+            ignored = Array.Push(parts, param.Name + " AS " + param.Type)
+        NEXT
+        RETURN Array.Join(parts, ", ")
+    END FUNCTION
+
+    FUNCTION Render()
+        header = "FUNCTION " + SELF.Name
+        IF LEN(SELF.Params) > 0 THEN header = header + "(" + SELF.RenderParams() + ")"
+        header = header + " RETURNS " + SELF.ReturnType
+        lines = [header, ""]
+        FOR block IN SELF.Blocks
+            ignored = Array.Push(lines, block.Render())
+            ignored = Array.Push(lines, "")
+        NEXT
+        ignored = Array.Push(lines, "END FUNCTION")
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS
+
+CLASS FissionAmirModule
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Version = "0"
+        SELF.Functions = []
+        SELF.Diagnostics = FissionDiagnosticBag()
+    END CONSTRUCTOR
+
+    FUNCTION AddFunction(fn)
+        ignored = Array.Push(SELF.Functions, fn)
+        RETURN fn
+    END FUNCTION
+
+    FUNCTION Render()
+        lines = ["A-MIR MODULE \"" + SELF.Name + "\"", "VERSION " + SELF.Version, ""]
+        FOR fn IN SELF.Functions
+            ignored = Array.Push(lines, fn.Render())
+        NEXT
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS
