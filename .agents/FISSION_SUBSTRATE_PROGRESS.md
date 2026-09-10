@@ -12,12 +12,16 @@ language construction, structural SIR). WP-004 (A-MIR) and WP-007 (bytecode)
 now have real, working first slices with genuine end-to-end execution
 verified (Source.arcobasic -> SIR -> A-MIR -> bytecode -> real `ArcoFission
 run` output, checked against expected program output, not just rendered
-text). WP-006 (ArcoBASIC -> SIR/A-MIR) is the RFC's own "Tiny BASIC-like"
-acceptance subset (RFC section 8 Test B): variables, numeric expressions,
-PRINT, IF, WHILE, FOR-range, function declarations/calls, string literals --
-not the full current SIR surface (no classes, arrays, TRY/CATCH, DO loops,
-ForEach in A-MIR/bytecode yet; the ArcoBASIC frontend itself understands all
-of those at the SIR level already, per WP-002/003).
+text). WP-006 (ArcoBASIC -> SIR/A-MIR) started from the RFC's own "Tiny BASIC-like"
+acceptance subset (RFC section 8 Test B) and has since grown well past it:
+variables, numeric expressions, PRINT, IF, WHILE, DO (all four shapes),
+FOR-range, ForEach, function declarations/calls, string literals, array
+literals, object literals, index/member read+write, TRY/CATCH/THROW, and now
+full CLASS support (constructors, methods, fields, instantiation, dynamic
+method dispatch) all have real, oracle-validated, execution-verified A-MIR
+and bytecode lowering. The one disclosed gap left in this construct family is
+nested/indirect index or member assignment targets (`a[i][j] = value`,
+`a.b.c = value`) -- see "Next Recommended Work" item A.
 
 **Not yet started: WP-012 (ELF64 artifact writer) and WP-009/010/011
 (x86-64 architecture / SysV ABI / Linux runtime, i.e. real native codegen).**
@@ -350,6 +354,49 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   read/write. One real bug found only by actually running the generated
   bytecode: the FUNCTION header line omitted RETURNS for any function with
   parameters, which the VM rejected outright.
+- Extended SIR -> A-MIR -> bytecode coverage to ForEach, all four DO-loop
+  shapes, TRY/CATCH/THROW, and object literals/member read+write. Every
+  construct validated the same way: legacy oracle comparison plus real
+  `ArcoFission run` execution output. `FOR item IN values` lowers using a
+  hidden `__fission_each_items`/`__fission_each_index` pair and an ordinary
+  `CALL LEN <items>` per iteration (`LEN` is just a callable name in this
+  frontend, not a reserved opcode). DO's `UNTIL` is confirmed, via the
+  oracle, to lower the source's own comparison unchanged (branch polarity
+  carries the negation, not the condition value). Member read/write reuses
+  the exact same INDEX/STORE_INDEX opcodes as array indexing with a
+  quoted-string CONST as the key -- no dedicated member-access opcode
+  exists anywhere in this pipeline.
+- WP-006's last major gap closed: full CLASS support (constructors, methods,
+  fields, instantiation, dynamic method dispatch) end to end through SIR ->
+  A-MIR -> bytecode. Confirmed via the oracle that a CLASS desugars entirely
+  into ordinary top-level functions this pipeline already knew how to lower
+  -- `Name.Init(SELF, ctorParams...)` for the constructor,
+  `Name.Method(SELF, params...)` per method (SELF is just an ordinary
+  parameter; `SELF.Field` needs no special-casing beyond the member
+  read/write path above), a synthesized `Name.__new` that allocates an
+  OBJECT tagged with a `"__class"` field, and a synthesized
+  `Name(ctorParams...)` wrapper that calls `__new` then `Init` -- so
+  `c = Counter(5)` requires no special call-site handling at all, it is an
+  ordinary CallExpr. `obj.Method(args)` lowers to a qualified callee name
+  (`instanceVar.MethodName`) with no explicit SELF argument; the VM resolves
+  it dynamically via the instance's own `__class` tag at runtime, not this
+  lowering pass. Only one new opcode needed: `DECLARE_CLASS`. Two more real
+  bugs found only via full class output (not caught by a two-construct
+  probe): RETURN used the *returned expression's* inferred type instead of
+  the enclosing function's own declared return type (worked by coincidence
+  for typed arithmetic, broke for `RETURN SELF.Value` -- fixed with an
+  explicit `builder.CurrentReturnType`, saved/restored per function scope);
+  and A-MIR parameter rendering always appended `" AS " + type` even when a
+  parameter has no type (SELF never does), rendering a dangling `SELF AS `.
+  Also found and fixed three more instances of this session's recurring
+  bare-AND (bitwise, non-short-circuiting) crash pattern, including one
+  *latent* bug in the already-committed FOR-range step/body
+  disambiguation that this session's own earlier tests never triggered (an
+  empty-body FOR loop). Verified via real execution: a CLASS with a typed
+  constructor and a mutating method prints the correct values through
+  construction, field storage, method dispatch, and field read.
+  `fission/tests/amir_bytecode_class_smoke.abas` added as the regression
+  fixture.
 
 ## In-Progress Components
 
@@ -699,6 +746,17 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/sir/validate.abas`
 - `fission/sir/semantics.abas`
 - `fission/sir/serialize.abas`
+- `fission/sir/lower_amir.abas`
+- `fission/amir/model.abas`
+- `fission/amir/lower_bytecode.abas`
+- `fission/bytecode/model.abas`
+- `fission/tests/sir_to_amir_smoke.abas`
+- `fission/tests/sir_to_amir_for_smoke.abas`
+- `fission/tests/sir_to_amir_loops2_smoke.abas`
+- `fission/tests/amir_to_bytecode_smoke.abas`
+- `fission/tests/amir_bytecode_array_smoke.abas`
+- `fission/tests/amir_bytecode_object_try_smoke.abas`
+- `fission/tests/amir_bytecode_class_smoke.abas`
 - `fission/cli/fission.abas`
 - `fission/modules/arcobasic_frontend/main.abas`
 - `fission/tests/core_smoke.abas`
@@ -906,16 +964,22 @@ targets (RFC sections 20/28, WP-012/009/010/011), in order:**
 
 A. Extend SIR->A-MIR->bytecode coverage to the rest of the ArcoBASIC subset
    the frontend already understands at the SIR level. DONE: variables,
-   numeric expressions, PRINT, IF, WHILE, FOR-range, function declarations/
-   calls, string literals, array literals, index read, index write (`name
-   [index] = value` shape only). Still needed: classes/fields/methods,
-   object literals, member read/write (`obj.field = value`), TRY/CATCH,
-   DO loops, ForEach, nested/indirect index targets (`a[i][j] = value`).
-   Each addition should be validated the same way this session's slices
-   were: compare against `ArcoFission reveal ... at A-MIR`/`at BYTECODE`
-   for a real program using that construct, then confirm real
-   `ArcoFission run` execution output, not just that rendering doesn't
-   crash.
+   numeric expressions, PRINT, IF, WHILE, DO (all four pre/post x WHILE/
+   UNTIL shapes plus bare infinite), FOR-range, ForEach, function
+   declarations/calls, string literals, array literals, object literals,
+   index read/write (`name[index] = value` shape only), member read/write
+   (`name.field = value` shape only, same underlying INDEX/STORE_INDEX
+   opcodes as array indexing with a string-key CONST), TRY/CATCH/THROW, and
+   now full CLASS support (constructors, methods, fields, instantiation,
+   dynamic method dispatch -- see Completed Components). Still needed:
+   nested/indirect index or member targets (`a[i][j] = value`,
+   `a.b.c = value`) -- this is the one remaining disclosed gap in this
+   construct family, likely low-value/low-urgency compared to moving on to
+   item B/C/D below. Each addition should be validated the same way this
+   session's slices were: compare against
+   `ArcoFission reveal ... at A-MIR`/`at BYTECODE` for a real program using
+   that construct, then confirm real `ArcoFission run` execution output,
+   not just that rendering doesn't crash.
 B. Implement the bytecode fusion optimizer this session deliberately skipped
    (STORE_CONST, BINARY_LOCAL_LOCAL, BINARY_LOCAL_CONST, INDEX_LOCAL_CONST) --
    current bytecode is correct but always takes the unfused CONST+STORE /
