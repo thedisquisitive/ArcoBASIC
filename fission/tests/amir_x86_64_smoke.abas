@@ -1,12 +1,14 @@
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 #IMPORT "fission/amir/lower_x86_64.abas"
 
-' fission/amir/lower_x86_64.abas's own header comment records the deliberate
-' Phase 1 scope this checks: PRINT of a string literal, GAS assembly text
-' output, real execution verified separately by
-' fission/tests/native_programs/hello_native.abas (built as a real ELF64 via
+' fission/amir/lower_x86_64.abas's own header comment records this backend's
+' current (Phase 2) scope: PRINT of string literals, variables/arithmetic/
+' comparisons/IF/WHILE/FOR over plain numbers, and PRINT of a computed
+' integer. Real execution verified separately by
+' fission/tests/native_programs/*.abas (built as real ELF64s via
 ' FissionNativeCapsuleTarget and run directly -- see
-' tests/integration/fission_substrate_core_smoke.sh).
+' tests/integration/fission_substrate_core_smoke.sh). This file checks the
+' lowering pass's own text output and its diagnostics.
 Source = "PRINT \"Hello, native!\"\nPRINT \"Second line\""
 Tokens = Fission_ArcoBasicLex(Source)
 Ast = Fission_ArcoBasicParse(Tokens, "x86-64-smoke.abas")
@@ -19,13 +21,37 @@ PRINT Amir.Diagnostics.HasErrors()
 PRINT Program.Diagnostics.HasErrors()
 PRINT Program.Render()
 
-' A construct this backend does not yet support (Phase 1: only PRINT of a
-' string literal) must report a diagnostic, not silently emit wrong assembly
-' -- matching every other lowering pass in this substrate.
-UnsupportedSource = "x = 1 + 2\nPRINT x"
-UnsupportedTokens = Fission_ArcoBasicLex(UnsupportedSource)
-UnsupportedAst = Fission_ArcoBasicParse(UnsupportedTokens, "x86-64-unsupported-smoke.abas")
-UnsupportedSir = Fission_ArcoBasicAstToSir(UnsupportedAst)
-UnsupportedAmir = Fission_SirToAmir(UnsupportedSir)
-UnsupportedProgram = Fission_AmirToX86_64(UnsupportedAmir)
-PRINT UnsupportedProgram.Diagnostics.HasErrors()
+' Phase 2: variables, arithmetic (+, MOD), comparisons, IF, WHILE -- all
+' over plain numbers, all real GAS mnemonics, no diagnostics.
+ArithSource = "x = 1 + 2\nPRINT x\ny = 10 MOD 3\nPRINT y\nIF x > 2 THEN\n    PRINT 100\nEND IF\ni = 1\nWHILE i <= 3\n    PRINT i\n    i = i + 1\nWEND"
+ArithTokens = Fission_ArcoBasicLex(ArithSource)
+ArithAst = Fission_ArcoBasicParse(ArithTokens, "x86-64-arith-smoke.abas")
+ArithSir = Fission_ArcoBasicAstToSir(ArithAst)
+ArithAmir = Fission_SirToAmir(ArithSir)
+ArithProgram = Fission_AmirToX86_64(ArithAmir)
+PRINT ArithProgram.Diagnostics.HasErrors()
+PRINT ArithProgram.Diagnostics.Render()
+
+' A real, direct bug found this session: a variable ever assigned a string
+' value must be rejected everywhere it's later used in a numeric context
+' (Load/Store/BinOp/Branch/PRINT), not silently resolved to whatever
+' garbage happens to sit at an unallocated stack offset. Confirmed via real
+' execution before this fix landed: `s = "hello"` / `PRINT s` compiled with
+' zero diagnostics and printed "0" instead of failing.
+StringVarSource = "s = \"hello\"\nPRINT s"
+StringVarTokens = Fission_ArcoBasicLex(StringVarSource)
+StringVarAst = Fission_ArcoBasicParse(StringVarTokens, "x86-64-string-var-smoke.abas")
+StringVarSir = Fission_ArcoBasicAstToSir(StringVarAst)
+StringVarAmir = Fission_SirToAmir(StringVarSir)
+StringVarProgram = Fission_AmirToX86_64(StringVarAmir)
+PRINT StringVarProgram.Diagnostics.HasErrors()
+
+' A construct this backend does not yet support at all (array literals)
+' must also report a diagnostic, not silently emit wrong assembly.
+ArraySource = "a = [1, 2, 3]\nPRINT a"
+ArrayTokens = Fission_ArcoBasicLex(ArraySource)
+ArrayAst = Fission_ArcoBasicParse(ArrayTokens, "x86-64-array-smoke.abas")
+ArraySir = Fission_ArcoBasicAstToSir(ArrayAst)
+ArrayAmir = Fission_SirToAmir(ArraySir)
+ArrayProgram = Fission_AmirToX86_64(ArrayAmir)
+PRINT ArrayProgram.Diagnostics.HasErrors()

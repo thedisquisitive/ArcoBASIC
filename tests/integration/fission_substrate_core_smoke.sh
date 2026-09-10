@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^91$" <<<"$fission_self_semantic_output"
 grep -q "^138$" <<<"$fission_self_semantic_output"
-grep -q "^2698$" <<<"$fission_self_semantic_output"
+grep -q "^2785$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -622,5 +622,14 @@ expected_hello_native_output="Hello, native!"
 test "$hello_native_output" = "$expected_hello_native_output"
 oracle_hello_native_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/hello_native.abas")"
 test "$hello_native_output" = "$oracle_hello_native_output"
+
+# fission/tests/native_programs/fizzbuzz.abas exercises native codegen's Phase 2 construct set
+# together (FOR-range, arithmetic, MOD, comparisons, nested IF, PRINT of both string literals and
+# computed integers) rather than a single-construct probe.
+fizzbuzz_native_output="$("$SOURCE_DIR/build/fission-native-programs/fizzbuzz")"
+expected_fizzbuzz_output="$(printf '1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz\n16\n17\nFizz\n19\nBuzz')"
+test "$fizzbuzz_native_output" = "$expected_fizzbuzz_output"
+oracle_fizzbuzz_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/fizzbuzz.abas")"
+test "$fizzbuzz_native_output" = "$oracle_fizzbuzz_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

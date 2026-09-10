@@ -634,6 +634,63 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   to match (87->91 etc.) and a new assertion added for the native capsule's
   real output against the oracle. Full suite and `fissure run --full`
   (13 changed files, correctly marked AFFECTED and re-run) both passing.
+- Native x86-64 codegen Phase 2: variables, arithmetic (`+`/`-`/`*`/`MOD`),
+  comparisons, `IF`/`WHILE`, and `FOR`-range, all over plain numbers, plus
+  `PRINT` of a computed integer -- requested directly ("Keep grinding away
+  at it... I want to see it live!") right after Phase 1 (PRINT of a string
+  literal only) landed. `fission/amir/lower_x86_64.abas` now does a real
+  pre-scan pass over Main's own A-MIR (`Fission_X86_64CollectNumericSlots`)
+  to assign every distinct numeric temp/variable a fixed 8-byte stack slot
+  under a flat `%rbp`-relative frame (`_start`'s own prologue, sized once,
+  up front -- no dynamic growth/relocation needed), then a second pass
+  lowers `Load`/`Store`/`BinOp`/`Branch`/`Jump` against those slots with
+  ordinary `mov`/`add`/`sub`/`imul`/`cqto`+`idiv`/`cmp`+`setcc` sequences.
+  `FOR`-range needed zero dedicated codegen at all -- confirmed via the
+  oracle that it desugars entirely into the same Const/Store/Load/BinOp/
+  Branch/Jump primitives everything else here already lowered, and it
+  "just worked" the moment IF/WHILE did.
+  `PRINT` of a computed integer needed one genuinely new piece: a small
+  internal `itoa_print` helper (real x86-64 `call`/`ret`, but a minimal
+  ad-hoc convention this pass invented for its own internal use -- input in
+  %rax, no stack parameters, no return value -- explicitly NOT the SysV ABI
+  WP-010 still owes for real user-declared ArcoBASIC functions, which
+  remains untouched). Converts a signed 64-bit integer to decimal ASCII via
+  repeated unsigned division by 10 and writes it plus a trailing newline,
+  matching `Runtime.Print`'s own always-append-newline behavior.
+  Verified via real execution against the demo the user actually asked to
+  "see live": `fission/tests/native_programs/fizzbuzz.abas`, classic
+  FizzBuzz 1-20 (FOR-range + MOD + nested IF/comparisons + PRINT of both
+  string literals and computed integers, together, not a single-construct
+  probe) -- compiled entirely by this substrate, assembled/linked via
+  `as`/`ld`, and run as a real standalone ELF64, byte-for-byte identical to
+  legacy `ArcoFission compile-run` on the same source.
+  **Found and fixed a real safety gap during this same work, before it ever
+  reached a committed test**: a variable assigned a STRING value (e.g.
+  `s = "hello"`) compiled with zero diagnostics and, when run, silently
+  printed `0` instead of "hello" or failing -- the pre-scan pass added
+  every `STORE`'s target name to the numeric-slot table unconditionally,
+  regardless of what was actually being stored, so a later `Load`/`PRINT`
+  of that variable resolved to whatever garbage happened to sit at an
+  offset that was never really validated as numeric. Fixed by tracking
+  string-ness (of both `%tN` temps and named variables) through the SAME
+  pre-scan pass, excluding any variable ever assigned a string anywhere in
+  the function from getting a numeric slot at all, and adding an explicit
+  `Fission_X86_64OperandIsResolvable` check at every consumption site
+  (`Load`, `Store`, `BinOp` operands, `Branch` condition, `PRINT`'s numeric
+  argument) that reports a real diagnostic instead of emitting a `mov`
+  against a slot that was never allocated. Re-verified every existing demo
+  (Phase 1 hello-native, the arithmetic/IF/WHILE probe, FOR-range,
+  FizzBuzz) still produces byte-identical output after this fix.
+  `fission/tests/amir_x86_64_smoke.abas` extended to cover the new
+  constructs directly (multi-statement arithmetic/comparison/IF/WHILE
+  lowering with zero diagnostics, plus two real unsupported-construct
+  diagnostic checks: the string-variable safety fix above, and array
+  literals, which this backend still does not support at all).
+  Self-parse/self-semantic corpus symbol count grew with the new helper
+  functions (91 files, 138 import edges, 2785 symbols, 0 diagnostics --
+  file/edge counts unchanged, only the symbol count moved). Integration
+  suite gained a FizzBuzz assertion (real output + oracle comparison). Full
+  suite and `fissure run --full` both passing.
 
 ## In-Progress Components
 
@@ -1060,6 +1117,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/cli/compile_to_x86_64.abas`
 - `fission/build/rivet_native_capsules.abas`
 - `fission/tests/native_programs/hello_native.abas`
+- `fission/tests/native_programs/fizzbuzz.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
 - `build.abas`
@@ -1267,32 +1325,38 @@ D. DONE, including the Rivet build-graph target -- see Completed Components.
    Compiler Substrate become a real standalone executable"), the answer is
    now genuinely yes.
 E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
-   runtime, i.e. no embedded bytecode VM at all). **Phase 1 (WP-009/013's
-   own first real slice) DONE -- see Completed Components**:
-   `fission/amir/lower_x86_64.abas` + `fission/cli/compile_to_x86_64.abas` +
-   `FissionNativeCapsuleTarget` produce a real, standalone, execution-
-   verified freestanding ELF64 for `PRINT` of a string literal, no embedded
-   bytecode VM, no legacy ArcoFission involvement in the compile itself
-   (only `as`/`ld`). Everything past that is still real, almost entirely
-   untouched, and each step below is its own substantial undertaking on its
-   own, roughly in the order a Tiny-BASIC-like acceptance subset would need
-   them (mirroring how A-MIR/bytecode grew this session):
-   - Variables and arithmetic: stack-slot (or register) allocation for
-     locals, `mov`/`add`/`sub`/`imul`/`cmp` lowering for `BinOp`, `LOAD`/
-     `STORE` against real memory instead of a temp map. The natural next
-     slice (`PRINT 1 + 2`, then `x = 1; PRINT x`).
-   - Control flow: real GAS labels/`jmp`/`je`/etc. for `Branch`/`Jump`
-     (IF/WHILE/DO/FOR).
+   runtime, i.e. no embedded bytecode VM at all). **Phase 1 AND Phase 2
+   DONE -- see Completed Components**: `fission/amir/lower_x86_64.abas` +
+   `fission/cli/compile_to_x86_64.abas` + `FissionNativeCapsuleTarget`
+   produce real, standalone, execution-verified freestanding ELF64s for
+   PRINT of string literals (Phase 1) plus variables, arithmetic (`+`/`-`/
+   `*`/`MOD`), comparisons, `IF`/`WHILE`/`FOR`-range, and PRINT of a
+   computed integer (Phase 2) -- no embedded bytecode VM, no legacy
+   ArcoFission involvement in the compile itself (only `as`/`ld`).
+   Real FizzBuzz runs as a genuine standalone x86-64 binary today. What's
+   still real, almost entirely untouched, and each its own substantial
+   undertaking on its own:
    - WP-010 SysV ABI: real function calls -- argument registers (RDI/RSI/
      RDX/RCX/R8/R9), stack alignment, prologue/epilogue, return values.
-     Needed the moment a program declares more than just Main.
+     Needed the moment a program declares more than just Main. (The
+     internal `itoa_print` helper added in Phase 2 uses real `call`/`ret`
+     but a minimal ad-hoc convention of this pass's own invention, NOT
+     this -- explicitly disclosed as such in its own comment.)
    - WP-011 Linux Runtime: everything this backend cannot hand-roll itself
-     -- strings beyond a literal (concatenation, length, slicing), arrays,
-     objects/classes, and a real fallback to the existing ~244-entry host-
-     function dispatch table for anything else (legacy's own
-     `arco_call_host`/`host_bridge.cpp` bridge is the reference for this,
-     though porting it into the substrate rather than linking against it
-     directly is itself a real design decision to make, not just a port).
+     -- strings beyond a literal (concatenation, length, slicing, string
+     variables -- currently a variable ever assigned a string correctly
+     reports a diagnostic rather than compiling wrong, see Completed
+     Components' "real safety gap" writeup), arrays, objects/classes, and a
+     real fallback to the existing ~244-entry host-function dispatch table
+     for anything else (legacy's own `arco_call_host`/`host_bridge.cpp`
+     bridge is the reference for this, though porting it into the
+     substrate rather than linking against it directly is itself a real
+     design decision to make, not just a port).
+   - DO loops and ForEach: not yet lowered by this backend at all (only
+     IF/WHILE/FOR-range are) -- likely straightforward given they already
+     desugar to the same Branch/Jump primitives once written, following
+     FOR-range's own "needed zero dedicated codegen" precedent, but not
+     confirmed yet.
    The existing experimental legacy native backend
    (`ArcoFission build FILE -o OUT --target linux-x86_64`,
    `.agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md`) is worth reading
