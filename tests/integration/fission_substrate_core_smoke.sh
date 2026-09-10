@@ -386,14 +386,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_parse_smoke")"
 
-grep -q "^83$" <<<"$fission_self_output"
+grep -q "^84$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_semantic_smoke")"
 
-grep -q "^83$" <<<"$fission_self_semantic_output"
-grep -q "^123$" <<<"$fission_self_semantic_output"
-grep -q "^2428$" <<<"$fission_self_semantic_output"
+grep -q "^84$" <<<"$fission_self_semantic_output"
+grep -q "^125$" <<<"$fission_self_semantic_output"
+grep -q "^2444$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -504,6 +504,18 @@ sed -n '/^ARCOFISSION BYTECODE$/,$p' <<<"$bytecode_full_output" > "$bytecode_smo
 bytecode_run_output="$("$SOURCE_DIR/build-rivet/ArcoFission" run "$bytecode_smoke_arcof")"
 expected_bytecode_run_output="$(printf '1\n2\n3\nhello\n10')"
 test "$bytecode_run_output" = "$expected_bytecode_run_output"
+
+bytecode_array_full_output="$("$SOURCE_DIR/build-rivet/fission/tests/amir_bytecode_array_smoke")"
+
+test "$(grep -c "^FALSE$" <<<"$bytecode_array_full_output")" = "3"
+grep -q "^12 INDEX %t7 %t5 %t6$" <<<"$bytecode_array_full_output"
+grep -q "^5 STORE_INDEX L1 %t9 %t8$" <<<"$bytecode_array_full_output"
+bytecode_array_smoke_arcof="$(mktemp /tmp/fission_bytecode_array_smoke.XXXXXX.arcof)"
+trap 'rm -f "$bytecode_smoke_arcof" "$bytecode_array_smoke_arcof"' EXIT
+sed -n '/^ARCOFISSION BYTECODE$/,$p' <<<"$bytecode_array_full_output" > "$bytecode_array_smoke_arcof"
+bytecode_array_run_output="$("$SOURCE_DIR/build-rivet/ArcoFission" run "$bytecode_array_smoke_arcof")"
+expected_bytecode_array_run_output="$(printf '2\n9')"
+test "$bytecode_array_run_output" = "$expected_bytecode_array_run_output"
 
 self_loop_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_loop_semantic_smoke")"
 

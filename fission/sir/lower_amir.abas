@@ -173,6 +173,23 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
         ignored = builder.Emit(FissionAmirInstruction("Call").WithField("Dest", dest).WithField("Callee", calleeName).WithField("Args", Array.Join(argValues, " ")))
         RETURN {Value: dest, Type: ""}
     END IF
+    IF node.Kind == "Array" THEN
+        itemValues = []
+        FOR child IN node.Children
+            itemResult = Fission_AmirLowerExpr(builder, child)
+            ignored = Array.Push(itemValues, itemResult.Value)
+        NEXT
+        dest = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Array").WithField("Dest", dest).WithField("Items", Array.Join(itemValues, " ")))
+        RETURN {Value: dest, Type: ""}
+    END IF
+    IF node.Kind == "IndexRead" THEN
+        base = Fission_AmirLowerExpr(builder, node.Children[0])
+        indexResult = Fission_AmirLowerExpr(builder, node.Children[1])
+        dest = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Index").WithField("Dest", dest).WithField("Base", base.Value).WithField("Index", indexResult.Value))
+        RETURN {Value: dest, Type: ""}
+    END IF
     RETURN Fission_AmirUnsupportedExpr(builder, node.Kind)
 END FUNCTION
 
@@ -418,6 +435,25 @@ FUNCTION Fission_AmirLowerStatement(builder, node)
         name = Object.Get(node.Fields, "Name", "")
         value = Fission_AmirLowerExpr(builder, node.Children[0])
         ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", name).WithField("Value", value.Value))
+        RETURN
+    END IF
+    IF node.Kind == "Set" THEN
+        target = node.Children[0]
+        value = Fission_AmirLowerExpr(builder, node.Children[1])
+        ' Only the common `name[index] = value` shape is supported here --
+        ' the base of the index target must itself be a bare variable Read
+        ' (matching bytecode's own STORE_INDEX, which addresses a LOCAL slot
+        ' directly, not an arbitrary loaded value). Member-write (`obj.field
+        ' = value`) and nested/indirect index targets (`a[i][j] = value`)
+        ' are out of scope for this lowering pass and report a diagnostic
+        ' rather than silently mis-lowering.
+        IF target.Kind == "IndexRead" AND target.Children[0].Kind == "Read" THEN
+            baseName = Object.Get(target.Children[0].Fields, "Name", "")
+            indexResult = Fission_AmirLowerExpr(builder, target.Children[1])
+            ignored = builder.Emit(FissionAmirInstruction("StoreIndex").WithField("Name", baseName).WithField("Index", indexResult.Value).WithField("Value", value.Value))
+            RETURN
+        END IF
+        ignored = builder.Diagnostics.ReportError("FISSION_AMIR_UNSUPPORTED", "Unsupported Set target for A-MIR lowering: " + target.Kind)
         RETURN
     END IF
     IF node.Kind == "Print" THEN

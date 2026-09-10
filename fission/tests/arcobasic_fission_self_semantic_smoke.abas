@@ -30,6 +30,7 @@ Files = [
     "fission/sir/semantics.abas",
     "fission/sir/serialize.abas",
     "fission/sir/validate.abas",
+    "fission/tests/amir_bytecode_array_smoke.abas",
     "fission/tests/amir_to_bytecode_smoke.abas",
     "fission/tests/arcobasic_access_interface_smoke.abas",
     "fission/tests/arcobasic_binding_semantic_smoke.abas",

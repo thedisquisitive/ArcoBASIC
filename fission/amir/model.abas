@@ -79,6 +79,9 @@ CLASS FissionAmirInstruction
             RETURN "RETURN " + SELF.Field("Type") + " " + SELF.Field("Value")
         END IF
         IF SELF.Kind == "DeclareFunction" THEN RETURN "DECLARE_FUNCTION " + SELF.Field("Name") + " params=" + SELF.Field("Params") + " returns=" + SELF.Field("Returns")
+        IF SELF.Kind == "Array" THEN RETURN destPart + "ARRAY" + Fission_AmirCallArgsSuffix(SELF.Field("Items"))
+        IF SELF.Kind == "Index" THEN RETURN destPart + "INDEX " + SELF.Field("Base") + ", " + SELF.Field("Index")
+        IF SELF.Kind == "StoreIndex" THEN RETURN "STORE_INDEX " + SELF.Field("Name") + " " + SELF.Field("Index") + " " + SELF.Field("Value")
         RETURN SELF.Kind + " " + String(SELF.Fields)
     END FUNCTION
 END CLASS

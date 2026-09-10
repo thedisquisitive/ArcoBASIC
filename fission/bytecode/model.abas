@@ -22,9 +22,12 @@ FUNCTION Fission_BytecodeOpcodeNumber(mnemonic)
     IF mnemonic == "CONST" THEN RETURN 2
     IF mnemonic == "LOAD" THEN RETURN 3
     IF mnemonic == "STORE" THEN RETURN 4
+    IF mnemonic == "STORE_INDEX" THEN RETURN 5
     IF mnemonic == "BINARY" THEN RETURN 7
     IF mnemonic == "CALL_VALUE" THEN RETURN 8
     IF mnemonic == "CALL_RUNTIME" THEN RETURN 9
+    IF mnemonic == "ARRAY" THEN RETURN 10
+    IF mnemonic == "INDEX" THEN RETURN 12
     IF mnemonic == "JUMP" THEN RETURN 13
     IF mnemonic == "BRANCH" THEN RETURN 14
     IF mnemonic == "DECLARE_FUNCTION" THEN RETURN 17
@@ -66,6 +69,9 @@ CLASS FissionBytecodeInstruction
             RETURN opcode + " " + SELF.Field("Type") + " " + SELF.Field("Value")
         END IF
         IF SELF.Mnemonic == "DECLARE_FUNCTION" THEN RETURN opcode + " " + SELF.Field("Name") + " params=" + SELF.Field("Params") + " returns=" + SELF.Field("Returns")
+        IF SELF.Mnemonic == "STORE_INDEX" THEN RETURN opcode + " " + SELF.Field("Local") + " " + SELF.Field("Index") + " " + SELF.Field("Value")
+        IF SELF.Mnemonic == "ARRAY" THEN RETURN opcode + " " + SELF.Field("Dest") + Fission_BytecodeArgsSuffix(SELF.Field("Items"))
+        IF SELF.Mnemonic == "INDEX" THEN RETURN opcode + " " + SELF.Field("Dest") + " " + SELF.Field("Base") + " " + SELF.Field("Index")
         RETURN opcode + " " + String(SELF.Fields)
     END FUNCTION
 END CLASS
