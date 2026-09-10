@@ -27,11 +27,15 @@ FUNCTION Fission_BytecodeOpcodeNumber(mnemonic)
     IF mnemonic == "CALL_VALUE" THEN RETURN 8
     IF mnemonic == "CALL_RUNTIME" THEN RETURN 9
     IF mnemonic == "ARRAY" THEN RETURN 10
+    IF mnemonic == "OBJECT" THEN RETURN 11
     IF mnemonic == "INDEX" THEN RETURN 12
     IF mnemonic == "JUMP" THEN RETURN 13
     IF mnemonic == "BRANCH" THEN RETURN 14
+    IF mnemonic == "TRY_BEGIN" THEN RETURN 15
+    IF mnemonic == "TRY_END" THEN RETURN 16
     IF mnemonic == "DECLARE_FUNCTION" THEN RETURN 17
     IF mnemonic == "RETURN" THEN RETURN 20
+    IF mnemonic == "THROW" THEN RETURN 23
     RETURN -1
 END FUNCTION
 
@@ -72,6 +76,15 @@ CLASS FissionBytecodeInstruction
         IF SELF.Mnemonic == "STORE_INDEX" THEN RETURN opcode + " " + SELF.Field("Local") + " " + SELF.Field("Index") + " " + SELF.Field("Value")
         IF SELF.Mnemonic == "ARRAY" THEN RETURN opcode + " " + SELF.Field("Dest") + Fission_BytecodeArgsSuffix(SELF.Field("Items"))
         IF SELF.Mnemonic == "INDEX" THEN RETURN opcode + " " + SELF.Field("Dest") + " " + SELF.Field("Base") + " " + SELF.Field("Index")
+        IF SELF.Mnemonic == "OBJECT" THEN RETURN opcode + " " + SELF.Field("Dest") + Fission_BytecodeArgsSuffix(SELF.Field("Fields"))
+        ' No "AS", no L-prefix on the catch name -- bytecode's own TRY_BEGIN
+        ' declares the catch variable by bare name, not as an operand
+        ' reference to an already-allocated LOCAL slot; the VM binds it
+        ' internally when entering the catch block. Confirmed via the oracle:
+        ' `15 TRY_BEGIN Catch0 err`, not `Catch0 AS err` or `Catch0 L1`.
+        IF SELF.Mnemonic == "TRY_BEGIN" THEN RETURN opcode + " " + SELF.Field("Catch") + " " + SELF.Field("Name")
+        IF SELF.Mnemonic == "TRY_END" THEN RETURN opcode
+        IF SELF.Mnemonic == "THROW" THEN RETURN opcode + " " + SELF.Field("Value")
         RETURN opcode + " " + String(SELF.Fields)
     END FUNCTION
 END CLASS

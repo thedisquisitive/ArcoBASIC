@@ -82,6 +82,10 @@ CLASS FissionAmirInstruction
         IF SELF.Kind == "Array" THEN RETURN destPart + "ARRAY" + Fission_AmirCallArgsSuffix(SELF.Field("Items"))
         IF SELF.Kind == "Index" THEN RETURN destPart + "INDEX " + SELF.Field("Base") + ", " + SELF.Field("Index")
         IF SELF.Kind == "StoreIndex" THEN RETURN "STORE_INDEX " + SELF.Field("Name") + " " + SELF.Field("Index") + " " + SELF.Field("Value")
+        IF SELF.Kind == "Object" THEN RETURN destPart + "OBJECT" + Fission_AmirCallArgsSuffix(SELF.Field("Fields"))
+        IF SELF.Kind == "TryBegin" THEN RETURN "TRY_BEGIN " + SELF.Field("Catch") + " AS " + SELF.Field("Name")
+        IF SELF.Kind == "TryEnd" THEN RETURN "TRY_END"
+        IF SELF.Kind == "Throw" THEN RETURN "THROW " + SELF.Field("Value")
         RETURN SELF.Kind + " " + String(SELF.Fields)
     END FUNCTION
 END CLASS

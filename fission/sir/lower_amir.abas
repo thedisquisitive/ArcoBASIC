@@ -183,11 +183,36 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
         ignored = builder.Emit(FissionAmirInstruction("Array").WithField("Dest", dest).WithField("Items", Array.Join(itemValues, " ")))
         RETURN {Value: dest, Type: ""}
     END IF
+    IF node.Kind == "Object" THEN
+        fieldTexts = []
+        FOR fieldNode IN node.Children
+            fieldName = Object.Get(fieldNode.Fields, "Name", "")
+            fieldValue = Fission_AmirLowerExpr(builder, fieldNode.Children[0])
+            ignored = Array.Push(fieldTexts, fieldName + ":" + fieldValue.Value)
+        NEXT
+        dest = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Object").WithField("Dest", dest).WithField("Fields", Array.Join(fieldTexts, " ")))
+        RETURN {Value: dest, Type: ""}
+    END IF
     IF node.Kind == "IndexRead" THEN
         base = Fission_AmirLowerExpr(builder, node.Children[0])
         indexResult = Fission_AmirLowerExpr(builder, node.Children[1])
         dest = builder.NewTemp()
         ignored = builder.Emit(FissionAmirInstruction("Index").WithField("Dest", dest).WithField("Base", base.Value).WithField("Index", indexResult.Value))
+        RETURN {Value: dest, Type: ""}
+    END IF
+    ' `obj.field` reads lower through the SAME INDEX opcode array indexing
+    ' uses, just with a quoted string CONST as the index operand instead of
+    ' a numeric one -- confirmed via the oracle (`err.Message` inside a real
+    ' CATCH body lowers to `%t3 := CONST "Message"` / `%t4 := INDEX %t2,
+    ' %t3`, no dedicated member-access opcode at all).
+    IF node.Kind == "MemberRead" THEN
+        base = Fission_AmirLowerExpr(builder, node.Children[0])
+        fieldName = Object.Get(node.Fields, "Name", "")
+        keyTemp = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", keyTemp).WithField("Value", "\"" + fieldName + "\""))
+        dest = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Index").WithField("Dest", dest).WithField("Base", base.Value).WithField("Index", keyTemp))
         RETURN {Value: dest, Type: ""}
     END IF
     RETURN Fission_AmirUnsupportedExpr(builder, node.Kind)
@@ -354,6 +379,182 @@ FUNCTION Fission_AmirLowerForRange(builder, node)
     builder.CurrentBlock = endBlock
 END FUNCTION
 
+' Matches the legacy oracle's own real desugaring (confirmed via
+' `ArcoFission reveal ... at A-MIR` on a real `FOR item IN values ... NEXT`):
+' the iterable is stored once into a hidden `__fission_each_items` variable
+' and a numeric `__fission_each_index` counter drives the loop, comparing
+' against `CALL LEN <items>` each iteration -- LEN is an ordinary callable
+' name in this frontend (not a reserved keyword), so it lowers through the
+' same CallExpr path as any other call, not a dedicated opcode. Unlike the
+' legacy oracle (which reuses %t7/%t8 from the Cond block directly inside
+' Body, valid under real SSA dominance), this lowering reloads items/index
+' fresh in Body -- extra instructions, same semantics, consistent with every
+' other loop in this file's own deliberate "correct over byte-identical"
+' scope choice.
+' Covers all four DO-loop shapes (pre/post condition x WHILE/UNTIL) plus a
+' bare infinite `DO ... LOOP`. UNTIL is not a negated condition value --
+' confirmed via the oracle (`ArcoFission reveal ... at A-MIR` on a real
+' `LOOP UNTIL x >= 3`): the SAME comparison the source wrote is evaluated,
+' and it is the BRANCH's own Then/Else targets that swap (condition true ->
+' End for UNTIL, condition true -> Body for WHILE). SIR "Do" node children
+' are [preCondition?, BodyWrapper, postCondition?] (unlike ForRange/ForEach/
+' Function, the body IS wrapped here, so no Kind-based disambiguation is
+' needed the way ForRange required).
+FUNCTION Fission_AmirLowerDo(builder, node)
+    preMode = Object.Get(node.Fields, "PreMode", "")
+    postMode = Object.Get(node.Fields, "PostMode", "")
+    childIndex = 0
+    preConditionNode = NULL
+    IF preMode != "" THEN
+        preConditionNode = node.Children[0]
+        childIndex = 1
+    END IF
+    bodyNode = node.Children[childIndex]
+    childIndex = childIndex + 1
+    postConditionNode = NULL
+    IF postMode != "" THEN postConditionNode = node.Children[childIndex]
+
+    bodyName = builder.NewBlockName("DoBody")
+    endName = builder.NewBlockName("DoEnd")
+    currentFunction = builder.CurrentFunction
+    condName = ""
+
+    IF preMode != "" THEN
+        condName = builder.NewBlockName("DoCond")
+        ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", condName))
+        condBlock = currentFunction.AddBlock(FissionAmirBlock(condName))
+        builder.CurrentBlock = condBlock
+        preResult = Fission_AmirLowerExpr(builder, preConditionNode)
+        IF preMode == "UNTIL" THEN
+            ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", preResult.Value).WithField("Then", endName).WithField("Else", bodyName))
+        ELSE
+            ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", preResult.Value).WithField("Then", bodyName).WithField("Else", endName))
+        END IF
+    ELSE
+        ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", bodyName))
+    END IF
+
+    bodyBlock = currentFunction.AddBlock(FissionAmirBlock(bodyName))
+    builder.CurrentBlock = bodyBlock
+    FOR statement IN bodyNode.Children
+        ignored = Fission_AmirLowerStatement(builder, statement)
+    NEXT
+
+    IF postMode != "" THEN
+        postResult = Fission_AmirLowerExpr(builder, postConditionNode)
+        IF postMode == "UNTIL" THEN
+            ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", postResult.Value).WithField("Then", endName).WithField("Else", bodyName))
+        ELSE
+            ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", postResult.Value).WithField("Then", bodyName).WithField("Else", endName))
+        END IF
+    ELSE
+        IF preMode != "" THEN
+            ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", condName))
+        ELSE
+            ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", bodyName))
+        END IF
+    END IF
+
+    endBlock = currentFunction.AddBlock(FissionAmirBlock(endName))
+    builder.CurrentBlock = endBlock
+END FUNCTION
+
+' TRY/CATCH does not open a new block for its own try-body the way every
+' other control-flow construct in this file does -- confirmed via the
+' oracle: `TRY_BEGIN Catch0 AS err` and the try-body's own statements stay
+' inline in whatever block was already active, followed by `TRY_END` plus a
+' JUMP to the end block on normal completion. Only CATCH gets a real new
+' block. SIR "Try" node children are [TryBodyWrapper, CatchBodyWrapper]
+' (both wrapped, like "Do", not spread like ForRange/ForEach/Function).
+FUNCTION Fission_AmirLowerTry(builder, node)
+    catchName = Object.Get(node.Fields, "Catch", "")
+    tryBodyNode = node.Children[0]
+    catchBodyNode = node.Children[1]
+
+    catchBlockName = builder.NewBlockName("Catch")
+    endBlockName = builder.NewBlockName("TryEnd")
+    currentFunction = builder.CurrentFunction
+
+    ignored = builder.Emit(FissionAmirInstruction("TryBegin").WithField("Catch", catchBlockName).WithField("Name", catchName))
+    FOR statement IN tryBodyNode.Children
+        ignored = Fission_AmirLowerStatement(builder, statement)
+    NEXT
+    ignored = builder.Emit(FissionAmirInstruction("TryEnd"))
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", endBlockName))
+
+    catchBlock = currentFunction.AddBlock(FissionAmirBlock(catchBlockName))
+    builder.CurrentBlock = catchBlock
+    FOR statement IN catchBodyNode.Children
+        ignored = Fission_AmirLowerStatement(builder, statement)
+    NEXT
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", endBlockName))
+
+    endBlock = currentFunction.AddBlock(FissionAmirBlock(endBlockName))
+    builder.CurrentBlock = endBlock
+END FUNCTION
+
+FUNCTION Fission_AmirLowerForEach(builder, node)
+    name = Object.Get(node.Fields, "Name", "")
+    iterable = Fission_AmirLowerExpr(builder, node.Children[0])
+
+    itemsName = "__fission_each_items" + String(builder.NewBlockName(""))
+    indexName = "__fission_each_index" + String(builder.NewBlockName(""))
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", itemsName).WithField("Value", iterable.Value))
+    zeroTemp = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", zeroTemp).WithField("Value", "0"))
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", indexName).WithField("Value", zeroTemp))
+
+    condName = builder.NewBlockName("ForEachCond")
+    bodyName = builder.NewBlockName("ForEachBody")
+    incName = builder.NewBlockName("ForEachInc")
+    endName = builder.NewBlockName("ForEachEnd")
+    currentFunction = builder.CurrentFunction
+
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", condName))
+
+    condBlock = currentFunction.AddBlock(FissionAmirBlock(condName))
+    builder.CurrentBlock = condBlock
+    indexLoadCond = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", indexLoadCond).WithField("Name", indexName))
+    itemsLoadCond = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", itemsLoadCond).WithField("Name", itemsName))
+    lenDest = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Call").WithField("Dest", lenDest).WithField("Callee", "LEN").WithField("Args", itemsLoadCond))
+    cmpDest = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("BinOp").WithField("Dest", cmpDest).WithField("Op", "<").WithField("Left", indexLoadCond).WithField("Right", lenDest).WithField("LeftType", "").WithField("RightType", ""))
+    ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", cmpDest).WithField("Then", bodyName).WithField("Else", endName))
+
+    bodyBlock = currentFunction.AddBlock(FissionAmirBlock(bodyName))
+    builder.CurrentBlock = bodyBlock
+    itemsLoadBody = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", itemsLoadBody).WithField("Name", itemsName))
+    indexLoadBody = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", indexLoadBody).WithField("Name", indexName))
+    itemDest = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Index").WithField("Dest", itemDest).WithField("Base", itemsLoadBody).WithField("Index", indexLoadBody))
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", name).WithField("Value", itemDest))
+    index = 1
+    WHILE index < LEN(node.Children)
+        ignored = Fission_AmirLowerStatement(builder, node.Children[index])
+        index = index + 1
+    WEND
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", incName))
+
+    incBlock = currentFunction.AddBlock(FissionAmirBlock(incName))
+    builder.CurrentBlock = incBlock
+    indexLoadInc = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", indexLoadInc).WithField("Name", indexName))
+    oneTemp = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", oneTemp).WithField("Value", "1"))
+    sumDest = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("BinOp").WithField("Dest", sumDest).WithField("Op", "+").WithField("Left", indexLoadInc).WithField("Right", oneTemp).WithField("LeftType", "").WithField("RightType", ""))
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", indexName).WithField("Value", sumDest))
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", condName))
+
+    endBlock = currentFunction.AddBlock(FissionAmirBlock(endName))
+    builder.CurrentBlock = endBlock
+END FUNCTION
+
 FUNCTION Fission_AmirParseArguments(argsText)
     descriptors = []
     IF argsText == "" THEN RETURN descriptors
@@ -440,17 +641,28 @@ FUNCTION Fission_AmirLowerStatement(builder, node)
     IF node.Kind == "Set" THEN
         target = node.Children[0]
         value = Fission_AmirLowerExpr(builder, node.Children[1])
-        ' Only the common `name[index] = value` shape is supported here --
-        ' the base of the index target must itself be a bare variable Read
+        ' Only `name[index] = value` and `name.field = value` are supported
+        ' here -- the base of the target must itself be a bare variable Read
         ' (matching bytecode's own STORE_INDEX, which addresses a LOCAL slot
-        ' directly, not an arbitrary loaded value). Member-write (`obj.field
-        ' = value`) and nested/indirect index targets (`a[i][j] = value`)
-        ' are out of scope for this lowering pass and report a diagnostic
-        ' rather than silently mis-lowering.
+        ' directly, not an arbitrary loaded value). Nested/indirect targets
+        ' (`a[i][j] = value`, `a.b.c = value`) are out of scope for this
+        ' lowering pass and report a diagnostic rather than silently
+        ' mis-lowering. Member-write lowers through the same STORE_INDEX
+        ' opcode as index-write, just with a quoted string CONST as the
+        ' index (confirmed via the oracle: `obj.Name = "b"` lowers to
+        ' `STORE_INDEX obj %t3 %t4` where %t3 is `CONST "Name"`).
         IF target.Kind == "IndexRead" AND target.Children[0].Kind == "Read" THEN
             baseName = Object.Get(target.Children[0].Fields, "Name", "")
             indexResult = Fission_AmirLowerExpr(builder, target.Children[1])
             ignored = builder.Emit(FissionAmirInstruction("StoreIndex").WithField("Name", baseName).WithField("Index", indexResult.Value).WithField("Value", value.Value))
+            RETURN
+        END IF
+        IF target.Kind == "MemberRead" AND target.Children[0].Kind == "Read" THEN
+            baseName = Object.Get(target.Children[0].Fields, "Name", "")
+            fieldName = Object.Get(target.Fields, "Name", "")
+            keyTemp = builder.NewTemp()
+            ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", keyTemp).WithField("Value", "\"" + fieldName + "\""))
+            ignored = builder.Emit(FissionAmirInstruction("StoreIndex").WithField("Name", baseName).WithField("Index", keyTemp).WithField("Value", value.Value))
             RETURN
         END IF
         ignored = builder.Diagnostics.ReportError("FISSION_AMIR_UNSUPPORTED", "Unsupported Set target for A-MIR lowering: " + target.Kind)
@@ -484,6 +696,23 @@ FUNCTION Fission_AmirLowerStatement(builder, node)
     END IF
     IF node.Kind == "ForRange" THEN
         ignored = Fission_AmirLowerForRange(builder, node)
+        RETURN
+    END IF
+    IF node.Kind == "ForEach" THEN
+        ignored = Fission_AmirLowerForEach(builder, node)
+        RETURN
+    END IF
+    IF node.Kind == "Do" THEN
+        ignored = Fission_AmirLowerDo(builder, node)
+        RETURN
+    END IF
+    IF node.Kind == "Throw" THEN
+        value = Fission_AmirLowerExpr(builder, node.Children[0])
+        ignored = builder.Emit(FissionAmirInstruction("Throw").WithField("Value", value.Value))
+        RETURN
+    END IF
+    IF node.Kind == "Try" THEN
+        ignored = Fission_AmirLowerTry(builder, node)
         RETURN
     END IF
     IF node.Kind == "Function" THEN

@@ -31,6 +31,7 @@ Files = [
     "fission/sir/serialize.abas",
     "fission/sir/validate.abas",
     "fission/tests/amir_bytecode_array_smoke.abas",
+    "fission/tests/amir_bytecode_object_try_smoke.abas",
     "fission/tests/amir_to_bytecode_smoke.abas",
     "fission/tests/arcobasic_access_interface_smoke.abas",
     "fission/tests/arcobasic_binding_semantic_smoke.abas",
@@ -84,6 +85,7 @@ Files = [
     "fission/tests/sir_builder_smoke.abas",
     "fission/tests/sir_semantic_artifact_smoke.abas",
     "fission/tests/sir_to_amir_for_smoke.abas",
+    "fission/tests/sir_to_amir_loops2_smoke.abas",
     "fission/tests/sir_to_amir_smoke.abas"
 ]
 

@@ -386,14 +386,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_parse_smoke")"
 
-grep -q "^84$" <<<"$fission_self_output"
+grep -q "^86$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_semantic_smoke")"
 
-grep -q "^84$" <<<"$fission_self_semantic_output"
-grep -q "^125$" <<<"$fission_self_semantic_output"
-grep -q "^2444$" <<<"$fission_self_semantic_output"
+grep -q "^86$" <<<"$fission_self_semantic_output"
+grep -q "^129$" <<<"$fission_self_semantic_output"
+grep -q "^2528$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -488,6 +488,23 @@ grep -q "^    %t16 := + %t14, %t15$" <<<"$amir_for_output"
 grep -q "^BLOCK ForEnd7$" <<<"$amir_for_output"
 grep -q "^    %t17 := CONST \"hello\"$" <<<"$amir_for_output"
 
+amir_loops2_output="$("$SOURCE_DIR/build-rivet/fission/tests/sir_to_amir_loops2_smoke")"
+
+test "$(grep -c "^FALSE$" <<<"$amir_loops2_output")" = "2"
+grep -q "^    STORE __fission_each_items0, %t5$" <<<"$amir_loops2_output"
+grep -q "^    STORE __fission_each_index1, %t6$" <<<"$amir_loops2_output"
+grep -q "^BLOCK ForEachCond2$" <<<"$amir_loops2_output"
+grep -q "^    %t9 := CALL LEN %t8$" <<<"$amir_loops2_output"
+grep -q "^    BRANCH %t10, ForEachBody3, ForEachEnd5$" <<<"$amir_loops2_output"
+grep -q "^BLOCK ForEachBody3$" <<<"$amir_loops2_output"
+grep -q "^    %t13 := INDEX %t11, %t12$" <<<"$amir_loops2_output"
+grep -q "^BLOCK ForEachInc4$" <<<"$amir_loops2_output"
+grep -q "^BLOCK ForEachEnd5$" <<<"$amir_loops2_output"
+grep -q "^BLOCK DoBody6$" <<<"$amir_loops2_output"
+grep -q "^    %t24 :BOOL := INT.CMP_LT_UNSIGNED %t22, %t23 \[,\]$" <<<"$amir_loops2_output"
+grep -q "^    BRANCH %t24, DoBody6, DoEnd7$" <<<"$amir_loops2_output"
+grep -q "^BLOCK DoEnd7$" <<<"$amir_loops2_output"
+
 # This one runs the produced bytecode through the real legacy VM
 # (`ArcoFission run`) and checks its actual printed output -- true
 # end-to-end functional verification (Source.arcobasic -> Fission SIR ->
@@ -516,6 +533,21 @@ sed -n '/^ARCOFISSION BYTECODE$/,$p' <<<"$bytecode_array_full_output" > "$byteco
 bytecode_array_run_output="$("$SOURCE_DIR/build-rivet/ArcoFission" run "$bytecode_array_smoke_arcof")"
 expected_bytecode_array_run_output="$(printf '2\n9')"
 test "$bytecode_array_run_output" = "$expected_bytecode_array_run_output"
+
+bytecode_object_try_full_output="$("$SOURCE_DIR/build-rivet/fission/tests/amir_bytecode_object_try_smoke")"
+
+test "$(grep -c "^FALSE$" <<<"$bytecode_object_try_full_output")" = "3"
+grep -q "^11 OBJECT %t2 Name:%t1$" <<<"$bytecode_object_try_full_output"
+grep -q "^5 STORE_INDEX L1 %t4 %t3$" <<<"$bytecode_object_try_full_output"
+grep -q "^15 TRY_BEGIN Catch0 err$" <<<"$bytecode_object_try_full_output"
+grep -q "^23 THROW %t8$" <<<"$bytecode_object_try_full_output"
+grep -q "^16 TRY_END$" <<<"$bytecode_object_try_full_output"
+bytecode_object_try_smoke_arcof="$(mktemp /tmp/fission_bytecode_object_try_smoke.XXXXXX.arcof)"
+trap 'rm -f "$bytecode_smoke_arcof" "$bytecode_array_smoke_arcof" "$bytecode_object_try_smoke_arcof"' EXIT
+sed -n '/^ARCOFISSION BYTECODE$/,$p' <<<"$bytecode_object_try_full_output" > "$bytecode_object_try_smoke_arcof"
+bytecode_object_try_run_output="$("$SOURCE_DIR/build-rivet/ArcoFission" run "$bytecode_object_try_smoke_arcof")"
+expected_bytecode_object_try_run_output="$(printf 'b\nboom\nafter')"
+test "$bytecode_object_try_run_output" = "$expected_bytecode_object_try_run_output"
 
 self_loop_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_loop_semantic_smoke")"
 
