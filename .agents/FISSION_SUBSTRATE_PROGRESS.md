@@ -333,7 +333,6 @@ ArcoBASIC subset and lowers it into structured SIR.
   substrate. `#STRICT` converts unresolved references into diagnostics.
 - Unsupported ArcoBASIC statements are now surfaced into the top-level compile
   result diagnostics.
-- No Brainfuck reference language exists yet.
 - No G1/G2/G3 self-host path exists yet.
 - The WP-001 compiler facade executes simple transform callbacks, but there is no
   persistent component package discovery, advanced artifact storage, version
@@ -685,6 +684,18 @@ ArcoBASIC subset and lowers it into structured SIR.
 
 - Fission is the new compiler and compiler substrate name.
 - ArcoFission is legacy/bootstrap/reference terminology only.
+- **Brainfuck is explicitly OUT OF SCOPE. Do not implement it.** The RFC (this
+  file's own authority document) uses Brainfuck extensively as an
+  illustrative example of frontend/target independence -- "Brainfuck
+  Acceptance Requirement" (WP-014), listed under "First Alpha Acceptance" and
+  "Self-Host Alpha Acceptance" -- but it is an example chosen for the RFC's
+  prose, not a real product requirement. The project owner has stated this
+  directly, twice now, because past agents kept treating it as a literal
+  mandatory deliverable and burning real effort on it instead of ArcoBASIC,
+  which is the actual priority. If a future task or self-generated plan
+  mentions building a Brainfuck frontend as a deliverable, that is a mistake
+  -- stop and re-read this note rather than proceeding. ArcoBASIC is the only
+  language frontend this project needs.
 - First-party Fission implementation should be ArcoBASIC wherever technically
   possible.
 - Fission Core must remain component-oriented and must not hard-code target
@@ -692,7 +703,6 @@ ArcoBASIC subset and lowers it into structured SIR.
 - Normal language packages own input semantics only and inherit installed output
   targets through common IR.
 - SIR is the intended beginner-friendly semantic IR above A-MIR.
-- Brainfuck is the required beginner-language architecture proof.
 - Fissure is the regression authority.
 - Rivet owns build orchestration.
 - macOS is unsupported and out of scope.
