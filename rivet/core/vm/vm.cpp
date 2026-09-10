@@ -112,6 +112,15 @@ arco::Value string_array_value(const std::vector<std::string>& values) {
 } // namespace
 
 VM::VM(std::string project_root) : project_root_(std::move(project_root)) {
+    // RuntimeLimits::instruction_limit defaults to 100000 -- a safety cap meant to bound a
+    // runaway interactive/hosted script (see src/native/host_bridge.cpp's own identical
+    // reasoning for the same override). A real build.abas graph-walking every source file
+    // reachable through #IMPORT for every capsule target (fission/build/rivet_test_capsules.abas
+    // alone discovers dozens of shared frontend files per target, dozens of targets) legitimately
+    // needs far more than 100000 instructions and is not an adversarial or accidentally-looping
+    // script -- it is this exact tool's own trusted build description. Uncapped here the same way
+    // host_bridge.cpp uncaps it for native embedding.
+    runtime_.set_instruction_limit_override(0);
     register_host_contracts();
 }
 

@@ -163,6 +163,55 @@ CLASS BuildTarget
     END FUNCTION
 END CLASS
 
+' A capsule's real Rivet-fingerprinted inputs are not just its entry file -- ArcoBASIC's own
+' `#IMPORT "path"` directives pull in a whole transitive closure of other .abas source (the same
+' way a C++ #include graph does), and every real capsule in this repo (test fixtures included)
+' imports several files deep into fission/core, fission/sir, fission/language/arcobasic. A cache
+' keyed on the entry file alone would go silently stale the moment an imported file changes --
+' worse than no cache, since it looks correct while replaying an old build. This is a deliberately
+' plain line-scanner (not the real ArcoBASIC lexer/preprocessor -- Rivet must not depend on Fission
+' to build Fission), matching every real `#IMPORT "quoted/path.abas"` line already in this repo:
+' directive char first on the trimmed line, keyword IMPORT, one double-quoted path, nothing else
+' considered (no #IF-guarded imports, no aliasing) since no real source uses those on an #IMPORT
+' line today.
+FUNCTION ArcoCapsule_ImportLinePath(line)
+    trimmed = String.Trim(line)
+    IF String.StartsWith(trimmed, "#") == FALSE THEN RETURN ""
+    rest = String.Trim(String.Slice(trimmed, 1))
+    IF String.StartsWith(Upper(rest), "IMPORT") == FALSE THEN RETURN ""
+    afterKeyword = String.Trim(String.Slice(rest, 6))
+    IF String.Length(afterKeyword) < 2 THEN RETURN ""
+    IF String.Slice(afterKeyword, 0, 1) != "\"" THEN RETURN ""
+    closeIndex = 1
+    WHILE closeIndex < String.Length(afterKeyword) AND String.Slice(afterKeyword, closeIndex, 1) != "\""
+        closeIndex = closeIndex + 1
+    WEND
+    RETURN String.Slice(afterKeyword, 1, closeIndex - 1)
+END FUNCTION
+
+' Breadth-first over the `#IMPORT` graph starting at `entryPath`, repo-root-relative like every
+' import path in this codebase already is. Returns entryPath plus the full transitive closure, in
+' discovery order, each path once -- exactly the input list a Compile action's fingerprint needs to
+' correctly invalidate on any change reachable from the entry file.
+FUNCTION ArcoCapsule_ImportClosure(entryPath)
+    visited = {}
+    queue = [entryPath]
+    result = []
+    WHILE LEN(queue) > 0
+        path = Array.Shift(queue)
+        IF Object.Has(visited, path) THEN CONTINUE WHILE
+        visited = Object.Set(visited, path, TRUE)
+        ignored = Array.Push(result, path)
+        IF File.Exists(path) == FALSE THEN CONTINUE WHILE
+        source = File.ReadText(path)
+        FOR line IN String.Split(source, "\n")
+            importPath = ArcoCapsule_ImportLinePath(line)
+            IF importPath != "" AND Object.Has(visited, importPath) == FALSE THEN ignored = Array.Push(queue, importPath)
+        NEXT
+    WEND
+    RETURN result
+END FUNCTION
+
 ' RFC section 38's own `CAPSULE app = BUILD.ArcoCapsule("MyApp")` shape. A single-action target --
 ' `ArcoFission native ENTRY -o OUTPUT` produces a self-contained capsule directly, no separate
 ' Compile-then-Link the way BuildTarget's C++ path needs -- so this reuses ActionType.Compile for
@@ -200,7 +249,7 @@ CLASS ArcoCapsuleTarget
     FUNCTION Build()
         args = FissionAdapter_BuildArguments(SELF.Entry, SELF.OutputPath())
         spec = { Type: "Compile", Target: SELF.Name, DisplayName: SELF.Entry,
-                 Inputs: [SELF.Entry], Outputs: [SELF.OutputPath()],
+                 Inputs: ArcoCapsule_ImportClosure(SELF.Entry), Outputs: [SELF.OutputPath()],
                  Tool: SELF.CompilerPath, ToolVersion: SELF.CompilerVersion,
                  Arguments: args, Dependencies: SELF.DependencyActionIds, OriginFunction: "ArcoCapsuleTarget.Build" }
         ignored = RIVET.Graph.Action(spec)
