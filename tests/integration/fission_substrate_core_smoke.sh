@@ -386,14 +386,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_parse_smoke")"
 
-grep -q "^75$" <<<"$fission_self_output"
+grep -q "^76$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_semantic_smoke")"
 
-grep -q "^75$" <<<"$fission_self_semantic_output"
-grep -q "^108$" <<<"$fission_self_semantic_output"
-grep -q "^2044$" <<<"$fission_self_semantic_output"
+grep -q "^76$" <<<"$fission_self_semantic_output"
+grep -q "^110$" <<<"$fission_self_semantic_output"
+grep -q "^2055$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -459,6 +459,13 @@ grep -q "^  Variable module::item$" <<<"$self_loop_output"
 grep -q "^  Variable module::index$" <<<"$self_loop_output"
 grep -q "^    Read module::item -> Resolved module::item$" <<<"$self_loop_output"
 grep -q "^    Read module::index -> Resolved module::index$" <<<"$self_loop_output"
+
+catch_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_catch_semantic_smoke")"
+
+grep -q "^TRUE$" <<<"$catch_semantic_output"
+grep -q "^FALSE$" <<<"$catch_semantic_output"
+grep -q "^  Variable module::err$" <<<"$catch_semantic_output"
+grep -q "^    Read module::err -> Resolved module::err$" <<<"$catch_semantic_output"
 
 self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_self_semantic_smoke")"
 

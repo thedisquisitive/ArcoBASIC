@@ -44,21 +44,30 @@ CLASS FissionArcoBasicSemanticReport
         SELF.Symbols = []
         SELF.References = []
         SELF.Diagnostics = FissionDiagnosticBag()
+        ' scope + "::" + Lower(name) -> symbol. HasSymbol/FindSymbol used to be a linear FOR scan
+        ' over SELF.Symbols per call; with strict whole-program analysis this is called once per
+        ' reference against every symbol collected so far (thousands, on real project files), an
+        ' O(references * symbols) cost that directly caused real files under 1000 lines (e.g.
+        ' arcfs-utils/apps/arconaut/arconaut.abas, 968 lines) to blow well past a 90s budget for
+        ' semantic analysis alone. This index turns each lookup into O(1) (well, O(scope-chain
+        ' depth) for FindSymbol's own walk-up-to-module loop, each step now O(1) instead of
+        ' O(symbol count)).
+        SELF.Index = {}
     END CONSTRUCTOR
 
+    FUNCTION IndexKey(scope, name)
+        RETURN scope + "::" + Lower(name)
+    END FUNCTION
+
     FUNCTION HasSymbol(scope, name)
-        FOR symbol IN SELF.Symbols
-            IF symbol.Scope == scope AND Lower(symbol.Name) == Lower(name) THEN RETURN TRUE
-        NEXT
-        RETURN FALSE
+        RETURN Object.Has(SELF.Index, SELF.IndexKey(scope, name))
     END FUNCTION
 
     FUNCTION FindSymbol(scope, name)
         searchScope = scope
         WHILE TRUE
-            FOR symbol IN SELF.Symbols
-                IF symbol.Scope == searchScope AND Lower(symbol.Name) == Lower(name) THEN RETURN symbol
-            NEXT
+            found = Object.Get(SELF.Index, SELF.IndexKey(searchScope, name), NULL)
+            IF found != NULL THEN RETURN found
             IF searchScope == "module" THEN EXIT WHILE
             IF String.Contains(searchScope, "::") == FALSE THEN EXIT WHILE
             parts = String.Split(searchScope, "::")
@@ -79,6 +88,7 @@ CLASS FissionArcoBasicSemanticReport
             RETURN symbol
         END IF
         ignored = Array.Push(SELF.Symbols, symbol)
+        SELF.Index = Object.Set(SELF.Index, SELF.IndexKey(symbol.Scope, symbol.Name), symbol)
         RETURN symbol
     END FUNCTION
 
@@ -197,6 +207,17 @@ CLASS FissionArcoBasicProgramReport
         SELF.References = []
         SELF.Bindings = []
         SELF.Diagnostics = FissionDiagnosticBag()
+        ' Three indexes over the same SELF.Symbols list, one per lookup shape used below.
+        ' FindSymbol/FindCanonicalSymbol/FindLocalTargetSymbol used to each be a linear FOR scan
+        ' over every program symbol, called once per program reference -- an O(references *
+        ' symbols) cost. On the current first-party Fission self-semantic corpus alone that is
+        ' ~100 references x ~2000 symbols; on a real, larger, moderately-sized project file (e.g.
+        ' arcfs-utils/apps/arconaut/arconaut.abas, 968 lines) it was enough to blow well past a
+        ' 90s budget for whole-program strict semantic analysis. All three keys are cheap to
+        ' maintain incrementally in AddProgramSymbol since every symbol is added exactly once.
+        SELF.ScopeIndex = {}
+        SELF.CanonicalIndex = {}
+        SELF.LocalTargetIndex = {}
     END CONSTRUCTOR
 
     FUNCTION AddModule(module)
@@ -214,6 +235,11 @@ CLASS FissionArcoBasicProgramReport
     FUNCTION AddProgramSymbol(moduleName, symbol)
         programSymbol = FissionArcoBasicProgramSymbol(moduleName, symbol)
         ignored = Array.Push(SELF.Symbols, programSymbol)
+        scopeKey = moduleName + "::" + programSymbol.Scope + "::" + Lower(programSymbol.Name)
+        SELF.ScopeIndex = Object.Set(SELF.ScopeIndex, scopeKey, programSymbol)
+        SELF.CanonicalIndex = Object.Set(SELF.CanonicalIndex, programSymbol.CanonicalName(), programSymbol)
+        localTargetKey = moduleName + "::" + programSymbol.Scope + "::" + programSymbol.Name
+        SELF.LocalTargetIndex = Object.Set(SELF.LocalTargetIndex, localTargetKey, programSymbol)
         RETURN programSymbol
     END FUNCTION
 
@@ -231,10 +257,7 @@ CLASS FissionArcoBasicProgramReport
     END FUNCTION
 
     FUNCTION FindSymbol(moduleName, scope, name)
-        FOR symbol IN SELF.Symbols
-            IF symbol.ModuleName == moduleName AND symbol.Scope == scope AND Lower(symbol.Name) == Lower(name) THEN RETURN symbol
-        NEXT
-        RETURN NULL
+        RETURN Object.Get(SELF.ScopeIndex, moduleName + "::" + scope + "::" + Lower(name), NULL)
     END FUNCTION
 
     FUNCTION FindModuleSymbol(moduleName, name)
@@ -242,18 +265,11 @@ CLASS FissionArcoBasicProgramReport
     END FUNCTION
 
     FUNCTION FindCanonicalSymbol(canonicalName)
-        FOR symbol IN SELF.Symbols
-            IF symbol.CanonicalName() == canonicalName THEN RETURN symbol
-        NEXT
-        RETURN NULL
+        RETURN Object.Get(SELF.CanonicalIndex, canonicalName, NULL)
     END FUNCTION
 
     FUNCTION FindLocalTargetSymbol(reference)
-        FOR symbol IN SELF.Symbols
-            localTarget = symbol.Scope + "::" + symbol.Name
-            IF symbol.ModuleName == reference.ModuleName AND localTarget == reference.Target THEN RETURN symbol
-        NEXT
-        RETURN NULL
+        RETURN Object.Get(SELF.LocalTargetIndex, reference.ModuleName + "::" + reference.Target, NULL)
     END FUNCTION
 
     FUNCTION FindReferenceTargetSymbol(reference)
@@ -591,6 +607,16 @@ FUNCTION Fission_ArcoBasicAnalyzeSirNode(report, node, scope)
     IF node.Kind == "ForEach" OR node.Kind == "ForRange" THEN
         name = Object.Get(node.Fields, "Name", "")
         IF name != "" AND report.HasSymbol(scope, name) == FALSE THEN ignored = report.AddSymbol(FissionArcoBasicSemanticSymbol(name, "Variable", scope))
+    END IF
+    ' `TRY ... CATCH err ... END TRY` binds `err` for the catch body, same as a loop variable
+    ' binds for its body -- this scope model has no finer-grained block scoping than
+    ' function/class/module, so registering it in the enclosing scope (like ForEach/ForRange
+    ' above) matches every other binding construct here. A real gap until now: nothing registered
+    ' the catch name at all, so `err.Message` inside a real catch body (found via
+    ' arcfs-utils/apps/arconaut/arconaut.abas) reported a false "unresolved read".
+    IF node.Kind == "Try" THEN
+        catchName = Object.Get(node.Fields, "Catch", "")
+        IF catchName != "" AND report.HasSymbol(scope, catchName) == FALSE THEN ignored = report.AddSymbol(FissionArcoBasicSemanticSymbol(catchName, "Variable", scope))
     END IF
     FOR child IN node.Children
         ignored = Fission_ArcoBasicAnalyzeSirNode(report, child, scope)
