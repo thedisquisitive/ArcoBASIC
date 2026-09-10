@@ -11905,7 +11905,12 @@ bool is_pe64_file(const std::filesystem::path& path) {
 // Shared by every native capsule target: a tiny launcher that embeds the compiled bytecode as a
 // byte string and hands it to the same hosted VM (run_bytecode_binary) the capsule is linked
 // against. What differs per target is only how that launcher gets compiled and linked.
-std::string native_launcher_source(const std::string& bytecode_binary, std::optional<std::size_t> instruction_limit_override) {
+// `text_format` swaps the embedded entry point to run_bytecode_text (the `.arcof-text` parser)
+// instead of run_bytecode_binary (the compact binary parser) -- used by
+// build_native_bytecode_file to package bytecode this compiler did not itself render, without
+// needing to also replicate the binary encoding.
+std::string native_launcher_source(const std::string& bytecode_binary, std::optional<std::size_t> instruction_limit_override,
+                                    bool text_format = false) {
     std::ostringstream out;
     out << "#include \"arco/fission.hpp\"\n"
         << "#include <iostream>\n"
@@ -11916,7 +11921,7 @@ std::string native_launcher_source(const std::string& bytecode_binary, std::opti
         << bytecode_binary.size() << ");\n"
         << "    std::vector<std::string> script_args;\n"
         << "    for (int i = 1; i < argc; ++i) script_args.emplace_back(argv[i]);\n"
-        << "    const auto result = arco::fission::run_bytecode_binary(bytecode, ";
+        << "    const auto result = arco::fission::" << (text_format ? "run_bytecode_text" : "run_bytecode_binary") << "(bytecode, ";
     if (instruction_limit_override.has_value()) {
         out << "std::optional<std::size_t>(" << *instruction_limit_override << ")";
     } else {
@@ -12279,7 +12284,7 @@ bool link_dependencies_resolve(const std::vector<std::string>& deps) {
 
 Result build_native_bytecode(const std::string& bytecode_binary, const std::string& output_path,
                              std::optional<std::size_t> instruction_limit_override = std::nullopt,
-                             bool prefer_lean_runtime = false) {
+                             bool prefer_lean_runtime = false, bool text_format = false) {
 #if defined(__linux__)
     try {
         const std::filesystem::path source_root = source_root_path();
@@ -12304,7 +12309,7 @@ Result build_native_bytecode(const std::string& bytecode_binary, const std::stri
             if (!out) {
                 return {false, "", "could not write native launcher source"};
             }
-            out << native_launcher_source(bytecode_binary, instruction_limit_override);
+            out << native_launcher_source(bytecode_binary, instruction_limit_override, text_format);
         }
 
         const std::filesystem::path cache = build_dir / "CMakeCache.txt";
@@ -12897,6 +12902,39 @@ Result run_bytecode_file(const std::string& path, std::optional<std::size_t> ins
     }
 }
 
+// Same shape as run_bytecode_binary (Args global, self-compile-run registration, ExitSignal
+// handling) but parses the plain-text `.arcof-text` format via parse_bytecode instead of the
+// compact binary format via parse_binary_bytecode. This is what a native_launcher_source(...,
+// text_format=true) capsule actually calls at startup -- see build_native_bytecode_file, which
+// packages bytecode this compiler did not itself render (e.g. the Fission Compiler Substrate's
+// own bytecode) without needing to replicate the binary encoding at all.
+Result run_bytecode_text(const std::string& bytecode, std::optional<std::size_t> instruction_limit_override,
+                         const std::vector<std::string>& script_args) {
+    std::ostringstream output;
+    try {
+        Runtime runtime;
+        runtime.set_instruction_limit_policy(true);
+        runtime.set_instruction_limit_override(instruction_limit_override);
+        runtime.set_output(output);
+        register_self_compile_run(runtime);
+        Value::Array args_array;
+        args_array.reserve(script_args.size());
+        for (const auto& arg : script_args) args_array.emplace_back(arg);
+        runtime.set_global("Args", Value(std::move(args_array)));
+        auto module = parse_bytecode(bytecode);
+        prepare_bytecode_module(module);
+        const bool count_instructions = !(instruction_limit_override.has_value() && *instruction_limit_override == 0);
+        (void)execute_bytecode(module, runtime, count_instructions);
+        return {true, output.str(), ""};
+    } catch (const ExitSignal& signal) {
+        // See run_bytecode()/run_bytecode_binary()'s identical catch above.
+        std::cout << output.str();
+        std::exit(signal.code());
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+
 Result compile_run(const std::string& source, const std::string& source_name,
                    std::optional<std::size_t> instruction_limit_override) {
     std::ostringstream output;
@@ -12966,6 +13004,21 @@ Result build_native_file(const std::string& path, const std::string& output_path
 #endif
         }
         return build_native_bytecode(bytecode, output_path, instruction_limit_override, !bytecode_needs_full_runtime(module));
+    } catch (const std::exception& error) {
+        return {false, "", error.what()};
+    }
+}
+
+Result build_native_bytecode_file(const std::string& bytecode_path, const std::string& output_path,
+                                  std::optional<std::size_t> instruction_limit_override) {
+    try {
+        const std::string bytecode_text = read_file(bytecode_path);
+        // Reused only to decide whether the lean (no-GUI/no-libcurl) runtime link set is enough --
+        // the same check build_native_file performs on its own freshly-compiled module. Parsing
+        // is otherwise unused here; the capsule embeds and re-parses the original text itself.
+        const BytecodeModule module = parse_bytecode(bytecode_text);
+        return build_native_bytecode(bytecode_text, output_path, instruction_limit_override,
+                                     !bytecode_needs_full_runtime(module), /*text_format=*/true);
     } catch (const std::exception& error) {
         return {false, "", error.what()};
     }

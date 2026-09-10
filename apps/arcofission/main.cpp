@@ -40,7 +40,12 @@ void print_usage(std::ostream& output) {
         << "    at it -- see arcoflow/README.md)\n"
         << "  ArcoFission run FILE.arcof\n"
         << "  ArcoFission compile-run FILE\n"
-        << "  Hosted run/build commands accept --instruction-limit COUNT|unlimited\n"
+        << "  ArcoFission package FILE.arcof -o OUT\n"
+        << "    (packages an existing .arcof-text bytecode file -- from `bytecode`/`reveal ...\n"
+        << "    at BYTECODE`, or from any other compiler that produces the same plain-text\n"
+        << "    format, e.g. the Fission Compiler Substrate -- into a standalone Linux ELF64\n"
+        << "    capsule, without recompiling any ArcoBASIC source.)\n"
+        << "  Hosted run/build/package commands accept --instruction-limit COUNT|unlimited\n"
         << "  Hosted ArcoFission execution defaults to unlimited instruction count.\n"
         << "\n"
         << "This first slice validates ArcoBASIC source with the existing parser\n"
@@ -118,6 +123,17 @@ int write_native_file(const std::string& source_path, const std::string& output_
     const auto result = arco::fission::build_native_file(source_path, output_path, instruction_limit, target);
     if (!result.ok) {
         std::cerr << "NATIVE BUILD FAILED\n\n" << result.error << '\n';
+        return 1;
+    }
+    std::cout << result.output;
+    return 0;
+}
+
+int write_package_file(const std::string& bytecode_path, const std::string& output_path,
+                       std::optional<std::size_t> instruction_limit = default_unlimited_instruction_limit()) {
+    const auto result = arco::fission::build_native_bytecode_file(bytecode_path, output_path, instruction_limit);
+    if (!result.ok) {
+        std::cerr << "PACKAGE BUILD FAILED\n\n" << result.error << '\n';
         return 1;
     }
     std::cout << result.output;
@@ -269,6 +285,23 @@ int main(int argc, char** argv) {
 
     if (argc == 5 && lowercase(argv[1]) == "bytecode" && std::string(argv[3]) == "-o") {
         return write_bytecode_file(argv[2], argv[4]);
+    }
+
+    if ((argc == 5 || argc == 7) && lowercase(argv[1]) == "package" && std::string(argv[3]) == "-o") {
+        std::optional<std::size_t> instruction_limit = default_unlimited_instruction_limit();
+        if (argc == 7) {
+            if (lowercase(argv[5]) != "--instruction-limit") {
+                std::cerr << "ArcoFission: unrecognized package option " << argv[5] << '\n';
+                return 2;
+            }
+            try {
+                instruction_limit = parse_instruction_limit(argv[6]);
+            } catch (const std::exception& error) {
+                std::cerr << "ArcoFission: " << error.what() << '\n';
+                return 2;
+            }
+        }
+        return write_package_file(argv[2], argv[4], instruction_limit);
     }
 
     if (argc >= 5 && lowercase(argv[1]) == "native" && std::string(argv[3]) == "-o") {

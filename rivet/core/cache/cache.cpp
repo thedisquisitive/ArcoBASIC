@@ -1,6 +1,8 @@
 #include "rivet/cache.hpp"
+#include "rivet/toolchain.hpp"
 
 #include <filesystem>
+#include <unordered_set>
 
 namespace rivet {
 
@@ -39,6 +41,29 @@ CacheDecision CacheManager::evaluate(const BuildAction& action) const {
             return decision;
         }
         decision.input_hashes.push_back({input, hash_file(input)});
+    }
+
+    // A Compile action's declared `inputs` is just its one primary source file -- the adapter that
+    // builds BuildAction (rivet/adapters/toolchain/cxx.ab) never lists transitively `#include`d
+    // headers, since it can't know them ahead of a real compile. record() below folds every header
+    // the compiler's own `-MMD -MF` depfile named for THIS action's last successful run into its
+    // recorded inputs; pull those back in here so a header-only edit still changes the fingerprint
+    // instead of silently staying a cache hit (the depfile-based half of RFC section 23's own
+    // "use the compiler's own dependency output" design -- previously recorded but never actually
+    // consulted on the read side, a real bug found while packaging Fission substrate bytecode into
+    // a native capsule: editing include/arco/fission.hpp did not trigger a rebuild of anything that
+    // includes it). Inert on an action's first-ever build, same as parse_depfile()'s own doc comment
+    // already disclosed -- no prior record means no extra paths to fold in yet.
+    std::unordered_set<std::string> declared_inputs(action.inputs.begin(), action.inputs.end());
+    for (const auto& recorded_input : store_.recorded_inputs(action.identity)) {
+        if (declared_inputs.count(recorded_input.path)) continue; // already hashed above
+        std::error_code error;
+        if (!std::filesystem::exists(recorded_input.path, error)) {
+            decision.hit = false;
+            decision.reason = "input '" + recorded_input.path + "' does not exist";
+            return decision;
+        }
+        decision.input_hashes.push_back({recorded_input.path, hash_file(recorded_input.path)});
     }
 
     decision.fingerprint = composite_fingerprint(action, decision.input_hashes);
@@ -111,8 +136,30 @@ void CacheManager::record(const BuildAction& action, const CacheDecision& decisi
             output_hashes.push_back({output, hash_file(output)});
         }
     }
+
+    // Fold in every header this Compile action's own `-MMD -MF <object>.d` just named (see
+    // rivet/adapters/toolchain/cxx.ab's comment) so the NEXT evaluate() call notices a header-only
+    // edit. A full replace, not a merge, on the read side too (record_action() below deletes this
+    // identity's prior recorded inputs first) -- a header dropped from an #include disappears from
+    // here on the very next successful compile that no longer names it.
+    std::vector<PathDigest> input_hashes = decision.input_hashes;
+    if (action.type == ActionType::Compile && !action.outputs.empty()) {
+        const std::string depfile_path = action.outputs.front() + ".d";
+        std::error_code error;
+        if (std::filesystem::exists(depfile_path, error)) {
+            std::unordered_set<std::string> already;
+            for (const auto& entry : input_hashes) already.insert(entry.path);
+            for (const auto& header : parse_depfile(depfile_path)) {
+                if (!already.insert(header).second) continue; // dedupe (the depfile also lists the source itself)
+                std::error_code header_error;
+                if (!std::filesystem::exists(header, header_error)) continue; // e.g. a generated file already consumed and gone
+                input_hashes.push_back({header, hash_file(header)});
+            }
+        }
+    }
+
     store_.record_action(action, decision.fingerprint, status, duration_seconds, decision.reason,
-                          decision.input_hashes, output_hashes);
+                          input_hashes, output_hashes);
 }
 
 } // namespace rivet
