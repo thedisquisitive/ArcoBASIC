@@ -310,6 +310,46 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   parse clean: zero genuine semantic diagnostics found; only the largest
   Arcology OS files (4800+ lines) remain unconfirmed within a 90s budget, a
   known, separate performance item (see Known Failures).
+- WP-004/WP-006 first slice: real SIR -> A-MIR lowering
+  (`fission/amir/model.abas`, `fission/sir/lower_amir.abas`), covering the
+  RFC's own "Tiny BASIC-like" acceptance subset (variables, numeric
+  expressions, PRINT, IF, WHILE, FOR-range, function declarations/calls,
+  string literals) plus array literals/index read/index write. Every
+  construct validated directly against `ArcoFission reveal ... at A-MIR`
+  (the legacy compiler as equivalence-testing oracle, RFC section 41) for a
+  real matching program -- for the tested constructs, output is
+  byte-identical to the oracle apart from per-statement `; source FILE:LINE`
+  debug comments (a disclosed, not-yet-implemented gap) and incidental
+  temp/block numbering differences where this lowering's own counter
+  allocation order differs from the legacy allocator's (structurally and
+  functionally equivalent, not byte-identical, a deliberate scope choice).
+  Three real bugs found and fixed only by direct oracle comparison: a
+  reserved-keyword collision (`function` as a parameter name), a body-vs-
+  first-statement indexing bug that silently emptied every lowered function
+  body, and current-function tracking that broke as soon as any nested
+  FUNCTION was lowered. Unsupported SIR node kinds report a diagnostic and
+  lower to a placeholder rather than producing silently-wrong A-MIR.
+- WP-007 first slice: real A-MIR -> bytecode lowering
+  (`fission/bytecode/model.abas`, `fission/amir/lower_bytecode.abas`),
+  covering the same construct set as the A-MIR slice above. Matches legacy
+  ArcoFission's own `.arcof-text` shape (`reveal ... at BYTECODE`):
+  numbered opcodes, module-wide deduplicated CONSTANTS pool, per-function
+  slot-indexed LOCALS/PARAMS. Deliberately unoptimized -- always
+  materializes operands through temps and emits plain CONST/LOAD/BINARY/
+  STORE instead of legacy's fused STORE_CONST/BINARY_LOCAL_LOCAL/
+  BINARY_LOCAL_CONST/INDEX_LOCAL_CONST forms; semantically equivalent, not
+  byte-identical, with the fusion optimizer recorded as real follow-on work
+  in Next Recommended Work rather than attempted here.
+  **The genuinely new capability this unlocks: real end-to-end execution.**
+  The produced `.arcof-text` is fed directly into `ArcoFission run` (the
+  legacy bytecode VM, a sanctioned Legacy Bridge) and its actual printed
+  output is checked against the expected program output -- true functional
+  verification, not just structural/text comparison. Confirmed correct for
+  programs combining function calls, if/else, while loops, for-range loops,
+  string literals, arithmetic/comparisons, array literals, and indexed
+  read/write. One real bug found only by actually running the generated
+  bytecode: the FUNCTION header line omitted RETURNS for any function with
+  parameters, which the VM rejected outright.
 
 ## In-Progress Components
 
@@ -865,13 +905,17 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 targets (RFC sections 20/28, WP-012/009/010/011), in order:**
 
 A. Extend SIR->A-MIR->bytecode coverage to the rest of the ArcoBASIC subset
-   the frontend already understands at the SIR level: classes/fields/
-   methods, arrays and array/object literals, member/index read+write,
-   TRY/CATCH, DO loops, ForEach. Each addition should be validated the same
-   way this session's slices were: compare against
-   `ArcoFission reveal ... at A-MIR`/`at BYTECODE` for a real program using
-   that construct, then confirm real `ArcoFission run` execution output, not
-   just that rendering doesn't crash.
+   the frontend already understands at the SIR level. DONE: variables,
+   numeric expressions, PRINT, IF, WHILE, FOR-range, function declarations/
+   calls, string literals, array literals, index read, index write (`name
+   [index] = value` shape only). Still needed: classes/fields/methods,
+   object literals, member read/write (`obj.field = value`), TRY/CATCH,
+   DO loops, ForEach, nested/indirect index targets (`a[i][j] = value`).
+   Each addition should be validated the same way this session's slices
+   were: compare against `ArcoFission reveal ... at A-MIR`/`at BYTECODE`
+   for a real program using that construct, then confirm real
+   `ArcoFission run` execution output, not just that rendering doesn't
+   crash.
 B. Implement the bytecode fusion optimizer this session deliberately skipped
    (STORE_CONST, BINARY_LOCAL_LOCAL, BINARY_LOCAL_CONST, INDEX_LOCAL_CONST) --
    current bytecode is correct but always takes the unfused CONST+STORE /
