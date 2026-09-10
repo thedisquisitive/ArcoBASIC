@@ -80,6 +80,10 @@ FUNCTION Fission_BytecodeLowerInstruction(module, fn, block, amirInstruction)
         ignored = block.Append(FissionBytecodeInstruction("DECLARE_FUNCTION").WithField("Name", amirInstruction.Field("Name")).WithField("Params", amirInstruction.Field("Params")).WithField("Returns", amirInstruction.Field("Returns")))
         RETURN
     END IF
+    IF kind == "DeclareClass" THEN
+        ignored = block.Append(FissionBytecodeInstruction("DECLARE_CLASS").WithField("Name", amirInstruction.Field("Name")))
+        RETURN
+    END IF
     IF kind == "Array" THEN
         ignored = block.Append(FissionBytecodeInstruction("ARRAY").WithField("Dest", amirInstruction.Field("Dest")).WithField("Items", amirInstruction.Field("Items")))
         RETURN

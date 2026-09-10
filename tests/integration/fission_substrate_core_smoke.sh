@@ -386,14 +386,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_parse_smoke")"
 
-grep -q "^86$" <<<"$fission_self_output"
+grep -q "^87$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_semantic_smoke")"
 
-grep -q "^86$" <<<"$fission_self_semantic_output"
-grep -q "^129$" <<<"$fission_self_semantic_output"
-grep -q "^2528$" <<<"$fission_self_semantic_output"
+grep -q "^87$" <<<"$fission_self_semantic_output"
+grep -q "^131$" <<<"$fission_self_semantic_output"
+grep -q "^2592$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -548,6 +548,26 @@ sed -n '/^ARCOFISSION BYTECODE$/,$p' <<<"$bytecode_object_try_full_output" > "$b
 bytecode_object_try_run_output="$("$SOURCE_DIR/build-rivet/ArcoFission" run "$bytecode_object_try_smoke_arcof")"
 expected_bytecode_object_try_run_output="$(printf 'b\nboom\nafter')"
 test "$bytecode_object_try_run_output" = "$expected_bytecode_object_try_run_output"
+
+bytecode_class_full_output="$("$SOURCE_DIR/build-rivet/fission/tests/amir_bytecode_class_smoke")"
+
+test "$(grep -c "^FALSE$" <<<"$bytecode_class_full_output")" = "3"
+grep -q "^18 DECLARE_CLASS Counter$" <<<"$bytecode_class_full_output"
+grep -q "^FUNCTION Counter.Init RETURNS VALUE$" <<<"$bytecode_class_full_output"
+grep -q "^P0 SELF$" <<<"$bytecode_class_full_output"
+grep -q "^20 RETURN VALUE nothing$" <<<"$bytecode_class_full_output"
+grep -q "^FUNCTION Counter.Increment RETURNS U64$" <<<"$bytecode_class_full_output"
+grep -q "^FUNCTION Counter.__new RETURNS VALUE$" <<<"$bytecode_class_full_output"
+grep -q "^11 OBJECT %t12$" <<<"$bytecode_class_full_output"
+grep -q "^FUNCTION Counter RETURNS VALUE$" <<<"$bytecode_class_full_output"
+grep -q "^8 CALL_VALUE %t20 Counter %t19$" <<<"$bytecode_class_full_output"
+grep -q "^8 CALL_VALUE %t21 c.Increment$" <<<"$bytecode_class_full_output"
+bytecode_class_smoke_arcof="$(mktemp /tmp/fission_bytecode_class_smoke.XXXXXX.arcof)"
+trap 'rm -f "$bytecode_smoke_arcof" "$bytecode_array_smoke_arcof" "$bytecode_object_try_smoke_arcof" "$bytecode_class_smoke_arcof"' EXIT
+sed -n '/^ARCOFISSION BYTECODE$/,$p' <<<"$bytecode_class_full_output" > "$bytecode_class_smoke_arcof"
+bytecode_class_run_output="$("$SOURCE_DIR/build-rivet/ArcoFission" run "$bytecode_class_smoke_arcof")"
+expected_bytecode_class_run_output="$(printf '6\n6')"
+test "$bytecode_class_run_output" = "$expected_bytecode_class_run_output"
 
 self_loop_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_loop_semantic_smoke")"
 

@@ -34,6 +34,7 @@ FUNCTION Fission_BytecodeOpcodeNumber(mnemonic)
     IF mnemonic == "TRY_BEGIN" THEN RETURN 15
     IF mnemonic == "TRY_END" THEN RETURN 16
     IF mnemonic == "DECLARE_FUNCTION" THEN RETURN 17
+    IF mnemonic == "DECLARE_CLASS" THEN RETURN 18
     IF mnemonic == "RETURN" THEN RETURN 20
     IF mnemonic == "THROW" THEN RETURN 23
     RETURN -1
@@ -73,6 +74,7 @@ CLASS FissionBytecodeInstruction
             RETURN opcode + " " + SELF.Field("Type") + " " + SELF.Field("Value")
         END IF
         IF SELF.Mnemonic == "DECLARE_FUNCTION" THEN RETURN opcode + " " + SELF.Field("Name") + " params=" + SELF.Field("Params") + " returns=" + SELF.Field("Returns")
+        IF SELF.Mnemonic == "DECLARE_CLASS" THEN RETURN opcode + " " + SELF.Field("Name")
         IF SELF.Mnemonic == "STORE_INDEX" THEN RETURN opcode + " " + SELF.Field("Local") + " " + SELF.Field("Index") + " " + SELF.Field("Value")
         IF SELF.Mnemonic == "ARRAY" THEN RETURN opcode + " " + SELF.Field("Dest") + Fission_BytecodeArgsSuffix(SELF.Field("Items"))
         IF SELF.Mnemonic == "INDEX" THEN RETURN opcode + " " + SELF.Field("Dest") + " " + SELF.Field("Base") + " " + SELF.Field("Index")

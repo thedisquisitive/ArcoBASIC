@@ -79,6 +79,7 @@ CLASS FissionAmirInstruction
             RETURN "RETURN " + SELF.Field("Type") + " " + SELF.Field("Value")
         END IF
         IF SELF.Kind == "DeclareFunction" THEN RETURN "DECLARE_FUNCTION " + SELF.Field("Name") + " params=" + SELF.Field("Params") + " returns=" + SELF.Field("Returns")
+        IF SELF.Kind == "DeclareClass" THEN RETURN "DECLARE_CLASS " + SELF.Field("Name")
         IF SELF.Kind == "Array" THEN RETURN destPart + "ARRAY" + Fission_AmirCallArgsSuffix(SELF.Field("Items"))
         IF SELF.Kind == "Index" THEN RETURN destPart + "INDEX " + SELF.Field("Base") + ", " + SELF.Field("Index")
         IF SELF.Kind == "StoreIndex" THEN RETURN "STORE_INDEX " + SELF.Field("Name") + " " + SELF.Field("Index") + " " + SELF.Field("Value")
@@ -130,9 +131,17 @@ CLASS FissionAmirFunction
     END FUNCTION
 
     FUNCTION RenderParams()
+        ' A real bug this fixes: SELF (a class method's implicit first
+        ' parameter, registered with an empty type since it has no declared
+        ' type of its own) rendered as "SELF AS " with a trailing bare "AS",
+        ' confirmed wrong against the oracle's own `FUNCTION Counter.Init
+        ' (SELF, start AS U64)` -- no "AS" at all for a parameter with no
+        ' declared type, present only when one exists.
         parts = []
         FOR param IN SELF.Params
-            ignored = Array.Push(parts, param.Name + " AS " + param.Type)
+            text = param.Name
+            IF param.Type != "" THEN text = text + " AS " + param.Type
+            ignored = Array.Push(parts, text)
         NEXT
         RETURN Array.Join(parts, ", ")
     END FUNCTION

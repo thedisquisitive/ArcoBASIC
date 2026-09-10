@@ -69,6 +69,19 @@ CLASS FissionAmirBuilder
         ' instead (since it had become the module's last-added function),
         ' producing a well-formed-looking but structurally wrong A-MIR module.
         SELF.CurrentFunction = NULL
+        ' A real bug this fixes: RETURN's own Type used to come from the
+        ' *returned expression's* inferred type (e.g. a typed BinOp's own
+        ' Type field), not the enclosing function's declared return type.
+        ' That happened to match for a function like `Sum(a AS U64, b AS
+        ' U64)` returning `a + b` (typed arithmetic over two U64 params
+        ' naturally produces a U64 result), but a method returning
+        ' `SELF.Value` (a MemberRead, which this lowering always treats as
+        ' untyped, same as any INDEX result) rendered `RETURN  %t11` --
+        ' double space, missing type entirely, confirmed only once a real
+        ' CLASS with a method returning a field was lowered and compared
+        ' against the oracle. RETURN must always use the function's own
+        ' declared return type.
+        SELF.CurrentReturnType = "I32"
         SELF.Scope = FissionAmirScope()
         SELF.Diagnostics = FissionDiagnosticBag()
     END CONSTRUCTOR
@@ -160,8 +173,24 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
     END IF
     IF node.Kind == "CallExpr" THEN
         callee = node.Children[0]
-        IF callee.Kind != "Read" THEN RETURN Fission_AmirUnsupportedExpr(builder, "indirect call target")
-        calleeName = Object.Get(callee.Fields, "Name", "")
+        calleeName = ""
+        isMemberCallee = FALSE
+        IF callee.Kind == "MemberRead" THEN isMemberCallee = callee.Children[0].Kind == "Read"
+        IF callee.Kind == "Read" THEN calleeName = Object.Get(callee.Fields, "Name", "")
+        ' `obj.Method(args)` -- the callee text is literally
+        ' "instanceVarName.MethodName", no explicit SELF argument passed at
+        ' the call site. Confirmed via the oracle: `c.Increment()` lowers to
+        ' plain `CALL c.Increment` (no args at all here since Increment
+        ' itself takes none) -- the VM resolves the qualified name to the
+        ' right `ClassName.Method` function using the instance's own
+        ' `__class` tag at runtime, this lowering pass does not need to (and
+        ' cannot, without real type inference) resolve it statically.
+        IF isMemberCallee THEN
+            baseName = Object.Get(callee.Children[0].Fields, "Name", "")
+            fieldName = Object.Get(callee.Fields, "Name", "")
+            calleeName = baseName + "." + fieldName
+        END IF
+        IF callee.Kind != "Read" AND isMemberCallee == FALSE THEN RETURN Fission_AmirUnsupportedExpr(builder, "indirect call target")
         argValues = []
         index = 1
         WHILE index < LEN(node.Children)
@@ -298,9 +327,23 @@ FUNCTION Fission_AmirLowerForRange(builder, node)
     endValue = Fission_AmirLowerExpr(builder, node.Children[1])
     bodyIndex = 2
     stepValue = NULL
-    IF LEN(node.Children) > 2 AND Fission_AmirIsAmirExpressionKind(node.Children[2].Kind) THEN
-        stepValue = Fission_AmirLowerExpr(builder, node.Children[2])
-        bodyIndex = 3
+    ' Bare AND is bitwise/non-short-circuiting in this language -- the
+    ' `node.Children[2]` access below was, for a while, gated by a single
+    ' `LEN(node.Children) > 2 AND Fission_AmirIsAmirExpressionKind(node.
+    ' Children[2].Kind)` condition, which evaluates BOTH sides regardless,
+    ' so a FOR loop with a completely empty body (`FOR i = 1 TO 10 \ NEXT`,
+    ' exactly 2 children: start and end, no step, no body statements) would
+    ' throw "array index out of range" on the right-hand access before the
+    ' length check on the left could matter. Not caught by this session's
+    ' own FOR-range tests, which all had a non-empty body -- fixed here as a
+    ' nested IF (short-circuit by construction) rather than trusting ANDALSO
+    ' placement again after finding this exact class of bug twice already
+    ' tonight via real crashes, not code review.
+    IF LEN(node.Children) > 2 THEN
+        IF Fission_AmirIsAmirExpressionKind(node.Children[2].Kind) THEN
+            stepValue = Fission_AmirLowerExpr(builder, node.Children[2])
+            bodyIndex = 3
+        END IF
     END IF
 
     endName = "__fission_for_end" + String(builder.NewBlockName(""))
@@ -572,6 +615,170 @@ FUNCTION Fission_AmirParseArguments(argsText)
     RETURN descriptors
 END FUNCTION
 
+' Class lowering, confirmed via the oracle
+' (`ArcoFission reveal ... at A-MIR` on a real CLASS with a CONSTRUCTOR and a
+' method) to desugar into several separate top-level A-MIR functions, all of
+' which this lowering pass can already emit with primitives it already has
+' (CALL/OBJECT/STORE_INDEX) -- no new opcodes needed for classes at all:
+'   - `DECLARE_CLASS Name` in the enclosing block, where the CLASS statement
+'     itself appeared.
+'   - `Name.Init(SELF, ctorParams...) RETURNS VALUE` for the constructor
+'     body, always ending `RETURN VALUE nothing` (a literal sentinel token,
+'     not a real expression -- constructors have no caller-visible value).
+'   - `Name.Method(SELF, params...)` for each ordinary method, SELF simply
+'     registered as an ordinary parameter (`SELF.Field` already lowers
+'     through the existing MemberRead/Set-with-MemberRead-target paths with
+'     no special-casing needed).
+'   - `Name.__new RETURNS VALUE`, synthesized here, not present in SIR at
+'     all: allocates a bare OBJECT, tags it with a `"__class"` field set to
+'     the class name string (this is how the VM's `obj.Method()` dynamic
+'     dispatch resolves which function to actually call), returns it.
+'   - `Name(ctorParams...) RETURNS VALUE`, synthesized here: calls
+'     `Name.__new`, then `Name.Init` with the new instance plus the
+'     constructor's own arguments, returns the instance. This is exactly
+'     what makes `c = Counter(5)` at a call site need NO special handling at
+'     all -- it is syntactically an ordinary CallExpr with callee "Counter",
+'     which the existing CallExpr lowering already handles.
+' Only CONSTRUCTOR and plain FUNCTION members are handled (unwrapping a
+' single layer of Modifier, e.g. `PUBLIC FUNCTION ...`); fields declared
+' without an initializing SELF.Field assignment, nested classes, interfaces,
+' and static/shared members are out of scope for this lowering pass.
+FUNCTION Fission_AmirLowerClassMember(builder, className, memberNode, paramName, paramType, isConstructor)
+    outerFunction = builder.CurrentFunction
+    outerBlock = builder.CurrentBlock
+    outerScope = builder.Scope
+    outerReturnType = builder.CurrentReturnType
+
+    memberParams = Fission_AmirParseArguments(Object.Get(memberNode.Fields, "Arguments", ""))
+    fnName = className + "." + paramName
+    returnType = paramType
+    fn = FissionAmirFunction(fnName)
+    fn.ReturnType = returnType
+    ignored = fn.AddParam("SELF", "")
+    FOR param IN memberParams
+        ignored = fn.AddParam(param.Name, param.Type)
+    NEXT
+    ignored = builder.Module.AddFunction(fn)
+    entryBlock = fn.AddBlock(FissionAmirBlock("Entry"))
+    builder.CurrentBlock = entryBlock
+    builder.CurrentFunction = fn
+    builder.CurrentReturnType = returnType
+    builder.Scope = FissionAmirScope()
+    ignored = builder.Scope.Declare("SELF", "")
+    FOR param IN memberParams
+        ignored = builder.Scope.Declare(param.Name, param.Type)
+    NEXT
+
+    FOR statement IN memberNode.Children
+        ignored = Fission_AmirLowerStatement(builder, statement)
+    NEXT
+    IF isConstructor THEN ignored = builder.Emit(FissionAmirInstruction("Return").WithField("Type", "VALUE").WithField("Value", "nothing"))
+
+    builder.CurrentBlock = outerBlock
+    builder.CurrentFunction = outerFunction
+    builder.CurrentReturnType = outerReturnType
+    builder.Scope = outerScope
+    RETURN memberParams
+END FUNCTION
+
+FUNCTION Fission_AmirUnwrapModifier(node)
+    IF node.Kind == "Modifier" AND LEN(node.Children) > 0 THEN RETURN node.Children[0]
+    RETURN node
+END FUNCTION
+
+FUNCTION Fission_AmirLowerClass(builder, node)
+    className = Object.Get(node.Fields, "Name", "")
+    ignored = builder.Emit(FissionAmirInstruction("DeclareClass").WithField("Name", className))
+
+    constructorNode = NULL
+    methodNodes = []
+    FOR member IN node.Children
+        actualMember = Fission_AmirUnwrapModifier(member)
+        IF actualMember.Kind == "Constructor" THEN
+            constructorNode = actualMember
+        END IF
+        IF actualMember.Kind == "Function" THEN
+            ignored = Array.Push(methodNodes, actualMember)
+        END IF
+    NEXT
+
+    ctorParams = []
+    IF constructorNode != NULL THEN ctorParams = Fission_AmirLowerClassMember(builder, className, constructorNode, "Init", "VALUE", TRUE)
+
+    FOR methodNode IN methodNodes
+        methodName = Object.Get(methodNode.Fields, "Name", "")
+        methodReturnType = Object.Get(methodNode.Fields, "Returns", "")
+        IF methodReturnType == "" THEN methodReturnType = "VOID"
+        ignored = Fission_AmirLowerClassMember(builder, className, methodNode, methodName, methodReturnType, FALSE)
+    NEXT
+
+    ' Synthesize Name.__new: allocate a bare instance tagged with its class.
+    outerFunction = builder.CurrentFunction
+    outerBlock = builder.CurrentBlock
+    outerScope = builder.Scope
+    outerReturnType = builder.CurrentReturnType
+
+    newFn = FissionAmirFunction(className + ".__new")
+    newFn.ReturnType = "VALUE"
+    ignored = builder.Module.AddFunction(newFn)
+    newEntry = newFn.AddBlock(FissionAmirBlock("Entry"))
+    builder.CurrentBlock = newEntry
+    builder.CurrentFunction = newFn
+    builder.CurrentReturnType = "VALUE"
+    builder.Scope = FissionAmirScope()
+    instTemp = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Object").WithField("Dest", instTemp).WithField("Fields", ""))
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", "__instance").WithField("Value", instTemp))
+    classKeyTemp = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", classKeyTemp).WithField("Value", "\"__class\""))
+    classNameTemp = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", classNameTemp).WithField("Value", "\"" + className + "\""))
+    ignored = builder.Emit(FissionAmirInstruction("StoreIndex").WithField("Name", "__instance").WithField("Index", classKeyTemp).WithField("Value", classNameTemp))
+    loadInstTemp = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", loadInstTemp).WithField("Name", "__instance"))
+    ignored = builder.Emit(FissionAmirInstruction("Return").WithField("Type", "VALUE").WithField("Value", loadInstTemp))
+
+    builder.CurrentBlock = outerBlock
+    builder.CurrentFunction = outerFunction
+    builder.CurrentReturnType = outerReturnType
+    builder.Scope = outerScope
+
+    ' Synthesize Name(ctorParams...): the ordinary-looking "constructor call"
+    ' every CallExpr call site already knows how to invoke.
+    wrapperFn = FissionAmirFunction(className)
+    wrapperFn.ReturnType = "VALUE"
+    FOR param IN ctorParams
+        ignored = wrapperFn.AddParam(param.Name, param.Type)
+    NEXT
+    ignored = builder.Module.AddFunction(wrapperFn)
+    wrapperEntry = wrapperFn.AddBlock(FissionAmirBlock("Entry"))
+    builder.CurrentBlock = wrapperEntry
+    builder.CurrentFunction = wrapperFn
+    builder.CurrentReturnType = "VALUE"
+    builder.Scope = FissionAmirScope()
+    FOR param IN ctorParams
+        ignored = builder.Scope.Declare(param.Name, param.Type)
+    NEXT
+    instanceTemp = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Call").WithField("Dest", instanceTemp).WithField("Callee", className + ".__new").WithField("Args", ""))
+    IF constructorNode != NULL THEN
+        argTemps = [instanceTemp]
+        FOR param IN ctorParams
+            paramLoadTemp = builder.NewTemp()
+            ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", paramLoadTemp).WithField("Name", param.Name))
+            ignored = Array.Push(argTemps, paramLoadTemp)
+        NEXT
+        initDest = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Call").WithField("Dest", initDest).WithField("Callee", className + ".Init").WithField("Args", Array.Join(argTemps, " ")))
+    END IF
+    ignored = builder.Emit(FissionAmirInstruction("Return").WithField("Type", "VALUE").WithField("Value", instanceTemp))
+
+    builder.CurrentBlock = outerBlock
+    builder.CurrentFunction = outerFunction
+    builder.CurrentReturnType = outerReturnType
+    builder.Scope = outerScope
+END FUNCTION
+
 FUNCTION Fission_AmirLowerFunctionDecl(builder, node)
     name = Object.Get(node.Fields, "Name", "")
     returnType = Object.Get(node.Fields, "Returns", "")
@@ -581,6 +788,7 @@ FUNCTION Fission_AmirLowerFunctionDecl(builder, node)
     outerFunction = builder.CurrentFunction
     outerBlock = builder.CurrentBlock
     outerScope = builder.Scope
+    outerReturnType = builder.CurrentReturnType
 
     paramText = []
     FOR param IN params
@@ -597,6 +805,7 @@ FUNCTION Fission_AmirLowerFunctionDecl(builder, node)
     entryBlock = fn.AddBlock(FissionAmirBlock("Entry"))
     builder.CurrentBlock = entryBlock
     builder.CurrentFunction = fn
+    builder.CurrentReturnType = returnType
     builder.Scope = FissionAmirScope()
     FOR param IN params
         ignored = builder.Scope.Declare(param.Name, param.Type)
@@ -618,6 +827,7 @@ FUNCTION Fission_AmirLowerFunctionDecl(builder, node)
 
     builder.CurrentBlock = outerBlock
     builder.CurrentFunction = outerFunction
+    builder.CurrentReturnType = outerReturnType
     builder.Scope = outerScope
 END FUNCTION
 
@@ -651,19 +861,31 @@ FUNCTION Fission_AmirLowerStatement(builder, node)
         ' opcode as index-write, just with a quoted string CONST as the
         ' index (confirmed via the oracle: `obj.Name = "b"` lowers to
         ' `STORE_INDEX obj %t3 %t4` where %t3 is `CONST "Name"`).
-        IF target.Kind == "IndexRead" AND target.Children[0].Kind == "Read" THEN
-            baseName = Object.Get(target.Children[0].Fields, "Name", "")
-            indexResult = Fission_AmirLowerExpr(builder, target.Children[1])
-            ignored = builder.Emit(FissionAmirInstruction("StoreIndex").WithField("Name", baseName).WithField("Index", indexResult.Value).WithField("Value", value.Value))
-            RETURN
+        ' Nested IFs, not a single `AND`-joined condition: bare AND is
+        ' bitwise/non-short-circuiting in this language, so a joined
+        ' condition would evaluate `target.Children[0]` even when target.Kind
+        ' is neither IndexRead nor MemberRead and has no children at all --
+        ' the same crash class found twice already tonight (real "array
+        ' index out of range" failures caught only by running the code, not
+        ' by review), fixed defensively here before it could happen a third
+        ' time rather than after.
+        IF target.Kind == "IndexRead" THEN
+            IF target.Children[0].Kind == "Read" THEN
+                baseName = Object.Get(target.Children[0].Fields, "Name", "")
+                indexResult = Fission_AmirLowerExpr(builder, target.Children[1])
+                ignored = builder.Emit(FissionAmirInstruction("StoreIndex").WithField("Name", baseName).WithField("Index", indexResult.Value).WithField("Value", value.Value))
+                RETURN
+            END IF
         END IF
-        IF target.Kind == "MemberRead" AND target.Children[0].Kind == "Read" THEN
-            baseName = Object.Get(target.Children[0].Fields, "Name", "")
-            fieldName = Object.Get(target.Fields, "Name", "")
-            keyTemp = builder.NewTemp()
-            ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", keyTemp).WithField("Value", "\"" + fieldName + "\""))
-            ignored = builder.Emit(FissionAmirInstruction("StoreIndex").WithField("Name", baseName).WithField("Index", keyTemp).WithField("Value", value.Value))
-            RETURN
+        IF target.Kind == "MemberRead" THEN
+            IF target.Children[0].Kind == "Read" THEN
+                baseName = Object.Get(target.Children[0].Fields, "Name", "")
+                fieldName = Object.Get(target.Fields, "Name", "")
+                keyTemp = builder.NewTemp()
+                ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", keyTemp).WithField("Value", "\"" + fieldName + "\""))
+                ignored = builder.Emit(FissionAmirInstruction("StoreIndex").WithField("Name", baseName).WithField("Index", keyTemp).WithField("Value", value.Value))
+                RETURN
+            END IF
         END IF
         ignored = builder.Diagnostics.ReportError("FISSION_AMIR_UNSUPPORTED", "Unsupported Set target for A-MIR lowering: " + target.Kind)
         RETURN
@@ -680,7 +902,7 @@ FUNCTION Fission_AmirLowerStatement(builder, node)
     IF node.Kind == "Return" THEN
         IF LEN(node.Children) > 0 THEN
             value = Fission_AmirLowerExpr(builder, node.Children[0])
-            ignored = builder.Emit(FissionAmirInstruction("Return").WithField("Type", value.Type).WithField("Value", value.Value))
+            ignored = builder.Emit(FissionAmirInstruction("Return").WithField("Type", builder.CurrentReturnType).WithField("Value", value.Value))
         ELSE
             ignored = builder.Emit(FissionAmirInstruction("Return").WithField("Type", "VOID"))
         END IF
@@ -715,6 +937,10 @@ FUNCTION Fission_AmirLowerStatement(builder, node)
         ignored = Fission_AmirLowerTry(builder, node)
         RETURN
     END IF
+    IF node.Kind == "Class" THEN
+        ignored = Fission_AmirLowerClass(builder, node)
+        RETURN
+    END IF
     IF node.Kind == "Function" THEN
         ignored = Fission_AmirLowerFunctionDecl(builder, node)
         RETURN
@@ -731,6 +957,7 @@ FUNCTION Fission_SirToAmir(sirModule)
     entryBlock = mainFunction.AddBlock(FissionAmirBlock("Entry"))
     builder.CurrentBlock = entryBlock
     builder.CurrentFunction = mainFunction
+    builder.CurrentReturnType = "I32"
 
     ' Every Main entry block starts by capturing the process's own argv into the
     ' `Args` global, matching the legacy oracle's own unconditional prelude
