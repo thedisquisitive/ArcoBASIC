@@ -1,0 +1,225 @@
+#IMPORT "fission/core/diagnostics.abas"
+
+' Fission bytecode model (RFC-AP-FISSION-001 section 29 "Bytecode" / WP-007).
+' Mirrors legacy ArcoFission's own `.arcof-text` shape (`ArcoFission reveal
+' FILE at BYTECODE`) closely enough to read side by side: numbered opcodes,
+' a deduplicated module-wide CONSTANTS pool, per-function slot-indexed LOCALS
+' (PARAMS pre-assigned the same slot numbers as their LOCALS entry, matching
+' the oracle), space-separated operands (no commas, unlike A-MIR's own
+' rendering).
+'
+' Deliberately unoptimized: the legacy compiler's bytecode lowering fuses
+' common patterns (STORE_CONST, BINARY_LOCAL_LOCAL, BINARY_LOCAL_CONST, ...)
+' into single instructions; this lowering (fission/amir/lower_bytecode.abas)
+' always materializes operands through temps and emits the plain CONST/LOAD/
+' BINARY/STORE sequence instead. Semantically equivalent, not byte-identical
+' to the legacy encoding -- a disclosed, deliberate scope cut given the size
+' of the fusion optimizer on its own, not a correctness gap.
+
+FUNCTION Fission_BytecodeOpcodeNumber(mnemonic)
+    IF mnemonic == "LABEL" THEN RETURN 0
+    IF mnemonic == "SOURCE" THEN RETURN 1
+    IF mnemonic == "CONST" THEN RETURN 2
+    IF mnemonic == "LOAD" THEN RETURN 3
+    IF mnemonic == "STORE" THEN RETURN 4
+    IF mnemonic == "BINARY" THEN RETURN 7
+    IF mnemonic == "CALL_VALUE" THEN RETURN 8
+    IF mnemonic == "CALL_RUNTIME" THEN RETURN 9
+    IF mnemonic == "JUMP" THEN RETURN 13
+    IF mnemonic == "BRANCH" THEN RETURN 14
+    IF mnemonic == "DECLARE_FUNCTION" THEN RETURN 17
+    IF mnemonic == "RETURN" THEN RETURN 20
+    RETURN -1
+END FUNCTION
+
+CLASS FissionBytecodeInstruction
+    CONSTRUCTOR(mnemonic)
+        SELF.Mnemonic = mnemonic
+        SELF.Fields = {}
+        SELF.FieldNames = []
+    END CONSTRUCTOR
+
+    FUNCTION WithField(name, value)
+        IF Fission_ListContains(SELF.FieldNames, name) == FALSE THEN
+            ignored = Array.Push(SELF.FieldNames, name)
+        END IF
+        SELF.Fields = Object.Set(SELF.Fields, name, value)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION Field(name)
+        RETURN Object.Get(SELF.Fields, name, "")
+    END FUNCTION
+
+    FUNCTION Render()
+        opcode = String(Fission_BytecodeOpcodeNumber(SELF.Mnemonic)) + " " + SELF.Mnemonic
+        IF SELF.Mnemonic == "CONST" THEN RETURN opcode + " " + SELF.Field("Dest") + " " + SELF.Field("Const")
+        IF SELF.Mnemonic == "LOAD" THEN RETURN opcode + " " + SELF.Field("Dest") + " " + SELF.Field("Local")
+        IF SELF.Mnemonic == "STORE" THEN RETURN opcode + " " + SELF.Field("Local") + " " + SELF.Field("Value")
+        IF SELF.Mnemonic == "BINARY" THEN RETURN opcode + " " + SELF.Field("Dest") + " " + SELF.Field("Op") + " " + SELF.Field("Left") + " " + SELF.Field("Right")
+        IF SELF.Mnemonic == "CALL_VALUE" THEN RETURN opcode + " " + SELF.Field("Dest") + " " + SELF.Field("Callee") + Fission_BytecodeArgsSuffix(SELF.Field("Args"))
+        IF SELF.Mnemonic == "CALL_RUNTIME" THEN RETURN opcode + " " + SELF.Field("Callee") + Fission_BytecodeArgsSuffix(SELF.Field("Args"))
+        IF SELF.Mnemonic == "JUMP" THEN RETURN opcode + " " + SELF.Field("Target")
+        IF SELF.Mnemonic == "BRANCH" THEN RETURN opcode + " " + SELF.Field("Condition") + " " + SELF.Field("Then") + " " + SELF.Field("Else")
+        IF SELF.Mnemonic == "RETURN" THEN
+            IF SELF.Field("Value") == "" THEN RETURN opcode + " " + SELF.Field("Type")
+            RETURN opcode + " " + SELF.Field("Type") + " " + SELF.Field("Value")
+        END IF
+        IF SELF.Mnemonic == "DECLARE_FUNCTION" THEN RETURN opcode + " " + SELF.Field("Name") + " params=" + SELF.Field("Params") + " returns=" + SELF.Field("Returns")
+        RETURN opcode + " " + String(SELF.Fields)
+    END FUNCTION
+END CLASS
+
+FUNCTION Fission_BytecodeArgsSuffix(argsText)
+    IF argsText == "" THEN RETURN ""
+    RETURN " " + argsText
+END FUNCTION
+
+CLASS FissionBytecodeBlock
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Instructions = []
+    END CONSTRUCTOR
+
+    FUNCTION Append(instruction)
+        ignored = Array.Push(SELF.Instructions, instruction)
+        RETURN instruction
+    END FUNCTION
+
+    FUNCTION Render()
+        lines = ["BLOCK " + SELF.Name]
+        FOR instruction IN SELF.Instructions
+            ignored = Array.Push(lines, instruction.Render())
+        NEXT
+        ignored = Array.Push(lines, "END BLOCK")
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS
+
+CLASS FissionBytecodeLocal
+    CONSTRUCTOR(name, typeName)
+        SELF.Name = name
+        SELF.Type = typeName
+    END CONSTRUCTOR
+END CLASS
+
+CLASS FissionBytecodeFunction
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.ReturnType = "I32"
+        SELF.Params = []
+        SELF.Locals = []
+        SELF.LocalIndex = {}
+        SELF.Blocks = []
+    END CONSTRUCTOR
+
+    ' First use of a name assigns the next free slot; later uses reuse it.
+    ' Every parameter is pre-registered (see FissionBytecodeBuilder.BeginFunction)
+    ' so its LOCALS entry lands at the same index as its PARAMS entry, matching
+    ' the legacy oracle's own layout.
+    FUNCTION SlotFor(name, typeName)
+        existing = Object.Get(SELF.LocalIndex, name, NULL)
+        IF existing != NULL THEN RETURN existing
+        index = LEN(SELF.Locals)
+        ignored = Array.Push(SELF.Locals, FissionBytecodeLocal(name, typeName))
+        SELF.LocalIndex = Object.Set(SELF.LocalIndex, name, index)
+        RETURN index
+    END FUNCTION
+
+    FUNCTION AddParam(name, typeName)
+        ignored = Array.Push(SELF.Params, FissionBytecodeLocal(name, typeName))
+        ignored = SELF.SlotFor(name, typeName)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION AddBlock(block)
+        ignored = Array.Push(SELF.Blocks, block)
+        RETURN block
+    END FUNCTION
+
+    FUNCTION RenderLocalEntry(index, local)
+        text = "L" + String(index) + " " + local.Name
+        IF local.Type != "" THEN text = text + " AS " + local.Type
+        RETURN text
+    END FUNCTION
+
+    FUNCTION Render()
+        ' The FUNCTION header line always carries RETURNS, regardless of
+        ' whether the function has parameters -- confirmed via
+        ' `ArcoFission reveal ... at BYTECODE`: `FUNCTION Sum RETURNS U64`
+        ' with PARAMS 2 as a separate following section, not folded into the
+        ' header line itself. An earlier version of this file conditioned
+        ' RETURNS on having zero params, a real bug caught only by actually
+        ' running the generated bytecode ("invalid bytecode FUNCTION line"),
+        ' not by inspecting the rendered text.
+        header = "FUNCTION " + SELF.Name + " RETURNS " + SELF.ReturnType
+        lines = [header]
+        IF LEN(SELF.Params) > 0 THEN
+            ignored = Array.Push(lines, "PARAMS " + String(LEN(SELF.Params)))
+            index = 0
+            FOR param IN SELF.Params
+                text = "P" + String(index) + " " + param.Name
+                IF param.Type != "" THEN text = text + " AS " + param.Type
+                ignored = Array.Push(lines, text)
+                index = index + 1
+            NEXT
+        ELSE
+            ignored = Array.Push(lines, "PARAMS 0")
+        END IF
+        ignored = Array.Push(lines, "LOCALS " + String(LEN(SELF.Locals)))
+        index = 0
+        FOR local IN SELF.Locals
+            ignored = Array.Push(lines, SELF.RenderLocalEntry(index, local))
+            index = index + 1
+        NEXT
+        FOR block IN SELF.Blocks
+            ignored = Array.Push(lines, block.Render())
+        NEXT
+        ignored = Array.Push(lines, "END FUNCTION")
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS
+
+CLASS FissionBytecodeModule
+    CONSTRUCTOR(name)
+        SELF.Name = name
+        SELF.Constants = []
+        SELF.ConstantIndex = {}
+        SELF.Functions = []
+        SELF.Diagnostics = FissionDiagnosticBag()
+    END CONSTRUCTOR
+
+    ' Deduped by rendered value text (matching the legacy oracle's own
+    ' module-wide constant pool -- confirmed via `reveal ... at BYTECODE`:
+    ' the literal `0` used both in `x = 0` and `x == 0` shares one K-slot).
+    FUNCTION InternConstant(valueText)
+        existing = Object.Get(SELF.ConstantIndex, valueText, NULL)
+        IF existing != NULL THEN RETURN "K" + String(existing)
+        index = LEN(SELF.Constants)
+        ignored = Array.Push(SELF.Constants, valueText)
+        SELF.ConstantIndex = Object.Set(SELF.ConstantIndex, valueText, index)
+        RETURN "K" + String(index)
+    END FUNCTION
+
+    FUNCTION AddFunction(fn)
+        ignored = Array.Push(SELF.Functions, fn)
+        RETURN fn
+    END FUNCTION
+
+    FUNCTION Render()
+        lines = ["ARCOFISSION BYTECODE", "FORMAT .arcof-text", "VERSION 0", "SOURCE \"" + SELF.Name + "\"", ""]
+        ignored = Array.Push(lines, "CONSTANTS " + String(LEN(SELF.Constants)))
+        index = 0
+        FOR value IN SELF.Constants
+            ignored = Array.Push(lines, "K" + String(index) + " " + value)
+            index = index + 1
+        NEXT
+        ignored = Array.Push(lines, "END CONSTANTS")
+        ignored = Array.Push(lines, "")
+        FOR fn IN SELF.Functions
+            ignored = Array.Push(lines, fn.Render())
+            ignored = Array.Push(lines, "")
+        NEXT
+        RETURN Array.Join(lines, "\n")
+    END FUNCTION
+END CLASS

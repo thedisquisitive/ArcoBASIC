@@ -386,14 +386,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_parse_smoke")"
 
-grep -q "^80$" <<<"$fission_self_output"
+grep -q "^83$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_semantic_smoke")"
 
-grep -q "^80$" <<<"$fission_self_semantic_output"
-grep -q "^118$" <<<"$fission_self_semantic_output"
-grep -q "^2301$" <<<"$fission_self_semantic_output"
+grep -q "^83$" <<<"$fission_self_semantic_output"
+grep -q "^123$" <<<"$fission_self_semantic_output"
+grep -q "^2428$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -487,6 +487,23 @@ grep -q "^BLOCK ForInc6$" <<<"$amir_for_output"
 grep -q "^    %t16 := + %t14, %t15$" <<<"$amir_for_output"
 grep -q "^BLOCK ForEnd7$" <<<"$amir_for_output"
 grep -q "^    %t17 := CONST \"hello\"$" <<<"$amir_for_output"
+
+# This one runs the produced bytecode through the real legacy VM
+# (`ArcoFission run`) and checks its actual printed output -- true
+# end-to-end functional verification (Source.arcobasic -> Fission SIR ->
+# Fission A-MIR -> Fission bytecode -> real execution), not just a
+# rendered-text comparison the way the A-MIR checks above are.
+bytecode_full_output="$("$SOURCE_DIR/build-rivet/fission/tests/amir_to_bytecode_smoke")"
+
+test "$(grep -c "^FALSE$" <<<"$bytecode_full_output")" = "3"
+grep -q "^ARCOFISSION BYTECODE$" <<<"$bytecode_full_output"
+grep -q "^FUNCTION Sum RETURNS U64$" <<<"$bytecode_full_output"
+bytecode_smoke_arcof="$(mktemp /tmp/fission_bytecode_smoke.XXXXXX.arcof)"
+trap 'rm -f "$bytecode_smoke_arcof"' EXIT
+sed -n '/^ARCOFISSION BYTECODE$/,$p' <<<"$bytecode_full_output" > "$bytecode_smoke_arcof"
+bytecode_run_output="$("$SOURCE_DIR/build-rivet/ArcoFission" run "$bytecode_smoke_arcof")"
+expected_bytecode_run_output="$(printf '1\n2\n3\nhello\n10')"
+test "$bytecode_run_output" = "$expected_bytecode_run_output"
 
 self_loop_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_loop_semantic_smoke")"
 

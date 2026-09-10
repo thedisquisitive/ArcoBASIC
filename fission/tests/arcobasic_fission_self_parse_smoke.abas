@@ -1,6 +1,7 @@
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 
 Files = [
+    "fission/amir/lower_bytecode.abas",
     "fission/amir/model.abas",
     "fission/cli/fission.abas",
     "fission/core/artifact.abas",
@@ -23,11 +24,13 @@ Files = [
     "fission/language/arcobasic/semantic.abas",
     "fission/modules/arcobasic_frontend/main.abas",
     "fission/sir/builder.abas",
+    "fission/bytecode/model.abas",
     "fission/sir/lower_amir.abas",
     "fission/sir/model.abas",
     "fission/sir/semantics.abas",
     "fission/sir/serialize.abas",
     "fission/sir/validate.abas",
+    "fission/tests/amir_to_bytecode_smoke.abas",
     "fission/tests/arcobasic_access_interface_smoke.abas",
     "fission/tests/arcobasic_binding_semantic_smoke.abas",
     "fission/tests/arcobasic_call_statement_smoke.abas",

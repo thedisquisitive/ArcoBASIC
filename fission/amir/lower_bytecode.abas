@@ -1,0 +1,108 @@
+#IMPORT "fission/bytecode/model.abas"
+#IMPORT "fission/sir/lower_amir.abas"
+
+' A-MIR -> bytecode lowering (WP-007). Mostly a mechanical, instruction-by-
+' instruction translation -- both A-MIR and bytecode already use the same
+' %tN temp references for intermediate values (confirmed via
+' `ArcoFission reveal ... at BYTECODE`: temps are never renumbered or
+' converted to locals, only named STORE/LOAD targets get LOCAL slots), so no
+' temp-renaming or renumbering is needed here, and blocks keep their A-MIR
+' names unchanged so JUMP/BRANCH targets carry over directly. See
+' fission/bytecode/model.abas's own header for the deliberate
+' unoptimized-but-correct scope of this pass (no STORE_CONST/BINARY_LOCAL_*
+' fusion).
+
+' The bytecode BINARY opcode always uses the bare operator symbol regardless
+' of whether A-MIR chose a typed INT.* opcode or the untyped fallback for the
+' same operation (confirmed: A-MIR's `INT.CMP_EQ %t5, %t6 [,]` and bytecode's
+' `BINARY %t7 == %t5 %t6` are the SAME source comparison). A-MIR's own Op
+' field holds whichever of the two it picked, so this reverses just the
+' typed-opcode names back to their bare symbol; anything else (the untyped
+' path, which is already bare) passes through unchanged.
+FUNCTION Fission_BytecodeBareOperator(amirOp)
+    IF amirOp == "INT.ADD" THEN RETURN "+"
+    IF amirOp == "INT.SUB" THEN RETURN "-"
+    IF amirOp == "INT.MUL" THEN RETURN "*"
+    IF amirOp == "INT.CMP_EQ" THEN RETURN "=="
+    IF amirOp == "INT.CMP_NE" THEN RETURN "!="
+    IF amirOp == "INT.CMP_LT_UNSIGNED" THEN RETURN "<"
+    IF amirOp == "INT.CMP_LE_UNSIGNED" THEN RETURN "<="
+    IF amirOp == "INT.CMP_GT_UNSIGNED" THEN RETURN ">"
+    IF amirOp == "INT.CMP_GE_UNSIGNED" THEN RETURN ">="
+    RETURN amirOp
+END FUNCTION
+
+FUNCTION Fission_BytecodeLocalRef(fn, name)
+    RETURN "L" + String(fn.SlotFor(name, ""))
+END FUNCTION
+
+FUNCTION Fission_BytecodeLowerInstruction(module, fn, block, amirInstruction)
+    kind = amirInstruction.Kind
+    IF kind == "Const" THEN
+        constRef = module.InternConstant(amirInstruction.Field("Value"))
+        ignored = block.Append(FissionBytecodeInstruction("CONST").WithField("Dest", amirInstruction.Field("Dest")).WithField("Const", constRef))
+        RETURN
+    END IF
+    IF kind == "Load" THEN
+        ignored = block.Append(FissionBytecodeInstruction("LOAD").WithField("Dest", amirInstruction.Field("Dest")).WithField("Local", Fission_BytecodeLocalRef(fn, amirInstruction.Field("Name"))))
+        RETURN
+    END IF
+    IF kind == "Store" THEN
+        ignored = block.Append(FissionBytecodeInstruction("STORE").WithField("Local", Fission_BytecodeLocalRef(fn, amirInstruction.Field("Name"))).WithField("Value", amirInstruction.Field("Value")))
+        RETURN
+    END IF
+    IF kind == "BinOp" THEN
+        op = Fission_BytecodeBareOperator(amirInstruction.Field("Op"))
+        ignored = block.Append(FissionBytecodeInstruction("BINARY").WithField("Dest", amirInstruction.Field("Dest")).WithField("Op", op).WithField("Left", amirInstruction.Field("Left")).WithField("Right", amirInstruction.Field("Right")))
+        RETURN
+    END IF
+    IF kind == "Call" THEN
+        ignored = block.Append(FissionBytecodeInstruction("CALL_VALUE").WithField("Dest", amirInstruction.Field("Dest")).WithField("Callee", amirInstruction.Field("Callee")).WithField("Args", amirInstruction.Field("Args")))
+        RETURN
+    END IF
+    IF kind == "CallVoid" THEN
+        ignored = block.Append(FissionBytecodeInstruction("CALL_RUNTIME").WithField("Callee", amirInstruction.Field("Callee")).WithField("Args", amirInstruction.Field("Args")))
+        RETURN
+    END IF
+    IF kind == "Branch" THEN
+        ignored = block.Append(FissionBytecodeInstruction("BRANCH").WithField("Condition", amirInstruction.Field("Condition")).WithField("Then", amirInstruction.Field("Then")).WithField("Else", amirInstruction.Field("Else")))
+        RETURN
+    END IF
+    IF kind == "Jump" THEN
+        ignored = block.Append(FissionBytecodeInstruction("JUMP").WithField("Target", amirInstruction.Field("Target")))
+        RETURN
+    END IF
+    IF kind == "Return" THEN
+        ignored = block.Append(FissionBytecodeInstruction("RETURN").WithField("Type", amirInstruction.Field("Type")).WithField("Value", amirInstruction.Field("Value")))
+        RETURN
+    END IF
+    IF kind == "DeclareFunction" THEN
+        ignored = block.Append(FissionBytecodeInstruction("DECLARE_FUNCTION").WithField("Name", amirInstruction.Field("Name")).WithField("Params", amirInstruction.Field("Params")).WithField("Returns", amirInstruction.Field("Returns")))
+        RETURN
+    END IF
+    ignored = module.Diagnostics.ReportError("FISSION_BYTECODE_UNSUPPORTED", "Unsupported A-MIR instruction for bytecode lowering: " + kind)
+END FUNCTION
+
+FUNCTION Fission_BytecodeLowerFunction(module, amirFunction)
+    fn = FissionBytecodeFunction(amirFunction.Name)
+    fn.ReturnType = amirFunction.ReturnType
+    FOR param IN amirFunction.Params
+        ignored = fn.AddParam(param.Name, param.Type)
+    NEXT
+    FOR amirBlock IN amirFunction.Blocks
+        block = fn.AddBlock(FissionBytecodeBlock(amirBlock.Name))
+        FOR instruction IN amirBlock.Instructions
+            ignored = Fission_BytecodeLowerInstruction(module, fn, block, instruction)
+        NEXT
+    NEXT
+    RETURN fn
+END FUNCTION
+
+FUNCTION Fission_AmirToBytecode(amirModule)
+    module = FissionBytecodeModule(amirModule.Name)
+    FOR amirFunction IN amirModule.Functions
+        ignored = module.AddFunction(Fission_BytecodeLowerFunction(module, amirFunction))
+    NEXT
+    ignored = module.Diagnostics.AppendMany(amirModule.Diagnostics)
+    RETURN module
+END FUNCTION
