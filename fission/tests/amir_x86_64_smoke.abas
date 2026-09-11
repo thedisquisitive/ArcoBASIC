@@ -55,3 +55,49 @@ ArraySir = Fission_ArcoBasicAstToSir(ArrayAst)
 ArrayAmir = Fission_SirToAmir(ArraySir)
 ArrayProgram = Fission_AmirToX86_64(ArrayAmir)
 PRINT ArrayProgram.Diagnostics.HasErrors()
+
+' Phase 3: real user-declared FUNCTIONs, a genuine SysV-shaped calling
+' convention (arguments in %rdi/%rsi/..., return value in %rax), and real
+' recursion -- verified separately by real execution
+' (fission/tests/native_programs/fibonacci.abas, a real recursive Fib).
+' Checked here: zero diagnostics, and that both functions' own "Entry"
+' blocks get distinct, function-prefixed labels (Sum_Entry/Fib_Entry) so
+' they never collide with each other or with Main's own bare "Entry".
+FuncSource = "FUNCTION Sum(a, b)\n    RETURN a + b\nEND FUNCTION\n\nFUNCTION Fib(n)\n    IF n <= 1 THEN\n        RETURN n\n    END IF\n    RETURN Fib(n - 1) + Fib(n - 2)\nEND FUNCTION\n\nPRINT Sum(3, 4)\nPRINT Fib(10)"
+FuncTokens = Fission_ArcoBasicLex(FuncSource)
+FuncAst = Fission_ArcoBasicParse(FuncTokens, "x86-64-func-smoke.abas")
+FuncSir = Fission_ArcoBasicAstToSir(FuncAst)
+FuncAmir = Fission_SirToAmir(FuncSir)
+FuncProgram = Fission_AmirToX86_64(FuncAmir)
+PRINT FuncProgram.Diagnostics.HasErrors()
+PRINT FuncProgram.Diagnostics.Render()
+FuncAssembly = FuncProgram.Render()
+PRINT String.Contains(FuncAssembly, "Sum:")
+PRINT String.Contains(FuncAssembly, "Sum_Entry:")
+PRINT String.Contains(FuncAssembly, "Fib_Entry:")
+PRINT String.Contains(FuncAssembly, "call Sum")
+PRINT String.Contains(FuncAssembly, "call Fib")
+PRINT String.Contains(FuncAssembly, "leave")
+
+' A real, disclosed limit: more than 6 parameters/arguments (SysV
+' register-passed only, no stack-passed arguments yet) must report a
+' diagnostic, not silently drop or misassign an argument.
+TooManyParamsSource = "FUNCTION Seven(a, b, c, d, e, f, g)\n    RETURN a\nEND FUNCTION\nPRINT Seven(1, 2, 3, 4, 5, 6, 7)"
+TooManyParamsTokens = Fission_ArcoBasicLex(TooManyParamsSource)
+TooManyParamsAst = Fission_ArcoBasicParse(TooManyParamsTokens, "x86-64-too-many-params-smoke.abas")
+TooManyParamsSir = Fission_ArcoBasicAstToSir(TooManyParamsAst)
+TooManyParamsAmir = Fission_SirToAmir(TooManyParamsSir)
+TooManyParamsProgram = Fission_AmirToX86_64(TooManyParamsAmir)
+PRINT TooManyParamsProgram.Diagnostics.HasErrors()
+
+' Calling a name that isn't a user-declared ArcoBASIC function (and isn't
+' Runtime.Print) must report a diagnostic instead of emitting a `call` to
+' an undefined symbol and letting the failure surface later, more
+' confusingly, at link time.
+UnknownCallSource = "PRINT UnknownFunc(1, 2)"
+UnknownCallTokens = Fission_ArcoBasicLex(UnknownCallSource)
+UnknownCallAst = Fission_ArcoBasicParse(UnknownCallTokens, "x86-64-unknown-call-smoke.abas")
+UnknownCallSir = Fission_ArcoBasicAstToSir(UnknownCallAst)
+UnknownCallAmir = Fission_SirToAmir(UnknownCallSir)
+UnknownCallProgram = Fission_AmirToX86_64(UnknownCallAmir)
+PRINT UnknownCallProgram.Diagnostics.HasErrors()

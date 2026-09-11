@@ -47,23 +47,25 @@ identical source exactly. See Completed Components for the full writeup,
 including the real binary-vs-text bytecode format distinction this
 uncovered, and three genuine Rivet bugs found and fixed along the way (a
 caching bug and two target-wiring bugs).
-**WP-009/013 first real slice landed: genuine x86-64 native codegen with NO
-embedded bytecode VM at all.** `fission/amir/lower_x86_64.abas` lowers A-MIR
-straight to GAS assembly text (delegating instruction encoding and linking
-to the system `as`/`ld` toolchain, the same "reuse mechanical tooling"
-scope decision this ledger already made for WP-012); `fission/cli/
-compile_to_x86_64.abas` + `FissionNativeCapsuleTarget` (rivet/stdlib/
-rivet.abas) turn that into a real, cached `rivet build` target producing a
-genuinely standalone, freestanding (`_start`, no libc/CRT) ELF64. Verified
-via real execution -- `fission/tests/native_programs/hello_native.abas`
-runs correctly with output matching legacy `ArcoFission compile-run`.
-Current scope is deliberately small and fully disclosed: PRINT of a string
-literal only (see lower_x86_64.abas's own header comment). **WP-010 (SysV
-ABI -- real calling convention across more than one function) and WP-011
-(Linux Runtime -- everything beyond hand-rolled codegen: variables,
-arithmetic, control flow, strings/arrays/objects, function calls) are still
-both real, almost entirely untouched, separately-sized follow-on work** --
-see "Next Recommended Work" item E.
+**Native x86-64 codegen with NO embedded bytecode VM at all, through Phase
+3.** `fission/amir/lower_x86_64.abas` lowers A-MIR straight to GAS assembly
+text (delegating instruction encoding and linking to the system `as`/`ld`
+toolchain, the same "reuse mechanical tooling" scope decision this ledger
+already made for WP-012); `fission/cli/compile_to_x86_64.abas` +
+`FissionNativeCapsuleTarget` (rivet/stdlib/rivet.abas) turn that into a
+real, cached `rivet build` target producing genuinely standalone,
+freestanding (`_start`, no libc/CRT) ELF64s. Phase 1: PRINT of a string
+literal. Phase 2: variables, arithmetic, comparisons, IF/WHILE/FOR over
+plain numbers, PRINT of a computed integer -- real FizzBuzz runs natively.
+**Phase 3: real user-declared ArcoBASIC FUNCTIONs, a genuine SysV-shaped
+integer calling convention (up to 6 parameters in `%rdi`/`%rsi`/`%rdx`/
+`%rcx`/`%r8`/`%r9`, return value in `%rax`), and real recursion** -- a
+genuinely recursive Fibonacci runs natively, output matching legacy
+`ArcoFission compile-run` exactly. **WP-011 (Linux Runtime -- strings
+beyond a literal, arrays, objects, the general host-function bridge for
+everything this backend cannot hand-roll itself) remains real, almost
+entirely untouched, separately-sized follow-on work** -- see "Next
+Recommended Work" item E.
 
 ## Current Work Package
 
@@ -691,6 +693,75 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   file/edge counts unchanged, only the symbol count moved). Integration
   suite gained a FizzBuzz assertion (real output + oracle comparison). Full
   suite and `fissure run --full` both passing.
+- Native x86-64 codegen Phase 3: real user-declared ArcoBASIC FUNCTIONs, a
+  genuine SysV-shaped integer calling convention, and real recursion --
+  requested directly right after Phase 2 landed ("Let's keep it coming,
+  baby."). Up to 6 numeric parameters passed in SysV's own first six
+  integer argument registers (`%rdi`/`%rsi`/`%rdx`/`%rcx`/`%r8`/`%r9`, in
+  order -- a disclosed limit, not silently wrong: a 7th parameter or
+  argument reports a real diagnostic, stack-passed arguments are real,
+  unstarted follow-on work), a real return value in `%rax`, and a genuine
+  per-call stack frame (`push %rbp; mov %rsp,%rbp; sub $FRAME,%rsp` /
+  `leave; ret`) for every function, Main included (Main's own "frame" is
+  its `_start` prologue, unchanged from Phase 1/2, and still exits via
+  syscall rather than `ret` -- it is the process entry point, never
+  `call`ed).
+  `fission/amir/lower_x86_64.abas`'s per-function lowering
+  (`Fission_X86_64LowerFunction`, generalized from the old Phase-2-only
+  `Fission_X86_64LowerMain`) now runs once per function in the A-MIR
+  module, not just for Main: `DECLARE_FUNCTION` (present inline in Main's
+  own body wherever a FUNCTION is declared) is a no-op; a `CALL`/`CallVoid`
+  whose callee isn't `Runtime.Print` is checked against the module's own
+  set of declared function names (`Fission_X86_64CollectFunctionNames`) --
+  an unresolvable callee is a real diagnostic now, not a `call` to an
+  undefined symbol left to fail later, more confusingly, at link time --
+  then its arguments are loaded into the SysV argument registers in order
+  and a real `call` emitted; `RETURN` outside Main resolves its own operand
+  into `%rax` (unlike Main's own synthesized `RETURN I32 0`, a real
+  user-written function's `RETURN VALUE <operand>` can be any resolvable
+  operand) and closes with `leave`/`ret` instead of Main's exit syscall.
+  Every function's own block labels (every function has its own "Entry",
+  every IF/WHILE/FOR desugars to the same block-name scheme) are prefixed
+  with the function's own name (`Fib_IfThen0`, not bare `IfThen0`) so two
+  different functions' same-named blocks never collide in the single flat
+  `.text` section -- Main's own blocks stay bare, unchanged, so this
+  session's already-tested Phase 1/2 output is byte-identical to before.
+  `Fission_X86_64CollectNumericSlots` now seeds a function's own declared
+  parameters into its numeric-slot table before scanning its body, so an
+  unused parameter still gets a real slot to spill its incoming argument
+  register into during the prologue. Rodata string-constant labels
+  (`str0`, `str1`, ...) and whether the shared `itoa_print` helper is
+  needed are now threaded as explicit module-wide state
+  (`Fission_AmirToX86_64`'s own `context`, passed into and mutated by every
+  function's lowering call) rather than being local to one function's own
+  lowering pass, since a string label must stay unique module-wide (a
+  program can `PRINT` a string literal from inside more than one function)
+  and `itoa_print` is emitted once, shared, regardless of which function(s)
+  actually call it. Confirmed empirically (a real probe, not assumed) that
+  this language's plain `{...}` object literals DO have reference
+  semantics when passed as a function parameter -- a mutation through the
+  parameter alias is visible to the caller -- before relying on that for
+  `context`'s own threading.
+  Verified via real execution against a genuinely recursive program:
+  `fission/tests/native_programs/fibonacci.abas` (`FUNCTION Fib(n)`
+  calling itself, plus a second `Sum(a, b)` function, inside a `FOR` loop)
+  -- compiled entirely by this substrate, assembled/linked via `as`/`ld`,
+  run as a real standalone ELF64, byte-for-byte identical to legacy
+  `ArcoFission compile-run` on the same source. Also directly stress-tested
+  (not committed as fixtures, but run for real during this work): a
+  recursive `Factorial`, a 6-parameter function (the max), a 7-parameter
+  function (correctly diagnostic-failed instead of miscompiling), and a
+  call to an undeclared function name (correctly diagnostic-failed instead
+  of emitting a broken `call`).
+  `fission/tests/amir_x86_64_smoke.abas` extended to cover multi-function
+  lowering directly (zero diagnostics; asserts the function-prefixed block
+  labels and `call`/`leave` sequences are actually present in the rendered
+  assembly text) plus the two new diagnostic paths (too many parameters/
+  arguments, an unresolvable callee). Self-parse/self-semantic corpus grew
+  with the new helper functions (91 files, 138 import edges, 2827 symbols,
+  0 diagnostics -- file/edge counts unchanged). Integration suite gained a
+  Fibonacci assertion (real output + oracle comparison). Full suite and
+  `fissure run --full` both passing.
 
 ## In-Progress Components
 
@@ -1118,6 +1189,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/build/rivet_native_capsules.abas`
 - `fission/tests/native_programs/hello_native.abas`
 - `fission/tests/native_programs/fizzbuzz.abas`
+- `fission/tests/native_programs/fibonacci.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
 - `build.abas`
@@ -1325,38 +1397,41 @@ D. DONE, including the Rivet build-graph target -- see Completed Components.
    Compiler Substrate become a real standalone executable"), the answer is
    now genuinely yes.
 E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
-   runtime, i.e. no embedded bytecode VM at all). **Phase 1 AND Phase 2
+   runtime, i.e. no embedded bytecode VM at all). **Phases 1, 2, AND 3
    DONE -- see Completed Components**: `fission/amir/lower_x86_64.abas` +
    `fission/cli/compile_to_x86_64.abas` + `FissionNativeCapsuleTarget`
    produce real, standalone, execution-verified freestanding ELF64s for
-   PRINT of string literals (Phase 1) plus variables, arithmetic (`+`/`-`/
-   `*`/`MOD`), comparisons, `IF`/`WHILE`/`FOR`-range, and PRINT of a
-   computed integer (Phase 2) -- no embedded bytecode VM, no legacy
+   PRINT of string literals (Phase 1); variables, arithmetic (`+`/`-`/`*`/
+   `MOD`), comparisons, `IF`/`WHILE`/`FOR`-range, and PRINT of a computed
+   integer (Phase 2); and now real user-declared FUNCTIONs with a genuine
+   SysV-shaped calling convention (up to 6 numeric parameters in
+   `%rdi`/`%rsi`/`%rdx`/`%rcx`/`%r8`/`%r9`, return value in `%rax`) and
+   real recursion (Phase 3) -- no embedded bytecode VM, no legacy
    ArcoFission involvement in the compile itself (only `as`/`ld`).
-   Real FizzBuzz runs as a genuine standalone x86-64 binary today. What's
-   still real, almost entirely untouched, and each its own substantial
-   undertaking on its own:
-   - WP-010 SysV ABI: real function calls -- argument registers (RDI/RSI/
-     RDX/RCX/R8/R9), stack alignment, prologue/epilogue, return values.
-     Needed the moment a program declares more than just Main. (The
-     internal `itoa_print` helper added in Phase 2 uses real `call`/`ret`
-     but a minimal ad-hoc convention of this pass's own invention, NOT
-     this -- explicitly disclosed as such in its own comment.)
+   Real FizzBuzz and a real recursive Fibonacci both run as genuine
+   standalone x86-64 binaries today. What's still real, almost entirely
+   untouched, and each its own substantial undertaking on its own:
+   - More than 6 parameters/arguments: real SysV allows this via stack-
+     passed arguments; this backend currently reports a diagnostic instead
+     (disclosed, not silently wrong, but a real gap for a function with a
+     large parameter list).
    - WP-011 Linux Runtime: everything this backend cannot hand-roll itself
      -- strings beyond a literal (concatenation, length, slicing, string
-     variables -- currently a variable ever assigned a string correctly
-     reports a diagnostic rather than compiling wrong, see Completed
-     Components' "real safety gap" writeup), arrays, objects/classes, and a
-     real fallback to the existing ~244-entry host-function dispatch table
-     for anything else (legacy's own `arco_call_host`/`host_bridge.cpp`
-     bridge is the reference for this, though porting it into the
-     substrate rather than linking against it directly is itself a real
-     design decision to make, not just a port).
+     variables/parameters/return values -- currently a variable ever
+     assigned a string correctly reports a diagnostic rather than compiling
+     wrong, see Completed Components' "real safety gap" writeup), arrays,
+     objects/classes, and a real fallback to the existing ~244-entry
+     host-function dispatch table for anything else (legacy's own
+     `arco_call_host`/`host_bridge.cpp` bridge is the reference for this,
+     though porting it into the substrate rather than linking against it
+     directly is itself a real design decision to make, not just a port).
    - DO loops and ForEach: not yet lowered by this backend at all (only
      IF/WHILE/FOR-range are) -- likely straightforward given they already
      desugar to the same Branch/Jump primitives once written, following
-     FOR-range's own "needed zero dedicated codegen" precedent, but not
-     confirmed yet.
+     FOR-range's own "needed zero dedicated codegen" precedent (confirmed
+     twice now: FOR-range in Phase 2, and ordinary function calls needing
+     no extra Branch/Jump work at all beyond what Phase 2 already had, in
+     Phase 3), but not confirmed yet for DO/ForEach specifically.
    The existing experimental legacy native backend
    (`ArcoFission build FILE -o OUT --target linux-x86_64`,
    `.agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md`) is worth reading

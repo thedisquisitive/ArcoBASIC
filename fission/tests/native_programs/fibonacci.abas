@@ -1,0 +1,29 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. This one exercises Phase 3's own
+' construct set: real user-declared FUNCTIONs, a genuine SysV-shaped
+' calling convention (arguments in %rdi/%rsi/..., return value in %rax,
+' independent stack frames per call), and real recursion -- each call gets
+' its own frame on the actual hardware call stack.
+'
+' Recursive Fibonacci, 0 through 12, plus one direct check that a
+' multi-parameter call and a deeper recursive call both still land on the
+' right stack frame. Expected output verified against legacy
+' `ArcoFission compile-run` on this identical source as the equivalence-
+' testing oracle.
+FUNCTION Fib(n)
+    IF n <= 1 THEN
+        RETURN n
+    END IF
+    RETURN Fib(n - 1) + Fib(n - 2)
+END FUNCTION
+
+FUNCTION Sum(a, b)
+    RETURN a + b
+END FUNCTION
+
+FOR i = 0 TO 12
+    PRINT Fib(i)
+NEXT
+PRINT Sum(Fib(10), Fib(11))

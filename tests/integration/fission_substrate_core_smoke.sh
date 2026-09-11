@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^91$" <<<"$fission_self_semantic_output"
 grep -q "^138$" <<<"$fission_self_semantic_output"
-grep -q "^2785$" <<<"$fission_self_semantic_output"
+grep -q "^2827$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -631,5 +631,14 @@ expected_fizzbuzz_output="$(printf '1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\
 test "$fizzbuzz_native_output" = "$expected_fizzbuzz_output"
 oracle_fizzbuzz_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/fizzbuzz.abas")"
 test "$fizzbuzz_native_output" = "$oracle_fizzbuzz_output"
+
+# fission/tests/native_programs/fibonacci.abas exercises native codegen's Phase 3 construct set:
+# real user-declared FUNCTIONs, a genuine SysV-shaped calling convention (arguments in
+# %rdi/%rsi/..., return value in %rax, independent stack frames per call), and real recursion.
+fibonacci_native_output="$("$SOURCE_DIR/build/fission-native-programs/fibonacci")"
+expected_fibonacci_output="$(printf '0\n1\n1\n2\n3\n5\n8\n13\n21\n34\n55\n89\n144\n144')"
+test "$fibonacci_native_output" = "$expected_fibonacci_output"
+oracle_fibonacci_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/fibonacci.abas")"
+test "$fibonacci_native_output" = "$oracle_fibonacci_output"
 
 echo "fission_substrate_core_smoke: all checks passed"
