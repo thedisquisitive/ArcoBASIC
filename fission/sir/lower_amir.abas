@@ -133,6 +133,30 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
         ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", temp).WithField("Value", constText))
         RETURN {Value: temp, Type: ""}
     END IF
+    IF node.Kind == "Unary" THEN
+        ' The legacy oracle emits a dedicated `INT.NEG` unary A-MIR
+        ' instruction for `-x` (confirmed via `ArcoFission reveal ... at
+        ' A-MIR` on a real `x = -5` program) -- this lowers it as `0 - x`
+        ' (an ordinary BinOp) instead, a deliberate, disclosed divergence
+        ' from the oracle's own structural shape rather than adding a whole
+        ' new A-MIR instruction kind (with its own bytecode and native
+        ' x86-64 lowering) for one operator. Semantically identical, not
+        ' byte-identical -- the same "unfused, not byte-for-byte" scope
+        ' choice this substrate already makes elsewhere (see e.g.
+        ' fission/bytecode/model.abas's own header comment). Only unary
+        ' `-` is handled; `NOT`/`!`/ADDRESSOF/COPY unary forms remain a
+        ' real, disclosed gap, same as before this fix.
+        operator = Object.Get(node.Fields, "Operator", "")
+        IF operator == "-" THEN
+            operand = Fission_AmirLowerExpr(builder, node.Children[0])
+            zeroTemp = builder.NewTemp()
+            ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", zeroTemp).WithField("Value", "0"))
+            resultTemp = builder.NewTemp()
+            ignored = builder.Emit(FissionAmirInstruction("BinOp").WithField("Dest", resultTemp).WithField("Op", "-").WithField("Left", zeroTemp).WithField("Right", operand.Value).WithField("LeftType", "").WithField("RightType", ""))
+            RETURN {Value: resultTemp, Type: operand.Type}
+        END IF
+        RETURN Fission_AmirUnsupportedExpr(builder, "unary operator " + operator)
+    END IF
     IF node.Kind == "Read" THEN
         name = Object.Get(node.Fields, "Name", "")
         temp = builder.NewTemp()

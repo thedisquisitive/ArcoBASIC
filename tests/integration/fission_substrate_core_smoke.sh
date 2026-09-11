@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^91$" <<<"$fission_self_semantic_output"
 grep -q "^138$" <<<"$fission_self_semantic_output"
-grep -q "^2891$" <<<"$fission_self_semantic_output"
+grep -q "^2914$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -667,5 +667,16 @@ expected_concat_output="$(printf 'Hello, World!\nHi Alice, welcome!\nxxxxx\nfoob
 test "$concat_native_output" = "$expected_concat_output"
 oracle_concat_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/concat.abas")"
 test "$concat_native_output" = "$oracle_concat_output"
+
+# fission/tests/native_programs/do_loops.abas exercises all four DO loop shapes (needed zero
+# dedicated codegen, the same "already works" precedent FOR-range set) plus real negative-number
+# arithmetic, comparisons, and unary minus -- which is what actually exposed two real bugs (a
+# wrong unsigned comparison instruction, and unary minus never being lowered at all) while
+# confirming DO loops.
+do_loops_native_output="$("$SOURCE_DIR/build/fission-native-programs/do_loops")"
+expected_do_loops_output="$(printf '1\n2\n3\n1\n2\n3\n10\n7\n4\n1\n1\n2\n3\n5\n3\n1\n-1\n-3\n-7\n400')"
+test "$do_loops_native_output" = "$expected_do_loops_output"
+oracle_do_loops_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/do_loops.abas")"
+test "$do_loops_native_output" = "$oracle_do_loops_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

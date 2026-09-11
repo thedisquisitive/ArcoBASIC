@@ -70,11 +70,17 @@ copy one string variable into another), represented as a pointer to
 CONCATENATION** -- `a + b` between two strings genuinely builds a new
 string at runtime via a bump allocator into a fixed `.bss` arena, chained
 and reused freely, exercised for real inside a WHILE-loop accumulator.
-Strings as function parameters/return values, string comparison, and
-branching on a string each remain their own real, disclosed diagnostic-
-reported gap rather than silently wrong behavior. **WP-011 (Linux Runtime
--- arrays, objects, the general host-function bridge for everything else
-this backend cannot hand-roll itself) remains real, substantial follow-on
+**DO loops (all four shapes) confirmed working with zero dedicated
+codegen**, the same precedent FOR-range set -- and confirming it directly
+found two real bugs, both fixed: comparisons used the wrong (unsigned) x86
+instruction family, so a negative-number `DO UNTIL` loop never terminated;
+and unary minus (`-5`) was never lowered by A-MIR at all (a shared bug,
+also affecting the bytecode backend). Strings as function parameters/
+return values, string comparison, and branching on a string each remain
+their own real, disclosed diagnostic-reported gap rather than silently
+wrong behavior. **WP-011 (Linux Runtime -- arrays, objects, the general
+host-function bridge for everything else this backend cannot hand-roll
+itself) remains real, substantial follow-on
 work** -- see "Next
 Recommended Work" item E.
 
@@ -946,6 +952,74 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   function and subroutine (91 files, 138 import edges, 2891 symbols, 0
   diagnostics). Integration suite gained a `concat` assertion. Verified
   with plain `fissure run`.
+- Confirmed DO loops (all four shapes -- pre-condition `DO WHILE`/`DO
+  UNTIL`, post-condition `LOOP WHILE`/`LOOP UNTIL`) need zero dedicated
+  native x86-64 codegen at all -- the same "already works" precedent
+  FOR-range set in Phase 2, now confirmed a second time. This was the
+  session's own last remaining item explicitly flagged as "likely
+  straightforward... but not confirmed yet" for the construct-coverage
+  side of native codegen.
+  **Confirming it directly (not just assuming) found two real, unrelated
+  bugs, both fixed the same session:**
+  1. A real, serious native-codegen-only bug: comparisons used the WRONG
+     x86 `set*` instruction family. A-MIR always picks the typed
+     `INT.CMP_*_UNSIGNED` opcode family for every comparison, regardless of
+     whether the operand is actually unsigned (already documented, this
+     session, as a known A-MIR quirk) -- but this backend had been treating
+     that "_UNSIGNED" suffix as a real runtime semantic worth honoring with
+     genuinely unsigned `set*` instructions (`setbe`/`setb`/`seta`/`setae`).
+     It is not: a `DO UNTIL k <= 0 ... k = k - 3 ... LOOP` counting a
+     variable through zero into negative numbers never terminated, because
+     `setbe` treats a negative number's two's-complement bit pattern as an
+     enormous positive one, so "k <= 0" was never true once `k` went
+     negative -- confirmed via `timeout` directly (a genuinely hanging
+     process, not a slow one). Confirmed against the real canonical oracle
+     (legacy ArcoFission's own bytecode VM, this whole project's actual
+     execution-semantics ground truth) that ArcoBASIC's real comparisons
+     are signed regardless of the A-MIR opcode name: `fission/amir/
+     lower_bytecode.abas`'s own `Fission_BytecodeBareOperator` always
+     reduces `INT.CMP_LE_UNSIGNED` and its siblings back to the bare
+     comparison symbol before the VM ever executes anything, and
+     `ArcoFission compile-run` on the exact failing program terminates
+     correctly (10/7/4/1, then stops). Fixed by using the SAME signed
+     `set*` instruction (`setle`/`setl`/`setg`/`setge`) for both the bare
+     and the typed "_UNSIGNED" opcode spelling of each comparison --
+     `Fission_X86_64SetInstructionForOp`'s own comment now records the
+     full investigation so a future agent does not "fix" this back based
+     on the opcode's own misleading name.
+  2. A real, separate, SHARED-substrate bug (affects both the bytecode and
+     native backends, since both lower from the same `fission/sir/
+     lower_amir.abas`): unary minus (`-5`) was never lowered by A-MIR at
+     all -- fell straight through to a generic "unsupported expression"
+     diagnostic. Confirmed via the oracle that legacy emits a dedicated
+     `INT.NEG` unary A-MIR instruction for this; this substrate instead
+     lowers `-x` as an ordinary `0 - x` BinOp -- a deliberate, disclosed
+     structural divergence from the oracle's own shape (semantically
+     identical, not byte-identical, the same scope choice this substrate
+     already makes elsewhere, e.g. bytecode's own unfused instruction
+     forms) rather than adding a whole new A-MIR instruction kind (with its
+     own bytecode AND native x86-64 lowering) for one operator. Verified
+     through BOTH substrate paths directly: `ArcoFission run` on the
+     substrate's own generated `.arcof-text` bytecode, and the native
+     x86-64 capsule, both now print `-5` for `x = -5; PRINT x`, matching
+     the oracle. Only unary `-` is handled; `NOT`/`!`/`ADDRESSOF`/`COPY`
+     unary forms remain a real, disclosed gap, unchanged from before.
+  Verified via real execution, both fixes together: a real program
+  exercising all four DO loop shapes plus negative-number arithmetic,
+  comparisons across every operator (`<`,`<=`,`>`,`>=`), and unary minus
+  literals together -- byte-for-byte identical to legacy `ArcoFission
+  compile-run`. Added as a permanent regression fixture,
+  `fission/tests/native_programs/do_loops.abas`. Re-verified every earlier
+  native demo (hello-native, strings, FizzBuzz, Fibonacci, many_params,
+  concat) unaffected by both fixes.
+  `fission/tests/amir_x86_64_smoke.abas` extended with direct coverage:
+  DO-loop lowering (zero diagnostics), the comparison fix (asserts the
+  rendered assembly contains `setle` and does NOT contain `setbe`), and
+  the unary-minus fix (zero diagnostics at both the A-MIR and native
+  x86-64 stage). Self-parse/self-semantic corpus grew with the new
+  `Fission_AmirLowerExpr` Unary case (91 files, 138 import edges, 2914
+  symbols, 0 diagnostics). Integration suite gained a `do_loops`
+  assertion. Verified with plain `fissure run`.
 
 ## In-Progress Components
 
@@ -1377,6 +1451,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/many_params.abas`
 - `fission/tests/native_programs/strings.abas`
 - `fission/tests/native_programs/concat.abas`
+- `fission/tests/native_programs/do_loops.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
 - `build.abas`
@@ -1603,25 +1678,33 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    program all run as genuine standalone x86-64 binaries today. What's
    still real, almost entirely untouched, and each its own substantial
    undertaking on its own:
+   **DO loops (all four shapes) confirmed working, zero dedicated codegen
+   needed** -- the same precedent FOR-range already set. What's still
+   real, almost entirely untouched, and each its own substantial
+   undertaking on its own:
    - Strings as function parameters or return values -- Phase 4/5's kind
      tracking is function-local only; currently a real diagnostic at the
-     call site / RETURN, not a silent misinterpretation.
+     call site / RETURN, not a silent misinterpretation. Would need real
+     inter-procedural kind inference (a parameter's kind can only be
+     learned from its call sites, not the function body alone -- a
+     pass-through function like `FUNCTION Echo(x) RETURN x END FUNCTION`
+     has no body-local evidence of x's kind at all), likely a small
+     fixed-point pass over the whole module; noted here as a real,
+     nontrivial design task, not a quick extension of the existing
+     function-local `kinds` tracking.
    - String comparison (`==`/`!=` between two strings) -- a real, separate
      gap from concatenation; currently the generic "non-numeric" operand
      diagnostic, not silently wrong.
+   - ForEach: not yet lowered by this backend -- but genuinely blocked on
+     arrays (ForEach always iterates something array-like, and Const Array
+     is entirely unsupported below), not itself a control-flow gap the way
+     DO loops turned out to be.
    - WP-011 Linux Runtime, the rest of it: arrays, objects/classes, and a
      real fallback to the existing ~244-entry host-function dispatch table
      for anything else (legacy's own `arco_call_host`/`host_bridge.cpp`
      bridge is the reference for this, though porting it into the
      substrate rather than linking against it directly is itself a real
      design decision to make, not just a port).
-   - DO loops and ForEach: not yet lowered by this backend at all (only
-     IF/WHILE/FOR-range are) -- likely straightforward given they already
-     desugar to the same Branch/Jump primitives once written, following
-     FOR-range's own "needed zero dedicated codegen" precedent (confirmed
-     twice now: FOR-range in Phase 2, and ordinary function calls needing
-     no extra Branch/Jump work at all beyond what Phase 2 already had, in
-     Phase 3), but not confirmed yet for DO/ForEach specifically.
    The existing experimental legacy native backend
    (`ArcoFission build FILE -o OUT --target linux-x86_64`,
    `.agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md`) is worth reading

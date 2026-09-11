@@ -2,16 +2,17 @@
 #IMPORT "fission/amir/lower_x86_64.abas"
 
 ' fission/amir/lower_x86_64.abas's own header comment records this backend's
-' current (through Phase 5) scope: PRINT of string literals, variables/
-' arithmetic/comparisons/IF/WHILE/FOR over plain numbers, PRINT of a
-' computed integer, real user-declared FUNCTIONs with a genuine SysV
-' calling convention (including stack-passed arguments beyond the first 6),
-' real string VARIABLES (assign/PRINT/reassign/copy), and real string
-' CONCATENATION (a bump-allocated `.bss` arena) -- function-local only:
-' string function parameters/return values, string comparison, and
-' branching on a string all remain real, disclosed gaps. Real execution
-' verified separately by fission/tests/native_programs/*.abas (built as
-' real ELF64s via FissionNativeCapsuleTarget and run directly -- see
+' current (through Phase 5, plus DO loops confirmed and two real bugs
+' fixed) scope: PRINT of string literals, variables/arithmetic/comparisons/
+' IF/WHILE/FOR/DO over plain numbers, PRINT of a computed integer, real
+' user-declared FUNCTIONs with a genuine SysV calling convention (including
+' stack-passed arguments beyond the first 6), real string VARIABLES
+' (assign/PRINT/reassign/copy), and real string CONCATENATION (a bump-
+' allocated `.bss` arena) -- function-local only: string function
+' parameters/return values, string comparison, and branching on a string
+' all remain real, disclosed gaps. Real execution verified separately by
+' fission/tests/native_programs/*.abas (built as real ELF64s via
+' FissionNativeCapsuleTarget and run directly -- see
 ' tests/integration/fission_substrate_core_smoke.sh). This file checks the
 ' lowering pass's own text output and its diagnostics.
 Source = "PRINT \"Hello, native!\"\nPRINT \"Second line\""
@@ -193,3 +194,55 @@ UnknownCallSir = Fission_ArcoBasicAstToSir(UnknownCallAst)
 UnknownCallAmir = Fission_SirToAmir(UnknownCallSir)
 UnknownCallProgram = Fission_AmirToX86_64(UnknownCallAmir)
 PRINT UnknownCallProgram.Diagnostics.HasErrors()
+
+' DO loops (all four shapes) needed zero dedicated codegen at all, the
+' same "already works" precedent FOR-range set in Phase 2 -- confirmed
+' directly, not assumed. Checked here: zero diagnostics, real execution
+' verified separately by fission/tests/native_programs/do_loops.abas.
+DoSource = "i = 1\nDO WHILE i <= 3\n    PRINT i\n    i = i + 1\nLOOP\nj = 1\nDO\n    PRINT j\n    j = j + 1\nLOOP UNTIL j > 3"
+DoTokens = Fission_ArcoBasicLex(DoSource)
+DoAst = Fission_ArcoBasicParse(DoTokens, "x86-64-do-smoke.abas")
+DoSir = Fission_ArcoBasicAstToSir(DoAst)
+DoAmir = Fission_SirToAmir(DoSir)
+DoProgram = Fission_AmirToX86_64(DoAmir)
+PRINT DoProgram.Diagnostics.HasErrors()
+PRINT DoProgram.Diagnostics.Render()
+
+' A real, serious bug found and fixed this session while confirming DO
+' loops: comparisons used the WRONG (unsigned) x86 set* instruction family
+' for A-MIR's typed INT.CMP_*_UNSIGNED opcodes, which A-MIR picks for
+' EVERY comparison regardless of whether the operand is actually unsigned
+' -- a negative number's bit pattern, compared unsigned, is never "<=" a
+' positive number, so `DO UNTIL k <= 0 ... k = k - 3 ... LOOP` never
+' terminated. Confirmed against the real canonical oracle (the bytecode
+' VM, which reduces INT.CMP_LE_UNSIGNED back to a bare, ordinary signed
+' comparison before executing) that ArcoBASIC's real semantics are signed.
+' Checked here: the rendered assembly for a `<=` comparison uses `setle`
+' (signed), never `setbe` (unsigned) -- real execution verified separately
+' by fission/tests/native_programs/do_loops.abas (a real DO UNTIL counting
+' through zero into negative numbers).
+NegCompareSource = "k = 10\nDO UNTIL k <= 0\n    PRINT k\n    k = k - 3\nLOOP"
+NegCompareTokens = Fission_ArcoBasicLex(NegCompareSource)
+NegCompareAst = Fission_ArcoBasicParse(NegCompareTokens, "x86-64-neg-compare-smoke.abas")
+NegCompareSir = Fission_ArcoBasicAstToSir(NegCompareAst)
+NegCompareAmir = Fission_SirToAmir(NegCompareSir)
+NegCompareProgram = Fission_AmirToX86_64(NegCompareAmir)
+PRINT NegCompareProgram.Diagnostics.HasErrors()
+NegCompareAssembly = NegCompareProgram.Render()
+PRINT String.Contains(NegCompareAssembly, "setle")
+PRINT String.Contains(NegCompareAssembly, "setbe")
+
+' A second real bug found and fixed the same session: unary minus (`-5`)
+' was never lowered by this substrate's shared A-MIR pass at all (fell
+' through to a generic "unsupported expression" diagnostic) -- affects
+' both the bytecode and native backends, since they share
+' fission/sir/lower_amir.abas. Checked here: zero diagnostics for a
+' program using a bare unary-minus literal.
+UnaryMinusSource = "x = -5\nPRINT x"
+UnaryMinusTokens = Fission_ArcoBasicLex(UnaryMinusSource)
+UnaryMinusAst = Fission_ArcoBasicParse(UnaryMinusTokens, "x86-64-unary-minus-smoke.abas")
+UnaryMinusSir = Fission_ArcoBasicAstToSir(UnaryMinusAst)
+UnaryMinusAmir = Fission_SirToAmir(UnaryMinusSir)
+PRINT UnaryMinusAmir.Diagnostics.HasErrors()
+UnaryMinusProgram = Fission_AmirToX86_64(UnaryMinusAmir)
+PRINT UnaryMinusProgram.Diagnostics.HasErrors()

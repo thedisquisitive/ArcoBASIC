@@ -1,0 +1,52 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. This one exercises all four DO
+' loop shapes (pre-condition DO WHILE, post-condition LOOP UNTIL, pre-
+' condition DO UNTIL, post-condition LOOP WHILE) -- confirmed to need zero
+' dedicated codegen at all, the same "already works" precedent FOR-range
+' set in Phase 2 -- together with real negative-number arithmetic,
+' comparisons, and unary minus literals, which is what actually exposed two
+' real bugs while confirming DO loops: a wrong (unsigned) comparison
+' instruction for negative numbers, and unary minus never being lowered by
+' this substrate's shared A-MIR pass at all (both fixed the same session
+' this fixture was added, see fission/amir/lower_x86_64.abas and
+' fission/sir/lower_amir.abas's own comments).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+i = 1
+DO WHILE i <= 3
+    PRINT i
+    i = i + 1
+LOOP
+
+j = 1
+DO
+    PRINT j
+    j = j + 1
+LOOP UNTIL j > 3
+
+k = 10
+DO UNTIL k <= 0
+    PRINT k
+    k = k - 3
+LOOP
+
+m = 0
+DO
+    m = m + 1
+    PRINT m
+LOOP WHILE m < 3
+
+n = 5
+WHILE n > -5
+    PRINT n
+    n = n - 2
+WEND
+
+x = -7
+PRINT x
+IF x >= -7 THEN
+    PRINT 400
+END IF

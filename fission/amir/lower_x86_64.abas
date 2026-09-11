@@ -379,26 +379,43 @@ FUNCTION Fission_X86_64ArgRegisters()
     RETURN ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
 END FUNCTION
 
-' SETcc mnemonic for a comparison Op -- both the untyped bare-symbol form
-' (real ArcoBASIC numbers are ordinary signed decimals, hence the signed
-' set* variants for those) and the typed INT.CMP_*_UNSIGNED family A-MIR
-' emits for every comparison regardless of whether operand types are
-' actually known (confirmed via the oracle: comparisons always pick the
-' typed opcode, only +/-/*/MOD fall back to a bare symbol when types are
-' unknown -- see fission/sir/lower_amir.abas's own Fission_AmirIsComparison).
+' SETcc mnemonic for a comparison Op. A-MIR always picks the typed
+' INT.CMP_*_UNSIGNED opcode family for a comparison, regardless of whether
+' operand types are actually known (confirmed via the oracle: comparisons
+' always pick the typed opcode, only +/-/*/MOD fall back to a bare symbol
+' when types are unknown -- see fission/sir/lower_amir.abas's own
+' Fission_AmirIsComparison) -- but that "_UNSIGNED" suffix is NOT a real
+' runtime semantic to honor with genuinely unsigned x86 set* instructions:
+' a real, serious bug found via direct testing (a `DO UNTIL k <= 0 ...
+' k = k - 3 ... LOOP` counting past zero into negative numbers never
+' terminated -- setbe treats a negative number's bit pattern as an
+' enormous positive one, so "k <= 0" was never true once k went negative).
+' Confirmed against the actual canonical oracle: legacy ArcoFission's own
+' bytecode VM (the real execution semantics this whole project validates
+' against) always reduces INT.CMP_LE_UNSIGNED and its siblings back to the
+' bare comparison symbol before executing (fission/amir/lower_bytecode.abas's
+' own Fission_BytecodeBareOperator) and performs an ordinary signed/numeric
+' comparison -- confirmed empirically too: `ArcoFission compile-run` on the
+' exact failing program terminates correctly, printing 10/7/4/1 then
+' stopping. ArcoBASIC's dynamically-typed numbers are ordinary signed
+' decimals at the language level; "_UNSIGNED" here is purely a residual
+' static-type-driven codegen hint from A-MIR's own lowering, not something
+' with independent runtime meaning this backend should trust. Every
+' comparison -- bare symbol or the typed "_UNSIGNED" family alike -- uses
+' the SAME signed set* instruction.
 FUNCTION Fission_X86_64SetInstructionForOp(op)
     IF op == "==" THEN RETURN "sete"
     IF op == "INT.CMP_EQ" THEN RETURN "sete"
     IF op == "!=" THEN RETURN "setne"
     IF op == "INT.CMP_NE" THEN RETURN "setne"
     IF op == "<" THEN RETURN "setl"
-    IF op == "INT.CMP_LT_UNSIGNED" THEN RETURN "setb"
+    IF op == "INT.CMP_LT_UNSIGNED" THEN RETURN "setl"
     IF op == "<=" THEN RETURN "setle"
-    IF op == "INT.CMP_LE_UNSIGNED" THEN RETURN "setbe"
+    IF op == "INT.CMP_LE_UNSIGNED" THEN RETURN "setle"
     IF op == ">" THEN RETURN "setg"
-    IF op == "INT.CMP_GT_UNSIGNED" THEN RETURN "seta"
+    IF op == "INT.CMP_GT_UNSIGNED" THEN RETURN "setg"
     IF op == ">=" THEN RETURN "setge"
-    IF op == "INT.CMP_GE_UNSIGNED" THEN RETURN "setae"
+    IF op == "INT.CMP_GE_UNSIGNED" THEN RETURN "setge"
     RETURN ""
 END FUNCTION
 
