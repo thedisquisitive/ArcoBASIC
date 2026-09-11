@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^91$" <<<"$fission_self_semantic_output"
 grep -q "^138$" <<<"$fission_self_semantic_output"
-grep -q "^2827$" <<<"$fission_self_semantic_output"
+grep -q "^2839$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -640,5 +640,14 @@ expected_fibonacci_output="$(printf '0\n1\n1\n2\n3\n5\n8\n13\n21\n34\n55\n89\n14
 test "$fibonacci_native_output" = "$expected_fibonacci_output"
 oracle_fibonacci_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/fibonacci.abas")"
 test "$fibonacci_native_output" = "$oracle_fibonacci_output"
+
+# fission/tests/native_programs/many_params.abas exercises real SysV stack-passed arguments (a
+# 10-parameter function, 4 more than the 6 SysV passes in registers) plus deep recursion with a
+# 2-parameter accumulator.
+many_params_native_output="$("$SOURCE_DIR/build/fission-native-programs/many_params")"
+expected_many_params_output="$(printf '10\n20\n30\n40\n50\n60\n70\n80\n90\n100\n10100\n5050')"
+test "$many_params_native_output" = "$expected_many_params_output"
+oracle_many_params_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/many_params.abas")"
+test "$many_params_native_output" = "$oracle_many_params_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

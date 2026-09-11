@@ -2,13 +2,14 @@
 #IMPORT "fission/amir/lower_x86_64.abas"
 
 ' fission/amir/lower_x86_64.abas's own header comment records this backend's
-' current (Phase 2) scope: PRINT of string literals, variables/arithmetic/
-' comparisons/IF/WHILE/FOR over plain numbers, and PRINT of a computed
-' integer. Real execution verified separately by
-' fission/tests/native_programs/*.abas (built as real ELF64s via
-' FissionNativeCapsuleTarget and run directly -- see
-' tests/integration/fission_substrate_core_smoke.sh). This file checks the
-' lowering pass's own text output and its diagnostics.
+' current (through Phase 3) scope: PRINT of string literals, variables/
+' arithmetic/comparisons/IF/WHILE/FOR over plain numbers, PRINT of a
+' computed integer, and real user-declared FUNCTIONs with a genuine SysV
+' calling convention (including stack-passed arguments beyond the first 6).
+' Real execution verified separately by fission/tests/native_programs/*.abas
+' (built as real ELF64s via FissionNativeCapsuleTarget and run directly --
+' see tests/integration/fission_substrate_core_smoke.sh). This file checks
+' the lowering pass's own text output and its diagnostics.
 Source = "PRINT \"Hello, native!\"\nPRINT \"Second line\""
 Tokens = Fission_ArcoBasicLex(Source)
 Ast = Fission_ArcoBasicParse(Tokens, "x86-64-smoke.abas")
@@ -79,16 +80,29 @@ PRINT String.Contains(FuncAssembly, "call Sum")
 PRINT String.Contains(FuncAssembly, "call Fib")
 PRINT String.Contains(FuncAssembly, "leave")
 
-' A real, disclosed limit: more than 6 parameters/arguments (SysV
-' register-passed only, no stack-passed arguments yet) must report a
-' diagnostic, not silently drop or misassign an argument.
-TooManyParamsSource = "FUNCTION Seven(a, b, c, d, e, f, g)\n    RETURN a\nEND FUNCTION\nPRINT Seven(1, 2, 3, 4, 5, 6, 7)"
-TooManyParamsTokens = Fission_ArcoBasicLex(TooManyParamsSource)
-TooManyParamsAst = Fission_ArcoBasicParse(TooManyParamsTokens, "x86-64-too-many-params-smoke.abas")
-TooManyParamsSir = Fission_ArcoBasicAstToSir(TooManyParamsAst)
-TooManyParamsAmir = Fission_SirToAmir(TooManyParamsSir)
-TooManyParamsProgram = Fission_AmirToX86_64(TooManyParamsAmir)
-PRINT TooManyParamsProgram.Diagnostics.HasErrors()
+' More than 6 parameters/arguments is real SysV too -- stack-passed, no
+' arbitrary limit (a real gap this backend had until directly asked to
+' close it: "We need to allow more than 6 params in user declared
+' functions"). Checked here: zero diagnostics for a 7-parameter function
+' and call, and that the generated assembly actually contains the real
+' stack-argument mechanics (a `push` for the pushed 7th argument and the
+' caller-side `add $8, %rsp` cleanup afterward) -- real execution verified
+' separately (this session, not committed as a fixture: a 7-arg function
+' using every parameter distinctly, and a 10-arg function printing every
+' parameter in order to catch a register/stack mis-ordering bug, both
+' matched legacy `ArcoFission compile-run` exactly).
+SevenParamsSource = "FUNCTION Seven(a, b, c, d, e, f, g)\n    RETURN a + g\nEND FUNCTION\nPRINT Seven(1, 2, 3, 4, 5, 6, 7)"
+SevenParamsTokens = Fission_ArcoBasicLex(SevenParamsSource)
+SevenParamsAst = Fission_ArcoBasicParse(SevenParamsTokens, "x86-64-seven-params-smoke.abas")
+SevenParamsSir = Fission_ArcoBasicAstToSir(SevenParamsAst)
+SevenParamsAmir = Fission_SirToAmir(SevenParamsSir)
+SevenParamsProgram = Fission_AmirToX86_64(SevenParamsAmir)
+PRINT SevenParamsProgram.Diagnostics.HasErrors()
+PRINT SevenParamsProgram.Diagnostics.Render()
+SevenParamsAssembly = SevenParamsProgram.Render()
+PRINT String.Contains(SevenParamsAssembly, "push")
+PRINT String.Contains(SevenParamsAssembly, "add $8, %rsp")
+PRINT String.Contains(SevenParamsAssembly, "16(%rbp)")
 
 ' Calling a name that isn't a user-declared ArcoBASIC function (and isn't
 ' Runtime.Print) must report a diagnostic instead of emitting a `call` to

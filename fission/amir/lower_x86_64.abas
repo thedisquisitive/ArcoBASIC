@@ -30,25 +30,26 @@
 ' Phase 3 scope (Phase 1: PRINT of a string literal; Phase 2: variables/
 ' arithmetic/comparisons/IF/WHILE/FOR over plain numbers): real
 ' user-declared ArcoBASIC FUNCTIONs, with a genuine (if deliberately scoped)
-' SysV-shaped integer calling convention -- up to 6 numeric parameters
-' passed in %rdi/%rsi/%rdx/%rcx/%r8/%r9 (SysV's own first six integer
-' argument registers, in order), a real `call`/`ret` per function (each
-' with its own independent stack frame, `push %rbp; mov %rsp,%rbp; sub
-' $FRAME,%rsp` / `leave; ret`), and a numeric return value in %rax.
-' Recursion works (confirmed via a real recursive Fibonacci): each call
-' gets its own frame on the real hardware call stack, nothing about this
-' backend's design assumes non-recursive calls. Every block label is
-' prefixed with its owning function's name (`Fib_IfThen0`, not bare
-' `IfThen0`) so two different functions' same-named blocks (every function
-' has its own "Entry", every IF/WHILE/FOR desugars to the same block-name
-' scheme) never collide in the single flat .text section -- Main's own
-' blocks are the one exception, left bare to match this backend's earlier,
-' already-tested Phase 1/2 output exactly.
+' SysV integer calling convention -- the first 6 numeric parameters/
+' arguments in %rdi/%rsi/%rdx/%rcx/%r8/%r9 (SysV's own first six integer
+' argument registers, in order), the 7th+ real SysV stack-passed arguments
+' too (pushed by the caller in reverse order, read by the callee at a
+' fixed positive %rbp offset -- no arbitrary parameter-count limit), a
+' real `call`/`ret` per function (each with its own independent stack
+' frame, `push %rbp; mov %rsp,%rbp; sub $FRAME,%rsp` / `leave; ret`), and
+' a numeric return value in %rax. Recursion works (confirmed via a real
+' recursive Fibonacci): each call gets its own frame on the real hardware
+' call stack, nothing about this backend's design assumes non-recursive
+' calls. Every block label is prefixed with its owning function's name
+' (`Fib_IfThen0`, not bare `IfThen0`) so two different functions'
+' same-named blocks (every function has its own "Entry", every IF/WHILE/
+' FOR desugars to the same block-name scheme) never collide in the single
+' flat .text section -- Main's own blocks are the one exception, left bare
+' to match this backend's earlier, already-tested Phase 1/2 output exactly.
 ' Still deliberately out of scope, still real, disclosed follow-on work:
-' more than 6 parameters/arguments (stack-passed args -- diagnostic, not
-' silently wrong), non-numeric parameters/return values, and everything
-' WP-011 (Linux Runtime) still owes -- strings beyond a literal, arrays,
-' objects, the general host-function bridge. See
+' non-numeric parameters/return values, and everything WP-011 (Linux
+' Runtime) still owes -- strings beyond a literal, arrays, objects, the
+' general host-function bridge. See
 ' .agents/FISSION_SUBSTRATE_PROGRESS.md.
 
 CLASS FissionX86_64Program
@@ -194,10 +195,27 @@ END FUNCTION
 FUNCTION Fission_X86_64CollectNumericSlots(fn)
     names = []
     seen = {}
+    registerParamCount = LEN(Fission_X86_64ArgRegisters())
+    paramIndex = 0
     FOR param IN fn.Params
-        state = Fission_X86_64Remember(names, seen, param.Name)
-        names = state.Names
-        seen = state.Seen
+        IF paramIndex < registerParamCount THEN
+            ' Register-passed (SysV's first 6 integer argument registers) --
+            ' gets an ordinary negative local slot, spilled from its
+            ' register in the prologue, same as before.
+            state = Fission_X86_64Remember(names, seen, param.Name)
+            names = state.Names
+            seen = state.Seen
+        ELSE
+            ' Stack-passed (the 7th+ parameter): NOT a local slot at all --
+            ' Fission_X86_64LowerFunction gives it a fixed POSITIVE %rbp
+            ' offset directly into the caller's own pushed arguments
+            ' instead (see its own comment), so it needs no negative slot
+            ' here. Still marked `seen` so the body-scan below (Load's own
+            ' "add if not already seen" logic) does not also try to hand it
+            ' an ordinary negative slot the moment the body reads it.
+            seen = Object.Set(seen, param.Name, TRUE)
+        END IF
+        paramIndex = paramIndex + 1
     NEXT
     stringTemps = {}
     stringVariables = {}
@@ -300,10 +318,27 @@ FUNCTION Fission_X86_64StoreRaxLine(offsets, name)
     RETURN "    mov %rax, " + offset + "(%rbp)"
 END FUNCTION
 
-' SysV's own first six integer/pointer argument registers, in order --
-' the real calling convention for up to 6 numeric parameters. A 7th+
-' parameter/argument (stack-passed in the real SysV ABI) is a disclosed,
-' diagnostic-reported limit in this backend for now, not silently wrong.
+' Returns the single `push` line that pushes `operand` onto the stack
+' directly -- `push` accepts a 64-bit memory operand or a (sign-extended)
+' immediate natively, so this never needs a scratch register the way
+' Fission_X86_64OperandLoadLine's `mov` destination does. Used only for the
+' 7th+ call argument (SysV's own stack-passed convention beyond the first
+' six registers) -- see the CALL/CallVoid lowering below.
+FUNCTION Fission_X86_64OperandPushLine(offsets, operand)
+    IF Fission_X86_64IsNumericLiteral(operand) THEN
+        RETURN "    push $" + operand
+    END IF
+    offset = Object.Get(offsets, operand, "0")
+    RETURN "    push " + offset + "(%rbp)"
+END FUNCTION
+
+' SysV's own first six integer/pointer argument registers, in order. A
+' 7th+ parameter/argument is real SysV too -- stack-passed, pushed by the
+' caller in reverse order so the 7th argument ends up closest to the
+' return address, read directly out of the caller's frame at a fixed
+' positive %rbp offset by the callee (16(%rbp) for the 7th, 24(%rbp) for
+' the 8th, ...) -- see Fission_X86_64LowerFunction's own prologue comment
+' and the CALL/CallVoid lowering below.
 FUNCTION Fission_X86_64ArgRegisters()
     RETURN ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
 END FUNCTION
@@ -480,17 +515,30 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
     IF frame.FrameSize > 0 THEN
         ignored = Array.Push(textLines, "    sub $" + String(frame.FrameSize) + ", %rsp")
     END IF
+    ' Real SysV: the first 6 integer/pointer parameters arrive in
+    ' registers and get spilled into their own local slot here (unchanged
+    ' from before); the 7th+ arrive on the stack, pushed by the CALLER
+    ' (see the CALL-lowering below) in reverse order so the 7th parameter
+    ' ends up closest to the return address -- 16(%rbp) in this callee's
+    ' own frame (0(%rbp) is the saved %rbp, 8(%rbp) the return address
+    ' `call` itself pushed), 8th at 24(%rbp), and so on. Those get no
+    ' local slot and no spill at all: Fission_X86_64CollectNumericSlots
+    ' deliberately excluded them from the negative-slot table, and their
+    ' fixed positive offset is set directly into `offsets` here, read
+    ' directly out of the caller's own frame by every later LOAD of that
+    ' parameter -- exactly the same as any other resolvable operand.
     IF isMain == FALSE THEN
         argRegisters = Fission_X86_64ArgRegisters()
-        IF LEN(fn.Params) > LEN(argRegisters) THEN
-            ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "native codegen supports at most " + String(LEN(argRegisters)) + " parameters (SysV register-passed only, no stack-passed arguments yet): " + fn.Name)
-        ELSE
-            paramIndex = 0
-            FOR param IN fn.Params
+        paramIndex = 0
+        FOR param IN fn.Params
+            IF paramIndex < LEN(argRegisters) THEN
                 ignored = Array.Push(textLines, "    mov %" + argRegisters[paramIndex] + ", " + Object.Get(offsets, param.Name, "0") + "(%rbp)")
-                paramIndex = paramIndex + 1
-            NEXT
-        END IF
+            ELSE
+                stackOffset = 16 + (paramIndex - LEN(argRegisters)) * 8
+                offsets = Object.Set(offsets, param.Name, String(stackOffset))
+            END IF
+            paramIndex = paramIndex + 1
+        NEXT
     END IF
 
     FOR block IN fn.Blocks
@@ -603,10 +651,6 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 END IF
                 args = Fission_X86_64SplitArgs(instruction.Field("Args"))
                 argRegisters = Fission_X86_64ArgRegisters()
-                IF LEN(args) > LEN(argRegisters) THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "native codegen supports at most " + String(LEN(argRegisters)) + " call arguments (SysV register-passed only, no stack-passed arguments yet): " + callee)
-                    CONTINUE FOR
-                END IF
                 unresolvedArg = ""
                 FOR arg IN args
                     IF Fission_X86_64OperandIsResolvable(offsets, arg) == FALSE THEN unresolvedArg = arg
@@ -615,12 +659,39 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with a non-numeric argument is not supported by native x86-64 codegen: " + unresolvedArg)
                     CONTINUE FOR
                 END IF
-                argIndex = 0
+                ' Real SysV: the first 6 arguments go in registers (below);
+                ' the 7th+ (stackArgs) are pushed onto the stack by THIS
+                ' caller, in reverse order, so the 7th argument ends up
+                ' closest to the return address -- matching exactly what
+                ' the callee's own prologue (Fission_X86_64LowerFunction,
+                ' above) expects to find at 16(%rbp), 24(%rbp), and so on.
+                ' `push` takes the operand directly (memory or immediate),
+                ' no scratch register needed, and never disturbs this
+                ' function's own %rbp-relative locals (only %rsp moves).
+                stackArgs = []
+                registerArgCount = 0
+                argPos = 0
                 FOR arg IN args
-                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, arg, argRegisters[argIndex]))
-                    argIndex = argIndex + 1
+                    IF argPos < LEN(argRegisters) THEN
+                        registerArgCount = registerArgCount + 1
+                    ELSE
+                        ignored = Array.Push(stackArgs, arg)
+                    END IF
+                    argPos = argPos + 1
                 NEXT
+                reversedStackArgs = Array.Reverse(stackArgs)
+                FOR arg IN reversedStackArgs
+                    ignored = Array.Push(textLines, Fission_X86_64OperandPushLine(offsets, arg))
+                NEXT
+                argIndex = 0
+                WHILE argIndex < registerArgCount
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[argIndex], argRegisters[argIndex]))
+                    argIndex = argIndex + 1
+                WEND
                 ignored = Array.Push(textLines, "    call " + callee)
+                IF LEN(stackArgs) > 0 THEN
+                    ignored = Array.Push(textLines, "    add $" + String(LEN(stackArgs) * 8) + ", %rsp")
+                END IF
                 IF kind == "Call" THEN
                     ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Dest")))
                 END IF

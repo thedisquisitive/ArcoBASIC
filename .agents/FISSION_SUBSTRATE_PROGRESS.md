@@ -57,10 +57,12 @@ real, cached `rivet build` target producing genuinely standalone,
 freestanding (`_start`, no libc/CRT) ELF64s. Phase 1: PRINT of a string
 literal. Phase 2: variables, arithmetic, comparisons, IF/WHILE/FOR over
 plain numbers, PRINT of a computed integer -- real FizzBuzz runs natively.
-**Phase 3: real user-declared ArcoBASIC FUNCTIONs, a genuine SysV-shaped
-integer calling convention (up to 6 parameters in `%rdi`/`%rsi`/`%rdx`/
-`%rcx`/`%r8`/`%r9`, return value in `%rax`), and real recursion** -- a
-genuinely recursive Fibonacci runs natively, output matching legacy
+**Phase 3: real user-declared ArcoBASIC FUNCTIONs, a genuine SysV integer
+calling convention (the first 6 parameters in `%rdi`/`%rsi`/`%rdx`/`%rcx`/
+`%r8`/`%r9`, the 7th+ real SysV stack-passed arguments too -- no arbitrary
+parameter-count limit, closed right after Phase 3 landed -- return value in
+`%rax`), and real recursion** -- a genuinely recursive Fibonacci and a real
+10-parameter function both run natively, output matching legacy
 `ArcoFission compile-run` exactly. **WP-011 (Linux Runtime -- strings
 beyond a literal, arrays, objects, the general host-function bridge for
 everything this backend cannot hand-roll itself) remains real, almost
@@ -762,6 +764,62 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   0 diagnostics -- file/edge counts unchanged). Integration suite gained a
   Fibonacci assertion (real output + oracle comparison). Full suite and
   `fissure run --full` both passing.
+- Removed native x86-64 codegen's 6-parameter/argument limit -- requested
+  directly right after Phase 3 landed ("We need to allow more than 6 params
+  in user declared functions"). Real SysV stack-passed arguments, not a
+  raised or removed check: the first 6 numeric parameters/arguments still
+  go in `%rdi`/`%rsi`/`%rdx`/`%rcx`/`%r8`/`%r9` exactly as before; the 7th+
+  are pushed onto the stack by the CALLER in reverse order (so the 7th
+  argument ends up closest to the return address after `call`) and read by
+  the CALLEE directly out of the caller's own frame at a fixed positive
+  `%rbp` offset (`16(%rbp)` for the 7th parameter, `24(%rbp)` for the 8th,
+  and so on) -- no arbitrary limit remains. `push`/`add $N,%rsp` (real x86
+  instructions that take a memory operand or immediate directly, no
+  scratch register needed) do the caller-side push and post-call cleanup.
+  `Fission_X86_64CollectNumericSlots` now only gives the first 6
+  (register-passed) parameters an ordinary negative local slot; parameters
+  7+ get no slot allocated at all -- their fixed positive offset is set
+  directly into the offsets table during the prologue instead, so every
+  later `LOAD` of that parameter resolves exactly the same way any other
+  operand does, with no special-casing needed anywhere else in the pass.
+  Verified via real execution, not just that assembly renders: a 7-
+  parameter function using both a register-passed and a stack-passed
+  parameter together (`a + g`), and (added as a permanent regression
+  fixture) `fission/tests/native_programs/many_params.abas` -- a real
+  10-parameter function that PRINTs each parameter individually, in order
+  (catches a register/stack mis-ordering bug that a summed result could
+  mask), plus a 2-parameter accumulator recursed 100 levels deep to
+  confirm stack-argument calls and deep recursion compose correctly
+  together. Both match legacy `ArcoFission compile-run` on the identical
+  source exactly. Re-verified every earlier native demo (hello-native,
+  FizzBuzz, the arithmetic/IF/WHILE probe, Fibonacci, a 6-arg function,
+  recursive Factorial) still produces byte-identical output after this
+  change.
+  `fission/tests/amir_x86_64_smoke.abas`'s old "more than 6 is a
+  diagnostic" check replaced with a real 7-parameter/7-argument check
+  (zero diagnostics; asserts the generated assembly actually contains a
+  `push`, the caller-side `add $8, %rsp` cleanup, and the callee-side
+  `16(%rbp)` stack-parameter read). Self-parse/self-semantic corpus grew
+  again with the new helper function (91 files, 138 import edges, 2839
+  symbols, 0 diagnostics). Integration suite gained a `many_params`
+  assertion (real output + oracle comparison).
+  **A real workflow correction landed alongside this work, not a substrate
+  change**: verification had drifted into running the raw integration
+  script directly AND `fissure run --full` right after, duplicating the
+  same ~5-minute suite for no added confidence -- caught directly by the
+  user ("Are we still doing the full regression suite instead of fissure
+  graphed regressions?" / "let's start using the tools properly"). Plain
+  `fissure run` (no `--full`) already does real graph-based impact
+  selection -- `--full` bypasses that and forces every probe to run
+  regardless of classification, working against Fissure's own purpose even
+  when, as in this single-probe project, it happens not to change what
+  actually runs. Verification for this change and going forward uses plain
+  `fissure run` as the one real check; direct script invocation is
+  reserved for interactively tracing a specific assertion failure (as it
+  was used earlier this session for two golden-count mismatches), never as
+  a duplicate pass. Recorded as a standing correction in agent memory
+  (`feedback_use_fissure_graph_not_full_plus_direct`), since it applies to
+  every future session working in this repository, not just this one.
 
 ## In-Progress Components
 
@@ -1190,6 +1248,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/hello_native.abas`
 - `fission/tests/native_programs/fizzbuzz.abas`
 - `fission/tests/native_programs/fibonacci.abas`
+- `fission/tests/native_programs/many_params.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
 - `build.abas`
@@ -1404,17 +1463,15 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    PRINT of string literals (Phase 1); variables, arithmetic (`+`/`-`/`*`/
    `MOD`), comparisons, `IF`/`WHILE`/`FOR`-range, and PRINT of a computed
    integer (Phase 2); and now real user-declared FUNCTIONs with a genuine
-   SysV-shaped calling convention (up to 6 numeric parameters in
-   `%rdi`/`%rsi`/`%rdx`/`%rcx`/`%r8`/`%r9`, return value in `%rax`) and
-   real recursion (Phase 3) -- no embedded bytecode VM, no legacy
-   ArcoFission involvement in the compile itself (only `as`/`ld`).
-   Real FizzBuzz and a real recursive Fibonacci both run as genuine
+   SysV calling convention -- the first 6 numeric parameters in
+   `%rdi`/`%rsi`/`%rdx`/`%rcx`/`%r8`/`%r9`, the 7th+ real SysV stack-passed
+   arguments too (no arbitrary parameter-count limit, closed right after
+   Phase 3 landed), return value in `%rax` -- and real recursion (Phase 3)
+   -- no embedded bytecode VM, no legacy ArcoFission involvement in the
+   compile itself (only `as`/`ld`). Real FizzBuzz, a real recursive
+   Fibonacci, and a real 10-parameter function all run as genuine
    standalone x86-64 binaries today. What's still real, almost entirely
    untouched, and each its own substantial undertaking on its own:
-   - More than 6 parameters/arguments: real SysV allows this via stack-
-     passed arguments; this backend currently reports a diagnostic instead
-     (disclosed, not silently wrong, but a real gap for a function with a
-     large parameter list).
    - WP-011 Linux Runtime: everything this backend cannot hand-roll itself
      -- strings beyond a literal (concatenation, length, slicing, string
      variables/parameters/return values -- currently a variable ever
