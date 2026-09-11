@@ -27,33 +27,39 @@
 ' pass simply starts from GAS text instead of arriving at it as a secondary
 ' rendering of already-encoded bytes.
 '
-' Phase 5 scope (Phase 1: PRINT of a string literal; Phase 2: variables/
-' arithmetic/comparisons/IF/WHILE/FOR over plain numbers; Phase 3: real
+' Phase 6 scope (Phase 1: PRINT of a string literal; Phase 2: variables/
+' arithmetic/comparisons/IF/WHILE/FOR/DO over plain numbers; Phase 3: real
 ' user-declared FUNCTIONs with a genuine SysV calling convention, including
 ' stack-passed arguments beyond the first 6; Phase 4: real string VARIABLES
 ' -- assign/PRINT/reassign/copy, a string value represented as a pointer to
 ' NUL-terminated (`.asciz`) `.rodata`, stored in an ordinary 8-byte slot
 ' exactly like a number, plus per-name KIND tracking so every numeric-only
 ' context rejects a string operand instead of silently misinterpreting a
-' pointer as an integer): real string CONCATENATION. `a + b` between two
-' String-kind operands now genuinely builds "a"+"b" at runtime via
-' `str_concat` -- real memory management, but the simplest correct kind: a
-' bump allocator into a fixed 1 MiB static `.bss` arena (`string_heap`/
-' `string_heap_top`), never freed. A concatenation result is String-kind
-' like any other (so `PRINT`ing one, or concatenating it again, both work
-' unmodified through the same machinery Phase 4 already built) -- the
-' collection pass (`Fission_X86_64CollectSlots`) and the emission pass both
-' check the exact same condition (`+` with both operands String-kind) to
-' agree on this without needing a new instruction kind or opcode at all.
+' pointer as an integer; Phase 5: real string CONCATENATION -- `a + b`
+' between two String-kind operands genuinely builds "a"+"b" at runtime via
+' `str_concat`, a bump allocator into a fixed 1 MiB static `.bss` arena,
+' never freed): real string EQUALITY. `a == b` / `a != b` between two
+' String-kind operands now does a genuine byte-by-byte content comparison
+' via `str_equals` (confirmed against the oracle: real ArcoBASIC string
+' equality is content-based, not pointer identity -- two separately-
+' `"hello"`-literal strings, or a literal compared against an equal-spelled
+' concatenation result, both compare equal) instead of the generic
+' "non-numeric operand" diagnostic. `!=` is `str_equals`'s own 0/1 result
+' inverted with a single `xor $1, %rax` at the call site, not a separate
+' subroutine. A-MIR uses the exact same `INT.CMP_EQ`/`INT.CMP_NE` opcode
+' family for string equality as for numeric equality (confirmed via the
+' oracle -- no dedicated "string compare" opcode exists at all), so this
+' is purely a kind-based dispatch decision in the BinOp handling, the same
+' shape as string concatenation's own `+`-with-both-operands-String check.
 ' Deliberately still out of scope, still real, disclosed follow-on work:
 ' strings as function parameters or return values (this phase's `kinds`
 ' tracking is function-local only; a parameter is always assumed numeric,
 ' so passing a string into or back out of a function correctly reports a
-' diagnostic rather than silently misinterpreting it), string comparison
-' (`==`/`!=` between two strings -- a real, separate gap from concatenation,
-' still reports the generic "non-numeric" diagnostic), and everything else
-' WP-011 (Linux Runtime) still owes -- arrays, objects, the general
-' host-function bridge. See .agents/FISSION_SUBSTRATE_PROGRESS.md.
+' diagnostic rather than silently misinterpreting it), string ordering
+' comparison (`<`/`<=`/`>`/`>=` between two strings -- a real, separate gap
+' from equality, still reports the generic "non-numeric" diagnostic), and
+' everything else WP-011 (Linux Runtime) still owes -- arrays, objects, the
+' general host-function bridge. See .agents/FISSION_SUBSTRATE_PROGRESS.md.
 
 CLASS FissionX86_64Program
     CONSTRUCTOR()
@@ -631,6 +637,38 @@ FUNCTION Fission_X86_64StrConcatSubroutine()
     RETURN lines
 END FUNCTION
 
+' Real string equality: a byte-by-byte comparison (content, not pointer
+' identity -- confirmed against the oracle: two separately-`"hello"`-
+' literal strings, or a literal compared against an equal-spelled
+' concatenation result, both compare equal). Same internal-only call/ret
+' convention as itoa_print/str_print/str_concat (input: %rdi/%rsi =
+' pointers to two NUL-terminated byte sequences; output: %rax = 1 if
+' equal, 0 if not; clobbers %rax/%rcx). `!=` is this same result inverted
+' with a single `xor $1, %rax` at the call site, not a separate
+' subroutine.
+FUNCTION Fission_X86_64StrEqualsSubroutine()
+    lines = [
+        "str_equals:",
+        ".Lstreq_loop:",
+        "    movb (%rdi), %al",
+        "    movb (%rsi), %cl",
+        "    cmp %al, %cl",
+        "    jne .Lstreq_not_equal",
+        "    testb %al, %al",
+        "    jz .Lstreq_equal",
+        "    inc %rdi",
+        "    inc %rsi",
+        "    jmp .Lstreq_loop",
+        ".Lstreq_not_equal:",
+        "    xor %rax, %rax",
+        "    ret",
+        ".Lstreq_equal:",
+        "    mov $1, %rax",
+        "    ret"
+    ]
+    RETURN lines
+END FUNCTION
+
 ' Lowers one function (Main or a real user-declared one) to GAS text.
 ' `labelPrefix` is "" for Main (matches this backend's earlier, already-
 ' tested Phase 1/2 output exactly -- Main's blocks stay bare) and
@@ -770,6 +808,27 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = Array.Push(textLines, "    call str_concat")
                     ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Dest")))
                     context.UsesConcat = TRUE
+                    CONTINUE FOR
+                END IF
+                isStringEquality = (op == "==" ORELSE op == "INT.CMP_EQ" ORELSE op == "!=" ORELSE op == "INT.CMP_NE") ANDALSO leftKind == "String" ANDALSO rightKind == "String"
+                IF isStringEquality THEN
+                    ' Real string equality: str_equals does a real
+                    ' byte-by-byte comparison (content equality, matching
+                    ' the oracle's own real semantics -- two separately
+                    ' `"hello"`-literal strings, or a literal and a
+                    ' concatenation result that happens to spell the same
+                    ' bytes, both compare equal, confirmed directly against
+                    ' the oracle rather than assumed) and returns 0/1 in
+                    ' %rax, exactly like a numeric comparison's own
+                    ' `movzbq` result -- `!=` is just `==`'s result
+                    ' inverted with a single `xor`.
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, left, "rdi"))
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, right, "rsi"))
+                    ignored = Array.Push(textLines, "    call str_equals")
+                    isNotEqual = op == "!=" ORELSE op == "INT.CMP_NE"
+                    IF isNotEqual THEN ignored = Array.Push(textLines, "    xor $1, %rax")
+                    ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Dest")))
+                    context.UsesStrEquals = TRUE
                     CONTINUE FOR
                 END IF
                 IF leftKind != "Number" ORELSE rightKind != "Number" THEN
@@ -928,7 +987,7 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
-    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE}
+    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE}
 
     allTextLines = []
     FOR fn IN amirModule.Functions
@@ -959,6 +1018,11 @@ FUNCTION Fission_AmirToX86_64(amirModule)
     END IF
     IF context.UsesConcat THEN
         FOR line IN Fission_X86_64StrConcatSubroutine()
+            ignored = Array.Push(allTextLines, line)
+        NEXT
+    END IF
+    IF context.UsesStrEquals THEN
+        FOR line IN Fission_X86_64StrEqualsSubroutine()
             ignored = Array.Push(allTextLines, line)
         NEXT
     END IF

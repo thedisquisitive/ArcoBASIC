@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^91$" <<<"$fission_self_semantic_output"
 grep -q "^138$" <<<"$fission_self_semantic_output"
-grep -q "^2914$" <<<"$fission_self_semantic_output"
+grep -q "^2925$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -678,5 +678,14 @@ expected_do_loops_output="$(printf '1\n2\n3\n1\n2\n3\n10\n7\n4\n1\n1\n2\n3\n5\n3
 test "$do_loops_native_output" = "$expected_do_loops_output"
 oracle_do_loops_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/do_loops.abas")"
 test "$do_loops_native_output" = "$oracle_do_loops_output"
+
+# fission/tests/native_programs/string_equality.abas exercises native codegen's Phase 6 construct
+# set: real string equality (==/!=), a genuine byte-by-byte content comparison, not pointer
+# identity -- including a concatenation result compared against an equal-spelled literal.
+string_equality_native_output="$("$SOURCE_DIR/build/fission-native-programs/string_equality")"
+expected_string_equality_output="$(printf '1\n3\n4\n5\n6\n8')"
+test "$string_equality_native_output" = "$expected_string_equality_output"
+oracle_string_equality_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/string_equality.abas")"
+test "$string_equality_native_output" = "$oracle_string_equality_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

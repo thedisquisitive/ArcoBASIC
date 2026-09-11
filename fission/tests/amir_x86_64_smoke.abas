@@ -2,17 +2,18 @@
 #IMPORT "fission/amir/lower_x86_64.abas"
 
 ' fission/amir/lower_x86_64.abas's own header comment records this backend's
-' current (through Phase 5, plus DO loops confirmed and two real bugs
+' current (through Phase 6, plus DO loops confirmed and two real bugs
 ' fixed) scope: PRINT of string literals, variables/arithmetic/comparisons/
 ' IF/WHILE/FOR/DO over plain numbers, PRINT of a computed integer, real
 ' user-declared FUNCTIONs with a genuine SysV calling convention (including
 ' stack-passed arguments beyond the first 6), real string VARIABLES
-' (assign/PRINT/reassign/copy), and real string CONCATENATION (a bump-
-' allocated `.bss` arena) -- function-local only: string function
-' parameters/return values, string comparison, and branching on a string
-' all remain real, disclosed gaps. Real execution verified separately by
-' fission/tests/native_programs/*.abas (built as real ELF64s via
-' FissionNativeCapsuleTarget and run directly -- see
+' (assign/PRINT/reassign/copy), real string CONCATENATION (a bump-allocated
+' `.bss` arena), and real string EQUALITY (`==`/`!=`, real content
+' comparison) -- function-local only: string function parameters/return
+' values, string ORDERING comparison (`<`/`<=`/`>`/`>=`), and branching on
+' a string all remain real, disclosed gaps. Real execution verified
+' separately by fission/tests/native_programs/*.abas (built as real ELF64s
+' via FissionNativeCapsuleTarget and run directly -- see
 ' tests/integration/fission_substrate_core_smoke.sh). This file checks the
 ' lowering pass's own text output and its diagnostics.
 Source = "PRINT \"Hello, native!\"\nPRINT \"Second line\""
@@ -82,16 +83,32 @@ PRINT String.Contains(ConcatAssembly, ".section .bss")
 PRINT String.Contains(ConcatAssembly, "string_heap")
 PRINT String.Contains(ConcatAssembly, "call str_print")
 
-' String comparison (as opposed to concatenation) remains a real, disclosed
-' gap this phase does NOT close -- must still report a diagnostic, not
-' silently emit wrong assembly.
-StringCompareSource = "a = \"x\"\nb = \"y\"\nIF a == b THEN\n    PRINT 1\nEND IF"
-StringCompareTokens = Fission_ArcoBasicLex(StringCompareSource)
-StringCompareAst = Fission_ArcoBasicParse(StringCompareTokens, "x86-64-string-compare-smoke.abas")
-StringCompareSir = Fission_ArcoBasicAstToSir(StringCompareAst)
-StringCompareAmir = Fission_SirToAmir(StringCompareSir)
-StringCompareProgram = Fission_AmirToX86_64(StringCompareAmir)
-PRINT StringCompareProgram.Diagnostics.HasErrors()
+' Phase 6: real string equality (`==`/`!=`). Real execution verified
+' separately by fission/tests/native_programs/string_equality.abas.
+' Checked here: zero diagnostics, and that the rendered assembly actually
+' contains `call str_equals` and (for `!=`) the inverting `xor $1, %rax`.
+StringEqualsSource = "a = \"x\"\nb = \"y\"\nIF a == b THEN\n    PRINT 1\nEND IF\nIF a != b THEN\n    PRINT 2\nEND IF"
+StringEqualsTokens = Fission_ArcoBasicLex(StringEqualsSource)
+StringEqualsAst = Fission_ArcoBasicParse(StringEqualsTokens, "x86-64-string-equals-smoke.abas")
+StringEqualsSir = Fission_ArcoBasicAstToSir(StringEqualsAst)
+StringEqualsAmir = Fission_SirToAmir(StringEqualsSir)
+StringEqualsProgram = Fission_AmirToX86_64(StringEqualsAmir)
+PRINT StringEqualsProgram.Diagnostics.HasErrors()
+PRINT StringEqualsProgram.Diagnostics.Render()
+StringEqualsAssembly = StringEqualsProgram.Render()
+PRINT String.Contains(StringEqualsAssembly, "call str_equals")
+PRINT String.Contains(StringEqualsAssembly, "xor $1, %rax")
+
+' String ORDERING comparison (as opposed to equality) remains a real,
+' disclosed gap this phase does NOT close -- must still report a
+' diagnostic, not silently emit wrong assembly.
+StringOrderSource = "a = \"x\"\nb = \"y\"\nIF a < b THEN\n    PRINT 1\nEND IF"
+StringOrderTokens = Fission_ArcoBasicLex(StringOrderSource)
+StringOrderAst = Fission_ArcoBasicParse(StringOrderTokens, "x86-64-string-order-smoke.abas")
+StringOrderSir = Fission_ArcoBasicAstToSir(StringOrderAst)
+StringOrderAmir = Fission_SirToAmir(StringOrderSir)
+StringOrderProgram = Fission_AmirToX86_64(StringOrderAmir)
+PRINT StringOrderProgram.Diagnostics.HasErrors()
 
 ' A variable assigned both a string and a number somewhere in the same
 ' function is a real, disclosed gap -- must report a diagnostic instead of

@@ -75,12 +75,15 @@ codegen**, the same precedent FOR-range set -- and confirming it directly
 found two real bugs, both fixed: comparisons used the wrong (unsigned) x86
 instruction family, so a negative-number `DO UNTIL` loop never terminated;
 and unary minus (`-5`) was never lowered by A-MIR at all (a shared bug,
-also affecting the bytecode backend). Strings as function parameters/
-return values, string comparison, and branching on a string each remain
-their own real, disclosed diagnostic-reported gap rather than silently
-wrong behavior. **WP-011 (Linux Runtime -- arrays, objects, the general
-host-function bridge for everything else this backend cannot hand-roll
-itself) remains real, substantial follow-on
+also affecting the bytecode backend). **Phase 6: real string EQUALITY**
+(`==`/`!=`) -- genuine byte-by-byte content comparison, confirmed correct
+even for a concatenation result compared against a same-spelled literal.
+Strings as function parameters/return values, string ORDERING comparison
+(`<`/`<=`/`>`/`>=`), and branching on a string each remain their own real,
+disclosed diagnostic-reported gap rather than silently wrong behavior.
+**WP-011 (Linux Runtime -- arrays, objects, the general host-function
+bridge for everything else this backend cannot hand-roll itself) remains
+real, substantial follow-on
 work** -- see "Next
 Recommended Work" item E.
 
@@ -1020,6 +1023,43 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   `Fission_AmirLowerExpr` Unary case (91 files, 138 import edges, 2914
   symbols, 0 diagnostics). Integration suite gained a `do_loops`
   assertion. Verified with plain `fissure run`.
+- Native x86-64 codegen Phase 6: real string EQUALITY (`==`/`!=`) --
+  continuing the "keep cranking" instruction, picked as the next
+  well-scoped, real gap (string ordering comparison and function-crossing
+  strings both need real inter-procedural design work first; string
+  equality did not). `a == b` / `a != b` between two String-kind operands
+  now does a genuine byte-by-byte content comparison via a new `str_equals`
+  runtime helper (same internal-only call/ret convention as `itoa_print`/
+  `str_print`/`str_concat`), confirmed against the real oracle that
+  ArcoBASIC string equality is content-based, not pointer identity: two
+  separately-`"hello"`-literal strings, a plain variable copy, and a
+  concatenation result that happens to spell the same bytes as a literal
+  all compare equal. `!=` is `str_equals`'s own 0/1 result inverted with a
+  single `xor $1, %rax` at the call site -- no separate subroutine needed.
+  A-MIR uses the exact same `INT.CMP_EQ`/`INT.CMP_NE` opcode family for
+  string equality as for numeric equality (confirmed via the oracle -- no
+  dedicated "string compare" opcode exists at all), so this is purely a
+  kind-based dispatch decision inside the existing BinOp handling, the
+  same shape string concatenation's own `+`-with-both-operands-String
+  check already established -- no new A-MIR instruction kind needed.
+  Verified via real execution: content equality across every case that
+  actually distinguishes it from pointer identity (separate literals,
+  variable copy, concatenation result), plus that unequal strings and `!=`
+  both behave correctly -- byte-for-byte identical to legacy `ArcoFission
+  compile-run`. Added as a permanent regression fixture,
+  `fission/tests/native_programs/string_equality.abas`. Confirmed string
+  ORDERING comparison (`<`/`<=`/`>`/`>=` between two strings -- a real,
+  separate gap from equality) still correctly reports a diagnostic rather
+  than silently emitting wrong assembly. Re-verified every earlier native
+  demo unaffected.
+  `fission/tests/amir_x86_64_smoke.abas`'s old "string comparison reports a
+  diagnostic" check split in two: a new string-equality check (zero
+  diagnostics; asserts the rendered assembly contains `call str_equals`
+  and the `!=`-inverting `xor $1, %rax`) and a renamed string-*ordering*
+  check (still correctly expects a diagnostic). Self-parse/self-semantic
+  corpus grew with the new subroutine (91 files, 138 import edges, 2925
+  symbols, 0 diagnostics). Integration suite gained a `string_equality`
+  assertion. Verified with plain `fissure run`.
 
 ## In-Progress Components
 
@@ -1452,6 +1492,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/strings.abas`
 - `fission/tests/native_programs/concat.abas`
 - `fission/tests/native_programs/do_loops.abas`
+- `fission/tests/native_programs/string_equality.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
 - `build.abas`
@@ -1659,42 +1700,44 @@ D. DONE, including the Rivet build-graph target -- see Completed Components.
    Compiler Substrate become a real standalone executable"), the answer is
    now genuinely yes.
 E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
-   runtime, i.e. no embedded bytecode VM at all). **Phases 1-5
+   runtime, i.e. no embedded bytecode VM at all). **Phases 1-6
    DONE -- see Completed Components**: `fission/amir/lower_x86_64.abas` +
    `fission/cli/compile_to_x86_64.abas` + `FissionNativeCapsuleTarget`
    produce real, standalone, execution-verified freestanding ELF64s for
    PRINT of string literals (Phase 1); variables, arithmetic (`+`/`-`/`*`/
-   `MOD`), comparisons, `IF`/`WHILE`/`FOR`-range, and PRINT of a computed
-   integer (Phase 2); real user-declared FUNCTIONs with a genuine SysV
-   calling convention -- the first 6 numeric parameters in
-   `%rdi`/`%rsi`/`%rdx`/`%rcx`/`%r8`/`%r9`, the 7th+ real SysV stack-passed
-   arguments too (no arbitrary parameter-count limit), return value in
-   `%rax` -- and real recursion (Phase 3); real string VARIABLES --
-   assign/PRINT/reassign/copy, function-local (Phase 4); and now real
-   string CONCATENATION via a real bump-allocated `.bss` arena (Phase 5)
-   -- no embedded bytecode VM, no legacy ArcoFission involvement in the
-   compile itself (only `as`/`ld`). Real FizzBuzz, a real recursive
+   `MOD`), comparisons, `IF`/`WHILE`/`FOR`-range/`DO` (all four shapes),
+   and PRINT of a computed integer (Phase 2); real user-declared FUNCTIONs
+   with a genuine SysV calling convention -- the first 6 numeric
+   parameters in `%rdi`/`%rsi`/`%rdx`/`%rcx`/`%r8`/`%r9`, the 7th+ real
+   SysV stack-passed arguments too (no arbitrary parameter-count limit),
+   return value in `%rax` -- and real recursion (Phase 3); real string
+   VARIABLES -- assign/PRINT/reassign/copy, function-local (Phase 4); real
+   string CONCATENATION via a real bump-allocated `.bss` arena (Phase 5);
+   and now real string EQUALITY (`==`/`!=`, genuine content comparison,
+   Phase 6) -- no embedded bytecode VM, no legacy ArcoFission involvement
+   in the compile itself (only `as`/`ld`). Real FizzBuzz, a real recursive
    Fibonacci, a real 10-parameter function, and a real string-building
-   program all run as genuine standalone x86-64 binaries today. What's
+   program all run as genuine standalone x86-64 binaries today. Along the
+   way, two real bugs were found and fixed while confirming DO loops: a
+   wrong (unsigned) x86 comparison instruction family that broke any
+   negative-number comparison, and unary minus never being lowered by
+   A-MIR at all (a shared bug, also affecting the bytecode backend). What's
    still real, almost entirely untouched, and each its own substantial
    undertaking on its own:
-   **DO loops (all four shapes) confirmed working, zero dedicated codegen
-   needed** -- the same precedent FOR-range already set. What's still
-   real, almost entirely untouched, and each its own substantial
-   undertaking on its own:
-   - Strings as function parameters or return values -- Phase 4/5's kind
-     tracking is function-local only; currently a real diagnostic at the
-     call site / RETURN, not a silent misinterpretation. Would need real
-     inter-procedural kind inference (a parameter's kind can only be
+   - Strings as function parameters or return values -- this backend's
+     `kinds` tracking is function-local only; currently a real diagnostic
+     at the call site / RETURN, not a silent misinterpretation. Would need
+     real inter-procedural kind inference (a parameter's kind can only be
      learned from its call sites, not the function body alone -- a
      pass-through function like `FUNCTION Echo(x) RETURN x END FUNCTION`
      has no body-local evidence of x's kind at all), likely a small
      fixed-point pass over the whole module; noted here as a real,
      nontrivial design task, not a quick extension of the existing
      function-local `kinds` tracking.
-   - String comparison (`==`/`!=` between two strings) -- a real, separate
-     gap from concatenation; currently the generic "non-numeric" operand
-     diagnostic, not silently wrong.
+   - String ORDERING comparison (`<`/`<=`/`>`/`>=` between two strings) --
+     a real, separate gap from equality (Phase 6 only added `==`/`!=`);
+     currently the generic "non-numeric" operand diagnostic, not silently
+     wrong.
    - ForEach: not yet lowered by this backend -- but genuinely blocked on
      arrays (ForEach always iterates something array-like, and Const Array
      is entirely unsupported below), not itself a control-flow gap the way
