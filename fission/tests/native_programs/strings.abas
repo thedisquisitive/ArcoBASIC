@@ -1,0 +1,29 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. This one exercises Phase 4's own
+' construct set: real string VARIABLES (assign from a literal, PRINT,
+' reassign, copy one string variable into another), mixed together with
+' ordinary numeric variables and a loop in the same program -- not just a
+' single string-literal probe.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+name = "World"
+greeting = "Hello, "
+PRINT greeting
+PRINT name
+
+copy = name
+name = "Universe"
+PRINT name
+PRINT copy
+
+count = 3
+i = 1
+WHILE i <= count
+    label = "Lap"
+    PRINT label
+    PRINT i
+    i = i + 1
+WEND

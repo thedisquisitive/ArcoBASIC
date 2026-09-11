@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^91$" <<<"$fission_self_semantic_output"
 grep -q "^138$" <<<"$fission_self_semantic_output"
-grep -q "^2839$" <<<"$fission_self_semantic_output"
+grep -q "^2876$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -649,5 +649,14 @@ expected_many_params_output="$(printf '10\n20\n30\n40\n50\n60\n70\n80\n90\n100\n
 test "$many_params_native_output" = "$expected_many_params_output"
 oracle_many_params_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/many_params.abas")"
 test "$many_params_native_output" = "$oracle_many_params_output"
+
+# fission/tests/native_programs/strings.abas exercises native codegen's Phase 4 construct set:
+# real string variables (assign, PRINT, reassign, copy one into another), mixed with ordinary
+# numeric variables and a loop.
+strings_native_output="$("$SOURCE_DIR/build/fission-native-programs/strings")"
+expected_strings_output="$(printf 'Hello, \nWorld\nUniverse\nWorld\nLap\n1\nLap\n2\nLap\n3')"
+test "$strings_native_output" = "$expected_strings_output"
+oracle_strings_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/strings.abas")"
+test "$strings_native_output" = "$oracle_strings_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

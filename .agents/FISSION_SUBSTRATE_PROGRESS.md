@@ -63,10 +63,16 @@ calling convention (the first 6 parameters in `%rdi`/`%rsi`/`%rdx`/`%rcx`/
 parameter-count limit, closed right after Phase 3 landed -- return value in
 `%rax`), and real recursion** -- a genuinely recursive Fibonacci and a real
 10-parameter function both run natively, output matching legacy
-`ArcoFission compile-run` exactly. **WP-011 (Linux Runtime -- strings
-beyond a literal, arrays, objects, the general host-function bridge for
-everything this backend cannot hand-roll itself) remains real, almost
-entirely untouched, separately-sized follow-on work** -- see "Next
+`ArcoFission compile-run` exactly. **Phase 4: real string VARIABLES** --
+`s = "hello"` / `PRINT s` genuinely works now (assign, PRINT, reassign,
+copy one string variable into another), represented as a pointer to
+`.rodata` alongside a runtime `str_print` helper; string concatenation,
+strings as function parameters/return values, and branching on a string
+each remain their own real, disclosed diagnostic-reported gap rather than
+silently wrong behavior. **WP-011 (Linux Runtime -- string concatenation,
+arrays, objects, the general host-function bridge for everything else
+this backend cannot hand-roll itself) remains real, substantial follow-on
+work** -- see "Next
 Recommended Work" item E.
 
 ## Current Work Package
@@ -820,6 +826,76 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   a duplicate pass. Recorded as a standing correction in agent memory
   (`feedback_use_fissure_graph_not_full_plus_direct`), since it applies to
   every future session working in this repository, not just this one.
+- Native x86-64 codegen Phase 4: real string VARIABLES -- requested
+  directly right after the 6-param limit closed ("Keep it going.").
+  `s = "hello"` / `PRINT s` now genuinely works (assign, print, reassign,
+  copy one string variable into another), closing the exact disclosed gap
+  Phase 2 had left open (a string-touched variable previously just reported
+  a diagnostic; it never actually printed a string). A string value is
+  represented as a pointer to a NUL-terminated (`.asciz`) byte sequence in
+  `.rodata`, stored in an ordinary 8-byte slot exactly like a number --
+  LOAD/STORE codegen for a string-kind slot is IDENTICAL to a numeric one
+  (moving a pointer around is no different from moving a number), so the
+  only genuinely new machinery is a `str_print` runtime helper (real
+  `strlen` scan then two `write` syscalls -- the string's own bytes, then a
+  shared `newline_byte` constant -- mirroring `itoa_print`'s own "internal
+  call/ret, ad-hoc convention" shape) plus per-name KIND tracking.
+  `Fission_X86_64CollectNumericSlots` (renamed `Fission_X86_64CollectSlots`)
+  now records "Number" or "String" per temp/variable, not just whether a
+  slot exists, so a %tN's own kind is always known at its single definition
+  site and a named variable's kind is decided by whichever STORE(s) touch
+  it; every numeric-only consumption site (BinOp, Branch conditions, call
+  arguments, non-Main Return) now checks kind, not just slot existence,
+  and reports a real diagnostic instead of letting a pointer flow silently
+  into a context expecting a number. The old Phase-1-era "direct literal
+  print" fast path (a precomputed compile-time length) was deliberately
+  dropped in favor of ALWAYS going through the new runtime `str_print` path
+  for every string PRINT, literal or variable -- a real simplicity-over-
+  micro-optimization trade, disclosed in the file's own header comment; no
+  existing assertion depended on the old assembly shape (this whole
+  session's own tests check real program OUTPUT, not exact assembly text),
+  so nothing needed updating for the swap itself.
+  Deliberately still out of scope, each a real, disclosed follow-on gap
+  with its own real diagnostic rather than silently wrong behavior:
+  - String CONCATENATION (`+` between two strings) -- needs a real
+    allocator, even a simple bump one, which this phase does not add.
+    Reports a specific "string concatenation is not yet supported"
+    diagnostic (not just a generic "non-numeric" one) when both BinOp
+    operands are String-kind and the operator is `+`.
+  - A variable assigned BOTH a string and a number somewhere in the same
+    function (e.g. down different IF branches) -- this phase's kind
+    tracking is a single per-name answer, not per-control-flow-path;
+    rather than silently trusting whichever assignment the collection pass
+    happened to see last, every individual STORE's own value-kind is
+    cross-checked against the collection pass's final answer at emission
+    time, and a genuine mismatch is reported as a real diagnostic.
+  - Strings as function parameters or return values -- this phase's kind
+    tracking is function-local only; a parameter is always assumed
+    Number (this backend's existing Phase 3 scope), so passing a string
+    into a function, or returning one out of a non-Main function, is
+    caught and reported rather than silently misinterpreted as a number.
+  - Branching on a string value -- a string pointer must never be silently
+    treated as a truthy/falsy numeric condition; checked and reported.
+  Verified via real execution, not just that assembly renders: a real
+  multi-statement program covering assignment, PRINT, reassignment,
+  variable-to-variable copying, and mixing string and numeric variables
+  together inside a WHILE loop -- output byte-for-byte identical to legacy
+  `ArcoFission compile-run` on the same source. Added as a permanent
+  regression fixture, `fission/tests/native_programs/strings.abas`.
+  Separately confirmed (this session, not committed as a fixture) that all
+  four disclosed gaps above fail with their own specific, real diagnostic
+  rather than a crash or silently wrong output. Re-verified every earlier
+  native demo (hello-native, FizzBuzz, Fibonacci, Factorial, many_params)
+  still produces byte-identical output after this substantial rewrite.
+  `fission/tests/amir_x86_64_smoke.abas` extended with direct coverage of
+  string-variable lowering (zero diagnostics; asserts the rendered
+  assembly actually contains `.asciz` and `call str_print`) plus all four
+  new diagnostic paths. Self-parse/self-semantic corpus grew with the new
+  helper functions and rewritten collection pass (91 files, 138 import
+  edges, 2876 symbols, 0 diagnostics). Integration suite gained a
+  `strings` assertion (real output + oracle comparison). Verified with
+  plain `fissure run` (not `--full`), per the workflow correction recorded
+  immediately above.
 
 ## In-Progress Components
 
@@ -1249,6 +1325,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/fizzbuzz.abas`
 - `fission/tests/native_programs/fibonacci.abas`
 - `fission/tests/native_programs/many_params.abas`
+- `fission/tests/native_programs/strings.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
 - `build.abas`
@@ -1456,32 +1533,36 @@ D. DONE, including the Rivet build-graph target -- see Completed Components.
    Compiler Substrate become a real standalone executable"), the answer is
    now genuinely yes.
 E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
-   runtime, i.e. no embedded bytecode VM at all). **Phases 1, 2, AND 3
+   runtime, i.e. no embedded bytecode VM at all). **Phases 1-4
    DONE -- see Completed Components**: `fission/amir/lower_x86_64.abas` +
    `fission/cli/compile_to_x86_64.abas` + `FissionNativeCapsuleTarget`
    produce real, standalone, execution-verified freestanding ELF64s for
    PRINT of string literals (Phase 1); variables, arithmetic (`+`/`-`/`*`/
    `MOD`), comparisons, `IF`/`WHILE`/`FOR`-range, and PRINT of a computed
-   integer (Phase 2); and now real user-declared FUNCTIONs with a genuine
-   SysV calling convention -- the first 6 numeric parameters in
+   integer (Phase 2); real user-declared FUNCTIONs with a genuine SysV
+   calling convention -- the first 6 numeric parameters in
    `%rdi`/`%rsi`/`%rdx`/`%rcx`/`%r8`/`%r9`, the 7th+ real SysV stack-passed
-   arguments too (no arbitrary parameter-count limit, closed right after
-   Phase 3 landed), return value in `%rax` -- and real recursion (Phase 3)
-   -- no embedded bytecode VM, no legacy ArcoFission involvement in the
-   compile itself (only `as`/`ld`). Real FizzBuzz, a real recursive
-   Fibonacci, and a real 10-parameter function all run as genuine
-   standalone x86-64 binaries today. What's still real, almost entirely
-   untouched, and each its own substantial undertaking on its own:
-   - WP-011 Linux Runtime: everything this backend cannot hand-roll itself
-     -- strings beyond a literal (concatenation, length, slicing, string
-     variables/parameters/return values -- currently a variable ever
-     assigned a string correctly reports a diagnostic rather than compiling
-     wrong, see Completed Components' "real safety gap" writeup), arrays,
-     objects/classes, and a real fallback to the existing ~244-entry
-     host-function dispatch table for anything else (legacy's own
-     `arco_call_host`/`host_bridge.cpp` bridge is the reference for this,
-     though porting it into the substrate rather than linking against it
-     directly is itself a real design decision to make, not just a port).
+   arguments too (no arbitrary parameter-count limit), return value in
+   `%rax` -- and real recursion (Phase 3); and now real string VARIABLES --
+   assign/PRINT/reassign/copy, function-local (Phase 4) -- no embedded
+   bytecode VM, no legacy ArcoFission involvement in the compile itself
+   (only `as`/`ld`). Real FizzBuzz, a real recursive Fibonacci, a real
+   10-parameter function, and a real string-variable program all run as
+   genuine standalone x86-64 binaries today. What's still real, almost
+   entirely untouched, and each its own substantial undertaking on its own:
+   - String CONCATENATION -- needs a real allocator (even a simple bump
+     one would do), which nothing in this backend provides yet. Currently
+     a real, specific diagnostic ("string concatenation is not yet
+     supported"), not silently wrong output or a generic error.
+   - Strings as function parameters or return values -- Phase 4's kind
+     tracking is function-local only; currently a real diagnostic at the
+     call site / RETURN, not a silent misinterpretation.
+   - WP-011 Linux Runtime, the rest of it: arrays, objects/classes, and a
+     real fallback to the existing ~244-entry host-function dispatch table
+     for anything else (legacy's own `arco_call_host`/`host_bridge.cpp`
+     bridge is the reference for this, though porting it into the
+     substrate rather than linking against it directly is itself a real
+     design decision to make, not just a port).
    - DO loops and ForEach: not yet lowered by this backend at all (only
      IF/WHILE/FOR-range are) -- likely straightforward given they already
      desugar to the same Branch/Jump primitives once written, following

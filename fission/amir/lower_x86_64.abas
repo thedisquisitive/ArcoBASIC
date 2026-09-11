@@ -27,29 +27,33 @@
 ' pass simply starts from GAS text instead of arriving at it as a secondary
 ' rendering of already-encoded bytes.
 '
-' Phase 3 scope (Phase 1: PRINT of a string literal; Phase 2: variables/
-' arithmetic/comparisons/IF/WHILE/FOR over plain numbers): real
-' user-declared ArcoBASIC FUNCTIONs, with a genuine (if deliberately scoped)
-' SysV integer calling convention -- the first 6 numeric parameters/
-' arguments in %rdi/%rsi/%rdx/%rcx/%r8/%r9 (SysV's own first six integer
-' argument registers, in order), the 7th+ real SysV stack-passed arguments
-' too (pushed by the caller in reverse order, read by the callee at a
-' fixed positive %rbp offset -- no arbitrary parameter-count limit), a
-' real `call`/`ret` per function (each with its own independent stack
-' frame, `push %rbp; mov %rsp,%rbp; sub $FRAME,%rsp` / `leave; ret`), and
-' a numeric return value in %rax. Recursion works (confirmed via a real
-' recursive Fibonacci): each call gets its own frame on the real hardware
-' call stack, nothing about this backend's design assumes non-recursive
-' calls. Every block label is prefixed with its owning function's name
-' (`Fib_IfThen0`, not bare `IfThen0`) so two different functions'
-' same-named blocks (every function has its own "Entry", every IF/WHILE/
-' FOR desugars to the same block-name scheme) never collide in the single
-' flat .text section -- Main's own blocks are the one exception, left bare
-' to match this backend's earlier, already-tested Phase 1/2 output exactly.
-' Still deliberately out of scope, still real, disclosed follow-on work:
-' non-numeric parameters/return values, and everything WP-011 (Linux
-' Runtime) still owes -- strings beyond a literal, arrays, objects, the
-' general host-function bridge. See
+' Phase 4 scope (Phase 1: PRINT of a string literal; Phase 2: variables/
+' arithmetic/comparisons/IF/WHILE/FOR over plain numbers; Phase 3: real
+' user-declared FUNCTIONs with a genuine SysV calling convention, including
+' stack-passed arguments beyond the first 6): real STRING VARIABLES --
+' `s = "hello"` / `PRINT s`, reassignment, one string variable copied into
+' another -- not just PRINT of a bare string literal. A string value is
+' represented as a pointer to a NUL-terminated (`.asciz`) byte sequence in
+' `.rodata`, stored in an ordinary 8-byte slot exactly like a number (the
+' same flat %rbp-relative frame, no separate memory region) -- LOAD/STORE
+' codegen for a string-kind slot is IDENTICAL to a numeric one (`mov` a
+' pointer around is no different from `mov`-ing a number), so the only new
+' machinery is a runtime `str_print` helper (a real `strlen` scan then a
+' `write` syscall, mirroring `itoa_print`'s own "internal call/ret, ad-hoc
+' convention" shape) and per-name KIND tracking (`Fission_X86_64CollectSlots`
+' now records "Number" or "String" per temp/variable, not just whether a
+' slot exists) so every numeric-only context (arithmetic, comparisons,
+' branch conditions, call arguments, non-Main return values) can reject a
+' string operand with a real diagnostic instead of silently misinterpreting
+' a pointer as an integer.
+' Deliberately still out of scope, still real, disclosed follow-on work:
+' string CONCATENATION (`+` between two strings -- needs a real allocator,
+' even a simple bump one, this phase doesn't add), strings as function
+' parameters or return values (this phase's `kinds` tracking is function-
+' local only; a parameter is always assumed numeric, so passing a string
+' into or back out of a function correctly reports a diagnostic rather than
+' silently misinterpreting it), and everything else WP-011 (Linux Runtime)
+' still owes -- arrays, objects, the general host-function bridge. See
 ' .agents/FISSION_SUBSTRATE_PROGRESS.md.
 
 CLASS FissionX86_64Program
@@ -65,11 +69,11 @@ END CLASS
 
 ' Escapes `text` (already unescaped to its real runtime content by the
 ' ArcoBASIC frontend, e.g. a literal newline is a real newline character, not
-' the two characters "\" "n") for a GAS `.ascii "..."` directive. Only the
-' characters that would otherwise break GAS's own quoted-string syntax are
-' escaped (backslash, double-quote, newline, tab, carriage return); every
-' other byte passes through literally -- GAS itself places no restriction on
-' raw bytes inside a quoted string beyond those.
+' the two characters "\" "n") for a GAS `.ascii`/`.asciz` `"..."` directive.
+' Only the characters that would otherwise break GAS's own quoted-string
+' syntax are escaped (backslash, double-quote, newline, tab, carriage
+' return); every other byte passes through literally -- GAS itself places no
+' restriction on raw bytes inside a quoted string beyond those.
 FUNCTION Fission_X86_64EscapeAscii(text)
     chars = String.ToChars(text)
     parts = []
@@ -168,118 +172,134 @@ FUNCTION Fission_X86_64CollectFunctionNames(amirModule)
     RETURN names
 END FUNCTION
 
-' Pre-scan pass: every distinct temp/variable name that will ever hold a
-' NUMBER (not a string constant, which stays handled by the existing
-' Const-text tracking map and never needs a stack slot) gets exactly one
-' fixed 8-byte slot, decided once, up front -- so the prologue's `sub
-' $FRAME,%rsp` can be emitted before any instruction codegen runs, with no
-' dynamic frame growth/relocation needed. `fn`'s own declared parameters
-' (always numeric in this backend's current scope) are seeded first, before
-' the body is scanned at all, so a parameter that the body never actually
-' reads still gets a real slot to spill its incoming argument register into
-' during the prologue.
+' Pre-scan pass: every distinct temp/variable name gets exactly one fixed
+' 8-byte slot, decided once, up front -- so the prologue's `sub $FRAME,%rsp`
+' can be emitted before any instruction codegen runs, with no dynamic frame
+' growth/relocation needed. `fn`'s own declared parameters (always numeric
+' in this backend's current scope -- see this file's own header comment)
+' are seeded first, before the body is scanned at all, so a parameter that
+' the body never actually reads still gets a real slot to spill its
+' incoming argument register into during the prologue; the 7th+ parameter
+' (SysV stack-passed) gets no slot here at all -- Fission_X86_64LowerFunction
+' gives it a fixed positive %rbp offset directly instead, see its own
+' comment.
 '
-' Tracks string-ness (of both %tN temps AND named variables) through the
-' SAME pass, in instruction order, rather than as a separate step -- a real
-' bug found and fixed via direct testing (`s = "hello"` compiled and ran
-' silently printing "0" instead of failing): a variable ever assigned a
-' known-string value must NOT get a numeric slot, or every later
-' consumption site (Load, BinOp, Print, Branch) would resolve it to
-' whatever garbage happens to sit at that address instead of reporting the
-' real "this backend doesn't support string variables yet" diagnostic.
-' Conservative by construction: a variable stored a string value even once,
-' anywhere in the function, is excluded from numeric slots entirely, so any
-' later numeric-context use of it (even down a path that never actually
-' stores a string into it at runtime) is correctly treated as unresolvable
-' by Fission_X86_64OperandIsResolvable below, rather than silently guessed.
-FUNCTION Fission_X86_64CollectNumericSlots(fn)
+' ALSO tracks the KIND ("Number" or "String") of every temp/variable
+' through this SAME pass, in declaration order -- a %tN temp's own kind is
+' always knowable immediately, at its own single definition site (Const/
+' Load/BinOp/Call), so scan order never matters for temps; a named
+' variable's kind is decided by whichever STORE to it this scan encounters
+' (last-write-wins during collection is fine here, since emission re-derives
+' and cross-checks each individual Store's own value-kind against this
+' pass's final answer -- see Fission_X86_64LowerFunction's own Store
+' handling for where an actual Number/String mix gets caught and reported).
+' Real bug found and fixed via direct testing before string variables
+' existed at all (`s = "hello"` compiled with zero diagnostics and ran,
+' printing "0" instead of "hello" or failing): every numeric-only
+' consumption site (BinOp, Branch, call arguments, non-Main Return) must
+' check kind, not just slot existence, or a string value flows silently
+' into a context expecting a number.
+FUNCTION Fission_X86_64CollectSlots(fn)
     names = []
     seen = {}
+    kinds = {}
     registerParamCount = LEN(Fission_X86_64ArgRegisters())
     paramIndex = 0
     FOR param IN fn.Params
         IF paramIndex < registerParamCount THEN
-            ' Register-passed (SysV's first 6 integer argument registers) --
-            ' gets an ordinary negative local slot, spilled from its
-            ' register in the prologue, same as before.
             state = Fission_X86_64Remember(names, seen, param.Name)
             names = state.Names
             seen = state.Seen
         ELSE
-            ' Stack-passed (the 7th+ parameter): NOT a local slot at all --
-            ' Fission_X86_64LowerFunction gives it a fixed POSITIVE %rbp
-            ' offset directly into the caller's own pushed arguments
-            ' instead (see its own comment), so it needs no negative slot
-            ' here. Still marked `seen` so the body-scan below (Load's own
-            ' "add if not already seen" logic) does not also try to hand it
-            ' an ordinary negative slot the moment the body reads it.
             seen = Object.Set(seen, param.Name, TRUE)
         END IF
+        kinds = Object.Set(kinds, param.Name, "Number")
         paramIndex = paramIndex + 1
     NEXT
-    stringTemps = {}
-    stringVariables = {}
     FOR block IN fn.Blocks
         FOR instruction IN block.Instructions
             kind = instruction.Kind
             IF kind == "Const" THEN
                 value = instruction.Field("Value")
                 dest = instruction.Field("Dest")
+                state = Fission_X86_64Remember(names, seen, dest)
+                names = state.Names
+                seen = state.Seen
                 IF Fission_X86_64IsStringConstValue(value) THEN
-                    stringTemps = Object.Set(stringTemps, dest, TRUE)
+                    kinds = Object.Set(kinds, dest, "String")
                 ELSE
-                    state = Fission_X86_64Remember(names, seen, dest)
-                    names = state.Names
-                    seen = state.Seen
+                    kinds = Object.Set(kinds, dest, "Number")
                 END IF
             END IF
             IF kind == "Load" THEN
                 name = instruction.Field("Name")
                 dest = instruction.Field("Dest")
-                IF Object.Has(stringVariables, name) THEN
-                    stringTemps = Object.Set(stringTemps, dest, TRUE)
-                ELSE
-                    state = Fission_X86_64Remember(names, seen, dest)
-                    names = state.Names
-                    seen = state.Seen
+                state = Fission_X86_64Remember(names, seen, dest)
+                names = state.Names
+                seen = state.Seen
+                ' Defensive: a variable read before any Store to it in this
+                ' scan's own declaration order (should not happen for valid
+                ' ArcoBASIC, but costs nothing to guard) still gets a slot.
+                IF Object.Has(seen, name) == FALSE THEN
                     state = Fission_X86_64Remember(names, seen, name)
                     names = state.Names
                     seen = state.Seen
                 END IF
+                kinds = Object.Set(kinds, dest, Object.Get(kinds, name, "Number"))
             END IF
             IF kind == "Store" ANDALSO instruction.Field("Name") != "Args" THEN
                 name = instruction.Field("Name")
                 value = instruction.Field("Value")
-                IF Object.Has(stringTemps, value) THEN
-                    stringVariables = Object.Set(stringVariables, name, TRUE)
-                ELSE
-                    state = Fission_X86_64Remember(names, seen, name)
-                    names = state.Names
-                    seen = state.Seen
-                END IF
+                state = Fission_X86_64Remember(names, seen, name)
+                names = state.Names
+                seen = state.Seen
+                valueKind = "Number"
+                IF Fission_X86_64IsNumericLiteral(value) == FALSE THEN valueKind = Object.Get(kinds, value, "Number")
+                kinds = Object.Set(kinds, name, valueKind)
             END IF
             IF kind == "BinOp" THEN
-                state = Fission_X86_64Remember(names, seen, instruction.Field("Dest"))
+                dest = instruction.Field("Dest")
+                state = Fission_X86_64Remember(names, seen, dest)
                 names = state.Names
                 seen = state.Seen
+                kinds = Object.Set(kinds, dest, "Number")
             END IF
             IF kind == "Call" ANDALSO instruction.Field("Callee") != "Runtime.Args" THEN
-                state = Fission_X86_64Remember(names, seen, instruction.Field("Dest"))
+                dest = instruction.Field("Dest")
+                state = Fission_X86_64Remember(names, seen, dest)
                 names = state.Names
                 seen = state.Seen
+                ' Phase 4 scope: a user function's return value is always
+                ' treated as Number -- see this file's own header comment.
+                kinds = Object.Set(kinds, dest, "Number")
             END IF
         NEXT
     NEXT
-    RETURN names
+    RETURN {Names: names, Kinds: kinds}
+END FUNCTION
+
+' The kind ("Number" or "String") of `operand` -- a bare numeric literal is
+' always "Number"; anything else is looked up in `kinds` (built by
+' Fission_X86_64CollectSlots), defaulting to "Number" when untracked (an
+' operand this pass has no other information about is assumed numeric,
+' preserving this backend's original Phase 2/3 behavior for purely numeric
+' programs, where `kinds` never gets populated with "String" for anything
+' relevant at all).
+FUNCTION Fission_X86_64OperandKind(kinds, operand)
+    IF Fission_X86_64IsNumericLiteral(operand) THEN RETURN "Number"
+    RETURN Object.Get(kinds, operand, "Number")
 END FUNCTION
 
 ' Whether `operand` (a %tN temp, a plain variable name, or a bare numeric
 ' literal) can actually be read into a register by this pass -- a numeric
-' literal always can; anything else needs a real slot (Fission_X86_64Collect
-' NumericSlots above excludes anything that ever touched a string). Every
-' consumption site below must check this before calling
-' Fission_X86_64OperandLoadLine, and report a diagnostic instead of emitting
-' a `mov` for a slot that was never actually allocated.
+' literal always can; anything else needs a real slot (every name
+' Fission_X86_64CollectSlots tracks a kind for also has one, string-kind
+' included since Phase 4 -- LOAD/STORE codegen for a string-kind slot is
+' identical to a numeric one, only PRINT and the numeric-only consumption
+' sites below need to distinguish kind at all). Every consumption site below
+' must check this before calling Fission_X86_64OperandLoadLine, and report a
+' diagnostic instead of emitting a `mov` for a slot that was never actually
+' allocated.
 FUNCTION Fission_X86_64OperandIsResolvable(offsets, operand)
     IF Fission_X86_64IsNumericLiteral(operand) THEN RETURN TRUE
     RETURN Object.Has(offsets, operand)
@@ -288,8 +308,9 @@ END FUNCTION
 ' Builds the name -> "-N" stack-offset table (relative to %rbp, growing
 ' downward, one slot per name) and the total frame size (16-byte aligned --
 ' not strictly required for a freestanding `_start` with no external ABI
-' boundary, but real `call`s -- itoa_print, and now user functions -- are
-' made from inside these frames, and costs nothing to keep conventional).
+' boundary, but real `call`s -- itoa_print/str_print, and now user
+' functions -- are made from inside these frames, and costs nothing to
+' keep conventional).
 FUNCTION Fission_X86_64BuildFrame(names)
     offsets = {}
     index = 0
@@ -335,10 +356,9 @@ END FUNCTION
 ' SysV's own first six integer/pointer argument registers, in order. A
 ' 7th+ parameter/argument is real SysV too -- stack-passed, pushed by the
 ' caller in reverse order so the 7th argument ends up closest to the
-' return address, read directly out of the caller's frame at a fixed
-' positive %rbp offset by the callee (16(%rbp) for the 7th, 24(%rbp) for
-' the 8th, ...) -- see Fission_X86_64LowerFunction's own prologue comment
-' and the CALL/CallVoid lowering below.
+' return address, read by the callee at a fixed positive %rbp offset (no
+' arbitrary parameter-count limit) -- see Fission_X86_64LowerFunction's own
+' prologue comment and the CALL/CallVoid lowering below.
 FUNCTION Fission_X86_64ArgRegisters()
     RETURN ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
 END FUNCTION
@@ -369,6 +389,7 @@ END FUNCTION
 ' Lowers one BinOp instruction (dest := left OP right). Returns {Ok, Lines}
 ' rather than reporting its own diagnostic -- the caller knows the
 ' instruction being lowered and can report a properly-contextualized error.
+' Caller has already checked both operands are Number-kind.
 FUNCTION Fission_X86_64LowerBinOp(offsets, instruction)
     op = instruction.Field("Op")
     left = instruction.Field("Left")
@@ -439,7 +460,7 @@ END FUNCTION
 ' INT64_MIN overflows (undefined behavior for that one specific value) --
 ' not handled, exceedingly unlikely to matter for the programs this phase
 ' targets. Emitted once, module-wide, shared by every function that prints
-' a number (not per-function) -- see usesItoa in Fission_AmirToX86_64.
+' a number (not per-function) -- see context.UsesItoa in Fission_AmirToX86_64.
 FUNCTION Fission_X86_64ItoaPrintSubroutine()
     lines = [
         "itoa_print:",
@@ -481,27 +502,65 @@ FUNCTION Fission_X86_64ItoaPrintSubroutine()
     RETURN lines
 END FUNCTION
 
+' Companion to itoa_print for string values: same internal-only call/ret
+' convention (input: a pointer to a NUL-terminated byte sequence in %rdi;
+' no return value; freely clobbers %rax/%rcx/%rdx/%rsi/%rdi). Every string
+' value in this backend is represented as a pointer to `.asciz` data (a real
+' string constant's own rodata, or another string variable's slot simply
+' copied -- LOAD/STORE never care that the 8 bytes happen to be a pointer),
+' so printing one always means: find its length at runtime (a NUL scan --
+' this backend does not track string length separately, unlike the direct-
+' literal print path Phase 1-3 used, which knew the length at compile time
+' and needed no runtime scan at all; Phase 4 deliberately unifies literal
+' and variable printing onto this one runtime path instead of keeping two,
+' trading a little runtime work for real simplicity), then two `write`
+' syscalls (the string's own bytes, then a shared single newline byte) to
+' match Runtime.Print's own always-append-newline behavior. Emitted once,
+' module-wide, shared by every function that prints a string -- see
+' context.UsesStrPrint in Fission_AmirToX86_64.
+FUNCTION Fission_X86_64StrPrintSubroutine()
+    lines = [
+        "str_print:",
+        "    mov %rdi, %rsi",
+        "    mov %rdi, %rax",
+        ".Lstrlen_loop:",
+        "    cmpb $0, (%rax)",
+        "    je .Lstrlen_done",
+        "    inc %rax",
+        "    jmp .Lstrlen_loop",
+        ".Lstrlen_done:",
+        "    sub %rsi, %rax",
+        "    mov %rax, %rdx",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    syscall",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    lea newline_byte(%rip), %rsi",
+        "    mov $1, %rdx",
+        "    syscall",
+        "    ret"
+    ]
+    RETURN lines
+END FUNCTION
+
 ' Lowers one function (Main or a real user-declared one) to GAS text.
 ' `labelPrefix` is "" for Main (matches this backend's earlier, already-
 ' tested Phase 1/2 output exactly -- Main's blocks stay bare) and
 ' `fn.Name + "_"` for everything else, so e.g. two different functions'
 ' same-named "Entry"/"IfThen0" blocks never collide in the single flat
 ' .text section. `context` threads module-wide state across every
-' function's own lowering call: the .rodata string-constant lines and
-' counter (string labels must be unique module-wide, not just per
-' function, since PRINT of a string can appear in any function), and
-' whether itoa_print (shared, emitted once at the very end) is needed by
-' ANY function, not just this one.
+' function's own lowering call: the .rodata lines and string-label counter
+' (labels must be unique module-wide, not just per function, since PRINT of
+' a string can appear in any function), and whether itoa_print/str_print
+' (shared, emitted once at the very end) are needed by ANY function, not
+' just this one.
 FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, functionNames, context)
-    numericNames = Fission_X86_64CollectNumericSlots(fn)
-    frame = Fission_X86_64BuildFrame(numericNames)
+    collected = Fission_X86_64CollectSlots(fn)
+    frame = Fission_X86_64BuildFrame(collected.Names)
     offsets = frame.Offsets
+    kinds = collected.Kinds
 
-    ' Const values (string constants only -- see Fission_X86_64CollectNumericSlots)
-    ' are tracked here so a later CallVoid Runtime.Print can tell a string
-    ' argument apart from a numeric one. Function-local: a %tN temp never
-    ' crosses a function boundary.
-    tempStringValues = {}
     textLines = []
 
     IF isMain THEN
@@ -522,7 +581,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
     ' ends up closest to the return address -- 16(%rbp) in this callee's
     ' own frame (0(%rbp) is the saved %rbp, 8(%rbp) the return address
     ' `call` itself pushed), 8th at 24(%rbp), and so on. Those get no
-    ' local slot and no spill at all: Fission_X86_64CollectNumericSlots
+    ' local slot and no spill at all: Fission_X86_64CollectSlots
     ' deliberately excluded them from the negative-slot table, and their
     ' fixed positive offset is set directly into `offsets` here, read
     ' directly out of the caller's own frame by every later LOAD of that
@@ -548,11 +607,18 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
             IF kind == "DeclareFunction" THEN CONTINUE FOR
             IF kind == "Const" THEN
                 value = instruction.Field("Value")
+                dest = instruction.Field("Dest")
                 IF Fission_X86_64IsStringConstValue(value) THEN
-                    tempStringValues = Object.Set(tempStringValues, instruction.Field("Dest"), value)
+                    text = Fission_X86_64UnquoteConstValue(value)
+                    label = "str" + String(context.StringCount)
+                    context.StringCount = context.StringCount + 1
+                    ignored = Array.Push(context.RodataLines, label + ":")
+                    ignored = Array.Push(context.RodataLines, "    .asciz \"" + Fission_X86_64EscapeAscii(text) + "\"")
+                    ignored = Array.Push(textLines, "    lea " + label + "(%rip), %rax")
+                    ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, dest))
                     CONTINUE FOR
                 END IF
-                ignored = Array.Push(textLines, "    movq $" + value + ", " + Object.Get(offsets, instruction.Field("Dest"), "0") + "(%rbp)")
+                ignored = Array.Push(textLines, "    movq $" + value + ", " + Object.Get(offsets, dest, "0") + "(%rbp)")
                 CONTINUE FOR
             END IF
             isArgsCall = kind == "Call" ANDALSO instruction.Field("Callee") == "Runtime.Args"
@@ -562,7 +628,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
             IF kind == "Load" THEN
                 name = instruction.Field("Name")
                 IF Fission_X86_64OperandIsResolvable(offsets, name) == FALSE THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Reading a non-numeric variable is not supported by native x86-64 codegen (numbers only): " + name)
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Reading an unsupported variable is not supported by native x86-64 codegen: " + name)
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, name, "rax"))
@@ -570,13 +636,26 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 CONTINUE FOR
             END IF
             IF kind == "Store" THEN
+                name = instruction.Field("Name")
                 value = instruction.Field("Value")
                 IF Fission_X86_64OperandIsResolvable(offsets, value) == FALSE THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Assigning a non-numeric value is not supported by native x86-64 codegen (numbers only): " + value)
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Assigning an unsupported value is not supported by native x86-64 codegen: " + value)
+                    CONTINUE FOR
+                END IF
+                ' A variable assigned both a Number and a String somewhere in
+                ' this same function (e.g. `IF x THEN s = "a" ELSE s = 1`) is
+                ' a real, disclosed gap, not silently guessed at: report it
+                ' here rather than letting a later LOAD/PRINT of `name`
+                ' misinterpret whichever kind Fission_X86_64CollectSlots
+                ' happened to settle on last.
+                valueKind = Fission_X86_64OperandKind(kinds, value)
+                variableKind = Object.Get(kinds, name, "Number")
+                IF valueKind != variableKind THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Variable " + name + " is assigned both a number and a string somewhere in this function, which native x86-64 codegen does not support")
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, value, "rax"))
-                ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Name")))
+                ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, name))
                 CONTINUE FOR
             END IF
             IF kind == "BinOp" THEN
@@ -585,7 +664,19 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 leftOk = Fission_X86_64OperandIsResolvable(offsets, left)
                 rightOk = Fission_X86_64OperandIsResolvable(offsets, right)
                 IF leftOk == FALSE ORELSE rightOk == FALSE THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Operating on a non-numeric value is not supported by native x86-64 codegen (numbers only): " + left + ", " + right)
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Operating on an unsupported value is not supported by native x86-64 codegen: " + left + ", " + right)
+                    CONTINUE FOR
+                END IF
+                leftKind = Fission_X86_64OperandKind(kinds, left)
+                rightKind = Fission_X86_64OperandKind(kinds, right)
+                IF leftKind != "Number" ORELSE rightKind != "Number" THEN
+                    op = instruction.Field("Op")
+                    isConcat = (op == "+") ANDALSO leftKind == "String" ANDALSO rightKind == "String"
+                    IF isConcat THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "String concatenation is not yet supported by native x86-64 codegen: " + left + " + " + right)
+                    ELSE
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Operating on a non-numeric value is not supported by native x86-64 codegen: " + left + ", " + right)
+                    END IF
                     CONTINUE FOR
                 END IF
                 lowered = Fission_X86_64LowerBinOp(offsets, instruction)
@@ -601,7 +692,11 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
             IF kind == "Branch" THEN
                 condition = instruction.Field("Condition")
                 IF Fission_X86_64OperandIsResolvable(offsets, condition) == FALSE THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Branching on a non-numeric condition is not supported by native x86-64 codegen: " + condition)
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Branching on an unsupported condition is not supported by native x86-64 codegen: " + condition)
+                    CONTINUE FOR
+                END IF
+                IF Fission_X86_64OperandKind(kinds, condition) != "Number" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Branching on a string value is not supported by native x86-64 codegen: " + condition)
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, condition, "rax"))
@@ -617,29 +712,19 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
             isPrintCall = kind == "CallVoid" ANDALSO instruction.Field("Callee") == "Runtime.Print"
             IF isPrintCall THEN
                 argRef = instruction.Field("Args")
-                isKnownString = Object.Has(tempStringValues, argRef)
-                IF isKnownString THEN
-                    rawValue = Object.Get(tempStringValues, argRef, "")
-                    text = Fission_X86_64UnquoteConstValue(rawValue) + "\n"
-                    label = "str" + String(context.StringCount)
-                    context.StringCount = context.StringCount + 1
-                    ignored = Array.Push(context.RodataLines, label + ":")
-                    ignored = Array.Push(context.RodataLines, "    .ascii \"" + Fission_X86_64EscapeAscii(text) + "\"")
-                    ignored = Array.Push(context.RodataLines, "    .set " + label + "_len, . - " + label)
-                    ignored = Array.Push(textLines, "    mov $" + Fission_X86_64SyscallWrite() + ", %rax")
-                    ignored = Array.Push(textLines, "    mov $1, %rdi")
-                    ignored = Array.Push(textLines, "    lea " + label + "(%rip), %rsi")
-                    ignored = Array.Push(textLines, "    mov $" + label + "_len, %rdx")
-                    ignored = Array.Push(textLines, "    syscall")
-                    CONTINUE FOR
-                END IF
                 IF Fission_X86_64OperandIsResolvable(offsets, argRef) == FALSE THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "PRINT operand is not a string literal or a known numeric value: " + argRef)
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "PRINT operand is not supported by native x86-64 codegen: " + argRef)
                     CONTINUE FOR
                 END IF
-                ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rax"))
-                ignored = Array.Push(textLines, "    call itoa_print")
-                context.UsesItoa = TRUE
+                IF Fission_X86_64OperandKind(kinds, argRef) == "String" THEN
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rdi"))
+                    ignored = Array.Push(textLines, "    call str_print")
+                    context.UsesStrPrint = TRUE
+                ELSE
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rax"))
+                    ignored = Array.Push(textLines, "    call itoa_print")
+                    context.UsesItoa = TRUE
+                END IF
                 CONTINUE FOR
             END IF
             isUserCall = (kind == "Call" ORELSE kind == "CallVoid") ANDALSO instruction.Field("Callee") != "Runtime.Print"
@@ -652,11 +737,17 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 args = Fission_X86_64SplitArgs(instruction.Field("Args"))
                 argRegisters = Fission_X86_64ArgRegisters()
                 unresolvedArg = ""
+                nonNumericArg = ""
                 FOR arg IN args
                     IF Fission_X86_64OperandIsResolvable(offsets, arg) == FALSE THEN unresolvedArg = arg
+                    IF Fission_X86_64OperandKind(kinds, arg) != "Number" THEN nonNumericArg = arg
                 NEXT
                 IF unresolvedArg != "" THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with a non-numeric argument is not supported by native x86-64 codegen: " + unresolvedArg)
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an unsupported argument is not supported by native x86-64 codegen: " + unresolvedArg)
+                    CONTINUE FOR
+                END IF
+                IF nonNumericArg != "" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with a string argument is not supported by native x86-64 codegen (function parameters are numeric-only): " + nonNumericArg)
                     CONTINUE FOR
                 END IF
                 ' Real SysV: the first 6 arguments go in registers (below);
@@ -718,7 +809,11 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 END IF
                 returnValue = instruction.Field("Value")
                 IF Fission_X86_64OperandIsResolvable(offsets, returnValue) == FALSE THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Returning a non-numeric value is not supported by native x86-64 codegen: " + returnValue)
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Returning an unsupported value is not supported by native x86-64 codegen: " + returnValue)
+                    CONTINUE FOR
+                END IF
+                IF Fission_X86_64OperandKind(kinds, returnValue) != "Number" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Returning a string value is not supported by native x86-64 codegen (function return values are numeric-only): " + returnValue)
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, returnValue, "rax"))
@@ -736,7 +831,7 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
-    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE}
+    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE}
 
     allTextLines = []
     FOR fn IN amirModule.Functions
@@ -760,11 +855,22 @@ FUNCTION Fission_AmirToX86_64(amirModule)
             ignored = Array.Push(allTextLines, line)
         NEXT
     END IF
+    IF context.UsesStrPrint THEN
+        FOR line IN Fission_X86_64StrPrintSubroutine()
+            ignored = Array.Push(allTextLines, line)
+        NEXT
+    END IF
 
     ignored = program.Diagnostics.AppendMany(amirModule.Diagnostics)
 
+    rodataLines = context.RodataLines
+    IF context.UsesStrPrint THEN
+        ignored = Array.Push(rodataLines, "newline_byte:")
+        ignored = Array.Push(rodataLines, "    .byte 10")
+    END IF
+
     lines = ["    .section .rodata"]
-    FOR line IN context.RodataLines
+    FOR line IN rodataLines
         ignored = Array.Push(lines, line)
     NEXT
     ignored = Array.Push(lines, "")
