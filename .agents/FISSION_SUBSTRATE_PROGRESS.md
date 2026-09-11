@@ -66,11 +66,14 @@ parameter-count limit, closed right after Phase 3 landed -- return value in
 `ArcoFission compile-run` exactly. **Phase 4: real string VARIABLES** --
 `s = "hello"` / `PRINT s` genuinely works now (assign, PRINT, reassign,
 copy one string variable into another), represented as a pointer to
-`.rodata` alongside a runtime `str_print` helper; string concatenation,
-strings as function parameters/return values, and branching on a string
-each remain their own real, disclosed diagnostic-reported gap rather than
-silently wrong behavior. **WP-011 (Linux Runtime -- string concatenation,
-arrays, objects, the general host-function bridge for everything else
+`.rodata` alongside a runtime `str_print` helper. **Phase 5: real string
+CONCATENATION** -- `a + b` between two strings genuinely builds a new
+string at runtime via a bump allocator into a fixed `.bss` arena, chained
+and reused freely, exercised for real inside a WHILE-loop accumulator.
+Strings as function parameters/return values, string comparison, and
+branching on a string each remain their own real, disclosed diagnostic-
+reported gap rather than silently wrong behavior. **WP-011 (Linux Runtime
+-- arrays, objects, the general host-function bridge for everything else
 this backend cannot hand-roll itself) remains real, substantial follow-on
 work** -- see "Next
 Recommended Work" item E.
@@ -896,6 +899,53 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   `strings` assertion (real output + oracle comparison). Verified with
   plain `fissure run` (not `--full`), per the workflow correction recorded
   immediately above.
+- Native x86-64 codegen Phase 5: real string CONCATENATION -- requested
+  directly right after Phase 4 landed ("the word", after being offered
+  concatenation as the natural next target). `a + b` between two
+  String-kind operands now genuinely builds "a"+"b" at runtime, closing
+  the exact disclosed gap Phase 4 had left open.
+  `str_concat` (new runtime helper, same internal-only call/ret convention
+  as `itoa_print`/`str_print`) does the real work: a bump allocator into a
+  fixed 1 MiB static `.bss` arena (`string_heap`/`string_heap_top`, the
+  bump pointer's own zero-initialized `.bss` state doubling as its
+  "not yet initialized" sentinel, lazily set to `string_heap`'s own address
+  on first use -- no separate init step needed anywhere). Real memory
+  management, deliberately the simplest correct kind: every concatenation
+  permanently claims new space and nothing is ever freed, a disclosed
+  limitation for a program that concatenates heavily in a long-running
+  loop, genuinely fine for everything this phase targets. Copies the left
+  operand first, stopping AT (not past) its own NUL terminator so the
+  right operand's own copy overwrites it, then copies the right operand
+  INCLUDING its own NUL (the result's real terminator), leaving the bump
+  pointer positioned exactly one byte past it for the next allocation.
+  A concatenation result is String-kind like any other value this backend
+  tracks -- `Fission_X86_64CollectSlots`'s BinOp handling and
+  `Fission_X86_64LowerFunction`'s own BinOp emission both check the exact
+  same condition (`+` with both operands String-kind) to agree on this
+  without needing a new A-MIR instruction kind or opcode at all, so
+  `PRINT`ing a concatenation result, or concatenating it again, both work
+  completely unmodified through the machinery Phase 4 already built.
+  Verified via real execution, not a single probe: chained (three-way)
+  concatenation, concatenation interpolated with a variable, an
+  accumulator pattern built up inside a WHILE loop (exercising the bump
+  allocator across many real calls, not just one), and reuse of an
+  already-concatenated result (concatenating it again without disturbing
+  its own original operands) -- all byte-for-byte identical to legacy
+  `ArcoFission compile-run` on the same source. Added as a permanent
+  regression fixture, `fission/tests/native_programs/concat.abas`.
+  Re-verified every earlier native demo, plus the string-variable
+  diagnostic paths that must still correctly fail (mixed-kind variable,
+  string passed as a call argument), unaffected by this change.
+  `fission/tests/amir_x86_64_smoke.abas`'s old "concatenation reports a
+  diagnostic" check updated to its opposite -- zero diagnostics, and the
+  rendered assembly actually contains `call str_concat`, the `.section
+  .bss` arena declaration, and (since the result is String-kind) a `call
+  str_print` for its own PRINT -- plus a new check that string COMPARISON
+  (a real, separate, still-unsupported gap) still correctly reports a
+  diagnostic. Self-parse/self-semantic corpus grew with the new helper
+  function and subroutine (91 files, 138 import edges, 2891 symbols, 0
+  diagnostics). Integration suite gained a `concat` assertion. Verified
+  with plain `fissure run`.
 
 ## In-Progress Components
 
@@ -1326,6 +1376,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/fibonacci.abas`
 - `fission/tests/native_programs/many_params.abas`
 - `fission/tests/native_programs/strings.abas`
+- `fission/tests/native_programs/concat.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
 - `build.abas`
@@ -1533,7 +1584,7 @@ D. DONE, including the Rivet build-graph target -- see Completed Components.
    Compiler Substrate become a real standalone executable"), the answer is
    now genuinely yes.
 E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
-   runtime, i.e. no embedded bytecode VM at all). **Phases 1-4
+   runtime, i.e. no embedded bytecode VM at all). **Phases 1-5
    DONE -- see Completed Components**: `fission/amir/lower_x86_64.abas` +
    `fission/cli/compile_to_x86_64.abas` + `FissionNativeCapsuleTarget`
    produce real, standalone, execution-verified freestanding ELF64s for
@@ -1543,20 +1594,21 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    calling convention -- the first 6 numeric parameters in
    `%rdi`/`%rsi`/`%rdx`/`%rcx`/`%r8`/`%r9`, the 7th+ real SysV stack-passed
    arguments too (no arbitrary parameter-count limit), return value in
-   `%rax` -- and real recursion (Phase 3); and now real string VARIABLES --
-   assign/PRINT/reassign/copy, function-local (Phase 4) -- no embedded
-   bytecode VM, no legacy ArcoFission involvement in the compile itself
-   (only `as`/`ld`). Real FizzBuzz, a real recursive Fibonacci, a real
-   10-parameter function, and a real string-variable program all run as
-   genuine standalone x86-64 binaries today. What's still real, almost
-   entirely untouched, and each its own substantial undertaking on its own:
-   - String CONCATENATION -- needs a real allocator (even a simple bump
-     one would do), which nothing in this backend provides yet. Currently
-     a real, specific diagnostic ("string concatenation is not yet
-     supported"), not silently wrong output or a generic error.
-   - Strings as function parameters or return values -- Phase 4's kind
+   `%rax` -- and real recursion (Phase 3); real string VARIABLES --
+   assign/PRINT/reassign/copy, function-local (Phase 4); and now real
+   string CONCATENATION via a real bump-allocated `.bss` arena (Phase 5)
+   -- no embedded bytecode VM, no legacy ArcoFission involvement in the
+   compile itself (only `as`/`ld`). Real FizzBuzz, a real recursive
+   Fibonacci, a real 10-parameter function, and a real string-building
+   program all run as genuine standalone x86-64 binaries today. What's
+   still real, almost entirely untouched, and each its own substantial
+   undertaking on its own:
+   - Strings as function parameters or return values -- Phase 4/5's kind
      tracking is function-local only; currently a real diagnostic at the
      call site / RETURN, not a silent misinterpretation.
+   - String comparison (`==`/`!=` between two strings) -- a real, separate
+     gap from concatenation; currently the generic "non-numeric" operand
+     diagnostic, not silently wrong.
    - WP-011 Linux Runtime, the rest of it: arrays, objects/classes, and a
      real fallback to the existing ~244-entry host-function dispatch table
      for anything else (legacy's own `arco_call_host`/`host_bridge.cpp`

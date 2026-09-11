@@ -27,34 +27,33 @@
 ' pass simply starts from GAS text instead of arriving at it as a secondary
 ' rendering of already-encoded bytes.
 '
-' Phase 4 scope (Phase 1: PRINT of a string literal; Phase 2: variables/
+' Phase 5 scope (Phase 1: PRINT of a string literal; Phase 2: variables/
 ' arithmetic/comparisons/IF/WHILE/FOR over plain numbers; Phase 3: real
 ' user-declared FUNCTIONs with a genuine SysV calling convention, including
-' stack-passed arguments beyond the first 6): real STRING VARIABLES --
-' `s = "hello"` / `PRINT s`, reassignment, one string variable copied into
-' another -- not just PRINT of a bare string literal. A string value is
-' represented as a pointer to a NUL-terminated (`.asciz`) byte sequence in
-' `.rodata`, stored in an ordinary 8-byte slot exactly like a number (the
-' same flat %rbp-relative frame, no separate memory region) -- LOAD/STORE
-' codegen for a string-kind slot is IDENTICAL to a numeric one (`mov` a
-' pointer around is no different from `mov`-ing a number), so the only new
-' machinery is a runtime `str_print` helper (a real `strlen` scan then a
-' `write` syscall, mirroring `itoa_print`'s own "internal call/ret, ad-hoc
-' convention" shape) and per-name KIND tracking (`Fission_X86_64CollectSlots`
-' now records "Number" or "String" per temp/variable, not just whether a
-' slot exists) so every numeric-only context (arithmetic, comparisons,
-' branch conditions, call arguments, non-Main return values) can reject a
-' string operand with a real diagnostic instead of silently misinterpreting
-' a pointer as an integer.
+' stack-passed arguments beyond the first 6; Phase 4: real string VARIABLES
+' -- assign/PRINT/reassign/copy, a string value represented as a pointer to
+' NUL-terminated (`.asciz`) `.rodata`, stored in an ordinary 8-byte slot
+' exactly like a number, plus per-name KIND tracking so every numeric-only
+' context rejects a string operand instead of silently misinterpreting a
+' pointer as an integer): real string CONCATENATION. `a + b` between two
+' String-kind operands now genuinely builds "a"+"b" at runtime via
+' `str_concat` -- real memory management, but the simplest correct kind: a
+' bump allocator into a fixed 1 MiB static `.bss` arena (`string_heap`/
+' `string_heap_top`), never freed. A concatenation result is String-kind
+' like any other (so `PRINT`ing one, or concatenating it again, both work
+' unmodified through the same machinery Phase 4 already built) -- the
+' collection pass (`Fission_X86_64CollectSlots`) and the emission pass both
+' check the exact same condition (`+` with both operands String-kind) to
+' agree on this without needing a new instruction kind or opcode at all.
 ' Deliberately still out of scope, still real, disclosed follow-on work:
-' string CONCATENATION (`+` between two strings -- needs a real allocator,
-' even a simple bump one, this phase doesn't add), strings as function
-' parameters or return values (this phase's `kinds` tracking is function-
-' local only; a parameter is always assumed numeric, so passing a string
-' into or back out of a function correctly reports a diagnostic rather than
-' silently misinterpreting it), and everything else WP-011 (Linux Runtime)
-' still owes -- arrays, objects, the general host-function bridge. See
-' .agents/FISSION_SUBSTRATE_PROGRESS.md.
+' strings as function parameters or return values (this phase's `kinds`
+' tracking is function-local only; a parameter is always assumed numeric,
+' so passing a string into or back out of a function correctly reports a
+' diagnostic rather than silently misinterpreting it), string comparison
+' (`==`/`!=` between two strings -- a real, separate gap from concatenation,
+' still reports the generic "non-numeric" diagnostic), and everything else
+' WP-011 (Linux Runtime) still owes -- arrays, objects, the general
+' host-function bridge. See .agents/FISSION_SUBSTRATE_PROGRESS.md.
 
 CLASS FissionX86_64Program
     CONSTRUCTOR()
@@ -262,7 +261,24 @@ FUNCTION Fission_X86_64CollectSlots(fn)
                 state = Fission_X86_64Remember(names, seen, dest)
                 names = state.Names
                 seen = state.Seen
-                kinds = Object.Set(kinds, dest, "Number")
+                ' `+` between two String-kind operands is real string
+                ' concatenation (see Fission_X86_64LowerFunction's own
+                ' BinOp handling) -- its own result is String-kind, not
+                ' Number, mirrored here exactly so a concatenated value
+                ' PRINTs correctly and can itself be concatenated again.
+                op = instruction.Field("Op")
+                left = instruction.Field("Left")
+                right = instruction.Field("Right")
+                leftKind = "Number"
+                IF Fission_X86_64IsNumericLiteral(left) == FALSE THEN leftKind = Object.Get(kinds, left, "Number")
+                rightKind = "Number"
+                IF Fission_X86_64IsNumericLiteral(right) == FALSE THEN rightKind = Object.Get(kinds, right, "Number")
+                isConcat = (op == "+") ANDALSO leftKind == "String" ANDALSO rightKind == "String"
+                IF isConcat THEN
+                    kinds = Object.Set(kinds, dest, "String")
+                ELSE
+                    kinds = Object.Set(kinds, dest, "Number")
+                END IF
             END IF
             IF kind == "Call" ANDALSO instruction.Field("Callee") != "Runtime.Args" THEN
                 dest = instruction.Field("Dest")
@@ -544,6 +560,60 @@ FUNCTION Fission_X86_64StrPrintSubroutine()
     RETURN lines
 END FUNCTION
 
+' Real string concatenation. Same internal-only call/ret convention as
+' itoa_print/str_print (input: %rdi/%rsi = pointers to two NUL-terminated
+' byte sequences; output: %rax = pointer to a newly-written NUL-terminated
+' "A"+"B"; freely clobbers %rax/%rcx/%rdx/%r8/%r9/%r10/%r11). Real memory
+' management, but deliberately the simplest correct kind: a bump allocator
+' into a fixed 1 MiB static `.bss` arena (`string_heap`/`string_heap_top`,
+' see Fission_AmirToX86_64's own `.section .bss` emission) -- every
+' concatenation permanently claims new space and nothing is ever freed, a
+' real, disclosed limitation for a program that concatenates heavily in a
+' long-running loop, but correct and simple for the programs this phase
+' targets. `string_heap_top` starts at 0 (`.bss`'s own zero-initialization,
+' the same the kernel already guarantees, no separate init step needed) and
+' is lazily set to `string_heap`'s own address the first time this runs.
+' Copies A first, stopping AT (not past) its own NUL terminator so B's own
+' copy overwrites it; then copies B including its own NUL, which becomes
+' the result's real terminator and leaves the bump pointer positioned
+' exactly one byte past it, ready for the next allocation.
+FUNCTION Fission_X86_64StrConcatSubroutine()
+    lines = [
+        "str_concat:",
+        "    mov %rdi, %r8",
+        "    mov %rsi, %r9",
+        "    lea string_heap_top(%rip), %rdx",
+        "    mov (%rdx), %rcx",
+        "    test %rcx, %rcx",
+        "    jnz .Lconcat_top_ready",
+        "    lea string_heap(%rip), %rcx",
+        ".Lconcat_top_ready:",
+        "    mov %rcx, %rax",
+        "    mov %r8, %r10",
+        ".Lconcat_copy_a:",
+        "    movb (%r10), %r11b",
+        "    movb %r11b, (%rcx)",
+        "    testb %r11b, %r11b",
+        "    jz .Lconcat_copy_a_done",
+        "    inc %r10",
+        "    inc %rcx",
+        "    jmp .Lconcat_copy_a",
+        ".Lconcat_copy_a_done:",
+        "    mov %r9, %r10",
+        ".Lconcat_copy_b:",
+        "    movb (%r10), %r11b",
+        "    movb %r11b, (%rcx)",
+        "    inc %rcx",
+        "    inc %r10",
+        "    testb %r11b, %r11b",
+        "    jnz .Lconcat_copy_b",
+        "    lea string_heap_top(%rip), %rdx",
+        "    mov %rcx, (%rdx)",
+        "    ret"
+    ]
+    RETURN lines
+END FUNCTION
+
 ' Lowers one function (Main or a real user-declared one) to GAS text.
 ' `labelPrefix` is "" for Main (matches this backend's earlier, already-
 ' tested Phase 1/2 output exactly -- Main's blocks stay bare) and
@@ -669,14 +739,24 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 END IF
                 leftKind = Fission_X86_64OperandKind(kinds, left)
                 rightKind = Fission_X86_64OperandKind(kinds, right)
+                op = instruction.Field("Op")
+                isConcat = (op == "+") ANDALSO leftKind == "String" ANDALSO rightKind == "String"
+                IF isConcat THEN
+                    ' Real string concatenation: str_concat bump-allocates
+                    ' the result (see its own comment -- a simple, never-
+                    ' freed arena, real but deliberately minimal memory
+                    ' management, enough for this phase's own scope) and
+                    ' returns a pointer to it in %rax, exactly like any
+                    ' other BinOp destination.
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, left, "rdi"))
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, right, "rsi"))
+                    ignored = Array.Push(textLines, "    call str_concat")
+                    ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Dest")))
+                    context.UsesConcat = TRUE
+                    CONTINUE FOR
+                END IF
                 IF leftKind != "Number" ORELSE rightKind != "Number" THEN
-                    op = instruction.Field("Op")
-                    isConcat = (op == "+") ANDALSO leftKind == "String" ANDALSO rightKind == "String"
-                    IF isConcat THEN
-                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "String concatenation is not yet supported by native x86-64 codegen: " + left + " + " + right)
-                    ELSE
-                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Operating on a non-numeric value is not supported by native x86-64 codegen: " + left + ", " + right)
-                    END IF
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Operating on a non-numeric value is not supported by native x86-64 codegen: " + left + ", " + right)
                     CONTINUE FOR
                 END IF
                 lowered = Fission_X86_64LowerBinOp(offsets, instruction)
@@ -831,7 +911,7 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
-    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE}
+    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE}
 
     allTextLines = []
     FOR fn IN amirModule.Functions
@@ -860,6 +940,11 @@ FUNCTION Fission_AmirToX86_64(amirModule)
             ignored = Array.Push(allTextLines, line)
         NEXT
     END IF
+    IF context.UsesConcat THEN
+        FOR line IN Fission_X86_64StrConcatSubroutine()
+            ignored = Array.Push(allTextLines, line)
+        NEXT
+    END IF
 
     ignored = program.Diagnostics.AppendMany(amirModule.Diagnostics)
 
@@ -874,6 +959,22 @@ FUNCTION Fission_AmirToX86_64(amirModule)
         ignored = Array.Push(lines, line)
     NEXT
     ignored = Array.Push(lines, "")
+    ' A fixed, never-freed bump-allocation arena for string concatenation
+    ' results -- see Fission_X86_64StrConcatSubroutine's own comment for
+    ' why a simple bump allocator is the right scope for this phase. `.bss`
+    ' (uninitialized, zero-filled at load by the kernel/loader, not stored
+    ' in the file itself) is the correct section for both the 1 MiB arena
+    ' and its own bump pointer, whose "not yet initialized" state IS a
+    ' real zero value the subroutine explicitly checks for.
+    IF context.UsesConcat THEN
+        ignored = Array.Push(lines, "    .section .bss")
+        ignored = Array.Push(lines, "    .align 8")
+        ignored = Array.Push(lines, "string_heap_top:")
+        ignored = Array.Push(lines, "    .skip 8")
+        ignored = Array.Push(lines, "string_heap:")
+        ignored = Array.Push(lines, "    .skip 1048576")
+        ignored = Array.Push(lines, "")
+    END IF
     ignored = Array.Push(lines, "    .section .text")
     FOR line IN allTextLines
         ignored = Array.Push(lines, line)

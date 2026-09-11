@@ -1,0 +1,35 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. This one exercises Phase 5's own
+' construct set: real string concatenation (`+` between two strings) --
+' chained (three-way concatenation), interpolated with a variable, built up
+' inside a WHILE loop (an accumulator, exercising the bump allocator across
+' many calls), and reused (concatenating an already-concatenated result
+' again without disturbing its own original operands).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+greeting = "Hello, " + "World" + "!"
+PRINT greeting
+
+name = "Alice"
+message = "Hi " + name + ", welcome!"
+PRINT message
+
+result = ""
+i = 1
+WHILE i <= 5
+    result = result + "x"
+    i = i + 1
+WEND
+PRINT result
+
+a = "foo"
+b = "bar"
+c = a + b
+d = c + "baz"
+PRINT c
+PRINT d
+PRINT a
+PRINT b

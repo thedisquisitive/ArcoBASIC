@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^91$" <<<"$fission_self_semantic_output"
 grep -q "^138$" <<<"$fission_self_semantic_output"
-grep -q "^2876$" <<<"$fission_self_semantic_output"
+grep -q "^2891$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -658,5 +658,14 @@ expected_strings_output="$(printf 'Hello, \nWorld\nUniverse\nWorld\nLap\n1\nLap\
 test "$strings_native_output" = "$expected_strings_output"
 oracle_strings_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/strings.abas")"
 test "$strings_native_output" = "$oracle_strings_output"
+
+# fission/tests/native_programs/concat.abas exercises native codegen's Phase 5 construct set:
+# real string concatenation (chained, variable-interpolated, accumulated inside a loop, and
+# reused without disturbing its own operands) via a real bump-allocated .bss arena.
+concat_native_output="$("$SOURCE_DIR/build/fission-native-programs/concat")"
+expected_concat_output="$(printf 'Hello, World!\nHi Alice, welcome!\nxxxxx\nfoobar\nfoobarbaz\nfoo\nbar')"
+test "$concat_native_output" = "$expected_concat_output"
+oracle_concat_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/concat.abas")"
+test "$concat_native_output" = "$oracle_concat_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

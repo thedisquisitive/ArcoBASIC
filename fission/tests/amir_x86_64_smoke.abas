@@ -2,17 +2,18 @@
 #IMPORT "fission/amir/lower_x86_64.abas"
 
 ' fission/amir/lower_x86_64.abas's own header comment records this backend's
-' current (through Phase 4) scope: PRINT of string literals, variables/
+' current (through Phase 5) scope: PRINT of string literals, variables/
 ' arithmetic/comparisons/IF/WHILE/FOR over plain numbers, PRINT of a
 ' computed integer, real user-declared FUNCTIONs with a genuine SysV
 ' calling convention (including stack-passed arguments beyond the first 6),
-' and real string VARIABLES (assign/PRINT/reassign/copy, function-local
-' only -- string concatenation, string function parameters/return values,
-' and branching on a string all remain real, disclosed gaps). Real
-' execution verified separately by fission/tests/native_programs/*.abas
-' (built as real ELF64s via FissionNativeCapsuleTarget and run directly --
-' see tests/integration/fission_substrate_core_smoke.sh). This file checks
-' the lowering pass's own text output and its diagnostics.
+' real string VARIABLES (assign/PRINT/reassign/copy), and real string
+' CONCATENATION (a bump-allocated `.bss` arena) -- function-local only:
+' string function parameters/return values, string comparison, and
+' branching on a string all remain real, disclosed gaps. Real execution
+' verified separately by fission/tests/native_programs/*.abas (built as
+' real ELF64s via FissionNativeCapsuleTarget and run directly -- see
+' tests/integration/fission_substrate_core_smoke.sh). This file checks the
+' lowering pass's own text output and its diagnostics.
 Source = "PRINT \"Hello, native!\"\nPRINT \"Second line\""
 Tokens = Fission_ArcoBasicLex(Source)
 Ast = Fission_ArcoBasicParse(Tokens, "x86-64-smoke.abas")
@@ -57,18 +58,39 @@ StringVarAssembly = StringVarProgram.Render()
 PRINT String.Contains(StringVarAssembly, ".asciz")
 PRINT String.Contains(StringVarAssembly, "call str_print")
 
-' String concatenation is a real, disclosed gap this phase does NOT close
-' (needs a real allocator, even a simple bump one) -- must report a clear,
-' specific diagnostic naming concatenation, not a generic "non-numeric"
-' message, and not silently emit wrong assembly.
-ConcatSource = "a = \"Hello, \"\nb = \"World\"\nPRINT a + b"
+' Phase 5: real string concatenation (`+` between two String-kind
+' operands) -- a real bump allocator into a fixed `.bss` arena, chained/
+' reused freely (`(a + b) + c`, concatenating into an accumulator inside a
+' loop). Real execution verified separately by
+' fission/tests/native_programs/concat.abas. Checked here: zero
+' diagnostics, and that the rendered assembly actually contains the
+' `str_concat` call, the `.bss` arena declaration, and (since a
+' concatenation result is String-kind like any other) a `call str_print`
+' for the PRINT of that result.
+ConcatSource = "a = \"Hello, \"\nb = \"World\"\nc = a + b\nPRINT c"
 ConcatTokens = Fission_ArcoBasicLex(ConcatSource)
 ConcatAst = Fission_ArcoBasicParse(ConcatTokens, "x86-64-concat-smoke.abas")
 ConcatSir = Fission_ArcoBasicAstToSir(ConcatAst)
 ConcatAmir = Fission_SirToAmir(ConcatSir)
 ConcatProgram = Fission_AmirToX86_64(ConcatAmir)
 PRINT ConcatProgram.Diagnostics.HasErrors()
-PRINT String.Contains(ConcatProgram.Diagnostics.Render(), "concatenation")
+PRINT ConcatProgram.Diagnostics.Render()
+ConcatAssembly = ConcatProgram.Render()
+PRINT String.Contains(ConcatAssembly, "call str_concat")
+PRINT String.Contains(ConcatAssembly, ".section .bss")
+PRINT String.Contains(ConcatAssembly, "string_heap")
+PRINT String.Contains(ConcatAssembly, "call str_print")
+
+' String comparison (as opposed to concatenation) remains a real, disclosed
+' gap this phase does NOT close -- must still report a diagnostic, not
+' silently emit wrong assembly.
+StringCompareSource = "a = \"x\"\nb = \"y\"\nIF a == b THEN\n    PRINT 1\nEND IF"
+StringCompareTokens = Fission_ArcoBasicLex(StringCompareSource)
+StringCompareAst = Fission_ArcoBasicParse(StringCompareTokens, "x86-64-string-compare-smoke.abas")
+StringCompareSir = Fission_ArcoBasicAstToSir(StringCompareAst)
+StringCompareAmir = Fission_SirToAmir(StringCompareSir)
+StringCompareProgram = Fission_AmirToX86_64(StringCompareAmir)
+PRINT StringCompareProgram.Diagnostics.HasErrors()
 
 ' A variable assigned both a string and a number somewhere in the same
 ' function is a real, disclosed gap -- must report a diagnostic instead of
