@@ -27,39 +27,48 @@
 ' pass simply starts from GAS text instead of arriving at it as a secondary
 ' rendering of already-encoded bytes.
 '
-' Phase 6 scope (Phase 1: PRINT of a string literal; Phase 2: variables/
+' Phase 7 scope (Phase 1: PRINT of a string literal; Phase 2: variables/
 ' arithmetic/comparisons/IF/WHILE/FOR/DO over plain numbers; Phase 3: real
 ' user-declared FUNCTIONs with a genuine SysV calling convention, including
-' stack-passed arguments beyond the first 6; Phase 4: real string VARIABLES
-' -- assign/PRINT/reassign/copy, a string value represented as a pointer to
-' NUL-terminated (`.asciz`) `.rodata`, stored in an ordinary 8-byte slot
-' exactly like a number, plus per-name KIND tracking so every numeric-only
-' context rejects a string operand instead of silently misinterpreting a
-' pointer as an integer; Phase 5: real string CONCATENATION -- `a + b`
-' between two String-kind operands genuinely builds "a"+"b" at runtime via
-' `str_concat`, a bump allocator into a fixed 1 MiB static `.bss` arena,
-' never freed): real string EQUALITY. `a == b` / `a != b` between two
-' String-kind operands now does a genuine byte-by-byte content comparison
-' via `str_equals` (confirmed against the oracle: real ArcoBASIC string
-' equality is content-based, not pointer identity -- two separately-
-' `"hello"`-literal strings, or a literal compared against an equal-spelled
-' concatenation result, both compare equal) instead of the generic
-' "non-numeric operand" diagnostic. `!=` is `str_equals`'s own 0/1 result
-' inverted with a single `xor $1, %rax` at the call site, not a separate
-' subroutine. A-MIR uses the exact same `INT.CMP_EQ`/`INT.CMP_NE` opcode
-' family for string equality as for numeric equality (confirmed via the
-' oracle -- no dedicated "string compare" opcode exists at all), so this
-' is purely a kind-based dispatch decision in the BinOp handling, the same
-' shape as string concatenation's own `+`-with-both-operands-String check.
+' stack-passed arguments beyond the first 6; Phase 4: real string VARIABLES;
+' Phase 5: real string CONCATENATION via a bump allocator into a fixed 1
+' MiB static `.bss` arena, never freed; Phase 6: real string EQUALITY,
+' `==`/`!=` -- genuine content comparison via `str_equals`, confirmed
+' against the oracle that ArcoBASIC string equality is content-based, not
+' pointer identity): real ARRAYS of numbers. `[1, 2, 3]` genuinely
+' bump-allocates on the SAME shared `.bss` arena Phase 5 already built
+' (untyped raw bytes -- nothing about the allocator itself needed to
+' change for a second kind of value to live there), via `array_alloc`
+' (writes an 8-byte length header, the caller's own inline codegen fills
+' each element with one plain `mov`, no runtime loop needed since element
+' count is always compile-time-known). Indexed read/write (`arr[i]`/
+' `arr[i] = v`) use real x86-64 SIB scaled addressing (`8(%rax,%rcx,8)`) to
+' compute the element address directly, no separate address-computation
+' instruction needed. `LEN(arr)` -- confirmed via the oracle to be an
+' ordinary CALL to a builtin name, not a dedicated opcode -- reads the
+' length header back directly, intercepted before the generic user-
+' function CALL dispatch. Array elements are numeric-only in this phase;
+' an array's own kind ("Array") is tracked the same way String already is,
+' so every non-array-aware consumption site correctly rejects one instead
+' of misinterpreting the pointer.
 ' Deliberately still out of scope, still real, disclosed follow-on work:
-' strings as function parameters or return values (this phase's `kinds`
-' tracking is function-local only; a parameter is always assumed numeric,
-' so passing a string into or back out of a function correctly reports a
-' diagnostic rather than silently misinterpreting it), string ordering
-' comparison (`<`/`<=`/`>`/`>=` between two strings -- a real, separate gap
-' from equality, still reports the generic "non-numeric" diagnostic), and
-' everything else WP-011 (Linux Runtime) still owes -- arrays, objects, the
-' general host-function bridge. See .agents/FISSION_SUBSTRATE_PROGRESS.md.
+' PRINT of a bare array (a real oracle feature -- `PRINT arr` renders
+' `[1, 2, 3]` -- deliberately not implemented; would need real runtime
+' string-building machinery, genuinely separate from anything array
+' indexing itself needed; PRINT of an indexed element already works, since
+' it's an ordinary Number), string arrays / arrays of arrays / arrays
+' holding anything but plain numbers, strings as function parameters or
+' return values (this phase's `kinds` tracking is function-local only; a
+' parameter is always assumed numeric, so passing a string into or back
+' out of a function correctly reports a diagnostic rather than silently
+' misinterpreting it), string ordering comparison (`<`/`<=`/`>`/`>=`
+' between two strings -- confirmed this is not even a real oracle feature:
+' `ArcoFission compile-run` on a real program comparing two strings with
+' `<` fails at runtime with "value is not a number", so this backend's own
+' diagnostic is arguably an improvement, catching the same error at
+' compile time instead), and everything else WP-011 (Linux Runtime) still
+' owes -- objects, the general host-function bridge. See
+' .agents/FISSION_SUBSTRATE_PROGRESS.md.
 
 CLASS FissionX86_64Program
     CONSTRUCTOR()
@@ -293,6 +302,34 @@ FUNCTION Fission_X86_64CollectSlots(fn)
                 seen = state.Seen
                 ' Phase 4 scope: a user function's return value is always
                 ' treated as Number -- see this file's own header comment.
+                ' `LEN(array)` is the one exception (an ordinary CALL to a
+                ' builtin name, not a user function, see Fission_X86_64
+                ' LowerFunction's own dedicated LEN handling) -- its result
+                ' is a count, still Number, so no special case is actually
+                ' needed here.
+                kinds = Object.Set(kinds, dest, "Number")
+            END IF
+            IF kind == "Array" THEN
+                ' Phase 7: a real array literal, bump-allocated on the same
+                ' shared heap string concatenation already uses (see
+                ' Fission_X86_64ArrayAllocSubroutine's own comment) --
+                ' its own kind is "Array", distinct from both Number and
+                ' String, so a later numeric/string-only consumption site
+                ' correctly rejects it instead of misinterpreting the
+                ' pointer.
+                dest = instruction.Field("Dest")
+                state = Fission_X86_64Remember(names, seen, dest)
+                names = state.Names
+                seen = state.Seen
+                kinds = Object.Set(kinds, dest, "Array")
+            END IF
+            IF kind == "Index" THEN
+                ' Phase 7 scope: numeric-element arrays only -- an indexed
+                ' read's own result is always Number.
+                dest = instruction.Field("Dest")
+                state = Fission_X86_64Remember(names, seen, dest)
+                names = state.Names
+                seen = state.Seen
                 kinds = Object.Set(kinds, dest, "Number")
             END IF
         NEXT
@@ -669,6 +706,38 @@ FUNCTION Fission_X86_64StrEqualsSubroutine()
     RETURN lines
 END FUNCTION
 
+' Real array allocation. Same internal-only call/ret convention as
+' itoa_print/str_print/str_concat/str_equals (input: %rdi = element count
+' N; output: %rax = pointer to a newly bump-allocated `(N+1)*8`-byte block
+' on the SAME shared heap string concatenation already uses -- untyped raw
+' bytes, so nothing about the bump allocator itself needs to change for a
+' second kind of value to live there; clobbers %rax/%rcx/%r8). Writes N as
+' an 8-byte length header at `[pointer]` (read back directly by `LEN`, no
+' runtime scan); the N element slots starting at `[pointer+8]` are left
+' uninitialized for the caller (the ARRAY instruction's own inline codegen
+' in Fission_X86_64LowerFunction, which already knows each element's own
+' source operand at compile time) to fill in directly, one plain `mov`
+' per element, no loop needed here at all.
+FUNCTION Fission_X86_64ArrayAllocSubroutine()
+    lines = [
+        "array_alloc:",
+        "    lea string_heap_top(%rip), %r8",
+        "    mov (%r8), %rax",
+        "    test %rax, %rax",
+        "    jnz .Lalloc_top_ready",
+        "    lea string_heap(%rip), %rax",
+        ".Lalloc_top_ready:",
+        "    mov %rdi, (%rax)",
+        "    mov %rdi, %rcx",
+        "    inc %rcx",
+        "    shl $3, %rcx",
+        "    add %rax, %rcx",
+        "    mov %rcx, (%r8)",
+        "    ret"
+    ]
+    RETURN lines
+END FUNCTION
+
 ' Lowers one function (Main or a real user-declared one) to GAS text.
 ' `labelPrefix` is "" for Main (matches this backend's earlier, already-
 ' tested Phase 1/2 output exactly -- Main's blocks stay bare) and
@@ -783,6 +852,99 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, name))
                 CONTINUE FOR
             END IF
+            IF kind == "Array" THEN
+                ' Phase 7: a real array literal. array_alloc bump-allocates
+                ' (element count + 1) * 8 bytes on the same shared heap
+                ' string concatenation already uses (see its own comment),
+                ' writes the element count as a length header at [pointer],
+                ' and returns the pointer in %rax -- element count is
+                ' always compile-time-known here (A-MIR materializes each
+                ' item into its own %tN before the ARRAY instruction
+                ' itself, confirmed via the oracle), so each element is
+                ' just one `mov` into its own fixed offset, no runtime loop
+                ' needed.
+                items = Fission_X86_64SplitArgs(instruction.Field("Items"))
+                unresolvedItem = ""
+                nonNumericItem = ""
+                FOR item IN items
+                    IF Fission_X86_64OperandIsResolvable(offsets, item) == FALSE THEN unresolvedItem = item
+                    IF Fission_X86_64OperandKind(kinds, item) != "Number" THEN nonNumericItem = item
+                NEXT
+                IF unresolvedItem != "" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Array element is not supported by native x86-64 codegen: " + unresolvedItem)
+                    CONTINUE FOR
+                END IF
+                IF nonNumericItem != "" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports numeric array elements: " + nonNumericItem)
+                    CONTINUE FOR
+                END IF
+                ignored = Array.Push(textLines, "    mov $" + String(LEN(items)) + ", %rdi")
+                ignored = Array.Push(textLines, "    call array_alloc")
+                itemIndex = 0
+                FOR item IN items
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, item, "rcx"))
+                    ignored = Array.Push(textLines, "    mov %rcx, " + String(8 + itemIndex * 8) + "(%rax)")
+                    itemIndex = itemIndex + 1
+                NEXT
+                ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Dest")))
+                context.UsesArrayAlloc = TRUE
+                CONTINUE FOR
+            END IF
+            IF kind == "Index" THEN
+                ' `arr[i]` -- Base is already a %tN (a prior LOAD of the
+                ' array variable, confirmed via the oracle), so it resolves
+                ' through the exact same operand machinery as any other
+                ' temp; the element address is `base + 8 (length header) +
+                ' index*8`, a single `lea` using real x86-64 SIB scaled
+                ' addressing, no extra arithmetic instructions needed.
+                base = instruction.Field("Base")
+                index = instruction.Field("Index")
+                baseOk = Fission_X86_64OperandIsResolvable(offsets, base)
+                indexOk = Fission_X86_64OperandIsResolvable(offsets, index)
+                IF baseOk == FALSE ORELSE indexOk == FALSE THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Indexing an unsupported value is not supported by native x86-64 codegen: " + base + ", " + index)
+                    CONTINUE FOR
+                END IF
+                IF Fission_X86_64OperandKind(kinds, base) != "Array" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Indexing a non-array value is not supported by native x86-64 codegen: " + base)
+                    CONTINUE FOR
+                END IF
+                ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, base, "rax"))
+                ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, index, "rcx"))
+                ignored = Array.Push(textLines, "    mov 8(%rax,%rcx,8), %rax")
+                ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Dest")))
+                CONTINUE FOR
+            END IF
+            IF kind == "StoreIndex" THEN
+                ' `arr[i] = v` -- unlike Index's own "Base" field, STORE_INDEX's
+                ' "Name" field is the bare array VARIABLE name (confirmed via
+                ' the oracle: `STORE_INDEX a %t14 %t15`, matching STORE's own
+                ' "Name" field convention), so the array pointer is loaded from
+                ' its slot the same way any named variable read is.
+                name = instruction.Field("Name")
+                index = instruction.Field("Index")
+                value = instruction.Field("Value")
+                nameOk = Fission_X86_64OperandIsResolvable(offsets, name)
+                indexOk = Fission_X86_64OperandIsResolvable(offsets, index)
+                valueOk = Fission_X86_64OperandIsResolvable(offsets, value)
+                IF nameOk == FALSE ORELSE indexOk == FALSE ORELSE valueOk == FALSE THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Assigning through an unsupported index is not supported by native x86-64 codegen: " + name)
+                    CONTINUE FOR
+                END IF
+                IF Fission_X86_64OperandKind(kinds, name) != "Array" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Indexing a non-array value is not supported by native x86-64 codegen: " + name)
+                    CONTINUE FOR
+                END IF
+                IF Fission_X86_64OperandKind(kinds, value) != "Number" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports numeric array elements: " + value)
+                    CONTINUE FOR
+                END IF
+                ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, name, "rax"))
+                ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, index, "rcx"))
+                ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, value, "rdx"))
+                ignored = Array.Push(textLines, "    mov %rdx, 8(%rax,%rcx,8)")
+                CONTINUE FOR
+            END IF
             IF kind == "BinOp" THEN
                 left = instruction.Field("Left")
                 right = instruction.Field("Right")
@@ -872,7 +1034,20 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "PRINT operand is not supported by native x86-64 codegen: " + argRef)
                     CONTINUE FOR
                 END IF
-                IF Fission_X86_64OperandKind(kinds, argRef) == "String" THEN
+                printKind = Fission_X86_64OperandKind(kinds, argRef)
+                IF printKind == "Array" THEN
+                    ' A real oracle feature (`PRINT arr` renders
+                    ' `[10, 20, 30]`) deliberately NOT implemented here --
+                    ' would need real runtime string-building (itoa per
+                    ' element plus separators/brackets), a genuinely
+                    ' separate piece of machinery from anything this phase
+                    ' added. Explicitly rejected rather than silently
+                    ' itoa-printing the array's own pointer value as if it
+                    ' were a number.
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "PRINT of an array is not yet supported by native x86-64 codegen (PRINT of an indexed element is): " + argRef)
+                    CONTINUE FOR
+                END IF
+                IF printKind == "String" THEN
                     ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rdi"))
                     ignored = Array.Push(textLines, "    call str_print")
                     context.UsesStrPrint = TRUE
@@ -881,6 +1056,25 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = Array.Push(textLines, "    call itoa_print")
                     context.UsesItoa = TRUE
                 END IF
+                CONTINUE FOR
+            END IF
+            isLenCall = kind == "Call" ANDALSO instruction.Field("Callee") == "LEN"
+            IF isLenCall THEN
+                ' `LEN(arr)` is an ordinary CALL to a builtin name, not a
+                ' user-declared function (confirmed via the oracle: `CALL
+                ' LEN %t19`) -- intercepted here, before the generic
+                ' user-function dispatch below, since LEN is never in
+                ' `functionNames`. The array's own length header (written
+                ' by array_alloc at allocation time) sits at [pointer],
+                ' read directly, no runtime scan needed.
+                args = Fission_X86_64SplitArgs(instruction.Field("Args"))
+                IF LEN(args) != 1 ORELSE Fission_X86_64OperandIsResolvable(offsets, args[0]) == FALSE ORELSE Fission_X86_64OperandKind(kinds, args[0]) != "Array" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "LEN is only supported on an array by native x86-64 codegen: " + instruction.Field("Args"))
+                    CONTINUE FOR
+                END IF
+                ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[0], "rax"))
+                ignored = Array.Push(textLines, "    mov (%rax), %rax")
+                ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Dest")))
                 CONTINUE FOR
             END IF
             isUserCall = (kind == "Call" ORELSE kind == "CallVoid") ANDALSO instruction.Field("Callee") != "Runtime.Print"
@@ -987,7 +1181,7 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
-    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE}
+    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE}
 
     allTextLines = []
     FOR fn IN amirModule.Functions
@@ -1026,6 +1220,11 @@ FUNCTION Fission_AmirToX86_64(amirModule)
             ignored = Array.Push(allTextLines, line)
         NEXT
     END IF
+    IF context.UsesArrayAlloc THEN
+        FOR line IN Fission_X86_64ArrayAllocSubroutine()
+            ignored = Array.Push(allTextLines, line)
+        NEXT
+    END IF
 
     ignored = program.Diagnostics.AppendMany(amirModule.Diagnostics)
 
@@ -1040,14 +1239,16 @@ FUNCTION Fission_AmirToX86_64(amirModule)
         ignored = Array.Push(lines, line)
     NEXT
     ignored = Array.Push(lines, "")
-    ' A fixed, never-freed bump-allocation arena for string concatenation
-    ' results -- see Fission_X86_64StrConcatSubroutine's own comment for
-    ' why a simple bump allocator is the right scope for this phase. `.bss`
-    ' (uninitialized, zero-filled at load by the kernel/loader, not stored
-    ' in the file itself) is the correct section for both the 1 MiB arena
-    ' and its own bump pointer, whose "not yet initialized" state IS a
-    ' real zero value the subroutine explicitly checks for.
-    IF context.UsesConcat THEN
+    ' A fixed, never-freed bump-allocation arena, shared by string
+    ' concatenation AND array literals alike (untyped raw bytes -- see
+    ' Fission_X86_64StrConcatSubroutine's and Fission_X86_64ArrayAlloc
+    ' Subroutine's own comments for why a simple bump allocator is the
+    ' right scope for this phase). `.bss` (uninitialized, zero-filled at
+    ' load by the kernel/loader, not stored in the file itself) is the
+    ' correct section for both the 1 MiB arena and its own bump pointer,
+    ' whose "not yet initialized" state IS a real zero value both
+    ' subroutines explicitly check for.
+    IF context.UsesConcat ORELSE context.UsesArrayAlloc THEN
         ignored = Array.Push(lines, "    .section .bss")
         ignored = Array.Push(lines, "    .align 8")
         ignored = Array.Push(lines, "string_heap_top:")

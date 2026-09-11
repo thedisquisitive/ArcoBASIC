@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^91$" <<<"$fission_self_semantic_output"
 grep -q "^138$" <<<"$fission_self_semantic_output"
-grep -q "^2925$" <<<"$fission_self_semantic_output"
+grep -q "^2959$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -687,5 +687,17 @@ expected_string_equality_output="$(printf '1\n3\n4\n5\n6\n8')"
 test "$string_equality_native_output" = "$expected_string_equality_output"
 oracle_string_equality_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/string_equality.abas")"
 test "$string_equality_native_output" = "$oracle_string_equality_output"
+
+# fission/tests/native_programs/arrays.abas exercises native codegen's Phase 7 construct set:
+# real numeric arrays -- literal construction, indexed read/write (both constant and
+# dynamically-computed indices), LEN, accumulating over an array inside a WHILE loop, passing an
+# indexed element as a function argument, and a larger (10-element) array. Represented as a
+# pointer to a bump-allocated [length][elem0][elem1]...] block on the same shared .bss arena
+# string concatenation already uses, with real x86-64 SIB scaled addressing for element access.
+arrays_native_output="$("$SOURCE_DIR/build/fission-native-programs/arrays")"
+expected_arrays_output="$(printf '10\n20\n30\n99\n3\n140\n40\n20\n3\n1000\n100\n600')"
+test "$arrays_native_output" = "$expected_arrays_output"
+oracle_arrays_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/arrays.abas")"
+test "$arrays_native_output" = "$oracle_arrays_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

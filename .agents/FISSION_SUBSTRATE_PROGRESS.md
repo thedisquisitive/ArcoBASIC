@@ -48,7 +48,7 @@ including the real binary-vs-text bytecode format distinction this
 uncovered, and three genuine Rivet bugs found and fixed along the way (a
 caching bug and two target-wiring bugs).
 **Native x86-64 codegen with NO embedded bytecode VM at all, through Phase
-3.** `fission/amir/lower_x86_64.abas` lowers A-MIR straight to GAS assembly
+7.** `fission/amir/lower_x86_64.abas` lowers A-MIR straight to GAS assembly
 text (delegating instruction encoding and linking to the system `as`/`ld`
 toolchain, the same "reuse mechanical tooling" scope decision this ledger
 already made for WP-012); `fission/cli/compile_to_x86_64.abas` +
@@ -78,10 +78,17 @@ and unary minus (`-5`) was never lowered by A-MIR at all (a shared bug,
 also affecting the bytecode backend). **Phase 6: real string EQUALITY**
 (`==`/`!=`) -- genuine byte-by-byte content comparison, confirmed correct
 even for a concatenation result compared against a same-spelled literal.
-Strings as function parameters/return values, string ORDERING comparison
-(`<`/`<=`/`>`/`>=`), and branching on a string each remain their own real,
-disclosed diagnostic-reported gap rather than silently wrong behavior.
-**WP-011 (Linux Runtime -- arrays, objects, the general host-function
+**Phase 7: real numeric ARRAYS** -- construction (`[1, 2, 3]`), indexed
+read/write (`arr[i]` / `arr[i] = v`, both constant and dynamically-computed
+indices), and `LEN(arr)`, represented as a pointer to a bump-allocated
+`[length][elem0][elem1]...]` block on the same shared `.bss` arena
+concatenation already uses, with real x86-64 SIB scaled addressing
+(`8(%rax,%rcx,8)`) for element access. Strings as function parameters/
+return values, string ORDERING comparison (`<`/`<=`/`>`/`>=`), branching on
+a string, PRINT of a bare array, and arrays of anything but plain numbers
+each remain their own real, disclosed diagnostic-reported gap rather than
+silently wrong behavior.
+**WP-011 (Linux Runtime -- objects, the general host-function
 bridge for everything else this backend cannot hand-roll itself) remains
 real, substantial follow-on
 work** -- see "Next
@@ -1060,6 +1067,75 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   corpus grew with the new subroutine (91 files, 138 import edges, 2925
   symbols, 0 diagnostics). Integration suite gained a `string_equality`
   assertion. Verified with plain `fissure run`.
+- Native x86-64 codegen Phase 7: real numeric ARRAYS -- continuing the "keep
+  cranking" instruction, picked as the next well-scoped construct after
+  confirming string ordering comparison is not even a real oracle feature
+  (see below) and strings-across-function-boundaries needs real
+  inter-procedural design work first. `[1, 2, 3]` construction, indexed
+  read/write (`arr[i]` / `arr[i] = v`, both constant and
+  dynamically-computed indices), and `LEN(arr)` now genuinely work.
+  An array is represented as a pointer to a bump-allocated
+  `[length:8][elem0:8][elem1:8]...]` block on the exact same shared `.bss`
+  arena (`string_heap`/`string_heap_top`) string concatenation already
+  built in Phase 5 -- no separate allocator, no separate arena. A new
+  `array_alloc` runtime helper (same internal-only call/ret convention as
+  `itoa_print`/`str_print`/`str_concat`/`str_equals`: input length in
+  `%rdi`, returns the new block's pointer in `%rax`) does the allocation and
+  writes the length header; element access uses real x86-64 SIB scaled
+  addressing (`8(%rax,%rcx,8)`, base + index*8 + 8-byte header offset) for
+  both read and write, and `LEN` is intercepted as a special-cased CALL
+  (checked before the ordinary user-function-call dispatch, since `LEN` is
+  not a real user-declared function) that just loads the 8-byte header.
+  `Fission_X86_64CollectSlots` (the pre-scan pass) gained a third real kind
+  alongside "Number"/"String": an `Array`-kind Const dest, an `Index`-kind
+  instruction's dest is always "Number" (indexing an array of numbers
+  yields a number), matching the same single-pass, per-name kind-tracking
+  shape Phase 4 established -- no new tracking architecture needed, just a
+  new kind value flowing through the existing machinery.
+  **Caught proactively, before it ever reached a failing test, not found by
+  one**: the existing PRINT dispatch would have silently routed an
+  Array-kind value into the numeric `itoa_print` path, printing the array's
+  own pointer value as if it were an integer -- the exact same silent-
+  wrong-output bug class this session already found and fixed for strings
+  multiple times. Fixed by adding an explicit `IF printKind == "Array"`
+  diagnostic-fail check before the String/Number PRINT dispatch, closing
+  the gap before it could ever miscompile a real program.
+  Also investigated, while assessing this phase's own scope, whether string
+  ORDERING comparison (`<`/`<=`/`>`/`>=`, Phase 6's own disclosed remaining
+  gap) was worth closing here too: ran a real probe through legacy
+  `ArcoFission compile-run` and found it fails at RUNTIME with "value is not
+  a number" -- string ordering comparison is not even a real supported
+  ArcoBASIC language feature, confirming this backend's existing "non-
+  numeric operand" diagnostic for that case is correct, complete behavior,
+  not an incompleteness needing a fix.
+  Verified via real execution, not just that assembly renders: literal
+  construction and PRINT of individual elements, in-place element mutation,
+  `LEN`, accumulating over an array inside a WHILE loop (`total = total +
+  squares[i]`, condition `i < LEN(squares)`), passing an indexed element as
+  a real function argument and storing a function's return value back into
+  an indexed slot, and a larger 10-element array with both a constant and a
+  dynamically-computed (variable) index -- all byte-for-byte identical to
+  legacy `ArcoFission compile-run` on the same source, zero debugging
+  iterations needed. Added as a permanent regression fixture,
+  `fission/tests/native_programs/arrays.abas`. Re-verified every earlier
+  native demo (hello-native, strings, FizzBuzz, Fibonacci, many_params,
+  concat, do_loops, string_equality) unaffected by this change.
+  `fission/tests/amir_x86_64_smoke.abas` extended with direct coverage:
+  real array construction/indexing/LEN lowering (zero diagnostics; asserts
+  the rendered assembly actually contains `call array_alloc`, the SIB
+  scaled-addressing form `8(%rax,%rcx,8)`, and the `.section .bss` arena
+  declaration), plus two new diagnostic paths -- indexing a non-array value,
+  and an array of non-numeric (String-kind) elements -- both still
+  correctly report a diagnostic rather than silently misinterpreting a
+  number as a pointer or vice versa. `ArraySource`'s pre-existing "PRINT of
+  a bare array is unsupported" check is unchanged (still a real, disclosed
+  gap -- needs runtime string-building machinery genuinely separate from
+  array indexing itself) with its comment clarified to say so explicitly,
+  now that array construction/indexing themselves are no longer
+  unsupported. Self-parse/self-semantic corpus grew with the new subroutine
+  and kind-tracking cases. Integration suite gained an `arrays` assertion
+  (real output + oracle comparison). `fission/fissure.ab`'s watched-files
+  list extended with the new fixture. Verified with plain `fissure run`.
 
 ## In-Progress Components
 
@@ -1493,6 +1569,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/concat.abas`
 - `fission/tests/native_programs/do_loops.abas`
 - `fission/tests/native_programs/string_equality.abas`
+- `fission/tests/native_programs/arrays.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
 - `build.abas`
@@ -1700,7 +1777,7 @@ D. DONE, including the Rivet build-graph target -- see Completed Components.
    Compiler Substrate become a real standalone executable"), the answer is
    now genuinely yes.
 E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
-   runtime, i.e. no embedded bytecode VM at all). **Phases 1-6
+   runtime, i.e. no embedded bytecode VM at all). **Phases 1-7
    DONE -- see Completed Components**: `fission/amir/lower_x86_64.abas` +
    `fission/cli/compile_to_x86_64.abas` + `FissionNativeCapsuleTarget`
    produce real, standalone, execution-verified freestanding ELF64s for
@@ -1713,16 +1790,21 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    return value in `%rax` -- and real recursion (Phase 3); real string
    VARIABLES -- assign/PRINT/reassign/copy, function-local (Phase 4); real
    string CONCATENATION via a real bump-allocated `.bss` arena (Phase 5);
-   and now real string EQUALITY (`==`/`!=`, genuine content comparison,
-   Phase 6) -- no embedded bytecode VM, no legacy ArcoFission involvement
-   in the compile itself (only `as`/`ld`). Real FizzBuzz, a real recursive
-   Fibonacci, a real 10-parameter function, and a real string-building
-   program all run as genuine standalone x86-64 binaries today. Along the
-   way, two real bugs were found and fixed while confirming DO loops: a
-   wrong (unsigned) x86 comparison instruction family that broke any
-   negative-number comparison, and unary minus never being lowered by
-   A-MIR at all (a shared bug, also affecting the bytecode backend). What's
-   still real, almost entirely untouched, and each its own substantial
+   real string EQUALITY (`==`/`!=`, genuine content comparison, Phase 6);
+   and now real numeric ARRAYS -- construction, indexed read/write
+   (constant and dynamically-computed indices), and `LEN` (Phase 7),
+   sharing the same `.bss` arena Phase 5 built -- no embedded bytecode VM,
+   no legacy ArcoFission involvement in the compile itself (only `as`/`ld`).
+   Real FizzBuzz, a real recursive Fibonacci, a real 10-parameter function,
+   a real string-building program, and a real array-accumulation-over-a-
+   WHILE-loop program all run as genuine standalone x86-64 binaries today.
+   Along the way, two real bugs were found and fixed while confirming DO
+   loops (a wrong unsigned x86 comparison instruction family, and unary
+   minus never being lowered by A-MIR at all -- a shared bug, also
+   affecting the bytecode backend), and a third was caught proactively
+   before it ever shipped while building Phase 7 (PRINT of an Array value
+   would have silently printed its own pointer as a number). What's still
+   real, almost entirely untouched, and each its own substantial
    undertaking on its own:
    - Strings as function parameters or return values -- this backend's
      `kinds` tracking is function-local only; currently a real diagnostic
@@ -1733,16 +1815,23 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
      has no body-local evidence of x's kind at all), likely a small
      fixed-point pass over the whole module; noted here as a real,
      nontrivial design task, not a quick extension of the existing
-     function-local `kinds` tracking.
+     function-local `kinds` tracking. The same inter-procedural gap applies
+     to arrays passed to/returned from functions, unexplored so far.
    - String ORDERING comparison (`<`/`<=`/`>`/`>=` between two strings) --
-     a real, separate gap from equality (Phase 6 only added `==`/`!=`);
-     currently the generic "non-numeric" operand diagnostic, not silently
-     wrong.
-   - ForEach: not yet lowered by this backend -- but genuinely blocked on
-     arrays (ForEach always iterates something array-like, and Const Array
-     is entirely unsupported below), not itself a control-flow gap the way
-     DO loops turned out to be.
-   - WP-011 Linux Runtime, the rest of it: arrays, objects/classes, and a
+     confirmed this session (via a real oracle probe) that this is not even
+     a real supported ArcoBASIC language feature at all (legacy
+     `ArcoFission compile-run` fails at runtime with "value is not a
+     number"), so this backend's existing "non-numeric operand" diagnostic
+     is correct, complete behavior -- not an incompleteness worth closing.
+   - PRINT of a bare array (`PRINT arr` rendering `[1, 2, 3]`, a real oracle
+     feature) and arrays of anything but plain numbers (string/nested
+     arrays) both remain real, disclosed gaps left open by Phase 7.
+   - ForEach: was blocked on arrays not existing at all; now that Phase 7
+     has landed real array construction/indexing, this may be newly
+     tractable and is worth investigating next -- but still needs its own
+     dedicated lowering (unlike DO/FOR-range, ForEach's own A-MIR shape has
+     not yet been checked against this backend at all).
+   - WP-011 Linux Runtime, the rest of it: objects/classes, and a
      real fallback to the existing ~244-entry host-function dispatch table
      for anything else (legacy's own `arco_call_host`/`host_bridge.cpp`
      bridge is the reference for this, though porting it into the
