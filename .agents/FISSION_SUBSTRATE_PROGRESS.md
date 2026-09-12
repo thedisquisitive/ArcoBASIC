@@ -2037,6 +2037,37 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   array_boundary.abas`; wired into `fission/fissure.ab`'s watched-files
   list. Self-parse/self-semantic corpus symbol count changed 3605 -> 3604
   (net code removal); golden value updated. Verified with `fissure run`.
+- **Real branching on a STRING value** (`fission/amir/lower_x86_64.abas`)
+  -- `IF`/`WHILE` on a plain string variable, previously a real,
+  disclosed, unconditionally-rejected gap. Confirmed the EXACT real
+  truthiness semantics via a direct oracle probe first, not assumed: a
+  string's own truthiness is CONTENT-based, not pointer-based -- any
+  NON-EMPTY string is truthy (even a string that spells "0", a
+  deliberately tricky case since "0" as a NUMBER is falsy but "0" as a
+  STRING is truthy), only the empty string `""` is falsy. Implemented as
+  a real, direct first-byte check (`cmpb $0, (%rax)`) rather than a full
+  length scan: every string here is a genuinely NUL-terminated byte
+  sequence (confirmed via `Fission_X86_64StrPrintSubroutine`'s own
+  already-proven NUL-scan loop, which already uses this exact `cmpb $0,
+  (%rax)` instruction for a different purpose), so an empty string IS
+  exactly the case where the first byte already is the NUL terminator --
+  no length scan needed at all, `cmpb`/`movzbq`/byte-register support
+  were already real, proven, working instructions in the self-contained
+  encoder (`fission/amir/x86_64_assembler.abas`) before this, needing
+  zero encoder changes.
+  Verified via real execution against the oracle: a truthy non-empty
+  string, a falsy empty string, a real WHILE loop draining a string
+  variable to empty, and the deliberately tricky "0"-string-is-truthy
+  case -- all byte-for-byte matching `ArcoFission compile-run`. All 19
+  existing native fixtures re-verified unaffected. Extended `fission/
+  tests/amir_x86_64_smoke.abas`'s own pre-existing `StringBranchSource`
+  case (originally written to check for a diagnostic, now checking real
+  success plus the rendered assembly actually contains the real `cmpb $0,
+  (%rax)` first-byte check). New permanent fixture `fission/tests/
+  native_programs/string_branch.abas`; wired into `fission/fissure.ab`'s
+  watched-files list. Self-parse/self-semantic corpus symbol count
+  changed 3604 -> 3605; golden value updated. Verified with `fissure
+  run`.
 
 ## In-Progress Components
 

@@ -108,9 +108,18 @@
 ' kind CONFLICT across different call sites is still, correctly, a real
 ' diagnostic (a parameter or return value has exactly one physical kind,
 ' real polymorphism is not representable there).
+' As of this Branch instruction's own handling, real branching on a
+' STRING value too (`IF`/`WHILE` on a plain string variable) -- a
+' string's own truthiness is CONTENT-based, not pointer-based (any
+' NON-EMPTY string is truthy, only "" is falsy, confirmed via a direct
+' oracle probe including the deliberately tricky "a string spelling '0'
+' is truthy" case), implemented as a real, direct first-byte NUL check
+' (`cmpb $0, (%rax)`, the exact same instruction
+' Fission_X86_64StrPrintSubroutine's own NUL-scan loop already proved
+' correct for a different purpose) rather than a full length scan.
 ' Deliberately still out of scope, still real, disclosed follow-on work:
 ' string arrays / arrays of arrays / arrays holding anything but plain
-' numbers; branching on a string value; string ordering comparison
+' numbers; string ordering comparison
 ' (`<`/`<=`/`>`/`>=` between two strings -- confirmed this is not even a
 ' real oracle feature: `ArcoFission compile-run` on a real program
 ' comparing two strings with `<` fails at runtime with "value is not a
@@ -2447,11 +2456,32 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Branching on an unsupported condition is not supported by native x86-64 codegen: " + condition)
                     CONTINUE FOR
                 END IF
-                IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, condition)) != "Number" THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Branching on a string value is not supported by native x86-64 codegen: " + condition)
+                conditionKind = Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, condition))
+                IF conditionKind != "Number" ANDALSO conditionKind != "String" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Branching on this value is not supported by native x86-64 codegen: " + condition)
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, condition, "rax"))
+                IF conditionKind == "String" THEN
+                    ' A real string's own truthiness is CONTENT-based, not
+                    ' pointer-based -- confirmed via a direct oracle probe
+                    ' (`IF s THEN`/`WHILE s`): any NON-EMPTY string is
+                    ' truthy (even a string spelling "0"), only the empty
+                    ' string "" is falsy, exactly matching real Python/JS-
+                    ' style string truthiness, not "is this a valid
+                    ' pointer" (which every string value always is). Since
+                    ' every string here is a real, genuinely NUL-terminated
+                    ' byte sequence (confirmed via str_print's own real,
+                    ' already-proven NUL-scan loop, `Fission_X86_64
+                    ' StrPrintSubroutine`), checking just the FIRST byte
+                    ' for zero is both correct and sufficient -- no full
+                    ' length scan needed, an empty string IS exactly the
+                    ' case where the first byte is the NUL terminator.
+                    ignored = Array.Push(textLines, "    cmpb $0, (%rax)")
+                    ignored = Array.Push(textLines, "    je " + labelPrefix + instruction.Field("Else"))
+                    ignored = Array.Push(textLines, "    jmp " + labelPrefix + instruction.Field("Then"))
+                    CONTINUE FOR
+                END IF
                 ignored = Array.Push(textLines, "    test %rax, %rax")
                 ignored = Array.Push(textLines, "    jne " + labelPrefix + instruction.Field("Then"))
                 ignored = Array.Push(textLines, "    jmp " + labelPrefix + instruction.Field("Else"))

@@ -189,6 +189,15 @@ ArrayArgAmir = Fission_SirToAmir(ArrayArgSir)
 ArrayArgProgram = Fission_AmirToX86_64(ArrayArgAmir)
 PRINT ArrayArgProgram.Diagnostics.HasErrors()
 
+' Real branching on a STRING value -- USED TO be a real, disclosed,
+' unconditionally-rejected gap (this exact source was originally written
+' to check for a diagnostic); a string's own truthiness is CONTENT-based,
+' not pointer-based, confirmed via a direct oracle probe (`IF s THEN`/
+' `WHILE s`): any NON-EMPTY string is truthy (even a string spelling
+' "0"), only "" is falsy -- checked here structurally (zero diagnostics,
+' and the rendered assembly actually contains the real `cmpb $0, (%rax)`
+' first-byte check, not a pointer-truthiness `test`). Real execution
+' verified separately by fission/tests/native_programs/string_branch.abas.
 StringBranchSource = "s = \"hello\"\nIF s THEN\n    PRINT 1\nEND IF"
 StringBranchTokens = Fission_ArcoBasicLex(StringBranchSource)
 StringBranchAst = Fission_ArcoBasicParse(StringBranchTokens, "x86-64-string-branch-smoke.abas")
@@ -196,6 +205,7 @@ StringBranchSir = Fission_ArcoBasicAstToSir(StringBranchAst)
 StringBranchAmir = Fission_SirToAmir(StringBranchSir)
 StringBranchProgram = Fission_AmirToX86_64(StringBranchAmir)
 PRINT StringBranchProgram.Diagnostics.HasErrors()
+PRINT String.Contains(StringBranchProgram.Render(), "cmpb $0, (%rax)")
 
 ' PRINT of a BARE array is a real oracle feature (`PRINT arr` renders
 ' `[1, 2, 3]`, confirmed via a direct oracle probe including the `[]`
