@@ -34,48 +34,43 @@
 ' fission/amir/x86_64_assembler.abas's own header comment for the full
 ' scope and the real bugs found while building it.
 '
-' Phase 7 scope (Phase 1: PRINT of a string literal; Phase 2: variables/
-' arithmetic/comparisons/IF/WHILE/FOR/DO over plain numbers; Phase 3: real
-' user-declared FUNCTIONs with a genuine SysV calling convention, including
-' stack-passed arguments beyond the first 6; Phase 4: real string VARIABLES;
-' Phase 5: real string CONCATENATION via a bump allocator into a fixed 1
-' MiB static `.bss` arena, never freed; Phase 6: real string EQUALITY,
-' `==`/`!=` -- genuine content comparison via `str_equals`, confirmed
-' against the oracle that ArcoBASIC string equality is content-based, not
-' pointer identity): real ARRAYS of numbers. `[1, 2, 3]` genuinely
-' bump-allocates on the SAME shared `.bss` arena Phase 5 already built
-' (untyped raw bytes -- nothing about the allocator itself needed to
-' change for a second kind of value to live there), via `array_alloc`
-' (writes an 8-byte length header, the caller's own inline codegen fills
-' each element with one plain `mov`, no runtime loop needed since element
-' count is always compile-time-known). Indexed read/write (`arr[i]`/
-' `arr[i] = v`) use real x86-64 SIB scaled addressing (`8(%rax,%rcx,8)`) to
-' compute the element address directly, no separate address-computation
-' instruction needed. `LEN(arr)` -- confirmed via the oracle to be an
-' ordinary CALL to a builtin name, not a dedicated opcode -- reads the
-' length header back directly, intercepted before the generic user-
-' function CALL dispatch. Array elements are numeric-only in this phase;
-' an array's own kind ("Array") is tracked the same way String already is,
-' so every non-array-aware consumption site correctly rejects one instead
-' of misinterpreting the pointer.
+' Current real construct coverage (see .agents/FISSION_SUBSTRATE_PROGRESS.md's
+' own Completed Components for the full phase-by-phase history and every
+' real bug found building each piece): PRINT of string/numeric literals and
+' computed values (including a real bare array, rendering `[1, 2, 3]`);
+' variables/arithmetic (`+`/`-`/`*`/`MOD`)/comparisons/IF/WHILE/FOR-range/DO
+' (all four shapes)/ForEach over plain numbers and arrays; EXIT/CONTINUE
+' across every loop shape; bare AND/OR/BITAND/BITOR/BITXOR/SHL/SHR (and the
+' eager, not actually short-circuit, ANDALSO/ORELSE -- see
+' Fission_X86_64InferSignatures' own sibling note in this file, a real,
+' disclosed, SHARED-substrate gap, not something specific to this backend);
+' real user-declared FUNCTIONs with a genuine SysV calling convention
+' (stack-passed arguments beyond the first 6, real recursion); real string
+' VARIABLES/CONCATENATION/EQUALITY (`==`/`!=`, genuine content comparison);
+' real numeric ARRAYS (construction, indexed read/write via real x86-64 SIB
+' scaled addressing, `LEN`); and, as of Fission_X86_64InferSignatures, real
+' STRING FUNCTION PARAMETERS AND RETURN VALUES -- closing the exact gap
+' this file's own header comment disclosed since Phase 4 ("a parameter is
+' always assumed numeric") via genuine inter-procedural fixed-point kind
+' inference across the whole module, not a per-function-only assumption.
 ' Deliberately still out of scope, still real, disclosed follow-on work:
-' PRINT of a bare array (a real oracle feature -- `PRINT arr` renders
-' `[1, 2, 3]` -- deliberately not implemented; would need real runtime
-' string-building machinery, genuinely separate from anything array
-' indexing itself needed; PRINT of an indexed element already works, since
-' it's an ordinary Number), string arrays / arrays of arrays / arrays
-' holding anything but plain numbers, strings as function parameters or
-' return values (this phase's `kinds` tracking is function-local only; a
-' parameter is always assumed numeric, so passing a string into or back
-' out of a function correctly reports a diagnostic rather than silently
-' misinterpreting it), string ordering comparison (`<`/`<=`/`>`/`>=`
-' between two strings -- confirmed this is not even a real oracle feature:
-' `ArcoFission compile-run` on a real program comparing two strings with
-' `<` fails at runtime with "value is not a number", so this backend's own
-' diagnostic is arguably an improvement, catching the same error at
-' compile time instead), and everything else WP-011 (Linux Runtime) still
-' owes -- objects, the general host-function bridge. See
-' .agents/FISSION_SUBSTRATE_PROGRESS.md.
+' arrays crossing a function boundary (parameter or return value -- a real
+' diagnostic, not silently misinterpreted, the same reasoning the inference
+' above already applies to a genuine Number/String kind CONFLICT at
+' different call sites -- a parameter or return value has exactly one
+' physical kind, real polymorphism is not representable here); string
+' arrays / arrays of arrays / arrays holding anything but plain numbers;
+' branching on a string value; string ordering comparison (`<`/`<=`/`>`/
+' `>=` between two strings -- confirmed this is not even a real oracle
+' feature: `ArcoFission compile-run` on a real program comparing two
+' strings with `<` fails at runtime with "value is not a number", so this
+' backend's own diagnostic is arguably an improvement, catching the same
+' error at compile time instead); real integer division (`\`) and the `SAR`
+' keyword specifically (both likewise confirmed NOT implemented by the
+' oracle's own bytecode VM at all -- left unsupported here rather than
+' guessing a semantic the oracle itself can never confirm or deny); and
+' everything else WP-011 (Linux Runtime) still owes -- objects, the general
+' host-function bridge.
 
 CLASS FissionX86_64Program
     CONSTRUCTOR()
@@ -220,10 +215,31 @@ END FUNCTION
 ' consumption site (BinOp, Branch, call arguments, non-Main Return) must
 ' check kind, not just slot existence, or a string value flows silently
 ' into a context expecting a number.
-FUNCTION Fission_X86_64CollectSlots(fn)
+'
+' `paramKindsIn` (this function's OWN current best-guess parameter-kind
+' array, one entry per declared parameter position) and `returnKindsIn`
+' (the WHOLE MODULE's current best-guess {fnName: kind} return-kind map)
+' are this pass's real inter-procedural inference inputs -- see
+' Fission_X86_64InferSignatures' own header comment for why a string
+' parameter/return value needs real cross-function fixed-point inference
+' rather than the old Phase 4-era "always Number" assumption: a
+' parameter's own kind can only be learned from its call sites, not the
+' function body alone (a pass-through function like `FUNCTION Echo(x)
+' RETURN x END FUNCTION` has no body-local evidence of x's kind at all).
+' This same function serves BOTH roles that fixed-point needs: called
+' once per function per inference round (only `ParamKindsOut`/
+' `ReturnKindOut`/`CallArgKindRequests` consulted, `Names`/`Kinds` unused
+' and thrown away), and once more per function after convergence (this
+' time `Names`/`Kinds` -- fed to real emission -- are what's wanted, and
+' the extra three fields are ignored) -- one real pass, two different
+' callers, rather than two near-duplicate scans that could drift apart.
+FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn)
     names = []
     seen = {}
     kinds = {}
+    paramNames = []
+    returnKindOut = "Number"
+    callArgKindRequests = []
     registerParamCount = LEN(Fission_X86_64ArgRegisters())
     paramIndex = 0
     FOR param IN fn.Params
@@ -234,7 +250,10 @@ FUNCTION Fission_X86_64CollectSlots(fn)
         ELSE
             seen = Object.Set(seen, param.Name, TRUE)
         END IF
-        kinds = Object.Set(kinds, param.Name, "Number")
+        paramKind = "Number"
+        IF paramIndex < LEN(paramKindsIn) THEN paramKind = paramKindsIn[paramIndex]
+        kinds = Object.Set(kinds, param.Name, paramKind)
+        ignored = Array.Push(paramNames, param.Name)
         paramIndex = paramIndex + 1
     NEXT
     FOR block IN fn.Blocks
@@ -307,14 +326,34 @@ FUNCTION Fission_X86_64CollectSlots(fn)
                 state = Fission_X86_64Remember(names, seen, dest)
                 names = state.Names
                 seen = state.Seen
-                ' Phase 4 scope: a user function's return value is always
-                ' treated as Number -- see this file's own header comment.
-                ' `LEN(array)` is the one exception (an ordinary CALL to a
-                ' builtin name, not a user function, see Fission_X86_64
-                ' LowerFunction's own dedicated LEN handling) -- its result
-                ' is a count, still Number, so no special case is actually
-                ' needed here.
-                kinds = Object.Set(kinds, dest, "Number")
+                callee = instruction.Field("Callee")
+                ' A call to a real user-declared ArcoBASIC function has a
+                ' dest kind equal to THAT function's own current best-guess
+                ' return kind (module-wide inference, converged before
+                ' real emission ever runs -- see Fission_X86_64
+                ' InferSignatures) -- no longer hardcoded "Number" the way
+                ' Phase 4 left it. `LEN(array)` and anything else that
+                ' isn't a user-declared function (never in `functionNames`)
+                ' keeps the "Number" default, which is already correct for
+                ' LEN's own real result (a count).
+                destKind = "Number"
+                IF Object.Has(functionNames, callee) THEN destKind = Object.Get(returnKindsIn, callee, "Number")
+                kinds = Object.Set(kinds, dest, destKind)
+                ' Every argument this call passes is itself real evidence
+                ' for the CALLEE's own corresponding parameter kind -- fed
+                ' back into Fission_X86_64InferSignatures' own fixed-point
+                ' loop as a request, not applied directly here (this
+                ' function's own local `kinds` map is scoped to ITS OWN
+                ' names, never another function's parameters).
+                IF Object.Has(functionNames, callee) THEN
+                    callArgs = Fission_X86_64SplitArgs(instruction.Field("Args"))
+                    argIndex = 0
+                    FOR callArg IN callArgs
+                        argKind = Fission_X86_64OperandKind(kinds, callArg)
+                        ignored = Array.Push(callArgKindRequests, {Callee: callee, ArgIndex: argIndex, Kind: argKind})
+                        argIndex = argIndex + 1
+                    NEXT
+                END IF
             END IF
             IF kind == "Array" THEN
                 ' Phase 7: a real array literal, bump-allocated on the same
@@ -339,9 +378,111 @@ FUNCTION Fission_X86_64CollectSlots(fn)
                 seen = state.Seen
                 kinds = Object.Set(kinds, dest, "Number")
             END IF
+            IF kind == "Return" THEN
+                ' This function's OWN return kind, fed back into
+                ' Fission_X86_64InferSignatures' fixed-point loop as
+                ' `ReturnKindOut` -- Main's synthesized `RETURN I32 0`
+                ' resolves harmlessly to "Number" (a bare literal "0") and
+                ' is simply never consulted anywhere (Main is never
+                ' `CALL`ed), so no isMain special-casing is needed here.
+                value = instruction.Field("Value")
+                IF value != "" THEN returnKindOut = Fission_X86_64OperandKind(kinds, value)
+            END IF
         NEXT
     NEXT
-    RETURN {Names: names, Kinds: kinds}
+    paramKindsOut = []
+    FOR paramName IN paramNames
+        ignored = Array.Push(paramKindsOut, Object.Get(kinds, paramName, "Number"))
+    NEXT
+    RETURN {Names: names, Kinds: kinds, ParamKindsOut: paramKindsOut, ReturnKindOut: returnKindOut, CallArgKindRequests: callArgKindRequests}
+END FUNCTION
+
+' Real inter-procedural kind inference: closes the exact gap this file's
+' own header comment (and the ledger's "Next Recommended Work") disclosed
+' since Phase 4 -- a function parameter or return value could only ever be
+' Number, since a parameter's kind can only really be learned from its
+' call sites, not the function body alone (a pass-through function like
+' `FUNCTION Echo(x) RETURN x END FUNCTION` has zero body-local evidence of
+' x's own kind), and a fixed-point pass over the whole module is the
+' smallest real mechanism that can answer that correctly.
+'
+' A simple, monomorphic (ArcoBASIC has no real generics/overloading here)
+' 2-value {Number, String} unification: every parameter position and every
+' function's own return start at "Number" and only ever get upgraded to
+' "String" -- never downgraded -- so the whole process is monotonic over a
+' bounded domain (function count x max param count distinct slots) and is
+' GUARANTEED to converge within `LEN(amirModule.Functions) + 2` rounds
+' (comfortably more than any real call-graph depth this needs to chase
+' through a forward or backward function reference). Each round calls
+' Fission_X86_64CollectSlots once per function purely for its
+' ParamKindsOut/ReturnKindOut/CallArgKindRequests (its Names/Kinds are
+' real work but simply unused here, thrown away and recomputed for real
+' at emission time once this whole process has converged) -- the same
+' real per-function scan emission itself needs, not a separate duplicate
+' analysis that could quietly drift out of sync with it.
+'
+' A genuine kind CONFLICT (the same parameter position receiving a Number
+' argument at one call site and a String argument at another -- real
+' polymorphism, which this backend cannot represent since a parameter has
+' exactly one physical kind) is deliberately NOT resolved or guessed at
+' here: this pass only ever grows a kind from Number to String, so the
+' LATER, non-String call site's own argument simply stops matching the
+' now-String-converged parameter by the time Fission_X86_64LowerFunction's
+' own emission-time check runs -- reported there as a real diagnostic
+' (see that function's own Call-argument handling), not silently
+' misinterpreted.
+FUNCTION Fission_X86_64InferSignatures(amirModule, functionNames)
+    paramKinds = {}
+    returnKinds = {}
+    FOR fn IN amirModule.Functions
+        seedParams = []
+        FOR param IN fn.Params
+            ignored = Array.Push(seedParams, "Number")
+        NEXT
+        paramKinds = Object.Set(paramKinds, fn.Name, seedParams)
+        returnKinds = Object.Set(returnKinds, fn.Name, "Number")
+    NEXT
+
+    maxRounds = LEN(amirModule.Functions) + 2
+    round = 0
+    changed = TRUE
+    WHILE changed ANDALSO round < maxRounds
+        changed = FALSE
+        FOR fn IN amirModule.Functions
+            fnParamKinds = Object.Get(paramKinds, fn.Name, [])
+            fnReturnKind = Object.Get(returnKinds, fn.Name, "Number")
+            collected = Fission_X86_64CollectSlots(fn, functionNames, fnParamKinds, returnKinds)
+
+            index = 0
+            WHILE index < LEN(collected.ParamKindsOut)
+                IF collected.ParamKindsOut[index] == "String" ANDALSO fnParamKinds[index] != "String" THEN
+                    fnParamKinds[index] = "String"
+                    changed = TRUE
+                END IF
+                index = index + 1
+            WEND
+            paramKinds = Object.Set(paramKinds, fn.Name, fnParamKinds)
+
+            IF collected.ReturnKindOut == "String" ANDALSO fnReturnKind != "String" THEN
+                returnKinds = Object.Set(returnKinds, fn.Name, "String")
+                changed = TRUE
+            END IF
+
+            FOR request IN collected.CallArgKindRequests
+                calleeParamKinds = Object.Get(paramKinds, request.Callee, [])
+                IF request.ArgIndex < LEN(calleeParamKinds) THEN
+                    IF request.Kind == "String" ANDALSO calleeParamKinds[request.ArgIndex] != "String" THEN
+                        calleeParamKinds[request.ArgIndex] = "String"
+                        paramKinds = Object.Set(paramKinds, request.Callee, calleeParamKinds)
+                        changed = TRUE
+                    END IF
+                END IF
+            NEXT
+        NEXT
+        round = round + 1
+    WEND
+
+    RETURN {ParamKinds: paramKinds, ReturnKinds: returnKinds}
 END FUNCTION
 
 ' The kind ("Number" or "String") of `operand` -- a bare numeric literal is
@@ -935,8 +1076,9 @@ END FUNCTION
 ' a string can appear in any function), and whether itoa_print/str_print
 ' (shared, emitted once at the very end) are needed by ANY function, not
 ' just this one.
-FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, functionNames, context)
-    collected = Fission_X86_64CollectSlots(fn)
+FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures)
+    fnParamKinds = Object.Get(signatures.ParamKinds, fn.Name, [])
+    collected = Fission_X86_64CollectSlots(fn, functionNames, fnParamKinds, signatures.ReturnKinds)
     frame = Fission_X86_64BuildFrame(collected.Names)
     offsets = frame.Offsets
     kinds = collected.Kinds
@@ -1266,18 +1408,44 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 END IF
                 args = Fission_X86_64SplitArgs(instruction.Field("Args"))
                 argRegisters = Fission_X86_64ArgRegisters()
+                calleeParamKinds = Object.Get(signatures.ParamKinds, callee, [])
                 unresolvedArg = ""
-                nonNumericArg = ""
+                arrayArg = ""
+                mismatchedArg = ""
+                argPosition = 0
                 FOR arg IN args
                     IF Fission_X86_64OperandIsResolvable(offsets, arg) == FALSE THEN unresolvedArg = arg
-                    IF Fission_X86_64OperandKind(kinds, arg) != "Number" THEN nonNumericArg = arg
+                    argKind = Fission_X86_64OperandKind(kinds, arg)
+                    ' Real inter-procedural inference (Fission_X86_64
+                    ' InferSignatures) means a Number/String argument now
+                    ' genuinely just needs to match whatever kind the
+                    ' whole module converged on for this parameter
+                    ' position -- Array crossing a function boundary
+                    ' remains a real, disclosed, unexplored gap (rejected
+                    ' unconditionally, same reasoning as PRINT/BinOp's own
+                    ' Array-kind checks elsewhere in this file: an array
+                    ' pointer must never be silently treated as a plain
+                    ' number or string). A genuine MISMATCH against the
+                    ' converged kind (not just "not Number") is real
+                    ' polymorphism this backend cannot represent -- a
+                    ' parameter has exactly one physical kind -- reported
+                    ' as its own diagnostic rather than guessed at.
+                    IF argKind == "Array" THEN arrayArg = arg
+                    IF argKind != "Array" ANDALSO argPosition < LEN(calleeParamKinds) THEN
+                        IF argKind != calleeParamKinds[argPosition] THEN mismatchedArg = arg
+                    END IF
+                    argPosition = argPosition + 1
                 NEXT
                 IF unresolvedArg != "" THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an unsupported argument is not supported by native x86-64 codegen: " + unresolvedArg)
                     CONTINUE FOR
                 END IF
-                IF nonNumericArg != "" THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with a string argument is not supported by native x86-64 codegen (function parameters are numeric-only): " + nonNumericArg)
+                IF arrayArg != "" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an array argument is not supported by native x86-64 codegen (arrays cannot cross a function boundary): " + arrayArg)
+                    CONTINUE FOR
+                END IF
+                IF mismatchedArg != "" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument whose kind conflicts with its other call sites is not supported by native x86-64 codegen (a parameter cannot be both Number and String): " + mismatchedArg)
                     CONTINUE FOR
                 END IF
                 ' Real SysV: the first 6 arguments go in registers (below);
@@ -1342,8 +1510,16 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Returning an unsupported value is not supported by native x86-64 codegen: " + returnValue)
                     CONTINUE FOR
                 END IF
-                IF Fission_X86_64OperandKind(kinds, returnValue) != "Number" THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Returning a string value is not supported by native x86-64 codegen (function return values are numeric-only): " + returnValue)
+                ' Real inter-procedural inference (Fission_X86_64
+                ' InferSignatures) means a String return value now Just
+                ' Works -- moving a pointer into %rax is identical to
+                ' moving a number, the same reasoning Phase 4 already
+                ' established for string VARIABLES. Only Array remains
+                ' rejected: arrays crossing a function boundary are a
+                ' real, disclosed, unexplored gap, not silently
+                ' misinterpreted as a plain number.
+                IF Fission_X86_64OperandKind(kinds, returnValue) == "Array" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Returning an array value is not supported by native x86-64 codegen (arrays cannot cross a function boundary): " + returnValue)
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, returnValue, "rax"))
@@ -1362,13 +1538,23 @@ FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
     context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE}
+    ' Real inter-procedural string-parameter/return-value inference, run
+    ' to a full fixed point BEFORE any real emission -- see
+    ' Fission_X86_64InferSignatures' own header comment. Every function's
+    ' own per-name Kinds map (built fresh per function inside
+    ' Fission_X86_64LowerFunction) consults this converged signature table
+    ' when seeding its own parameters and when resolving a CALL's own dest
+    ' kind, so a string parameter/return value now Just Works through the
+    ' exact same LOAD/STORE/mov machinery Phase 4 already built for string
+    ' VARIABLES -- moving a pointer is no different from moving a number.
+    signatures = Fission_X86_64InferSignatures(amirModule, functionNames)
 
     allTextLines = []
     FOR fn IN amirModule.Functions
         isMain = fn.Name == "Main"
         labelPrefix = ""
         IF isMain == FALSE THEN labelPrefix = fn.Name + "_"
-        functionLines = Fission_X86_64LowerFunction(program.Diagnostics, fn, isMain, labelPrefix, functionNames, context)
+        functionLines = Fission_X86_64LowerFunction(program.Diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures)
         FOR line IN functionLines
             ignored = Array.Push(allTextLines, line)
         NEXT

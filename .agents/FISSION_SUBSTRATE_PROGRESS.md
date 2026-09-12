@@ -92,11 +92,18 @@ previously-undiscovered gap in the SHARED A-MIR lowering pass (affects
 both backends), fixed with a per-loop Continue/Break target stack, and a
 real surprise (CONTINUE in a post-condition-only DO loop bypasses its own
 post-condition check, unlike every other loop shape) found only by
-comparing native execution against the oracle. Strings as function
-parameters/return values, string ORDERING comparison (`<`/`<=`/`>`/`>=`),
-branching on a string, and arrays of anything but plain numbers each
-remain their own real, disclosed diagnostic-reported gap rather than
-silently wrong behavior.
+comparing native execution against the oracle. **Real string function
+PARAMETERS and RETURN VALUES** now also work, via genuine inter-
+procedural fixed-point kind inference (`Fission_X86_64InferSignatures`)
+-- a monomorphic Number/String unification across the whole module's own
+call graph (a real Number/String CONFLICT across different call sites is
+still, correctly, a real diagnostic -- a parameter has exactly one
+physical kind). String ORDERING comparison (`<`/`<=`/`>`/`>=`), branching
+on a string, arrays crossing a function boundary, and arrays of anything
+but plain numbers each remain their own real, disclosed diagnostic-
+reported gap rather than silently wrong behavior. A real, separate,
+pre-existing bug was found (not yet fixed): `PRINT` of a bare boolean
+comparison result prints `0`/`1` instead of `FALSE`/`TRUE`.
 **WP-011 (Linux Runtime -- objects, the general host-function
 bridge for everything else this backend cannot hand-roll itself) remains
 real, substantial follow-on
@@ -1425,6 +1432,87 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   `File.SetExecutable` runtime addition itself is sound, in addition to
   the normal `rivet build` + `fissure run` verification. Verified with
   plain `fissure run` (452s, passing).
+- **Native x86-64 codegen: real string function PARAMETERS and RETURN
+  VALUES**, via genuine inter-procedural fixed-point kind inference
+  (`Fission_X86_64InferSignatures`) -- closing the exact gap this
+  backend's own header comment disclosed since Phase 4 ("a parameter is
+  always assumed numeric"). Picked directly by the user's own explicit
+  "keep it going... I wanna get this part finished so we can start
+  porting the rest of arcology to ArcoBASIC" -- string parameters/return
+  values are common enough in real ArcoBASIC programs that this was the
+  clear next highest-leverage gap toward that goal.
+  A parameter's kind can only really be learned from its OWN call sites,
+  not the function body alone (a pass-through function like `FUNCTION
+  Echo(x) RETURN x END FUNCTION` has zero body-local evidence of `x`'s own
+  kind) -- this is a real, monomorphic (ArcoBASIC has no generics/
+  overloading here), 2-value {Number, String} unification problem, solved
+  with a genuine module-wide fixed-point pass run once, to convergence,
+  BEFORE any real emission: every function's own parameters and return
+  start assumed "Number" and only ever get upgraded to "String" (never
+  downgraded), fed by three kinds of real evidence gathered per function
+  per round -- internal body usage (a parameter concatenated with a
+  string, or passed straight through to another String-kind parameter),
+  every CALL's own argument kinds (fed back as upgrade requests into the
+  callee's OWN parameter-kind table), and every RETURN's own operand kind
+  (the function's own return-kind upgrade). Monotonic over a bounded
+  domain guarantees convergence within `functionCount + 2` rounds,
+  comfortably covering any real call-graph depth or forward/backward
+  function reference. `Fission_X86_64CollectSlots` (the existing per-
+  function collection pass, unchanged in spirit) now does double duty:
+  called once per function per inference round (only its new
+  `ParamKindsOut`/`ReturnKindOut`/`CallArgKindRequests` fields consulted),
+  and once more per function after convergence for real emission (its
+  `Names`/`Kinds` fields, as before) -- one real scan, two callers, rather
+  than a second analysis that could drift out of sync with the real one.
+  Once converged, a String parameter or return value needs ZERO new
+  codegen at all: moving a pointer into an argument register or out of
+  %rax is byte-identical machine code to moving a number, exactly the
+  same "LOAD/STORE codegen is kind-agnostic" property Phase 4 already
+  established for string VARIABLES -- only the emission-time validation
+  changed (a Call argument's own kind must now match the callee's
+  CONVERGED parameter kind, not a hardcoded "Number"; a Return's own
+  value just gets rejected only if it's Array-kind, not String).
+  A genuine kind CONFLICT -- the same parameter position receiving a
+  Number argument at one call site and a String argument at another, real
+  polymorphism this backend cannot represent since a parameter has
+  exactly one physical kind -- is deliberately never resolved or guessed
+  at: the monotonic-only-upgrade design means the LATER, non-matching call
+  site's own argument simply stops matching the now-converged parameter
+  kind, caught and reported as a real, distinct diagnostic by the same
+  emission-time check, confirmed via a real probe (`FUNCTION Echo(x)
+  RETURN x END FUNCTION` called with both a string and a number) that
+  this correctly fails with a clear diagnostic rather than miscompiling.
+  Arrays crossing a function boundary (parameter or return) remain a
+  real, disclosed, unexplored gap, rejected unconditionally (unaffected
+  by the new Number/String inference).
+  Verified via real execution across every real shape: a plain pass-
+  through function, string concatenation inside a function body, a two-
+  hop call chain (`DoubleWrap(x) = Wrap(Wrap(x))`), a mixed number/string/
+  number parameter list combined with a WHILE loop and accumulator, and a
+  plain numeric function alongside all of the above in the same program --
+  all byte-for-byte identical to legacy `ArcoFission compile-run`, working
+  correctly on the very first real test after fixing an unrelated bug in
+  the TEST PROGRAM itself (`Add` is a reserved ArcoBASIC keyword, the same
+  real gotcha already recorded in [[project_rivet]]'s own memory).
+  **A real, separate, pre-existing, unrelated bug was found while writing
+  these probes, NOT fixed here** (kept as a clean, distinct next
+  increment rather than bundled into this commit): `PRINT` of a bare
+  boolean comparison result (e.g. `PRINT x == y`) prints `0`/`1` instead
+  of the oracle's own `FALSE`/`TRUE` -- confirmed via a direct, isolated
+  probe with NO function calls or strings involved at all, so this is
+  independent of string parameters; comparisons currently have no
+  distinct "Bool" kind at all, only "Number".
+  Added a permanent regression fixture,
+  `fission/tests/native_programs/string_params.abas`; wired into
+  `FissionNativeCapsuleTarget`, `tests/integration/fission_substrate_core_smoke.sh`,
+  and `fission/fissure.ab`'s watched-files list. Re-verified every earlier
+  native demo unaffected. `fission/tests/amir_x86_64_smoke.abas`'s old
+  "string call argument is a diagnostic" check flipped to its opposite
+  (zero diagnostics), plus two new diagnostic-path checks (the genuine
+  Number/String conflict case, and an array argument still correctly
+  rejected). Self-parse/self-semantic corpus symbol count grew 3196 ->
+  3249; golden value in `tests/integration/fission_substrate_core_smoke.sh`
+  updated to match. Verified with plain `fissure run` (681s, passing).
 
 ## In-Progress Components
 
@@ -1862,6 +1950,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/for_each.abas`
 - `fission/tests/native_programs/loop_control.abas`
 - `fission/tests/native_programs/bitops.abas`
+- `fission/tests/native_programs/string_params.abas`
 - `fission/amir/x86_64_assembler.abas`
 - `fission/tests/sir_to_amir_loop_control_smoke.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
@@ -2113,7 +2202,12 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    Fibonacci, a real 10-parameter function, a real string-building
    program, and a real array-accumulation-over-a-ForEach program all run
    as genuine standalone x86-64 binaries today, produced with zero
-   subprocess invocations anywhere in the compile path.
+   subprocess invocations anywhere in the compile path. Real STRING
+   FUNCTION PARAMETERS AND RETURN VALUES now also work, via genuine
+   inter-procedural fixed-point kind inference
+   (`Fission_X86_64InferSignatures`) -- a real, monomorphic Number/String
+   unification across the whole module's own call graph, not a per-
+   function-only assumption.
    Along the way, two real bugs were found and fixed while confirming DO
    loops (a wrong unsigned x86 comparison instruction family, and unary
    minus never being lowered by A-MIR at all -- a shared bug, also
@@ -2128,17 +2222,18 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    entirely, rather than re-checking it). What's still real, almost
    entirely untouched, and each its own substantial undertaking on its
    own:
-   - Strings as function parameters or return values -- this backend's
-     `kinds` tracking is function-local only; currently a real diagnostic
-     at the call site / RETURN, not a silent misinterpretation. Would need
-     real inter-procedural kind inference (a parameter's kind can only be
-     learned from its call sites, not the function body alone -- a
-     pass-through function like `FUNCTION Echo(x) RETURN x END FUNCTION`
-     has no body-local evidence of x's kind at all), likely a small
-     fixed-point pass over the whole module; noted here as a real,
-     nontrivial design task, not a quick extension of the existing
-     function-local `kinds` tracking. The same inter-procedural gap applies
-     to arrays passed to/returned from functions, unexplored so far.
+   - DONE -- real string function parameters and return values, via
+     genuine inter-procedural fixed-point kind inference
+     (`Fission_X86_64InferSignatures`), see Completed Components. Arrays
+     passed to/returned from functions remain a real, disclosed,
+     unexplored gap, unaffected by this (rejected unconditionally, not
+     silently misinterpreted).
+   - A real, separate, pre-existing bug found (NOT fixed yet) while
+     verifying string parameters: `PRINT` of a bare boolean comparison
+     result (`PRINT x == y`) prints `0`/`1` instead of the oracle's own
+     `FALSE`/`TRUE` -- confirmed independent of strings/function calls via
+     an isolated probe. Comparisons have no distinct "Bool" kind
+     currently, only "Number" -- worth its own well-scoped fix.
    - String ORDERING comparison (`<`/`<=`/`>`/`>=` between two strings) --
      confirmed this session (via a real oracle probe) that this is not even
      a real supported ArcoBASIC language feature at all (legacy

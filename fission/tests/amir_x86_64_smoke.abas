@@ -11,14 +11,19 @@
 ' and EQUALITY (`==`/`!=`, real content comparison; a bump-allocated
 ' `.bss` arena shared with arrays), real numeric ARRAYS (construction,
 ' indexed read/write, `LEN`, and PRINT of a bare array rendering
-' `[1, 2, 3]`), and bare AND/OR/BITAND/BITOR/BITXOR/SHL/SHR plus the
-' (eager, not actually short-circuit -- a real, disclosed, substrate-wide
-' divergence from the oracle) ANDALSO/ORELSE -- function-local only:
-' string function parameters/return values, string ORDERING comparison
-' (`<`/`<=`/`>`/`>=`), branching on a string, arrays of anything but plain
-' numbers, SAR (a real oracle limitation, not just this backend's own),
-' and real integer division (`\`, likewise a real oracle limitation) all
-' remain real, disclosed gaps. Real execution verified separately by
+' `[1, 2, 3]`), bare AND/OR/BITAND/BITOR/BITXOR/SHL/SHR plus the (eager,
+' not actually short-circuit -- a real, disclosed, substrate-wide
+' divergence from the oracle) ANDALSO/ORELSE, and, as of
+' Fission_X86_64InferSignatures' own real inter-procedural fixed-point
+' analysis, real STRING FUNCTION PARAMETERS AND RETURN VALUES -- a genuine
+' Number/String kind CONFLICT across different call sites (real
+' polymorphism, not representable here) is still a real diagnostic, not
+' guessed at. Remaining real, disclosed gaps: arrays crossing a function
+' boundary, string ORDERING comparison (`<`/`<=`/`>`/`>=`), branching on a
+' string, arrays of anything but plain numbers, SAR (a real oracle
+' limitation, not just this backend's own), and real integer division
+' (`\`, likewise a real oracle limitation). Real execution verified
+' separately by
 ' fission/tests/native_programs/*.abas (built as real ELF64s via
 ' FissionNativeCapsuleTarget and run directly -- see
 ' tests/integration/fission_substrate_core_smoke.sh). This file checks the
@@ -129,11 +134,11 @@ MixedKindAmir = Fission_SirToAmir(MixedKindSir)
 MixedKindProgram = Fission_AmirToX86_64(MixedKindAmir)
 PRINT MixedKindProgram.Diagnostics.HasErrors()
 
-' Phase 4 scope is function-local string variables only -- passing a
-' string as a call argument, or branching on one, remain real, disclosed
-' gaps (this backend's `kinds` tracking never crosses a function boundary,
-' and a string pointer must never be silently treated as a numeric branch
-' condition).
+' Real inter-procedural inference (Fission_X86_64InferSignatures) means a
+' string function parameter/return value now genuinely works -- a
+' pass-through function called only with a string converges to a
+' String-kind parameter and return, zero diagnostics. Real execution
+' verified separately by fission/tests/native_programs/string_params.abas.
 StringArgSource = "FUNCTION Foo(x)\n    RETURN x\nEND FUNCTION\nPRINT Foo(\"hello\")"
 StringArgTokens = Fission_ArcoBasicLex(StringArgSource)
 StringArgAst = Fission_ArcoBasicParse(StringArgTokens, "x86-64-string-arg-smoke.abas")
@@ -141,6 +146,29 @@ StringArgSir = Fission_ArcoBasicAstToSir(StringArgAst)
 StringArgAmir = Fission_SirToAmir(StringArgSir)
 StringArgProgram = Fission_AmirToX86_64(StringArgAmir)
 PRINT StringArgProgram.Diagnostics.HasErrors()
+
+' The SAME pass-through function called with BOTH a Number and a String
+' argument at different call sites is real, disclosed, genuine
+' polymorphism this backend cannot represent (a parameter has exactly one
+' physical kind) -- must still report a diagnostic, not silently pick
+' whichever kind converged first or misinterpret one as the other.
+PolySource = "FUNCTION Foo(x)\n    RETURN x\nEND FUNCTION\nPRINT Foo(\"hello\")\nPRINT Foo(1)"
+PolyTokens = Fission_ArcoBasicLex(PolySource)
+PolyAst = Fission_ArcoBasicParse(PolyTokens, "x86-64-poly-smoke.abas")
+PolySir = Fission_ArcoBasicAstToSir(PolyAst)
+PolyAmir = Fission_SirToAmir(PolySir)
+PolyProgram = Fission_AmirToX86_64(PolyAmir)
+PRINT PolyProgram.Diagnostics.HasErrors()
+
+' A real array argument still cannot cross a function boundary -- a real,
+' disclosed, unexplored gap, unaffected by string parameters now working.
+ArrayArgSource = "FUNCTION Foo(x)\n    RETURN x\nEND FUNCTION\na = [1, 2]\nPRINT Foo(a)"
+ArrayArgTokens = Fission_ArcoBasicLex(ArrayArgSource)
+ArrayArgAst = Fission_ArcoBasicParse(ArrayArgTokens, "x86-64-array-arg-smoke.abas")
+ArrayArgSir = Fission_ArcoBasicAstToSir(ArrayArgAst)
+ArrayArgAmir = Fission_SirToAmir(ArrayArgSir)
+ArrayArgProgram = Fission_AmirToX86_64(ArrayArgAmir)
+PRINT ArrayArgProgram.Diagnostics.HasErrors()
 
 StringBranchSource = "s = \"hello\"\nIF s THEN\n    PRINT 1\nEND IF"
 StringBranchTokens = Fission_ArcoBasicLex(StringBranchSource)

@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^92$" <<<"$fission_self_semantic_output"
 grep -q "^140$" <<<"$fission_self_semantic_output"
-grep -q "^3196$" <<<"$fission_self_semantic_output"
+grep -q "^3249$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -738,5 +738,17 @@ expected_bitops_output="$(printf '1\n0\n15\n20\n15\n15\n-4\n4\n100\n200')"
 test "$bitops_native_output" = "$expected_bitops_output"
 oracle_bitops_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/bitops.abas")"
 test "$bitops_native_output" = "$oracle_bitops_output"
+
+# fission/tests/native_programs/string_params.abas exercises real string function PARAMETERS and
+# RETURN VALUES -- Fission_X86_64InferSignatures' own real inter-procedural fixed-point kind
+# inference across the whole module, closing the exact gap this backend's own header comment
+# disclosed since Phase 4 ("a parameter is always assumed numeric"): a pass-through function, string
+# concatenation inside a function body, a multi-hop call chain, and a mixed number/string parameter
+# list.
+string_params_native_output="$("$SOURCE_DIR/build/fission-native-programs/string_params")"
+expected_string_params_output="$(printf 'plain string\nHello, World!\nreused\n[[core]]\nHi there!!!\n7\n42')"
+test "$string_params_native_output" = "$expected_string_params_output"
+oracle_string_params_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/string_params.abas")"
+test "$string_params_native_output" = "$oracle_string_params_output"
 
 echo "fission_substrate_core_smoke: all checks passed"
