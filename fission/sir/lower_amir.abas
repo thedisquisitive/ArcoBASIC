@@ -798,7 +798,18 @@ END FUNCTION
 
 FUNCTION Fission_AmirLowerClass(builder, node)
     className = Object.Get(node.Fields, "Name", "")
-    ignored = builder.Emit(FissionAmirInstruction("DeclareClass").WithField("Name", className))
+    ' `Extends` is carried straight through from the SIR ClassDecl node (see
+    ' fission/language/arcobasic/lower_sir.abas's own Class handling) onto
+    ' DeclareClass itself -- confirmed via the oracle
+    ' (`ArcoFission reveal ... at A-MIR`) that class hierarchy is purely
+    ' static/compile-time information (ArcoBASIC has no dynamic
+    ' reparenting), matching legacy ArcoFission's own native backend design
+    ' (`AmirModule::class_parents`, src/compiler/fission.cpp) -- the native
+    ' x86-64 backend's own Fission_X86_64CollectClassParents (fission/amir/
+    ' lower_x86_64.abas) consumes this field to support real inheritance-
+    ' aware field layout and dynamic-dispatch codegen.
+    extendsName = Object.Get(node.Fields, "Extends", "")
+    ignored = builder.Emit(FissionAmirInstruction("DeclareClass").WithField("Name", className).WithField("Extends", extendsName))
 
     constructorNode = NULL
     methodNodes = []

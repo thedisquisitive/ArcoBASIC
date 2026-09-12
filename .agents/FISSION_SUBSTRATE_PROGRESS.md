@@ -1825,6 +1825,130 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   reproducing identically with this change reverted -- not caused by this
   work, left as a disclosed pre-existing gap rather than silently claimed
   fixed or hidden.
+- **Real class-instance runtime polymorphism + full EXTENDS inheritance**
+  (`fission/amir/lower_x86_64.abas`) -- the "very much required feature"
+  explicitly deferred by the project owner until after The Arcology Fusion
+  Linker landed, picked up immediately once that was confirmed solid.
+  Closes what was previously a disclosed, unstarted diagnostic-only gap:
+  a variable genuinely assigned different concrete classes down different
+  branches (`IF cond THEN pet = Dog(4) ELSE pet = Animal(2)`, confirmed
+  real, legal, working ArcoBASIC via a direct oracle probe) now compiles
+  to REAL, correct, oracle-matching native machine code instead of a
+  diagnostic. Two real, separate halves, both needed:
+  1. **Real EXTENDS inheritance** (previously not implemented AT ALL in
+     the AMIR lowering -- `Extends` was parsed and carried into SIR but
+     silently dropped, confirmed by reading `fission/sir/lower_amir.abas`
+     directly, not assumed): `Extends` is now threaded onto `DeclareClass`
+     itself (`Fission_AmirLowerClass`), and the native backend's own
+     `Fission_X86_64CollectClassParents` builds a real
+     `{ChildClass: ParentClass}` map from it, module-wide -- the exact
+     same `class_parents` design legacy ArcoFission's own bytecode-VM
+     native backend already uses for its own runtime dispatch
+     (`src/compiler/fission.cpp`), consulted here at COMPILE time instead
+     since this backend controls its own ahead-of-time codegen.
+     `Fission_X86_64CollectClassFields` (the fixed-offset field-layout
+     pass) is now INHERITANCE-AWARE: classes are resolved parent-first
+     (a real, bounded topological pass over `classParents`), and a
+     derived class's own inherited fields keep the EXACT SAME byte offset
+     its base class already resolved them to -- essential, not cosmetic:
+     an inherited (non-overridden) method's own compiled body is
+     literally the base class's OWN function, referencing its OWN fixed
+     offsets, so it must keep reading correct memory when its SELF
+     happens to be a derived instance. `Fission_X86_64ResolveMethodOwner`
+     walks the chain (bounded to 64 hops, defensive against a malformed/
+     cyclic EXTENDS) to find which class ACTUALLY owns a called method,
+     letting a derived instance genuinely call an INHERITED method for
+     the first time (previously this even FAILED for the static,
+     non-polymorphic case -- confirmed via a direct probe before this fix
+     landed: `Dog.GetLegs` didn't exist as a function at all when Dog
+     doesn't override it, and the old code never looked further than the
+     receiver's own exact class name, unconditionally reporting "not a
+     user-declared function").
+  2. **Real runtime polymorphic dispatch**: `Fission_X86_64MergeKinds`
+     (used by `Fission_X86_64CollectSlots`'s own Store handling) unions
+     multiple concrete classes ever assigned to the same variable into a
+     real `"Poly:Class1,Class2,..."` kind (first-seen order, deduplicated)
+     instead of the old "last write wins" silently discarding the earlier
+     branch's own class. `Fission_X86_64LowerFunction`'s own Call handling
+     detects a Poly-kind receiver and, for EACH candidate concrete class
+     (a closed, exhaustive, compile-time-known set), resolves which
+     function actually runs (via `Fission_X86_64ResolveMethodOwner`) and
+     emits a REAL runtime `__class`-tag comparison chain -- `str_equals`
+     against each candidate's own class-name literal (content comparison,
+     since two separately-constructed instances' own "ClassName" rodata
+     strings are never pointer-identical, no interning exists) -- picking
+     the correct concrete dispatch target at actual runtime, an ordinary
+     if/elif/.../else chain (the last candidate needs no comparison at
+     all). The exact same observable behavior as the oracle's own
+     bytecode VM (confirmed via `ArcoFission reveal ... at A-MIR`: `CALL
+     c.Increment` with no explicit SELF argument, the VM injecting it
+     itself after a runtime `__class` lookup), reached via a different,
+     closed/exhaustive mechanism suited to ahead-of-time codegen rather
+     than literally replicating the VM's own runtime lookup. Field access
+     (`Index`/`StoreIndex`) on a Poly-kind receiver is also supported,
+     gated by a new `Fission_X86_64ResolvePolyFieldOffset`: sound only
+     when EVERY candidate class resolves the field to the identical fixed
+     offset (always true for a field inherited from a shared ancestor, by
+     construction; NOT guaranteed for two unrelated classes that happen
+     to declare a same-named field independently -- a real, reported
+     diagnostic for that case, confirmed via a direct probe, not a silent
+     wrong-offset read). A new shared `Fission_X86_64EmitCall` helper
+     factors out real SysV arg-validation/marshaling/`call`-emission/
+     result-store, used identically by an ordinary function call, a
+     statically-resolved (possibly inherited) method call, and every
+     branch of a polymorphic dispatch chain -- one real implementation,
+     not three that could drift apart; it deliberately exempts a method
+     call's own SELF argument (position 0, Object- or Poly-kind) from the
+     general Number/String-conflict arg-kind check, since a method's own
+     declared SELF-kind is always its ENCLOSING class, which legitimately
+     differs from an actual derived-instance/polymorphic receiver -- the
+     exact case real inheritance/polymorphism needs to allow, confirmed
+     necessary the hard way (this exemption's absence was the very first
+     real bug hit while verifying the poly-dispatch codegen: every single
+     dispatch branch failed with a spurious "argument whose kind
+     conflicts" diagnostic on the SELF argument until this was added).
+  Genuine, remaining, disclosed limits, each confirmed against the oracle
+  directly rather than assumed: a genuinely UNRESOLVABLE polymorphic call
+  (no shared ancestor between two candidate classes declares the method
+  at all) is still a real diagnostic -- a deliberate, disclosed
+  divergence from the oracle here, since the oracle's own lazy per-call
+  runtime dispatch would actually SUCCEED whenever the unsupported branch
+  is never actually reached at runtime (e.g. a compile-time-constant
+  condition), while this backend requires EVERY statically-observed
+  candidate class to support a called method regardless of whether that
+  branch could ever really execute -- the same "reject a theoretically-
+  maybe-fine case for a source-level guarantee" trade-off already
+  established elsewhere in this file (arrays crossing a function
+  boundary). `SUPER.Method(...)` explicit base-class calls (a real oracle
+  feature, `src/frontend/parser.cpp`'s own `SuperCallExpr`) are not
+  lowered by `fission/sir/lower_amir.abas` AT ALL yet -- a SHARED-
+  substrate gap, not native-codegen-specific, left untouched here. A
+  derived class with NO constructor of its own reading a field only its
+  BASE class's own constructor ever initializes is a genuine ORACLE
+  limitation too (confirmed directly: `ArcoFission compile-run` on that
+  exact shape fails at runtime with "undefined property", since EXTENDS
+  does not auto-chain construction) -- this backend's own inheritance-
+  aware field layout deliberately still lets such a field's fixed memory
+  slot exist and read as unwritten/garbage rather than erroring, a
+  disclosed, narrow representational divergence from the oracle's own
+  dynamic-property-bag crash, in this one specific, already-broken-on-
+  the-oracle shape.
+  New permanent regression fixture,
+  `fission/tests/native_programs/polymorphism.abas` (real execution,
+  byte-for-byte verified against the oracle: two-way and three-way
+  polymorphism inside both top-level code and a FUNCTION's own local
+  scope, polymorphic field access, and a 3-level-deep static inheritance
+  chain -- Puppy -> Dog -> Animal -- genuinely calling an inherited
+  method with no override at any intermediate level). All 16 existing
+  native fixtures re-verified byte-for-byte unaffected. Extended
+  `fission/tests/amir_x86_64_smoke.abas`'s own pre-existing
+  `PolyClassSource` case (originally written to check for a diagnostic,
+  now checking real dispatch structurally: zero diagnostics, both
+  concrete `call ClassName.Speak` targets present, a real `call
+  str_equals`) plus four new structural cases (a genuinely inherited
+  method call, an unresolvable-poly diagnostic, an ambiguous-poly-field
+  diagnostic). Wired the new fixture into `fission/fissure.ab`'s watched-
+  files list.
 
 ## In-Progress Components
 
@@ -2595,18 +2719,21 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
      Completed Components and the Architectural Decisions entry recording
      this reversal of WP-009's own original scope choice.
    - DONE -- real CLASS support (constructors, methods, SELF/external
-     field access, multiple instances, inheritance with method
-     overriding), see Completed Components. Real, disclosed remaining
-     gaps: non-numeric class fields; genuine class-instance runtime
-     polymorphism (a real dynamic-dispatch mechanism -- a runtime
-     `__class`-tag comparison chain -- is real, substantial, unstarted
-     follow-on work, not attempted); and a real fallback to the existing
-     ~244-entry host-function dispatch table for anything else (legacy's
-     own `arco_call_host`/`host_bridge.cpp` bridge is the reference for
-     this, though porting it into the substrate rather than linking
-     against it directly is itself a real design decision to make, not
-     just a port) -- this last item is now WP-011's own single largest
-     remaining piece.
+     field access, multiple instances, full EXTENDS inheritance including
+     a derived class genuinely calling an INHERITED, non-overridden
+     method, and now real class-instance RUNTIME POLYMORPHISM -- a real
+     `__class`-tag comparison chain, the "very much required feature" the
+     project owner explicitly deferred until after The Arcology Fusion
+     Linker landed), see Completed Components. Real, disclosed remaining
+     gaps: non-numeric class fields; `SUPER.Method(...)` explicit
+     base-class calls (a real oracle feature never lowered by
+     `fission/sir/lower_amir.abas` at all, a SHARED-substrate gap); and a
+     real fallback to the existing ~244-entry host-function dispatch table
+     for anything else (legacy's own `arco_call_host`/`host_bridge.cpp`
+     bridge is the reference for this, though porting it into the
+     substrate rather than linking against it directly is itself a real
+     design decision to make, not just a port) -- this last item is now
+     WP-011's own single largest remaining piece.
    The existing experimental legacy native backend
    (`ArcoFission build FILE -o OUT --target linux-x86_64`,
    `.agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md`) is worth reading

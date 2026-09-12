@@ -455,11 +455,9 @@ PRINT String.Contains(ClassAssembly, "call Counter.Increment")
 ' itself never contains an explicit RETURN in its own ArcoBASIC source).
 PRINT String.Contains(ClassAssembly, "Counter.Increment:")
 
-' Real, disclosed Phase 1 gaps: a non-numeric (String) field, an unknown
-' field name, and genuine runtime polymorphism (a variable that could hold
-' different concrete classes at different times) all still correctly
-' report a diagnostic rather than silently misinterpreting one kind as
-' another.
+' Real, disclosed Phase 1 gaps: a non-numeric (String) field and an
+' unknown field name still correctly report a diagnostic rather than
+' silently misinterpreting one kind as another.
 StringFieldSource = "CLASS Person\n    CONSTRUCTOR(name)\n        SELF.Name = name\n    END CONSTRUCTOR\nEND CLASS\np = Person(\"Ada\")"
 StringFieldTokens = Fission_ArcoBasicLex(StringFieldSource)
 StringFieldAst = Fission_ArcoBasicParse(StringFieldTokens, "x86-64-string-field-smoke.abas")
@@ -476,6 +474,17 @@ UnknownFieldAmir = Fission_SirToAmir(UnknownFieldSir)
 UnknownFieldProgram = Fission_AmirToX86_64(UnknownFieldAmir)
 PRINT UnknownFieldProgram.Diagnostics.HasErrors()
 
+' Real class-instance runtime polymorphism (Fission_X86_64IsPolyKind, see
+' its own header comment in fission/amir/lower_x86_64.abas): `pet` is
+' genuinely assigned two different concrete classes down different IF
+' branches, then `pet.Speak()` is called -- this USED TO be a disclosed,
+' unstarted diagnostic-only gap (this exact source was originally written
+' to check for a real diagnostic here); now it's real, working dispatch,
+' checked here structurally (zero diagnostics, and the rendered assembly
+' actually contains a real runtime `__class`-tag comparison via
+' `str_equals` plus BOTH concrete Speak targets, not just one guessed
+' arbitrarily) -- real execution verified separately by
+' fission/tests/native_programs/polymorphism.abas.
 PolyClassSource = "CLASS Animal\n    CONSTRUCTOR(legs)\n        SELF.Legs = legs\n    END CONSTRUCTOR\n    FUNCTION Speak()\n        RETURN 0\n    END FUNCTION\nEND CLASS\nCLASS Dog EXTENDS Animal\n    FUNCTION Speak()\n        RETURN 1\n    END FUNCTION\nEND CLASS\nx = 1\nIF x == 1 THEN\n    pet = Dog(4)\nELSE\n    pet = Animal(2)\nEND IF\nPRINT pet.Speak()"
 PolyClassTokens = Fission_ArcoBasicLex(PolyClassSource)
 PolyClassAst = Fission_ArcoBasicParse(PolyClassTokens, "x86-64-poly-class-smoke.abas")
@@ -483,3 +492,56 @@ PolyClassSir = Fission_ArcoBasicAstToSir(PolyClassAst)
 PolyClassAmir = Fission_SirToAmir(PolyClassSir)
 PolyClassProgram = Fission_AmirToX86_64(PolyClassAmir)
 PRINT PolyClassProgram.Diagnostics.HasErrors()
+PolyClassAssembly = PolyClassProgram.Render()
+PRINT String.Contains(PolyClassAssembly, "call str_equals")
+PRINT String.Contains(PolyClassAssembly, "call Dog.Speak")
+PRINT String.Contains(PolyClassAssembly, "call Animal.Speak")
+
+' A genuinely INHERITED (non-overridden) method, called on a STATICALLY
+' single-concrete-class receiver (not polymorphic at all) -- Dog has no
+' Speak of its own here, so `Fission_X86_64ResolveMethodOwner` must walk
+' up to Animal and resolve the call to `Animal.Speak`, not report "not a
+' user-declared function" the way this backend used to before real
+' inheritance support landed.
+InheritedMethodSource = "CLASS Animal\n    CONSTRUCTOR(legs)\n        SELF.Legs = legs\n    END CONSTRUCTOR\n    FUNCTION Speak()\n        RETURN 0\n    END FUNCTION\nEND CLASS\nCLASS Dog EXTENDS Animal\nEND CLASS\nd = Dog(4)\nPRINT d.Speak()"
+InheritedMethodTokens = Fission_ArcoBasicLex(InheritedMethodSource)
+InheritedMethodAst = Fission_ArcoBasicParse(InheritedMethodTokens, "x86-64-inherited-method-smoke.abas")
+InheritedMethodSir = Fission_ArcoBasicAstToSir(InheritedMethodAst)
+InheritedMethodAmir = Fission_SirToAmir(InheritedMethodSir)
+InheritedMethodProgram = Fission_AmirToX86_64(InheritedMethodAmir)
+PRINT InheritedMethodProgram.Diagnostics.HasErrors()
+PRINT String.Contains(InheritedMethodProgram.Render(), "call Animal.Speak")
+
+' A genuinely UNRESOLVABLE polymorphic call -- `pet` could be a Cat (which
+' declares no Speak of its own, and has no shared ancestor with Dog that
+' does either) -- is still a real, reported diagnostic, not a crash or a
+' silently-guessed dispatch target. A real, disclosed, deliberately
+' conservative divergence from the oracle here: the oracle's own bytecode
+' VM would actually SUCCEED at running this exact source (`x` is always
+' 1, so Cat.Speak is never actually reached at runtime), since it resolves
+' `__class` dispatch lazily, per-call, at actual runtime -- this backend
+' instead requires EVERY candidate class a variable was ever statically
+' observed being assigned to support a called method, even down a branch
+' that might never execute, the same "reject a theoretically-maybe-fine
+' case for a source-level guarantee" trade-off already established
+' elsewhere in this file (e.g. arrays crossing a function boundary).
+UnresolvablePolySource = "CLASS Cat\n    CONSTRUCTOR(legs)\n        SELF.Legs = legs\n    END CONSTRUCTOR\n    FUNCTION Meow()\n        RETURN 9\n    END FUNCTION\nEND CLASS\nCLASS Dog\n    CONSTRUCTOR(legs)\n        SELF.Legs = legs\n    END CONSTRUCTOR\n    FUNCTION Speak()\n        RETURN 1\n    END FUNCTION\nEND CLASS\nx = 1\nIF x == 1 THEN\n    pet = Dog(4)\nELSE\n    pet = Cat(4)\nEND IF\nPRINT pet.Speak()"
+UnresolvablePolyTokens = Fission_ArcoBasicLex(UnresolvablePolySource)
+UnresolvablePolyAst = Fission_ArcoBasicParse(UnresolvablePolyTokens, "x86-64-unresolvable-poly-smoke.abas")
+UnresolvablePolySir = Fission_ArcoBasicAstToSir(UnresolvablePolyAst)
+UnresolvablePolyAmir = Fission_SirToAmir(UnresolvablePolySir)
+UnresolvablePolyProgram = Fission_AmirToX86_64(UnresolvablePolyAmir)
+PRINT UnresolvablePolyProgram.Diagnostics.HasErrors()
+
+' A genuinely ambiguous polymorphic FIELD access -- `Foo`/`Bar` are two
+' UNRELATED classes (no shared ancestor) that each independently declare a
+' field named "B" at a DIFFERENT fixed byte offset -- is a real, reported
+' diagnostic (Fission_X86_64ResolvePolyFieldOffset), not a silent
+' wrong-offset read.
+AmbiguousFieldSource = "CLASS Foo\n    CONSTRUCTOR(a, b)\n        SELF.A = a\n        SELF.B = b\n    END CONSTRUCTOR\nEND CLASS\nCLASS Bar\n    CONSTRUCTOR(b)\n        SELF.B = b\n    END CONSTRUCTOR\nEND CLASS\nx = 1\nIF x == 1 THEN\n    thing = Foo(1, 2)\nELSE\n    thing = Bar(9)\nEND IF\nPRINT thing.B"
+AmbiguousFieldTokens = Fission_ArcoBasicLex(AmbiguousFieldSource)
+AmbiguousFieldAst = Fission_ArcoBasicParse(AmbiguousFieldTokens, "x86-64-ambiguous-field-smoke.abas")
+AmbiguousFieldSir = Fission_ArcoBasicAstToSir(AmbiguousFieldAst)
+AmbiguousFieldAmir = Fission_SirToAmir(AmbiguousFieldSir)
+AmbiguousFieldProgram = Fission_AmirToX86_64(AmbiguousFieldAmir)
+PRINT AmbiguousFieldProgram.Diagnostics.HasErrors()

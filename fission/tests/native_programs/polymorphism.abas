@@ -1,0 +1,92 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises real class-instance
+' RUNTIME POLYMORPHISM (Fission_X86_64IsPolyKind, see that function's own
+' comment for the full design/history): a variable genuinely assigned
+' different concrete classes down different branches -- inside a plain
+' top-level IF/ELSE (Pet1) AND inside a FUNCTION's own local scope, across
+' three sibling candidate classes, including field access on the
+' polymorphic variable itself (MakePet) -- then a method call on it
+' dispatched CORRECTLY at runtime via a real `__class`-tag comparison
+' chain, not guessed at compile time. Also exercises real EXTENDS
+' inheritance's OTHER half this same work landed: a derived class with NO
+' constructor and NO override of its own genuinely calling an INHERITED
+' method three levels up the hierarchy (Puppy -> Dog -> Animal), correct
+' because Fission_X86_64CollectClassFields' own field-offset layout is
+' inheritance-aware (an inherited field keeps the exact same fixed byte
+' offset its base class already resolved it to).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+CLASS Animal
+    CONSTRUCTOR(legs)
+        SELF.Legs = legs
+    END CONSTRUCTOR
+
+    FUNCTION Speak()
+        RETURN 0
+    END FUNCTION
+
+    FUNCTION GetLegs()
+        RETURN SELF.Legs
+    END FUNCTION
+END CLASS
+
+CLASS Dog EXTENDS Animal
+    CONSTRUCTOR(legs)
+        SELF.Legs = legs
+    END CONSTRUCTOR
+
+    FUNCTION Speak()
+        RETURN 1
+    END FUNCTION
+END CLASS
+
+CLASS Cat EXTENDS Animal
+    CONSTRUCTOR(legs)
+        SELF.Legs = legs
+    END CONSTRUCTOR
+
+    FUNCTION Speak()
+        RETURN 2
+    END FUNCTION
+END CLASS
+
+CLASS Puppy EXTENDS Dog
+    CONSTRUCTOR(legs)
+        SELF.Legs = legs
+    END CONSTRUCTOR
+END CLASS
+
+FUNCTION MakePet(n)
+    IF n == 0 THEN
+        pet = Dog(4)
+    ELSE
+        IF n == 1 THEN
+            pet = Cat(4)
+        ELSE
+            pet = Animal(2)
+        END IF
+    END IF
+    PRINT pet.Speak()
+    PRINT pet.GetLegs()
+    PRINT pet.Legs
+END FUNCTION
+
+flag = 1
+IF flag == 1 THEN
+    pet1 = Dog(4)
+ELSE
+    pet1 = Animal(2)
+END IF
+PRINT pet1.Speak()
+PRINT pet1.GetLegs()
+
+MakePet(0)
+MakePet(1)
+MakePet(2)
+
+pup = Puppy(4)
+PRINT pup.Speak()
+PRINT pup.GetLegs()
