@@ -1,0 +1,42 @@
+' Real host-function bridge machinery -- builds fission/native_runtime/
+' host_bridge.c into a real ELF64 relocatable object file (see that
+' file's own header comment, and fission/amir/lower_x86_64.abas's own
+' Fission_X86_64HostFunctionTable comment, for the full design). This is
+' the ONE place gcc/g++ is invoked as part of THIS project's own build --
+' a one-time, development-time step, exactly like compiling any other
+' C++ source in this repo (ArcoFission itself, arco_runtime_core.a, ...)
+' -- an end user's own ArcoBASIC program compile never shells out to it,
+' only to this project's own Fusion (fission/amir/fusion_linker.abas)
+' consuming the resulting `.o` via fission/amir/elf_object.abas.
+'
+' Deliberately NOT built through BuildTarget's own general Compile+Link/
+' Archive machinery (that class always chains a Link or Archive action
+' after compiling, and this needs neither -- just the raw, single `.o`
+' fission/cli/compile_to_x86_64.abas reads directly at a well-known
+' path) -- a single, explicit Compile action instead, the same
+' RIVET.Graph.Action shape every other real Rivet target in this
+' project's own build graph already uses.
+'
+' Reuses RIVET.Toolchain.DetectCxx()'s own real, absolute compiler
+' detection (rather than a bare "gcc"/"cc" name, which the underlying
+' execution mechanism cannot PATH-resolve itself) -- `host_bridge.c` is
+' deliberately written in a C-compatible dialect (see that file's own
+' header comment: freestanding, no C++-only features), and `-x c` forces
+' real C compilation regardless of whether g++ or clang++ was actually
+' detected, confirmed byte-for-byte identical to a direct `gcc` invocation
+' via a real probe.
+FUNCTION Fission_RivetBuildHostBridge()
+    sourcePath = "fission/native_runtime/host_bridge.c"
+    outputPath = ".rivet/fission-native-runtime/host_bridge.o"
+    detected = RIVET.Toolchain.DetectCxx()
+    IF !detected.Found THEN
+        ignored = RIVET.Log.Error("no C/C++ compiler found to build fission/native_runtime/host_bridge.c (the real host-function bridge)")
+    END IF
+    args = ["-x", "c", "-ffreestanding", "-fno-stack-protector", "-fno-pic", "-fno-pie", "-fno-asynchronous-unwind-tables", "-nostdlib", "-O1", "-c", sourcePath, "-o", outputPath]
+    spec = { Type: "Compile", Target: "fission-native-runtime-host-bridge", DisplayName: sourcePath,
+             Inputs: [sourcePath], Outputs: [outputPath],
+             Tool: detected.Path, ToolVersion: "host-bridge/1/" + detected.Version,
+             Arguments: args, Dependencies: [], OriginFunction: "Fission_RivetBuildHostBridge" }
+    actionId = RIVET.Graph.Action(spec)
+    RETURN {OutputPath: outputPath, FinalActionId: actionId}
+END FUNCTION

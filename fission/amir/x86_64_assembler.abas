@@ -775,10 +775,20 @@ FUNCTION Fission_X86_64AssembleFragment(assemblyText)
     ' always Section "text" here, since every rel32/RIP-relative field
     ' this backend's own codegen ever emits lives in .text (see
     ' fission/amir/x86_64_fragment.abas's own header comment on why that's
-    ' sound, modeled generally rather than assumed forever).
+    ' sound, modeled generally rather than assumed forever). Every
+    ' relocation this encoder itself ever produces is RIP-relative
+    ' ("PC32", Addend -4 -- see fission/amir/fusion_linker.abas's own
+    ' comment on why that specific formula/addend is real ELF's own
+    ' R_X86_64_PC32/PLT32 convention, not a special case this backend
+    ' invented) -- Type/Addend are explicit fields here (not left to
+    ' Fusion's own default) so a genuine ELF object file's own relocations
+    ' (fission/amir/elf_object.abas), which can carry a DIFFERENT type
+    ' (R_X86_64_32, absolute) or addend, are handled by the exact same
+    ' general patch logic with no special-casing for "which kind of
+    ' fragment produced this."
     relocations = []
     FOR fixup IN textFixups
-        ignored = Array.Push(relocations, {Section: "text", FieldOffset: fixup.FieldOffset, Target: fixup.Target})
+        ignored = Array.Push(relocations, {Section: "text", FieldOffset: fixup.FieldOffset, Target: fixup.Target, Type: "PC32", Addend: -4})
     NEXT
 
     fragment = FissionX86_64Fragment(textBuffer.Bytes, rodataBuffer.Bytes, bssOffset, symbols, relocations)

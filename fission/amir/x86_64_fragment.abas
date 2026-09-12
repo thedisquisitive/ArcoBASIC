@@ -236,6 +236,22 @@ FUNCTION Fission_FragmentSectionFromTag(tag)
     RETURN "bss"
 END FUNCTION
 
+' A relocation's own TYPE (see fission/amir/fusion_linker.abas's own
+' comment for the real ELF `S + A - P` vs `S + A` formulas this
+' distinguishes) -- "PC32" (RIP-relative, this backend's own encoder's
+' only kind) or "ABS32" (a plain absolute 32-bit field, real ELF
+' `R_X86_64_32`, produced by a genuine compiled `.o` file's own
+' relocations, fission/amir/elf_object.abas).
+FUNCTION Fission_FragmentRelocationTypeTag(relocationType)
+    IF relocationType == "ABS32" THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+FUNCTION Fission_FragmentRelocationTypeFromTag(tag)
+    IF tag == 1 THEN RETURN "ABS32"
+    RETURN "PC32"
+END FUNCTION
+
 ' Serializes `fragment` into a real, self-contained `.frag` file's own
 ' bytes -- MAGIC + VERSION, then TEXT/RODATA (length-prefixed byte blocks),
 ' the BSS size, then the symbol table and relocation table (each a
@@ -250,7 +266,7 @@ FUNCTION Fission_FragmentSerialize(fragment)
     FOR b IN magicBytes
         ignored = buffer.EmitByte(b)
     NEXT
-    ignored = buffer.EmitByte(1)
+    ignored = buffer.EmitByte(2)
 
     ignored = buffer.EmitU32(LEN(fragment.TextBytes))
     FOR b IN fragment.TextBytes
@@ -274,6 +290,8 @@ FUNCTION Fission_FragmentSerialize(fragment)
         ignored = buffer.EmitByte(Fission_FragmentSectionTag(relocation.Section))
         ignored = buffer.EmitU32(relocation.FieldOffset)
         ignored = Fission_FragmentWriteString(buffer, relocation.Target)
+        ignored = buffer.EmitByte(Fission_FragmentRelocationTypeTag(Object.Get(relocation, "Type", "PC32")))
+        ignored = buffer.EmitU32(Object.Get(relocation, "Addend", -4))
     NEXT
 
     RETURN buffer.Bytes
@@ -292,7 +310,7 @@ FUNCTION Fission_FragmentDeserialize(bytes)
     reader = FissionX86_64ByteReader(bytes)
     ignored = reader.ReadBytes(4)
     version = reader.ReadU8()
-    IF version != 1 THEN
+    IF version != 2 THEN
         ignored = diagnostics.ReportError("FISSION_FRAGMENT_INVALID", "Unsupported Arcology Fusion fragment version: " + String(version))
         RETURN {Ok: FALSE, Fragment: NULL, Diagnostics: diagnostics}
     END IF
@@ -321,7 +339,11 @@ FUNCTION Fission_FragmentDeserialize(bytes)
         sectionTag = reader.ReadU8()
         fieldOffset = reader.ReadU32()
         target = reader.ReadString()
-        ignored = Array.Push(relocations, {Section: Fission_FragmentSectionFromTag(sectionTag), FieldOffset: fieldOffset, Target: target})
+        relocationTypeTag = reader.ReadU8()
+        rawAddend = reader.ReadU32()
+        addend = rawAddend
+        IF addend >= 2147483648 THEN addend = addend - 4294967296
+        ignored = Array.Push(relocations, {Section: Fission_FragmentSectionFromTag(sectionTag), FieldOffset: fieldOffset, Target: target, Type: Fission_FragmentRelocationTypeFromTag(relocationTypeTag), Addend: addend})
         index = index + 1
     WEND
 

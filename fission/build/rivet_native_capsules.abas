@@ -6,6 +6,8 @@
 ' supported construct subset, and fission/tests/native_programs/ itself for
 ' why these fixtures are kept separate from fission/tests/substrate_programs/
 ' (whose bytecode-VM-embedded path supports a much larger subset already).
+#IMPORT "fission/build/rivet_native_runtime.abas"
+
 FUNCTION Fission_RivetBuildNativeDriver(compilerTarget)
     target = BUILD.ArcoCapsule("fission-compile-to-x86-64")
     target.Entry = "fission/cli/compile_to_x86_64.abas"
@@ -29,20 +31,31 @@ FUNCTION Fission_RivetNativeProgramEntries()
     RETURN entries
 END FUNCTION
 
-FUNCTION Fission_RivetBuildNativeCapsule(entryPath, driverTarget)
+' `hostBridgeResult` (Fission_RivetBuildHostBridge's own {OutputPath,
+' FinalActionId}) is a real build-graph DEPENDENCY of every native
+' capsule, not just something that happens to exist on disk by the time
+' this RUNS -- without this, a cold/parallel build could run this
+' capsule's own Compile action (which RUNS the driver, and the driver
+' checks for host_bridge.o's own real existence at that exact moment)
+' before the host bridge's own Compile action has actually produced it,
+' silently compiling a capsule with no host-function support at all
+' instead of a real "wait for it" dependency edge.
+FUNCTION Fission_RivetBuildNativeCapsule(entryPath, driverTarget, hostBridgeResult)
     target = BUILD.FissionNativeCapsule(Fission_RivetNativeProgramBaseName(entryPath))
     target.Entry = entryPath
     target.OutputDirectory = "build/fission-native-programs"
     ignored = target.UseDriverTarget(driverTarget)
+    ignored = target.AddDependency({FinalActionId: hostBridgeResult.FinalActionId})
     ignored = target.Build()
     RETURN target
 END FUNCTION
 
 FUNCTION Fission_RivetBuildAllNativeCapsules(compilerTarget)
     driverTarget = Fission_RivetBuildNativeDriver(compilerTarget)
+    hostBridgeResult = Fission_RivetBuildHostBridge()
     targets = []
     FOR entryPath IN Fission_RivetNativeProgramEntries()
-        ignored = Array.Push(targets, Fission_RivetBuildNativeCapsule(entryPath, driverTarget))
+        ignored = Array.Push(targets, Fission_RivetBuildNativeCapsule(entryPath, driverTarget, hostBridgeResult))
     NEXT
     RETURN targets
 END FUNCTION

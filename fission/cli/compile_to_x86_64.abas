@@ -31,6 +31,7 @@
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 #IMPORT "fission/amir/lower_x86_64.abas"
 #IMPORT "fission/amir/x86_64_assembler.abas"
+#IMPORT "fission/amir/elf_object.abas"
 #IMPORT "fission/amir/fusion_linker.abas"
 
 FUNCTION FissionNativeCli_Fail(stage, message)
@@ -62,7 +63,29 @@ IF program.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("X86_64"
 assembled = Fission_X86_64AssembleFragment(program.Render())
 IF assembled.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("ASSEMBLE", assembled.Diagnostics.Render())
 
-linked = Fission_FusionLink([assembled.Fragment], "_start")
+' The real host-function bridge (see Fission_X86_64HostFunctionTable's
+' own comment in fission/amir/lower_x86_64.abas for the full design) --
+' fission/native_runtime/host_bridge.c, compiled by Rivet's own
+' Fission_RivetBuildHostBridge into a real ELF64 relocatable object at a
+' well-known path, linked in unconditionally (a small, fixed amount of
+' unused machine code for a program that happens not to call any host
+' function costs nothing real, and keeps this common path simple --
+' `program.UsesHostBridge` still tracks the real answer for whoever wants
+' it). If that `.o` hasn't been built yet (a fresh checkout, before the
+' first `rivet build`), this compile still succeeds for any program that
+' doesn't actually call a host function -- one only ever fails, with a
+' real "undefined symbol" diagnostic from Fusion itself, at the point it
+' actually needed a host function this fragment can't provide.
+fragments = [assembled.Fragment]
+hostBridgePath = ".rivet/fission-native-runtime/host_bridge.o"
+IF File.Exists(hostBridgePath) THEN
+    hostBridgeBytes = File.ReadBytes(hostBridgePath)
+    hostBridgeParsed = Fission_ElfObjectParse(hostBridgeBytes)
+    IF hostBridgeParsed.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("HOST_BRIDGE", hostBridgeParsed.Diagnostics.Render())
+    ignored = Array.Push(fragments, hostBridgeParsed.Fragment)
+END IF
+
+linked = Fission_FusionLink(fragments, "_start")
 IF linked.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("FUSION", linked.Diagnostics.Render())
 
 ignored = File.WriteBytes(outputPath, linked.Bytes)

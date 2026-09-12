@@ -1,0 +1,255 @@
+#IMPORT "fission/core/diagnostics.abas"
+#IMPORT "fission/amir/x86_64_fragment.abas"
+
+' Real ELF64 relocatable object file (`.o`) parsing -- lets The Arcology
+' Fusion Linker link genuine, externally-compiled native machine code
+' (today: `fission/native_runtime/host_bridge.c`, compiled by the
+' system's own C compiler as a ONE-TIME, DEVELOPMENT-TIME build step, see
+' that file's own header comment for why this doesn't reintroduce an
+' external-toolchain dependency into an end user's own ArcoBASIC compile)
+' directly alongside this backend's own encoder-produced fragments, with
+' ZERO changes needed to Fission_FusionLink's own merge/link logic beyond
+' making its relocation-patching TYPE-aware (see
+' fission/amir/fusion_linker.abas's own comment) -- `Fission_ElfObjectParse`
+' produces a plain `FissionX86_64Fragment`-shaped result, the exact same
+' shape `Fission_X86_64AssembleFragment` already produces, so Fusion
+' itself never needs to know whether a given fragment came from this
+' backend's own encoder or a genuine compiled `.o` file.
+'
+' Real, disclosed FIRST-SLICE scope: only a `.o` with ZERO relocations is
+' supported (a real, reported diagnostic otherwise, not a silent
+' mis-link) -- `fission/native_runtime/host_bridge.c`'s own functions are
+' deliberately written self-contained (no static/global data, no
+' cross-function calls) specifically so gcc never needs to emit one,
+' confirmed via a direct `readelf -r` probe. A real relocation whose own
+' target is a SECTION symbol with an addend (GCC's own usual convention
+' for referencing static/local data, rather than the specific object's
+' own name) is real, disclosed, unimplemented follow-on work -- to be
+' added once an actual host function needs static data or a genuine
+' cross-function call, not attempted here without a real function that
+' needs it to verify against.
+FUNCTION Fission_ElfReadU16(bytes, offset)
+    RETURN bytes[offset] BITOR (bytes[offset + 1] SHL 8)
+END FUNCTION
+
+FUNCTION Fission_ElfReadU32(bytes, offset)
+    RETURN bytes[offset] BITOR (bytes[offset + 1] SHL 8) BITOR (bytes[offset + 2] SHL 16) BITOR (bytes[offset + 3] SHL 24)
+END FUNCTION
+
+' A real 64-bit little-endian read, built from two 32-bit halves (ArcoBASIC
+' integers are themselves genuinely 64-bit, confirmed already relied on
+' throughout this whole backend -- e.g. Fission_X86_64Buffer's own
+' EmitU64Full wrapping arithmetic -- so this is exact, not an approximation).
+' Every real ELF64 field this parser reads (offsets, sizes, symbol values)
+' fits comfortably within this range for any object file this backend's
+' own toolchain produces or consumes.
+FUNCTION Fission_ElfReadU64(bytes, offset)
+    low = Fission_ElfReadU32(bytes, offset)
+    high = Fission_ElfReadU32(bytes, offset + 4)
+    RETURN low BITOR (high SHL 32)
+END FUNCTION
+
+' A real SIGNED 32-bit read -- every relocation addend this parser reads
+' is a genuine signed value (e.g. -4 for a real RIP-relative reference,
+' see fission/amir/fusion_linker.abas's own comment on why that specific
+' value matters).
+FUNCTION Fission_ElfReadI32(bytes, offset)
+    v = Fission_ElfReadU32(bytes, offset)
+    IF v >= 2147483648 THEN RETURN v - 4294967296
+    RETURN v
+END FUNCTION
+
+FUNCTION Fission_ElfReadBytes(bytes, offset, count)
+    result = []
+    index = 0
+    WHILE index < count
+        ignored = Array.Push(result, bytes[offset + index])
+        index = index + 1
+    WEND
+    RETURN result
+END FUNCTION
+
+' A real, NUL-terminated ASCII string read starting at `offset` within a
+' string table's own bytes (ELF's own `.strtab`/`.shstrtab` convention:
+' every name is just a NUL-terminated run inside one shared byte blob,
+' addressed by its own starting offset, not length-prefixed the way this
+' backend's own fragment format's strings are).
+FUNCTION Fission_ElfReadCString(bytes, offset)
+    chars = []
+    index = offset
+    WHILE index < LEN(bytes) ANDALSO bytes[index] != 0
+        ignored = Array.Push(chars, Fission_FragmentCharFromCode(bytes[index]))
+        index = index + 1
+    WEND
+    RETURN Array.Join(chars, "")
+END FUNCTION
+
+' One real ELF64 section header (64 bytes): NameOffset (into .shstrtab,
+' resolved to a real Name once .shstrtab itself is located), Type, Flags,
+' Offset (into the file), Size, Link, Info, EntSize.
+' `SectionFlags`, not `Flags` -- a real reserved ArcoBASIC keyword
+' (confirmed the hard way: `{Flags: x}` fails to parse at all,
+' "expected object field name" -- the same class of gotcha this
+' project's own established discipline already documents for method
+' names, e.g. `Add`/`Has`/`Contains` can't be SIR builder method names
+' either).
+FUNCTION Fission_ElfReadSectionHeader(bytes, offset)
+    RETURN {NameOffset: Fission_ElfReadU32(bytes, offset), Type: Fission_ElfReadU32(bytes, offset + 4), SectionFlags: Fission_ElfReadU64(bytes, offset + 8), Address: Fission_ElfReadU64(bytes, offset + 16), Offset: Fission_ElfReadU64(bytes, offset + 24), Size: Fission_ElfReadU64(bytes, offset + 32), Link: Fission_ElfReadU32(bytes, offset + 40), Info: Fission_ElfReadU32(bytes, offset + 44), EntSize: Fission_ElfReadU64(bytes, offset + 56)}
+END FUNCTION
+
+' The real ELF section TYPE constants this parser actually consults.
+FUNCTION Fission_ElfSectionTypeProgbits()
+    RETURN 1
+END FUNCTION
+FUNCTION Fission_ElfSectionTypeSymtab()
+    RETURN 2
+END FUNCTION
+FUNCTION Fission_ElfSectionTypeRela()
+    RETURN 4
+END FUNCTION
+FUNCTION Fission_ElfSectionTypeNobits()
+    RETURN 8
+END FUNCTION
+
+' Real ELF64 symbol table entries (24 bytes each): Name (resolved via
+' .strtab), Info (bind/type packed, `Info SHR 4` = bind, `Info BITAND 15`
+' = type -- STT_FUNC=2/STT_OBJECT=1 are what this parser cares about),
+' SectionIndex (`st_shndx` -- which section this symbol's own Value is
+' relative to), Value (byte offset within that section), Size.
+FUNCTION Fission_ElfReadSymbol(bytes, offset, strtabBytes, strtabOffset)
+    nameOffset = Fission_ElfReadU32(bytes, offset)
+    info = bytes[offset + 4]
+    sectionIndex = Fission_ElfReadU16(bytes, offset + 6)
+    value = Fission_ElfReadU64(bytes, offset + 8)
+    size = Fission_ElfReadU64(bytes, offset + 16)
+    name = ""
+    IF nameOffset != 0 THEN name = Fission_ElfReadCString(strtabBytes, strtabOffset + nameOffset)
+    RETURN {Name: name, Info: info, SectionIndex: sectionIndex, Value: value, Size: size}
+END FUNCTION
+
+' The real parsing entry point. `bytes` is a genuine ELF64 relocatable
+' object file's own raw bytes (e.g. `File.ReadBytes` on a real `.o` gcc
+' produced). Returns {Ok, Fragment, Diagnostics} -- the exact same shape
+' Fission_X86_64AssembleFragment/Fission_FragmentDeserialize already
+' return, so a caller threading this alongside either barely notices the
+' seam.
+FUNCTION Fission_ElfObjectParse(bytes)
+    diagnostics = FissionDiagnosticBag()
+    emptyResult = {Ok: FALSE, Fragment: NULL, Diagnostics: diagnostics}
+    IF LEN(bytes) < 64 THEN
+        ignored = diagnostics.ReportError("FISSION_ELF_INVALID", "Not a real ELF64 object file (too short)")
+        RETURN emptyResult
+    END IF
+    IF bytes[0] != 127 ORELSE bytes[1] != 69 ORELSE bytes[2] != 76 ORELSE bytes[3] != 70 THEN
+        ignored = diagnostics.ReportError("FISSION_ELF_INVALID", "Not a real ELF64 object file (bad magic)")
+        RETURN emptyResult
+    END IF
+    IF bytes[4] != 2 THEN
+        ignored = diagnostics.ReportError("FISSION_ELF_INVALID", "The Arcology Fusion Linker only supports ELFCLASS64 object files")
+        RETURN emptyResult
+    END IF
+    elfType = Fission_ElfReadU16(bytes, 16)
+    IF elfType != 1 THEN
+        ignored = diagnostics.ReportError("FISSION_ELF_INVALID", "The Arcology Fusion Linker only supports ET_REL (relocatable) object files, not a final executable/shared object")
+        RETURN emptyResult
+    END IF
+    machine = Fission_ElfReadU16(bytes, 18)
+    IF machine != 62 THEN
+        ignored = diagnostics.ReportError("FISSION_ELF_INVALID", "The Arcology Fusion Linker only supports x86-64 object files")
+        RETURN emptyResult
+    END IF
+
+    shoff = Fission_ElfReadU64(bytes, 40)
+    shentsize = Fission_ElfReadU16(bytes, 58)
+    shnum = Fission_ElfReadU16(bytes, 60)
+    shstrndx = Fission_ElfReadU16(bytes, 62)
+
+    sections = []
+    index = 0
+    WHILE index < shnum
+        ignored = Array.Push(sections, Fission_ElfReadSectionHeader(bytes, shoff + index * shentsize))
+        index = index + 1
+    WEND
+
+    shstrtabSection = sections[shstrndx]
+    FOR section IN sections
+        section.Name = Fission_ElfReadCString(bytes, shstrtabSection.Offset + section.NameOffset)
+    NEXT
+
+    textSection = NULL
+    rodataSection = NULL
+    bssSection = NULL
+    symtabSection = NULL
+    strtabSection = NULL
+    relaTextSection = NULL
+    FOR section IN sections
+        IF section.Name == ".text" THEN textSection = section
+        IF section.Name == ".rodata" THEN rodataSection = section
+        IF section.Name == ".bss" THEN bssSection = section
+        IF section.Type == Fission_ElfSectionTypeSymtab() THEN symtabSection = section
+        IF section.Name == ".rela.text" THEN relaTextSection = section
+    NEXT
+    IF symtabSection == NULL THEN
+        ignored = diagnostics.ReportError("FISSION_ELF_INVALID", "The Arcology Fusion Linker found no .symtab in this object file")
+        RETURN emptyResult
+    END IF
+    strtabSection = sections[symtabSection.Link]
+
+    textBytes = []
+    IF textSection != NULL THEN textBytes = Fission_ElfReadBytes(bytes, textSection.Offset, textSection.Size)
+    rodataBytes = []
+    IF rodataSection != NULL THEN rodataBytes = Fission_ElfReadBytes(bytes, rodataSection.Offset, rodataSection.Size)
+    bssSize = 0
+    IF bssSection != NULL THEN bssSize = bssSection.Size
+
+    ' Which section INDEX (this object file's own numbering, matching
+    ' `st_shndx`) is .text/.rodata/.bss -- needed to translate each
+    ' symbol's own section-relative Value into this fragment's own
+    ' {Section, Offset} shape.
+    textIndex = -1
+    rodataIndex = -1
+    bssIndex = -1
+    sectionIndex = 0
+    FOR section IN sections
+        IF section.Name == ".text" THEN textIndex = sectionIndex
+        IF section.Name == ".rodata" THEN rodataIndex = sectionIndex
+        IF section.Name == ".bss" THEN bssIndex = sectionIndex
+        sectionIndex = sectionIndex + 1
+    NEXT
+
+    symbols = []
+    symbolCount = symtabSection.Size / symtabSection.EntSize
+    symIndex = 0
+    WHILE symIndex < symbolCount
+        symbol = Fission_ElfReadSymbol(bytes, symtabSection.Offset + symIndex * symtabSection.EntSize, bytes, strtabSection.Offset)
+        symType = symbol.Info BITAND 15
+        symBind = symbol.Info SHR 4
+        ' Only real, globally-visible FUNC/OBJECT symbols (STT_FUNC=2,
+        ' STT_OBJECT=1; STB_GLOBAL=1) become part of this fragment's own
+        ' exported Symbols table -- a LOCAL symbol (a static helper, the
+        ' file's own FILE/SECTION symbols) is never something another
+        ' fragment's own relocation could legally name anyway, matching
+        ' real ELF linking semantics.
+        isExportable = (symType == 1 ORELSE symType == 2) ANDALSO symBind == 1 ANDALSO symbol.Name != ""
+        IF isExportable THEN
+            fragmentSection = ""
+            IF symbol.SectionIndex == textIndex THEN fragmentSection = "text"
+            IF symbol.SectionIndex == rodataIndex THEN fragmentSection = "rodata"
+            IF symbol.SectionIndex == bssIndex THEN fragmentSection = "bss"
+            IF fragmentSection != "" THEN
+                ignored = Array.Push(symbols, {Name: symbol.Name, Section: fragmentSection, Offset: symbol.Value})
+            END IF
+        END IF
+        symIndex = symIndex + 1
+    WEND
+
+    relocations = []
+    IF relaTextSection != NULL THEN
+        relaCount = relaTextSection.Size / relaTextSection.EntSize
+        ignored = diagnostics.ReportError("FISSION_ELF_UNSUPPORTED_RELOCATION", "The Arcology Fusion Linker's own ELF object support does not yet handle a real relocation in this object file (" + String(relaCount) + " found in .rela.text) -- real, disclosed follow-on work, not attempted without a real host function that needs it")
+        RETURN emptyResult
+    END IF
+
+    fragment = FissionX86_64Fragment(textBytes, rodataBytes, bssSize, symbols, relocations)
+    RETURN {Ok: TRUE, Fragment: fragment, Diagnostics: diagnostics}
+END FUNCTION

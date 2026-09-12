@@ -1,0 +1,43 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises the real HOST-FUNCTION
+' BRIDGE (fission/amir/lower_x86_64.abas's own Fission_X86_64HostFunctionTable):
+' genuinely compiled native machine code (fission/native_runtime/
+' host_bridge.c, compiled once by the system's own C compiler as a
+' development-time build step -- see that file's own header comment),
+' linked directly into this program's own final ELF64 by The Arcology
+' Fusion Linker via a real ELF64 object-file reader
+' (fission/amir/elf_object.abas), NOT a bytecode-VM host-call dispatch and
+' NOT a from-scratch ArcoBASIC reimplementation. All 7 real String.*
+' functions this first slice supports: Length, Contains, IndexOf,
+' StartsWith, EndsWith (all confirmed against the oracle first), Trim and
+' Slice (both real, mmap-allocated new strings, proving the host bridge's
+' own memory allocation path -- a raw mmap syscall, no libc -- works
+' correctly and the returned pointer is a genuinely valid, NUL-terminated
+' string this backend's own machinery can consume right back).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+PRINT String.Length("Hello World")
+PRINT String.Length("")
+PRINT String.Contains("Hello World", "World")
+PRINT String.Contains("Hello World", "xyz")
+PRINT String.IndexOf("Hello World", "World")
+PRINT String.IndexOf("Hello World", "xyz")
+PRINT String.StartsWith("Hello World", "Hello")
+PRINT String.StartsWith("Hello World", "World")
+PRINT String.EndsWith("Hello World", "World")
+PRINT String.Trim("  hi  ")
+PRINT String.Slice("Hello World", 6, 5)
+PRINT String.Slice("Hello World", 0, 5)
+
+' A host function's own result flows correctly back through this
+' backend's own EVERYTHING ELSE -- stored into a variable, concatenated,
+' passed to another host function, used as a branch condition.
+trimmed = String.Trim("  padded  ")
+PRINT trimmed + "!"
+IF String.Contains(trimmed, "padded") THEN
+    PRINT "yes"
+END IF
+PRINT String.Length(trimmed)

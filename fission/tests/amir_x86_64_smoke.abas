@@ -673,3 +673,54 @@ MixedArraySir = Fission_ArcoBasicAstToSir(MixedArrayAst)
 MixedArrayAmir = Fission_SirToAmir(MixedArraySir)
 MixedArrayProgram = Fission_AmirToX86_64(MixedArrayAmir)
 PRINT MixedArrayProgram.Diagnostics.HasErrors()
+
+' The real HOST-FUNCTION BRIDGE (Fission_X86_64HostFunctionTable) -- a
+' call to a real host function (`String.Length`) compiles with zero
+' diagnostics and calls the REAL native symbol
+' fission/native_runtime/host_bridge.c exports (`call
+' arco_host_string_length`, never "String.Length" itself, confirmed
+' structurally here), and `program.UsesHostBridge` is real, accurate
+' tracking (see Fission_X86_64HostFunctionTable's own comment), not
+' always TRUE regardless of whether a program actually calls one. Real
+' execution (including the mmap-based allocation path for Trim/Slice, and
+' a host function's own result flowing back through this backend's own
+' concat/branch/further-host-call machinery) verified separately by
+' fission/tests/native_programs/host_bridge_strings.abas.
+HostCallSource = "n = String.Length(\"Hello\")\nPRINT n"
+HostCallTokens = Fission_ArcoBasicLex(HostCallSource)
+HostCallAst = Fission_ArcoBasicParse(HostCallTokens, "x86-64-host-call-smoke.abas")
+HostCallSir = Fission_ArcoBasicAstToSir(HostCallAst)
+HostCallAmir = Fission_SirToAmir(HostCallSir)
+HostCallProgram = Fission_AmirToX86_64(HostCallAmir)
+PRINT HostCallProgram.Diagnostics.HasErrors()
+PRINT String.Contains(HostCallProgram.Render(), "call arco_host_string_length")
+PRINT HostCallProgram.UsesHostBridge
+
+NoHostCallSource = "PRINT 5"
+NoHostCallTokens = Fission_ArcoBasicLex(NoHostCallSource)
+NoHostCallAst = Fission_ArcoBasicParse(NoHostCallTokens, "x86-64-no-host-call-smoke.abas")
+NoHostCallSir = Fission_ArcoBasicAstToSir(NoHostCallAst)
+NoHostCallAmir = Fission_SirToAmir(NoHostCallSir)
+NoHostCallProgram = Fission_AmirToX86_64(NoHostCallAmir)
+PRINT NoHostCallProgram.UsesHostBridge
+
+' A wrong argument COUNT or KIND for a real host function is a real,
+' reported diagnostic -- this backend's own fixed, ahead-of-time-compiled
+' host bridge signature can never be inferred the way a real ArcoBASIC
+' function's own signature can, so it is checked directly, exactly, not
+' guessed at.
+HostCallBadCountSource = "PRINT String.Length(\"a\", \"b\")"
+HostCallBadCountTokens = Fission_ArcoBasicLex(HostCallBadCountSource)
+HostCallBadCountAst = Fission_ArcoBasicParse(HostCallBadCountTokens, "x86-64-host-call-bad-count-smoke.abas")
+HostCallBadCountSir = Fission_ArcoBasicAstToSir(HostCallBadCountAst)
+HostCallBadCountAmir = Fission_SirToAmir(HostCallBadCountSir)
+HostCallBadCountProgram = Fission_AmirToX86_64(HostCallBadCountAmir)
+PRINT HostCallBadCountProgram.Diagnostics.HasErrors()
+
+HostCallBadKindSource = "PRINT String.Length(5)"
+HostCallBadKindTokens = Fission_ArcoBasicLex(HostCallBadKindSource)
+HostCallBadKindAst = Fission_ArcoBasicParse(HostCallBadKindTokens, "x86-64-host-call-bad-kind-smoke.abas")
+HostCallBadKindSir = Fission_ArcoBasicAstToSir(HostCallBadKindAst)
+HostCallBadKindAmir = Fission_SirToAmir(HostCallBadKindSir)
+HostCallBadKindProgram = Fission_AmirToX86_64(HostCallBadKindAmir)
+PRINT HostCallBadKindProgram.Diagnostics.HasErrors()

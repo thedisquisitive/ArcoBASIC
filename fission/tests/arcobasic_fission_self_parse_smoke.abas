@@ -6,6 +6,7 @@ Files = [
     "fission/amir/x86_64_assembler.abas",
     "fission/amir/x86_64_fragment.abas",
     "fission/amir/fusion_linker.abas",
+    "fission/amir/elf_object.abas",
     "fission/amir/model.abas",
     "fission/cli/compile_to_bytecode.abas",
     "fission/cli/compile_to_x86_64.abas",

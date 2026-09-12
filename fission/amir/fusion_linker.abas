@@ -141,6 +141,23 @@ FUNCTION Fission_FusionLink(fragments, entrySymbol)
     headerSize = 120
     baseVaddr = 4194304
 
+    ' Real, TYPE-aware patching -- generalized beyond the original
+    ' "always RIP-relative, always -4" assumption once fission/amir/
+    ' elf_object.abas started producing REAL ELF relocations too (a
+    ' genuine compiled `.o` file, e.g. fission/native_runtime/
+    ' host_bridge.c, can use R_X86_64_32 -- a plain ABSOLUTE 32-bit
+    ' field -- for a data reference when compiled -fno-pic, distinct from
+    ' the RIP-relative R_X86_64_PC32/PLT32 this backend's own encoder
+    ' exclusively produces). `relocation.Type` ("PC32" or "ABS32") and
+    ' `relocation.Addend` default to this backend's own original exclusive
+    ' behavior (`Object.Get(relocation, "Type", "PC32")`/`-4`) so an
+    ' encoder-produced fragment's own relocations (which always set them
+    ' explicitly anyway, see fission/amir/x86_64_assembler.abas's own
+    ' comment) patch identically to before this generalization. The real
+    ' ELF formula either way: `PC32`/`PLT32` is `S + A - P` (P = this
+    ' field's own address); `ABS32` (`R_X86_64_32`) is just `S + A`, no P
+    ' subtraction -- real ELF x86-64 psABI relocation processing, not
+    ' something this backend invented.
     fragIndex = 0
     FOR fragment IN fragments
         FOR relocation IN fragment.Relocations
@@ -151,9 +168,12 @@ FUNCTION Fission_FusionLink(fragments, entrySymbol)
                 ignored = diagnostics.ReportError("FISSION_FUSION_UNDEFINED_SYMBOL", "The Arcology Fusion Linker found an undefined symbol: " + relocation.Target)
                 CONTINUE FOR
             END IF
+            relocType = Object.Get(relocation, "Type", "PC32")
+            addend = Object.Get(relocation, "Addend", -4)
             targetVaddr = baseVaddr + headerSize + Object.Get(globalSymbols, relocation.Target, 0)
-            instructionEndVaddr = baseVaddr + headerSize + fieldOffset + 4
-            patchValue = targetVaddr - instructionEndVaddr
+            fieldVaddr = baseVaddr + headerSize + fieldOffset
+            patchValue = targetVaddr + addend
+            IF relocType == "PC32" THEN patchValue = patchValue - fieldVaddr
             IF relocation.Section == "rodata" THEN
                 ignored = combinedRodata.PatchU32(fieldOffset - layout.TotalText, patchValue)
             ELSE

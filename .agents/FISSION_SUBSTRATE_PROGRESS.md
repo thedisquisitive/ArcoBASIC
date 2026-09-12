@@ -2172,6 +2172,137 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   string_arrays.abas`; wired into `fission/fissure.ab`'s watched-files
   list. Self-parse/self-semantic corpus symbol count grew 3637 -> 3655;
   golden value updated. Verified with `fissure run`.
+- **The real host-function bridge (WP-011's own single largest piece) --
+  first real slice, 7 String.\* functions** -- a real design correction
+  mid-session: the project owner's own request ("do... the host-function
+  bridge. I thought we did a linker to get around that but apparently I
+  misunderstood") surfaced that Fusion, as it stood, only linked this
+  backend's own "fragment" format, not arbitrary compiled ELF object
+  files -- the actual gap for calling into the existing ~244-entry
+  `arco_call_host` dispatch table. Closed by extending Fusion into a
+  REAL ELF64 object-file linker, not by reimplementing the host-function
+  table from scratch in hand-written ArcoBASIC-generated x86-64 (an
+  enormous, unnecessary undertaking).
+  Four real, coordinated pieces:
+  1. `fission/native_runtime/host_bridge.c` (NEW, the ONE non-ArcoBASIC
+     source file in this whole native backend) -- 7 real String.*
+     functions (Length, Contains, IndexOf, StartsWith, EndsWith, Trim,
+     Slice), each semantic CONFIRMED against the oracle directly first
+     (`String.ToUpper`/`ToLower` were tried first and found NOT to exist
+     on the oracle's own bytecode VM at all -- dropped before writing any
+     code for them, not guessed at). Freestanding (`-ffreestanding
+     -fno-pic -fno-pie -nostdlib`, no libc, no PIC/GOT/PLT, no C runtime
+     startup) -- Trim/Slice's own real memory allocation is a raw `mmap`
+     syscall via inline assembly, the same "simple, real, deliberately
+     minimal, never freed" memory management this backend's OWN
+     str_concat/array_alloc already use. Deliberately self-contained (no
+     static/global data, no calls between functions in this file, each
+     shared helper forced `always_inline`) -- confirmed via a direct
+     `readelf -r` probe this produces a real `.o` with ZERO relocations,
+     keeping the FIRST real ELF-parsing slice's own scope small and fully
+     verifiable; a real relocation whose target is a SECTION symbol with
+     an addend (GCC's own usual convention for static/local data) remains
+     real, disclosed, unimplemented follow-on work, not attempted without
+     a real function that needs it.
+  2. `fission/amir/elf_object.abas` (NEW) -- `Fission_ElfObjectParse`, a
+     genuine ELF64 relocatable-object-file reader (header, section
+     headers, `.symtab`/`.strtab`, `.text`/`.rodata`/`.bss`), producing
+     the exact same `FissionX86_64Fragment` shape
+     `Fission_X86_64AssembleFragment` already does, so Fusion's own
+     merge/link logic needed zero changes for "which kind of fragment
+     produced this." Only real GLOBAL FUNC/OBJECT symbols become part of
+     the exported Symbols table (matching real ELF linking semantics --
+     a LOCAL symbol is never something another fragment's relocation
+     could legally reference anyway). A real relocation found in the
+     object file (none expected for this first slice) is a real,
+     reported diagnostic, not a silent mis-link.
+  3. `fission/amir/fusion_linker.abas`/`fission/amir/x86_64_fragment.abas`
+     -- Fusion's own relocation patching generalized from "always
+     RIP-relative, always -4" (this backend's own encoder's exclusive
+     prior behavior) to real TYPE-aware patching (`PC32`/`PLT32`: `S + A
+     - P`; `ABS32`/`R_X86_64_32`: `S + A`, real ELF x86-64 psABI
+     relocation formulas, confirmed directly via `readelf -r`/`objdump`
+     probes against real gcc output, not assumed) -- a genuine compiled
+     `.o` can use `R_X86_64_32` (absolute) for a data reference when
+     compiled `-fno-pic`, distinct from this backend's own exclusively
+     RIP-relative relocations. `Type`/`Addend` are now explicit fields on
+     every relocation (defaulting to the original exclusive behavior, so
+     nothing about the encoder's own existing output changed). The
+     fragment file format's own VERSION bumped 1 -> 2 to carry them (no
+     real `.frag` files are ever persisted as build artifacts today, so
+     no real backward-compatibility break).
+  4. `fission/amir/lower_x86_64.abas`'s own `Fission_X86_64HostFunctionTable`
+     -- a real, disclosed, FIXED (never inferred, since the C
+     implementation's own signature can never change per-program) table
+     mapping each host function's own EXACT AMIR callee text (confirmed
+     via the oracle: `String.Length(s)` lowers to plain `CALL
+     String.Length %t1`, no receiver injected -- NOT a variable-qualified
+     method call the way `obj.Method(...)` is, since "String" is never a
+     real tracked variable) to its real native symbol/return kind/fixed
+     param kinds. Checked before the generic method-call-rewrite logic
+     (which would otherwise incorrectly try to resolve "String" as a
+     tracked variable's own kind and fail). A real host call's own
+     arguments are validated (count AND kind) directly against the
+     table's fixed signature, then dispatched through the SAME
+     `Fission_X86_64EmitCall` helper every other call already uses.
+     `fission/cli/compile_to_x86_64.abas` links in the host bridge's own
+     `.o` (parsed via `Fission_ElfObjectParse`) UNCONDITIONALLY alongside
+     the program's own fragment (a small, fixed amount of unused machine
+     code for a program that calls no host function costs nothing real;
+     `program.UsesHostBridge` still tracks the real answer) -- if that
+     `.o` hasn't been built yet, this compile still succeeds for any
+     program that doesn't call a host function, only failing (a real
+     "undefined symbol" diagnostic from Fusion itself) at the point one
+     actually needed. `fission/build/rivet_native_runtime.abas` (NEW)
+     builds `host_bridge.c` via a single, explicit `RIVET.Graph.Action`
+     (reusing `RIVET.Toolchain.DetectCxx()`'s own real, absolute compiler
+     detection with `-x c` forcing real C compilation regardless of
+     whether g++ or clang++ was actually detected -- confirmed
+     byte-for-byte identical to a direct `gcc` invocation via a real
+     probe) -- a real, one-time, DEVELOPMENT-TIME build step, exactly
+     like compiling any other C++ source in this repo already is; an end
+     user's own ArcoBASIC program compile never shells out to gcc, only
+     to this project's own Fusion, preserving "no external toolchain
+     dependency" at the level that actually matters. Every native
+     capsule's own build action now has a REAL build-graph dependency
+     edge on the host bridge's own compile action (not just "happens to
+     exist on disk by the time this runs") -- without it, a cold/
+     parallel build could race.
+  Verified via real execution against the oracle at EVERY layer: (a) a
+  hand-assembled fragment calling directly into the ELF-parsed host
+  bridge, proving the whole mechanism before touching the real compiler
+  pipeline at all; (b) the SAME probe with Trim (the mmap-allocation
+  path), confirming the returned pointer is a genuinely valid string this
+  backend's own `str_print` can consume right back; (c) the REAL compiler
+  pipeline end to end -- all 7 functions, a genuine host function's own
+  result flowing through this backend's own concat/branch/further-host-
+  call machinery -- byte-for-byte matching `ArcoFission compile-run` on
+  the very first attempt; (d) the exact same programs re-verified through
+  the REAL Rivet-built pipeline (a fresh `rivet build` from a clean
+  `.rivet/fission-native-runtime/`, proving the real build-graph
+  dependency wiring, not just a manual `gcc` invocation). All 21 existing
+  native fixtures re-verified unaffected. Extended `fission/tests/
+  amir_x86_64_smoke.abas` with a real success case (checking the rendered
+  assembly contains the real `call arco_host_string_length`, and that
+  `program.UsesHostBridge` is real, accurate tracking, not always TRUE)
+  plus two new diagnostic cases (wrong argument count, wrong argument
+  kind). New permanent fixture `fission/tests/native_programs/
+  host_bridge_strings.abas`; `fission/amir/elf_object.abas` added to the
+  self-parse/self-semantic corpus (the first genuinely new core compiler-
+  pipeline file since the corpus was established); `native_runtime/`
+  added to `fission/fissure.ab`'s own watched-directory-prefix list; the
+  new fixture added to its watched-files list. Self-parse/self-semantic
+  corpus grew 95 -> 96 files, 147 -> 150 import edges, 3655 -> 3789
+  symbols; golden values updated. Verified with `fissure run`.
+  Real, disclosed remaining scope: only 7 of the real ~244-entry host-
+  function table are covered (String.* specifically) -- extending this is
+  now genuinely straightforward, mechanical follow-on work (add a real C
+  implementation confirmed against the oracle first, add one entry to
+  `Fission_X86_64HostFunctionTable`, nothing else in this file changes);
+  Array.*/File.*/other namespaces are real, disclosed, unstarted; a real
+  ELF relocation involving a SECTION symbol (needed for a host function
+  with static data or genuine cross-function calls) remains unimplemented,
+  to be added once an actual function needs it.
 
 ## In-Progress Components
 
@@ -2954,21 +3085,28 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
      three-layer gap this session found and closed across the shared
      parser/SIR/A-MIR, working on both the bytecode and native backends
      with zero backend-specific changes needed), see Completed Components.
-     Real, disclosed remaining gaps: a
-     field established ONLY via an external `obj.Field = value` write
-     (never a `SELF.Field = value` inside the class's own methods) is a
-     real, narrower limitation of the same fixed point (scoped to SELF
-     specifically, by far the dominant real pattern); and a real fallback
-     to the existing ~244-entry host-function dispatch table for anything
-     else (legacy's own `arco_call_host`/`host_bridge.cpp` bridge is the
-     reference for this, though porting it into the substrate rather than
-     linking against it directly is itself a real design decision to
-     make, not just a port) -- this last item is now
-     WP-011's own single largest remaining piece -- see below for the
-     real ELF `.o`-linking design now underway to close it.
+     Real, disclosed remaining gap: a field established ONLY via an
+     external `obj.Field = value` write (never a `SELF.Field = value`
+     inside the class's own methods) is a real, narrower limitation of
+     the same fixed point (scoped to SELF specifically, by far the
+     dominant real pattern).
    - DONE -- real TYPED (String) arrays, see Completed Components. Arrays
      of arrays/objects remain real, disclosed, unverified-against-the-
      oracle scope.
+   - DONE -- the real host-function bridge's own FIRST slice (a real ELF
+     `.o` linker, 7 real String.* functions), see Completed Components.
+     WP-011's own single largest remaining piece is now genuinely
+     mechanical follow-on work, not a design problem: extending
+     `Fission_X86_64HostFunctionTable` with more of the real ~244-entry
+     set (Array.*/File.*/other namespaces) needs a real C implementation
+     confirmed against the oracle first plus one table entry each,
+     nothing else in `fission/amir/lower_x86_64.abas` changes. A real
+     relocation involving a SECTION symbol (GCC's own usual convention
+     for static data / genuine cross-function calls within one `.o`)
+     remains unimplemented in `fission/amir/elf_object.abas`, to be added
+     once an actual host function needs it (most Array.*/File.* functions
+     likely will, unlike this first String.* slice's own deliberately
+     self-contained design).
    The existing experimental legacy native backend
    (`ArcoFission build FILE -o OUT --target linux-x86_64`,
    `.agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md`) is worth reading
