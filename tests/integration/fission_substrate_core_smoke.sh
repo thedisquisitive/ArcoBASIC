@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^91$" <<<"$fission_self_semantic_output"
 grep -q "^138$" <<<"$fission_self_semantic_output"
-grep -q "^2978$" <<<"$fission_self_semantic_output"
+grep -q "^2999$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -727,5 +727,16 @@ expected_loop_control_output="$(printf '25\n5\n36\n1\n2\n3\n4\n5\n4')"
 test "$loop_control_native_output" = "$expected_loop_control_output"
 oracle_loop_control_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/loop_control.abas")"
 test "$loop_control_native_output" = "$oracle_loop_control_output"
+
+# fission/tests/native_programs/bitops.abas exercises bare AND/OR/BITAND/BITOR/BITXOR/SHL/SHR and
+# the (eager, not actually short-circuit -- a real, disclosed, pre-existing substrate divergence
+# from the oracle) ANDALSO/ORELSE, all real single-instruction x86 lowerings -- including a real
+# surprise confirmed directly against the oracle: SHR is actually an ARITHMETIC shift right at
+# runtime despite its own "logical-sounding" name.
+bitops_native_output="$("$SOURCE_DIR/build/fission-native-programs/bitops")"
+expected_bitops_output="$(printf '1\n0\n15\n20\n15\n15\n-4\n4\n100\n200')"
+test "$bitops_native_output" = "$expected_bitops_output"
+oracle_bitops_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/bitops.abas")"
+test "$bitops_native_output" = "$oracle_bitops_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

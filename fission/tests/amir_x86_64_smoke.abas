@@ -9,12 +9,16 @@
 ' convention (including stack-passed arguments beyond the first 6), real
 ' string VARIABLES (assign/PRINT/reassign/copy), real string CONCATENATION
 ' and EQUALITY (`==`/`!=`, real content comparison; a bump-allocated
-' `.bss` arena shared with arrays), and real numeric ARRAYS (construction,
+' `.bss` arena shared with arrays), real numeric ARRAYS (construction,
 ' indexed read/write, `LEN`, and PRINT of a bare array rendering
-' `[1, 2, 3]`) -- function-local only: string function parameters/return
-' values, string ORDERING comparison (`<`/`<=`/`>`/`>=`), branching on a
-' string, and arrays of anything but plain numbers all remain real,
-' disclosed gaps. Real execution verified separately by
+' `[1, 2, 3]`), and bare AND/OR/BITAND/BITOR/BITXOR/SHL/SHR plus the
+' (eager, not actually short-circuit -- a real, disclosed, substrate-wide
+' divergence from the oracle) ANDALSO/ORELSE -- function-local only:
+' string function parameters/return values, string ORDERING comparison
+' (`<`/`<=`/`>`/`>=`), branching on a string, arrays of anything but plain
+' numbers, SAR (a real oracle limitation, not just this backend's own),
+' and real integer division (`\`, likewise a real oracle limitation) all
+' remain real, disclosed gaps. Real execution verified separately by
 ' fission/tests/native_programs/*.abas (built as real ELF64s via
 ' FissionNativeCapsuleTarget and run directly -- see
 ' tests/integration/fission_substrate_core_smoke.sh). This file checks the
@@ -311,3 +315,46 @@ StringArraySir = Fission_ArcoBasicAstToSir(StringArrayAst)
 StringArrayAmir = Fission_SirToAmir(StringArraySir)
 StringArrayProgram = Fission_AmirToX86_64(StringArrayAmir)
 PRINT StringArrayProgram.Diagnostics.HasErrors()
+
+' Bare AND/OR/BITAND/BITOR/BITXOR/SHL/SHR, plus the (eager, not actually
+' short-circuit) ANDALSO/ORELSE -- real execution verified separately by
+' fission/tests/native_programs/bitops.abas. Checked here: zero
+' diagnostics, and that the rendered assembly actually contains the real
+' single-instruction x86 lowerings (`and`, `or`, `xor`, `shl`, and `sar`
+' for SHR specifically -- confirmed, not assumed, that SHR is actually an
+' arithmetic shift right at runtime).
+BitopsSource = "x = 5\ny = 10\nz = x AND y\nPRINT z\nw = x BITAND y\nPRINT w\nv = x BITOR y\nPRINT v\nu = x SHL 2\nPRINT u\nt = x BITXOR y\nPRINT t\ns = x SHR 1\nPRINT s\nIF x > 0 ANDALSO y > 0 THEN\n    PRINT 1\nEND IF\nIF x < 0 ORELSE y > 0 THEN\n    PRINT 2\nEND IF"
+BitopsTokens = Fission_ArcoBasicLex(BitopsSource)
+BitopsAst = Fission_ArcoBasicParse(BitopsTokens, "x86-64-bitops-smoke.abas")
+BitopsSir = Fission_ArcoBasicAstToSir(BitopsAst)
+BitopsAmir = Fission_SirToAmir(BitopsSir)
+BitopsProgram = Fission_AmirToX86_64(BitopsAmir)
+PRINT BitopsProgram.Diagnostics.HasErrors()
+BitopsAssembly = BitopsProgram.Render()
+PRINT String.Contains(BitopsAssembly, "    and %rcx, %rax")
+PRINT String.Contains(BitopsAssembly, "    or %rcx, %rax")
+PRINT String.Contains(BitopsAssembly, "    xor %rcx, %rax")
+PRINT String.Contains(BitopsAssembly, "    shl %cl, %rax")
+PRINT String.Contains(BitopsAssembly, "    sar %cl, %rax")
+
+' SAR itself (as opposed to SHR) and real integer division (`\`) remain
+' real, disclosed gaps -- confirmed via a direct oracle probe that legacy
+' `ArcoFission compile-run` fails outright on both ("unsupported bytecode
+' binary operator"), so this backend correctly reports a diagnostic rather
+' than guessing a semantic its own equivalence-testing oracle can never
+' confirm or deny.
+SarSource = "a = -8\nPRINT a SAR 1"
+SarTokens = Fission_ArcoBasicLex(SarSource)
+SarAst = Fission_ArcoBasicParse(SarTokens, "x86-64-sar-smoke.abas")
+SarSir = Fission_ArcoBasicAstToSir(SarAst)
+SarAmir = Fission_SirToAmir(SarSir)
+SarProgram = Fission_AmirToX86_64(SarAmir)
+PRINT SarProgram.Diagnostics.HasErrors()
+
+IntDivSource = "a = 17\nPRINT a \\ 5"
+IntDivTokens = Fission_ArcoBasicLex(IntDivSource)
+IntDivAst = Fission_ArcoBasicParse(IntDivTokens, "x86-64-intdiv-smoke.abas")
+IntDivSir = Fission_ArcoBasicAstToSir(IntDivAst)
+IntDivAmir = Fission_SirToAmir(IntDivSir)
+IntDivProgram = Fission_AmirToX86_64(IntDivAmir)
+PRINT IntDivProgram.Diagnostics.HasErrors()

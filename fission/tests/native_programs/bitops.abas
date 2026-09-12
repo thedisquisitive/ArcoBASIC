@@ -1,0 +1,44 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises bare AND/OR/BITAND/
+' BITOR/BITXOR/SHL/SHR and the short-circuit-in-name-only ANDALSO/ORELSE
+' (this substrate does not actually short-circuit either operator today --
+' see the ANDALSO/ORELSE case in Fission_X86_64LowerBinOp's own comment
+' for the real, disclosed, substrate-wide divergence from the oracle this
+' uncovered), all real single-instruction x86 lowerings confirmed directly
+' against the oracle (`ArcoFission compile-run`) before being implemented,
+' including a real surprise: SHR is, at runtime, actually an ARITHMETIC
+' shift right (sign-preserving) despite its own "logical-sounding" name,
+' and the separate SAR keyword is not even implemented by the oracle's own
+' bytecode VM at all -- confirmed and left as a real, disclosed diagnostic,
+' not guessed at.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+x = 5
+y = 10
+z = x > 0 AND y > 0
+PRINT z
+w = x BITAND y
+PRINT w
+v = x BITOR y
+PRINT v
+u = x SHL 2
+PRINT u
+t = x BITXOR y
+PRINT t
+r = x OR y
+PRINT r
+
+a = -8
+PRINT a SHR 1
+b = 8
+PRINT b SHR 1
+
+IF x > 0 ANDALSO y > 0 THEN
+    PRINT 100
+END IF
+IF x < 0 ORELSE y > 0 THEN
+    PRINT 200
+END IF

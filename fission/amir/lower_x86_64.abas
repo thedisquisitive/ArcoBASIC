@@ -511,6 +511,87 @@ FUNCTION Fission_X86_64LowerBinOp(offsets, instruction)
         RETURN {Ok: TRUE, Lines: lines}
     END IF
 
+    ' Bare AND/OR (non-short-circuit -- ANDALSO/ORELSE never appear as a
+    ' BinOp Op string at all, confirmed via the oracle: they desugar
+    ' entirely into Store/Load/Const/Branch/Jump plus an ordinary nested
+    ' comparison BinOp, primitives this backend already lowered, so they
+    ' already worked before this addition) and BITAND/BITOR are, per the
+    ' real oracle's own runtime behavior, plain bitwise operations on the
+    ' full 64-bit value regardless of whether the source meant it as a
+    ' boolean combination or an integer one -- ArcoBASIC's TRUE/FALSE are
+    ' ordinary 1/0 integers (see project note on `NOT` being bitwise, not
+    ' logical negation), so a bitwise `and`/`or`/`xor` instruction is
+    ' correct for BOTH uses with no separate boolean-specific path needed.
+    ' A real, disclosed, PRE-EXISTING divergence found while adding this:
+    ' ANDALSO/ORELSE are NOT actually lowered with real short-circuit
+    ' evaluation anywhere in this substrate today (confirmed directly --
+    ' `Fission_SirToAmir` on a real `x > 0 ANDALSO y > 0` produces an
+    ' ordinary eager `%t9 := ANDALSO %t5, %t8` BinOp, both operands always
+    ' computed, exactly like bare AND -- unlike the real oracle, which DOES
+    ' short-circuit, confirmed via `ArcoFission reveal ... at A-MIR`
+    ' producing genuine ShortCircuitRhs/ShortCircuitEnd blocks). This is a
+    ' real, substrate-wide (not native-codegen-specific) gap: a program
+    ' relying on short-circuiting for safety (e.g. `x != NULL ANDALSO
+    ' x.Field > 0`) would evaluate the right side even when it would
+    ' crash -- out of scope to fix here (it belongs in the SHARED
+    ' fission/sir/lower_amir.abas, affecting the bytecode backend too, and
+    ' is a real SIR->A-MIR lowering redesign, not a native x86-64 codegen
+    ' task). What IS in scope here: matching this backend to the SAME
+    ' eager behavior the bytecode backend already has for ANDALSO/ORELSE
+    ' today (both operands are plain BOOL-typed I64s by the time this
+    ' reaches a BinOp, so a bitwise and/or IS the eager AND/OR this
+    ' substrate's own bytecode path already computes) -- not introducing a
+    ' new native-only divergence, just closing a support gap for an
+    ' operator the substrate already lowers this way.
+    isBitAnd = op == "AND" ORELSE op == "BITAND" ORELSE op == "ANDALSO"
+    IF isBitAnd THEN
+        ignored = Array.Push(lines, "    and %rcx, %rax")
+        ignored = Array.Push(lines, Fission_X86_64StoreRaxLine(offsets, dest))
+        RETURN {Ok: TRUE, Lines: lines}
+    END IF
+    isBitOr = op == "OR" ORELSE op == "BITOR" ORELSE op == "ORELSE"
+    IF isBitOr THEN
+        ignored = Array.Push(lines, "    or %rcx, %rax")
+        ignored = Array.Push(lines, Fission_X86_64StoreRaxLine(offsets, dest))
+        RETURN {Ok: TRUE, Lines: lines}
+    END IF
+    IF op == "BITXOR" THEN
+        ignored = Array.Push(lines, "    xor %rcx, %rax")
+        ignored = Array.Push(lines, Fission_X86_64StoreRaxLine(offsets, dest))
+        RETURN {Ok: TRUE, Lines: lines}
+    END IF
+    IF op == "SHL" THEN
+        ' x86 variable-count shifts require the count in %cl specifically
+        ' -- %rcx already holds the right operand from the common load
+        ' above, so no extra move is needed, just a narrower register name
+        ' for the same physical register.
+        ignored = Array.Push(lines, "    shl %cl, %rax")
+        ignored = Array.Push(lines, Fission_X86_64StoreRaxLine(offsets, dest))
+        RETURN {Ok: TRUE, Lines: lines}
+    END IF
+    ' SHR is, confirmed directly against the real oracle (a negative
+    ' operand's own SHR result matches arithmetic, not logical, shift --
+    ' e.g. `-8 SHR 1` prints -4, sign-preserving), actually an ARITHMETIC
+    ' shift right at runtime despite its own "logical-sounding" name --
+    ' `sar`, not `shr`, is the correct x86 instruction here. This is the
+    ' same class of "opcode name doesn't match real runtime semantics"
+    ' surprise this session already found once for INT.CMP_*_UNSIGNED
+    ' (see Fission_X86_64SetInstructionForOp's own comment) -- confirmed
+    ' the same way, by direct oracle execution, not assumed from the name.
+    ' The real `SAR` keyword itself, separately, is NOT actually
+    ' implemented by the oracle's own bytecode VM at all (`ArcoFission
+    ' compile-run` fails outright with "unsupported bytecode binary
+    ' operator: SAR") -- left as a real, disclosed diagnostic here rather
+    ' than guessing a semantic this substrate's own equivalence-testing
+    ' oracle can never confirm or deny. Real integer division (`\`) is the
+    ' same situation (oracle fails the same way) and is likewise left
+    ' unsupported here, not implemented and guessed at.
+    IF op == "SHR" THEN
+        ignored = Array.Push(lines, "    sar %cl, %rax")
+        ignored = Array.Push(lines, Fission_X86_64StoreRaxLine(offsets, dest))
+        RETURN {Ok: TRUE, Lines: lines}
+    END IF
+
     RETURN {Ok: FALSE, Lines: []}
 END FUNCTION
 

@@ -1277,6 +1277,54 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   direct integration script itself (a sanctioned interactive-tracing use,
   per the standing `fissure`-workflow correction) was run twice, both
   green, while waiting for a clean `fissure run` window.
+- Native x86-64 codegen: bare `AND`/`OR`/`BITAND`/`BITOR`/`BITXOR`/`SHL`/
+  `SHR`, plus the (eager, not actually short-circuit) `ANDALSO`/`ORELSE`,
+  as real single-instruction x86 lowerings (`and`/`or`/`xor`/`shl`/`sar`).
+  Each operator's real runtime semantics were confirmed directly against
+  the oracle BEFORE writing any codegen (the established "check first,
+  don't guess" discipline this whole native-codegen effort has followed),
+  which surfaced two real findings:
+  1. `SHR` is, at runtime, actually an ARITHMETIC shift right (sign-
+     preserving -- `-8 SHR 1` prints `-4`) despite its own
+     "logical-sounding" name -- the same class of "opcode name doesn't
+     match real runtime semantics" surprise already found once this
+     session for `INT.CMP_*_UNSIGNED`. Lowered to `sar`, not `shr`.
+  2. The real `SAR` keyword itself, and real integer division (`\`), are
+     BOTH not actually implemented by the oracle's own bytecode VM at all
+     (`ArcoFission compile-run` fails outright with "unsupported bytecode
+     binary operator") -- left as real, disclosed diagnostics here rather
+     than guessing a semantic this substrate's own equivalence-testing
+     oracle can never confirm or deny, the same reasoning already applied
+     to string ordering comparison.
+  A third, more consequential finding, NOT specific to native codegen: a
+  direct check of the substrate's own A-MIR output for `ANDALSO`/`ORELSE`
+  (`Fission_SirToAmir` on a real `x > 0 ANDALSO y > 0`) showed they lower
+  to an ORDINARY EAGER BinOp (`%t9 := ANDALSO %t5, %t8`, both operands
+  always computed) -- NOT real short-circuit evaluation, unlike the real
+  oracle (confirmed via `ArcoFission reveal ... at A-MIR`, which produces
+  genuine `ShortCircuitRhs`/`ShortCircuitEnd` blocks). This is a real,
+  pre-existing, SHARED-substrate gap (in `fission/sir/lower_amir.abas`,
+  affecting the bytecode backend too, not something this session's native
+  codegen work introduced) -- a program relying on short-circuiting for
+  safety (e.g. `x != NULL ANDALSO x.Field > 0`) would evaluate the right
+  side even when it would crash. Left unfixed here (a real SIR->A-MIR
+  lowering redesign, out of scope for native-codegen-specific work) but
+  now disclosed for the first time; native codegen was made to match the
+  bytecode backend's own existing eager behavior for consistency, not to
+  introduce a second, different divergence.
+  Verified via real execution across every operator, confirmed
+  byte-for-byte identical to legacy `ArcoFission compile-run`. Added as a
+  permanent regression fixture, `fission/tests/native_programs/
+  bitops.abas`; wired into `FissionNativeCapsuleTarget`,
+  `tests/integration/fission_substrate_core_smoke.sh`, and
+  `fission/fissure.ab`'s watched-files list. Re-verified every earlier
+  native demo unaffected. `fission/tests/amir_x86_64_smoke.abas` extended
+  with direct coverage (zero diagnostics, the five real instruction
+  mnemonics present in the rendered assembly, plus the SAR/integer-division
+  diagnostic paths). Self-parse/self-semantic corpus symbol count grew
+  2978 -> 2999; golden value in
+  `tests/integration/fission_substrate_core_smoke.sh` updated to match.
+  Verified with plain `fissure run` (572s, passing).
 
 ## In-Progress Components
 
@@ -1713,6 +1761,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/arrays.abas`
 - `fission/tests/native_programs/for_each.abas`
 - `fission/tests/native_programs/loop_control.abas`
+- `fission/tests/native_programs/bitops.abas`
 - `fission/tests/sir_to_amir_loop_control_smoke.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
