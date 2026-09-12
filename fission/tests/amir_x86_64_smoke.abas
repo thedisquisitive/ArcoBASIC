@@ -171,8 +171,16 @@ PolyAmir = Fission_SirToAmir(PolySir)
 PolyProgram = Fission_AmirToX86_64(PolyAmir)
 PRINT PolyProgram.Diagnostics.HasErrors()
 
-' A real array argument still cannot cross a function boundary -- a real,
-' disclosed, unexplored gap, unaffected by string parameters now working.
+' Real ARRAYS crossing a function boundary (parameter AND return value) --
+' USED TO be a real, disclosed, unexplored gap (this exact source was
+' originally written to check for a diagnostic); confirmed real, legal
+' ArcoBASIC via a direct oracle probe, and needed ZERO dedicated codegen
+' once Fission_X86_64InferSignatures' own generic "any kind other than
+' Number is upgrade-worthy" merge (already generalized past String) was
+' simply trusted for Array too -- an array is a plain pointer, physically
+' identical to a String value, the same "already works" precedent this
+' file has hit repeatedly. Real execution verified separately by
+' fission/tests/native_programs/array_boundary.abas.
 ArrayArgSource = "FUNCTION Foo(x)\n    RETURN x\nEND FUNCTION\na = [1, 2]\nPRINT Foo(a)"
 ArrayArgTokens = Fission_ArcoBasicLex(ArrayArgSource)
 ArrayArgAst = Fission_ArcoBasicParse(ArrayArgTokens, "x86-64-array-arg-smoke.abas")

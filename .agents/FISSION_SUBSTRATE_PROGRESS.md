@@ -2001,6 +2001,42 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   watched-files list. Self-parse/self-semantic corpus symbol count grew
   3563 -> 3605 (new functions/params); golden value updated. Verified
   with `fissure run`.
+- **Real ARRAYS crossing a function boundary** (`fission/amir/
+  lower_x86_64.abas`) -- a parameter or return value, previously a real,
+  disclosed, unconditionally-rejected gap. Confirmed real, legal
+  ArcoBASIC via a direct oracle probe first (`FUNCTION Sum(arr) FOR item
+  IN arr ... NEXT ... END FUNCTION`, called both with a literal array and
+  a function's own returned array). Needed ZERO dedicated codegen: an
+  array is a plain pointer, physically identical to a String value
+  (Phase 4's own representation), and Fission_X86_64InferSignatures' own
+  generic "any kind other than Number is upgrade-worthy" merge (already
+  generalized past the literal string "String" specifically -- see that
+  function's own comment) already covered "Array" too, with no changes
+  needed there at all. The only real change: removing the two
+  unconditional rejections (`Fission_X86_64EmitCall`'s own arg-kind
+  validation, and Return's own handling) that were built BEFORE this
+  generalization existed and never revisited -- the same "already works,
+  just needed the deliberate block removed" precedent this file has hit
+  repeatedly (ForEach, EXIT/CONTINUE, bare AND/OR/etc.). While removing
+  the argument-side rejection, also closed a small adjacent gap it had
+  been masking: an Array-kind argument used to skip the general
+  kind-mismatch check entirely (`IF argKind != "Array" ANDALSO ...`) --
+  now checked like every other kind, so a genuine Number/Array or
+  String/Array parameter conflict is a real diagnostic instead of
+  silently passing through unchecked.
+  Verified via real execution against the oracle: an array parameter
+  consumed via both `LEN`/indexed access AND a real ForEach loop, a
+  freshly-constructed array returned from a function, a pass-through
+  function returning its own array parameter unmodified then indexed by
+  the caller, and a RECURSIVE function consuming an array parameter --
+  all byte-for-byte matching `ArcoFission compile-run`. All 18 existing
+  native fixtures re-verified unaffected. Extended `fission/tests/
+  amir_x86_64_smoke.abas`'s own pre-existing `ArrayArgSource` case
+  (originally written to check for a diagnostic, now checking real
+  success). New permanent fixture `fission/tests/native_programs/
+  array_boundary.abas`; wired into `fission/fissure.ab`'s watched-files
+  list. Self-parse/self-semantic corpus symbol count changed 3605 -> 3604
+  (net code removal); golden value updated. Verified with `fissure run`.
 
 ## In-Progress Components
 
@@ -2736,10 +2772,10 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    own:
    - DONE -- real string function parameters and return values, via
      genuine inter-procedural fixed-point kind inference
-     (`Fission_X86_64InferSignatures`), see Completed Components. Arrays
-     passed to/returned from functions remain a real, disclosed,
-     unexplored gap, unaffected by this (rejected unconditionally, not
-     silently misinterpreted).
+     (`Fission_X86_64InferSignatures`), see Completed Components. DONE --
+     real ARRAYS crossing a function boundary too (a parameter or return
+     value), needing zero dedicated codegen once the SAME generic merge
+     was simply trusted for Array, see Completed Components.
    - DONE -- real PRINT of a Bool-kind value (`PRINT x == y` now renders
      `TRUE`/`FALSE` like the oracle, not `0`/`1`), see Completed
      Components. The SHARED root cause (a bare TRUE/FALSE literal lowers

@@ -1,0 +1,52 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises real ARRAYS crossing a
+' function boundary -- a parameter (`Sum`, consuming an array both via
+' `LEN`/indexed access AND a real ForEach loop), a return value (`MakeArr`,
+' constructing a fresh array), a pass-through (`Identity`, returning its
+' own array parameter unmodified, then indexed by the caller), and a
+' recursive function consuming an array parameter -- all via NO dedicated
+' codegen at all: an array is a plain pointer, physically identical to a
+' String value (Fission_X86_64InferSignatures' own generic kind-inference
+' merge, already generalized past String, is simply trusted for Array too;
+' see that function's own header comment for the full history -- this was
+' originally a disclosed, unexplored gap).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+FUNCTION Sum(arr)
+    total = 0
+    FOR item IN arr
+        total = total + item
+    NEXT
+    RETURN total
+END FUNCTION
+
+FUNCTION MakeArr()
+    RETURN [10, 20, 30]
+END FUNCTION
+
+FUNCTION Identity(arr)
+    RETURN arr
+END FUNCTION
+
+FUNCTION SumFirstN(arr, n)
+    IF n == 0 THEN
+        RETURN 0
+    END IF
+    RETURN arr[n - 1] + SumFirstN(arr, n - 1)
+END FUNCTION
+
+nums = [1, 2, 3, 4]
+PRINT Sum(nums)
+a = MakeArr()
+PRINT a
+PRINT Sum(a)
+PRINT LEN(a)
+
+same = Identity(nums)
+PRINT same[0]
+PRINT same[3]
+
+PRINT SumFirstN(nums, 4)

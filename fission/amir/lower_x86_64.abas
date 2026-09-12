@@ -99,12 +99,16 @@
 ' `obj.Field = value` write (never `SELF.Field = value` inside the
 ' class's own methods) remains a real, narrower, disclosed limitation of
 ' this same fixed point.
+' As of Fission_X86_64EmitCall's own comment, real ARRAYS crossing a
+' function boundary too (a parameter or return value) -- needed zero
+' dedicated codegen once Fission_X86_64InferSignatures' own generic merge
+' (already generalized past String) was simply trusted for Array, the
+' same "already works, just needed a deliberate block removed" precedent
+' this file has hit repeatedly. A genuine Number/Array or String/Array
+' kind CONFLICT across different call sites is still, correctly, a real
+' diagnostic (a parameter or return value has exactly one physical kind,
+' real polymorphism is not representable there).
 ' Deliberately still out of scope, still real, disclosed follow-on work:
-' arrays crossing a function boundary (parameter or return value -- a real
-' diagnostic, not silently misinterpreted, the same reasoning the string-
-' parameter inference above already applies to a genuine Number/String
-' kind CONFLICT at different call sites -- a parameter or return value has
-' exactly one physical kind, real polymorphism is not representable there);
 ' string arrays / arrays of arrays / arrays holding anything but plain
 ' numbers; branching on a string value; string ordering comparison
 ' (`<`/`<=`/`>`/`>=` between two strings -- confirmed this is not even a
@@ -1925,34 +1929,41 @@ END FUNCTION
 ' instance as SELF) -- exactly the case real inheritance/polymorphism
 ' needs to allow, unlike a genuine Number/String parameter conflict, which
 ' this check must still catch.
+' Real ARRAYS crossing a function boundary (parameter or return value):
+' an array is represented as a plain pointer, physically identical to a
+' String value (Phase 4's own representation) -- once
+' Fission_X86_64InferSignatures' own generic "any kind other than Number
+' is upgrade-worthy" merge (already generalized past String specifically,
+' see that function's own comment) is trusted for Array too, a real
+' array argument/return value Just Works through the exact same
+' SysV-register-move machinery every other pointer-kind value already
+' uses, no dedicated codegen needed at all -- the same "already works"
+' precedent this file has hit repeatedly (ForEach, EXIT/CONTINUE,
+' bare AND/OR/etc.). Confirmed real, legal ArcoBASIC via a direct oracle
+' probe (`FUNCTION Sum(arr) FOR item IN arr ... NEXT ... END FUNCTION`,
+' called both with a literal array and a function's own returned array).
 FUNCTION Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, callee, args, destOperand, isVoidCall)
     argRegisters = Fission_X86_64ArgRegisters()
     calleeParamKinds = Object.Get(signatures.ParamKinds, callee, [])
     unresolvedArg = ""
-    arrayArg = ""
     mismatchedArg = ""
     argPosition = 0
     FOR arg IN args
         IF Fission_X86_64OperandIsResolvable(offsets, arg) == FALSE THEN unresolvedArg = arg
         argKind = Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, arg))
-        IF argKind == "Array" THEN arrayArg = arg
         ' A polymorphic receiver's own SELF argument is STILL Poly-kind
         ' here (it's the same variable, passed unmodified into every
         ' candidate branch of the dispatch chain -- runtime `__class`
         ' comparison, not per-branch static narrowing, is what picks the
         ' right one) -- exempt exactly like a plain Object-kind SELF.
         isExemptSelfArg = argPosition == 0 ANDALSO (Fission_X86_64IsObjectKind(argKind) ORELSE Fission_X86_64IsPolyKind(argKind))
-        IF argKind != "Array" ANDALSO isExemptSelfArg == FALSE ANDALSO argPosition < LEN(calleeParamKinds) THEN
+        IF isExemptSelfArg == FALSE ANDALSO argPosition < LEN(calleeParamKinds) THEN
             IF argKind != calleeParamKinds[argPosition] THEN mismatchedArg = arg
         END IF
         argPosition = argPosition + 1
     NEXT
     IF unresolvedArg != "" THEN
         ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an unsupported argument is not supported by native x86-64 codegen: " + unresolvedArg)
-        RETURN FALSE
-    END IF
-    IF arrayArg != "" THEN
-        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an array argument is not supported by native x86-64 codegen (arrays cannot cross a function boundary): " + arrayArg)
         RETURN FALSE
     END IF
     IF mismatchedArg != "" THEN
@@ -2658,17 +2669,13 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     CONTINUE FOR
                 END IF
                 ' Real inter-procedural inference (Fission_X86_64
-                ' InferSignatures) means a String return value now Just
-                ' Works -- moving a pointer into %rax is identical to
+                ' InferSignatures) means a String OR Array return value
+                ' Just Works -- moving a pointer into %rax is identical to
                 ' moving a number, the same reasoning Phase 4 already
-                ' established for string VARIABLES. Only Array remains
-                ' rejected: arrays crossing a function boundary are a
-                ' real, disclosed, unexplored gap, not silently
-                ' misinterpreted as a plain number.
-                IF Fission_X86_64OperandKind(kinds, returnValue) == "Array" THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Returning an array value is not supported by native x86-64 codegen (arrays cannot cross a function boundary): " + returnValue)
-                    CONTINUE FOR
-                END IF
+                ' established for string VARIABLES (see
+                ' Fission_X86_64EmitCall's own comment for the full "why
+                ' arrays crossing a function boundary needed no dedicated
+                ' codegen at all" reasoning).
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, returnValue, "rax"))
                 ignored = Array.Push(textLines, "    leave")
                 ignored = Array.Push(textLines, "    ret")
