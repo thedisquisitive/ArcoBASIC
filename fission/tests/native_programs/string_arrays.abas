@@ -1,0 +1,31 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises real TYPED (String)
+' arrays -- construction, indexed read/write, ForEach, LEN, PRINT of a
+' bare string array (rendering without quotes, matching the oracle
+' exactly), and a string array crossing a function boundary (both as a
+' parameter, consumed via ForEach, and concatenated across elements). See
+' fission/amir/lower_x86_64.abas's own Fission_X86_64IsArrayKind comment
+' for the "Array:ElementKind" design.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+FUNCTION Join(arr)
+    result = ""
+    FOR item IN arr
+        result = result + item
+    NEXT
+    RETURN result
+END FUNCTION
+
+names = ["Alice", "Bob", "Carol"]
+FOR item IN names
+    PRINT item
+NEXT
+PRINT names[1]
+names[1] = "Bobby"
+PRINT names[1]
+PRINT LEN(names)
+PRINT names
+PRINT Join(names)

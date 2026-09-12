@@ -643,3 +643,33 @@ SuperNotCallSource = "CLASS Animal\n    FUNCTION Speak()\n        RETURN 0\n    
 SuperNotCallTokens = Fission_ArcoBasicLex(SuperNotCallSource)
 SuperNotCallAst = Fission_ArcoBasicParse(SuperNotCallTokens, "x86-64-super-not-call-smoke.abas")
 PRINT SuperNotCallAst.Diagnostics.HasErrors()
+
+' Real TYPED (String) arrays -- USED TO be a real, disclosed,
+' unconditionally-rejected gap (Phase 7's own "numeric array elements
+' only" restriction); a real "Array:ElementKind" parameterized kind (see
+' Fission_X86_64IsArrayKind's own comment) now lets a homogeneous String
+' array construct/read/write/PRINT correctly, checked here structurally
+' (zero diagnostics, and the rendered assembly contains a real `call
+' array_print_string`, the dedicated NUL-scan-based array-of-strings
+' printer, distinct from the numeric `array_print`). Real execution
+' verified separately by fission/tests/native_programs/string_arrays.abas.
+StringArraySource = "names = [\"Alice\", \"Bob\"]\nPRINT names"
+StringArrayTokens = Fission_ArcoBasicLex(StringArraySource)
+StringArrayAst = Fission_ArcoBasicParse(StringArrayTokens, "x86-64-string-array-smoke.abas")
+StringArraySir = Fission_ArcoBasicAstToSir(StringArrayAst)
+StringArrayAmir = Fission_SirToAmir(StringArraySir)
+StringArrayProgram = Fission_AmirToX86_64(StringArrayAmir)
+PRINT StringArrayProgram.Diagnostics.HasErrors()
+PRINT String.Contains(StringArrayProgram.Render(), "call array_print_string")
+
+' A genuinely HETEROGENEOUS array literal (legal on the oracle -- real
+' per-element dynamic typing -- but not representable by this backend's
+' own single "Array:ElementKind" per array) is a real, reported
+' diagnostic, not a silent wrong-kind read.
+MixedArraySource = "a = [1, \"two\", 3]\nPRINT a"
+MixedArrayTokens = Fission_ArcoBasicLex(MixedArraySource)
+MixedArrayAst = Fission_ArcoBasicParse(MixedArrayTokens, "x86-64-mixed-array-smoke.abas")
+MixedArraySir = Fission_ArcoBasicAstToSir(MixedArrayAst)
+MixedArrayAmir = Fission_SirToAmir(MixedArraySir)
+MixedArrayProgram = Fission_AmirToX86_64(MixedArrayAmir)
+PRINT MixedArrayProgram.Diagnostics.HasErrors()

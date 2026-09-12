@@ -117,23 +117,22 @@
 ' (`cmpb $0, (%rax)`, the exact same instruction
 ' Fission_X86_64StrPrintSubroutine's own NUL-scan loop already proved
 ' correct for a different purpose) rather than a full length scan.
+' As of Fission_X86_64IsArrayKind/Fission_X86_64ArrayElementKind, real
+' TYPED (String) arrays too -- a real "Array:ElementKind" parameterized
+' kind (mirroring "Object:ClassName"/"Poly:Class1,Class2..."'s own
+' precedent), derived from a literal's own first item at construction and
+' threaded through every array-consuming site in this file (LEN, PRINT --
+' a genuinely new `array_print_string` runtime subroutine was needed
+' here, real per-element NUL-scan printing, since a numeric array's own
+' `array_print` itoa's each element -- Index/StoreIndex, EmitCall arg
+' validation, Return). A genuinely HETEROGENEOUS literal (`[1, "two", 3]`,
+' confirmed real, legal ArcoBASIC via a direct oracle probe -- real
+' per-element dynamic typing) remains a real, reported diagnostic, not
+' representable by this backend's own single per-array kind.
 ' Deliberately still out of scope, still real, disclosed follow-on work:
-' string arrays / arrays of arrays / arrays holding anything but plain
-' numbers -- confirmed real, legal ArcoBASIC via a direct oracle probe
-' (`names = ["Alice", "Bob"]` / indexed read+write / ForEach / LEN all
-' work on the oracle), and the underlying element STORAGE here is already
-' representation-agnostic (a plain 8-byte slot, identical for Number or
-' String), so this is very likely another "just needs kind-tracking
-' extended" case rather than new codegen -- the real work is parameterizing
-' the "Array" kind itself (mirroring "Object:ClassName"/"Poly:Class1,
-' Class2..."'s own precedent, e.g. "Array:String") and updating every
-' existing `== "Array"` kind check across this file (LEN, PRINT, EmitCall
-' arg validation, Return, Index/StoreIndex's own array-vs-object dispatch)
-' to recognize the parameterized form -- a broader, multi-site refactor,
-' deliberately not attempted in the same pass as this session's other
-' slices to keep each change independently verifiable; a real, disclosed,
-' concretely-scoped next candidate, not a vague "future work" note.
-' string ordering comparison
+' arrays of arrays / arrays of objects (unverified against the oracle,
+' even though the underlying pointer-sized element storage would likely
+' tolerate it the same way it does String); string ordering comparison
 ' (`<`/`<=`/`>`/`>=` between two strings -- confirmed this is not even a
 ' real oracle feature: `ArcoFission compile-run` on a real program
 ' comparing two strings with `<` fails at runtime with "value is not a
@@ -860,20 +859,32 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
             IF kind == "Array" THEN
                 ' Phase 7: a real array literal, bump-allocated on the same
                 ' shared heap string concatenation already uses (see
-                ' Fission_X86_64ArrayAllocSubroutine's own comment) --
-                ' its own kind is "Array", distinct from both Number and
-                ' String, so a later numeric/string-only consumption site
-                ' correctly rejects it instead of misinterpreting the
-                ' pointer.
+                ' Fission_X86_64ArrayAllocSubroutine's own comment). Its
+                ' own kind is now "Array:ElementKind" (see
+                ' Fission_X86_64IsArrayKind's own comment for the full
+                ' typed-array design) -- derived from the literal's own
+                ' FIRST item (an empty array `[]` defaults to
+                ' "Array:Number", matching this kind's own pre-typed-array
+                ' default and costing nothing since an empty array has no
+                ' elements to ever misinterpret). A genuinely
+                ' heterogeneous literal is caught and reported as a real
+                ' diagnostic at EMISSION time (Fission_X86_64LowerFunction's
+                ' own Array-instruction handling), not here -- this
+                ' collection pass stays best-effort/non-diagnostic for
+                ' kind tracking, same as every other kind here.
                 dest = instruction.Field("Dest")
                 state = Fission_X86_64Remember(names, seen, dest)
                 names = state.Names
                 seen = state.Seen
-                kinds = Object.Set(kinds, dest, "Array")
+                items = Fission_X86_64SplitArgs(instruction.Field("Items"))
+                elementKind = "Number"
+                IF LEN(items) > 0 THEN elementKind = Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, items[0]))
+                kinds = Object.Set(kinds, dest, "Array:" + elementKind)
             END IF
             IF kind == "Index" THEN
-                ' Phase 7 scope: numeric-element arrays only -- an ARRAY
-                ' indexed read's own result is always Number. A real
+                ' A real ARRAY indexed read's own result carries the
+                ' array's own ELEMENT kind (Number or String, see
+                ' Fission_X86_64IsArrayKind's own comment). A real
                 ' object FIELD read (`obj.Field`/`SELF.Field`, the SAME
                 ' opcode with a CONST-string key instead of a numeric one)
                 ' instead carries that field's own real kind, looked up via
@@ -908,6 +919,8 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                             END IF
                         NEXT
                     END IF
+                ELSE
+                    IF Fission_X86_64IsArrayKind(baseKind) THEN destKind = Fission_X86_64ArrayElementKind(baseKind)
                 END IF
                 kinds = Object.Set(kinds, dest, destKind)
             END IF
@@ -1151,6 +1164,31 @@ END FUNCTION
 FUNCTION Fission_X86_64NormalizeNumericKind(kind)
     IF kind == "Bool" THEN RETURN "Number"
     RETURN kind
+END FUNCTION
+
+' Real typed arrays: a "Array:ElementKind" parameterized kind (mirroring
+' "Object:ClassName"/"Poly:Class1,Class2..."'s own precedent) -- an
+' array's own ELEMENT kind (Number or String) is fixed once, at
+' construction (Fission_X86_64CollectSlots' own "Array" handling derives
+' it from the literal's own first item), homogeneous across every element
+' the same way a class field's own kind is homogeneous across every
+' class's own writes to it. Confirmed real, legal ArcoBASIC via a direct
+' oracle probe that a HETEROGENEOUS array (`[1, "two", 3]`) is genuinely
+' legal too (per-element dynamic typing) -- out of scope here, same
+' reasoning genuine class-instance polymorphism needed a real mechanism
+' for: a single "Array:X" kind cannot represent a per-element dynamic
+' type, so a non-homogeneous literal is a real, disclosed diagnostic
+' (Fission_X86_64LowerFunction's own Array-instruction handling), not
+' silently guessed at. `Fission_X86_64IsArrayKind` also accepts the bare
+' "Array" kind for defensive forward-compatibility, though nothing in
+' this file emits that form anymore.
+FUNCTION Fission_X86_64IsArrayKind(kind)
+    RETURN String.StartsWith(kind, "Array:") ORELSE kind == "Array"
+END FUNCTION
+
+FUNCTION Fission_X86_64ArrayElementKind(kind)
+    IF String.StartsWith(kind, "Array:") THEN RETURN String.Slice(kind, 6, String.Length(kind) - 6)
+    RETURN "Number"
 END FUNCTION
 
 ' A real CLASS instance's own kind is "Object:ClassName" -- a parameterized
@@ -1909,6 +1947,71 @@ FUNCTION Fission_X86_64ArrayPrintSubroutine()
     RETURN lines
 END FUNCTION
 
+' `PRINT arr` on a real STRING array -- the typed-array counterpart of
+' Fission_X86_64ArrayPrintSubroutine (see its own comment for the shared
+' bracket/comma/close rodata and register-preservation discipline this
+' mirrors exactly), selected instead of it when the array's own element
+' kind is String (Fission_X86_64ArrayElementKind). Each element is
+' written via a real NUL-scan (the exact same technique
+' Fission_X86_64StrPrintSubroutine's own loop already proved correct),
+' not itoa -- confirmed via a direct oracle probe that a string array's
+' own elements render WITHOUT quotes (`["Alice", "Bob"]` renders
+' `[Alice, Bob]`, matching a heterogeneous array's own per-element
+' rendering too).
+FUNCTION Fission_X86_64ArrayPrintStringSubroutine()
+    lines = [
+        "array_print_string:",
+        "    push %rbx",
+        "    push %r12",
+        "    push %r13",
+        "    mov %rdi, %rbx",
+        "    mov (%rbx), %r13",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    lea array_print_open(%rip), %rsi",
+        "    mov $1, %rdx",
+        "    syscall",
+        "    xor %r12, %r12",
+        ".Larrprintstr_loop:",
+        "    cmp %r13, %r12",
+        "    jge .Larrprintstr_done",
+        "    test %r12, %r12",
+        "    jz .Larrprintstr_skip_comma",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    lea array_print_comma(%rip), %rsi",
+        "    mov $2, %rdx",
+        "    syscall",
+        ".Larrprintstr_skip_comma:",
+        "    mov 8(%rbx,%r12,8), %rsi",
+        "    mov %rsi, %rax",
+        ".Larrprintstr_strlen_loop:",
+        "    cmpb $0, (%rax)",
+        "    je .Larrprintstr_strlen_done",
+        "    inc %rax",
+        "    jmp .Larrprintstr_strlen_loop",
+        ".Larrprintstr_strlen_done:",
+        "    mov %rax, %rdx",
+        "    sub %rsi, %rdx",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    syscall",
+        "    inc %r12",
+        "    jmp .Larrprintstr_loop",
+        ".Larrprintstr_done:",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    lea array_print_close(%rip), %rsi",
+        "    mov $2, %rdx",
+        "    syscall",
+        "    pop %r13",
+        "    pop %r12",
+        "    pop %rbx",
+        "    ret"
+    ]
+    RETURN lines
+END FUNCTION
+
 ' `PRINT` of a genuine Bool-kind value (a comparison result, or a bare
 ' TRUE/FALSE literal) -- see Fission_X86_64OperandIsBoolLiteral's own
 ' comment for the real bug this closes (the oracle prints `TRUE`/`FALSE`,
@@ -2214,19 +2317,46 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 ' itself, confirmed via the oracle), so each element is
                 ' just one `mov` into its own fixed offset, no runtime loop
                 ' needed.
+                ' Real typed arrays (Fission_X86_64IsArrayKind's own
+                ' comment): every element must share the SAME kind (the
+                ' first item's own kind decides it, matching
+                ' Fission_X86_64CollectSlots' own "Array" handling
+                ' exactly) -- a genuinely heterogeneous literal (legal on
+                ' the oracle, real per-element dynamic typing this
+                ' backend's own single "Array:ElementKind" cannot
+                ' represent) is a real, reported diagnostic, not silently
+                ' misinterpreted. The actual element STORE below is
+                ' already representation-agnostic either way (an 8-byte
+                ' `mov`, identical whether the value is a number or a
+                ' string pointer), so no other codegen change is needed.
                 items = Fission_X86_64SplitArgs(instruction.Field("Items"))
                 unresolvedItem = ""
-                nonNumericItem = ""
+                mismatchedItem = ""
+                nonScalarItem = ""
+                elementKind = "Number"
+                IF LEN(items) > 0 THEN elementKind = Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, items[0]))
                 FOR item IN items
                     IF Fission_X86_64OperandIsResolvable(offsets, item) == FALSE THEN unresolvedItem = item
-                    IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, item)) != "Number" THEN nonNumericItem = item
+                    itemKind = Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, item))
+                    IF itemKind != elementKind THEN mismatchedItem = item
                 NEXT
+                ' Arrays of arrays / arrays of objects remain real,
+                ' disclosed, unexplored scope -- deliberately not
+                ' attempted here (unverified against the oracle), even
+                ' though the underlying pointer-sized element storage
+                ' would likely tolerate it the same way it does String --
+                ' only Number/String elements are accepted.
+                IF elementKind != "Number" ANDALSO elementKind != "String" THEN nonScalarItem = items[0]
                 IF unresolvedItem != "" THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Array element is not supported by native x86-64 codegen: " + unresolvedItem)
                     CONTINUE FOR
                 END IF
-                IF nonNumericItem != "" THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports numeric array elements: " + nonNumericItem)
+                IF nonScalarItem != "" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports Number or String array elements (not nested arrays or objects): " + nonScalarItem)
+                    CONTINUE FOR
+                END IF
+                IF mismatchedItem != "" THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports arrays whose elements all share the same kind (" + elementKind + "): " + mismatchedItem)
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, "    mov $" + String(LEN(items)) + ", %rdi")
@@ -2305,7 +2435,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Dest")))
                     CONTINUE FOR
                 END IF
-                IF baseKind != "Array" THEN
+                IF Fission_X86_64IsArrayKind(baseKind) == FALSE THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Indexing a non-array value is not supported by native x86-64 codegen: " + base)
                     CONTINUE FOR
                 END IF
@@ -2388,12 +2518,13 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = Array.Push(textLines, "    mov %rdx, " + String(fieldOffset) + "(%rax)")
                     CONTINUE FOR
                 END IF
-                IF nameKind != "Array" THEN
+                IF Fission_X86_64IsArrayKind(nameKind) == FALSE THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Indexing a non-array value is not supported by native x86-64 codegen: " + name)
                     CONTINUE FOR
                 END IF
-                IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, value)) != "Number" THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports numeric array elements: " + value)
+                arrayElementKind = Fission_X86_64ArrayElementKind(nameKind)
+                IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, value)) != arrayElementKind THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports an array element value matching the array's own established kind (" + arrayElementKind + "): " + value)
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, name, "rax"))
@@ -2520,10 +2651,15 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     CONTINUE FOR
                 END IF
                 printKind = Fission_X86_64OperandKind(kinds, argRef)
-                IF printKind == "Array" THEN
+                IF Fission_X86_64IsArrayKind(printKind) THEN
                     ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rdi"))
-                    ignored = Array.Push(textLines, "    call array_print")
-                    context.UsesArrayPrint = TRUE
+                    IF Fission_X86_64ArrayElementKind(printKind) == "String" THEN
+                        ignored = Array.Push(textLines, "    call array_print_string")
+                        context.UsesArrayPrintString = TRUE
+                    ELSE
+                        ignored = Array.Push(textLines, "    call array_print")
+                        context.UsesArrayPrint = TRUE
+                    END IF
                     CONTINUE FOR
                 END IF
                 IF printKind == "String" THEN
@@ -2553,7 +2689,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 ' by array_alloc at allocation time) sits at [pointer],
                 ' read directly, no runtime scan needed.
                 args = Fission_X86_64SplitArgs(instruction.Field("Args"))
-                IF LEN(args) != 1 ORELSE Fission_X86_64OperandIsResolvable(offsets, args[0]) == FALSE ORELSE Fission_X86_64OperandKind(kinds, args[0]) != "Array" THEN
+                IF LEN(args) != 1 ORELSE Fission_X86_64OperandIsResolvable(offsets, args[0]) == FALSE ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "LEN is only supported on an array by native x86-64 codegen: " + instruction.Field("Args"))
                     CONTINUE FOR
                 END IF
@@ -2746,7 +2882,7 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
-    context = {RodataLines: [], StringCount: 0, DispatchCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesBoolPrint: FALSE, UsesObjectAlloc: FALSE}
+    context = {RodataLines: [], StringCount: 0, DispatchCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesArrayPrintString: FALSE, UsesBoolPrint: FALSE, UsesObjectAlloc: FALSE}
     ' Real inter-procedural string-parameter/return-value inference, run
     ' to a full fixed point BEFORE any real emission -- see
     ' Fission_X86_64InferSignatures' own header comment. Every function's
@@ -2830,6 +2966,11 @@ FUNCTION Fission_AmirToX86_64(amirModule)
             ignored = Array.Push(allTextLines, line)
         NEXT
     END IF
+    IF context.UsesArrayPrintString THEN
+        FOR line IN Fission_X86_64ArrayPrintStringSubroutine()
+            ignored = Array.Push(allTextLines, line)
+        NEXT
+    END IF
     IF context.UsesBoolPrint THEN
         FOR line IN Fission_X86_64BoolPrintSubroutine()
             ignored = Array.Push(allTextLines, line)
@@ -2843,7 +2984,7 @@ FUNCTION Fission_AmirToX86_64(amirModule)
         ignored = Array.Push(rodataLines, "newline_byte:")
         ignored = Array.Push(rodataLines, "    .byte 10")
     END IF
-    IF context.UsesArrayPrint THEN
+    IF context.UsesArrayPrint ORELSE context.UsesArrayPrintString THEN
         ignored = Array.Push(rodataLines, "array_print_open:")
         ignored = Array.Push(rodataLines, "    .ascii \"[\"")
         ignored = Array.Push(rodataLines, "array_print_comma:")

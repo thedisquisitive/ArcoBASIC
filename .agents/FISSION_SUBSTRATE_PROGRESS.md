@@ -2127,6 +2127,51 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   watched-files list. Self-parse/self-semantic corpus symbol count grew
   3605 -> 3637 (new parser/SIR/AMIR functions); golden value updated.
   Verified with `fissure run`.
+- **Real TYPED (String) arrays** (`fission/amir/lower_x86_64.abas`) --
+  closes "object/array elements are numeric-only" for the array case
+  (the class-field case was already closed). The array's own kind is now
+  "Array:ElementKind" (Number or String), a real parameterized kind
+  mirroring "Object:ClassName"/"Poly:Class1,Class2..."'s own precedent
+  (`Fission_X86_64IsArrayKind`/`Fission_X86_64ArrayElementKind`), derived
+  from a literal's own first item at construction
+  (`Fission_X86_64CollectSlots`), threaded through every existing
+  `== "Array"` kind check across the file (LEN, PRINT, Index/StoreIndex's
+  own array-vs-object dispatch, the array-literal homogeneity check, a
+  function boundary's own generic Number-or-String-or-Array machinery
+  already generalized for this from the earlier arrays-crossing-a-
+  boundary work). A genuinely HETEROGENEOUS literal (`[1, "two", 3]`,
+  confirmed real, legal ArcoBASIC via a direct oracle probe -- real
+  per-element dynamic typing) is a real, reported diagnostic, not
+  representable by this backend's own single per-array kind, the same
+  reasoning genuine class-instance polymorphism needed a real mechanism
+  for. Deliberately scoped to Number/String elements only -- arrays of
+  arrays/objects remain real, disclosed, unverified-against-the-oracle
+  scope, even though the underlying pointer-sized element storage would
+  likely tolerate it the same way it does String.
+  One real new codegen piece needed (everything else was kind-tracking
+  only): `PRINT arr` on a String array needed a genuinely different
+  runtime subroutine (`array_print_string`, a new
+  `Fission_X86_64ArrayPrintStringSubroutine`) from the existing numeric
+  `array_print` -- confirmed via the oracle that string array elements
+  render WITHOUT quotes (`["Alice", "Bob"]` -> `[Alice, Bob]`, matching a
+  heterogeneous array's own per-element rendering too) -- built via a
+  real per-element NUL-scan (the exact same technique
+  `Fission_X86_64StrPrintSubroutine`'s own loop already proved correct),
+  reusing the SAME `array_print_open`/`comma`/`close` rodata both
+  subroutines share.
+  Verified via real execution against the oracle: string array
+  construction, indexed read/write, ForEach, LEN, PRINT of a bare string
+  array, and a string array crossing a function boundary (parameter,
+  consumed via ForEach, concatenated across elements) -- all byte-for-
+  byte matching `ArcoFission compile-run` on the very first attempt, no
+  debugging iterations needed. All 20 existing native fixtures
+  re-verified unaffected. Extended `fission/tests/amir_x86_64_smoke.abas`
+  with a real success case (checking the rendered assembly contains the
+  real `call array_print_string`) plus the heterogeneous-array diagnostic
+  case. New permanent fixture `fission/tests/native_programs/
+  string_arrays.abas`; wired into `fission/fissure.ab`'s watched-files
+  list. Self-parse/self-semantic corpus symbol count grew 3637 -> 3655;
+  golden value updated. Verified with `fissure run`.
 
 ## In-Progress Components
 
@@ -2919,15 +2964,11 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
      reference for this, though porting it into the substrate rather than
      linking against it directly is itself a real design decision to
      make, not just a port) -- this last item is now
-     WP-011's own single largest remaining piece.
-   - NEXT CONCRETE CANDIDATE: string arrays / arrays holding anything but
-     plain numbers (confirmed real, legal ArcoBASIC via a direct oracle
-     probe; see `fission/amir/lower_x86_64.abas`'s own header comment for
-     the concrete scoping -- likely another "extend kind-tracking, no new
-     codegen" case, parameterizing the "Array" kind the same way
-     "Object:ClassName"/"Poly:..." already are, but touching more call
-     sites across the file than any single slice so far, so scope it as
-     its own pass rather than folding it into another change).
+     WP-011's own single largest remaining piece -- see below for the
+     real ELF `.o`-linking design now underway to close it.
+   - DONE -- real TYPED (String) arrays, see Completed Components. Arrays
+     of arrays/objects remain real, disclosed, unverified-against-the-
+     oracle scope.
    The existing experimental legacy native backend
    (`ArcoFission build FILE -o OUT --target linux-x86_64`,
    `.agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md`) is worth reading
