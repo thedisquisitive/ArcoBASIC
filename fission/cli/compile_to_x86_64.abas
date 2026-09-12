@@ -1,50 +1,32 @@
 ' Generic file-based Fission Compiler Substrate driver for real native x86-64
 ' output -- no embedded bytecode VM at all (WP-009/013's own "Linux Native
-' Target" composition, first slice; see fission/amir/lower_x86_64.abas's own
-' header comment for the exact scope and the reasoning behind delegating
-' instruction encoding/linking to the system `as`/`ld` toolchain instead of
-' hand-rolling an ELF64 writer). Mirrors compile_to_bytecode.abas's own shape
-' and its reason for existing as its own capsule (`ArcoFission compile-run`
-' does not forward script args, confirmed by reading apps/arcofission/
-' main.cpp -- a generic ENTRY/OUTPUT driver has to run with real argv).
+' Target" composition), and, as of this file's own real self-contained
+' assembler (fission/amir/x86_64_assembler.abas), no external `as`/`ld`
+' toolchain dependency either -- Arcology is meant to be a self-contained
+' ecosystem, and shelling out to GAS for something as central as "compile
+' ArcoBASIC to a native executable" didn't fit that, called out directly by
+' the project owner. Mirrors compile_to_bytecode.abas's own shape and its
+' reason for existing as its own capsule (`ArcoFission compile-run` does not
+' forward script args, confirmed by reading apps/arcofission/main.cpp -- a
+' generic ENTRY/OUTPUT driver has to run with real argv).
 '
 ' Unlike compile_to_bytecode.abas, this driver produces the FINAL standalone
 ' ELF64 directly in one shot -- Source -> AST -> SIR -> A-MIR -> x86_64
-' assembly -> `as` -> `ld` -- rather than stopping at an intermediate
-' artifact another step packages later. Assembling/linking a handful of GAS
-' mnemonics is cheap, ordinary shelling-out work (Process.Run, the same
-' primitive Arconaut/arcfsctl/ArcoFlow already use for real subprocess work),
-' not something that needs a dedicated legacy C++ bridge the way embedding
-' the bytecode VM into a capsule did.
+' assembly text (this backend's own internal dialect, not general GAS) ->
+' real machine code bytes + a real ELF64 file, entirely in-process, written
+' with File.WriteBytes/File.SetExecutable -- rather than stopping at an
+' intermediate artifact another step packages later, and with zero
+' subprocess invocations anywhere in this path.
 '
 ' Usage: ArcoFission compile-run fission/cli/compile_to_x86_64.abas -- ENTRY OUTPUT
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 #IMPORT "fission/amir/lower_x86_64.abas"
-
-FUNCTION FissionNativeCli_ShellQuote(value)
-    chars = String.ToChars(STRING(value))
-    parts = ["'"]
-    FOR ch IN chars
-        IF ch == "'" THEN
-            ignored = Array.Push(parts, "'\\''")
-            CONTINUE FOR
-        END IF
-        ignored = Array.Push(parts, ch)
-    NEXT
-    ignored = Array.Push(parts, "'")
-    RETURN Array.Join(parts, "")
-END FUNCTION
+#IMPORT "fission/amir/x86_64_assembler.abas"
 
 FUNCTION FissionNativeCli_Fail(stage, message)
     PRINT "FISSION NATIVE COMPILE FAILED at " + stage
     PRINT message
     ignored = Exit(1)
-END FUNCTION
-
-FUNCTION FissionNativeCli_Run(stage, command)
-    result = Process.Run(command)
-    IF result.Ok == FALSE THEN ignored = FissionNativeCli_Fail(stage, command + "\n" + result.Output)
-    RETURN result
 END FUNCTION
 
 appArgs = Runtime.Args()
@@ -54,8 +36,6 @@ IF LEN(appArgs) < 2 THEN
 END IF
 entryPath = appArgs[0]
 outputPath = appArgs[1]
-asmPath = outputPath + ".s"
-objectPath = outputPath + ".o"
 
 source = File.ReadText(entryPath)
 tokens = Fission_ArcoBasicLex(source)
@@ -69,8 +49,10 @@ IF amir.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("A-MIR", am
 program = Fission_AmirToX86_64(amir)
 IF program.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("X86_64", program.Diagnostics.Render())
 
-ignored = File.WriteText(asmPath, program.Render())
-ignored = FissionNativeCli_Run("as", "as -o " + FissionNativeCli_ShellQuote(objectPath) + " " + FissionNativeCli_ShellQuote(asmPath))
-ignored = FissionNativeCli_Run("ld", "ld -static -nostdlib -o " + FissionNativeCli_ShellQuote(outputPath) + " " + FissionNativeCli_ShellQuote(objectPath))
+assembled = Fission_X86_64Assemble(program.Render())
+IF assembled.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("ASSEMBLE", assembled.Diagnostics.Render())
+
+ignored = File.WriteBytes(outputPath, assembled.Bytes)
+ignored = File.SetExecutable(outputPath)
 
 PRINT "NATIVE ELF64 WRITTEN " + outputPath

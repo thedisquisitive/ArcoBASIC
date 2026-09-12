@@ -3,6 +3,7 @@
 Files = [
     "fission/amir/lower_bytecode.abas",
     "fission/amir/lower_x86_64.abas",
+    "fission/amir/x86_64_assembler.abas",
     "fission/amir/model.abas",
     "fission/cli/compile_to_bytecode.abas",
     "fission/cli/compile_to_x86_64.abas",

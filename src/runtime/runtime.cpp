@@ -2847,6 +2847,22 @@ Runtime::Runtime()
         write_plain_file(args[0].to_string(), string_from_bytes(args[1]), std::ios::binary | std::ios::trunc);
         return true;
     });
+    // Sets the owner/group/other execute bits on an existing file -- added for the Fission
+    // Compiler Substrate's self-contained native x86-64 backend, which writes a real ELF64
+    // executable itself via File.WriteBytes (no external `as`/`ld`, and until this function
+    // existed, no way to mark that output runnable without a `chmod` subprocess either, which
+    // would have reintroduced exactly the kind of external-tool dependency the rest of that work
+    // was written to eliminate).
+    register_function("File.SetExecutable", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "File.SetExecutable", 1, 1);
+        std::error_code error;
+        std::filesystem::permissions(
+            args[0].to_string(),
+            std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec | std::filesystem::perms::others_exec,
+            std::filesystem::perm_options::add,
+            error);
+        return !error;
+    });
     // Directory.Create/Exists, File.List, and System.Open had the same arco_shell-only gap as
     // Path.*/ArcoSH.AssetsDir below and above -- arcfs-utils/apps/arconaut/arconaut.abas (now built as a standalone
     // ArcoFission capsule, not run through arcosh) uses all of them: Directory.Create/Exists and

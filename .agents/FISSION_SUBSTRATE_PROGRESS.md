@@ -1325,6 +1325,106 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   2978 -> 2999; golden value in
   `tests/integration/fission_substrate_core_smoke.sh` updated to match.
   Verified with plain `fissure run` (572s, passing).
+- **Native x86-64 codegen is now fully self-contained: a real, ArcoBASIC-
+  implemented instruction encoder + minimal ELF64 writer
+  (`fission/amir/x86_64_assembler.abas`) replaces the system `as`/`ld`
+  toolchain entirely.** Requested directly by the project owner mid-
+  session, overriding WP-009's own original scope decision ("we're
+  passing stuff to GAS. Arcology is supposed to be self contained... port
+  the machine code gen from legacy fission").
+  Scoping this first found a genuinely useful thing: legacy ArcoFission's
+  OWN Linux native backend (`generate_x86_64_program`, using a real byte-
+  level encoder, `systems::x86_64::Assembler`, `src/compiler/fission.cpp`)
+  ALSO ends up shelling out to `as`/`ld` for its own final ELF64
+  (`render_x86_64_linux_asm`) -- its byte-level encoder only ever reaches
+  an in-memory stream for its JIT; reaching a real Linux executable file
+  still goes through GAS text and the system toolchain, for two things
+  legacy explicitly declined to reimplement: resolving calls into an
+  external native runtime shim, and general ELF section layout/alignment.
+  There is no ELF64 writer anywhere in this codebase (the only from-
+  scratch executable-format writer that exists at all,
+  `write_pe32plus_efi_image`, targets PE32+ for the freestanding UEFI/
+  Arcology OS bootloader, not ELF64). Fission's own situation turned out
+  simpler than legacy's general-purpose one, though: every callee this
+  backend ever emits (user functions, str_print/itoa_print/array_alloc/
+  array_print/itoa_write) lives in the SAME translation unit -- there is
+  no external symbol to resolve at all, only internal labels whose final
+  addresses this same compile already computes -- so a real ELF64 writer
+  here needed no general relocation/linking machinery, just a standard
+  two-pass "encode with placeholders, then patch" scheme.
+  `fission/amir/lower_x86_64.abas`'s OWN codegen logic (which A-MIR
+  instruction becomes which x86 operation) is completely UNCHANGED by
+  this work -- it still renders the exact same text lines as before, now
+  understood as this backend's own self-defined text dialect rather than
+  GAS input. The new assembler parses that text (never general GAS
+  syntax) directly into real machine code bytes: a real REX-prefix/
+  ModRM/SIB encoder (bit patterns ported from the byte-level encoding
+  techniques legacy already proved out and verified against `nasm -f bin`
+  in `arcology-os/include/arco/x86_64_encoder.hpp`), scoped to exactly
+  the ~40 instruction mnemonic/operand shapes this backend's own codegen
+  actually emits (confirmed by inventorying every real
+  `fission/tests/native_programs/*.abas` fixture's own rendered assembly
+  text, not assumed). Deliberately NOT a general-purpose assembler: every
+  memory operand always uses the widest safe form (disp32, never disp8)
+  and every jump/call always uses the near rel32 form (never the short
+  rel8 form) -- code density is not a goal anywhere in this project, and
+  a fixed-width encoding per shape means every instruction's own byte
+  length is known immediately in a single pass, with no iterative
+  relaxation needed. `File.SetExecutable` (new native runtime function,
+  `src/runtime/runtime.cpp`) sets the real execute permission bits on the
+  written ELF64 -- added specifically so marking the output runnable
+  needs no `chmod` subprocess either, keeping the whole path free of any
+  external-tool dependency, not just the actual code generation.
+  Two real bugs were found only by actually running the resulting
+  binaries (assembling without error is not the same as encoding CORRECT
+  machine code):
+  1. `inc`/`dec` were originally grouped into the same "Group 3" opcode
+     (0xF7) as `idiv`/`div`/`neg`/`not` since all six looked like the same
+     "unary register operand" shape -- but INC/DEC r/m64 is genuinely a
+     DIFFERENT opcode (Group 5, 0xFF /0 and /1). `inc %rax` was being
+     mis-encoded as a 7-byte `TEST r/m64,imm32` (0xF7 /0) with garbage
+     trailing immediate bytes, corrupting every instruction after it --
+     confirmed via `objdump` on the real emitted bytes (a nonsense `test
+     rax, 0xffffffffffffebe9` where a 3-byte `inc rax` belonged) after the
+     resulting binary crashed with SIGILL. Fixed by splitting Group 3 and
+     Group 5 into their own separate opcode tables instead of trusting
+     two same-shaped mnemonic groups share an opcode byte.
+  2. `add`/`sub`/`and`/`or`/`xor`/`cmp` with an IMMEDIATE first operand
+     (`sub $16, %rsp`, `xor $1, %rax`) were being routed through the
+     register/memory-only 2-operand encoder (which assumes the first
+     operand is always a register or memory location, reading a `.Index`
+     field an immediate operand doesn't have), crashing outright
+     ("undefined property: Index") the moment `hello_native.abas` itself
+     -- the very first, smallest fixture -- was compiled. Fixed by
+     checking the first operand's own kind before dispatch and routing
+     immediate-first-operand forms through the correct, genuinely
+     different `81 /ext id` encoding family instead.
+  Verified via real execution -- not just that assembly renders or that
+  compilation succeeds without a diagnostic, the same "confirm on real
+  hardware, not by inspection" discipline this session already used for
+  the `INT.CMP_*_UNSIGNED`/`SHR` opcode-name surprises -- every one of the
+  12 permanent `fission/tests/native_programs/*.abas` fixtures (hello-
+  native, FizzBuzz, Fibonacci, many_params, strings, concat, do_loops,
+  string_equality, arrays, for_each, loop_control, bitops) was rebuilt
+  from a clean state (deleting all previous `.rivet`/`build` artifacts
+  first, confirming no stale cache was hiding a real failure) and its
+  real output re-verified byte-for-byte identical to legacy `ArcoFission
+  compile-run`, with zero `as`/`ld`/subprocess invocation anywhere in the
+  path -- confirmed directly (a fresh build produces ONLY the final ELF64
+  files, no intermediate `.s`/`.o` artifacts at all; `file` and `objdump`
+  both recognize the output as a genuine ELF64; the driver's own source,
+  `fission/cli/compile_to_x86_64.abas`, has zero `Process.Run` calls
+  anywhere in it now).
+  `fission/amir/x86_64_assembler.abas` and `src/runtime/runtime.cpp`'s new
+  `File.SetExecutable` added to the self-parse/self-semantic corpus (91 ->
+  92 files, 138 -> 140 import edges, 2999 -> 3196 symbols, 0 diagnostics);
+  golden values in `tests/integration/fission_substrate_core_smoke.sh`
+  updated to match (all three: file count, edge count, symbol count).
+  `cmake --build build --target ArcoFission` and the C++ unit test suite
+  (`arco_runtime_tests` and friends) re-run directly to confirm the
+  `File.SetExecutable` runtime addition itself is sound, in addition to
+  the normal `rivet build` + `fissure run` verification. Verified with
+  plain `fissure run` (452s, passing).
 
 ## In-Progress Components
 
@@ -1762,6 +1862,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/for_each.abas`
 - `fission/tests/native_programs/loop_control.abas`
 - `fission/tests/native_programs/bitops.abas`
+- `fission/amir/x86_64_assembler.abas`
 - `fission/tests/sir_to_amir_loop_control_smoke.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
@@ -1796,6 +1897,19 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - Fissure is the regression authority.
 - Rivet owns build orchestration.
 - macOS is unsupported and out of scope.
+- **Native x86-64 codegen must be fully self-contained -- no external
+  `as`/`ld`/GAS dependency, ever.** REVERSES an earlier scope decision
+  recorded in this same ledger (WP-009's own Completed Components entry
+  originally chose to emit GAS text and hand off to the system assembler/
+  linker, reasoning by analogy to WP-012's "reuse legacy's own
+  bytecode-embedding linker step" choice). Overridden directly by the
+  project owner: "we're passing stuff to GAS. Arcology is supposed to be
+  self contained. It's its own ecosystem. Port the machine code gen from
+  legacy fission." `fission/amir/x86_64_assembler.abas` is the real,
+  ArcoBASIC-implemented instruction encoder + minimal ELF64 writer that
+  closed this gap -- see its own Completed Components entry and header
+  comment for the full scope and the real bugs found building it. Do not
+  reintroduce an `as`/`ld`/subprocess dependency into this path.
 - The first implementation slice uses plain ArcoBASIC classes and functions, not
   a compiler-definition DSL.
 - Fission Core route resolution is based on artifact types (`Consumes` /
@@ -1990,11 +2104,16 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    ... NEXT`, unblocked by Phase 7's own arrays landing, needing ZERO
    dedicated codegen -- the same "already works" precedent FOR-range/DO
    set) plus real EXIT/CONTINUE across every loop shape (While/ForRange/
-   Do/ForEach) -- no embedded bytecode VM, no legacy ArcoFission
-   involvement in the compile itself (only `as`/`ld`). Real FizzBuzz, a
-   real recursive Fibonacci, a real 10-parameter function, a real
-   string-building program, and a real array-accumulation-over-a-ForEach
-   program all run as genuine standalone x86-64 binaries today.
+   Do/ForEach), plus bare AND/OR/BITAND/BITOR/BITXOR/SHL/SHR -- no
+   embedded bytecode VM, no legacy ArcoFission involvement in the compile
+   itself, and (as of `fission/amir/x86_64_assembler.abas`, a real
+   self-contained instruction encoder + ELF64 writer, requested directly
+   by the project owner to close a real external-tool dependency) no
+   `as`/`ld`/GAS involvement either. Real FizzBuzz, a real recursive
+   Fibonacci, a real 10-parameter function, a real string-building
+   program, and a real array-accumulation-over-a-ForEach program all run
+   as genuine standalone x86-64 binaries today, produced with zero
+   subprocess invocations anywhere in the compile path.
    Along the way, two real bugs were found and fixed while confirming DO
    loops (a wrong unsigned x86 comparison instruction family, and unary
    minus never being lowered by A-MIR at all -- a shared bug, also
@@ -2032,6 +2151,15 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    - DONE -- ForEach (was blocked on arrays not existing; needed zero
      dedicated codegen once Phase 7 landed) and EXIT/CONTINUE across every
      loop shape, see Completed Components.
+   - DONE -- bare AND/OR/BITAND/BITOR/BITXOR/SHL/SHR as real x86
+     instructions, see Completed Components (also discloses a real,
+     separate, pre-existing eager-not-short-circuit ANDALSO/ORELSE gap in
+     the SHARED A-MIR pass, out of scope for native codegen specifically).
+   - DONE -- full self-containment: `fission/amir/x86_64_assembler.abas`
+     replaces the system `as`/`ld` toolchain entirely with a real
+     ArcoBASIC-implemented instruction encoder + ELF64 writer, see
+     Completed Components and the Architectural Decisions entry recording
+     this reversal of WP-009's own original scope choice.
    - WP-011 Linux Runtime, the rest of it: objects/classes, and a
      real fallback to the existing ~244-entry host-function dispatch table
      for anything else (legacy's own `arco_call_host`/`host_bridge.cpp`

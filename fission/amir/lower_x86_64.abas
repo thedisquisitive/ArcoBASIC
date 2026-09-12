@@ -6,26 +6,33 @@
 ' ledger (.agents/FISSION_SUBSTRATE_PROGRESS.md) had left entirely untouched
 ' after WP-004/007/012 (A-MIR, bytecode, ArcoCapsule packaging) all landed.
 '
-' Deliberate scope decision, disclosed here rather than left implicit: this
-' pass emits GAS (GNU assembler) TEXT -- real x86-64 mnemonics -- and hands
-' that to the system `as`/`ld` toolchain to encode into actual machine code
-' and link into a final ELF64, instead of hand-encoding raw instruction bytes
-' the way legacy ArcoFission's own native backend does
-' (X86_64CodegenResult/generate_x86_64_program in src/compiler/fission.cpp,
-' a real low-level instruction encoder -- REX prefixes, ModRM/SIB bytes,
-' immediate/relocation handling -- roughly 4500 lines on its own). That is a
-' fundamentally different, much larger undertaking than everything else this
-' ledger has built so far, and is not what makes this substrate's own
-' architecture-layer codegen decisions (which registers, which instructions,
-' what stack/calling-convention shape represents an ArcoBASIC construct) real
-' or valuable -- exactly the same reasoning this session already applied to
-' WP-012 (ELF64 artifact writer: reused legacy's own bytecode-embedding
-' linker step, `ArcoFission package`, rather than writing a from-scratch
-' ELF64 writer). Legacy's own `render_x86_64_linux_asm` ends up funneling
-' through `as`/`ld` too, for exactly the parts a hand-rolled encoder still
-' can't fully own (external symbol resolution, final section layout) -- this
-' pass simply starts from GAS text instead of arriving at it as a secondary
-' rendering of already-encoded bytes.
+' This pass still emits real x86-64 mnemonics as TEXT -- but as of
+' fission/amir/x86_64_assembler.abas, that text is this backend's OWN
+' self-defined dialect, not GAS input: no external `as`/`ld` toolchain is
+' involved anywhere in reaching a final ELF64 anymore. That WAS the
+' original scope decision here (hand off to the system assembler/linker,
+' reasoning by analogy to WP-012's own "reuse legacy's `ArcoFission
+' package` rather than write a from-scratch ELF64 writer" choice) --
+' reversed directly by the project owner ("we're passing stuff to GAS...
+' Arcology is supposed to be self contained... port the machine code gen
+' from legacy fission"). Real self-containment turned out simpler than
+' legacy's own general-purpose approach: legacy ArcoFission's native
+' backend (`generate_x86_64_program`, src/compiler/fission.cpp, using a
+' real byte-level encoder, `systems::x86_64::Assembler`) ALSO ends up
+' rendering back to GAS text and shelling out to `as`/`ld` for its own
+' final Linux ELF64, for two things it explicitly declined to reimplement:
+' resolving calls into an external runtime shim, and general ELF section
+' layout. Fission's own situation has neither problem -- every callee this
+' backend ever emits (user functions, str_print/itoa_print/array_alloc/
+' etc.) lives in the SAME translation unit, so there is no external symbol
+' to resolve, only internal labels this same compile already knows about --
+' making a real, self-contained assembler + minimal ELF64 writer (this
+' backend's own text dialect -> real machine code bytes -> a real ELF64
+' file, via a standard two-pass "encode with placeholders, then patch"
+' scheme, no general relocation/linking machinery needed at all) a genuinely
+' smaller, tractable undertaking than it first appears. See
+' fission/amir/x86_64_assembler.abas's own header comment for the full
+' scope and the real bugs found while building it.
 '
 ' Phase 7 scope (Phase 1: PRINT of a string literal; Phase 2: variables/
 ' arithmetic/comparisons/IF/WHILE/FOR/DO over plain numbers; Phase 3: real

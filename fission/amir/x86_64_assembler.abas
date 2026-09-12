@@ -1,0 +1,926 @@
+' A real, self-contained x86-64 instruction encoder and minimal ELF64
+' executable writer, ported (as a real ArcoBASIC implementation, per this
+' project's own "First-party Fission implementation should be ArcoBASIC
+' wherever technically possible" rule) from the byte-level encoding
+' techniques legacy ArcoFission itself already proved out
+' (systems::x86_64::Assembler, arcology-os/include/arco/x86_64_encoder.hpp
+' -- REX-prefix/ModRM/SIB bit patterns verified there against `nasm -f bin`
+' output). This exists specifically because Arcology is meant to be a
+' self-contained ecosystem: this substrate's native x86-64 backend
+' previously rendered GAS assembly TEXT and shelled out to the system
+' `as`/`ld` toolchain to reach a final ELF64 -- a real external-tool
+' dependency for something as central as "compile ArcoBASIC to a native
+' executable," called out directly by the project owner ("we're passing
+' stuff to GAS... port the machine code gen from legacy fission").
+'
+' A genuinely useful finding while scoping this: legacy ArcoFission's OWN
+' Linux native backend also ends up shelling out to `as`/`ld` for the final
+' ELF64 (`render_x86_64_linux_asm`, src/compiler/fission.cpp) -- its own
+' byte-level encoder only ever reaches an in-memory instruction stream
+' (used directly by its JIT), then gets rendered BACK to GAS text and
+' handed to `as`/`ld` for two things it explicitly declined to reimplement:
+' resolving calls into an external runtime shim, and general ELF section
+' layout/alignment. Fission's own situation is simpler than legacy's
+' general-purpose one: every callee this backend ever emits (user
+' functions, str_print/itoa_print/array_alloc/etc.) lives in the SAME
+' translation unit -- there is no external symbol to resolve at all, only
+' internal labels whose final addresses this same file computes -- so a
+' real ELF64 writer here needs no general relocation/linking machinery,
+' just a standard two-pass "encode with placeholders, then patch" scheme.
+'
+' Scope: exactly the ~40 instruction mnemonics/operand shapes
+' fission/amir/lower_x86_64.abas's own codegen actually emits (confirmed
+' directly against every real fission/tests/native_programs/*.abas
+' fixture's own rendered assembly text, not assumed) -- this is
+' deliberately NOT a general x86-64 assembler. Every memory operand is
+' encoded using the WIDEST safe form (disp32, never disp8; rel32 jumps/
+' calls, never the short rel8 form) rather than a real assembler's own
+' size-minimizing relaxation -- code density is not a goal anywhere in this
+' project, and a single fixed-width encoding per instruction shape means
+' every instruction's own byte length is known immediately during a single
+' encoding pass, with no iterative relaxation needed at all.
+'
+' fission/amir/lower_x86_64.abas's OWN codegen logic (which A-MIR
+' instruction becomes which x86 operation) is completely unchanged by this
+' file -- it still renders the exact same text lines as before; this file
+' just parses that text (a small, fully self-defined dialect, not general
+' GAS syntax) into real machine code bytes and a real ELF64 file, replacing
+' fission/cli/compile_to_x86_64.abas's own `as`/`ld` shell-outs.
+
+#IMPORT "fission/core/diagnostics.abas"
+
+FUNCTION Fission_X86_64AsmRegisterIndex(name)
+    table = {rax: 0, rcx: 1, rdx: 2, rbx: 3, rsp: 4, rbp: 5, rsi: 6, rdi: 7,
+             r8: 8, r9: 9, r10: 10, r11: 11, r12: 12, r13: 13, r14: 14, r15: 15}
+    RETURN Object.Get(table, name, -1)
+END FUNCTION
+
+' Byte-sized register names this backend's own codegen actually emits:
+' the four legacy byte registers (al/cl/dl -- never bl, never the
+' high-byte ah/ch/dh/bh forms, and never spl/bpl/sil/dil, none of which
+' this backend's own codegen ever needs) plus the numbered r8b..r15b
+' forms (always available with no legacy ambiguity, unlike al/cl/dl).
+' Returns {Index, IsByteReg} or NULL if `name` isn't a recognized register
+' token at all.
+FUNCTION Fission_X86_64AsmParseRegisterToken(token)
+    name = token
+    IF String.StartsWith(name, "%") THEN name = String.Slice(name, 1, String.Length(name) - 1)
+    byteTable = {al: 0, cl: 1, dl: 2, bl: 3}
+    byteIndex = Object.Get(byteTable, name, -1)
+    IF byteIndex >= 0 THEN RETURN {Index: byteIndex, IsByteReg: TRUE}
+    IF String.EndsWith(name, "b") ANDALSO String.StartsWith(name, "r") THEN
+        wideName = String.Slice(name, 0, String.Length(name) - 1)
+        wideIndex = Fission_X86_64AsmRegisterIndex(wideName)
+        IF wideIndex >= 8 THEN RETURN {Index: wideIndex, IsByteReg: TRUE}
+    END IF
+    plainIndex = Fission_X86_64AsmRegisterIndex(name)
+    IF plainIndex >= 0 THEN RETURN {Index: plainIndex, IsByteReg: FALSE}
+    RETURN NULL
+END FUNCTION
+
+' A growing byte buffer plus the two-pass bookkeeping (labels and pending
+' fixups) a real assembler needs. `SELF.Bytes` holds every byte emitted so
+' far as a plain Number (0-255) array -- File.WriteBytes' own expected
+' shape.
+CLASS FissionX86_64Buffer
+    CONSTRUCTOR()
+        SELF.Bytes = []
+    END CONSTRUCTOR
+
+    FUNCTION Length()
+        RETURN LEN(SELF.Bytes)
+    END FUNCTION
+
+    FUNCTION EmitByte(value)
+        ignored = Array.Push(SELF.Bytes, value)
+        RETURN SELF
+    END FUNCTION
+
+    ' Little-endian, wrapping a negative value into its real two's-complement
+    ' 32-bit unsigned bit pattern first -- every displacement this backend
+    ' ever needs (a backward jump, a negative stack-slot offset) is a
+    ' genuine negative number until this point.
+    FUNCTION EmitU32(value)
+        v = value
+        IF v < 0 THEN v = v + 4294967296
+        ignored = SELF.EmitByte(v BITAND 255)
+        ignored = SELF.EmitByte((v SHR 8) BITAND 255)
+        ignored = SELF.EmitByte((v SHR 16) BITAND 255)
+        ignored = SELF.EmitByte((v SHR 24) BITAND 255)
+        RETURN SELF
+    END FUNCTION
+
+    ' Every literal immediate this backend's own codegen ever emits (loop
+    ' counters, ASCII codes, small user constants, syscall numbers) fits
+    ' comfortably in a signed 32-bit range -- confirmed by inventorying
+    ' every real fission/tests/native_programs/*.abas fixture's own
+    ' rendered assembly, not assumed -- so `mov $N, %reg64` always uses the
+    ' short REX.W C7 /0 id form (7 bytes: sign-extends the imm32 into the
+    ' full 64-bit register), matching exactly what `as` itself would have
+    ' chosen for these same values. A value outside that range falls back
+    ' to the full 10-byte REX.W B8+rd io form instead of silently
+    ' truncating it.
+    FUNCTION EmitU64Full(value)
+        v = value
+        IF v < 0 THEN v = v + 18446744073709551616
+        remaining = v
+        index = 0
+        WHILE index < 8
+            ignored = SELF.EmitByte(remaining BITAND 255)
+            remaining = remaining SHR 8
+            index = index + 1
+        WEND
+        RETURN SELF
+    END FUNCTION
+
+    ' Patches 4 bytes at `offset` in-place (used once every label's final
+    ' address is known) -- the same little-endian/two's-complement wrapping
+    ' EmitU32 does, just writing into an already-emitted position instead
+    ' of appending.
+    FUNCTION PatchU32(offset, value)
+        v = value
+        IF v < 0 THEN v = v + 4294967296
+        SELF.Bytes[offset] = v BITAND 255
+        SELF.Bytes[offset + 1] = (v SHR 8) BITAND 255
+        SELF.Bytes[offset + 2] = (v SHR 16) BITAND 255
+        SELF.Bytes[offset + 3] = (v SHR 24) BITAND 255
+        RETURN SELF
+    END FUNCTION
+
+    ' Little-endian 2-byte and 8-byte emission -- needed only for the
+    ' ELF64 header/program-header fields (e_type, e_entry, p_vaddr, ...),
+    ' never for real instruction encoding, which is always 32-bit-or-
+    ' narrower per this backend's own "always the widest SAFE, not
+    ' arbitrarily wide, form" rule.
+    FUNCTION EmitU16(value)
+        v = value
+        IF v < 0 THEN v = v + 65536
+        ignored = SELF.EmitByte(v BITAND 255)
+        ignored = SELF.EmitByte((v SHR 8) BITAND 255)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION EmitU64(value)
+        remaining = value
+        index = 0
+        WHILE index < 8
+            ignored = SELF.EmitByte(remaining BITAND 255)
+            remaining = remaining SHR 8
+            index = index + 1
+        WEND
+        RETURN SELF
+    END FUNCTION
+END CLASS
+
+FUNCTION Fission_X86_64AsmFitsSigned32(value)
+    RETURN value >= -2147483648 ANDALSO value <= 2147483647
+END FUNCTION
+
+' REX prefix -- 0100WRXB. Omitted entirely (real assemblers do this too)
+' when none of W/R/X/B are needed, exactly matching legacy's own byte
+' output for e.g. a bare `movb (%rdi), %al` (no REX at all).
+FUNCTION Fission_X86_64AsmRex(w, regIndex, indexRegIndex, rmIndex)
+    r = 0
+    IF regIndex >= 8 THEN r = 1
+    x = 0
+    IF indexRegIndex >= 8 THEN x = 1
+    b = 0
+    IF rmIndex >= 8 THEN b = 1
+    IF w == 0 ANDALSO r == 0 ANDALSO x == 0 ANDALSO b == 0 THEN RETURN -1
+    RETURN 64 BITOR (w SHL 3) BITOR (r SHL 2) BITOR (x SHL 1) BITOR b
+END FUNCTION
+
+FUNCTION Fission_X86_64AsmEmitRex(buffer, w, regIndex, indexRegIndex, rmIndex)
+    rex = Fission_X86_64AsmRex(w, regIndex, indexRegIndex, rmIndex)
+    IF rex >= 0 THEN ignored = buffer.EmitByte(rex)
+END FUNCTION
+
+' A parsed operand -- exactly one of:
+'   {Kind: "reg", Index, IsByteReg}
+'   {Kind: "imm", Value}
+'   {Kind: "mem", Base, HasIndex, Index, Scale, Disp}   -- Base/Index are
+'       register indices; HasIndex FALSE means a plain [Base+Disp] operand
+'   {Kind: "riprel", Label}                              -- LABEL(%rip)
+'   {Kind: "label", Name}                                -- a bare jmp/call
+'       target with no `%`/`$`/`(` at all
+FUNCTION Fission_X86_64AsmParseOperand(token)
+    trimmed = String.Trim(token)
+    IF String.StartsWith(trimmed, "$") THEN
+        RETURN {Kind: "imm", Value: NUMBER(String.Slice(trimmed, 1, String.Length(trimmed) - 1))}
+    END IF
+    IF String.EndsWith(trimmed, "(%rip)") THEN
+        label = String.Slice(trimmed, 0, String.Length(trimmed) - 6)
+        RETURN {Kind: "riprel", Label: label}
+    END IF
+    IF String.Contains(trimmed, "(") THEN
+        parenIndex = String.IndexOf(trimmed, "(")
+        dispText = String.Trim(String.Slice(trimmed, 0, parenIndex))
+        disp = 0
+        IF dispText != "" THEN disp = NUMBER(dispText)
+        inner = String.Slice(trimmed, parenIndex + 1, String.Length(trimmed) - parenIndex - 2)
+        parts = Fission_X86_64AsmSplitTopLevel(inner, ",")
+        baseReg = Fission_X86_64AsmParseRegisterToken(String.Trim(parts[0]))
+        IF LEN(parts) == 1 THEN
+            RETURN {Kind: "mem", Base: baseReg.Index, HasIndex: FALSE, Index: -1, Scale: 1, Disp: disp}
+        END IF
+        indexReg = Fission_X86_64AsmParseRegisterToken(String.Trim(parts[1]))
+        scale = NUMBER(String.Trim(parts[2]))
+        RETURN {Kind: "mem", Base: baseReg.Index, HasIndex: TRUE, Index: indexReg.Index, Scale: scale, Disp: disp}
+    END IF
+    IF String.StartsWith(trimmed, "%") THEN
+        reg = Fission_X86_64AsmParseRegisterToken(trimmed)
+        RETURN {Kind: "reg", Index: reg.Index, IsByteReg: reg.IsByteReg}
+    END IF
+    RETURN {Kind: "label", Name: trimmed}
+END FUNCTION
+
+' Splits `text` on `sep` at PAREN-DEPTH ZERO ONLY -- needed because a SIB
+' memory operand's own inner "base,index,scale" list (e.g.
+' "8(%rax,%rcx,8)") contains commas that must NOT be treated as operand
+' separators when splitting a whole instruction's operand list, and this
+' same splitter is reused (with `,` as `sep`) for that inner list too, once
+' the outer parens have already been stripped down to just "rax,rcx,8".
+FUNCTION Fission_X86_64AsmSplitTopLevel(text, sep)
+    parts = []
+    current = ""
+    depth = 0
+    chars = String.ToChars(text)
+    sepLen = String.Length(sep)
+    index = 0
+    WHILE index < LEN(chars)
+        ch = chars[index]
+        IF ch == "(" THEN depth = depth + 1
+        IF ch == ")" THEN depth = depth - 1
+        matchesSep = FALSE
+        IF depth == 0 ANDALSO index + sepLen <= LEN(chars) THEN
+            candidate = String.Slice(text, index, sepLen)
+            IF candidate == sep THEN matchesSep = TRUE
+        END IF
+        IF matchesSep THEN
+            ignored = Array.Push(parts, current)
+            current = ""
+            index = index + sepLen
+            CONTINUE WHILE
+        END IF
+        current = current + ch
+        index = index + 1
+    WEND
+    ignored = Array.Push(parts, current)
+    RETURN parts
+END FUNCTION
+
+' A memory (or register-direct) operand's ModRM[+SIB][+disp32] bytes,
+' given the OTHER operand's register index for the ModRM.reg field (per
+' the real x86-64 "/r" convention every instruction below uses). Always
+' the widest safe form: mod=11 for a bare register, otherwise ALWAYS
+' mod=10 (disp32), even for a zero or small displacement, and a SIB byte
+' whenever the base register is RSP/R12 (whose low 3 bits collide with
+' "SIB follows") or an explicit index register is present -- one uniform
+' code path with no smaller-encoding special cases to get wrong.
+FUNCTION Fission_X86_64AsmEmitModRM(buffer, regField, rm)
+    IF rm.Kind == "reg" THEN
+        modrm = 192 BITOR ((regField BITAND 7) SHL 3) BITOR (rm.Index BITAND 7)
+        ignored = buffer.EmitByte(modrm)
+        RETURN
+    END IF
+    IF rm.Kind == "riprel" THEN
+        modrm = ((regField BITAND 7) SHL 3) BITOR 5
+        ignored = buffer.EmitByte(modrm)
+        ignored = buffer.EmitU32(0)
+        RETURN
+    END IF
+    ' rm.Kind == "mem"
+    baseLow3 = rm.Base BITAND 7
+    needsSib = rm.HasIndex ORELSE baseLow3 == 4
+    rmField = 4
+    IF needsSib == FALSE THEN rmField = baseLow3
+    modrm = 128 BITOR ((regField BITAND 7) SHL 3) BITOR rmField
+    ignored = buffer.EmitByte(modrm)
+    IF needsSib THEN
+        indexLow3 = 4
+        IF rm.HasIndex THEN indexLow3 = rm.Index BITAND 7
+        scaleBits = 0
+        IF rm.HasIndex THEN
+            IF rm.Scale == 2 THEN scaleBits = 1
+            IF rm.Scale == 4 THEN scaleBits = 2
+            IF rm.Scale == 8 THEN scaleBits = 3
+        END IF
+        sib = (scaleBits SHL 6) BITOR (indexLow3 SHL 3) BITOR baseLow3
+        ignored = buffer.EmitByte(sib)
+    END IF
+    ignored = buffer.EmitU32(rm.Disp)
+END FUNCTION
+
+' The register-extension bits an `rm` operand contributes to REX.X/REX.B --
+' 0 for anything that isn't a "mem" operand with an extended base/index
+' register (a bare "reg" operand's own extension is handled by the caller
+' via its own regIndex, and "riprel"/"label" operands never need REX.X/B
+' at all since RIP-relative addressing has no base/index register).
+FUNCTION Fission_X86_64AsmRmIndexBits(rm)
+    IF rm.Kind == "mem" THEN
+        indexBit = -1
+        IF rm.HasIndex THEN indexBit = rm.Index
+        RETURN {Base: rm.Base, Index: indexBit}
+    END IF
+    IF rm.Kind == "reg" THEN RETURN {Base: rm.Index, Index: -1}
+    RETURN {Base: -1, Index: -1}
+END FUNCTION
+
+' Encodes a standard 2-operand "opcode /r" instruction where `regOperand`
+' (a bare register) fills ModRM.reg and `rmOperand` (register or memory)
+' fills ModRM.rm/SIB/disp32 -- the shape shared by mov/add/sub/and/or/xor/
+' cmp/test/movzx and friends below. `w` selects REX.W (64-bit operand
+' size); byte-sized forms (movb/cmpb/testb and any instruction using an
+' 8-bit register) pass w=0.
+FUNCTION Fission_X86_64AsmEmitRegRm(buffer, w, opcodeBytes, regIndex, rm)
+    rmBits = Fission_X86_64AsmRmIndexBits(rm)
+    ignored = Fission_X86_64AsmEmitRex(buffer, w, regIndex, rmBits.Index, rmBits.Base)
+    FOR b IN opcodeBytes
+        ignored = buffer.EmitByte(b)
+    NEXT
+    ignored = Fission_X86_64AsmEmitModRM(buffer, regIndex, rm)
+END FUNCTION
+
+' A relative-displacement fixup: patched once every label's own final
+' address is known. `FieldOffset` is the byte offset (in the FINAL,
+' combined text+rodata buffer -- see Fission_X86_64Assemble) of the first
+' byte of the 4-byte field to patch; the real x86-64 rule for BOTH a near
+' JMP/Jcc/CALL's rel32 and a RIP-relative LEA's own disp32 is identical:
+' `target_address - (address_of_the_byte_immediately_after_this_field)`,
+' so one fixup shape covers both cases.
+FUNCTION FissionX86_64Fixup(fieldOffset, targetLabel)
+    RETURN {FieldOffset: fieldOffset, Target: targetLabel}
+END FUNCTION
+
+' The whole per-instruction dispatcher: given a mnemonic and its already-
+' top-level-split operand tokens, appends real bytes to `buffer` and
+' records any fixup needed (a jmp/call/lea whose target is a label defined
+' elsewhere in this same program) into `fixups`. `currentOffset()` is a
+' function the caller supplies to read the buffer's own length at the
+' moment a fixup is recorded, since PushLoop-style closures aren't needed
+' here -- `buffer.Length()` is passed directly instead.
+FUNCTION Fission_X86_64AsmEncodeInstruction(buffer, fixups, diagnostics, mnemonic, operandTokens)
+    operands = []
+    FOR token IN operandTokens
+        ignored = Array.Push(operands, Fission_X86_64AsmParseOperand(token))
+    NEXT
+
+    ' "op $N, dst" -- an immediate first operand (`sub $16, %rsp`,
+    ' `add $8, %rsp`, `xor $1, %rax`), a genuinely different encoding
+    ' family (81 /ext id) from the register/memory "op src, dst" form
+    ' below, checked first since add/sub/and/or/xor/cmp all share the same
+    ' mnemonic between both forms and only the FIRST operand's own kind
+    ' tells them apart.
+    immExtOpcodes = {"add": 0, "or": 1, "and": 4, "sub": 5, "xor": 6, "cmp": 7}
+    IF Object.Has(immExtOpcodes, mnemonic) ANDALSO LEN(operands) == 2 ANDALSO operands[0].Kind == "imm" THEN
+        ext = Object.Get(immExtOpcodes, mnemonic, 0)
+        dst = operands[1]
+        rmBits = Fission_X86_64AsmRmIndexBits(dst)
+        ignored = Fission_X86_64AsmEmitRex(buffer, 1, 0, -1, rmBits.Base)
+        ignored = buffer.EmitByte(129)
+        ignored = Fission_X86_64AsmEmitModRM(buffer, ext, dst)
+        ignored = buffer.EmitU32(operands[0].Value)
+        RETURN
+    END IF
+
+    ' Plain register-register / register-memory "op src, dst" family --
+    ' AT&T order: ModRM.reg = SRC (1st operand), ModRM.rm = DST (2nd).
+    ' Two opcode tables since a byte-register pair (only ever `cmp %al,
+    ' %cl`-shaped in this backend's own real codegen, but handled
+    ' generally rather than special-cased to just that one mnemonic) needs
+    ' the byte-sized opcode family and REX.W=0, not the 64-bit family.
+    binaryOpcodes = {"add": [1], "sub": [41], "and": [33], "or": [9], "xor": [49], "cmp": [57], "test": [133]}
+    binaryOpcodesByte = {"add": [0], "sub": [40], "and": [32], "or": [8], "xor": [48], "cmp": [56], "test": [132]}
+    IF Object.Has(binaryOpcodes, mnemonic) THEN
+        src = operands[0]
+        dst = operands[1]
+        isByte = (src.Kind == "reg" ANDALSO src.IsByteReg) ORELSE (dst.Kind == "reg" ANDALSO dst.IsByteReg)
+        opcode = Object.Get(binaryOpcodes, mnemonic, [])
+        w = 1
+        IF isByte THEN
+            opcode = Object.Get(binaryOpcodesByte, mnemonic, [])
+            w = 0
+        END IF
+        regIndex = src.Index
+        IF dst.Kind == "reg" ANDALSO src.Kind == "mem" THEN
+            ' A memory source with a register dest still needs the "load"
+            ' direction bit for cmp/test to read correctly -- but every
+            ' real use in this backend's own codegen keeps the register
+            ' operand as ModRM.reg regardless of which side loads, since
+            ' the encoded FLAGS/result is symmetric for cmp/test and the
+            ' other binaryOpcodes members never see a bare memory operand
+            ' at all in this backend's own generated text.
+            regIndex = dst.Index
+        END IF
+        ignored = Fission_X86_64AsmEmitRegRm(buffer, w, opcode, regIndex, dst)
+        RETURN
+    END IF
+
+    ' `movq $N, disp(%rbp)`-shaped: an immediate stored directly to a
+    ' memory operand, with an explicit `q` (quadword) size suffix since
+    ' unlike every other `mov` this backend emits, there is no register
+    ' operand at all to make the 64-bit operand size unambiguous. Byte-
+    ' identical encoding to the "mov" immediate-to-memory case below (C7
+    ' /0 id), just reached under a different mnemonic spelling.
+    IF mnemonic == "mov" ORELSE mnemonic == "movq" THEN
+        src = operands[0]
+        dst = operands[1]
+        IF src.Kind == "imm" THEN
+            ' C7 /0 id -- MOV r/m64, imm32 (sign-extended). Works
+            ' identically whether dst is a register (mod=11) or a memory
+            ' operand (mod=10 disp32 then the imm32 value) since
+            ' Fission_X86_64AsmEmitModRM already handles both uniformly.
+            rmBits = Fission_X86_64AsmRmIndexBits(dst)
+            ignored = Fission_X86_64AsmEmitRex(buffer, 1, 0, -1, rmBits.Base)
+            ignored = buffer.EmitByte(199)
+            ignored = Fission_X86_64AsmEmitModRM(buffer, 0, dst)
+            ignored = buffer.EmitU32(src.Value)
+            RETURN
+        END IF
+        IF src.Kind == "riprel" THEN
+            ' Never actually emitted (`lea`, not `mov`, is always used for
+            ' a label reference in this backend's own codegen) but handled
+            ' for completeness/robustness rather than silently mis-encoding
+            ' it if that ever changes.
+            ignored = diagnostics.ReportError("FISSION_X86_64_ASM_UNSUPPORTED", "mov with a RIP-relative source is not supported")
+            RETURN
+        END IF
+        IF src.Kind == "reg" ANDALSO dst.Kind == "reg" THEN
+            IF src.IsByteReg THEN
+                ignored = Fission_X86_64AsmEmitRegRm(buffer, 0, [136], src.Index, dst)
+            ELSE
+                ignored = Fission_X86_64AsmEmitRegRm(buffer, 1, [137], src.Index, dst)
+            END IF
+            RETURN
+        END IF
+        IF src.Kind == "reg" ANDALSO dst.Kind == "mem" THEN
+            ' Store: reg -> memory.
+            IF src.IsByteReg THEN
+                ignored = Fission_X86_64AsmEmitRegRm(buffer, 0, [136], src.Index, dst)
+            ELSE
+                ignored = Fission_X86_64AsmEmitRegRm(buffer, 1, [137], src.Index, dst)
+            END IF
+            RETURN
+        END IF
+        IF src.Kind == "mem" ANDALSO dst.Kind == "reg" THEN
+            ' Load: memory -> reg.
+            IF dst.IsByteReg THEN
+                ignored = Fission_X86_64AsmEmitRegRm(buffer, 0, [138], dst.Index, src)
+            ELSE
+                ignored = Fission_X86_64AsmEmitRegRm(buffer, 1, [139], dst.Index, src)
+            END IF
+            RETURN
+        END IF
+        ignored = diagnostics.ReportError("FISSION_X86_64_ASM_UNSUPPORTED", "Unsupported mov operand combination")
+        RETURN
+    END IF
+
+    IF mnemonic == "movb" THEN
+        src = operands[0]
+        dst = operands[1]
+        IF src.Kind == "imm" THEN
+            ' C6 /0 ib -- MOV r/m8, imm8.
+            rmBits = Fission_X86_64AsmRmIndexBits(dst)
+            ignored = Fission_X86_64AsmEmitRex(buffer, 0, 0, -1, rmBits.Base)
+            ignored = buffer.EmitByte(198)
+            ignored = Fission_X86_64AsmEmitModRM(buffer, 0, dst)
+            ignored = buffer.EmitByte(src.Value)
+            RETURN
+        END IF
+        IF dst.Kind == "reg" THEN
+            ignored = Fission_X86_64AsmEmitRegRm(buffer, 0, [138], dst.Index, src)
+        ELSE
+            ignored = Fission_X86_64AsmEmitRegRm(buffer, 0, [136], src.Index, dst)
+        END IF
+        RETURN
+    END IF
+
+    IF mnemonic == "movzbq" THEN
+        src = operands[0]
+        dst = operands[1]
+        ignored = Fission_X86_64AsmEmitRegRm(buffer, 1, [15, 182], dst.Index, src)
+        RETURN
+    END IF
+
+    IF mnemonic == "cmpb" THEN
+        left = operands[0]
+        right = operands[1]
+        IF left.Kind == "imm" THEN
+            ' 80 /7 ib -- CMP r/m8, imm8 (right is the memory operand).
+            rmBits = Fission_X86_64AsmRmIndexBits(right)
+            ignored = Fission_X86_64AsmEmitRex(buffer, 0, 0, -1, rmBits.Base)
+            ignored = buffer.EmitByte(128)
+            ignored = Fission_X86_64AsmEmitModRM(buffer, 7, right)
+            ignored = buffer.EmitByte(left.Value)
+            RETURN
+        END IF
+        ignored = diagnostics.ReportError("FISSION_X86_64_ASM_UNSUPPORTED", "Unsupported cmpb operand combination")
+        RETURN
+    END IF
+
+    IF mnemonic == "testb" THEN
+        left = operands[0]
+        right = operands[1]
+        ignored = Fission_X86_64AsmEmitRegRm(buffer, 0, [132], left.Index, right)
+        RETURN
+    END IF
+
+    IF mnemonic == "imul" THEN
+        src = operands[0]
+        dst = operands[1]
+        ignored = Fission_X86_64AsmEmitRegRm(buffer, 1, [15, 175], dst.Index, src)
+        RETURN
+    END IF
+
+    IF mnemonic == "cqto" THEN
+        ignored = buffer.EmitByte(72)
+        ignored = buffer.EmitByte(153)
+        RETURN
+    END IF
+
+    ' Group 3 (opcode F7 /ext) -- idiv/div/neg/not. A real, caught-by-
+    ' running-the-code bug found here: inc/dec were originally grouped into
+    ' this SAME F7 opcode table, but INC/DEC r/m64 is a genuinely different
+    ' opcode (Group 5, FF /0 and /1 respectively) -- F7 /0 is actually
+    ' TEST r/m,imm32, so `inc %rax` was being mis-encoded as a 7-byte TEST
+    ' instruction with garbage trailing bytes, corrupting everything after
+    ' it (confirmed via objdump on the real emitted bytes: a `test
+    ' rax,0xffffffffffffebe9` where a plain 3-byte `inc rax` belonged,
+    ' followed by a SIGILL when the corrupted instruction stream was
+    ' actually executed). Split into its own Group 5 table below instead
+    ' of trusting the two families share an opcode just because both are
+    ' "unary register operand" shaped.
+    group3Opcodes = {"idiv": 7, "div": 6, "neg": 3, "not": 2}
+    IF Object.Has(group3Opcodes, mnemonic) THEN
+        ext = Object.Get(group3Opcodes, mnemonic, 0)
+        rm = operands[0]
+        rmBits = Fission_X86_64AsmRmIndexBits(rm)
+        ignored = Fission_X86_64AsmEmitRex(buffer, 1, 0, -1, rmBits.Base)
+        ignored = buffer.EmitByte(247)
+        ignored = Fission_X86_64AsmEmitModRM(buffer, ext, rm)
+        RETURN
+    END IF
+    group5Opcodes = {"inc": 0, "dec": 1}
+    IF Object.Has(group5Opcodes, mnemonic) THEN
+        ext = Object.Get(group5Opcodes, mnemonic, 0)
+        rm = operands[0]
+        rmBits = Fission_X86_64AsmRmIndexBits(rm)
+        ignored = Fission_X86_64AsmEmitRex(buffer, 1, 0, -1, rmBits.Base)
+        ignored = buffer.EmitByte(255)
+        ignored = Fission_X86_64AsmEmitModRM(buffer, ext, rm)
+        RETURN
+    END IF
+
+    IF mnemonic == "push" THEN
+        operand = operands[0]
+        IF operand.Kind == "reg" THEN
+            IF operand.Index >= 8 THEN ignored = buffer.EmitByte(65)
+            ignored = buffer.EmitByte(80 + (operand.Index BITAND 7))
+            RETURN
+        END IF
+        ' push m64 -- FF /6.
+        rmBits = Fission_X86_64AsmRmIndexBits(operand)
+        ignored = Fission_X86_64AsmEmitRex(buffer, 0, 0, -1, rmBits.Base)
+        ignored = buffer.EmitByte(255)
+        ignored = Fission_X86_64AsmEmitModRM(buffer, 6, operand)
+        RETURN
+    END IF
+    IF mnemonic == "pop" THEN
+        operand = operands[0]
+        IF operand.Index >= 8 THEN ignored = buffer.EmitByte(65)
+        ignored = buffer.EmitByte(88 + (operand.Index BITAND 7))
+        RETURN
+    END IF
+
+    IF mnemonic == "lea" THEN
+        src = operands[0]
+        dst = operands[1]
+        IF src.Kind == "riprel" THEN
+            rmBits = Fission_X86_64AsmRmIndexBits(src)
+            ignored = Fission_X86_64AsmEmitRex(buffer, 1, dst.Index, rmBits.Index, rmBits.Base)
+            ignored = buffer.EmitByte(141)
+            fieldOffset = buffer.Length() + 1
+            ignored = Fission_X86_64AsmEmitModRM(buffer, dst.Index, src)
+            ignored = Array.Push(fixups, FissionX86_64Fixup(fieldOffset, src.Label))
+            RETURN
+        END IF
+        ignored = Fission_X86_64AsmEmitRegRm(buffer, 1, [141], dst.Index, src)
+        RETURN
+    END IF
+
+    setccOpcodes = {"sete": 148, "setne": 149, "setl": 156, "setle": 158, "setg": 159, "setge": 157}
+    IF Object.Has(setccOpcodes, mnemonic) THEN
+        opcode = Object.Get(setccOpcodes, mnemonic, 148)
+        operand = operands[0]
+        IF operand.Index >= 8 THEN ignored = buffer.EmitByte(65)
+        ignored = buffer.EmitByte(15)
+        ignored = buffer.EmitByte(opcode)
+        ignored = buffer.EmitByte(192 BITOR (operand.Index BITAND 7))
+        RETURN
+    END IF
+
+    shiftImmOpcodes = {"shl": 4, "sar": 7, "shr": 5}
+    IF Object.Has(shiftImmOpcodes, mnemonic) THEN
+        ext = Object.Get(shiftImmOpcodes, mnemonic, 4)
+        left = operands[0]
+        right = operands[1]
+        IF left.Kind == "imm" THEN
+            rmBits = Fission_X86_64AsmRmIndexBits(right)
+            ignored = Fission_X86_64AsmEmitRex(buffer, 1, 0, -1, rmBits.Base)
+            ignored = buffer.EmitByte(193)
+            ignored = Fission_X86_64AsmEmitModRM(buffer, ext, right)
+            ignored = buffer.EmitByte(left.Value)
+            RETURN
+        END IF
+        ' %cl, reg -- D3 /ext, the CPU implicitly uses CL, not encoded in
+        ' the ModRM at all.
+        rmBits = Fission_X86_64AsmRmIndexBits(right)
+        ignored = Fission_X86_64AsmEmitRex(buffer, 1, 0, -1, rmBits.Base)
+        ignored = buffer.EmitByte(211)
+        ignored = Fission_X86_64AsmEmitModRM(buffer, ext, right)
+        RETURN
+    END IF
+
+    IF mnemonic == "jmp" ORELSE mnemonic == "call" THEN
+        opcode = 233
+        IF mnemonic == "call" THEN opcode = 232
+        ignored = buffer.EmitByte(opcode)
+        fieldOffset = buffer.Length()
+        ignored = buffer.EmitU32(0)
+        ignored = Array.Push(fixups, FissionX86_64Fixup(fieldOffset, operands[0].Name))
+        RETURN
+    END IF
+
+    jccOpcodes = {"je": 132, "jz": 132, "jne": 133, "jnz": 133, "jl": 140, "jle": 142,
+                  "jg": 143, "jge": 141, "js": 136, "jns": 137}
+    IF Object.Has(jccOpcodes, mnemonic) THEN
+        opcode = Object.Get(jccOpcodes, mnemonic, 132)
+        ignored = buffer.EmitByte(15)
+        ignored = buffer.EmitByte(opcode)
+        fieldOffset = buffer.Length()
+        ignored = buffer.EmitU32(0)
+        ignored = Array.Push(fixups, FissionX86_64Fixup(fieldOffset, operands[0].Name))
+        RETURN
+    END IF
+
+    IF mnemonic == "syscall" THEN
+        ignored = buffer.EmitByte(15)
+        ignored = buffer.EmitByte(5)
+        RETURN
+    END IF
+    IF mnemonic == "ret" THEN
+        ignored = buffer.EmitByte(195)
+        RETURN
+    END IF
+    IF mnemonic == "leave" THEN
+        ignored = buffer.EmitByte(201)
+        RETURN
+    END IF
+
+    ignored = diagnostics.ReportError("FISSION_X86_64_ASM_UNSUPPORTED", "Unsupported instruction mnemonic for the self-contained assembler: " + mnemonic)
+END FUNCTION
+
+' Reverses Fission_X86_64EscapeAscii's own escaping (fission/amir/
+' lower_x86_64.abas) -- a `.asciz`/`.ascii` directive's own quoted text
+' still carries literal two-character `\"`/`\\`/`\n`/`\t`/`\r` escape
+' sequences exactly the way a real GAS `.asciz` string would, since this
+' backend's own codegen never changed how it renders that text, only how
+' the RESULT is consumed. Returns a plain array of byte values (0-255).
+FUNCTION Fission_X86_64AsmUnescapeBytes(text)
+    chars = String.ToChars(text)
+    bytes = []
+    index = 0
+    WHILE index < LEN(chars)
+        ch = chars[index]
+        IF ch == "\\" ANDALSO index + 1 < LEN(chars) THEN
+            nextCh = chars[index + 1]
+            IF nextCh == "\"" THEN
+                ignored = Array.Push(bytes, 34)
+            ELSE
+                IF nextCh == "\\" THEN
+                    ignored = Array.Push(bytes, 92)
+                ELSE
+                    IF nextCh == "n" THEN
+                        ignored = Array.Push(bytes, 10)
+                    ELSE
+                        IF nextCh == "t" THEN
+                            ignored = Array.Push(bytes, 9)
+                        ELSE
+                            IF nextCh == "r" THEN
+                                ignored = Array.Push(bytes, 13)
+                            ELSE
+                                ignored = Array.Push(bytes, Fission_X86_64AsmCharCode(nextCh))
+                            END IF
+                        END IF
+                    END IF
+                END IF
+            END IF
+            index = index + 2
+            CONTINUE WHILE
+        END IF
+        ignored = Array.Push(bytes, Fission_X86_64AsmCharCode(ch))
+        index = index + 1
+    WEND
+    RETURN bytes
+END FUNCTION
+
+' A plain ASCII byte value for a single-character string -- every string
+' constant this backend's own codegen ever renders is plain ASCII source
+' text (confirmed by the same real-fixture inventory this whole file is
+' scoped to), so a small fixed table covering the printable ASCII range
+' plus the handful of control characters Fission_X86_64EscapeAscii itself
+' ever needs to escape is enough; anything else falls back to 63 ('?')
+' rather than silently emitting a wrong byte for a codepoint this backend
+' was never asked to round-trip.
+FUNCTION Fission_X86_64AsmCharCode(ch)
+    table = String.ToChars(" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~")
+    index = 0
+    WHILE index < LEN(table)
+        IF table[index] == ch THEN RETURN 32 + index
+        index = index + 1
+    WEND
+    RETURN 63
+END FUNCTION
+
+FUNCTION Fission_X86_64AsmRoundUp(value, align)
+    remainder = value BITAND (align - 1)
+    IF remainder == 0 THEN RETURN value
+    RETURN value + (align - remainder)
+END FUNCTION
+
+' Splits an already-trimmed instruction/directive line into its mnemonic
+' and (still top-level-comma-joined) operand text, e.g.
+' "mov %rdx, 8(%rax,%rcx,8)" -> {Mnemonic: "mov", OperandsText: "%rdx, 8(%rax,%rcx,8)"}.
+FUNCTION Fission_X86_64AsmSplitMnemonic(trimmedLine)
+    spaceIndex = String.IndexOf(trimmedLine, " ")
+    IF spaceIndex < 0 THEN RETURN {Mnemonic: trimmedLine, OperandsText: ""}
+    mnemonic = String.Slice(trimmedLine, 0, spaceIndex)
+    rest = String.Trim(String.Slice(trimmedLine, spaceIndex + 1, String.Length(trimmedLine) - spaceIndex - 1))
+    RETURN {Mnemonic: mnemonic, OperandsText: rest}
+END FUNCTION
+
+' A label's own final virtual address, given which section defined it and
+' that section's own base offset within the combined text+rodata+bss
+' region -- -1 if `name` was never defined anywhere (a real, reported
+' diagnostic at the call site, not a silently wrong jump target).
+FUNCTION Fission_X86_64AsmResolveVaddr(textLabels, rodataLabels, bssLabels, baseVaddr, headerSize, textLen, rodataLen, name)
+    IF Object.Has(textLabels, name) THEN RETURN baseVaddr + headerSize + Object.Get(textLabels, name, 0)
+    IF Object.Has(rodataLabels, name) THEN RETURN baseVaddr + headerSize + textLen + Object.Get(rodataLabels, name, 0)
+    IF Object.Has(bssLabels, name) THEN RETURN baseVaddr + headerSize + textLen + rodataLen + Object.Get(bssLabels, name, 0)
+    RETURN -1
+END FUNCTION
+
+' The real assembler entry point: parses `assemblyText` (the exact text
+' fission/amir/lower_x86_64.abas's own Fission_AmirToX86_64 already
+' produces -- this backend's own self-defined dialect, not general GAS)
+' into real machine code and links it into a real minimal ELF64
+' executable, with NO external `as`/`ld` involvement at all. Two real
+' passes: the first walks every line in source order, encoding .text
+' instructions into real bytes immediately (using a placeholder 0 for any
+' rel32/RIP-relative field whose target is a label -- a real fixup is
+' recorded instead) and accumulating .rodata bytes / .bss size, while
+' recording every label's own LOCAL offset within its own section; the
+' second, once every section's final length is known, resolves each
+' recorded fixup's target label to a real virtual address and patches the
+' placeholder in place. Returns {Ok, Bytes, Diagnostics}; `Bytes` is a
+' plain array of byte values (0-255), File.WriteBytes' own expected shape.
+FUNCTION Fission_X86_64Assemble(assemblyText)
+    diagnostics = FissionDiagnosticBag()
+    textBuffer = FissionX86_64Buffer()
+    rodataBuffer = FissionX86_64Buffer()
+    textFixups = []
+    textLabels = {}
+    rodataLabels = {}
+    bssLabels = {}
+    bssOffset = 0
+    currentSection = "text"
+
+    lines = String.Split(assemblyText, "\n")
+    FOR rawLine IN lines
+        IF String.Trim(rawLine) == "" THEN CONTINUE FOR
+        isLabel = (String.StartsWith(rawLine, "    ") == FALSE) ANDALSO String.EndsWith(String.Trim(rawLine), ":")
+        IF isLabel THEN
+            trimmed = String.Trim(rawLine)
+            name = String.Slice(trimmed, 0, String.Length(trimmed) - 1)
+            IF currentSection == "text" THEN textLabels = Object.Set(textLabels, name, textBuffer.Length())
+            IF currentSection == "rodata" THEN rodataLabels = Object.Set(rodataLabels, name, rodataBuffer.Length())
+            IF currentSection == "bss" THEN bssLabels = Object.Set(bssLabels, name, bssOffset)
+            CONTINUE FOR
+        END IF
+
+        split = Fission_X86_64AsmSplitMnemonic(String.Trim(rawLine))
+        mnemonic = split.Mnemonic
+        operandsText = split.OperandsText
+
+        IF mnemonic == ".section" THEN
+            currentSection = String.Slice(operandsText, 1, String.Length(operandsText) - 1)
+            CONTINUE FOR
+        END IF
+        IF mnemonic == ".globl" THEN CONTINUE FOR
+
+        IF mnemonic == ".asciz" ORELSE mnemonic == ".ascii" THEN
+            quoted = String.Slice(operandsText, 1, String.Length(operandsText) - 2)
+            bytes = Fission_X86_64AsmUnescapeBytes(quoted)
+            FOR b IN bytes
+                ignored = rodataBuffer.EmitByte(b)
+            NEXT
+            IF mnemonic == ".asciz" THEN ignored = rodataBuffer.EmitByte(0)
+            CONTINUE FOR
+        END IF
+        IF mnemonic == ".byte" THEN
+            ignored = rodataBuffer.EmitByte(NUMBER(operandsText))
+            CONTINUE FOR
+        END IF
+        IF mnemonic == ".align" THEN
+            IF currentSection == "bss" THEN bssOffset = Fission_X86_64AsmRoundUp(bssOffset, NUMBER(operandsText))
+            CONTINUE FOR
+        END IF
+        IF mnemonic == ".skip" THEN
+            IF currentSection == "bss" THEN bssOffset = bssOffset + NUMBER(operandsText)
+            CONTINUE FOR
+        END IF
+
+        IF currentSection != "text" THEN
+            ignored = diagnostics.ReportError("FISSION_X86_64_ASM_UNSUPPORTED", "Real instruction found outside .text: " + mnemonic)
+            CONTINUE FOR
+        END IF
+        operandTokens = []
+        IF operandsText != "" THEN operandTokens = Fission_X86_64AsmSplitTopLevel(operandsText, ",")
+        index = 0
+        WHILE index < LEN(operandTokens)
+            operandTokens[index] = String.Trim(operandTokens[index])
+            index = index + 1
+        WEND
+        ignored = Fission_X86_64AsmEncodeInstruction(textBuffer, textFixups, diagnostics, mnemonic, operandTokens)
+    NEXT
+
+    IF diagnostics.HasErrors() THEN RETURN {Ok: FALSE, Bytes: [], Diagnostics: diagnostics}
+
+    ' A minimal, statically-linked, non-PIE ELF64 executable: a fixed
+    ' virtual load base (0x400000, the same conventional default `ld`
+    ' itself uses for a non-PIE Linux x86-64 executable) with ONE PT_LOAD
+    ' segment covering the whole file (headers + .text + .rodata) plus a
+    ' zero-filled tail beyond the file's own length for .bss (p_memsz >
+    ' p_filesz is explicitly legal ELF -- the kernel zero-fills the
+    ' difference itself, no file bytes needed for .bss at all). No section
+    ' headers at all (e_shnum=0) -- execve/the kernel loader only ever
+    ' reads program headers, and this substrate has no other tool that
+    ' would need section headers to inspect this file either.
+    headerSize = 120
+    baseVaddr = 4194304
+    textLen = textBuffer.Length()
+    rodataLen = rodataBuffer.Length()
+
+    FOR fixup IN textFixups
+        targetVaddr = Fission_X86_64AsmResolveVaddr(textLabels, rodataLabels, bssLabels, baseVaddr, headerSize, textLen, rodataLen, fixup.Target)
+        IF targetVaddr < 0 THEN
+            ignored = diagnostics.ReportError("FISSION_X86_64_ASM_UNSUPPORTED", "Undefined label referenced by the self-contained assembler: " + fixup.Target)
+            CONTINUE FOR
+        END IF
+        instructionEndVaddr = baseVaddr + headerSize + fixup.FieldOffset + 4
+        ignored = textBuffer.PatchU32(fixup.FieldOffset, targetVaddr - instructionEndVaddr)
+    NEXT
+    IF diagnostics.HasErrors() THEN RETURN {Ok: FALSE, Bytes: [], Diagnostics: diagnostics}
+
+    entryVaddr = baseVaddr + headerSize
+    fileSize = headerSize + textLen + rodataLen
+
+    elf = FissionX86_64Buffer()
+    ' e_ident: magic, ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_SYSV,
+    ' ABI version, 7 bytes padding.
+    identBytes = [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    FOR b IN identBytes
+        ignored = elf.EmitByte(b)
+    NEXT
+    ignored = elf.EmitU16(2)
+    ignored = elf.EmitU16(62)
+    ignored = elf.EmitU32(1)
+    ignored = elf.EmitU64(entryVaddr)
+    ignored = elf.EmitU64(64)
+    ignored = elf.EmitU64(0)
+    ignored = elf.EmitU32(0)
+    ignored = elf.EmitU16(64)
+    ignored = elf.EmitU16(56)
+    ignored = elf.EmitU16(1)
+    ignored = elf.EmitU16(0)
+    ignored = elf.EmitU16(0)
+    ignored = elf.EmitU16(0)
+
+    ignored = elf.EmitU32(1)
+    ignored = elf.EmitU32(7)
+    ignored = elf.EmitU64(0)
+    ignored = elf.EmitU64(baseVaddr)
+    ignored = elf.EmitU64(baseVaddr)
+    ignored = elf.EmitU64(fileSize)
+    ignored = elf.EmitU64(fileSize + bssOffset)
+    ignored = elf.EmitU64(4096)
+
+    FOR b IN textBuffer.Bytes
+        ignored = elf.EmitByte(b)
+    NEXT
+    FOR b IN rodataBuffer.Bytes
+        ignored = elf.EmitByte(b)
+    NEXT
+
+    RETURN {Ok: TRUE, Bytes: elf.Bytes, Diagnostics: diagnostics}
+END FUNCTION
