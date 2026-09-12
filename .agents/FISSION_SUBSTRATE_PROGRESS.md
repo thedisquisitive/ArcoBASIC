@@ -1793,6 +1793,38 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   files list. Self-parse/self-semantic corpus grew 92 -> 95 files, 140 ->
   147 import edges, 3333 -> 3458 symbols; golden values updated to match.
   Verified with plain `fissure run` (474s, passing).
+- **Fusion support confirmed/hardened in Rivet** -- requested directly by
+  the project owner ("make sure we add fusion support into rivet") right
+  after the Fusion split above landed. `fission/build/rivet_native_capsules.abas`'s
+  `Fission_RivetBuildFusionCli` (an ordinary `BUILD.ArcoCapsule("fusion")`
+  target, called from this project's own `build.abas`) was already correct
+  and unchanged. The real gap found: `rivet/stdlib/rivet.abas`'s own
+  `FissionNativeCapsuleTarget` -- the reusable Rivet stdlib target type
+  every native-codegen capsule (including third-party ones, once other
+  languages are onboarded) is actually built through -- still carried a
+  STALE header comment describing the pre-Fusion pipeline ("x86_64
+  assembly -> `as` -> `ld`... `as`/`ld` are the only external tools this
+  path uses"), directly contradicting the self-contained-codegen work this
+  session already did. Fixed: rewrote the comment to correctly describe
+  the real current pipeline (encoder -> Fragment -> Fusion, in-process, no
+  external toolchain dependency at all), and bumped this class's own
+  `ToolVersion` fingerprint string (`fission-native/1` ->
+  `fission-native-fusion/1`) since the actual tool binary's behavior
+  genuinely changed (no more `as`/`ld` subprocesses) -- confirmed this
+  correctly forced a real cache invalidation: a fresh `rivet build`
+  recompiled all 15 existing native fixtures (`[COMPILE]`, not `[CACHE]`)
+  while leaving everything else (including `fission/cli/fusion.abas`
+  itself) cached, and every recompiled fixture still ran correctly
+  end-to-end (`classes`, `bool_print`, `strings` spot-checked directly).
+  Also ran `fissure run` at the repo root (the top-level `fissure.ab`, not
+  `fission/fissure.ab`, has its own `project.rivet` probe watching
+  `rivet/stdlib/rivet.abas` directly) -- `project.rivet` passed; a
+  `project.arcade` failure surfaced in the same run (`arcade_buildchain_smoke`'s
+  own "second rivet build should be a pure cache hit" check) but was
+  confirmed via `git stash` to be a pre-existing, unrelated flake,
+  reproducing identically with this change reverted -- not caused by this
+  work, left as a disclosed pre-existing gap rather than silently claimed
+  fixed or hidden.
 
 ## In-Progress Components
 
