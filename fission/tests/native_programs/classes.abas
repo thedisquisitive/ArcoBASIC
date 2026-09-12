@@ -1,0 +1,75 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises real CLASS support: a
+' constructor initializing a field, methods reading/writing SELF's own
+' fields, multiple independent instances (confirming real memory
+' isolation, not aliasing), a method calling another method on itself
+' (`SELF.Method(...)`), and inheritance with method overriding (a genuine
+' non-ambiguous case -- the base class's own field, accessed only through
+' the base class's own method, plus a derived class overriding a method,
+' resolved statically from each variable's own tracked concrete class).
+'
+' Real, disclosed Phase 1 scope, NOT exercised here (see
+' fission/amir/lower_x86_64.abas's own header comment for the full
+' reasoning): object fields are numeric-only; `obj.Method(...)` is
+' resolved STATICALLY at compile time from the calling code's own tracked
+' concrete class, not true runtime polymorphism -- a variable that could
+' hold different concrete classes at different times (e.g. down different
+' IF branches) is a real, disclosed diagnostic, not silently guessed at.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+CLASS Counter
+    CONSTRUCTOR(start)
+        SELF.Value = start
+    END CONSTRUCTOR
+
+    FUNCTION Increase(n)
+        SELF.Value = SELF.Value + n
+    END FUNCTION
+
+    FUNCTION Get()
+        RETURN SELF.Value
+    END FUNCTION
+
+    FUNCTION DoubleIt()
+        SELF.Increase(SELF.Get())
+    END FUNCTION
+END CLASS
+
+a = Counter(1)
+b = Counter(100)
+a.Increase(5)
+b.Increase(1)
+PRINT a.Get()
+PRINT b.Get()
+a.DoubleIt()
+PRINT a.Get()
+PRINT b.Get()
+
+CLASS Animal
+    CONSTRUCTOR(legs)
+        SELF.Legs = legs
+    END CONSTRUCTOR
+
+    FUNCTION Speak()
+        RETURN 0
+    END FUNCTION
+
+    FUNCTION GetLegs()
+        RETURN SELF.Legs
+    END FUNCTION
+END CLASS
+
+CLASS Dog EXTENDS Animal
+    FUNCTION Speak()
+        RETURN 1
+    END FUNCTION
+END CLASS
+
+pet1 = Animal(2)
+pet2 = Dog(4)
+PRINT pet1.Speak()
+PRINT pet2.Speak()
+PRINT pet1.GetLegs()

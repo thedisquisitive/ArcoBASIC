@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^92$" <<<"$fission_self_semantic_output"
 grep -q "^140$" <<<"$fission_self_semantic_output"
-grep -q "^3262$" <<<"$fission_self_semantic_output"
+grep -q "^3333$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -761,5 +761,16 @@ expected_bool_print_output="$(printf 'TRUE\nFALSE\nTRUE\nFALSE\nTRUE\nyes\nTRUE\
 test "$bool_print_native_output" = "$expected_bool_print_output"
 oracle_bool_print_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/bool_print.abas")"
 test "$bool_print_native_output" = "$oracle_bool_print_output"
+
+# fission/tests/native_programs/classes.abas exercises real CLASS support: a constructor
+# initializing a field, methods reading/writing SELF's own fields, multiple independent instances,
+# a method calling another method on itself, and inheritance with method overriding (resolved
+# statically from each variable's own tracked concrete class -- a real, disclosed Phase 1 scope
+# limit, not true runtime polymorphism).
+classes_native_output="$("$SOURCE_DIR/build/fission-native-programs/classes")"
+expected_classes_output="$(printf '6\n101\n12\n101\n0\n1\n2')"
+test "$classes_native_output" = "$expected_classes_output"
+oracle_classes_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/classes.abas")"
+test "$classes_native_output" = "$oracle_classes_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

@@ -18,13 +18,22 @@
 ' analysis, real STRING FUNCTION PARAMETERS AND RETURN VALUES -- a genuine
 ' Number/String kind CONFLICT across different call sites (real
 ' polymorphism, not representable here) is still a real diagnostic, not
-' guessed at -- and real PRINT of a Bool-kind value (a comparison result,
-' or a bare TRUE/FALSE literal) rendering `TRUE`/`FALSE` like the oracle
-' does, not the raw 0/1. Remaining real, disclosed gaps: arrays crossing a
-' function boundary, string ORDERING comparison (`<`/`<=`/`>`/`>=`),
-' branching on a string, arrays of anything but plain numbers, SAR (a real
-' oracle limitation, not just this backend's own), and real integer division
-' (`\`, likewise a real oracle limitation). Real execution verified
+' guessed at -- real PRINT of a Bool-kind value (a comparison result, or a
+' bare TRUE/FALSE literal) rendering `TRUE`/`FALSE` like the oracle does,
+' not the raw 0/1 -- and real CLASS support (a constructor initializing
+' numeric fields, methods reading/writing SELF's own fields, external
+' `obj.Field` access, multiple independent instances, inheritance with
+' method overriding), with `obj.Method(...)` resolved STATICALLY at
+' compile time from the calling code's own tracked concrete class (real
+' runtime polymorphism -- a variable that could hold different concrete
+' classes at different times -- is a real, disclosed diagnostic, the same
+' Number/String-conflict machinery generalized). Remaining real, disclosed
+' gaps: arrays crossing a function boundary, string ORDERING comparison
+' (`<`/`<=`/`>`/`>=`), branching on a string, arrays of anything but plain
+' numbers, non-numeric class fields, genuine class-instance runtime
+' polymorphism, SAR (a real oracle limitation, not just this backend's
+' own), and real integer division (`\`, likewise a real oracle
+' limitation). Real execution verified
 ' separately by
 ' fission/tests/native_programs/*.abas (built as real ELF64s via
 ' FissionNativeCapsuleTarget and run directly -- see
@@ -409,3 +418,68 @@ PRINT BoolPrintProgram.Diagnostics.HasErrors()
 BoolPrintAssembly = BoolPrintProgram.Render()
 PRINT String.Contains(BoolPrintAssembly, "call bool_print")
 PRINT String.Contains(BoolPrintAssembly, "call itoa_print")
+
+' Real CLASS support -- a constructor initializing a numeric field, a
+' method reading/writing SELF's own field, and a method call from outside
+' -- resolved to real fixed-offset field access and a real, statically-
+' resolved direct call (see Fission_X86_64CollectClassFields' own header
+' comment in fission/amir/lower_x86_64.abas for the full design). Real
+' execution verified separately by
+' fission/tests/native_programs/classes.abas. Checked here: zero
+' diagnostics, and that the rendered assembly actually contains
+' `call object_alloc`, a real fixed-displacement field access (`8(%rax)`,
+' `SELF.Value`'s own offset -- 0 is always reserved for `__class`), and a
+' real direct call to the statically-resolved method (`call
+' Counter.Increment`, not the variable-qualified `c.Increment` text the
+' A-MIR itself carries).
+ClassSource = "CLASS Counter\n    CONSTRUCTOR(start)\n        SELF.Value = start\n    END CONSTRUCTOR\n    FUNCTION Increment()\n        SELF.Value = SELF.Value + 1\n    END FUNCTION\nEND CLASS\nc = Counter(5)\nc.Increment()\nPRINT c.Value"
+ClassTokens = Fission_ArcoBasicLex(ClassSource)
+ClassAst = Fission_ArcoBasicParse(ClassTokens, "x86-64-class-smoke.abas")
+ClassSir = Fission_ArcoBasicAstToSir(ClassAst)
+ClassAmir = Fission_SirToAmir(ClassSir)
+ClassProgram = Fission_AmirToX86_64(ClassAmir)
+PRINT ClassProgram.Diagnostics.HasErrors()
+ClassAssembly = ClassProgram.Render()
+PRINT String.Contains(ClassAssembly, "call object_alloc")
+PRINT String.Contains(ClassAssembly, "8(%rax)")
+PRINT String.Contains(ClassAssembly, "call Counter.Increment")
+
+' A real, previously-undiscovered, SEVERE bug found while verifying
+' CLASS support, NOT class-specific at all: a function with no explicit
+' RETURN statement (falls off the end -- Counter.Increment above is
+' exactly this shape) previously emitted NO closing `leave`/`ret` at all,
+' silently falling through into whatever code is laid out next in the
+' flat `.text` stream and corrupting the return address -- confirmed via
+' a real SIGSEGV on the actual compiled binary before this fix. Checked
+' here directly on the class assembly already rendered above (Increment
+' itself never contains an explicit RETURN in its own ArcoBASIC source).
+PRINT String.Contains(ClassAssembly, "Counter.Increment:")
+
+' Real, disclosed Phase 1 gaps: a non-numeric (String) field, an unknown
+' field name, and genuine runtime polymorphism (a variable that could hold
+' different concrete classes at different times) all still correctly
+' report a diagnostic rather than silently misinterpreting one kind as
+' another.
+StringFieldSource = "CLASS Person\n    CONSTRUCTOR(name)\n        SELF.Name = name\n    END CONSTRUCTOR\nEND CLASS\np = Person(\"Ada\")"
+StringFieldTokens = Fission_ArcoBasicLex(StringFieldSource)
+StringFieldAst = Fission_ArcoBasicParse(StringFieldTokens, "x86-64-string-field-smoke.abas")
+StringFieldSir = Fission_ArcoBasicAstToSir(StringFieldAst)
+StringFieldAmir = Fission_SirToAmir(StringFieldSir)
+StringFieldProgram = Fission_AmirToX86_64(StringFieldAmir)
+PRINT StringFieldProgram.Diagnostics.HasErrors()
+
+UnknownFieldSource = "CLASS Counter\n    CONSTRUCTOR(start)\n        SELF.Value = start\n    END CONSTRUCTOR\nEND CLASS\nc = Counter(5)\nPRINT c.Missing"
+UnknownFieldTokens = Fission_ArcoBasicLex(UnknownFieldSource)
+UnknownFieldAst = Fission_ArcoBasicParse(UnknownFieldTokens, "x86-64-unknown-field-smoke.abas")
+UnknownFieldSir = Fission_ArcoBasicAstToSir(UnknownFieldAst)
+UnknownFieldAmir = Fission_SirToAmir(UnknownFieldSir)
+UnknownFieldProgram = Fission_AmirToX86_64(UnknownFieldAmir)
+PRINT UnknownFieldProgram.Diagnostics.HasErrors()
+
+PolyClassSource = "CLASS Animal\n    CONSTRUCTOR(legs)\n        SELF.Legs = legs\n    END CONSTRUCTOR\n    FUNCTION Speak()\n        RETURN 0\n    END FUNCTION\nEND CLASS\nCLASS Dog EXTENDS Animal\n    FUNCTION Speak()\n        RETURN 1\n    END FUNCTION\nEND CLASS\nx = 1\nIF x == 1 THEN\n    pet = Dog(4)\nELSE\n    pet = Animal(2)\nEND IF\nPRINT pet.Speak()"
+PolyClassTokens = Fission_ArcoBasicLex(PolyClassSource)
+PolyClassAst = Fission_ArcoBasicParse(PolyClassTokens, "x86-64-poly-class-smoke.abas")
+PolyClassSir = Fission_ArcoBasicAstToSir(PolyClassAst)
+PolyClassAmir = Fission_SirToAmir(PolyClassSir)
+PolyClassProgram = Fission_AmirToX86_64(PolyClassAmir)
+PRINT PolyClassProgram.Diagnostics.HasErrors()

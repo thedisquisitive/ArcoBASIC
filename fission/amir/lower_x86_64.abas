@@ -48,29 +48,47 @@
 ' (stack-passed arguments beyond the first 6, real recursion); real string
 ' VARIABLES/CONCATENATION/EQUALITY (`==`/`!=`, genuine content comparison);
 ' real numeric ARRAYS (construction, indexed read/write via real x86-64 SIB
-' scaled addressing, `LEN`); and, as of Fission_X86_64InferSignatures, real
-' STRING FUNCTION PARAMETERS AND RETURN VALUES -- closing the exact gap
-' this file's own header comment disclosed since Phase 4 ("a parameter is
-' always assumed numeric") via genuine inter-procedural fixed-point kind
-' inference across the whole module, not a per-function-only assumption.
+' scaled addressing, `LEN`); real STRING FUNCTION PARAMETERS AND RETURN
+' VALUES (Fission_X86_64InferSignatures, genuine inter-procedural fixed-
+' point kind inference across the whole module); real PRINT of a Bool-kind
+' value (a comparison result, or a bare TRUE/FALSE literal, rendering
+' `TRUE`/`FALSE` like the oracle, not the raw 0/1 -- a real, purely
+' native-side structural recovery, see Fission_X86_64OperandIsBoolLiteral's
+' own comment); and, as of Fission_X86_64CollectClassFields, real CLASS
+' support -- a constructor initializing numeric fields, methods reading/
+' writing SELF's own fields (and external `obj.Field` access), multiple
+' independent instances (real memory isolation, not aliasing), and
+' inheritance with method overriding, all via a fixed-per-class field-
+' offset layout resolved at compile time (see that function's own header
+' comment for the full "why fixed offsets are sound here" reasoning) and
+' `obj.Method(...)` calls resolved STATICALLY from the calling code's own
+' tracked "Object:ClassName" kind -- sound for the overwhelming majority
+' of real, non-polymorphic class usage, but not genuine runtime
+' polymorphism (a variable that could hold different concrete classes at
+' different times), which is a real, disclosed diagnostic (the same
+' Number/String-conflict machinery, generalized) rather than silently
+' guessed at.
 ' Deliberately still out of scope, still real, disclosed follow-on work:
 ' arrays crossing a function boundary (parameter or return value -- a real
-' diagnostic, not silently misinterpreted, the same reasoning the inference
-' above already applies to a genuine Number/String kind CONFLICT at
-' different call sites -- a parameter or return value has exactly one
-' physical kind, real polymorphism is not representable here); string
-' arrays / arrays of arrays / arrays holding anything but plain numbers;
-' branching on a string value; string ordering comparison (`<`/`<=`/`>`/
-' `>=` between two strings -- confirmed this is not even a real oracle
-' feature: `ArcoFission compile-run` on a real program comparing two
-' strings with `<` fails at runtime with "value is not a number", so this
-' backend's own diagnostic is arguably an improvement, catching the same
-' error at compile time instead); real integer division (`\`) and the `SAR`
-' keyword specifically (both likewise confirmed NOT implemented by the
-' oracle's own bytecode VM at all -- left unsupported here rather than
-' guessing a semantic the oracle itself can never confirm or deny); and
-' everything else WP-011 (Linux Runtime) still owes -- objects, the general
-' host-function bridge.
+' diagnostic, not silently misinterpreted, the same reasoning the string-
+' parameter inference above already applies to a genuine Number/String
+' kind CONFLICT at different call sites -- a parameter or return value has
+' exactly one physical kind, real polymorphism is not representable here);
+' string arrays / arrays of arrays / arrays holding anything but plain
+' numbers; branching on a string value; string ordering comparison
+' (`<`/`<=`/`>`/`>=` between two strings -- confirmed this is not even a
+' real oracle feature: `ArcoFission compile-run` on a real program
+' comparing two strings with `<` fails at runtime with "value is not a
+' number", so this backend's own diagnostic is arguably an improvement,
+' catching the same error at compile time instead); real integer division
+' (`\`) and the `SAR` keyword specifically (both likewise confirmed NOT
+' implemented by the oracle's own bytecode VM at all -- left unsupported
+' here rather than guessing a semantic the oracle itself can never confirm
+' or deny); non-numeric class fields; genuine class-instance runtime
+' polymorphism (a real dynamic-dispatch mechanism -- a runtime `__class`-
+' tag comparison chain -- is a real, substantial, unstarted piece of
+' follow-on work, not attempted here); and the general host-function
+' bridge WP-011 (Linux Runtime) still owes.
 
 CLASS FissionX86_64Program
     CONSTRUCTOR()
@@ -188,6 +206,139 @@ FUNCTION Fission_X86_64CollectFunctionNames(amirModule)
     RETURN names
 END FUNCTION
 
+' Real CLASS support: a CLASS entirely desugars (in the SHARED fission/sir/
+' lower_amir.abas, confirmed via `ArcoFission reveal ... at A-MIR` on a
+' real `CLASS Counter ... END CLASS` -- the same oracle-comparison
+' discipline every other construct in this file was built against) into
+' ordinary functions this backend already knows how to lower structurally
+' (`ClassName.Init`/`ClassName.MethodName` take SELF as an ordinary first
+' parameter; `ClassName.__new` allocates a bare instance and tags it;
+' `ClassName(ctorArgs...)` is an ordinary ArcoBASIC-callable wrapper) --
+' the only genuinely NEW things this needs are a real instance
+' representation (see Fission_X86_64ObjectAllocSubroutine) and resolving
+' `SELF.Field`/`obj.Field`/`obj.Method(...)` member access, which the
+' shared pass lowers through the exact same INDEX/STORE_INDEX opcodes
+' array indexing already uses, just with a quoted-string CONST as the key
+' instead of a numeric one (confirmed via the same reveal).
+'
+' A class instance's own field SET is fixed at compile time in practice
+' (an ArcoBASIC class's fields are always assigned via `SELF.Field = ...`
+' inside its own constructor/methods, never added dynamically from
+' outside), even though the underlying `OBJECT`/`INDEX`/`STORE_INDEX`
+' A-MIR primitives are fully generic property-bag operations with no
+' static field-offset concept of their own. This pass exploits that: for
+' each class, scan every one of its own functions (any "ClassName.X" whose
+' own first parameter is literally named "SELF" -- Init and every real
+' method, not `__new`/the bare constructor-call wrapper, neither of which
+' takes SELF at all) for every field name referenced via a CONST-string-
+' keyed INDEX/STORE_INDEX against SELF, assigning each FIRST-ENCOUNTERED
+' field name the next available fixed byte offset -- offset 0 is always
+' reserved for `__class` (the tag string `ClassName.__new` itself always
+' writes there, confirmed via the reveal, whether or not any of the
+' class's own methods ever read it back by name), so real field access
+' becomes an ordinary fixed-displacement LOAD/STORE, no runtime property
+' lookup or hashing needed at all -- the same "resolve a dynamic-looking
+' primitive down to something concrete at compile time" move array
+' construction/indexing already made for the generic Array/Index/
+' STORE_INDEX primitives in Phase 7.
+' Real, disclosed Phase 1 scope, matching this whole file's own
+' incremental-construct-coverage discipline: object fields are
+' numeric-only (the exact same limitation Phase 7 arrays started with),
+' and `obj.Method(...)`/`SELF.Method(...)` calls are resolved STATICALLY
+' at compile time from the calling code's own tracked "Object:ClassName"
+' kind for the base variable/temp -- which this pass's own kind-tracking
+' can determine soundly for the overwhelming majority of real, non-
+' polymorphic class usage (a variable always constructed from exactly one
+' class), but NOT for genuine runtime polymorphism (a variable that could
+' hold different concrete classes at different times, e.g. `pet = Dog(...)
+' \ pet = Animal(...)` down different IF branches, then `pet.Speak()`
+' dispatched polymorphically) -- confirmed via a direct oracle probe that
+' this IS real, legal, working ArcoBASIC (the oracle's own bytecode VM
+' does genuine runtime dispatch via the instance's own `__class` tag,
+' confirmed via `ArcoFission reveal ... at A-MIR`: `CALL c.Increment` with
+' NO explicit SELF argument at all, the VM injecting it itself after a
+' runtime tag lookup). Real dynamic dispatch (a runtime tag comparison
+' chain, since this backend controls its own codegen and does not need to
+' literally replicate the VM's own string-concatenation-based lookup
+' mechanism to produce the same observable behavior) is disclosed,
+' unstarted follow-on work -- Phase 1 reports a real diagnostic for this
+' case (the SAME "mixed-kind variable" diagnostic class Phase 4 already
+' established for a variable assigned both a String and a Number) rather
+' than silently guessing one class or crashing.
+FUNCTION Fission_X86_64ClassNameFromFunctionName(name)
+    dotIndex = String.IndexOf(name, ".")
+    IF dotIndex < 0 THEN RETURN ""
+    RETURN String.Slice(name, 0, dotIndex)
+END FUNCTION
+
+FUNCTION Fission_X86_64MethodNameFromFunctionName(name)
+    dotIndex = String.IndexOf(name, ".")
+    IF dotIndex < 0 THEN RETURN ""
+    RETURN String.Slice(name, dotIndex + 1, String.Length(name) - dotIndex - 1)
+END FUNCTION
+
+' Whether `fn` is a real class method or constructor-init function (has
+' SELF as its own first parameter) -- as opposed to `ClassName.__new` (no
+' parameters at all) or the bare `ClassName(ctorArgs...)` wrapper (no dot
+' in its own name), neither of which takes SELF.
+FUNCTION Fission_X86_64FunctionHasSelfParam(fn)
+    IF LEN(fn.Params) == 0 THEN RETURN FALSE
+    RETURN fn.Params[0].Name == "SELF"
+END FUNCTION
+
+' {ClassName: {FieldOffsets: {fieldName: byteOffset}, Size: totalBytes}}
+' for every class this module declares, built once, module-wide, before
+' any real per-function emission -- see this section's own header comment
+' for the full "why fixed offsets are sound here" reasoning.
+FUNCTION Fission_X86_64CollectClassFields(amirModule)
+    classes = {}
+    ' Seed every known class from its own `ClassName.__new` function first
+    ' -- a class with no explicit constructor and no methods (only `__new`
+    ' and the bare wrapper) would otherwise never get an entry at all
+    ' below, since `__new` itself takes no SELF parameter and so never
+    ' matches Fission_X86_64FunctionHasSelfParam.
+    FOR fn IN amirModule.Functions
+        IF String.EndsWith(fn.Name, ".__new") THEN
+            className = Fission_X86_64ClassNameFromFunctionName(fn.Name)
+            classes = Object.Set(classes, className, {FieldOffsets: {"__class": 0}, NextOffset: 8})
+        END IF
+    NEXT
+    FOR fn IN amirModule.Functions
+        IF Fission_X86_64FunctionHasSelfParam(fn) == FALSE THEN CONTINUE FOR
+        className = Fission_X86_64ClassNameFromFunctionName(fn.Name)
+        classInfo = Object.Get(classes, className, {FieldOffsets: {"__class": 0}, NextOffset: 8})
+        constStringValues = {}
+        FOR block IN fn.Blocks
+            FOR instruction IN block.Instructions
+                IF instruction.Kind == "Const" THEN
+                    value = instruction.Field("Value")
+                    IF Fission_X86_64IsStringConstValue(value) THEN
+                        constStringValues = Object.Set(constStringValues, instruction.Field("Dest"), Fission_X86_64UnquoteConstValue(value))
+                    END IF
+                END IF
+                isFieldAccess = instruction.Kind == "Index" ORELSE instruction.Kind == "StoreIndex"
+                IF isFieldAccess THEN
+                    keyOperand = instruction.Field("Index")
+                    IF Object.Has(constStringValues, keyOperand) THEN
+                        fieldName = Object.Get(constStringValues, keyOperand, "")
+                        IF Object.Has(classInfo.FieldOffsets, fieldName) == FALSE THEN
+                            fieldOffsets = Object.Set(classInfo.FieldOffsets, fieldName, classInfo.NextOffset)
+                            classInfo = {FieldOffsets: fieldOffsets, NextOffset: classInfo.NextOffset + 8}
+                        END IF
+                    END IF
+                END IF
+            NEXT
+        NEXT
+        classes = Object.Set(classes, className, classInfo)
+    NEXT
+    result = {}
+    FOR className IN Object.Keys(classes)
+        classInfo = Object.Get(classes, className, {FieldOffsets: {}, NextOffset: 8})
+        result = Object.Set(result, className, {FieldOffsets: classInfo.FieldOffsets, Size: classInfo.NextOffset})
+    NEXT
+    RETURN result
+END FUNCTION
+
 ' Pre-scan pass: every distinct temp/variable name gets exactly one fixed
 ' 8-byte slot, decided once, up front -- so the prologue's `sub $FRAME,%rsp`
 ' can be emitted before any instruction codegen runs, with no dynamic frame
@@ -237,9 +388,18 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
     names = []
     seen = {}
     kinds = {}
+    constStringValues = {}
     paramNames = []
     returnKindOut = "Number"
     callArgKindRequests = []
+    ' A class method/constructor-init's own SELF is ALWAYS "Object:
+    ' ClassName" -- staticaly determined directly from THIS function's own
+    ' name (never through call-site inference, unlike every other
+    ' parameter: SELF's class never varies, it's always exactly the
+    ' enclosing class). See Fission_X86_64CollectClassFields' own header
+    ' comment for the full CLASS design.
+    selfClassName = ""
+    IF Fission_X86_64FunctionHasSelfParam(fn) THEN selfClassName = Fission_X86_64ClassNameFromFunctionName(fn.Name)
     registerParamCount = LEN(Fission_X86_64ArgRegisters())
     paramIndex = 0
     FOR param IN fn.Params
@@ -252,6 +412,7 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
         END IF
         paramKind = "Number"
         IF paramIndex < LEN(paramKindsIn) THEN paramKind = paramKindsIn[paramIndex]
+        IF paramIndex == 0 ANDALSO selfClassName != "" THEN paramKind = "Object:" + selfClassName
         kinds = Object.Set(kinds, param.Name, paramKind)
         ignored = Array.Push(paramNames, param.Name)
         paramIndex = paramIndex + 1
@@ -267,9 +428,23 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 seen = state.Seen
                 IF Fission_X86_64IsStringConstValue(value) THEN
                     kinds = Object.Set(kinds, dest, "String")
+                    constStringValues = Object.Set(constStringValues, dest, Fission_X86_64UnquoteConstValue(value))
                 ELSE
                     kinds = Object.Set(kinds, dest, "Number")
                 END IF
+            END IF
+            IF kind == "Object" THEN
+                ' `OBJECT` only ever appears inside `ClassName.__new`
+                ' (confirmed via the oracle: the shared lowering
+                ' synthesizes exactly this one shape) -- its own dest kind
+                ' is therefore staticaly known directly from THIS
+                ' function's own name, the same reasoning SELF's own kind
+                ' above uses.
+                dest = instruction.Field("Dest")
+                state = Fission_X86_64Remember(names, seen, dest)
+                names = state.Names
+                seen = state.Seen
+                kinds = Object.Set(kinds, dest, "Object:" + Fission_X86_64ClassNameFromFunctionName(fn.Name))
             END IF
             IF kind == "Load" THEN
                 name = instruction.Field("Name")
@@ -350,8 +525,26 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 ' isn't a user-declared function (never in `functionNames`)
                 ' keeps the "Number" default, which is already correct for
                 ' LEN's own real result (a count).
+                ' A call to `ClassName` itself (the bare constructor-call
+                ' wrapper, e.g. `CALL Counter %t19`) is detected by
+                ' checking whether `ClassName.__new` exists -- its own
+                ' dest kind is staticaly "Object:ClassName" directly, the
+                ' same reasoning SELF/OBJECT's own kinds above use, never
+                ' through the general Number/String-only inference (which
+                ' has no concept of Object kinds at all). A method call
+                ' like `c.Increment` is never itself a real function name
+                ' (the actual target, "Counter.Increment", is resolved at
+                ' EMISSION time from `c`'s own tracked kind -- see
+                ' Fission_X86_64LowerFunction's own Call handling) so it
+                ' naturally falls through to the plain "Number" default
+                ' here, correct for Phase 1's own "methods return Number
+                ' or void" scope.
                 destKind = "Number"
-                IF Object.Has(functionNames, callee) THEN destKind = Object.Get(returnKindsIn, callee, "Number")
+                IF Object.Has(functionNames, callee + ".__new") THEN
+                    destKind = "Object:" + callee
+                ELSE
+                    IF Object.Has(functionNames, callee) THEN destKind = Object.Get(returnKindsIn, callee, "Number")
+                END IF
                 kinds = Object.Set(kinds, dest, destKind)
                 ' Every argument this call passes is itself real evidence
                 ' for the CALLEE's own corresponding parameter kind -- fed
@@ -400,7 +593,13 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 ' is simply never consulted anywhere (Main is never
                 ' `CALL`ed), so no isMain special-casing is needed here.
                 value = instruction.Field("Value")
-                IF value != "" THEN returnKindOut = Fission_X86_64OperandKind(kinds, value)
+                ' `RETURN VALUE nothing` -- a real, distinct sentinel the
+                ' oracle uses for a class constructor/method's own void
+                ' return (confirmed via the reveal: `Counter.Init`/
+                ' `Counter.Increment` both close with this exact text, not
+                ' a real operand at all) -- never a genuine value to
+                ' resolve a kind from.
+                IF value != "" ANDALSO value != "nothing" THEN returnKindOut = Fission_X86_64OperandKind(kinds, value)
             END IF
         NEXT
     NEXT
@@ -408,7 +607,7 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
     FOR paramName IN paramNames
         ignored = Array.Push(paramKindsOut, Object.Get(kinds, paramName, "Number"))
     NEXT
-    RETURN {Names: names, Kinds: kinds, ParamKindsOut: paramKindsOut, ReturnKindOut: returnKindOut, CallArgKindRequests: callArgKindRequests}
+    RETURN {Names: names, Kinds: kinds, ConstStringValues: constStringValues, ParamKindsOut: paramKindsOut, ReturnKindOut: returnKindOut, CallArgKindRequests: callArgKindRequests}
 END FUNCTION
 
 ' Real inter-procedural kind inference: closes the exact gap this file's
@@ -467,26 +666,45 @@ FUNCTION Fission_X86_64InferSignatures(amirModule, functionNames)
             fnReturnKind = Object.Get(returnKinds, fn.Name, "Number")
             collected = Fission_X86_64CollectSlots(fn, functionNames, fnParamKinds, returnKinds)
 
+            ' A real bug found and fixed while adding CLASS support: this
+            ' merge originally only ever recognized "String" as a real
+            ' upgrade-worthy kind (matching the ONLY non-Number kind that
+            ' existed when this fixed-point pass was first built) --
+            ' "Object:ClassName" (SELF's own kind, and `ClassName.__new`'s
+            ' own return kind, BOTH hardcoded directly from a function's
+            ' own name inside Fission_X86_64CollectSlots, never needing
+            ' real cross-function inference) would never actually persist
+            ' into this table at all, silently staying stuck at the
+            ' initial "Number" seed forever -- confirmed the hard way (a
+            ' real `c = Counter(5)` probe's own wrapper-function return
+            ' kind stayed wrong until this was generalized). Any kind
+            ' other than "Number" is now treated as upgrade-worthy, not
+            ' just the literal string "String" -- still monotonic and
+            ' still safe: Object kinds are stable from round 1 (never
+            ' genuinely inferred, always known immediately), so this
+            ' generalization changes nothing about String's own existing
+            ' behavior or the whole loop's convergence guarantee.
             index = 0
             WHILE index < LEN(collected.ParamKindsOut)
-                IF collected.ParamKindsOut[index] == "String" ANDALSO fnParamKinds[index] != "String" THEN
-                    fnParamKinds[index] = "String"
+                newParamKind = collected.ParamKindsOut[index]
+                IF newParamKind != "Number" ANDALSO fnParamKinds[index] != newParamKind THEN
+                    fnParamKinds[index] = newParamKind
                     changed = TRUE
                 END IF
                 index = index + 1
             WEND
             paramKinds = Object.Set(paramKinds, fn.Name, fnParamKinds)
 
-            IF collected.ReturnKindOut == "String" ANDALSO fnReturnKind != "String" THEN
-                returnKinds = Object.Set(returnKinds, fn.Name, "String")
+            IF collected.ReturnKindOut != "Number" ANDALSO fnReturnKind != collected.ReturnKindOut THEN
+                returnKinds = Object.Set(returnKinds, fn.Name, collected.ReturnKindOut)
                 changed = TRUE
             END IF
 
             FOR request IN collected.CallArgKindRequests
                 calleeParamKinds = Object.Get(paramKinds, request.Callee, [])
                 IF request.ArgIndex < LEN(calleeParamKinds) THEN
-                    IF request.Kind == "String" ANDALSO calleeParamKinds[request.ArgIndex] != "String" THEN
-                        calleeParamKinds[request.ArgIndex] = "String"
+                    IF request.Kind != "Number" ANDALSO calleeParamKinds[request.ArgIndex] != request.Kind THEN
+                        calleeParamKinds[request.ArgIndex] = request.Kind
                         paramKinds = Object.Set(paramKinds, request.Callee, calleeParamKinds)
                         changed = TRUE
                     END IF
@@ -547,6 +765,19 @@ END FUNCTION
 FUNCTION Fission_X86_64NormalizeNumericKind(kind)
     IF kind == "Bool" THEN RETURN "Number"
     RETURN kind
+END FUNCTION
+
+' A real CLASS instance's own kind is "Object:ClassName" -- a parameterized
+' kind value, unlike the flat String/Number/Array/Bool kinds, since a
+' consumption site needs to know WHICH class, not just "this is an
+' object", to resolve a field name to its own fixed byte offset (see
+' Fission_X86_64CollectClassFields' own header comment).
+FUNCTION Fission_X86_64IsObjectKind(kind)
+    RETURN String.StartsWith(kind, "Object:")
+END FUNCTION
+
+FUNCTION Fission_X86_64ObjectClassOfKind(kind)
+    RETURN String.Slice(kind, 7, String.Length(kind) - 7)
 END FUNCTION
 
 FUNCTION Fission_X86_64OperandKind(kinds, operand)
@@ -1025,6 +1256,35 @@ FUNCTION Fission_X86_64ArrayAllocSubroutine()
     RETURN lines
 END FUNCTION
 
+' A real CLASS instance's own allocator -- same shared bump-allocated
+' `.bss` heap array_alloc/str_concat already use (see this file's own
+' header comment on Fission_X86_64CollectClassFields for why a fixed-size,
+' fixed-offset instance layout is sound here), but genuinely simpler than
+' array_alloc: input %rdi is a plain BYTE COUNT (not an element count with
+' its own +1-for-the-length-header adjustment), and no header is written
+' at all -- a class instance has no `LEN`-style runtime size query, every
+' one of its own fields is accessed at a fixed compile-time offset, so
+' there is nothing here worth recording at runtime. The returned block
+' comes from `.bss`, zero-initialized by the loader before this program
+' ever runs, so a freshly allocated instance's fields all start real,
+' well-defined zero values even before its own constructor runs.
+FUNCTION Fission_X86_64ObjectAllocSubroutine()
+    lines = [
+        "object_alloc:",
+        "    lea string_heap_top(%rip), %r8",
+        "    mov (%r8), %rax",
+        "    test %rax, %rax",
+        "    jnz .Lobjalloc_top_ready",
+        "    lea string_heap(%rip), %rax",
+        ".Lobjalloc_top_ready:",
+        "    mov %rax, %rcx",
+        "    add %rdi, %rcx",
+        "    mov %rcx, (%r8)",
+        "    ret"
+    ]
+    RETURN lines
+END FUNCTION
+
 ' Same internal-only call/ret convention as itoa_print, but writes the
 ' decimal digits with NO trailing newline -- itoa_print's own buffer always
 ' has a newline baked in right after the digits (see that subroutine's own
@@ -1162,12 +1422,13 @@ END FUNCTION
 ' a string can appear in any function), and whether itoa_print/str_print
 ' (shared, emitted once at the very end) are needed by ANY function, not
 ' just this one.
-FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures)
+FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures, classFields)
     fnParamKinds = Object.Get(signatures.ParamKinds, fn.Name, [])
     collected = Fission_X86_64CollectSlots(fn, functionNames, fnParamKinds, signatures.ReturnKinds)
     frame = Fission_X86_64BuildFrame(collected.Names)
     offsets = frame.Offsets
     kinds = collected.Kinds
+    constStringValues = collected.ConstStringValues
 
     textLines = []
 
@@ -1208,11 +1469,34 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
         NEXT
     END IF
 
+    ' A real, previously-undiscovered, SEVERE bug found while verifying
+    ' CLASS support (a class method with no explicit RETURN -- e.g.
+    ' `Counter.Increment`, which just mutates SELF.Value and falls off the
+    ' end -- is exactly this shape, but it is NOT class-specific at all:
+    ' confirmed via an isolated, class-free probe, `FUNCTION Foo() PRINT 1
+    ' END FUNCTION` also crashes with SIGSEGV). Root cause: unlike Main
+    ' (which the SHARED fission/sir/lower_amir.abas always closes with an
+    ' explicit synthesized `RETURN I32 0`), a non-Main function that never
+    ' contains an explicit RETURN statement in its own ArcoBASIC source
+    ' gets NO closing Return instruction in its A-MIR at all -- its last
+    ' block simply ends after its last real instruction, with nothing
+    ' telling this backend the function is over. Previously, this meant
+    ' the generated `leave`/`ret` epilogue was skipped entirely, and
+    ' execution silently fell through into whatever code happens to be
+    ' laid out immediately next in the flat `.text` stream (another
+    ' function's own prologue, or a runtime helper), corrupting the return
+    ' address on the stack and crashing. Tracked here via `sawReturn` and
+    ' fixed below, after every block is lowered: any non-Main function
+    ' that never emitted a real Return instruction gets a real, synthetic
+    ' `leave`/`ret` appended, exactly matching what an explicit `RETURN`
+    ' with no value would have produced.
+    sawReturn = FALSE
     FOR block IN fn.Blocks
         ignored = Array.Push(textLines, labelPrefix + block.Name + ":")
         FOR instruction IN block.Instructions
             kind = instruction.Kind
             IF kind == "DeclareFunction" THEN CONTINUE FOR
+            IF kind == "DeclareClass" THEN CONTINUE FOR
             IF kind == "Const" THEN
                 value = instruction.Field("Value")
                 dest = instruction.Field("Dest")
@@ -1227,6 +1511,21 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, "    movq $" + value + ", " + Object.Get(offsets, dest, "0") + "(%rbp)")
+                CONTINUE FOR
+            END IF
+            IF kind == "Object" THEN
+                ' Real CLASS support: `OBJECT` only ever appears inside
+                ' `ClassName.__new` -- this function's OWN name tells us
+                ' which class, and thus the fixed byte size to allocate
+                ' (see Fission_X86_64CollectClassFields' own header
+                ' comment for the whole design).
+                dest = instruction.Field("Dest")
+                objClassName = Fission_X86_64ClassNameFromFunctionName(fn.Name)
+                classInfo = Object.Get(classFields, objClassName, {FieldOffsets: {"__class": 0}, Size: 8})
+                ignored = Array.Push(textLines, "    mov $" + String(classInfo.Size) + ", %rdi")
+                ignored = Array.Push(textLines, "    call object_alloc")
+                ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, dest))
+                context.UsesObjectAlloc = TRUE
                 CONTINUE FOR
             END IF
             isArgsCall = kind == "Call" ANDALSO instruction.Field("Callee") == "Runtime.Args"
@@ -1250,16 +1549,20 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Assigning an unsupported value is not supported by native x86-64 codegen: " + value)
                     CONTINUE FOR
                 END IF
-                ' A variable assigned both a Number and a String somewhere in
-                ' this same function (e.g. `IF x THEN s = "a" ELSE s = 1`) is
-                ' a real, disclosed gap, not silently guessed at: report it
-                ' here rather than letting a later LOAD/PRINT of `name`
-                ' misinterpret whichever kind Fission_X86_64CollectSlots
-                ' happened to settle on last.
+                ' A variable assigned two genuinely different kinds
+                ' somewhere in this same function (e.g. `IF x THEN s = "a"
+                ' ELSE s = 1`, or -- since real CLASS support landed --
+                ' `IF x THEN pet = Dog(...) ELSE pet = Animal(...)`, real
+                ' runtime polymorphism this backend cannot represent since
+                ' a variable has exactly one physical kind here) is a
+                ' real, disclosed gap, not silently guessed at: report it
+                ' here rather than letting a later LOAD/PRINT/member-access
+                ' of `name` misinterpret whichever kind Fission_X86_64
+                ' CollectSlots happened to settle on last.
                 valueKind = Fission_X86_64OperandKind(kinds, value)
                 variableKind = Object.Get(kinds, name, "Number")
                 IF valueKind != variableKind THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Variable " + name + " is assigned both a number and a string somewhere in this function, which native x86-64 codegen does not support")
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Variable " + name + " is assigned conflicting kinds (" + variableKind + " and " + valueKind + ") somewhere in this function, which native x86-64 codegen does not support")
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, value, "rax"))
@@ -1319,7 +1622,35 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Indexing an unsupported value is not supported by native x86-64 codegen: " + base + ", " + index)
                     CONTINUE FOR
                 END IF
-                IF Fission_X86_64OperandKind(kinds, base) != "Array" THEN
+                baseKind = Fission_X86_64OperandKind(kinds, base)
+                IF Fission_X86_64IsObjectKind(baseKind) THEN
+                    ' `SELF.Field`/`obj.Field` -- the SAME generic
+                    ' INDEX opcode array indexing uses, just with a
+                    ' CONST-string key instead of a numeric one (confirmed
+                    ' via the oracle, see Fission_X86_64CollectClassFields'
+                    ' own header comment for the full CLASS design). The
+                    ' key operand's own kind must be String (a genuinely
+                    ' dynamic, non-compile-time-known key -- real property-
+                    ' bag lookup -- remains a real, disclosed, unstarted
+                    ' gap this Phase 1 scope does not attempt).
+                    IF Fission_X86_64OperandKind(kinds, index) != "String" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports a compile-time-known field name for member access: " + index)
+                        CONTINUE FOR
+                    END IF
+                    fieldName = Object.Get(constStringValues, index, "")
+                    className = Fission_X86_64ObjectClassOfKind(baseKind)
+                    classInfo = Object.Get(classFields, className, {FieldOffsets: {}, Size: 8})
+                    IF Object.Has(classInfo.FieldOffsets, fieldName) == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Unknown field '" + fieldName + "' on class " + className + " is not supported by native x86-64 codegen")
+                        CONTINUE FOR
+                    END IF
+                    fieldOffset = Object.Get(classInfo.FieldOffsets, fieldName, 0)
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, base, "rax"))
+                    ignored = Array.Push(textLines, "    mov " + String(fieldOffset) + "(%rax), %rax")
+                    ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Dest")))
+                    CONTINUE FOR
+                END IF
+                IF baseKind != "Array" THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Indexing a non-array value is not supported by native x86-64 codegen: " + base)
                     CONTINUE FOR
                 END IF
@@ -1345,7 +1676,43 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Assigning through an unsupported index is not supported by native x86-64 codegen: " + name)
                     CONTINUE FOR
                 END IF
-                IF Fission_X86_64OperandKind(kinds, name) != "Array" THEN
+                nameKind = Fission_X86_64OperandKind(kinds, name)
+                IF Fission_X86_64IsObjectKind(nameKind) THEN
+                    ' `SELF.Field = value`/`obj.Field = value` -- the
+                    ' write-side counterpart of Index's own member-access
+                    ' handling above; see that block's own comment for the
+                    ' full reasoning (same String-key/known-field/fixed-
+                    ' offset requirements apply symmetrically here).
+                    IF Fission_X86_64OperandKind(kinds, index) != "String" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports a compile-time-known field name for member access: " + index)
+                        CONTINUE FOR
+                    END IF
+                    fieldName = Object.Get(constStringValues, index, "")
+                    ' `__class` is the ONE field that's always genuinely
+                    ' String-kind, not Number -- the tag `ClassName.__new`
+                    ' itself always writes (confirmed via the oracle);
+                    ' every OTHER field is real, disclosed Phase 1 scope:
+                    ' numeric-only, the same limitation Phase 7 arrays
+                    ' started with.
+                    IF fieldName != "__class" THEN
+                        IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, value)) != "Number" THEN
+                            ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports numeric class fields: " + value)
+                            CONTINUE FOR
+                        END IF
+                    END IF
+                    className = Fission_X86_64ObjectClassOfKind(nameKind)
+                    classInfo = Object.Get(classFields, className, {FieldOffsets: {}, Size: 8})
+                    IF Object.Has(classInfo.FieldOffsets, fieldName) == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Unknown field '" + fieldName + "' on class " + className + " is not supported by native x86-64 codegen")
+                        CONTINUE FOR
+                    END IF
+                    fieldOffset = Object.Get(classInfo.FieldOffsets, fieldName, 0)
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, name, "rax"))
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, value, "rdx"))
+                    ignored = Array.Push(textLines, "    mov %rdx, " + String(fieldOffset) + "(%rax)")
+                    CONTINUE FOR
+                END IF
+                IF nameKind != "Array" THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Indexing a non-array value is not supported by native x86-64 codegen: " + name)
                     CONTINUE FOR
                 END IF
@@ -1501,11 +1868,41 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
             isUserCall = (kind == "Call" ORELSE kind == "CallVoid") ANDALSO instruction.Field("Callee") != "Runtime.Print"
             IF isUserCall THEN
                 callee = instruction.Field("Callee")
+                args = Fission_X86_64SplitArgs(instruction.Field("Args"))
+                ' `obj.Method(args)` -- the A-MIR Callee text is literally
+                ' "instanceVarName.MethodName" with NO explicit SELF
+                ' argument at all (confirmed via the oracle: the VM
+                ' injects it itself after a runtime `__class`-tag lookup).
+                ' This backend resolves it STATICALLY instead, from the
+                ' base variable/temp's own tracked "Object:ClassName" kind
+                ' -- sound for the overwhelming majority of real,
+                ' non-polymorphic class usage, but NOT genuine runtime
+                ' polymorphism (a variable that could hold different
+                ' concrete classes at different times) -- see
+                ' Fission_X86_64CollectClassFields' own header comment for
+                ' the full investigation and why that's a disclosed,
+                ' unstarted follow-on rather than attempted here. Skipped
+                ' entirely when `callee` is ALREADY a real function name
+                ' (a direct call like `Counter.__new`/`Counter.Init`,
+                ' which every class's own synthesized functions use
+                ' amongst themselves -- never a variable-qualified name).
+                IF Object.Has(functionNames, callee) == FALSE ANDALSO String.Contains(callee, ".") THEN
+                    baseName = Fission_X86_64ClassNameFromFunctionName(callee)
+                    methodName = Fission_X86_64MethodNameFromFunctionName(callee)
+                    baseKind = Fission_X86_64OperandKind(kinds, baseName)
+                    IF Fission_X86_64IsObjectKind(baseKind) THEN
+                        callee = Fission_X86_64ObjectClassOfKind(baseKind) + "." + methodName
+                        rewrittenArgs = [baseName]
+                        FOR arg IN args
+                            ignored = Array.Push(rewrittenArgs, arg)
+                        NEXT
+                        args = rewrittenArgs
+                    END IF
+                END IF
                 IF Object.Has(functionNames, callee) == FALSE THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Call to a function native x86-64 codegen does not know how to lower (not a user-declared ArcoBASIC function): " + callee)
                     CONTINUE FOR
                 END IF
-                args = Fission_X86_64SplitArgs(instruction.Field("Args"))
                 argRegisters = Fission_X86_64ArgRegisters()
                 calleeParamKinds = Object.Get(signatures.ParamKinds, callee, [])
                 unresolvedArg = ""
@@ -1591,6 +1988,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
             END IF
             isReturn = kind == "Return"
             IF isReturn THEN
+                sawReturn = TRUE
                 IF isMain THEN
                     ' Fission_SirToAmir always synthesizes exactly `RETURN
                     ' I32 0` as Main's own closing instruction (a raw
@@ -1609,6 +2007,18 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     CONTINUE FOR
                 END IF
                 returnValue = instruction.Field("Value")
+                ' `RETURN VALUE nothing` -- a real, distinct sentinel a
+                ' class constructor/method's own void return uses
+                ' (confirmed via the oracle: every CONSTRUCTOR/method that
+                ' never explicitly returns a value closes with exactly
+                ' this text, not a real operand at all) -- a plain `leave;
+                ' ret` with no value ever loaded into %rax, the same shape
+                ' Main's own RETURN 0 uses minus the exit syscall.
+                IF returnValue == "nothing" THEN
+                    ignored = Array.Push(textLines, "    leave")
+                    ignored = Array.Push(textLines, "    ret")
+                    CONTINUE FOR
+                END IF
                 IF Fission_X86_64OperandIsResolvable(offsets, returnValue) == FALSE THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Returning an unsupported value is not supported by native x86-64 codegen: " + returnValue)
                     CONTINUE FOR
@@ -1633,6 +2043,10 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
             ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Unsupported A-MIR instruction for native x86-64 codegen: " + kind)
         NEXT
     NEXT
+    IF isMain == FALSE ANDALSO sawReturn == FALSE THEN
+        ignored = Array.Push(textLines, "    leave")
+        ignored = Array.Push(textLines, "    ret")
+    END IF
 
     RETURN textLines
 END FUNCTION
@@ -1640,7 +2054,7 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
-    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesBoolPrint: FALSE}
+    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesBoolPrint: FALSE, UsesObjectAlloc: FALSE}
     ' Real inter-procedural string-parameter/return-value inference, run
     ' to a full fixed point BEFORE any real emission -- see
     ' Fission_X86_64InferSignatures' own header comment. Every function's
@@ -1651,13 +2065,17 @@ FUNCTION Fission_AmirToX86_64(amirModule)
     ' exact same LOAD/STORE/mov machinery Phase 4 already built for string
     ' VARIABLES -- moving a pointer is no different from moving a number.
     signatures = Fission_X86_64InferSignatures(amirModule, functionNames)
+    ' Real CLASS support: every class's own fixed field-offset table, built
+    ' once, module-wide -- see Fission_X86_64CollectClassFields' own header
+    ' comment for the full design.
+    classFields = Fission_X86_64CollectClassFields(amirModule)
 
     allTextLines = []
     FOR fn IN amirModule.Functions
         isMain = fn.Name == "Main"
         labelPrefix = ""
         IF isMain == FALSE THEN labelPrefix = fn.Name + "_"
-        functionLines = Fission_X86_64LowerFunction(program.Diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures)
+        functionLines = Fission_X86_64LowerFunction(program.Diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures, classFields)
         FOR line IN functionLines
             ignored = Array.Push(allTextLines, line)
         NEXT
@@ -1691,6 +2109,11 @@ FUNCTION Fission_AmirToX86_64(amirModule)
     END IF
     IF context.UsesArrayAlloc THEN
         FOR line IN Fission_X86_64ArrayAllocSubroutine()
+            ignored = Array.Push(allTextLines, line)
+        NEXT
+    END IF
+    IF context.UsesObjectAlloc THEN
+        FOR line IN Fission_X86_64ObjectAllocSubroutine()
             ignored = Array.Push(allTextLines, line)
         NEXT
     END IF
@@ -1749,7 +2172,7 @@ FUNCTION Fission_AmirToX86_64(amirModule)
     ' correct section for both the 1 MiB arena and its own bump pointer,
     ' whose "not yet initialized" state IS a real zero value both
     ' subroutines explicitly check for.
-    IF context.UsesConcat ORELSE context.UsesArrayAlloc THEN
+    IF context.UsesConcat ORELSE context.UsesArrayAlloc ORELSE context.UsesObjectAlloc THEN
         ignored = Array.Push(lines, "    .section .bss")
         ignored = Array.Push(lines, "    .align 8")
         ignored = Array.Push(lines, "string_heap_top:")

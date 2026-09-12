@@ -107,7 +107,18 @@ like the oracle) -- a real, purely native-side workaround (bare TRUE/
 FALSE literals are structurally recoverable since every genuine number
 always materializes through a real CONST) for a SHARED-substrate root
 cause left unfixed at the source.
-**WP-011 (Linux Runtime -- objects, the general host-function
+**Real CLASS support** -- constructors, methods, SELF/external field
+access (numeric fields only), multiple instances, and inheritance with
+method overriding, all via a fixed-per-class compile-time field-offset
+layout and STATICALLY-resolved method dispatch (sound for the
+overwhelming majority of real, non-polymorphic class usage; genuine
+runtime polymorphism -- a variable holding different concrete classes at
+different times -- is a real, disclosed diagnostic, not a real dynamic-
+dispatch mechanism, which remains substantial, unstarted follow-on work).
+Found and fixed a SEVERE, NOT class-specific, previously-latent bug along
+the way: a function with no explicit RETURN statement crashed with a real
+SIGSEGV (no closing `leave`/`ret` was ever emitted at all).
+**WP-011 (Linux Runtime -- the general host-function
 bridge for everything else this backend cannot hand-roll itself) remains
 real, substantial follow-on
 work** -- see "Next
@@ -1581,6 +1592,121 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   Bool-kind PRINT with a bitwise-AND PRINT). Self-parse/self-semantic
   corpus symbol count grew 3249 -> 3262; golden value updated to match.
   Verified with plain `fissure run` (714s, passing).
+- **Native x86-64 codegen: real CLASS support** -- the single biggest
+  remaining gap toward the user's own stated next goal ("I wanna get this
+  part finished so we can start porting the rest of arcology to
+  ArcoBASIC"): virtually every real Arcology ArcoBASIC application
+  (Arconaut, arcfs-utils, ArcoUI) uses classes.
+  Investigated the shared lowering directly (`ArcoFission reveal ... at
+  A-MIR` on a real `CLASS Counter ... END CLASS`) before writing any
+  codegen: a CLASS entirely desugars into ordinary functions this backend
+  already lowers structurally (`ClassName.Init`/`ClassName.MethodName`
+  take SELF as an ordinary first parameter; `ClassName.__new` allocates a
+  bare instance and tags it; `ClassName(ctorArgs...)` is an ordinary
+  callable wrapper) -- `SELF.Field`/`obj.Field`/`obj.Method(...)` all
+  lower through the exact same generic `OBJECT`/`INDEX`/`STORE_INDEX`
+  property-bag primitives array indexing already used, just with a
+  quoted-string CONST as the key. This backend exploits a real, sound
+  compile-time property of actual ArcoBASIC class usage: a class's own
+  field SET is fixed in practice (always assigned via `SELF.Field = ...`
+  inside its own methods, never added dynamically from outside), so
+  `Fission_X86_64CollectClassFields` (new, module-wide, run once before
+  any emission) scans every class's own methods for every CONST-string-
+  keyed field reference and assigns each one a FIXED byte offset (offset 0
+  always reserved for the `__class` tag `ClassName.__new` itself always
+  writes) -- real member access becomes an ordinary fixed-displacement
+  LOAD/STORE, no runtime property lookup or hashing needed at all, the
+  same "resolve a dynamic-looking primitive down to something concrete at
+  compile time" move Phase 7 arrays already made.
+  A new "Object:ClassName" kind (parameterized, unlike the flat String/
+  Number/Array/Bool kinds) tracks a variable/temp's own concrete class
+  through the exact same Store/Load propagation machinery every other
+  kind already uses -- SELF's own kind and `ClassName.__new`'s own return
+  kind are BOTH staticaly determined directly from a function's own name
+  (never through call-site inference, since SELF's class never varies).
+  `obj.Method(args)` -- whose A-MIR Callee text is literally
+  "instanceVarName.MethodName" with NO explicit SELF argument at all, the
+  oracle's own VM injecting it itself after a runtime `__class`-tag lookup
+  -- is resolved STATICALLY here instead, from the base variable/temp's
+  own tracked "Object:ClassName" kind: sound for the overwhelming
+  majority of real, non-polymorphic class usage (confirmed a variable
+  always constructed from exactly one class resolves correctly, including
+  through inheritance with method overriding), but NOT genuine runtime
+  polymorphism -- confirmed via a direct oracle probe that a variable
+  which could hold different concrete classes at different times (e.g.
+  down different IF branches) IS real, legal, working ArcoBASIC, dispatched
+  correctly by the oracle's own runtime tag lookup. This backend instead
+  reports a real diagnostic for that specific case (generalizing the exact
+  same "variable assigned conflicting kinds" machinery Phase 4 already
+  built for a Number/String mix, just fixed its own error message to stop
+  hardcoding "number and string" when the real conflict could be any two
+  kinds, including two different classes) rather than attempting a real
+  dynamic-dispatch mechanism (a runtime `__class`-tag comparison chain) --
+  disclosed, substantial, unstarted follow-on work, not attempted here.
+  A new `object_alloc` runtime helper (same shared bump-allocated `.bss`
+  arena string concatenation/arrays already use, same internal-only call/
+  ret convention as the others) allocates a fixed-size instance with no
+  header write at all (unlike `array_alloc`'s own length header -- a class
+  instance has no `LEN`-style runtime query, every field is a compile-
+  time-known offset).
+  **Two real, previously-undiscovered bugs were found only by actually
+  running the compiled binary**, not by inspection:
+  1. A SEVERE, NOT class-specific bug: a function with no explicit RETURN
+     statement (falls off the end -- exactly `Counter.Increment`'s own
+     shape, but confirmed via an isolated, class-free probe too --
+     `FUNCTION Foo() PRINT 1 END FUNCTION` also crashed) previously
+     emitted NO closing `leave`/`ret` at all, silently falling through
+     into whatever code is laid out next in the flat `.text` stream and
+     corrupting the return address on the stack -- a real SIGSEGV on the
+     actual compiled binary, confirmed directly, not assumed. Root cause:
+     unlike Main (which the shared pass always closes with a synthesized
+     `RETURN I32 0`), a non-Main function that never contains an explicit
+     RETURN gets no closing Return instruction in its own A-MIR at all --
+     nothing ever told this backend the function was over. This bug had
+     been latent since Phase 3 (real user-declared FUNCTIONs) landed,
+     never triggered because every prior test's own functions happened to
+     always end with an explicit RETURN. Fixed by tracking whether a
+     function's own body ever emitted a real Return instruction and
+     appending a synthetic `leave`/`ret` afterward if not.
+  2. `Fission_X86_64ObjectAllocSubroutine`'s field-write validation
+     originally rejected `__class`'s own write (a genuine String value,
+     the tag `ClassName.__new` always writes) under the blanket "object
+     fields are numeric-only" Phase 1 rule -- fixed by exempting `__class`
+     specifically from that check (the one field that's always genuinely
+     String-kind, every other field stays numeric-only as designed).
+  Verified via real execution across every real shape: a constructor
+  initializing a field, a method mutating SELF's own field, a method
+  calling ANOTHER method on itself (`SELF.Method(...)`), multiple
+  independent instances (real memory isolation confirmed, not aliasing),
+  external `obj.Field` access from outside the class, inheritance with
+  method overriding (a real, non-ambiguous case), and genuine runtime
+  polymorphism correctly rejected with a real, clear diagnostic -- all
+  byte-for-byte identical to legacy `ArcoFission compile-run` (the two
+  bugs above were both found and fixed via a real SIGSEGV crash, then
+  re-verified matching exactly on the very next attempt with zero further
+  debugging iterations needed). Also confirmed a related, separate real
+  oracle limitation while stress-testing (not a bug in this backend): a
+  derived class accessing a field only ever assigned by the BASE class's
+  own constructor fails at runtime with "undefined property" on the
+  oracle itself too -- ArcoBASIC's own EXTENDS does not automatically
+  inherit/call the base class's own constructor, confirmed directly rather
+  than assumed to be this backend's own gap.
+  Added a permanent regression fixture,
+  `fission/tests/native_programs/classes.abas`; wired into
+  `FissionNativeCapsuleTarget`, `tests/integration/fission_substrate_core_smoke.sh`,
+  and `fission/fissure.ab`'s watched-files list. Re-verified every earlier
+  native demo unaffected. `fission/tests/amir_x86_64_smoke.abas` extended
+  with direct coverage (a real class construction/method-call/field-access
+  program with zero diagnostics, asserting the rendered assembly contains
+  `call object_alloc`, a real fixed-displacement field access, a real
+  direct call to the statically-resolved method, and the synthesized
+  `leave`/`ret` for a method with no explicit RETURN; plus three new
+  diagnostic-path checks: a non-numeric field, an unknown field name, and
+  genuine class-instance polymorphism). Self-parse/self-semantic corpus
+  symbol count grew 3262 -> 3333; golden value updated to match. Verified
+  with plain `fissure run` (499s, passing) -- everything above worked
+  correctly on the very first full verification pass after both bugs were
+  fixed, no further debugging iterations needed.
 
 ## In-Progress Components
 
@@ -2020,6 +2146,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/bitops.abas`
 - `fission/tests/native_programs/string_params.abas`
 - `fission/tests/native_programs/bool_print.abas`
+- `fission/tests/native_programs/classes.abas`
 - `fission/amir/x86_64_assembler.abas`
 - `fission/tests/sir_to_amir_loop_control_smoke.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
@@ -2327,12 +2454,19 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
      ArcoBASIC-implemented instruction encoder + ELF64 writer, see
      Completed Components and the Architectural Decisions entry recording
      this reversal of WP-009's own original scope choice.
-   - WP-011 Linux Runtime, the rest of it: objects/classes, and a
-     real fallback to the existing ~244-entry host-function dispatch table
-     for anything else (legacy's own `arco_call_host`/`host_bridge.cpp`
-     bridge is the reference for this, though porting it into the
-     substrate rather than linking against it directly is itself a real
-     design decision to make, not just a port).
+   - DONE -- real CLASS support (constructors, methods, SELF/external
+     field access, multiple instances, inheritance with method
+     overriding), see Completed Components. Real, disclosed remaining
+     gaps: non-numeric class fields; genuine class-instance runtime
+     polymorphism (a real dynamic-dispatch mechanism -- a runtime
+     `__class`-tag comparison chain -- is real, substantial, unstarted
+     follow-on work, not attempted); and a real fallback to the existing
+     ~244-entry host-function dispatch table for anything else (legacy's
+     own `arco_call_host`/`host_bridge.cpp` bridge is the reference for
+     this, though porting it into the substrate rather than linking
+     against it directly is itself a real design decision to make, not
+     just a port) -- this last item is now WP-011's own single largest
+     remaining piece.
    The existing experimental legacy native backend
    (`ArcoFission build FILE -o OUT --target linux-x86_64`,
    `.agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md`) is worth reading
