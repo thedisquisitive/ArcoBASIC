@@ -455,9 +455,17 @@ PRINT String.Contains(ClassAssembly, "call Counter.Increment")
 ' itself never contains an explicit RETURN in its own ArcoBASIC source).
 PRINT String.Contains(ClassAssembly, "Counter.Increment:")
 
-' Real, disclosed Phase 1 gaps: a non-numeric (String) field and an
-' unknown field name still correctly report a diagnostic rather than
-' silently misinterpreting one kind as another.
+' Real, non-numeric (String) class fields (Fission_X86_64CollectClassFields'
+' own `signatures.FieldKinds`, folded directly into Fission_X86_64
+' InferSignatures' fixed point) -- this exact source USED TO be checked
+' for a real diagnostic here (Phase 1's own "object fields are numeric-
+' only" restriction); now it's real, working codegen: `name` (a String
+' constructor parameter, confirmed String via the SAME inter-procedural
+' inference string function parameters already use) copied straight into
+' `SELF.Name`, checked here structurally (zero diagnostics, and the
+' rendered assembly still resolves fine with no numeric-only rejection)
+' -- real execution verified separately by fission/tests/native_programs/
+' string_fields.abas.
 StringFieldSource = "CLASS Person\n    CONSTRUCTOR(name)\n        SELF.Name = name\n    END CONSTRUCTOR\nEND CLASS\np = Person(\"Ada\")"
 StringFieldTokens = Fission_ArcoBasicLex(StringFieldSource)
 StringFieldAst = Fission_ArcoBasicParse(StringFieldTokens, "x86-64-string-field-smoke.abas")
@@ -465,6 +473,34 @@ StringFieldSir = Fission_ArcoBasicAstToSir(StringFieldAst)
 StringFieldAmir = Fission_SirToAmir(StringFieldSir)
 StringFieldProgram = Fission_AmirToX86_64(StringFieldAmir)
 PRINT StringFieldProgram.Diagnostics.HasErrors()
+
+' A field genuinely assigned CONFLICTING kinds -- once by a Number
+' constructor argument, once by a String argument to a different method --
+' is still a real, disclosed, reported diagnostic (a field's own kind is
+' fixed once, module-wide, like a real typed struct field, not a
+' per-instance union the way a plain variable's Poly kind is).
+FieldKindConflictSource = "CLASS Widget\n    CONSTRUCTOR(v)\n        SELF.Value = v\n    END CONSTRUCTOR\n    FUNCTION SetStr(s)\n        SELF.Value = s\n    END FUNCTION\nEND CLASS\nw = Widget(5)\nw.SetStr(\"hi\")"
+FieldKindConflictTokens = Fission_ArcoBasicLex(FieldKindConflictSource)
+FieldKindConflictAst = Fission_ArcoBasicParse(FieldKindConflictTokens, "x86-64-field-kind-conflict-smoke.abas")
+FieldKindConflictSir = Fission_ArcoBasicAstToSir(FieldKindConflictAst)
+FieldKindConflictAmir = Fission_SirToAmir(FieldKindConflictSir)
+FieldKindConflictProgram = Fission_AmirToX86_64(FieldKindConflictAmir)
+PRINT FieldKindConflictProgram.Diagnostics.HasErrors()
+
+' A derived class's own constructor re-assigning an INHERITED field with a
+' genuinely different kind than its base class already established for it
+' is a real, disclosed, reported diagnostic too (Fission_X86_64
+' CollectClassFields' own inheritance-consistency check) -- the fixed
+' point tracks each class's OWN field writes separately by construction,
+' so this specific cross-class conflict only surfaces once offsets/kinds
+' are merged parent-first.
+FieldInheritConflictSource = "CLASS Animal\n    CONSTRUCTOR(v)\n        SELF.Tag = v\n    END CONSTRUCTOR\nEND CLASS\nCLASS Dog EXTENDS Animal\n    CONSTRUCTOR(v)\n        SELF.Tag = \"not a number\"\n    END CONSTRUCTOR\nEND CLASS\na = Animal(5)\nd = Dog(1)"
+FieldInheritConflictTokens = Fission_ArcoBasicLex(FieldInheritConflictSource)
+FieldInheritConflictAst = Fission_ArcoBasicParse(FieldInheritConflictTokens, "x86-64-field-inherit-conflict-smoke.abas")
+FieldInheritConflictSir = Fission_ArcoBasicAstToSir(FieldInheritConflictAst)
+FieldInheritConflictAmir = Fission_SirToAmir(FieldInheritConflictSir)
+FieldInheritConflictProgram = Fission_AmirToX86_64(FieldInheritConflictAmir)
+PRINT FieldInheritConflictProgram.Diagnostics.HasErrors()
 
 UnknownFieldSource = "CLASS Counter\n    CONSTRUCTOR(start)\n        SELF.Value = start\n    END CONSTRUCTOR\nEND CLASS\nc = Counter(5)\nPRINT c.Missing"
 UnknownFieldTokens = Fission_ArcoBasicLex(UnknownFieldSource)

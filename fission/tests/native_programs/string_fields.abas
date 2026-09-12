@@ -1,0 +1,63 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises real NON-NUMERIC
+' (String) class fields (Fission_X86_64CollectClassFields' own
+' `signatures.FieldKinds`, folded into Fission_X86_64InferSignatures' own
+' fixed point -- see that function's own comment): a constructor copying a
+' String parameter straight into a field, a method reading the field back
+' and concatenating it, an accessor method whose ONLY evidence for its own
+' return kind is reading the field back (the case that specifically
+' required folding field kinds INTO the fixed point rather than resolving
+' them as a one-shot pass afterward), external field access from outside
+' the class, and the same String field combined with real class-instance
+' polymorphism and EXTENDS inheritance (a derived class's own constructor
+' also setting the inherited field, and an accessor inherited unmodified).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+CLASS Person
+    CONSTRUCTOR(name)
+        SELF.Name = name
+    END CONSTRUCTOR
+
+    FUNCTION Greet()
+        PRINT "Hello, " + SELF.Name
+    END FUNCTION
+
+    FUNCTION GetName()
+        RETURN SELF.Name
+    END FUNCTION
+END CLASS
+
+p = Person("Ada")
+p.Greet()
+n = p.GetName()
+PRINT n
+PRINT n + "!"
+PRINT p.Name
+
+CLASS Animal
+    CONSTRUCTOR(name)
+        SELF.Name = name
+    END CONSTRUCTOR
+
+    FUNCTION GetName()
+        RETURN SELF.Name
+    END FUNCTION
+END CLASS
+
+CLASS Dog EXTENDS Animal
+    CONSTRUCTOR(name)
+        SELF.Name = name
+    END CONSTRUCTOR
+END CLASS
+
+flag = 1
+IF flag == 1 THEN
+    pet = Dog("Rex")
+ELSE
+    pet = Animal("Generic")
+END IF
+PRINT pet.GetName()
+PRINT pet.Name + "!"

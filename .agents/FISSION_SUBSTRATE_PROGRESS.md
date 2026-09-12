@@ -1949,6 +1949,58 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   method call, an unresolvable-poly diagnostic, an ambiguous-poly-field
   diagnostic). Wired the new fixture into `fission/fissure.ab`'s watched-
   files list.
+- **Real non-numeric (String) class fields** (`fission/amir/
+  lower_x86_64.abas`) -- closes the "object fields are numeric-only"
+  Phase 1 restriction for the overwhelmingly common real pattern
+  (`CONSTRUCTOR(name) SELF.Name = name`, a String constructor parameter
+  copied straight into a field, then read back by an accessor method).
+  `Fission_X86_64CollectClassFields` now tracks each field's own KIND
+  (Number or String) alongside its byte offset, inheritance-aware exactly
+  like offsets (a derived class's own constructor re-assigning an
+  INHERITED field must agree with the kind already established for it --
+  a real, reported diagnostic if not). The real design finding this
+  session: a field's kind could NOT be resolved as a simple one-shot pass
+  after `Fission_X86_64InferSignatures` converges, the way it first
+  seemed -- an accessor method whose ONLY evidence for its own return
+  kind is reading a field back (`FUNCTION GetName() RETURN SELF.Name END
+  FUNCTION`) needs the field's REAL kind known DURING convergence, or its
+  own return kind stays permanently stuck at "Number" (confirmed the hard
+  way: `PRINT obj.GetName() + "!"` failed with a genuine "non-numeric
+  value" error even after the field itself was correctly typed, tracing
+  back to exactly this). Fixed by folding field-kind resolution directly
+  into `Fission_X86_64InferSignatures`' own fixed point as a THIRD
+  converging map (alongside `ParamKinds`/`ReturnKinds`), fed by a new
+  `Fission_X86_64CollectSlots` output (`FieldKindRequests`, scoped to
+  `SELF.Field = value` specifically -- by far the dominant real pattern,
+  external `obj.Field = value` writes remain a real, narrower, disclosed
+  limitation) -- the same "grow monotonically from Number, never
+  downgrade" discipline every other kind in this pass already uses. A
+  SECOND real bug found and fixed along the way, independent of fields:
+  a METHOD CALL's own dest kind (`n = p.GetName()`) had ALWAYS been
+  hardcoded "Number" (Phase 1's own original "methods return Number or
+  void" scope, never revisited) -- now resolved for real via the same
+  `Fission_X86_64ResolveMethodOwner` inheritance walk emission already
+  uses, so a method returning a String (a field, or anything else) Just
+  Works through every existing consumption site. `Fission_X86_64
+  ResolvePolyFieldOffset` (the polymorphic-field-access consistency
+  check from the polymorphism work above) now ALSO verifies every
+  candidate class agrees on the field's KIND, not just its offset.
+  Verified via real execution against the oracle: a constructor-parameter-
+  to-field String copy, an accessor method, external field access,
+  concatenation of a field-read result, and the same String field
+  combined with real polymorphism/inheritance (a derived class's own
+  constructor also setting the inherited field, an accessor inherited
+  unmodified) -- all byte-for-byte matching `ArcoFission compile-run`.
+  All 17 existing native fixtures re-verified unaffected. Extended
+  `fission/tests/amir_x86_64_smoke.abas`'s own pre-existing
+  `StringFieldSource` case (originally written to check for a diagnostic,
+  now checking real success) plus two new diagnostic cases (a same-class
+  field kind conflict across two different methods, a cross-class
+  inheritance kind conflict). New permanent fixture `fission/tests/
+  native_programs/string_fields.abas`; wired into `fission/fissure.ab`'s
+  watched-files list. Self-parse/self-semantic corpus symbol count grew
+  3563 -> 3605 (new functions/params); golden value updated. Verified
+  with `fissure run`.
 
 ## In-Progress Components
 
@@ -2721,18 +2773,24 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    - DONE -- real CLASS support (constructors, methods, SELF/external
      field access, multiple instances, full EXTENDS inheritance including
      a derived class genuinely calling an INHERITED, non-overridden
-     method, and now real class-instance RUNTIME POLYMORPHISM -- a real
+     method, real class-instance RUNTIME POLYMORPHISM -- a real
      `__class`-tag comparison chain, the "very much required feature" the
      project owner explicitly deferred until after The Arcology Fusion
-     Linker landed), see Completed Components. Real, disclosed remaining
-     gaps: non-numeric class fields; `SUPER.Method(...)` explicit
+     Linker landed -- and now real non-numeric, String-valued class
+     fields too, folded directly into the same fixed-point kind inference
+     string function parameters already use), see Completed Components.
+     Real, disclosed remaining gaps: `SUPER.Method(...)` explicit
      base-class calls (a real oracle feature never lowered by
-     `fission/sir/lower_amir.abas` at all, a SHARED-substrate gap); and a
-     real fallback to the existing ~244-entry host-function dispatch table
-     for anything else (legacy's own `arco_call_host`/`host_bridge.cpp`
-     bridge is the reference for this, though porting it into the
-     substrate rather than linking against it directly is itself a real
-     design decision to make, not just a port) -- this last item is now
+     `fission/sir/lower_amir.abas` at all, a SHARED-substrate gap); a
+     field established ONLY via an external `obj.Field = value` write
+     (never a `SELF.Field = value` inside the class's own methods) is a
+     real, narrower limitation of the same fixed point (scoped to SELF
+     specifically, by far the dominant real pattern); and a real fallback
+     to the existing ~244-entry host-function dispatch table for anything
+     else (legacy's own `arco_call_host`/`host_bridge.cpp` bridge is the
+     reference for this, though porting it into the substrate rather than
+     linking against it directly is itself a real design decision to
+     make, not just a port) -- this last item is now
      WP-011's own single largest remaining piece.
    The existing experimental legacy native backend
    (`ArcoFission build FILE -o OUT --target linux-x86_64`,

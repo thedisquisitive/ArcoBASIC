@@ -55,9 +55,10 @@
 ' `TRUE`/`FALSE` like the oracle, not the raw 0/1 -- a real, purely
 ' native-side structural recovery, see Fission_X86_64OperandIsBoolLiteral's
 ' own comment); and, as of Fission_X86_64CollectClassFields, real CLASS
-' support -- a constructor initializing numeric fields, methods reading/
-' writing SELF's own fields (and external `obj.Field` access), multiple
-' independent instances (real memory isolation, not aliasing), real
+' support -- a constructor initializing fields (Number OR String, see
+' `signatures.FieldKinds` below), methods reading/writing SELF's own
+' fields (and external `obj.Field` access), multiple independent
+' instances (real memory isolation, not aliasing), real
 ' EXTENDS inheritance (Fission_X86_64CollectClassParents/
 ' Fission_X86_64ResolveMethodOwner) with both method OVERRIDING and a
 ' derived class genuinely calling an INHERITED, non-overridden method (the
@@ -86,7 +87,18 @@
 ' non-representable case remains a real, disclosed diagnostic (a
 ' polymorphic receiver whose candidate classes don't ALL define a field at
 ' the identical offset, or don't ALL declare/inherit the called method) --
-' reported, not silently guessed at.
+' reported, not silently guessed at. And, as of `signatures.FieldKinds`
+' (folded directly into Fission_X86_64InferSignatures' own fixed point --
+' see that function's own comment for why a one-shot-after-convergence
+' derivation isn't enough), real NON-NUMERIC (String) class fields: a
+' constructor copying a String parameter straight into a field, an
+' accessor method reading it back, external field access, and the same
+' String field combined with real polymorphism/inheritance all work
+' through the exact same kind-tracking every other consumption site in
+' this file already trusts. A field established ONLY via an external
+' `obj.Field = value` write (never `SELF.Field = value` inside the
+' class's own methods) remains a real, narrower, disclosed limitation of
+' this same fixed point.
 ' Deliberately still out of scope, still real, disclosed follow-on work:
 ' arrays crossing a function boundary (parameter or return value -- a real
 ' diagnostic, not silently misinterpreted, the same reasoning the string-
@@ -103,7 +115,7 @@
 ' (`\`) and the `SAR` keyword specifically (both likewise confirmed NOT
 ' implemented by the oracle's own bytecode VM at all -- left unsupported
 ' here rather than guessing a semantic the oracle itself can never confirm
-' or deny); non-numeric class fields; SUPER.Method(...) explicit base-class
+' or deny); SUPER.Method(...) explicit base-class
 ' calls (a real oracle feature -- src/frontend/parser.cpp's own
 ' SuperCallExpr -- never lowered by fission/sir/lower_amir.abas at all
 ' yet, a SHARED-substrate gap, not native-codegen-specific); a derived
@@ -341,7 +353,30 @@ END FUNCTION
 ' PARENT-FIRST via a real (bounded, defensive-against-a-malformed/cyclic
 ' EXTENDS chain) topological pass over `classParents`, so a child is never
 ' resolved before the parent it needs to inherit from.
-FUNCTION Fission_X86_64CollectClassFields(amirModule, classParents)
+' `signatures` (Fission_X86_64InferSignatures' own converged output) lets
+' this pass ALSO determine each field's own KIND (Number or String) from
+' `signatures.FieldKinds` -- real field-kind convergence is folded
+' directly into Fission_X86_64InferSignatures' own fixed point (see that
+' function's own comment for why: an accessor method whose ONLY evidence
+' for its own return kind is reading a field back, e.g. `FUNCTION
+' GetName() RETURN SELF.Name END FUNCTION`, needs the field's REAL kind
+' known DURING convergence, not just after it, so a plain one-shot
+' derivation here isn't enough) -- closing the "object fields are
+' numeric-only" Phase 1 restriction for the overwhelmingly common real
+' pattern (`CONSTRUCTOR(name) SELF.Name = name`, a String parameter
+' copied straight into a field, then read back by another method).
+' `diagnostics` lets this pass report a real, disclosed "field assigned a
+' kind conflicting with its own INHERITED kind" error for the one case
+' the fixed point itself cannot see (it tracks each class's OWN field
+' writes separately, by construction, so a derived class's own
+' constructor re-assigning an INHERITED field with a genuinely different
+' kind than its base class only surfaces once offsets/kinds are merged
+' here) -- an ordinary same-class conflict (two DIFFERENT methods of the
+' SAME class disagreeing) is instead caught the same way every other kind
+' conflict in this file already is: at the actual Store/StoreIndex
+' EMISSION site, comparing that one instruction's own value kind against
+' the final converged kind, not during collection.
+FUNCTION Fission_X86_64CollectClassFields(amirModule, classParents, functionNames, signatures, diagnostics)
     ownFields = {}
     classNames = []
     seenClassNames = {}
@@ -411,19 +446,36 @@ FUNCTION Fission_X86_64CollectClassFields(amirModule, classParents)
                 CONTINUE FOR
             END IF
             fieldOffsets = {"__class": 0}
+            fieldKinds = {"__class": "String"}
             nextOffset = 8
             IF parentName != "" THEN
-                parentInfo = Object.Get(resolved, parentName, {FieldOffsets: {"__class": 0}, Size: 8})
+                parentInfo = Object.Get(resolved, parentName, {FieldOffsets: {"__class": 0}, FieldKinds: {"__class": "String"}, Size: 8})
                 fieldOffsets = parentInfo.FieldOffsets
+                fieldKinds = parentInfo.FieldKinds
                 nextOffset = parentInfo.Size
             END IF
+            ownKindsForClass = Object.Get(signatures.FieldKinds, className, {FieldKinds: {}}).FieldKinds
             FOR fieldName IN Object.Get(ownFields, className, [])
+                ownKind = Object.Get(ownKindsForClass, fieldName, "Number")
                 IF Object.Has(fieldOffsets, fieldName) == FALSE THEN
                     fieldOffsets = Object.Set(fieldOffsets, fieldName, nextOffset)
+                    fieldKinds = Object.Set(fieldKinds, fieldName, ownKind)
                     nextOffset = nextOffset + 8
+                ELSE
+                    ' An INHERITED field name re-assigned by this class's
+                    ' own constructor/methods (e.g. Dog's own CONSTRUCTOR
+                    ' also setting SELF.Legs, a field Animal already
+                    ' introduced) must agree with the kind already
+                    ' established for it -- a real, reported diagnostic if
+                    ' not, the same reasoning a plain variable's own
+                    ' conflicting-kind check already uses.
+                    inheritedKind = Object.Get(fieldKinds, fieldName, "Number")
+                    IF inheritedKind != ownKind THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Field '" + fieldName + "' on class " + className + " is assigned kind " + ownKind + ", conflicting with its inherited kind " + inheritedKind + ", which native x86-64 codegen does not support")
+                    END IF
                 END IF
             NEXT
-            resolved = Object.Set(resolved, className, {FieldOffsets: fieldOffsets, Size: nextOffset})
+            resolved = Object.Set(resolved, className, {FieldOffsets: fieldOffsets, FieldKinds: fieldKinds, Size: nextOffset})
         NEXT
         remaining = stillRemaining
         guard = guard + 1
@@ -436,14 +488,17 @@ FUNCTION Fission_X86_64CollectClassFields(amirModule, classParents)
     ' catches actual misuse.
     FOR className IN remaining
         fieldOffsets = {"__class": 0}
+        fieldKinds = {"__class": "String"}
         nextOffset = 8
+        ownKindsForClass = Object.Get(signatures.FieldKinds, className, {FieldKinds: {}}).FieldKinds
         FOR fieldName IN Object.Get(ownFields, className, [])
             IF Object.Has(fieldOffsets, fieldName) == FALSE THEN
                 fieldOffsets = Object.Set(fieldOffsets, fieldName, nextOffset)
+                fieldKinds = Object.Set(fieldKinds, fieldName, Object.Get(ownKindsForClass, fieldName, "Number"))
                 nextOffset = nextOffset + 8
             END IF
         NEXT
-        resolved = Object.Set(resolved, className, {FieldOffsets: fieldOffsets, Size: nextOffset})
+        resolved = Object.Set(resolved, className, {FieldOffsets: fieldOffsets, FieldKinds: fieldKinds, Size: nextOffset})
     NEXT
     RETURN resolved
 END FUNCTION
@@ -452,28 +507,31 @@ END FUNCTION
 ' receiver (Fission_X86_64IsPolyKind) -- every one of `candidates` (the
 ' closed, exhaustive set of concrete classes this receiver was ever
 ' observed holding) must resolve `fieldName` to the EXACT SAME fixed byte
-' offset. Always true when the field is inherited from a shared ancestor
-' (Fission_X86_64CollectClassFields' own inheritance-aware layout
-' guarantees this by construction -- every descendant of the class that
-' first introduces a field keeps that exact offset forever), but NOT
-' guaranteed for two UNRELATED candidate classes that each happen to
-' declare a same-named field independently (their own NextOffset at
-' resolution time need not agree) -- {Ok: FALSE} for that case, a real,
-' disclosed diagnostic at the call site rather than a silent wrong-offset
-' read/write.
+' offset AND the exact same KIND. Always true when the field is inherited
+' from a shared ancestor (Fission_X86_64CollectClassFields' own
+' inheritance-aware layout guarantees this by construction -- every
+' descendant of the class that first introduces a field keeps that exact
+' offset and kind forever), but NOT guaranteed for two UNRELATED candidate
+' classes that each happen to declare a same-named field independently
+' (their own NextOffset/kind at resolution time need not agree) -- {Ok:
+' FALSE} for that case, a real, disclosed diagnostic at the call site
+' rather than a silent wrong-offset/wrong-kind read/write.
 FUNCTION Fission_X86_64ResolvePolyFieldOffset(classFields, candidates, fieldName)
     firstOffset = -1
+    firstKind = ""
     FOR candidate IN candidates
-        classInfo = Object.Get(classFields, candidate, {FieldOffsets: {}, Size: 8})
-        IF Object.Has(classInfo.FieldOffsets, fieldName) == FALSE THEN RETURN {Ok: FALSE, Offset: 0}
+        classInfo = Object.Get(classFields, candidate, {FieldOffsets: {}, FieldKinds: {}, Size: 8})
+        IF Object.Has(classInfo.FieldOffsets, fieldName) == FALSE THEN RETURN {Ok: FALSE, Offset: 0, Kind: "Number"}
         offset = Object.Get(classInfo.FieldOffsets, fieldName, 0)
+        candidateKind = Object.Get(classInfo.FieldKinds, fieldName, "Number")
         IF firstOffset == -1 THEN
             firstOffset = offset
+            firstKind = candidateKind
         ELSE
-            IF offset != firstOffset THEN RETURN {Ok: FALSE, Offset: 0}
+            IF offset != firstOffset ORELSE candidateKind != firstKind THEN RETURN {Ok: FALSE, Offset: 0, Kind: "Number"}
         END IF
     NEXT
-    RETURN {Ok: TRUE, Offset: firstOffset}
+    RETURN {Ok: TRUE, Offset: firstOffset, Kind: firstKind}
 END FUNCTION
 
 ' Pre-scan pass: every distinct temp/variable name gets exactly one fixed
@@ -521,7 +579,24 @@ END FUNCTION
 ' time `Names`/`Kinds` -- fed to real emission -- are what's wanted, and
 ' the extra three fields are ignored) -- one real pass, two different
 ' callers, rather than two near-duplicate scans that could drift apart.
-FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn)
+'
+' `classFieldsIn` ({ClassName: {FieldOffsets, FieldKinds, Size}}, see
+' Fission_X86_64CollectClassFields' own header comment) is what lets a
+' field READ's own dest correctly carry a String kind instead of always
+' hardcoding Number -- but ONLY the FINAL, real-emission caller
+' (Fission_X86_64LowerFunction) passes the real, converged classFields;
+' every call made DURING Fission_X86_64InferSignatures' own fixed point
+' passes `{}` instead, a real, disclosed, narrow limitation: a field's
+' own kind is resolved from the ALREADY-converged signatures directly
+' (Fission_X86_64CollectClassFields runs after InferSignatures, not
+' folded into the same fixed point), so a method whose ONLY evidence for
+' its own return kind is reading back a String field (e.g. `FUNCTION
+' GetName() RETURN SELF.Name END FUNCTION`) is not yet seen as
+' String-returning by cross-function signature inference -- it still
+' works correctly for any LOCAL use within the same function (PRINT,
+' concatenation, a local variable copy), which is what `{}` here
+' preserves exactly the pre-existing "Number" default for.
+FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn)
     names = []
     seen = {}
     kinds = {}
@@ -529,6 +604,7 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
     paramNames = []
     returnKindOut = "Number"
     callArgKindRequests = []
+    fieldKindRequests = []
     ' A class method/constructor-init's own SELF is ALWAYS "Object:
     ' ClassName" -- staticaly determined directly from THIS function's own
     ' name (never through call-site inference, unlike every other
@@ -684,19 +760,51 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 ' dest kind is staticaly "Object:ClassName" directly, the
                 ' same reasoning SELF/OBJECT's own kinds above use, never
                 ' through the general Number/String-only inference (which
-                ' has no concept of Object kinds at all). A method call
-                ' like `c.Increment` is never itself a real function name
-                ' (the actual target, "Counter.Increment", is resolved at
-                ' EMISSION time from `c`'s own tracked kind -- see
-                ' Fission_X86_64LowerFunction's own Call handling) so it
-                ' naturally falls through to the plain "Number" default
-                ' here, correct for Phase 1's own "methods return Number
-                ' or void" scope.
+                ' has no concept of Object kinds at all).
+                ' A method call like `c.Increment` is never itself a real
+                ' function name -- its ACTUAL target ("Counter.Increment")
+                ' is resolved the SAME way Fission_X86_64LowerFunction's
+                ' own Call handling resolves it for real emission: from
+                ' `c`'s own tracked kind, walking a real EXTENDS chain via
+                ' Fission_X86_64ResolveMethodOwner for a single concrete
+                ' class, or the FIRST candidate for a genuinely
+                ' polymorphic receiver (every candidate's own method must
+                ' agree on kind by construction once real dispatch is
+                ' emitted -- Fission_X86_64LowerFunction's own dispatch
+                ' loop calls the SAME resolved function for every branch
+                ' when the class hierarchy makes that the same answer, and
+                ' a genuine per-branch return-kind MISMATCH would already
+                ' be a separate, real Number/String conflict this pass's
+                ' own general machinery below still catches at the actual
+                ' call/consumption site). This used to unconditionally
+                ' default to "Number" here (Phase 1's own "methods return
+                ' Number or void" scope) -- now resolved for real, so a
+                ' method returning a String field (`RETURN SELF.Name`)
+                ' Just Works through the exact same kind-tracking every
+                ' other consumption site already trusts.
                 destKind = "Number"
                 IF Object.Has(functionNames, callee + ".__new") THEN
                     destKind = "Object:" + callee
                 ELSE
-                    IF Object.Has(functionNames, callee) THEN destKind = Object.Get(returnKindsIn, callee, "Number")
+                    IF Object.Has(functionNames, callee) THEN
+                        destKind = Object.Get(returnKindsIn, callee, "Number")
+                    ELSE
+                        IF String.Contains(callee, ".") THEN
+                            baseName = Fission_X86_64ClassNameFromFunctionName(callee)
+                            methodName = Fission_X86_64MethodNameFromFunctionName(callee)
+                            baseKind = Object.Get(kinds, baseName, "Number")
+                            candidateClass = ""
+                            IF Fission_X86_64IsObjectKind(baseKind) THEN candidateClass = Fission_X86_64ObjectClassOfKind(baseKind)
+                            IF Fission_X86_64IsPolyKind(baseKind) THEN
+                                polyClasses = Fission_X86_64PolyClassesOfKind(baseKind)
+                                IF LEN(polyClasses) > 0 THEN candidateClass = polyClasses[0]
+                            END IF
+                            IF candidateClass != "" THEN
+                                owner = Fission_X86_64ResolveMethodOwner(classParentsIn, functionNames, candidateClass, methodName)
+                                IF owner != "" THEN destKind = Object.Get(returnKindsIn, owner + "." + methodName, "Number")
+                            END IF
+                        END IF
+                    END IF
                 END IF
                 kinds = Object.Set(kinds, dest, destKind)
                 ' Every argument this call passes is itself real evidence
@@ -730,13 +838,70 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 kinds = Object.Set(kinds, dest, "Array")
             END IF
             IF kind == "Index" THEN
-                ' Phase 7 scope: numeric-element arrays only -- an indexed
-                ' read's own result is always Number.
+                ' Phase 7 scope: numeric-element arrays only -- an ARRAY
+                ' indexed read's own result is always Number. A real
+                ' object FIELD read (`obj.Field`/`SELF.Field`, the SAME
+                ' opcode with a CONST-string key instead of a numeric one)
+                ' instead carries that field's own real kind, looked up via
+                ' `classFieldsIn` (see this function's own header comment
+                ' for why that's `{}` -- Number -- during
+                ' Fission_X86_64InferSignatures' own fixed point, and the
+                ' real, converged classFields only for actual emission).
+                ' For a POLYMORPHIC base, the first candidate class that
+                ' actually declares the field is used -- sound enough here
+                ' since a genuine cross-candidate offset/kind mismatch is
+                ' independently caught, and the whole instruction rejected,
+                ' by Fission_X86_64LowerFunction's own real Index emission
+                ' (Fission_X86_64ResolvePolyFieldOffset) before this
+                ' tentative kind could ever actually matter.
                 dest = instruction.Field("Dest")
                 state = Fission_X86_64Remember(names, seen, dest)
                 names = state.Names
                 seen = state.Seen
-                kinds = Object.Set(kinds, dest, "Number")
+                destKind = "Number"
+                base = instruction.Field("Base")
+                baseKind = Fission_X86_64OperandKind(kinds, base)
+                IF Fission_X86_64IsObjectKind(baseKind) ORELSE Fission_X86_64IsPolyKind(baseKind) THEN
+                    indexOperand = instruction.Field("Index")
+                    IF Object.Has(constStringValues, indexOperand) THEN
+                        fieldName = Object.Get(constStringValues, indexOperand, "")
+                        candidateClasses = [Fission_X86_64ObjectClassOfKind(baseKind)]
+                        IF Fission_X86_64IsPolyKind(baseKind) THEN candidateClasses = Fission_X86_64PolyClassesOfKind(baseKind)
+                        FOR candidate IN candidateClasses
+                            candidateInfo = Object.Get(classFieldsIn, candidate, {FieldKinds: {}})
+                            IF destKind == "Number" ANDALSO Object.Has(candidateInfo.FieldKinds, fieldName) THEN
+                                destKind = Object.Get(candidateInfo.FieldKinds, fieldName, "Number")
+                            END IF
+                        NEXT
+                    END IF
+                END IF
+                kinds = Object.Set(kinds, dest, destKind)
+            END IF
+            IF kind == "StoreIndex" ANDALSO instruction.Field("Name") == "SELF" THEN
+                ' `SELF.Field = value` is itself real evidence for that
+                ' FIELD's own kind -- fed back into Fission_X86_64
+                ' InferSignatures' fixed-point loop as a request, exactly
+                ' like a call argument feeds a parameter's own kind (see
+                ' this function's own CallArgKindRequests). Scoped to SELF
+                ' specifically (by far the dominant real pattern -- every
+                ' constructor/method establishing its own class's fields)
+                ' rather than a general `obj.Field = value` from outside
+                ' the class: SELF's own enclosing class is always known
+                ' directly from this function's own name, no ambiguity,
+                ' unlike an external object's tracked kind which could
+                ' itself still be converging. A field ONLY ever
+                ' established this way (never through an external write)
+                ' remains real, disclosed, narrower scope -- consistent
+                ' with this whole file's own incremental-construct-
+                ' coverage discipline.
+                indexOperand = instruction.Field("Index")
+                IF selfClassName != "" ANDALSO Object.Has(constStringValues, indexOperand) THEN
+                    fieldName = Object.Get(constStringValues, indexOperand, "")
+                    IF fieldName != "__class" THEN
+                        valueKind = Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, instruction.Field("Value")))
+                        ignored = Array.Push(fieldKindRequests, {ClassName: selfClassName, FieldName: fieldName, Kind: valueKind})
+                    END IF
+                END IF
             END IF
             IF kind == "Return" THEN
                 ' This function's OWN return kind, fed back into
@@ -760,7 +925,7 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
     FOR paramName IN paramNames
         ignored = Array.Push(paramKindsOut, Object.Get(kinds, paramName, "Number"))
     NEXT
-    RETURN {Names: names, Kinds: kinds, ConstStringValues: constStringValues, ParamKindsOut: paramKindsOut, ReturnKindOut: returnKindOut, CallArgKindRequests: callArgKindRequests}
+    RETURN {Names: names, Kinds: kinds, ConstStringValues: constStringValues, ParamKindsOut: paramKindsOut, ReturnKindOut: returnKindOut, CallArgKindRequests: callArgKindRequests, FieldKindRequests: fieldKindRequests}
 END FUNCTION
 
 ' Real inter-procedural kind inference: closes the exact gap this file's
@@ -798,8 +963,32 @@ END FUNCTION
 ' (see that function's own Call-argument handling), not silently
 ' misinterpreted.
 FUNCTION Fission_X86_64InferSignatures(amirModule, functionNames)
+    ' Needed here too (not just by Fission_X86_64CollectClassFields/
+    ' Fission_X86_64LowerFunction) so a METHOD call's own dest kind can
+    ' resolve through a real EXTENDS chain during convergence itself --
+    ' see Fission_X86_64CollectSlots' own Call-handling comment. Cheap and
+    ' side-effect-free to recompute here; classParents has no dependency
+    ' on signatures at all (purely structural, from DeclareClass's own
+    ' Extends field), so there is no ordering hazard.
+    classParents = Fission_X86_64CollectClassParents(amirModule)
     paramKinds = {}
     returnKinds = {}
+    ' {ClassName: {FieldKinds: {fieldName: kind}}} -- the SAME shape real
+    ' classFields carries, grown monotonically (Number -> String, never
+    ' downgraded) by this SAME fixed point, from real `SELF.Field = value`
+    ' evidence (Fission_X86_64CollectSlots' own FieldKindRequests) --
+    ' folded in here, not resolved as a separate one-shot pass after
+    ' convergence, precisely so a method whose ONLY evidence for its own
+    ' return kind is reading a field back (`FUNCTION GetName() RETURN
+    ' SELF.Name END FUNCTION`) sees the field's REAL kind DURING
+    ' convergence, letting GetName's own return kind correctly grow to
+    ' String too -- confirmed necessary the hard way: without this, a
+    ' one-shot-after-the-fact field-kind derivation left GetName's own
+    ' converged return kind permanently stuck at "Number" (accessor
+    ' methods are the overwhelmingly common real use of a String field),
+    ' breaking `PRINT obj.GetName() + "!"` even though the field itself
+    ' was correctly typed.
+    fieldKinds = {}
     FOR fn IN amirModule.Functions
         seedParams = []
         FOR param IN fn.Params
@@ -817,7 +1006,7 @@ FUNCTION Fission_X86_64InferSignatures(amirModule, functionNames)
         FOR fn IN amirModule.Functions
             fnParamKinds = Object.Get(paramKinds, fn.Name, [])
             fnReturnKind = Object.Get(returnKinds, fn.Name, "Number")
-            collected = Fission_X86_64CollectSlots(fn, functionNames, fnParamKinds, returnKinds)
+            collected = Fission_X86_64CollectSlots(fn, functionNames, fnParamKinds, returnKinds, fieldKinds, classParents)
 
             ' A real bug found and fixed while adding CLASS support: this
             ' merge originally only ever recognized "String" as a real
@@ -863,11 +1052,21 @@ FUNCTION Fission_X86_64InferSignatures(amirModule, functionNames)
                     END IF
                 END IF
             NEXT
+
+            FOR request IN collected.FieldKindRequests
+                classFieldKindInfo = Object.Get(fieldKinds, request.ClassName, {FieldKinds: {}})
+                existingFieldKind = Object.Get(classFieldKindInfo.FieldKinds, request.FieldName, "Number")
+                IF request.Kind != "Number" ANDALSO existingFieldKind != request.Kind THEN
+                    newFieldKindsForClass = Object.Set(classFieldKindInfo.FieldKinds, request.FieldName, request.Kind)
+                    fieldKinds = Object.Set(fieldKinds, request.ClassName, {FieldKinds: newFieldKindsForClass})
+                    changed = TRUE
+                END IF
+            NEXT
         NEXT
         round = round + 1
     WEND
 
-    RETURN {ParamKinds: paramKinds, ReturnKinds: returnKinds}
+    RETURN {ParamKinds: paramKinds, ReturnKinds: returnKinds, FieldKinds: fieldKinds}
 END FUNCTION
 
 ' The kind ("Number" or "String") of `operand` -- a bare numeric literal is
@@ -1811,7 +2010,7 @@ END FUNCTION
 ' just this one.
 FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures, classFields, classParents)
     fnParamKinds = Object.Get(signatures.ParamKinds, fn.Name, [])
-    collected = Fission_X86_64CollectSlots(fn, functionNames, fnParamKinds, signatures.ReturnKinds)
+    collected = Fission_X86_64CollectSlots(fn, functionNames, fnParamKinds, signatures.ReturnKinds, classFields, classParents)
     frame = Fission_X86_64BuildFrame(collected.Names)
     offsets = frame.Offsets
     kinds = collected.Kinds
@@ -2103,38 +2302,45 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                         CONTINUE FOR
                     END IF
                     fieldName = Object.Get(constStringValues, index, "")
-                    ' `__class` is the ONE field that's always genuinely
-                    ' String-kind, not Number -- the tag `ClassName.__new`
-                    ' itself always writes (confirmed via the oracle);
-                    ' every OTHER field is real, disclosed Phase 1 scope:
-                    ' numeric-only, the same limitation Phase 7 arrays
-                    ' started with.
-                    IF fieldName != "__class" THEN
-                        IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, value)) != "Number" THEN
-                            ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports numeric class fields: " + value)
-                            CONTINUE FOR
-                        END IF
-                    END IF
                     fieldOffset = 0
+                    fieldKind = "Number"
                     IF Fission_X86_64IsPolyKind(nameKind) THEN
                         ' See Index's own poly-field-read handling above for
                         ' the full "every candidate must agree on the exact
-                        ' same offset" reasoning -- applies symmetrically
-                        ' to a write.
+                        ' same offset AND kind" reasoning -- applies
+                        ' symmetrically to a write.
                         polyResult = Fission_X86_64ResolvePolyFieldOffset(classFields, Fission_X86_64PolyClassesOfKind(nameKind), fieldName)
                         IF polyResult.Ok == FALSE THEN
                             ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Field '" + fieldName + "' is not supported by native x86-64 codegen: " + name + " could hold different concrete classes (" + nameKind + ") that do not all define this field at the same location")
                             CONTINUE FOR
                         END IF
                         fieldOffset = polyResult.Offset
+                        fieldKind = polyResult.Kind
                     ELSE
                         className = Fission_X86_64ObjectClassOfKind(nameKind)
-                        classInfo = Object.Get(classFields, className, {FieldOffsets: {}, Size: 8})
+                        classInfo = Object.Get(classFields, className, {FieldOffsets: {}, FieldKinds: {}, Size: 8})
                         IF Object.Has(classInfo.FieldOffsets, fieldName) == FALSE THEN
                             ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Unknown field '" + fieldName + "' on class " + className + " is not supported by native x86-64 codegen")
                             CONTINUE FOR
                         END IF
                         fieldOffset = Object.Get(classInfo.FieldOffsets, fieldName, 0)
+                        fieldKind = Object.Get(classInfo.FieldKinds, fieldName, "Number")
+                    END IF
+                    ' `__class` is always genuinely String-kind (the tag
+                    ' `ClassName.__new` itself always writes, confirmed via
+                    ' the oracle); every OTHER field must match its own
+                    ' ESTABLISHED kind (Fission_X86_64CollectClassFields'
+                    ' own converged Number-or-String result for this exact
+                    ' field name) -- real, disclosed scope beyond Phase 1's
+                    ' original numeric-only restriction: a field's kind is
+                    ' fixed once, module-wide (like a real typed struct
+                    ' field), not a per-instance union the way a plain
+                    ' variable's Poly kind is.
+                    IF fieldName != "__class" THEN
+                        IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, value)) != fieldKind THEN
+                            ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports a class field value matching its own established kind (" + fieldKind + "): " + value)
+                            CONTINUE FOR
+                        END IF
                     END IF
                     ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, name, "rax"))
                     ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, value, "rdx"))
@@ -2504,7 +2710,7 @@ FUNCTION Fission_AmirToX86_64(amirModule)
     ' Real CLASS support: every class's own fixed field-offset table, built
     ' once, module-wide -- see Fission_X86_64CollectClassFields' own header
     ' comment for the full design.
-    classFields = Fission_X86_64CollectClassFields(amirModule, classParents)
+    classFields = Fission_X86_64CollectClassFields(amirModule, classParents, functionNames, signatures, program.Diagnostics)
 
     allTextLines = []
     FOR fn IN amirModule.Functions
