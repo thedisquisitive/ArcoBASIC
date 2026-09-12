@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^91$" <<<"$fission_self_semantic_output"
 grep -q "^138$" <<<"$fission_self_semantic_output"
-grep -q "^2959$" <<<"$fission_self_semantic_output"
+grep -q "^2974$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -504,6 +504,11 @@ grep -q "^BLOCK DoBody6$" <<<"$amir_loops2_output"
 grep -q "^    %t24 :BOOL := INT.CMP_LT_UNSIGNED %t22, %t23 \[,\]$" <<<"$amir_loops2_output"
 grep -q "^    BRANCH %t24, DoBody6, DoEnd7$" <<<"$amir_loops2_output"
 grep -q "^BLOCK DoEnd7$" <<<"$amir_loops2_output"
+
+amir_loop_control_output="$("$SOURCE_DIR/build-rivet/fission/tests/sir_to_amir_loop_control_smoke")"
+
+test "$(grep -c "^FALSE$" <<<"$amir_loop_control_output")" = "4"
+test "$(grep -c "^TRUE$" <<<"$amir_loop_control_output")" = "5"
 
 # This one runs the produced bytecode through the real legacy VM
 # (`ArcoFission run`) and checks its actual printed output -- true
@@ -699,5 +704,28 @@ expected_arrays_output="$(printf '10\n20\n30\n99\n3\n140\n40\n20\n3\n1000\n100\n
 test "$arrays_native_output" = "$expected_arrays_output"
 oracle_arrays_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/arrays.abas")"
 test "$arrays_native_output" = "$oracle_arrays_output"
+
+# fission/tests/native_programs/for_each.abas exercises ForEach (FOR item IN values ... NEXT) over
+# a real array, unblocked by Phase 7 (numeric arrays) landing -- confirmed to need zero dedicated
+# native x86-64 codegen at all, since it desugars entirely (in the SHARED fission/sir/lower_amir.abas
+# pass) into primitives this backend already lowered for other constructs.
+for_each_native_output="$("$SOURCE_DIR/build/fission-native-programs/for_each")"
+expected_for_each_output="$(printf '10\n20\n30\n60\n2\n8\n18\n32\n50')"
+test "$for_each_native_output" = "$expected_for_each_output"
+oracle_for_each_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/for_each.abas")"
+test "$for_each_native_output" = "$oracle_for_each_output"
+
+# fission/tests/native_programs/loop_control.abas exercises EXIT/CONTINUE (SIR "LoopControl")
+# across every loop shape this substrate lowers -- a real gap in the SHARED
+# fission/sir/lower_amir.abas pass (affects both the bytecode and native backends) found and fixed
+# while investigating whether Phase 7's own arrays newly unblocked ForEach. Also exercises a real,
+# disclosed surprise found only by comparing native execution against the oracle: CONTINUE in a
+# post-condition-only DO loop jumps straight back to the top of the body, bypassing that
+# iteration's own post-condition check entirely.
+loop_control_native_output="$("$SOURCE_DIR/build/fission-native-programs/loop_control")"
+expected_loop_control_output="$(printf '25\n5\n36\n1\n2\n3\n4\n5\n4')"
+test "$loop_control_native_output" = "$expected_loop_control_output"
+oracle_loop_control_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/loop_control.abas")"
+test "$loop_control_native_output" = "$oracle_loop_control_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

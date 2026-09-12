@@ -84,7 +84,27 @@ CLASS FissionAmirBuilder
         SELF.CurrentReturnType = "I32"
         SELF.Scope = FissionAmirScope()
         SELF.Diagnostics = FissionDiagnosticBag()
+        ' A stack of {Continue, Break} block-name pairs, one entry per
+        ' currently-open loop (innermost last) -- see PushLoop/PopLoop/
+        ' CurrentLoop and Fission_AmirLowerLoopControl below. Empty outside
+        ' any loop.
+        SELF.LoopStack = []
     END CONSTRUCTOR
+
+    FUNCTION PushLoop(continueTarget, breakTarget)
+        ignored = Array.Push(SELF.LoopStack, {ContinueTarget: continueTarget, BreakTarget: breakTarget})
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION PopLoop()
+        ignored = Array.Pop(SELF.LoopStack)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION CurrentLoop()
+        IF LEN(SELF.LoopStack) == 0 THEN RETURN NULL
+        RETURN SELF.LoopStack[LEN(SELF.LoopStack) - 1]
+    END FUNCTION
 
     FUNCTION NewTemp()
         name = "%t" + String(SELF.TempCounter)
@@ -315,11 +335,13 @@ FUNCTION Fission_AmirLowerWhile(builder, node)
 
     bodyBlock = currentFunction.AddBlock(FissionAmirBlock(bodyName))
     builder.CurrentBlock = bodyBlock
+    ignored = builder.PushLoop(condName, endName)
     index = 1
     WHILE index < LEN(node.Children)
         ignored = Fission_AmirLowerStatement(builder, node.Children[index])
         index = index + 1
     WEND
+    ignored = builder.PopLoop()
     ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", condName))
 
     endBlock = currentFunction.AddBlock(FissionAmirBlock(endName))
@@ -424,11 +446,13 @@ FUNCTION Fission_AmirLowerForRange(builder, node)
 
     bodyBlock = currentFunction.AddBlock(FissionAmirBlock(bodyName))
     builder.CurrentBlock = bodyBlock
+    ignored = builder.PushLoop(incName, forEndName)
     index = bodyIndex
     WHILE index < LEN(node.Children)
         ignored = Fission_AmirLowerStatement(builder, node.Children[index])
         index = index + 1
     WEND
+    ignored = builder.PopLoop()
     ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", incName))
 
     incBlock = currentFunction.AddBlock(FissionAmirBlock(incName))
@@ -501,11 +525,32 @@ FUNCTION Fission_AmirLowerDo(builder, node)
         ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", bodyName))
     END IF
 
+    ' The real "CONTINUE DO" target, confirmed via the oracle (`ArcoFission
+    ' reveal ... at A-MIR` on real DO WHILE/DO...LOOP UNTIL probes using
+    ' CONTINUE), is NOT simply "wherever the body would jump to next on
+    ' ordinary completion" -- a real, disclosed surprise this pass got wrong
+    ' on its first attempt (verified only by comparing native x86-64
+    ' execution output against the oracle's own, which caught it: this DO
+    ' loop shape's own post-condition check must NEVER be reached via
+    ' CONTINUE, only via ordinary fallthrough from the body). If this shape
+    ' has a PRE-condition (DO WHILE/DO UNTIL), CONTINUE re-checks it
+    ' (condName), exactly like WHILE's own CONTINUE re-checks its condition.
+    ' But if this shape's only condition is a POST-condition (LOOP WHILE/
+    ' LOOP UNTIL) or it has no condition at all (a bare infinite
+    ' `DO ... LOOP`), CONTINUE jumps directly back to the top of the body
+    ' (bodyName) -- completely bypassing the post-condition check for that
+    ' iteration, confirmed real oracle behavior, not a simplification of
+    ' convenience.
+    continueTarget = bodyName
+    IF preMode != "" THEN continueTarget = condName
+
     bodyBlock = currentFunction.AddBlock(FissionAmirBlock(bodyName))
     builder.CurrentBlock = bodyBlock
+    ignored = builder.PushLoop(continueTarget, endName)
     FOR statement IN bodyNode.Children
         ignored = Fission_AmirLowerStatement(builder, statement)
     NEXT
+    ignored = builder.PopLoop()
 
     IF postMode != "" THEN
         postResult = Fission_AmirLowerExpr(builder, postConditionNode)
@@ -524,6 +569,45 @@ FUNCTION Fission_AmirLowerDo(builder, node)
 
     endBlock = currentFunction.AddBlock(FissionAmirBlock(endName))
     builder.CurrentBlock = endBlock
+END FUNCTION
+
+' EXIT/CONTINUE (SIR "LoopControl", Fields Action="EXIT"|"CONTINUE" and an
+' optional, purely informational Target keyword -- WHILE/FOR/DO/etc, see
+' FissionArcoBasicParser.ParseLoopControlStmt) always target the INNERMOST
+' enclosing loop, ignoring the Target keyword's own text: every loop shape
+' this file lowers (While/ForRange/Do/ForEach) pushes exactly one
+' {Continue, Break} block-name pair onto BUILDER.LoopStack for the duration
+' of its own body (see PushLoop/PopLoop/CurrentLoop on FissionAmirBuilder),
+' so "the innermost loop on the stack" and "the loop the keyword names"
+' always agree for well-formed source -- this substrate's SIR carries no
+' separate per-loop identity to match the keyword against even if a
+' mismatch needed detecting. A LoopControl node with nothing on the stack
+' (EXIT/CONTINUE used outside any loop, not caught by an earlier semantic
+' pass) is a real diagnostic, not a dangling jump to a block that doesn't
+' exist. Previously this SIR node kind was not handled here AT ALL --
+' `EXIT WHILE`/`EXIT FOR`/`CONTINUE`/etc. fell straight through to the
+' generic "unsupported statement" diagnostic, a real gap in this SHARED
+' pass (affects both the bytecode and native x86-64 backends) found while
+' investigating whether native codegen's Phase 7 arrays newly unblocked
+' ForEach -- confirmed via the oracle (`ArcoFission compile-run` on a real
+' EXIT WHILE/EXIT FOR/CONTINUE FOR probe) that this is a genuine, working
+' ArcoBASIC language feature, not something to leave unsupported.
+FUNCTION Fission_AmirLowerLoopControl(builder, node)
+    activeLoop = builder.CurrentLoop()
+    IF activeLoop == NULL THEN
+        ignored = builder.Diagnostics.ReportError("FISSION_AMIR_UNSUPPORTED", "EXIT/CONTINUE used outside any loop")
+        RETURN
+    END IF
+    action = Object.Get(node.Fields, "Action", "")
+    IF action == "EXIT" THEN
+        ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", activeLoop.BreakTarget))
+        RETURN
+    END IF
+    IF action == "CONTINUE" THEN
+        ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", activeLoop.ContinueTarget))
+        RETURN
+    END IF
+    ignored = builder.Diagnostics.ReportError("FISSION_AMIR_UNSUPPORTED", "Unsupported LoopControl action for A-MIR lowering: " + action)
 END FUNCTION
 
 ' TRY/CATCH does not open a new block for its own try-body the way every
@@ -600,11 +684,13 @@ FUNCTION Fission_AmirLowerForEach(builder, node)
     itemDest = builder.NewTemp()
     ignored = builder.Emit(FissionAmirInstruction("Index").WithField("Dest", itemDest).WithField("Base", itemsLoadBody).WithField("Index", indexLoadBody))
     ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", name).WithField("Value", itemDest))
+    ignored = builder.PushLoop(incName, endName)
     index = 1
     WHILE index < LEN(node.Children)
         ignored = Fission_AmirLowerStatement(builder, node.Children[index])
         index = index + 1
     WEND
+    ignored = builder.PopLoop()
     ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", incName))
 
     incBlock = currentFunction.AddBlock(FissionAmirBlock(incName))
@@ -959,6 +1045,10 @@ FUNCTION Fission_AmirLowerStatement(builder, node)
     END IF
     IF node.Kind == "Try" THEN
         ignored = Fission_AmirLowerTry(builder, node)
+        RETURN
+    END IF
+    IF node.Kind == "LoopControl" THEN
+        ignored = Fission_AmirLowerLoopControl(builder, node)
         RETURN
     END IF
     IF node.Kind == "Class" THEN

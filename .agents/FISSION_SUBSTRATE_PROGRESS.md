@@ -83,11 +83,18 @@ read/write (`arr[i]` / `arr[i] = v`, both constant and dynamically-computed
 indices), and `LEN(arr)`, represented as a pointer to a bump-allocated
 `[length][elem0][elem1]...]` block on the same shared `.bss` arena
 concatenation already uses, with real x86-64 SIB scaled addressing
-(`8(%rax,%rcx,8)`) for element access. Strings as function parameters/
-return values, string ORDERING comparison (`<`/`<=`/`>`/`>=`), branching on
-a string, PRINT of a bare array, and arrays of anything but plain numbers
-each remain their own real, disclosed diagnostic-reported gap rather than
-silently wrong behavior.
+(`8(%rax,%rcx,8)`) for element access. **ForEach and EXIT/CONTINUE** --
+ForEach needed zero dedicated codegen once arrays existed (same "already
+works" precedent FOR-range/DO set); EXIT/CONTINUE was a real,
+previously-undiscovered gap in the SHARED A-MIR lowering pass (affects
+both backends), fixed with a per-loop Continue/Break target stack, and a
+real surprise (CONTINUE in a post-condition-only DO loop bypasses its own
+post-condition check, unlike every other loop shape) found only by
+comparing native execution against the oracle. Strings as function
+parameters/return values, string ORDERING comparison (`<`/`<=`/`>`/`>=`),
+branching on a string, PRINT of a bare array, and arrays of anything but
+plain numbers each remain their own real, disclosed diagnostic-reported
+gap rather than silently wrong behavior.
 **WP-011 (Linux Runtime -- objects, the general host-function
 bridge for everything else this backend cannot hand-roll itself) remains
 real, substantial follow-on
@@ -1136,6 +1143,80 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   and kind-tracking cases. Integration suite gained an `arrays` assertion
   (real output + oracle comparison). `fission/fissure.ab`'s watched-files
   list extended with the new fixture. Verified with plain `fissure run`.
+- Real ForEach lowering for native x86-64 codegen, plus a real, previously-
+  undiscovered EXIT/CONTINUE (SIR "LoopControl") gap found and fixed in the
+  SHARED `fission/sir/lower_amir.abas` pass (affects both the bytecode and
+  native backends) -- both found while investigating, right after Phase 7
+  landed, whether real arrays had newly unblocked ForEach (previously
+  blocked purely on arrays not existing at all).
+  Confirmed via real execution that ForEach needs ZERO dedicated native
+  x86-64 codegen at all, the same "already works" precedent FOR-range and
+  DO loops already set this session: `FOR item IN values ... NEXT`
+  desugars entirely (in the shared A-MIR pass) into the same Store/Const/
+  Load/Call(LEN)/BinOp/Branch/Jump/Index primitives this backend already
+  lowered for every other construct -- it "just worked" the moment arrays
+  did, verified with a real array-PRINT loop, an accumulator, and a
+  function call over each item.
+  Stress-testing ForEach with `EXIT FOR`/`CONTINUE FOR` surfaced the real
+  gap: `fission/sir/lower_amir.abas` never handled SIR "LoopControl" nodes
+  AT ALL (not specific to ForEach or to native codegen) -- `EXIT WHILE`,
+  `EXIT FOR`, `CONTINUE DO`, etc. all fell straight through to the generic
+  "unsupported statement" diagnostic on BOTH backends, confirmed via the
+  oracle that this is a genuine, working ArcoBASIC language feature that
+  had simply never been implemented in this substrate before. Fixed with a
+  new `BUILDER.LoopStack` (a stack of `{ContinueTarget, BreakTarget}`
+  block-name pairs, one entry per currently-open loop, pushed/popped around
+  each loop shape's own body lowering -- While/ForRange/Do/ForEach all
+  gained one `PushLoop`/`PopLoop` pair each, no other change to their own
+  control-flow shape) and a new `Fission_AmirLowerLoopControl` that emits a
+  plain `Jump` to the innermost loop's own Continue or Break target,
+  ignoring the optional keyword after EXIT/CONTINUE (WHILE/FOR/DO/etc --
+  purely informational text in this substrate's SIR, with no separate
+  per-loop identity to match it against anyway) and reporting a real
+  diagnostic if used outside any loop.
+  **A real, disclosed surprise found only by comparing native x86-64
+  execution against the oracle, not assumed or reasoned out**: a first
+  implementation attempt gave CONTINUE inside a post-condition-only DO loop
+  (`DO ... LOOP UNTIL`/`LOOP WHILE`) its own dedicated post-condition-check
+  block as its Continue target (the "obviously correct" C-style choice --
+  re-run the condition, then decide). Comparing native output against the
+  oracle on a real `DO ... LOOP UNTIL` + `CONTINUE DO` program immediately
+  disagreed (native: 25, oracle: 36) -- `ArcoFission reveal ... at A-MIR`
+  on the same probe showed the real legacy semantics are different and
+  simpler: CONTINUE in a post-condition-only DO loop jumps straight back to
+  the TOP of the body, completely bypassing that iteration's own post-
+  condition check. WHILE's own CONTINUE, and a pre-condition DO's own
+  CONTINUE (`DO WHILE`/`DO UNTIL`), both DO re-check their condition on
+  CONTINUE (confirmed the same way) -- only the post-condition-only shape
+  behaves differently. Fixed by picking the CONTINUE target per DO shape
+  (`condName` if there's a pre-condition, else `bodyName` even when a
+  post-condition exists) instead of assuming one target shape fits all
+  four DO variants; re-verified against the oracle afterward, matching
+  exactly.
+  Verified via real execution across every loop shape and combination:
+  WHILE/DO WHILE/DO...LOOP UNTIL/bare infinite DO/nested FOR/ForEach, each
+  with EXIT and CONTINUE (including nested loops confirming EXIT/CONTINUE
+  always target the INNERMOST loop, and a DO...LOOP UNTIL post-condition
+  CONTINUE specifically) -- all byte-for-byte identical to legacy
+  `ArcoFission compile-run` on the same source. Added as two permanent
+  regression fixtures, `fission/tests/native_programs/for_each.abas` and
+  `fission/tests/native_programs/loop_control.abas`. Re-verified every
+  earlier native demo (hello-native, strings, FizzBuzz, Fibonacci,
+  many_params, concat, do_loops, string_equality, arrays) unaffected by
+  this change -- the DO loop restructuring needed no actual change to any
+  existing DO shape's own block layout, only added push/pop calls around
+  body lowering.
+  New shared-pass regression fixture
+  `fission/tests/sir_to_amir_loop_control_smoke.abas` (checks the rendered
+  A-MIR text directly: CONTINUE's JUMP target for each of the three
+  condition shapes, EXIT's JUMP target, and the outside-any-loop diagnostic
+  path) plus a new integration assertion for both native fixtures. Self-
+  parse/self-semantic corpus grew with the new builder methods and lowering
+  function plus the new smoke fixture (91 -> 92 files, symbol count 2959 ->
+  2974); golden values in `tests/integration/fission_substrate_core_smoke.sh`
+  updated to match. `fission/fissure.ab`'s watched-files list extended with
+  both new native fixtures and the new smoke fixture. Verified with plain
+  `fissure run`.
 
 ## In-Progress Components
 
@@ -1570,6 +1651,9 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/do_loops.abas`
 - `fission/tests/native_programs/string_equality.abas`
 - `fission/tests/native_programs/arrays.abas`
+- `fission/tests/native_programs/for_each.abas`
+- `fission/tests/native_programs/loop_control.abas`
+- `fission/tests/sir_to_amir_loop_control_smoke.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
 - `build.abas`
@@ -1791,21 +1875,31 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    VARIABLES -- assign/PRINT/reassign/copy, function-local (Phase 4); real
    string CONCATENATION via a real bump-allocated `.bss` arena (Phase 5);
    real string EQUALITY (`==`/`!=`, genuine content comparison, Phase 6);
-   and now real numeric ARRAYS -- construction, indexed read/write
-   (constant and dynamically-computed indices), and `LEN` (Phase 7),
-   sharing the same `.bss` arena Phase 5 built -- no embedded bytecode VM,
-   no legacy ArcoFission involvement in the compile itself (only `as`/`ld`).
-   Real FizzBuzz, a real recursive Fibonacci, a real 10-parameter function,
-   a real string-building program, and a real array-accumulation-over-a-
-   WHILE-loop program all run as genuine standalone x86-64 binaries today.
+   real numeric ARRAYS -- construction, indexed read/write (constant and
+   dynamically-computed indices), and `LEN` (Phase 7), sharing the same
+   `.bss` arena Phase 5 built; and now real ForEach (`FOR item IN values
+   ... NEXT`, unblocked by Phase 7's own arrays landing, needing ZERO
+   dedicated codegen -- the same "already works" precedent FOR-range/DO
+   set) plus real EXIT/CONTINUE across every loop shape (While/ForRange/
+   Do/ForEach) -- no embedded bytecode VM, no legacy ArcoFission
+   involvement in the compile itself (only `as`/`ld`). Real FizzBuzz, a
+   real recursive Fibonacci, a real 10-parameter function, a real
+   string-building program, and a real array-accumulation-over-a-ForEach
+   program all run as genuine standalone x86-64 binaries today.
    Along the way, two real bugs were found and fixed while confirming DO
    loops (a wrong unsigned x86 comparison instruction family, and unary
    minus never being lowered by A-MIR at all -- a shared bug, also
-   affecting the bytecode backend), and a third was caught proactively
-   before it ever shipped while building Phase 7 (PRINT of an Array value
-   would have silently printed its own pointer as a number). What's still
-   real, almost entirely untouched, and each its own substantial
-   undertaking on its own:
+   affecting the bytecode backend); a third was caught proactively before
+   it ever shipped while building Phase 7 (PRINT of an Array value would
+   have silently printed its own pointer as a number); and a fourth, real,
+   previously-undiscovered SHARED-pass gap (EXIT/CONTINUE never lowered by
+   A-MIR at all, affecting both backends) was found and fixed while
+   investigating ForEach, including a real, disclosed surprise found only
+   by comparing native execution against the oracle (CONTINUE in a
+   post-condition-only DO loop bypasses its own post-condition check
+   entirely, rather than re-checking it). What's still real, almost
+   entirely untouched, and each its own substantial undertaking on its
+   own:
    - Strings as function parameters or return values -- this backend's
      `kinds` tracking is function-local only; currently a real diagnostic
      at the call site / RETURN, not a silent misinterpretation. Would need
@@ -1826,11 +1920,9 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
    - PRINT of a bare array (`PRINT arr` rendering `[1, 2, 3]`, a real oracle
      feature) and arrays of anything but plain numbers (string/nested
      arrays) both remain real, disclosed gaps left open by Phase 7.
-   - ForEach: was blocked on arrays not existing at all; now that Phase 7
-     has landed real array construction/indexing, this may be newly
-     tractable and is worth investigating next -- but still needs its own
-     dedicated lowering (unlike DO/FOR-range, ForEach's own A-MIR shape has
-     not yet been checked against this backend at all).
+   - DONE -- ForEach (was blocked on arrays not existing; needed zero
+     dedicated codegen once Phase 7 landed) and EXIT/CONTINUE across every
+     loop shape, see Completed Components.
    - WP-011 Linux Runtime, the rest of it: objects/classes, and a
      real fallback to the existing ~244-entry host-function dispatch table
      for anything else (legacy's own `arco_call_host`/`host_bridge.cpp`

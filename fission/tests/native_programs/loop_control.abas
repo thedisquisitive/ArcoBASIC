@@ -1,0 +1,90 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises EXIT/CONTINUE (SIR
+' "LoopControl") across every loop shape this substrate lowers -- a real
+' gap in the SHARED fission/sir/lower_amir.abas pass (affects both the
+' bytecode and native backends) found and fixed while investigating whether
+' Phase 7's own arrays newly unblocked ForEach: this SIR node kind was
+' previously not handled at all, falling straight through to a generic
+' "unsupported statement" diagnostic.
+'
+' Also exercises a real, disclosed surprise found only by comparing native
+' execution against the oracle: CONTINUE in a post-condition-only DO loop
+' (`DO ... LOOP UNTIL`/`LOOP WHILE`) jumps straight back to the TOP of the
+' body, bypassing that iteration's own post-condition check entirely --
+' NOT re-checking the condition the way WHILE's or a pre-condition DO's own
+' CONTINUE does.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+i = 0
+total = 0
+WHILE i < 10
+    i = i + 1
+    IF i MOD 2 == 0 THEN
+        CONTINUE WHILE
+    END IF
+    total = total + i
+WEND
+PRINT total
+
+j = 0
+count = 0
+DO WHILE j < 10
+    j = j + 1
+    IF j MOD 2 == 0 THEN
+        CONTINUE DO
+    END IF
+    count = count + 1
+LOOP
+PRINT count
+
+k = 0
+postTotal = 0
+DO
+    k = k + 1
+    IF k MOD 2 == 0 THEN
+        CONTINUE DO
+    END IF
+    postTotal = postTotal + k
+LOOP UNTIL k >= 10
+PRINT postTotal
+
+m = 0
+DO
+    m = m + 1
+    IF m >= 5 THEN
+        EXIT DO
+    END IF
+    PRINT m
+LOOP
+
+outerSum = 0
+FOR a = 1 TO 3
+    FOR b = 1 TO 3
+        IF b == 2 THEN
+            CONTINUE FOR
+        END IF
+        IF b == 3 THEN
+            IF a == 3 THEN
+                EXIT FOR
+            END IF
+        END IF
+        outerSum = outerSum + 1
+    NEXT
+NEXT
+PRINT outerSum
+
+nums = [1, 2, 3, 4, 5, 6]
+foreachTotal = 0
+FOR n IN nums
+    IF n == 5 THEN
+        EXIT FOR
+    END IF
+    IF n MOD 2 == 0 THEN
+        CONTINUE FOR
+    END IF
+    foreachTotal = foreachTotal + n
+NEXT
+PRINT foreachTotal

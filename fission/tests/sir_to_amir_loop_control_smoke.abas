@@ -1,0 +1,61 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/sir/lower_amir.abas"
+
+' EXIT/CONTINUE (SIR "LoopControl") -- previously not handled by this SHARED
+' A-MIR lowering pass at ALL (affects both the bytecode and native x86-64
+' backends), found while investigating whether native codegen's Phase 7
+' arrays newly unblocked ForEach. Real execution verified separately by
+' fission/tests/native_programs/loop_control.abas. Checked here: zero
+' diagnostics, and that CONTINUE/EXIT actually render as JUMPs to the
+' correct block for each of the four loop shapes -- WHILE's own CONTINUE
+' re-checks its condition (WhileCond), a pre-condition DO's own CONTINUE
+' re-checks its own pre-condition (DoCond), a post-condition-only DO's own
+' CONTINUE jumps straight back to the top of the body (DoBody, bypassing
+' the post-condition check entirely -- a real, disclosed surprise found
+' only by comparing native execution against the oracle, not assumed), and
+' EXIT always jumps to the loop's own End block.
+WhileSource = "i = 0\nWHILE i < 3\ni = i + 1\nIF i == 2 THEN\nCONTINUE WHILE\nEND IF\nPRINT i\nWEND"
+WhileTokens = Fission_ArcoBasicLex(WhileSource)
+WhileAst = Fission_ArcoBasicParse(WhileTokens, "loop-control-while-smoke.abas")
+WhileSir = Fission_ArcoBasicAstToSir(WhileAst)
+WhileAmir = Fission_SirToAmir(WhileSir)
+PRINT WhileAmir.Diagnostics.HasErrors()
+WhileRendered = WhileAmir.Render()
+PRINT String.Contains(WhileRendered, "JUMP WhileCond")
+
+PreDoSource = "i = 0\nDO WHILE i < 3\ni = i + 1\nIF i == 2 THEN\nCONTINUE DO\nEND IF\nPRINT i\nLOOP"
+PreDoTokens = Fission_ArcoBasicLex(PreDoSource)
+PreDoAst = Fission_ArcoBasicParse(PreDoTokens, "loop-control-predo-smoke.abas")
+PreDoSir = Fission_ArcoBasicAstToSir(PreDoAst)
+PreDoAmir = Fission_SirToAmir(PreDoSir)
+PRINT PreDoAmir.Diagnostics.HasErrors()
+PreDoRendered = PreDoAmir.Render()
+PRINT String.Contains(PreDoRendered, "JUMP DoCond")
+
+PostDoSource = "i = 0\nDO\ni = i + 1\nIF i == 2 THEN\nCONTINUE DO\nEND IF\nPRINT i\nLOOP UNTIL i >= 3"
+PostDoTokens = Fission_ArcoBasicLex(PostDoSource)
+PostDoAst = Fission_ArcoBasicParse(PostDoTokens, "loop-control-postdo-smoke.abas")
+PostDoSir = Fission_ArcoBasicAstToSir(PostDoAst)
+PostDoAmir = Fission_SirToAmir(PostDoSir)
+PRINT PostDoAmir.Diagnostics.HasErrors()
+PostDoRendered = PostDoAmir.Render()
+PRINT String.Contains(PostDoRendered, "JUMP DoBody")
+
+ExitForSource = "FOR i = 1 TO 5\nIF i == 3 THEN\nEXIT FOR\nEND IF\nPRINT i\nNEXT"
+ExitForTokens = Fission_ArcoBasicLex(ExitForSource)
+ExitForAst = Fission_ArcoBasicParse(ExitForTokens, "loop-control-exitfor-smoke.abas")
+ExitForSir = Fission_ArcoBasicAstToSir(ExitForAst)
+ExitForAmir = Fission_SirToAmir(ExitForSir)
+PRINT ExitForAmir.Diagnostics.HasErrors()
+ExitForRendered = ExitForAmir.Render()
+PRINT String.Contains(ExitForRendered, "JUMP ForEnd")
+
+' EXIT/CONTINUE used outside any loop remains a real, disclosed gap --
+' must report a diagnostic, not a dangling jump to a block that doesn't
+' exist.
+BadSource = "PRINT 1\nEXIT WHILE\nPRINT 2"
+BadTokens = Fission_ArcoBasicLex(BadSource)
+BadAst = Fission_ArcoBasicParse(BadTokens, "loop-control-bad-smoke.abas")
+BadSir = Fission_ArcoBasicAstToSir(BadAst)
+BadAmir = Fission_SirToAmir(BadSir)
+PRINT BadAmir.Diagnostics.HasErrors()
