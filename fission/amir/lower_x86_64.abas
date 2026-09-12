@@ -128,10 +128,17 @@
 ' (`\`) and the `SAR` keyword specifically (both likewise confirmed NOT
 ' implemented by the oracle's own bytecode VM at all -- left unsupported
 ' here rather than guessing a semantic the oracle itself can never confirm
-' or deny); SUPER.Method(...) explicit base-class
-' calls (a real oracle feature -- src/frontend/parser.cpp's own
-' SuperCallExpr -- never lowered by fission/sir/lower_amir.abas at all
-' yet, a SHARED-substrate gap, not native-codegen-specific); a derived
+' or deny). As of fission/sir/lower_amir.abas's own SuperCall handling,
+' real SUPER.Method(...) explicit base-class calls now also work, on
+' both backends, with zero native-codegen-specific changes: SUPER always
+' resolves to a DIRECT, statically-named call to the enclosing class's
+' own EXTENDS parent (SELF injected as an explicit argument), never a
+' runtime dispatch, so it flows through the exact same "direct call to an
+' already-real function name" path every class's own synthesized
+' constructor/wrapper already uses. `SUPER.Init(...)` is also the PROPER,
+' oracle-sanctioned way to chain construction, closing the practical
+' impact of the next disclosed gap below for any real program that
+' actually calls it. Still real, disclosed, unfixed: a derived
 ' class with NO constructor of its own reading a field only its BASE
 ' class's own constructor ever initializes (confirmed this is a genuine
 ' ORACLE limitation too, not just this backend's own: `ArcoFission

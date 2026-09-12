@@ -2068,6 +2068,65 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   watched-files list. Self-parse/self-semantic corpus symbol count
   changed 3604 -> 3605; golden value updated. Verified with `fissure
   run`.
+- **Real `SUPER.Method(...)` explicit base-class calls** -- a real oracle
+  feature (`src/frontend/parser.cpp`'s own `SuperCallExpr`) this whole
+  substrate's SHARED frontend (used by BOTH the bytecode-VM-embedded path
+  AND native x86-64 codegen) previously did not parse or lower AT ALL --
+  confirmed directly (not assumed): `SUPER.Init(...)` inside a class's own
+  CONSTRUCTOR failed with a genuine parser error
+  (`FISSION_ARCOBASIC_UNSUPPORTED_STATEMENT`), meaning this was a real gap
+  three layers deep (parser, SIR, A-MIR), not just a missing backend
+  lowering case the way most of this session's other work was. This is
+  also the PROPER, oracle-sanctioned fix for the earlier disclosed gap
+  ("a derived class with no constructor of its own reading a field only
+  its base class's constructor initializes fails on the oracle too") --
+  `SUPER.Init(...)` is exactly how a real ArcoBASIC program is supposed to
+  chain construction, not a limitation to route around.
+  Three real, coordinated changes: (1) `fission/language/arcobasic/
+  parser.abas`'s own `ParsePrimary` now recognizes the `SUPER` keyword,
+  requiring the call-only `SUPER.MethodName(args)` shape (matching the
+  oracle's own restriction exactly -- a real diagnostic for SUPER used
+  outside a class with EXTENDS, or as anything but a method call), emitting
+  a new `SuperCall` AST node; a small `ParseCallArgumentsInto` helper was
+  factored out of the existing `(args)`-parsing loop so both call sites
+  share one real implementation. (2) `fission/sir/builder.abas` gained a
+  `SuperCallExpression` SIR node constructor, and `fission/language/
+  arcobasic/lower_sir.abas` lowers the new AST node straight to it. (3)
+  `fission/sir/lower_amir.abas` -- the real design decision -- resolves
+  `SUPER.Method(...)` to a DIRECT, statically-named call (`AncestorClass.
+  Method`, SELF injected as an explicit first argument) rather than
+  reusing the generic `obj.Method(...)`/`SELF.Method(...)` variable-
+  qualified-callee machinery: SUPER always means "this exact ancestor's
+  own implementation," never a runtime `__class`-tag dispatch, confirmed
+  via the oracle's own reveal (`current_super_class_` resolved once, at
+  parse time, in `src/frontend/parser.cpp`). `builder.CurrentSuperClassName`
+  (new `FissionAmirBuilder` state, threaded through `Fission_AmirLowerClass`/
+  `Fission_AmirLowerClassMember` from each class's own already-known
+  `Extends` field) is what lets this resolution happen with zero new
+  inter-procedural analysis -- the resulting callee text (e.g.
+  "Animal.Init") is ALREADY a real, declared function name by construction,
+  so it flows through the EXACT SAME "a direct call to an already-real
+  function name" path every class's own synthesized `Name.__new`/
+  `Name(ctorParams...)` wrapper already uses internally, on EITHER
+  backend, with ZERO changes needed to `fission/amir/lower_bytecode.abas`
+  or `fission/amir/lower_x86_64.abas` at all.
+  Verified via real execution against BOTH backends: the bytecode-VM-
+  embedded path (`compile_to_bytecode.abas` + `ArcoFission run`) and the
+  native x86-64 backend, a constructor chaining to its base via
+  `SUPER.Init(legs)` and a method extending its base's own behavior via
+  `SUPER.Speak()` -- all byte-for-byte matching `ArcoFission compile-run`
+  on the first attempt for both backends, no debugging iterations needed.
+  All 20 existing native fixtures re-verified unaffected (the parser
+  change triggered a 79-file recompile of the self-parse corpus, `0
+  failed`). Extended `fission/tests/amir_x86_64_smoke.abas` with a real
+  success case (checking the rendered assembly contains real direct
+  `call Animal.Init`/`call Animal.Speak`, never a variable-qualified
+  callee) plus two new diagnostic cases (SUPER outside EXTENDS, SUPER used
+  as anything but a method call). New permanent fixture `fission/tests/
+  native_programs/super_calls.abas`; wired into `fission/fissure.ab`'s
+  watched-files list. Self-parse/self-semantic corpus symbol count grew
+  3605 -> 3637 (new parser/SIR/AMIR functions); golden value updated.
+  Verified with `fissure run`.
 
 ## In-Progress Components
 
@@ -2845,10 +2904,12 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
      project owner explicitly deferred until after The Arcology Fusion
      Linker landed -- and now real non-numeric, String-valued class
      fields too, folded directly into the same fixed-point kind inference
-     string function parameters already use), see Completed Components.
-     Real, disclosed remaining gaps: `SUPER.Method(...)` explicit
-     base-class calls (a real oracle feature never lowered by
-     `fission/sir/lower_amir.abas` at all, a SHARED-substrate gap); a
+     string function parameters already use, and real `SUPER.Method(...)`
+     explicit base-class calls -- previously not even PARSED, a real
+     three-layer gap this session found and closed across the shared
+     parser/SIR/A-MIR, working on both the bytecode and native backends
+     with zero backend-specific changes needed), see Completed Components.
+     Real, disclosed remaining gaps: a
      field established ONLY via an external `obj.Field = value` write
      (never a `SELF.Field = value` inside the class's own methods) is a
      real, narrower limitation of the same fixed point (scoped to SELF

@@ -84,6 +84,21 @@ CLASS FissionSirBuilder
         RETURN node
     END FUNCTION
 
+    ' `SUPER.Method(args)` -- a real, distinct SIR node (not just a
+    ' CallExpr over a MemberRead the way `obj.Method(...)` lowers) since
+    ' SUPER always means "this exact ancestor's own implementation," never
+    ' a runtime `__class`-tag dispatch -- see fission/sir/lower_amir.abas's
+    ' own SuperCall handling for the full reasoning and how it resolves
+    ' the enclosing class's own EXTENDS parent.
+    FUNCTION SuperCallExpression(methodName, args)
+        node = FissionSirNode("SuperCall")
+        ignored = node.WithField("Method", methodName)
+        FOR arg IN args
+            ignored = node.AppendChild(arg)
+        NEXT
+        RETURN node
+    END FUNCTION
+
     FUNCTION NamedArgument(name, value)
         node = FissionSirNode("NamedArg")
         ignored = node.WithField("Name", name)

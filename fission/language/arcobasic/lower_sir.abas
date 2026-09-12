@@ -26,6 +26,13 @@ FUNCTION Fission_ArcoBasicAstExpressionToSir(builder, ast)
         WEND
         RETURN builder.CallExpression(callee, args)
     END IF
+    IF ast.Kind == "SuperCall" THEN
+        args = []
+        FOR child IN ast.Children
+            ignored = Array.Push(args, Fission_ArcoBasicAstExpressionToSir(builder, child))
+        NEXT
+        RETURN builder.SuperCallExpression(Object.Get(ast.Fields, "Method", ""), args)
+    END IF
     IF ast.Kind == "NamedArg" THEN
         RETURN builder.NamedArgument(Object.Get(ast.Fields, "Name", ""), Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0]))
     END IF

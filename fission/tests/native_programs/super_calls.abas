@@ -1,0 +1,48 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises real SUPER.Method(...)
+' explicit base-class calls -- a real oracle feature (`src/frontend/
+' parser.cpp`'s own SuperCallExpr) this whole substrate's shared frontend
+' (fission/language/arcobasic/parser.abas's own ParsePrimary, fission/sir/
+' lower_amir.abas's own SuperCall handling) previously did not parse or
+' lower at all. `Dog`'s own CONSTRUCTOR chains to `Animal`'s via
+' `SUPER.Init(legs)` (the PROPER, oracle-sanctioned way to initialize an
+' inherited field, unlike the disclosed "no constructor of its own" gap
+' this closes for real programs that actually chain construction), and
+' `Dog.Speak` calls `SUPER.Speak()` to get the base behavior before adding
+' its own. Both lower to a DIRECT, statically-named call (SELF injected as
+' an explicit argument) -- never a runtime `__class`-tag dispatch, since
+' SUPER always means "this exact ancestor's own implementation."
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+CLASS Animal
+    CONSTRUCTOR(legs)
+        SELF.Legs = legs
+    END CONSTRUCTOR
+
+    FUNCTION Speak()
+        RETURN 0
+    END FUNCTION
+
+    FUNCTION GetLegs()
+        RETURN SELF.Legs
+    END FUNCTION
+END CLASS
+
+CLASS Dog EXTENDS Animal
+    CONSTRUCTOR(legs)
+        SUPER.Init(legs)
+    END CONSTRUCTOR
+
+    FUNCTION Speak()
+        base = SUPER.Speak()
+        RETURN base + 1
+    END FUNCTION
+END CLASS
+
+d = Dog(4)
+PRINT d.Speak()
+PRINT d.GetLegs()
+PRINT d.Legs

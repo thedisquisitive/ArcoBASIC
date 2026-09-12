@@ -208,7 +208,7 @@ CLASS FissionArcoBasicParser
         IF Fission_ArcoBasicCanName(token) AND SELF.TokenAt(1).Kind == "Keyword" AND Lower(SELF.TokenAt(1).Text) == "as" THEN RETURN SELF.ParseDeclarationStmt()
         IF Fission_ArcoBasicCanName(token) AND Fission_ListContains(["=", "+=", "-=", "*=", "/="], SELF.TokenAt(1).Text) THEN RETURN SELF.ParseAssignmentStmt()
         IF Fission_ArcoBasicCanName(token) AND SELF.TokenAtIsSymbol(1, "(") THEN RETURN SELF.ParseExpressionOrTargetStmt()
-        IF (Fission_ArcoBasicCanName(token) OR SELF.CheckText("self")) AND (SELF.TokenAtIsSymbol(1, ".") OR SELF.TokenAtIsSymbol(1, "[")) THEN RETURN SELF.ParseExpressionOrTargetStmt()
+        IF (Fission_ArcoBasicCanName(token) OR SELF.CheckText("self") OR SELF.CheckText("super")) AND (SELF.TokenAtIsSymbol(1, ".") OR SELF.TokenAtIsSymbol(1, "[")) THEN RETURN SELF.ParseExpressionOrTargetStmt()
         ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_UNSUPPORTED_STATEMENT", "Unsupported statement starting with " + token.Render())
         ignored = SELF.ReadToken()
         RETURN NULL
@@ -759,28 +759,39 @@ CLASS FissionArcoBasicParser
             END IF
             IF SELF.MatchSymbol("(") THEN
                 callNode = FissionArcoBasicAstNode("CallExpr").AppendChild(expression)
-                ignored = SELF.SkipExpressionNewlines()
-                WHILE SELF.Done() == FALSE AND SELF.CheckSymbol(")") == FALSE
-                    IF Fission_ArcoBasicCanName(SELF.PeekToken()) AND SELF.TokenAtIsSymbol(1, "=") THEN
-                        argumentName = SELF.ReadToken().Text
-                        ignored = SELF.ReadToken()
-                        argumentNode = FissionArcoBasicAstNode("NamedArg").WithField("Name", argumentName).AppendChild(SELF.ParseExpression())
-                        ignored = callNode.AppendChild(argumentNode)
-                    ELSE
-                        ignored = callNode.AppendChild(SELF.ParseExpression())
-                    END IF
-                    IF SELF.MatchSymbol(",") == FALSE THEN
-                        ignored = SELF.SkipExpressionNewlines()
-                        IF SELF.CheckSymbol(")") == FALSE THEN ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_COMMA", "Expected comma in call argument list before " + SELF.PeekToken().Render())
-                    END IF
-                    ignored = SELF.SkipExpressionNewlines()
-                WEND
-                ignored = SELF.MatchSymbol(")")
-                expression = callNode
+                expression = SELF.ParseCallArgumentsInto(callNode)
                 CONTINUE WHILE
             END IF
         WEND
         RETURN expression
+    END FUNCTION
+
+    ' Parses a parenthesized, comma-separated (possibly `name=value`
+    ' NAMED) argument list into `node` (already holding whatever comes
+    ' before the arguments -- the callee for an ordinary CallExpr, or just
+    ' the Method name for a SuperCall), through the closing `)`. Shared by
+    ' ParsePostfix's own `(args)` call-parsing and ParsePrimary's own
+    ' `SUPER.Method(args)` handling, one real implementation rather than
+    ' two that could drift apart.
+    FUNCTION ParseCallArgumentsInto(node)
+        ignored = SELF.SkipExpressionNewlines()
+        WHILE SELF.Done() == FALSE AND SELF.CheckSymbol(")") == FALSE
+            IF Fission_ArcoBasicCanName(SELF.PeekToken()) AND SELF.TokenAtIsSymbol(1, "=") THEN
+                argumentName = SELF.ReadToken().Text
+                ignored = SELF.ReadToken()
+                argumentNode = FissionArcoBasicAstNode("NamedArg").WithField("Name", argumentName).AppendChild(SELF.ParseExpression())
+                ignored = node.AppendChild(argumentNode)
+            ELSE
+                ignored = node.AppendChild(SELF.ParseExpression())
+            END IF
+            IF SELF.MatchSymbol(",") == FALSE THEN
+                ignored = SELF.SkipExpressionNewlines()
+                IF SELF.CheckSymbol(")") == FALSE THEN ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_COMMA", "Expected comma in call argument list before " + SELF.PeekToken().Render())
+            END IF
+            ignored = SELF.SkipExpressionNewlines()
+        WEND
+        ignored = SELF.MatchSymbol(")")
+        RETURN node
     END FUNCTION
 
     FUNCTION ParsePrimary()
@@ -793,6 +804,31 @@ CLASS FissionArcoBasicParser
         IF token.Kind == "Keyword" AND Lower(token.Text) == "false" THEN RETURN FissionArcoBasicAstNode("Literal").WithField("Value", "FALSE")
         IF token.Kind == "Keyword" AND Lower(token.Text) == "null" THEN RETURN FissionArcoBasicAstNode("Literal").WithField("Value", "NULL")
         IF token.Kind == "Keyword" AND Lower(token.Text) == "self" THEN RETURN FissionArcoBasicAstNode("Read").WithField("Name", "SELF")
+        ' `SUPER.Method(args)` -- call-only (matching the oracle's own
+        ' restriction, `src/frontend/parser.cpp`: "SUPER can only be used
+        ' inside a class method with EXTENDS", and SUPER is never valid as
+        ' a bare value or a field access on its own). Resolving WHICH
+        ' class SUPER actually refers to (the enclosing class's own
+        ' EXTENDS parent) is deferred to SIR->A-MIR lowering
+        ' (`Fission_AmirLowerClass`/`Fission_AmirLowerClassMember`'s own
+        ' `CurrentSuperClassName`), not attempted here -- this parser has
+        ' no notion of "the current class" as parse state at all yet, and
+        ' every other real class-shape validation in this pass (unknown
+        ' field, method resolution, etc.) is likewise deferred past the
+        ' parser, not novel scope creep specific to SUPER.
+        IF token.Kind == "Keyword" AND Lower(token.Text) == "super" THEN
+            IF SELF.MatchSymbol(".") == FALSE THEN
+                ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_SUPER_METHOD", "Expected '.MethodName(...)' after SUPER")
+                RETURN FissionArcoBasicAstNode("Literal").WithField("Value", "NULL")
+            END IF
+            methodToken = SELF.ReadToken()
+            IF SELF.MatchSymbol("(") == FALSE THEN
+                ignored = SELF.Module.Diagnostics.ReportError("FISSION_ARCOBASIC_EXPECTED_SUPER_CALL", "SUPER can only be used as a method call, e.g. SUPER." + methodToken.Text + "(...)")
+                RETURN FissionArcoBasicAstNode("Literal").WithField("Value", "NULL")
+            END IF
+            superNode = FissionArcoBasicAstNode("SuperCall").WithField("Method", methodToken.Text)
+            RETURN SELF.ParseCallArgumentsInto(superNode)
+        END IF
         IF token.Kind == "Symbol" AND token.Text == "(" THEN
             expression = SELF.ParseExpression()
             ignored = SELF.MatchSymbol(")")

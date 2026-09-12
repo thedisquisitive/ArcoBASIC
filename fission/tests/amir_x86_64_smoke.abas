@@ -599,3 +599,47 @@ AmbiguousFieldSir = Fission_ArcoBasicAstToSir(AmbiguousFieldAst)
 AmbiguousFieldAmir = Fission_SirToAmir(AmbiguousFieldSir)
 AmbiguousFieldProgram = Fission_AmirToX86_64(AmbiguousFieldAmir)
 PRINT AmbiguousFieldProgram.Diagnostics.HasErrors()
+
+' Real SUPER.Method(...) explicit base-class calls -- a real oracle
+' feature (`src/frontend/parser.cpp`'s own SuperCallExpr) this whole
+' substrate's SHARED frontend previously did not parse or lower at all
+' (`fission/language/arcobasic/parser.abas`'s own ParsePrimary now
+' recognizes the SUPER keyword; `fission/sir/lower_amir.abas`'s own
+' SuperCall handling resolves it to a DIRECT, statically-named call --
+' SELF injected as an explicit argument -- never a runtime `__class`-tag
+' dispatch, since SUPER always means "this exact ancestor's own
+' implementation"). Checked here structurally (zero diagnostics, and the
+' rendered assembly contains a real direct `call Animal.Init`/`call
+' Animal.Speak`, never a variable-qualified callee) -- real execution
+' verified separately by fission/tests/native_programs/super_calls.abas
+' AND directly against the BYTECODE backend (a shared-frontend fix, not
+' native-codegen-specific).
+SuperCallSource = "CLASS Animal\n    CONSTRUCTOR(legs)\n        SELF.Legs = legs\n    END CONSTRUCTOR\n    FUNCTION Speak()\n        RETURN 0\n    END FUNCTION\nEND CLASS\nCLASS Dog EXTENDS Animal\n    CONSTRUCTOR(legs)\n        SUPER.Init(legs)\n    END CONSTRUCTOR\n    FUNCTION Speak()\n        base = SUPER.Speak()\n        RETURN base + 1\n    END FUNCTION\nEND CLASS\nd = Dog(4)\nPRINT d.Speak()"
+SuperCallTokens = Fission_ArcoBasicLex(SuperCallSource)
+SuperCallAst = Fission_ArcoBasicParse(SuperCallTokens, "x86-64-super-call-smoke.abas")
+SuperCallSir = Fission_ArcoBasicAstToSir(SuperCallAst)
+SuperCallAmir = Fission_SirToAmir(SuperCallSir)
+SuperCallProgram = Fission_AmirToX86_64(SuperCallAmir)
+PRINT SuperCallProgram.Diagnostics.HasErrors()
+SuperCallAssembly = SuperCallProgram.Render()
+PRINT String.Contains(SuperCallAssembly, "call Animal.Init")
+PRINT String.Contains(SuperCallAssembly, "call Animal.Speak")
+
+' SUPER used outside a class with EXTENDS is a real, reported diagnostic
+' (the same check the oracle itself enforces), not a crash or a silently
+' misresolved call.
+SuperNoExtendsSource = "CLASS Foo\n    FUNCTION Bar()\n        SUPER.Bar()\n    END FUNCTION\nEND CLASS"
+SuperNoExtendsTokens = Fission_ArcoBasicLex(SuperNoExtendsSource)
+SuperNoExtendsAst = Fission_ArcoBasicParse(SuperNoExtendsTokens, "x86-64-super-no-extends-smoke.abas")
+SuperNoExtendsSir = Fission_ArcoBasicAstToSir(SuperNoExtendsAst)
+SuperNoExtendsAmir = Fission_SirToAmir(SuperNoExtendsSir)
+PRINT SuperNoExtendsAmir.Diagnostics.HasErrors()
+
+' SUPER used as anything but a method call (a bare field-style reference)
+' is a real parser-level diagnostic (SUPER is call-only, matching the
+' oracle's own restriction), not a crash or a silently misparsed
+' expression.
+SuperNotCallSource = "CLASS Animal\n    FUNCTION Speak()\n        RETURN 0\n    END FUNCTION\nEND CLASS\nCLASS Dog EXTENDS Animal\n    FUNCTION Speak()\n        x = SUPER.Legs\n        RETURN x\n    END FUNCTION\nEND CLASS"
+SuperNotCallTokens = Fission_ArcoBasicLex(SuperNotCallSource)
+SuperNotCallAst = Fission_ArcoBasicParse(SuperNotCallTokens, "x86-64-super-not-call-smoke.abas")
+PRINT SuperNotCallAst.Diagnostics.HasErrors()

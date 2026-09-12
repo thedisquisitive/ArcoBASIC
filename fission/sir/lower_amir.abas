@@ -82,6 +82,14 @@ CLASS FissionAmirBuilder
         ' against the oracle. RETURN must always use the function's own
         ' declared return type.
         SELF.CurrentReturnType = "I32"
+        ' The ENCLOSING class's own EXTENDS parent, set only while lowering
+        ' one of that class's own constructor/method bodies (see
+        ' Fission_AmirLowerClassMember) -- what a `SuperCall` expression
+        ' (`SUPER.Method(...)`) resolves against, since SUPER always means
+        ' "this exact ancestor's own implementation," never a runtime
+        ' `__class`-tag dispatch the way `obj.Method(...)`/`SELF.Method(...)`
+        ' use.
+        SELF.CurrentSuperClassName = ""
         SELF.Scope = FissionAmirScope()
         SELF.Diagnostics = FissionDiagnosticBag()
         ' A stack of {Continue, Break} block-name pairs, one entry per
@@ -244,6 +252,37 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
         WEND
         dest = builder.NewTemp()
         ignored = builder.Emit(FissionAmirInstruction("Call").WithField("Dest", dest).WithField("Callee", calleeName).WithField("Args", Array.Join(argValues, " ")))
+        RETURN {Value: dest, Type: ""}
+    END IF
+    ' `SUPER.Method(args)` -- UNLIKE `obj.Method(args)`/`SELF.Method(args)`
+    ' above, SUPER always means "this exact ancestor's own implementation,"
+    ' never a runtime `__class`-tag dispatch (confirmed via a direct oracle
+    ' probe: `src/frontend/parser.cpp`'s own SuperCallExpr resolves
+    ' `current_super_class_` -- the enclosing class's own EXTENDS parent --
+    ' at PARSE time, not through the receiver's own tracked/runtime type).
+    ' So this lowers to a DIRECT, statically-named call
+    ' (`builder.CurrentSuperClassName + "." + methodName`, e.g.
+    ' "Animal.Init") with SELF injected as an explicit first argument here
+    ' -- unlike `obj.Method(...)`'s own callee text above, this callee is
+    ' NEVER variable-qualified, so nothing downstream (either backend) ever
+    ' mistakes it for a dynamic dispatch site; it's the exact same "a real,
+    ' already-declared function name, called directly" shape every class's
+    ' own synthesized `Name.__new`/`Name(ctorParams...)` wrapper already
+    ' uses internally.
+    IF node.Kind == "SuperCall" THEN
+        methodName = Object.Get(node.Fields, "Method", "")
+        IF builder.CurrentSuperClassName == "" THEN
+            ignored = builder.Diagnostics.ReportError("FISSION_AMIR_SUPER_OUTSIDE_EXTENDS", "SUPER can only be used inside a class method with EXTENDS: SUPER." + methodName)
+            RETURN Fission_AmirUnsupportedExpr(builder, "SUPER outside an EXTENDS class")
+        END IF
+        selfResult = Fission_AmirLowerExpr(builder, FissionSirNode("Read").WithField("Name", "SELF"))
+        argValues = [selfResult.Value]
+        FOR argNode IN node.Children
+            argResult = Fission_AmirLowerExpr(builder, argNode)
+            ignored = Array.Push(argValues, argResult.Value)
+        NEXT
+        dest = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Call").WithField("Dest", dest).WithField("Callee", builder.CurrentSuperClassName + "." + methodName).WithField("Args", Array.Join(argValues, " ")))
         RETURN {Value: dest, Type: ""}
     END IF
     IF node.Kind == "Array" THEN
@@ -753,11 +792,12 @@ END FUNCTION
 ' single layer of Modifier, e.g. `PUBLIC FUNCTION ...`); fields declared
 ' without an initializing SELF.Field assignment, nested classes, interfaces,
 ' and static/shared members are out of scope for this lowering pass.
-FUNCTION Fission_AmirLowerClassMember(builder, className, memberNode, paramName, paramType, isConstructor)
+FUNCTION Fission_AmirLowerClassMember(builder, className, memberNode, paramName, paramType, isConstructor, extendsName)
     outerFunction = builder.CurrentFunction
     outerBlock = builder.CurrentBlock
     outerScope = builder.Scope
     outerReturnType = builder.CurrentReturnType
+    outerSuperClassName = builder.CurrentSuperClassName
 
     memberParams = Fission_AmirParseArguments(Object.Get(memberNode.Fields, "Arguments", ""))
     fnName = className + "." + paramName
@@ -773,6 +813,7 @@ FUNCTION Fission_AmirLowerClassMember(builder, className, memberNode, paramName,
     builder.CurrentBlock = entryBlock
     builder.CurrentFunction = fn
     builder.CurrentReturnType = returnType
+    builder.CurrentSuperClassName = extendsName
     builder.Scope = FissionAmirScope()
     ignored = builder.Scope.Declare("SELF", "")
     FOR param IN memberParams
@@ -787,6 +828,7 @@ FUNCTION Fission_AmirLowerClassMember(builder, className, memberNode, paramName,
     builder.CurrentBlock = outerBlock
     builder.CurrentFunction = outerFunction
     builder.CurrentReturnType = outerReturnType
+    builder.CurrentSuperClassName = outerSuperClassName
     builder.Scope = outerScope
     RETURN memberParams
 END FUNCTION
@@ -824,13 +866,13 @@ FUNCTION Fission_AmirLowerClass(builder, node)
     NEXT
 
     ctorParams = []
-    IF constructorNode != NULL THEN ctorParams = Fission_AmirLowerClassMember(builder, className, constructorNode, "Init", "VALUE", TRUE)
+    IF constructorNode != NULL THEN ctorParams = Fission_AmirLowerClassMember(builder, className, constructorNode, "Init", "VALUE", TRUE, extendsName)
 
     FOR methodNode IN methodNodes
         methodName = Object.Get(methodNode.Fields, "Name", "")
         methodReturnType = Object.Get(methodNode.Fields, "Returns", "")
         IF methodReturnType == "" THEN methodReturnType = "VOID"
-        ignored = Fission_AmirLowerClassMember(builder, className, methodNode, methodName, methodReturnType, FALSE)
+        ignored = Fission_AmirLowerClassMember(builder, className, methodNode, methodName, methodReturnType, FALSE, extendsName)
     NEXT
 
     ' Synthesize Name.__new: allocate a bare instance tagged with its class.
