@@ -2920,6 +2920,14 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
      linking against it directly is itself a real design decision to
      make, not just a port) -- this last item is now
      WP-011's own single largest remaining piece.
+   - NEXT CONCRETE CANDIDATE: string arrays / arrays holding anything but
+     plain numbers (confirmed real, legal ArcoBASIC via a direct oracle
+     probe; see `fission/amir/lower_x86_64.abas`'s own header comment for
+     the concrete scoping -- likely another "extend kind-tracking, no new
+     codegen" case, parameterizing the "Array" kind the same way
+     "Object:ClassName"/"Poly:..." already are, but touching more call
+     sites across the file than any single slice so far, so scope it as
+     its own pass rather than folding it into another change).
    The existing experimental legacy native backend
    (`ArcoFission build FILE -o OUT --target linux-x86_64`,
    `.agents/reports/ARCO_NATIVE_COMPILER_BACKEND_PLAN.md`) is worth reading

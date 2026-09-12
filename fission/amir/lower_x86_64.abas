@@ -119,7 +119,21 @@
 ' correct for a different purpose) rather than a full length scan.
 ' Deliberately still out of scope, still real, disclosed follow-on work:
 ' string arrays / arrays of arrays / arrays holding anything but plain
-' numbers; string ordering comparison
+' numbers -- confirmed real, legal ArcoBASIC via a direct oracle probe
+' (`names = ["Alice", "Bob"]` / indexed read+write / ForEach / LEN all
+' work on the oracle), and the underlying element STORAGE here is already
+' representation-agnostic (a plain 8-byte slot, identical for Number or
+' String), so this is very likely another "just needs kind-tracking
+' extended" case rather than new codegen -- the real work is parameterizing
+' the "Array" kind itself (mirroring "Object:ClassName"/"Poly:Class1,
+' Class2..."'s own precedent, e.g. "Array:String") and updating every
+' existing `== "Array"` kind check across this file (LEN, PRINT, EmitCall
+' arg validation, Return, Index/StoreIndex's own array-vs-object dispatch)
+' to recognize the parameterized form -- a broader, multi-site refactor,
+' deliberately not attempted in the same pass as this session's other
+' slices to keep each change independently verifiable; a real, disclosed,
+' concretely-scoped next candidate, not a vague "future work" note.
+' string ordering comparison
 ' (`<`/`<=`/`>`/`>=` between two strings -- confirmed this is not even a
 ' real oracle feature: `ArcoFission compile-run` on a real program
 ' comparing two strings with `<` fails at runtime with "value is not a
