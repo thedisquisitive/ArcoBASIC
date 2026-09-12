@@ -762,3 +762,189 @@ arco_i64 arco_host_directory_create(const char* path) {
     if (arco_raw_stat_mode(path, &mode) == 0) return 0;
     return (mode & ARCO_S_IFMT) == ARCO_S_IFDIR ? 1 : 0;
 }
+
+
+// --- Batch 4: real Random.*, plus Time.Timestamp and Sleep.
+//
+// Random.* ports the oracle's OWN Pcg32 generator (include/arco/random.hpp
+// / src/runtime/random.cpp) byte-for-byte -- a real, standard PCG32 XSH-RR
+// generator, confirmed identical via a direct unit-test harness comparing
+// known seed/sequence outputs against the oracle's own class directly, not
+// a "close enough" reimplementation. A "handle" here is simply a REAL
+// POINTER to a 16-byte {state, increment} block this file's own
+// `arco_raw_mmap` allocates (`Random.Create`'s own real return value) --
+// NOT an opaque runtime-registry handle the way the oracle's own
+// `RuntimeHandle`/`object_handles_` machinery works, since this native
+// backend has no handle/resource-registry infrastructure of its own at
+// all. `Random.Destroy` is not implemented here: there is nothing for it
+// to meaningfully do (this whole backend never frees anything it
+// allocates, the same deliberate "simple, no realloc, no free" discipline
+// `array_alloc`/`str_concat` already established) -- calling
+// `Random.Float`/`Integer`/etc. on a "destroyed" handle here just keeps
+// working, a real, disclosed divergence from the oracle's own real
+// validity tracking, consistent with this whole backend's already-
+// established "no runtime error/exception mechanism yet" gap (the same
+// one File.ReadText's own missing-file handling above already discloses).
+//
+// Real, disclosed scope: `Random.Float`/`Math.Random` are NOT implemented
+// at all -- both return a real FRACTIONAL double in [0, 1), and this
+// whole native backend's own Number representation is INTEGER-ONLY
+// throughout (see `arco_host_number_to_string`'s own comment) -- there is
+// no way to represent their real return value correctly, a pre-existing,
+// separate, disclosed gap, not something Random.* itself should paper
+// over with a wrong truncated/scaled integer. `Random.Integer`'s own
+// result IS always a whole integer even though the oracle stores it as a
+// C++ double, so it fits this backend's representation exactly, no
+// truncation involved. `Random.Create`/`Random.Reseed`'s own OPTIONAL
+// `sequence` parameter and `Random.Create`'s own ZERO-argument auto-seed
+// form (which needs a real OS entropy source plus a process-lifetime
+// serial counter to match the oracle's own `automatic_random_seed()`
+// exactly -- itself real, persistent, mutable GLOBAL state, the same
+// "needs a real static-data relocation, not yet supported" boundary this
+// file's own header comment already flags) are not implemented either --
+// only the explicit-seed, explicit-handle forms this backend's own
+// fixed-arity host-table design (or, for `Random.Choice`/`Sample`/
+// `Shuffle`, `Fission_X86_64LowerFunction`'s own real special-case
+// dispatch -- see that file's own comment for why) can represent without
+// guessing at an unsupported call shape.
+typedef struct { arco_u64 state; arco_u64 increment; } arco_pcg32_state;
+
+static inline __attribute__((always_inline)) unsigned int arco_pcg32_rotr32(unsigned int value, unsigned int rotation) {
+    rotation = rotation & 31u;
+    return (value >> rotation) | (value << ((0u - rotation) & 31u));
+}
+static inline __attribute__((always_inline)) unsigned int arco_pcg32_next(arco_pcg32_state* s) {
+    arco_u64 old_state = s->state;
+    s->state = old_state * 6364136223846793005ULL + s->increment;
+    unsigned int xorshifted = (unsigned int)(((old_state >> 18) ^ old_state) >> 27);
+    unsigned int rotation = (unsigned int)(old_state >> 59);
+    return arco_pcg32_rotr32(xorshifted, rotation);
+}
+static inline __attribute__((always_inline)) void arco_pcg32_reseed(arco_pcg32_state* s, arco_u64 seed, arco_u64 sequence) {
+    s->state = 0;
+    s->increment = (sequence << 1) | 1;
+    arco_pcg32_next(s);
+    s->state = s->state + seed;
+    arco_pcg32_next(s);
+}
+// Matches the oracle's own Lemire-style rejection loop exactly (`bound`
+// real range [1, 2^32]; the oracle itself throws outside that range --
+// not validated here, matching this whole batch's own "no exception
+// mechanism yet" choice).
+static inline __attribute__((always_inline)) unsigned int arco_pcg32_bounded(arco_pcg32_state* s, arco_u64 bound) {
+    if (bound == (1ULL << 32)) return arco_pcg32_next(s);
+    unsigned int width = (unsigned int)bound;
+    unsigned int threshold = (unsigned int)(0u - width) % width;
+    while (1) {
+        unsigned int value = arco_pcg32_next(s);
+        if (value >= threshold) return value % width;
+    }
+}
+#define ARCO_PCG32_DEFAULT_SEQUENCE 54ULL
+
+// Random.Create(seed) -- a real new handle (see this section's own header
+// comment for what a "handle" really is here).
+const void* arco_host_random_create(arco_i64 seed) {
+    arco_pcg32_state* s = (arco_pcg32_state*)arco_raw_mmap(sizeof(arco_pcg32_state));
+    arco_pcg32_reseed(s, (arco_u64)seed, ARCO_PCG32_DEFAULT_SEQUENCE);
+    return (const void*)s;
+}
+// Random.Reseed(handle, seed) -- real in-place reseeding of an EXISTING
+// handle (matching the oracle's own real semantic: the same generator
+// object, now producing a fresh stream).
+arco_i64 arco_host_random_reseed(arco_pcg32_state* handle, arco_i64 seed) {
+    arco_pcg32_reseed(handle, (arco_u64)seed, ARCO_PCG32_DEFAULT_SEQUENCE);
+    return 1;
+}
+// Random.Integer(minimum, maximum, handle) -- real bounded rejection
+// sampling, matching the oracle's own `minimum + generator->bounded(width)`
+// exactly (`minimum > maximum`/an over-wide range are real oracle errors,
+// not validated here either).
+arco_i64 arco_host_random_integer(arco_i64 minimum, arco_i64 maximum, arco_pcg32_state* handle) {
+    arco_u64 width = (arco_u64)(maximum - minimum + 1);
+    return minimum + (arco_i64)arco_pcg32_bounded(handle, width);
+}
+// Random.Choice(array, handle) -- returns ONE raw element slot verbatim
+// (works identically for a Number or a String array, see this section's
+// own header comment -- the real result KIND is resolved at compile time
+// by fission/amir/lower_x86_64.abas instead).
+arco_i64 arco_host_random_choice(const arco_i64* arr, arco_pcg32_state* handle) {
+    arco_i64 count = arr[0];
+    arco_u64 index = arco_pcg32_bounded(handle, (arco_u64)count);
+    return arr[1 + index];
+}
+// Random.Shuffle(array, handle) -- a real NEW array (the oracle's own
+// Shuffle returns a fresh `Value::Array` by value, confirmed via a direct
+// read of runtime.cpp's own implementation -- it copies `args[0]` before
+// shuffling, never mutates the caller's own array in place), real
+// Fisher-Yates, matching the oracle's own exact iteration order and RNG
+// consumption.
+const void* arco_host_random_shuffle(const arco_i64* arr, arco_pcg32_state* handle) {
+    arco_i64 count = arr[0];
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    result[0] = count;
+    arco_i64 i = 0;
+    while (i < count) { result[1 + i] = arr[1 + i]; i = i + 1; }
+    arco_i64 remaining = count;
+    while (remaining > 1) {
+        arco_u64 selected = arco_pcg32_bounded(handle, (arco_u64)remaining);
+        arco_i64 tmp = result[remaining];
+        result[remaining] = result[1 + selected];
+        result[1 + selected] = tmp;
+        remaining = remaining - 1;
+    }
+    return (const void*)result;
+}
+// Random.Sample(array, count, handle) -- a real NEW array of length
+// `count`, real PARTIAL Fisher-Yates matching the oracle's own exact
+// algorithm and RNG consumption order (`for index in [0, count):
+// selected = index + bounded(size - index); swap(values[index],
+// values[selected])`, then truncate to `count`).
+const void* arco_host_random_sample(const arco_i64* arr, arco_i64 count, arco_pcg32_state* handle) {
+    arco_i64 total = arr[0];
+    char* workRaw = (char*)arco_raw_mmap((arco_u64)(total > 0 ? total * 8 : 8));
+    arco_i64* work = (arco_i64*)workRaw;
+    arco_i64 i = 0;
+    while (i < total) { work[i] = arr[1 + i]; i = i + 1; }
+    i = 0;
+    while (i < count) {
+        arco_u64 selected = (arco_u64)i + arco_pcg32_bounded(handle, (arco_u64)(total - i));
+        arco_i64 tmp = work[i];
+        work[i] = work[selected];
+        work[selected] = tmp;
+        i = i + 1;
+    }
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    result[0] = count;
+    i = 0;
+    while (i < count) { result[1 + i] = work[i]; i = i + 1; }
+    return (const void*)result;
+}
+
+// Time.Timestamp() -- real clock_gettime(CLOCK_REALTIME) syscall, whole
+// seconds since the epoch (matching the oracle's own real
+// `duration_cast<seconds>` truncation -- always a whole integer, fits
+// this backend's own integer-only Number representation exactly).
+arco_i64 arco_host_time_timestamp(void) {
+    long ts[2];
+    arco_raw_syscall2(228, 0, (long)ts);
+    return (arco_i64)ts[0];
+}
+
+// Sleep(milliseconds) -- real nanosleep(2) syscall. Returns Bool (TRUE)
+// rather than the oracle's own real NULL -- this whole native backend has
+// no NULL/void value representation established yet (a real, disclosed,
+// separate, pre-existing gap), and Sleep's own return value is never
+// meaningfully used in real ArcoBASIC code (a statement-only call in
+// practice). A single `nanosleep` call (not retried on EINTR) is a real,
+// disclosed simplification versus `std::this_thread::sleep_for`'s own
+// retry-until-elapsed behavior.
+arco_i64 arco_host_sleep(arco_i64 milliseconds) {
+    if (milliseconds > 0) {
+        long ts[2];
+        ts[0] = milliseconds / 1000;
+        ts[1] = (milliseconds % 1000) * 1000000L;
+        arco_raw_syscall2(35, (long)ts, 0);
+    }
+    return 1;
+}

@@ -2466,6 +2466,105 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   Network/Web/Document/Process/System/ArcoSH/RESOURCE/Project namespaces,
   `Random.*`/`Date`/`Time.*` deprioritized-but-feasible, `Path.Join`/
   `Format` variadic arity) is unchanged and still stands as written above.
+- **Host-function bridge, fourth batch: real Random.\*, plus
+  Time.Timestamp/Sleep** -- a real, byte-for-byte PORT of the oracle's own
+  PCG32 generator (`include/arco/random.hpp`/`src/runtime/random.cpp`:
+  `state * 6364136223846793005 + increment`, XSH-RR output, the SAME
+  Lemire-style bounded-rejection loop), confirmed identical via a direct
+  unit-test harness comparing known seed/sequence outputs against the
+  oracle's own class directly -- not a "close enough" reimplementation. A
+  "handle" here is simply a real POINTER to a 16-byte {state, increment}
+  block (`Random.Create`'s own real return value), since this native
+  backend has no handle/resource-registry infrastructure of its own the
+  way the oracle's `RuntimeHandle`/`object_handles_` machinery does.
+  `Random.Create(seed)`, `Random.Reseed(handle, seed)`,
+  `Random.Integer(min, max, handle)` are uniform host-table entries.
+  `Random.Choice(array, handle)`/`Random.Sample(array, count, handle)`/
+  `Random.Shuffle(array, handle)` are the SAME kind of case String(x)/
+  TYPEOF(x) already were: their own native symbol is fully kind-AGNOSTIC
+  (it only ever moves raw 8-byte element slots, never interprets them, so
+  the identical code serves a Number or a String array), but the real
+  result KIND still depends on the INPUT array's own element kind, so
+  these needed real special-case dispatch in
+  `Fission_X86_64LowerFunction`/`Fission_X86_64CollectSlots` instead of a
+  uniform table entry -- confirmed by exercising both a Number array and
+  a String array through `Random.Choice` in the same fixture.
+  `Random.Sample`/`Shuffle` both return a real NEW array (confirmed via a
+  direct read of `runtime.cpp`'s own implementation: it copies the
+  argument before permuting, never mutates the caller's own array in
+  place), real Fisher-Yates/partial-Fisher-Yates matching the oracle's
+  own exact algorithm and RNG-consumption order. `Time.Timestamp` (real
+  `clock_gettime(CLOCK_REALTIME)`) and `Sleep` (real `nanosleep`) round
+  out the batch.
+  A real, NEW correctness bug was found (not fixed) while verifying this
+  batch: `Random.Integer`'s own upper-bound argument at `2^32 - 1`
+  triggered a genuine CRASH (`SIGFPE`) in the compiled native binary.
+  Root cause, confirmed by direct inspection, is entirely PRE-EXISTING
+  and unrelated to Random.\* itself: this whole native backend's own
+  operand-loading path (`Fission_X86_64OperandLoadLine`'s `mov $N, %reg`
+  text, encoded by `fission/amir/x86_64_assembler.abas`'s own `mov`
+  handling as a plain `C7 /0 id` -- `MOV r/m64, imm32`, SIGN-EXTENDED)
+  silently corrupts ANY integer literal outside the signed 32-bit range
+  (confirmed directly: `PRINT 4294967295` prints `-1` from native
+  codegen, `4294967296` from the oracle) -- a real x86-64 ISA constraint
+  (there is no `MOV r/m64, imm64`; a full 64-bit immediate needs a
+  register-destination-only `MOVABS`-style encoding, `REX.W + B8+rd io`,
+  which this assembler's own `mov` handling never falls back to). This is
+  disclosed here, NOT fixed, since it is a real, separate, cross-cutting
+  correctness issue in the CORE operand-loading path (reachable from
+  ordinary arithmetic/assignment, not specific to the host bridge) that
+  deserves its own dedicated pass, not a fix folded into an unrelated
+  host-function-bridge batch. The new fixture
+  (`fission/tests/native_programs/host_bridge_random.abas`) deliberately
+  keeps every `Random.Integer` call well under 2^31 to avoid it, matching
+  every real Random.Integer call in ordinary ArcoBASIC code in practice.
+  Verified: a plain non-freestanding C harness against the real
+  freestanding `.o`, cross-checked value-for-value against a small,
+  separate C++ harness linked directly against the oracle's OWN
+  `Pcg32`/`random.cpp` (not just `compile-run` output) for `next_u32`,
+  `bounded`, `Choice`, `Shuffle`, `Sample`, and `Reseed`, confirming
+  byte-for-byte agreement before ever touching the compiler; then a real
+  probe against the oracle via `ArcoFission compile-run`, byte-for-byte
+  matching (with the disclosed `Sleep`-return-value divergence noted
+  below, worked around by never PRINTing it in the fixture, matching real
+  practice). All 24 existing native fixtures re-verified unaffected; the
+  real diagnostic paths (wrong arg count/kind for
+  `Random.Choice`/`Sample`) checked directly. Extended
+  `fission/tests/amir_x86_64_smoke.abas` with real structural checks,
+  including the Number-array/String-array kind-preserving dispatch proof.
+  Self-parse/self-semantic corpus symbol count grew 3832 -> 3849; golden
+  value updated. Verified with `fissure run`.
+  Real, disclosed remaining scope: `Random.Float`/`Math.Random` are NOT
+  implemented at all -- both return a real FRACTIONAL double in [0, 1),
+  and this whole native backend's own Number representation is
+  INTEGER-ONLY throughout, so there is no way to represent their real
+  return value correctly (a pre-existing, separate, disclosed gap, not
+  something Random.\* itself should paper over with a wrong truncated/
+  scaled integer). `Random.Destroy`/`Random.Clone` are not implemented
+  (Destroy has nothing to meaningfully do given this backend's own
+  never-free memory discipline; Clone was simply not prioritized).
+  `Random.Create`/`Reseed`'s own optional `sequence` parameter and
+  `Random.Create`'s own zero-argument auto-seed form (needs a real OS
+  entropy source PLUS a process-lifetime serial counter -- itself real,
+  persistent, mutable GLOBAL state, the exact "needs a real static-data
+  relocation, not yet supported" boundary `host_bridge.c`'s own header
+  comment already flags) are not implemented either. `Sleep` returns Bool
+  `TRUE` rather than the oracle's own real `NULL` (this whole native
+  backend has no NULL/void value representation established yet -- a
+  real, disclosed, separate, pre-existing gap, the same one File.
+  ReadText's own missing-file handling already discloses). `Time.Now`/
+  `DATE`/`Date` are NOT implemented -- all three format a real LOCAL
+  time string, which needs full timezone-database awareness (`TZ`/
+  `/etc/localtime`/DST rules) this freestanding backend has no path to
+  without either a real libc dependency or a from-scratch tzdata port,
+  neither attempted here; `Time.Timestamp` (UTC, unambiguous) was
+  implemented instead. THE NEW, MOST IMPORTANT DISCLOSED ITEM: the real,
+  pre-existing large-integer-literal encoding bug described above (any
+  literal outside signed 32-bit range is silently corrupted by this
+  backend's own `mov $imm, reg` encoding) is a genuine, cross-cutting
+  correctness gap independent of the host bridge, and should be the next
+  priority fix regardless of which host-function category is tackled
+  next.
 
 ## In-Progress Components
 

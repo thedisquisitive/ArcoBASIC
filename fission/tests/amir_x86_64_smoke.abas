@@ -822,3 +822,45 @@ FileExistsBadKindSource = "PRINT File.Exists(5)"
 FileExistsBadKindAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FileExistsBadKindSource), "x86-64-file-exists-bad-kind-smoke.abas")))
 FileExistsBadKindProgram = Fission_AmirToX86_64(FileExistsBadKindAmir)
 PRINT FileExistsBadKindProgram.Diagnostics.HasErrors()
+
+' Batch 4 of the host-function bridge: real Random.* (see
+' host_bridge.c's own "Batch 4" header comment for the full design, a
+' real byte-for-byte port of the oracle's own PCG32 generator).
+' Random.Create is checked structurally here (calls the real symbol,
+' zero diagnostics); Random.Choice is checked on BOTH a Number array and
+' a String array with zero diagnostics either way -- proving the real
+' special-case, kind-PRESERVING dispatch (see
+' Fission_X86_64CollectSlots' own comment: Random.Choice/Sample/Shuffle
+' can't be uniform host-function-table entries at all, since their own
+' real result kind depends on the INPUT array's own element kind).
+' Real execution (including the real Fisher-Yates array permutation
+' Random.Sample/Shuffle both use) verified separately by fission/tests/
+' native_programs/host_bridge_random.abas.
+RandomCreateSource = "h = Random.Create(1)\nPRINT h"
+RandomCreateAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(RandomCreateSource), "x86-64-random-create-smoke.abas")))
+RandomCreateProgram = Fission_AmirToX86_64(RandomCreateAmir)
+PRINT RandomCreateProgram.Diagnostics.HasErrors()
+PRINT String.Contains(RandomCreateProgram.Render(), "call arco_host_random_create")
+
+RandomChoiceNumberSource = "a = [1, 2, 3]\nh = Random.Create(1)\nc = Random.Choice(a, h)\nPRINT c"
+RandomChoiceNumberAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(RandomChoiceNumberSource), "x86-64-random-choice-number-smoke.abas")))
+RandomChoiceNumberProgram = Fission_AmirToX86_64(RandomChoiceNumberAmir)
+PRINT RandomChoiceNumberProgram.Diagnostics.HasErrors()
+PRINT String.Contains(RandomChoiceNumberProgram.Render(), "call arco_host_random_choice")
+
+RandomChoiceStringSource = "a = [\"x\", \"y\"]\nh = Random.Create(1)\nc = Random.Choice(a, h)\nPRINT c"
+RandomChoiceStringAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(RandomChoiceStringSource), "x86-64-random-choice-string-smoke.abas")))
+RandomChoiceStringProgram = Fission_AmirToX86_64(RandomChoiceStringAmir)
+PRINT RandomChoiceStringProgram.Diagnostics.HasErrors()
+
+' A wrong argument COUNT or KIND for Random.Choice/Sample/Shuffle is a
+' real, reported diagnostic, the same as any other host-bridge call.
+RandomSampleBadCountSource = "a = [1, 2, 3]\nh = Random.Create(1)\nPRINT Random.Sample(a, h)"
+RandomSampleBadCountAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(RandomSampleBadCountSource), "x86-64-random-sample-bad-count-smoke.abas")))
+RandomSampleBadCountProgram = Fission_AmirToX86_64(RandomSampleBadCountAmir)
+PRINT RandomSampleBadCountProgram.Diagnostics.HasErrors()
+
+RandomChoiceBadKindSource = "h = Random.Create(1)\nPRINT Random.Choice(5, h)"
+RandomChoiceBadKindAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(RandomChoiceBadKindSource), "x86-64-random-choice-bad-kind-smoke.abas")))
+RandomChoiceBadKindProgram = Fission_AmirToX86_64(RandomChoiceBadKindAmir)
+PRINT RandomChoiceBadKindProgram.Diagnostics.HasErrors()

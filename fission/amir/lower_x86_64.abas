@@ -376,6 +376,19 @@ FUNCTION Fission_X86_64HostFunctionTable()
     table = Object.Set(table, "FILE.SETEXECUTABLE", {Symbol: "arco_host_file_set_executable", ReturnKind: "Bool", ParamKinds: ["String"]})
     table = Object.Set(table, "DIRECTORY.CREATE", {Symbol: "arco_host_directory_create", ReturnKind: "Bool", ParamKinds: ["String"]})
     table = Object.Set(table, "DIRECTORY.EXISTS", {Symbol: "arco_host_directory_exists", ReturnKind: "Bool", ParamKinds: ["String"]})
+    ' Batch 4: real Random.* (see host_bridge.c's own "Batch 4" header
+    ' comment for the full design, including why Random.Float/Math.Random
+    ' are NOT here -- an integer-only Number representation can't
+    ' represent a real fractional [0, 1) result), Time.Timestamp, Sleep.
+    ' Random.Choice/Sample/Shuffle are NOT here either -- their own real
+    ' result kind depends on the INPUT array's own element kind, so they
+    ' need real special-case dispatch in Fission_X86_64LowerFunction
+    ' instead (the same reasoning String(x)/TYPEOF(x) already established).
+    table = Object.Set(table, "RANDOM.CREATE", {Symbol: "arco_host_random_create", ReturnKind: "Number", ParamKinds: ["Number"]})
+    table = Object.Set(table, "RANDOM.RESEED", {Symbol: "arco_host_random_reseed", ReturnKind: "Bool", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "RANDOM.INTEGER", {Symbol: "arco_host_random_integer", ReturnKind: "Number", ParamKinds: ["Number", "Number", "Number"]})
+    table = Object.Set(table, "TIME.TIMESTAMP", {Symbol: "arco_host_time_timestamp", ReturnKind: "Number", ParamKinds: []})
+    table = Object.Set(table, "SLEEP", {Symbol: "arco_host_sleep", ReturnKind: "Bool", ParamKinds: ["Number"]})
     RETURN table
 END FUNCTION
 
@@ -937,6 +950,32 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 ' fixed ABI signature) always produce a real String result,
                 ' regardless of the argument's own kind.
                 IF Upper(callee) == "STRING" ORELSE Upper(callee) == "TYPEOF" THEN destKind = "String"
+                ' `Random.Choice`/`Random.Sample`/`Random.Shuffle` are the
+                ' SAME kind of case: their own real native implementation
+                ' (host_bridge.c) only ever moves raw 8-byte element slots
+                ' around, never interprets them, so the identical native
+                ' code serves a Number array or a String array alike --
+                ' but the COMPILE-TIME result kind still depends on the
+                ' INPUT array's own element kind, not a single fixed ABI
+                ' signature, so these can't be uniform
+                ' Fission_X86_64HostFunctionTable entries either. Choice
+                ' returns one element (same kind as the array's own
+                ' element kind); Sample/Shuffle return a real NEW array of
+                ' the array's own SAME full kind (e.g. "Array:String" in,
+                ' "Array:String" out).
+                IF Upper(callee) == "RANDOM.CHOICE" ORELSE Upper(callee) == "RANDOM.SAMPLE" ORELSE Upper(callee) == "RANDOM.SHUFFLE" THEN
+                    randArgs = Fission_X86_64SplitArgs(instruction.Field("Args"))
+                    IF LEN(randArgs) >= 1 THEN
+                        randBaseKind = Object.Get(kinds, randArgs[0], "Number")
+                        IF Fission_X86_64IsArrayKind(randBaseKind) THEN
+                            IF Upper(callee) == "RANDOM.CHOICE" THEN
+                                destKind = Fission_X86_64ArrayElementKind(randBaseKind)
+                            ELSE
+                                destKind = randBaseKind
+                            END IF
+                        END IF
+                    END IF
+                END IF
                 hostEntry = Object.Get(Fission_X86_64HostFunctionTable(), Upper(callee), NULL)
                 IF hostEntry != NULL THEN
                     destKind = hostEntry.ReturnKind
@@ -2921,6 +2960,58 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = Array.Push(context.RodataLines, "    .asciz \"" + typeName + "\"")
                     ignored = Array.Push(textLines, "    lea " + typeofLabel + "(%rip), %rax")
                     IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                ' `Random.Choice`/`Random.Sample`/`Random.Shuffle` -- see
+                ' Fission_X86_64CollectSlots' own comment on why these
+                ' can't be uniform host-table entries (their real result
+                ' kind depends on the INPUT array's own element kind, not
+                ' a single fixed ABI signature); the native symbols
+                ' themselves (host_bridge.c) are fully kind-agnostic,
+                ' since they only ever move raw 8-byte element slots, so
+                ' one real Fission_X86_64EmitCall dispatch per name
+                ' suffices once the arg SHAPE (an Array-kind first
+                ' argument, Number-kind handle/count arguments) is
+                ' validated here, exactly the same real diagnostic
+                ' discipline every other host-bridge call site already
+                ' uses.
+                IF Upper(callee) == "RANDOM.CHOICE" THEN
+                    IF LEN(args) != 2 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected 2)")
+                        CONTINUE FOR
+                    END IF
+                    IF Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE ORELSE Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[1])) != "Number" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array and a Number handle)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_random_choice", args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                IF Upper(callee) == "RANDOM.SAMPLE" THEN
+                    IF LEN(args) != 3 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected 3)")
+                        CONTINUE FOR
+                    END IF
+                    IF Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE ORELSE Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[1])) != "Number" ORELSE Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[2])) != "Number" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array, a Number count, and a Number handle)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_random_sample", args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                IF Upper(callee) == "RANDOM.SHUFFLE" THEN
+                    IF LEN(args) != 2 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected 2)")
+                        CONTINUE FOR
+                    END IF
+                    IF Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE ORELSE Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[1])) != "Number" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array and a Number handle)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_random_shuffle", args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
                     CONTINUE FOR
                 END IF
                 ' The real host-function bridge (see Fission_X86_64

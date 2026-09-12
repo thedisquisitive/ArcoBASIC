@@ -1,0 +1,74 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises the FOURTH real batch of
+' host-function-bridge coverage: real Random.* (fission/native_runtime/
+' host_bridge.c's own "Batch 4" section), a real, byte-for-byte port of
+' the oracle's own PCG32 generator (include/arco/random.hpp/
+' src/runtime/random.cpp), confirmed identical via a direct unit-test
+' harness comparing known seed/sequence outputs against the oracle's own
+' class directly -- plus Time.Timestamp and Sleep.
+'
+' Random.Choice/Sample/Shuffle are exercised on BOTH a Number array and a
+' String array, proving the real special-case, kind-preserving dispatch
+' (see fission/amir/lower_x86_64.abas's own comment: these can't be
+' uniform host-function-table entries at all, since their own real result
+' kind depends on the INPUT array's own element kind, not a single fixed
+' ABI signature) -- Random.Sample/Shuffle both return a real NEW array,
+' never mutating the caller's own array in place (confirmed against the
+' oracle, checked here too: `a` PRINTs unchanged after `Random.Shuffle(a,
+' ...)`).
+'
+' Real, disclosed scope: `Random.Integer`'s own upper bound is kept well
+' under 2^31 here deliberately -- this batch's own verification work
+' surfaced a real, PRE-EXISTING bug in this native backend's own operand-
+' loading path (`Fission_X86_64OperandLoadLine`/the assembler's own `mov
+' $imm, reg` encoding), unrelated to Random.* itself: any integer literal
+' outside the signed 32-bit range is silently corrupted (a real x86-64 ISA
+' constraint -- `MOV r/m64, imm32` sign-extends -- this backend's own
+' assembler never falls back to a real 64-bit-immediate encoding for it).
+' Recorded in .agents/FISSION_SUBSTRATE_PROGRESS.md as a real, disclosed,
+' NOT-yet-fixed gap (out of this batch's own host-function-bridge scope);
+' this fixture works around it by staying within the range every real
+' Random.Integer call in ordinary ArcoBASIC code already uses in practice.
+' `Sleep`'s own return value is deliberately not PRINTed (see
+' `arco_host_sleep`'s own comment: it returns Bool TRUE, not the oracle's
+' own real NULL -- this whole native backend has no NULL/void value
+' representation yet, a real, disclosed, separate, pre-existing gap) --
+' called here purely as a statement, its own real, common use in practice.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+h = Random.Create(100)
+PRINT Random.Integer(0, 9, h)
+PRINT Random.Integer(0, 9, h)
+PRINT Random.Integer(0, 9, h)
+
+a = [5, 10, 20, 30, 40, 50]
+h2 = Random.Create(100)
+PRINT Random.Choice(a, h2)
+
+sa = ["red", "green", "blue", "yellow"]
+h3 = Random.Create(100)
+PRINT Random.Choice(sa, h3)
+
+h4 = Random.Create(100)
+shuffled = Random.Shuffle(a, h4)
+PRINT shuffled
+PRINT a
+
+nums = [1, 2, 3, 4, 5, 6, 7]
+h5 = Random.Create(100)
+sampled = Random.Sample(nums, 3, h5)
+PRINT sampled
+
+h6 = Random.Create(1)
+ok = Random.Reseed(h6, 999)
+PRINT ok
+PRINT Random.Integer(0, 999999999, h6)
+
+t = Time.Timestamp()
+PRINT t > 1700000000
+
+Sleep(1)
+PRINT "slept"
