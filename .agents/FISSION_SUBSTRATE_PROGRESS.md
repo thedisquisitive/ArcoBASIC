@@ -2398,6 +2398,74 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   feasible NOW without any representation overhaul (a read of known size
   or a write of an already-allocated array needs no array growth at all)
   and is the clear next concrete candidate.
+- **Host-function bridge, third batch: real File I/O** -- the named "clear
+  next concrete candidate" from the previous entry, delivered: real raw
+  Linux x86-64 SYSCALLS (`open`/`read`/`write`/`close`/`lseek`/`stat`/
+  `mkdir`/`access`/`chmod`, real, stable syscall numbers, not libc), no
+  representation overhaul needed (every array involved has a real size
+  known BEFORE allocation). `File.Exists` (`access`), `File.ReadText`/
+  `File.WriteText`/`File.AppendText` (`open`+`lseek`/`read`/`write`+
+  `close`), `File.SetExecutable` (real `stat`+`chmod`, ADDING the
+  owner/group/other exec bits onto the file's own EXISTING mode, matching
+  the oracle's own `perm_options::add` exactly, not a fixed-mode
+  overwrite), `Directory.Exists` (real `stat`, checking the `S_IFDIR` bit
+  read directly by fixed byte offset -- no full `struct stat` declared),
+  `Directory.Create` (real RECURSIVE `mkdir -p`: walks a mutable copy of
+  the path, `mkdir`s each `/`-delimited prefix in turn, each individual
+  segment's own error including EEXIST is harmless -- only a real final
+  existence check decides the return value, matching the oracle's own
+  `create_directories` contract).
+  `File.ReadBytes`/`File.WriteBytes` are this bridge's own FIRST functions
+  to touch a real ArcoBASIC Array value at all: `Array:Number` is just an
+  ordinary string value to every piece of machinery that reads
+  `ReturnKind`/`ParamKinds` (`Fission_X86_64CollectSlots`'s Call dest-kind
+  resolution, the host-call arg-kind check), so it needed zero special-
+  casing there. `File.ReadBytes` builds a real array using the EXACT SAME
+  layout `array_alloc` already establishes (an 8-byte element-count
+  header, then N raw 8-byte element slots), just allocated through this
+  same file's own separate `arco_raw_mmap` block rather than the shared
+  bump-allocated heap -- safe because nothing downstream (LEN/INDEX/
+  STORE_INDEX/`array_print`/ForEach) ever assumes an array's own backing
+  memory came from one particular allocator, only that the pointer this
+  function itself returns is real, valid memory in that same layout.
+  `File.WriteBytes` reads an existing array the same way, masking each
+  element to its own low byte (matching the oracle's own lack of range
+  validation too).
+  Verified: a plain non-freestanding C harness against the real
+  freestanding `.o` first (every real filesystem side effect -- write,
+  append, read-back, chmod, recursive mkdir, missing-file/non-directory
+  edge cases -- matched expectations exactly), then a real combined probe
+  against the oracle (`ArcoFission compile-run`), byte-for-byte matching
+  on the first full attempt; all 23 existing native fixtures re-verified
+  unaffected; the real diagnostic paths (wrong arg count/kind) checked
+  directly. New permanent fixture `fission/tests/native_programs/
+  host_bridge_files.abas` (the first native fixture with a real filesystem
+  side effect under `/tmp`, deliberately idempotent -- `Directory.Create`
+  is real `mkdir -p`, `File.WriteText` truncates, both safe to re-run);
+  wired into `fission/fissure.ab`. Extended `fission/tests/
+  amir_x86_64_smoke.abas` with real structural checks (symbol-name checks,
+  an Array-kind `ReturnKind` round-tripped through `LEN` with zero
+  diagnostics, the real bad-kind diagnostic) -- caught and fixed one real
+  authoring mistake in the process: ArcoBASIC string literals escape an
+  embedded quote with `\"`, not BASIC's classic doubled `""`, confirmed by
+  running the smoke file itself through `ArcoFission compile-run` before
+  trusting the new blocks (a doubled-quote attempt produced a real parse
+  error, caught immediately rather than committed). Self-parse/self-
+  semantic corpus symbol count grew again with the new fixture and table
+  entries; golden value updated. Verified with `fissure run`.
+  Real, disclosed remaining scope: 41 of the real ~246-entry host-function
+  table are now covered. `File.List` (returns an array of real dynamic
+  Objects with Name/Path/IsDirectory/IsFile/IsHidden/Size/Extension
+  fields) and `System.Open` (process launching) were deliberately NOT
+  added in this batch -- `File.List` needs the same `Object.*` dynamic
+  property-bag representation already disclosed as a separate, unstarted
+  category, and `System.Open` falls under the same "needs real external
+  process/subsystem support" category `System.*` was already disclosed
+  under. Every other previously-disclosed remaining category (`Array.*`
+  mutation needing a representation overhaul, `Object.*`, GUI/Graphics/
+  Network/Web/Document/Process/System/ArcoSH/RESOURCE/Project namespaces,
+  `Random.*`/`Date`/`Time.*` deprioritized-but-feasible, `Path.Join`/
+  `Format` variadic arity) is unchanged and still stands as written above.
 
 ## In-Progress Components
 

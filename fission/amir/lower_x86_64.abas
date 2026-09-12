@@ -360,6 +360,22 @@ FUNCTION Fission_X86_64HostFunctionTable()
     table = Object.Set(table, "PATH.BASENAME", {Symbol: "arco_host_path_basename", ReturnKind: "String", ParamKinds: ["String"]})
     table = Object.Set(table, "PATH.DIRNAME", {Symbol: "arco_host_path_dirname", ReturnKind: "String", ParamKinds: ["String"]})
     table = Object.Set(table, "PATH.EXTENSION", {Symbol: "arco_host_path_extension", ReturnKind: "String", ParamKinds: ["String"]})
+    ' Batch 3: real File I/O (see host_bridge.c's own "Batch 3" header
+    ' comment for the full design). File.ReadBytes/File.WriteBytes are the
+    ' first host functions with an Array-kind ReturnKind/ParamKind at all
+    ' -- "Array:Number" is just an ordinary string value to every piece of
+    ' machinery that reads ReturnKind/ParamKinds (Fission_X86_64CollectSlots'
+    ' own Call dest-kind resolution, this same function's own caller-side
+    ' arg-kind check), so it needs no special-casing here.
+    table = Object.Set(table, "FILE.EXISTS", {Symbol: "arco_host_file_exists", ReturnKind: "Bool", ParamKinds: ["String"]})
+    table = Object.Set(table, "FILE.READTEXT", {Symbol: "arco_host_file_read_text", ReturnKind: "String", ParamKinds: ["String"]})
+    table = Object.Set(table, "FILE.WRITETEXT", {Symbol: "arco_host_file_write_text", ReturnKind: "Bool", ParamKinds: ["String", "String"]})
+    table = Object.Set(table, "FILE.APPENDTEXT", {Symbol: "arco_host_file_append_text", ReturnKind: "Bool", ParamKinds: ["String", "String"]})
+    table = Object.Set(table, "FILE.READBYTES", {Symbol: "arco_host_file_read_bytes", ReturnKind: "Array:Number", ParamKinds: ["String"]})
+    table = Object.Set(table, "FILE.WRITEBYTES", {Symbol: "arco_host_file_write_bytes", ReturnKind: "Bool", ParamKinds: ["String", "Array:Number"]})
+    table = Object.Set(table, "FILE.SETEXECUTABLE", {Symbol: "arco_host_file_set_executable", ReturnKind: "Bool", ParamKinds: ["String"]})
+    table = Object.Set(table, "DIRECTORY.CREATE", {Symbol: "arco_host_directory_create", ReturnKind: "Bool", ParamKinds: ["String"]})
+    table = Object.Set(table, "DIRECTORY.EXISTS", {Symbol: "arco_host_directory_exists", ReturnKind: "Bool", ParamKinds: ["String"]})
     RETURN table
 END FUNCTION
 

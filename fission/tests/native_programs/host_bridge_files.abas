@@ -1,0 +1,50 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises the THIRD real batch of
+' host-function-bridge coverage: real File I/O
+' (fission/native_runtime/host_bridge.c's own "Batch 3" section), reached
+' via real raw Linux x86-64 syscalls (open/read/write/close/lseek/stat/
+' mkdir/access/chmod), not libc. This is the FIRST batch to touch a real
+' ArcoBASIC Array value at all through the host bridge: File.ReadBytes
+' produces one, File.WriteBytes consumes one, both using the exact same
+' array layout (an 8-byte element-count header, then N raw 8-byte element
+' slots) this backend's own `array_alloc` subroutine already establishes,
+' just allocated through a separate mmap'd block -- feasible without any
+' array-representation overhaul because every array involved has a real
+' size known BEFORE allocation (a file's own real byte length via lseek,
+' or an array this program already built and never grows).
+'
+' Uses temp-file paths under /tmp, matching a real, disclosed test-only
+' constraint (a real filesystem side effect, not a hermetic in-memory
+' fixture like every other native_programs/*.abas fixture) -- deliberately
+' idempotent (Directory.Create is real mkdir -p, safe to re-run;
+' File.WriteText truncates, safe to re-run too).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+p = "/tmp/arco_native_host_bridge_files_test.txt"
+PRINT File.Exists(p)
+ok = File.WriteText(p, "Hello")
+PRINT ok
+PRINT File.Exists(p)
+PRINT File.ReadText(p)
+ok2 = File.AppendText(p, ", World")
+PRINT ok2
+PRINT File.ReadText(p)
+PRINT File.SetExecutable(p)
+
+bytes = File.ReadBytes(p)
+PRINT LEN(bytes)
+PRINT bytes[0]
+PRINT bytes[1]
+
+p2 = "/tmp/arco_native_host_bridge_files_test_out.bin"
+ok3 = File.WriteBytes(p2, bytes)
+PRINT ok3
+PRINT File.ReadText(p2)
+
+d = "/tmp/arco_native_host_bridge_files_test_dir/nested"
+PRINT Directory.Exists(d)
+PRINT Directory.Create(d)
+PRINT Directory.Exists(d)

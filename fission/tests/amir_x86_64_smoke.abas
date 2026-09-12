@@ -793,3 +793,32 @@ TypeofArraySource = "a = [1, 2]\nPRINT TYPEOF(a)"
 TypeofArrayAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(TypeofArraySource), "x86-64-typeof-array-smoke.abas")))
 TypeofArrayProgram = Fission_AmirToX86_64(TypeofArrayAmir)
 PRINT TypeofArrayProgram.Diagnostics.HasErrors()
+
+' Batch 3 of the host-function bridge: real File I/O (see
+' host_bridge.c's own "Batch 3" header comment for the full design).
+' File.Exists is checked structurally here (calls the real symbol, zero
+' diagnostics); File.ReadBytes is the FIRST host function with a real
+' Array-kind ReturnKind at all ("Array:Number", an ordinary string value
+' to every piece of machinery that reads ReturnKind, so LEN/Index on its
+' own result Just Work with no special-casing), checked here by
+' round-tripping its result through LEN with zero diagnostics. Real
+' execution (including the real mmap-backed Array layout File.ReadBytes/
+' File.WriteBytes both use) verified separately by fission/tests/
+' native_programs/host_bridge_files.abas.
+FileExistsSource = "PRINT File.Exists(\"/tmp/does-not-matter\")"
+FileExistsAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FileExistsSource), "x86-64-file-exists-smoke.abas")))
+FileExistsProgram = Fission_AmirToX86_64(FileExistsAmir)
+PRINT FileExistsProgram.Diagnostics.HasErrors()
+PRINT String.Contains(FileExistsProgram.Render(), "call arco_host_file_exists")
+
+FileReadBytesLenSource = "b = File.ReadBytes(\"/tmp/does-not-matter\")\nPRINT LEN(b)"
+FileReadBytesLenAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FileReadBytesLenSource), "x86-64-file-readbytes-len-smoke.abas")))
+FileReadBytesLenProgram = Fission_AmirToX86_64(FileReadBytesLenAmir)
+PRINT FileReadBytesLenProgram.Diagnostics.HasErrors()
+
+' A wrong argument KIND for a File.* host function is a real, reported
+' diagnostic, the same as any other host-table entry.
+FileExistsBadKindSource = "PRINT File.Exists(5)"
+FileExistsBadKindAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FileExistsBadKindSource), "x86-64-file-exists-bad-kind-smoke.abas")))
+FileExistsBadKindProgram = Fission_AmirToX86_64(FileExistsBadKindAmir)
+PRINT FileExistsBadKindProgram.Diagnostics.HasErrors()
