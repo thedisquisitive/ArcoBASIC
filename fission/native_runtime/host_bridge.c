@@ -186,3 +186,327 @@ const char* arco_host_string_slice(const char* s, arco_i64 start, arco_i64 lengt
     result[clampedLength] = 0;
     return result;
 }
+
+// --- Batch 2: the real Number<->String conversion this whole language
+// uses pervasively (`String(n)`, a genuine, real gap in native codegen
+// found only by trying to use it -- confirmed via a direct probe:
+// `s = String(42)` failed to compile at all before this), a batch of
+// pure String.*/Bit.*/Path.* functions, and BytesToHex. Every real
+// semantic here (including which edge cases the oracle itself gets
+// "wrong" -- `NUMBER("abc")` genuinely crashes the oracle with a raw
+// `stod` C++ exception, `StringToHex`/`HexToString` crash too and are
+// simply not implemented here at all -- a broken host function is not
+// something a correct native implementation should try to replicate)
+// confirmed via direct, real oracle probes first, not guessed at.
+
+// String(number) -- a real itoa, matching this backend's own existing
+// itoa_write subroutine's algorithm exactly (see
+// fission/amir/lower_x86_64.abas's own comment), just returning a real
+// mmap-allocated string instead of writing via syscall directly. This
+// backend's own Number representation is integer-only throughout (no
+// floating point anywhere yet), so this is real, complete coverage for
+// every Number value this backend can actually produce -- not a
+// simplification of a "real" float-capable String() the oracle has that
+// this backend lacks; the oracle's own float support is a real,
+// disclosed, SEPARATE, pre-existing gap of this whole native backend,
+// not something String() itself needs to solve.
+const char* arco_host_number_to_string(arco_i64 value) {
+    char buf[24];
+    arco_i64 pos = 24;
+    int negative = value < 0;
+    arco_u64 v = negative ? (arco_u64)(-(value + 1)) + 1 : (arco_u64)value;
+    if (v == 0) {
+        buf[--pos] = '0';
+    } else {
+        while (v != 0) {
+            buf[--pos] = (char)('0' + (v % 10));
+            v = v / 10;
+        }
+    }
+    if (negative) buf[--pos] = '-';
+    arco_i64 len = 24 - pos;
+    char* result = (char*)arco_raw_mmap((arco_u64)(len + 1));
+    arco_i64 i = 0;
+    while (i < len) {
+        result[i] = buf[pos + i];
+        i = i + 1;
+    }
+    result[len] = 0;
+    return result;
+}
+
+// NUMBER(s) -- real integer parsing (this backend's own Number
+// representation is integer-only). A leading `-` is a real sign; any
+// other non-digit stops parsing there (matching a real, sane "parse as
+// much as looks like a number" contract) -- confirmed the oracle itself
+// has no sane defined behavior for a non-numeric string at all (a raw
+// C++ `stod` exception), so there is no real oracle behavior to match
+// for that case; this just never crashes, real disclosed divergence.
+arco_i64 arco_host_string_to_number(const char* s) {
+    arco_i64 i = 0;
+    int negative = 0;
+    if (s[0] == '-') { negative = 1; i = 1; }
+    arco_i64 value = 0;
+    while (s[i] >= '0' && s[i] <= '9') {
+        value = value * 10 + (s[i] - '0');
+        i = i + 1;
+    }
+    return negative ? -value : value;
+}
+
+static inline __attribute__((always_inline)) char arco_raw_to_upper(char c) {
+    if (c >= 'a' && c <= 'z') return (char)(c - 32);
+    return c;
+}
+static inline __attribute__((always_inline)) char arco_raw_to_lower(char c) {
+    if (c >= 'A' && c <= 'Z') return (char)(c + 32);
+    return c;
+}
+
+// Upper(s)/Lower(s) -- real new NUL-terminated strings (mmap-allocated),
+// plain ASCII case folding (matching this backend's own current
+// byte-oriented, non-Unicode-aware string representation throughout).
+const char* arco_host_upper(const char* s) {
+    arco_i64 len = arco_raw_strlen(s);
+    char* result = (char*)arco_raw_mmap((arco_u64)(len + 1));
+    arco_i64 i = 0;
+    while (i < len) {
+        result[i] = arco_raw_to_upper(s[i]);
+        i = i + 1;
+    }
+    result[len] = 0;
+    return result;
+}
+const char* arco_host_lower(const char* s) {
+    arco_i64 len = arco_raw_strlen(s);
+    char* result = (char*)arco_raw_mmap((arco_u64)(len + 1));
+    arco_i64 i = 0;
+    while (i < len) {
+        result[i] = arco_raw_to_lower(s[i]);
+        i = i + 1;
+    }
+    result[len] = 0;
+    return result;
+}
+
+// String.Delete(s, start, count) -- removes `count` bytes starting at
+// `start`, real bound-clamping the same way String.Slice already does.
+const char* arco_host_string_delete(const char* s, arco_i64 start, arco_i64 count) {
+    arco_i64 sLen = arco_raw_strlen(s);
+    arco_i64 clampedStart = start;
+    if (clampedStart < 0) clampedStart = 0;
+    if (clampedStart > sLen) clampedStart = sLen;
+    arco_i64 clampedCount = count;
+    if (clampedCount < 0) clampedCount = 0;
+    if (clampedStart + clampedCount > sLen) clampedCount = sLen - clampedStart;
+    arco_i64 resultLen = sLen - clampedCount;
+    char* result = (char*)arco_raw_mmap((arco_u64)(resultLen + 1));
+    arco_i64 i = 0;
+    while (i < clampedStart) { result[i] = s[i]; i = i + 1; }
+    arco_i64 j = clampedStart + clampedCount;
+    while (j < sLen) { result[i] = s[j]; i = i + 1; j = j + 1; }
+    result[resultLen] = 0;
+    return result;
+}
+
+// String.Insert(s, index, text) -- inserts `text` at byte offset
+// `index`, real bound-clamping the same way every other real function
+// here already does.
+const char* arco_host_string_insert(const char* s, arco_i64 index, const char* text) {
+    arco_i64 sLen = arco_raw_strlen(s);
+    arco_i64 tLen = arco_raw_strlen(text);
+    arco_i64 clampedIndex = index;
+    if (clampedIndex < 0) clampedIndex = 0;
+    if (clampedIndex > sLen) clampedIndex = sLen;
+    arco_i64 resultLen = sLen + tLen;
+    char* result = (char*)arco_raw_mmap((arco_u64)(resultLen + 1));
+    arco_i64 i = 0;
+    while (i < clampedIndex) { result[i] = s[i]; i = i + 1; }
+    arco_i64 k = 0;
+    while (k < tLen) { result[i] = text[k]; i = i + 1; k = k + 1; }
+    arco_i64 j = clampedIndex;
+    while (j < sLen) { result[i] = s[j]; i = i + 1; j = j + 1; }
+    result[resultLen] = 0;
+    return result;
+}
+
+// String.Replace(s, oldText, newText) -- ALL occurrences (confirmed via
+// a direct oracle probe: `String.Replace("aXbXcX", "X", "-")` ->
+// "a-b-c-", not just the first), real content matching (the same
+// technique arco_raw_find already proved correct for Contains/IndexOf).
+// A two-pass approach (measure the real result length first, then
+// build it) since this backend's own mmap allocator has no realloc --
+// the same "know the exact size before allocating once" discipline
+// Trim/Slice/Delete/Insert above already use.
+const char* arco_host_string_replace(const char* s, const char* oldText, const char* newText) {
+    arco_i64 sLen = arco_raw_strlen(s);
+    arco_i64 oldLen = arco_raw_strlen(oldText);
+    arco_i64 newLen = arco_raw_strlen(newText);
+    if (oldLen == 0) {
+        char* copy = (char*)arco_raw_mmap((arco_u64)(sLen + 1));
+        arco_i64 i = 0;
+        while (i < sLen) { copy[i] = s[i]; i = i + 1; }
+        copy[sLen] = 0;
+        return copy;
+    }
+    arco_i64 resultLen = 0;
+    arco_i64 i = 0;
+    while (i < sLen) {
+        if (i + oldLen <= sLen) {
+            arco_i64 j = 0;
+            while (j < oldLen && s[i + j] == oldText[j]) j = j + 1;
+            if (j == oldLen) { resultLen = resultLen + newLen; i = i + oldLen; continue; }
+        }
+        resultLen = resultLen + 1;
+        i = i + 1;
+    }
+    char* result = (char*)arco_raw_mmap((arco_u64)(resultLen + 1));
+    arco_i64 outPos = 0;
+    i = 0;
+    while (i < sLen) {
+        if (i + oldLen <= sLen) {
+            arco_i64 j = 0;
+            while (j < oldLen && s[i + j] == oldText[j]) j = j + 1;
+            if (j == oldLen) {
+                arco_i64 k = 0;
+                while (k < newLen) { result[outPos] = newText[k]; outPos = outPos + 1; k = k + 1; }
+                i = i + oldLen;
+                continue;
+            }
+        }
+        result[outPos] = s[i];
+        outPos = outPos + 1;
+        i = i + 1;
+    }
+    result[resultLen] = 0;
+    return result;
+}
+
+// Bit.And/Or/Xor/Not/ShiftLeft/ShiftRight, BITCOUNT, SETBIT, CLEARBIT,
+// TOGGLEBIT, BIT, ROTATELEFT, ROTATERIGHT, SHIFT -- plain 64-bit integer
+// bit manipulation, every real semantic confirmed against the oracle
+// directly first (`Bit.ShiftRight`/`SHIFT` are real ARITHMETIC
+// (sign-preserving) shifts, confirmed via `Bit.ShiftRight(-8, 1)` ->
+// `-4`, matching C's own signed right-shift on `arco_i64` exactly, no
+// special-casing needed; `ROTATELEFT`/`ROTATERIGHT` operate over the
+// FULL 64-bit width, confirmed via a real wraparound probe:
+// `ROTATELEFT(2^60, 4)` -> `1`).
+arco_i64 arco_host_bit_and(arco_i64 a, arco_i64 b) { return a & b; }
+arco_i64 arco_host_bit_or(arco_i64 a, arco_i64 b) { return a | b; }
+arco_i64 arco_host_bit_xor(arco_i64 a, arco_i64 b) { return a ^ b; }
+arco_i64 arco_host_bit_not(arco_i64 a) { return ~a; }
+arco_i64 arco_host_bit_shift_left(arco_i64 a, arco_i64 n) { return a << n; }
+arco_i64 arco_host_bit_shift_right(arco_i64 a, arco_i64 n) { return a >> n; }
+arco_i64 arco_host_bit_count(arco_i64 a) {
+    arco_u64 v = (arco_u64)a;
+    arco_i64 count = 0;
+    while (v != 0) { count = count + (arco_i64)(v & 1); v = v >> 1; }
+    return count;
+}
+arco_i64 arco_host_set_bit(arco_i64 value, arco_i64 index) { return value | (((arco_i64)1) << index); }
+arco_i64 arco_host_clear_bit(arco_i64 value, arco_i64 index) { return value & ~(((arco_i64)1) << index); }
+arco_i64 arco_host_toggle_bit(arco_i64 value, arco_i64 index) { return value ^ (((arco_i64)1) << index); }
+arco_i64 arco_host_test_bit(arco_i64 value, arco_i64 index) { return ((value >> index) & 1) != 0 ? 1 : 0; }
+arco_i64 arco_host_rotate_left(arco_i64 value, arco_i64 n) {
+    arco_u64 v = (arco_u64)value;
+    arco_u64 shift = (arco_u64)n & 63;
+    if (shift == 0) return (arco_i64)v;
+    return (arco_i64)((v << shift) | (v >> (64 - shift)));
+}
+arco_i64 arco_host_rotate_right(arco_i64 value, arco_i64 n) {
+    arco_u64 v = (arco_u64)value;
+    arco_u64 shift = (arco_u64)n & 63;
+    if (shift == 0) return (arco_i64)v;
+    return (arco_i64)((v >> shift) | (v << (64 - shift)));
+}
+arco_i64 arco_host_shift(arco_i64 value, arco_i64 n) {
+    if (n >= 0) return value << n;
+    return value >> (-n);
+}
+
+// BytesToHex(s) -- treats `s` as a raw byte sequence (real, matching the
+// oracle exactly: confirmed `BytesToHex("Hi")` -> `"4869"`, the ASCII
+// bytes 0x48/0x69 hex-encoded, lowercase confirmed too) and returns a
+// real new hex-digit string. `StringToHex`/`HexToString` are
+// deliberately NOT implemented here -- confirmed via a direct oracle
+// probe that BOTH genuinely crash the oracle itself (a raw `stoll` C++
+// exception / "value is not a number"), so there is no real, working
+// oracle behavior to port at all.
+static inline __attribute__((always_inline)) char arco_raw_hex_digit(int nibble) {
+    if (nibble < 10) return (char)('0' + nibble);
+    return (char)('a' + (nibble - 10));
+}
+const char* arco_host_bytes_to_hex(const char* s) {
+    arco_i64 len = arco_raw_strlen(s);
+    char* result = (char*)arco_raw_mmap((arco_u64)(len * 2 + 1));
+    arco_i64 i = 0;
+    while (i < len) {
+        unsigned char b = (unsigned char)s[i];
+        result[i * 2] = arco_raw_hex_digit(b >> 4);
+        result[i * 2 + 1] = arco_raw_hex_digit(b & 15);
+        i = i + 1;
+    }
+    result[len * 2] = 0;
+    return result;
+}
+
+// Path.BaseName/DirName/Extension -- pure byte-oriented path string
+// manipulation (no real filesystem syscall needed at all), every real
+// edge case confirmed against the oracle directly: a trailing slash
+// (`Path.BaseName("/a/b/")`) real empties to "" (matching a real
+// last-path-COMPONENT semantic, not "strip the last slash then take
+// what's left"); no slash at all keeps the whole string as the base
+// name; no `.` at all is a real empty extension, not the whole name.
+const char* arco_host_path_basename(const char* s) {
+    arco_i64 len = arco_raw_strlen(s);
+    arco_i64 lastSlash = -1;
+    arco_i64 i = 0;
+    while (i < len) {
+        if (s[i] == '/') lastSlash = i;
+        i = i + 1;
+    }
+    arco_i64 start = lastSlash + 1;
+    arco_i64 resultLen = len - start;
+    char* result = (char*)arco_raw_mmap((arco_u64)(resultLen + 1));
+    arco_i64 j = 0;
+    while (j < resultLen) { result[j] = s[start + j]; j = j + 1; }
+    result[resultLen] = 0;
+    return result;
+}
+const char* arco_host_path_dirname(const char* s) {
+    arco_i64 len = arco_raw_strlen(s);
+    arco_i64 lastSlash = -1;
+    arco_i64 i = 0;
+    while (i < len) {
+        if (s[i] == '/') lastSlash = i;
+        i = i + 1;
+    }
+    arco_i64 resultLen = lastSlash < 0 ? 0 : lastSlash;
+    char* result = (char*)arco_raw_mmap((arco_u64)(resultLen + 1));
+    arco_i64 j = 0;
+    while (j < resultLen) { result[j] = s[j]; j = j + 1; }
+    result[resultLen] = 0;
+    return result;
+}
+const char* arco_host_path_extension(const char* s) {
+    arco_i64 len = arco_raw_strlen(s);
+    arco_i64 lastDot = -1;
+    arco_i64 lastSlash = -1;
+    arco_i64 i = 0;
+    while (i < len) {
+        if (s[i] == '.') lastDot = i;
+        if (s[i] == '/') lastSlash = i;
+        i = i + 1;
+    }
+    if (lastDot < 0 || lastDot < lastSlash) {
+        char* empty = (char*)arco_raw_mmap(1);
+        empty[0] = 0;
+        return empty;
+    }
+    arco_i64 resultLen = len - lastDot;
+    char* result = (char*)arco_raw_mmap((arco_u64)(resultLen + 1));
+    arco_i64 j = 0;
+    while (j < resultLen) { result[j] = s[lastDot + j]; j = j + 1; }
+    result[resultLen] = 0;
+    return result;
+}

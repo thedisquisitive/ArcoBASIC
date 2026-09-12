@@ -2294,15 +2294,110 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   new fixture added to its watched-files list. Self-parse/self-semantic
   corpus grew 95 -> 96 files, 147 -> 150 import edges, 3655 -> 3789
   symbols; golden values updated. Verified with `fissure run`.
-  Real, disclosed remaining scope: only 7 of the real ~244-entry host-
-  function table are covered (String.* specifically) -- extending this is
-  now genuinely straightforward, mechanical follow-on work (add a real C
-  implementation confirmed against the oracle first, add one entry to
-  `Fission_X86_64HostFunctionTable`, nothing else in this file changes);
-  Array.*/File.*/other namespaces are real, disclosed, unstarted; a real
-  ELF relocation involving a SECTION symbol (needed for a host function
-  with static data or genuine cross-function calls) remains unimplemented,
-  to be added once an actual function needs it.
+- **Host-function bridge, second batch (25 more functions) + a real
+  case-sensitivity bugfix + `String(x)`/`TYPEOF(x)`** -- the user's own
+  "do the 244 things" instruction, worked through as far as the current
+  architecture soundly supports in one pass. All real semantics confirmed
+  against the oracle directly first (a batch-probe script, not guessed
+  at) -- two functions (`StringToHex`/`HexToString`) were found to
+  genuinely CRASH the oracle itself (`stoll`/"value is not a number") and
+  were dropped before writing any code for them, the same discipline
+  `Fission_X86_64ArrayPrintSubroutine`'s own "not even a real oracle
+  feature" findings already established.
+  New in `fission/native_runtime/host_bridge.c` (unit-tested directly
+  with a plain non-freestanding C harness linked against the real
+  freestanding `.o` before ever touching the compiler, catching every
+  real semantic -- e.g. `Bit.ShiftRight`/`SHIFT` are real ARITHMETIC,
+  sign-preserving shifts, confirmed via `Bit.ShiftRight(-8, 1) == -4`,
+  not logical -- against the oracle's own probed values first): `Upper`/
+  `Lower`, `String.Delete`/`Insert`/`Replace` (Replace is confirmed
+  ALL-occurrences, not just the first), `NUMBER` (string-to-integer
+  parsing), the whole `Bit.*`/`BITCOUNT`/`SETBIT`/`CLEARBIT`/
+  `TOGGLEBIT`/`BIT`/`ROTATELEFT`/`ROTATERIGHT`/`SHIFT` bitwise family
+  (real 64-bit-width rotation, confirmed via a real wraparound probe),
+  `BytesToHex`, and `Path.BaseName`/`DirName`/`Extension` (pure
+  byte-oriented string manipulation, no syscalls needed) -- 25 new
+  functions, all added to `Fission_X86_64HostFunctionTable`.
+  A real, pre-existing BUG found and fixed while extending the table:
+  host/builtin function dispatch is CASE-INSENSITIVE on the oracle
+  (confirmed directly: `len(a)`/`string.length(s)`, both lowercase, are
+  real, legal, working ArcoBASIC) -- but native codegen's own `LEN`
+  detection and the host-function-table lookup both compared the raw
+  AMIR callee text with no case normalization at all, silently rejecting
+  a real, common, valid program. Fixed centrally: every host-table key is
+  now `Upper()`-normalized, and every lookup site (including `isLenCall`)
+  uppercases `callee` before comparing.
+  Real `String(x)` -- this whole language's own most commonly used
+  Number/Bool-to-String conversion, confirmed to be a genuine, real gap
+  (`s = String(42)` failed to compile via native codegen at all before
+  this, despite being used constantly in real ArcoBASIC code, including
+  throughout this very session's own diagnostic probes) -- and `TYPEOF(x)`
+  are deliberately NOT in the uniform host-function table: both need a
+  DIFFERENT real native implementation PER ARGUMENT KIND (a native value
+  has no runtime type tag at all -- the same 8-byte slot means Number,
+  String, or Bool purely by this pass's own compile-time tracking), so
+  real compile-time dispatch happens directly in
+  `Fission_X86_64LowerFunction` instead of one shared symbol. `String(x)`:
+  a String argument is real IDENTITY (immutable representation, same
+  pointer); a Bool argument needs real runtime branching (its own
+  TRUE/FALSE value isn't known at compile time) to one of two real, fixed,
+  genuinely NUL-terminated rodata strings (`bool_true_str`/
+  `bool_false_str` -- distinct from `Fission_X86_64BoolPrintSubroutine`'s
+  own `bool_true_text`/`bool_false_text`, which carry a trailing newline
+  and no NUL terminator, built only for direct syscall printing); a
+  Number argument calls a new host function (`arco_host_number_to_string`,
+  a real itoa matching `Fission_X86_64ItoaWriteSubroutine`'s own algorithm
+  exactly, just returning a real mmap-allocated string instead of writing
+  via syscall -- this backend's own Number representation is
+  integer-only throughout, so this is complete coverage for every Number
+  value this backend can actually produce, not a simplification of a
+  "real" float-capable oracle feature this backend lacks -- float support
+  is a real, disclosed, SEPARATE, pre-existing gap of the whole native
+  backend). `TYPEOF(x)`: the result is compile-time-KNOWN once `x`'s own
+  kind is known (no runtime branching needed at all, unlike `String(bool)`
+  -- TYPEOF never needs the VALUE, only its static kind), so this just
+  emits a real, fixed rodata string literal directly, the exact same
+  mechanism a genuine source string literal already uses.
+  Verified via real execution against the oracle: all 25 new functions,
+  `String(x)`'s all three real sub-cases plus its Array-kind diagnostic,
+  `TYPEOF(x)` for all three supported kinds plus its Array-kind
+  diagnostic, and the case-insensitivity fix (`len`/`string.length`
+  lowercase) -- one single combined probe, byte-for-byte matching the
+  oracle on the very first full attempt. All 22 existing native fixtures
+  re-verified unaffected. Extended `fission/tests/amir_x86_64_smoke.abas`
+  with real structural checks for every new case. New permanent fixture
+  `fission/tests/native_programs/host_bridge_batch2.abas`; wired into
+  `fission/fissure.ab`'s watched-files list. Self-parse/self-semantic
+  corpus symbol count grew 3789 -> 3823; golden value updated. Verified
+  with `fissure run`.
+  Real, disclosed remaining scope: 32 of the real ~246-entry host-
+  function table are now covered (String.\*/Bit.\*/Path.\*/a handful of
+  bare utility functions, plus the two real native special cases). Real,
+  disclosed, genuinely DIFFERENT-SCOPE categories, each requiring more
+  than "add a C function, add a table entry" before attempting: `Array.*`
+  MUTATING functions (`Push`/`Pop`/`Add`/`Insert`/`Remove`/`Resize`/...) --
+  confirmed via a direct oracle probe that the oracle's own arrays have
+  REAL REFERENCE semantics (`b = a; Array.Push(a, 4)` mutates `b` too,
+  the SAME underlying object growing in place) that this backend's own
+  CURRENT array representation (a fixed-size allocation, no capacity,
+  no realloc) cannot represent correctly -- a real array-representation
+  overhaul (a real growable-vector-style double indirection) is needed
+  FIRST, not attempted here since doing it wrong would be a genuine
+  correctness regression, not a disclosed simplification; `Object.*`
+  (Get/Has/Keys/Set) needs an entirely new native runtime representation
+  for ArcoBASIC's own dynamic property-bag Object type, which this
+  backend does not represent as a first-class value at all yet (only
+  fixed-offset CLASS instances); `GUI.*`/`GRAPHICS.*`/`Network.*`/`Web.*`/
+  `Document.*`/`Process.*`/`System.*`/`ArcoSH.*`/`RESOURCE.*`/`Project.*`
+  need either real dynamic linking against actual GUI/network libraries
+  or complex, stateful subsystems fundamentally out of this native
+  backend's own current freestanding, self-contained scope; `Random.*`/
+  `Date`/`Time.*` need real state management (an RNG's own seed state, a
+  real clock syscall) -- feasible via the same freestanding approach, just
+  deprioritized behind the above; File I/O (`File.*`/`Directory.*`) is
+  feasible NOW without any representation overhaul (a read of known size
+  or a write of an already-allocated array needs no array growth at all)
+  and is the clear next concrete candidate.
 
 ## In-Progress Components
 

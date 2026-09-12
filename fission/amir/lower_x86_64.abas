@@ -311,15 +311,55 @@ END FUNCTION
 ' File.*, ...) is real, disclosed, straightforward follow-on work once a
 ' concrete function is actually needed -- add the C implementation, add
 ' one entry here, nothing else in this file changes.
+' Real, disclosed FIX found while extending this table to a much larger
+' real batch of host functions: `callee` names are matched CASE-
+' INSENSITIVELY by the oracle's own real host-function dispatch
+' (confirmed via a direct probe: `string.length("hi")`, all lowercase,
+' genuinely works and prints 2) -- and this affects `LEN` too, a real,
+' pre-existing bug found the same way (`len(a)`, lowercase, is real,
+' legal, working ArcoBASIC on the oracle, confirmed directly, but native
+' codegen's own `isLenCall` check used to compare the raw AMIR callee
+' text against the literal string "LEN" with no case normalization at
+' all, silently failing to recognize a real, common, perfectly valid
+' program). Every table key here is `Upper()`-normalized, and every
+' lookup site (this table's own two consumers in
+' Fission_X86_64CollectSlots/Fission_X86_64LowerFunction, PLUS
+' `isLenCall` itself, fixed alongside this) uppercases `callee` before
+' comparing -- one real, central fix rather than patching each call site
+' with its own ad hoc casing assumption.
 FUNCTION Fission_X86_64HostFunctionTable()
     table = {}
-    table = Object.Set(table, "String.Length", {Symbol: "arco_host_string_length", ReturnKind: "Number", ParamKinds: ["String"]})
-    table = Object.Set(table, "String.Contains", {Symbol: "arco_host_string_contains", ReturnKind: "Bool", ParamKinds: ["String", "String"]})
-    table = Object.Set(table, "String.IndexOf", {Symbol: "arco_host_string_index_of", ReturnKind: "Number", ParamKinds: ["String", "String"]})
-    table = Object.Set(table, "String.StartsWith", {Symbol: "arco_host_string_starts_with", ReturnKind: "Bool", ParamKinds: ["String", "String"]})
-    table = Object.Set(table, "String.EndsWith", {Symbol: "arco_host_string_ends_with", ReturnKind: "Bool", ParamKinds: ["String", "String"]})
-    table = Object.Set(table, "String.Trim", {Symbol: "arco_host_string_trim", ReturnKind: "String", ParamKinds: ["String"]})
-    table = Object.Set(table, "String.Slice", {Symbol: "arco_host_string_slice", ReturnKind: "String", ParamKinds: ["String", "Number", "Number"]})
+    table = Object.Set(table, "STRING.LENGTH", {Symbol: "arco_host_string_length", ReturnKind: "Number", ParamKinds: ["String"]})
+    table = Object.Set(table, "STRING.CONTAINS", {Symbol: "arco_host_string_contains", ReturnKind: "Bool", ParamKinds: ["String", "String"]})
+    table = Object.Set(table, "STRING.INDEXOF", {Symbol: "arco_host_string_index_of", ReturnKind: "Number", ParamKinds: ["String", "String"]})
+    table = Object.Set(table, "STRING.STARTSWITH", {Symbol: "arco_host_string_starts_with", ReturnKind: "Bool", ParamKinds: ["String", "String"]})
+    table = Object.Set(table, "STRING.ENDSWITH", {Symbol: "arco_host_string_ends_with", ReturnKind: "Bool", ParamKinds: ["String", "String"]})
+    table = Object.Set(table, "STRING.TRIM", {Symbol: "arco_host_string_trim", ReturnKind: "String", ParamKinds: ["String"]})
+    table = Object.Set(table, "STRING.SLICE", {Symbol: "arco_host_string_slice", ReturnKind: "String", ParamKinds: ["String", "Number", "Number"]})
+    table = Object.Set(table, "STRING.DELETE", {Symbol: "arco_host_string_delete", ReturnKind: "String", ParamKinds: ["String", "Number", "Number"]})
+    table = Object.Set(table, "STRING.INSERT", {Symbol: "arco_host_string_insert", ReturnKind: "String", ParamKinds: ["String", "Number", "String"]})
+    table = Object.Set(table, "STRING.REPLACE", {Symbol: "arco_host_string_replace", ReturnKind: "String", ParamKinds: ["String", "String", "String"]})
+    table = Object.Set(table, "UPPER", {Symbol: "arco_host_upper", ReturnKind: "String", ParamKinds: ["String"]})
+    table = Object.Set(table, "LOWER", {Symbol: "arco_host_lower", ReturnKind: "String", ParamKinds: ["String"]})
+    table = Object.Set(table, "NUMBER", {Symbol: "arco_host_string_to_number", ReturnKind: "Number", ParamKinds: ["String"]})
+    table = Object.Set(table, "BIT.AND", {Symbol: "arco_host_bit_and", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "BIT.OR", {Symbol: "arco_host_bit_or", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "BIT.XOR", {Symbol: "arco_host_bit_xor", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "BIT.NOT", {Symbol: "arco_host_bit_not", ReturnKind: "Number", ParamKinds: ["Number"]})
+    table = Object.Set(table, "BIT.SHIFTLEFT", {Symbol: "arco_host_bit_shift_left", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "BIT.SHIFTRIGHT", {Symbol: "arco_host_bit_shift_right", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "BITCOUNT", {Symbol: "arco_host_bit_count", ReturnKind: "Number", ParamKinds: ["Number"]})
+    table = Object.Set(table, "SETBIT", {Symbol: "arco_host_set_bit", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "CLEARBIT", {Symbol: "arco_host_clear_bit", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "TOGGLEBIT", {Symbol: "arco_host_toggle_bit", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "BIT", {Symbol: "arco_host_test_bit", ReturnKind: "Bool", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "ROTATELEFT", {Symbol: "arco_host_rotate_left", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "ROTATERIGHT", {Symbol: "arco_host_rotate_right", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "SHIFT", {Symbol: "arco_host_shift", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "BYTESTOHEX", {Symbol: "arco_host_bytes_to_hex", ReturnKind: "String", ParamKinds: ["String"]})
+    table = Object.Set(table, "PATH.BASENAME", {Symbol: "arco_host_path_basename", ReturnKind: "String", ParamKinds: ["String"]})
+    table = Object.Set(table, "PATH.DIRNAME", {Symbol: "arco_host_path_dirname", ReturnKind: "String", ParamKinds: ["String"]})
+    table = Object.Set(table, "PATH.EXTENSION", {Symbol: "arco_host_path_extension", ReturnKind: "String", ParamKinds: ["String"]})
     RETURN table
 END FUNCTION
 
@@ -873,7 +913,15 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 ' Just Works through the exact same kind-tracking every
                 ' other consumption site already trusts.
                 destKind = "Number"
-                hostEntry = Object.Get(Fission_X86_64HostFunctionTable(), callee, NULL)
+                ' `String(x)`/`TYPEOF(x)` (see Fission_X86_64LowerFunction's
+                ' own emission-time handling for the full "why these can't
+                ' go through the uniform host-function table" reasoning --
+                ' their own real native IMPLEMENTATION depends on `x`'s
+                ' OWN kind, known only at compile time here, not a single
+                ' fixed ABI signature) always produce a real String result,
+                ' regardless of the argument's own kind.
+                IF Upper(callee) == "STRING" ORELSE Upper(callee) == "TYPEOF" THEN destKind = "String"
+                hostEntry = Object.Get(Fission_X86_64HostFunctionTable(), Upper(callee), NULL)
                 IF hostEntry != NULL THEN
                     destKind = hostEntry.ReturnKind
                 ELSE
@@ -2741,7 +2789,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 context.UsesItoa = TRUE
                 CONTINUE FOR
             END IF
-            isLenCall = kind == "Call" ANDALSO instruction.Field("Callee") == "LEN"
+            isLenCall = kind == "Call" ANDALSO Upper(instruction.Field("Callee")) == "LEN"
             IF isLenCall THEN
                 ' `LEN(arr)` is an ordinary CALL to a builtin name, not a
                 ' user-declared function (confirmed via the oracle: `CALL
@@ -2767,6 +2815,98 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 isVoidCall = kind == "CallVoid"
                 destOperand = ""
                 IF isVoidCall == FALSE THEN destOperand = instruction.Field("Dest")
+                ' `String(x)`/`TYPEOF(x)` -- deliberately NOT in the
+                ' uniform host-function table above: unlike every other
+                ' host function (one fixed native ABI signature, the
+                ' EXACT same real C implementation regardless of caller),
+                ' these two need a DIFFERENT real native implementation
+                ' PER ARGUMENT KIND (a native "String"/"Number"/"Bool"
+                ' value has no runtime type tag at all -- the SAME 8-byte
+                ' slot means something different depending purely on this
+                ' pass's own compile-time kind tracking), so the real
+                ' dispatch happens HERE, at compile time, picking a
+                ' different concrete implementation per call site instead
+                ' of one shared symbol.
+                IF Upper(callee) == "STRING" THEN
+                    IF LEN(args) != 1 ORELSE Fission_X86_64OperandIsResolvable(offsets, args[0]) == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "String(...) is only supported with exactly one argument by native x86-64 codegen: " + instruction.Field("Args"))
+                        CONTINUE FOR
+                    END IF
+                    stringConvArgKind = Fission_X86_64OperandKind(kinds, args[0])
+                    ' A String argument is real IDENTITY -- strings are
+                    ' immutable in this representation, so returning the
+                    ' SAME pointer is exactly what a real "convert to
+                    ' string" of an already-String value means.
+                    IF stringConvArgKind == "String" THEN
+                        ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[0], "rax"))
+                        IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+                        CONTINUE FOR
+                    END IF
+                    ' A Bool argument needs real runtime branching (its
+                    ' own TRUE/FALSE value is not known at compile time)
+                    ' -- picking between two FIXED, real rodata strings,
+                    ' no allocation needed at all (unlike
+                    ' Fission_X86_64BoolPrintSubroutine's own `.ascii`
+                    ' labels, which carry a trailing newline and no NUL
+                    ' terminator for direct syscall printing -- these are
+                    ' real, separate, genuinely NUL-terminated `.asciz`
+                    ' strings a native String value can actually be).
+                    IF stringConvArgKind == "Bool" THEN
+                        context.DispatchCount = context.DispatchCount + 1
+                        dispatchId = String(context.DispatchCount)
+                        ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[0], "rax"))
+                        ignored = Array.Push(textLines, "    test %rax, %rax")
+                        ignored = Array.Push(textLines, "    jz .Lboolstr_false_" + dispatchId)
+                        ignored = Array.Push(textLines, "    lea bool_true_str(%rip), %rax")
+                        ignored = Array.Push(textLines, "    jmp .Lboolstr_done_" + dispatchId)
+                        ignored = Array.Push(textLines, ".Lboolstr_false_" + dispatchId + ":")
+                        ignored = Array.Push(textLines, "    lea bool_false_str(%rip), %rax")
+                        ignored = Array.Push(textLines, ".Lboolstr_done_" + dispatchId + ":")
+                        IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+                        context.UsesBoolToString = TRUE
+                        CONTINUE FOR
+                    END IF
+                    IF Fission_X86_64NormalizeNumericKind(stringConvArgKind) == "Number" THEN
+                        ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_number_to_string", args, destOperand, isVoidCall)
+                        context.UsesHostBridge = TRUE
+                        CONTINUE FOR
+                    END IF
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen does not support String(...) on this kind of value: " + args[0])
+                    CONTINUE FOR
+                END IF
+                ' `TYPEOF(x)` -- the result is a compile-time-KNOWN
+                ' constant once `x`'s own kind is known (no runtime
+                ' branching needed at all, unlike String(bool) above,
+                ' since TYPEOF never needs the VALUE itself, only its
+                ' static kind), so this just emits a real, fixed rodata
+                ' string literal directly -- the exact same mechanism a
+                ' genuine `"Number"`/`"String"` source literal already
+                ' uses (Fission_X86_64LowerFunction's own Const handling).
+                IF Upper(callee) == "TYPEOF" THEN
+                    IF LEN(args) != 1 ORELSE Fission_X86_64OperandIsResolvable(offsets, args[0]) == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "TYPEOF(...) is only supported with exactly one argument by native x86-64 codegen: " + instruction.Field("Args"))
+                        CONTINUE FOR
+                    END IF
+                    typeofArgKind = Fission_X86_64OperandKind(kinds, args[0])
+                    typeName = ""
+                    IF typeofArgKind == "Bool" THEN
+                        typeName = "Boolean"
+                    ELSE
+                        IF typeofArgKind == "String" THEN typeName = "String"
+                        IF typeofArgKind == "Number" THEN typeName = "Number"
+                    END IF
+                    IF typeName == "" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen does not support TYPEOF(...) on this kind of value: " + args[0])
+                        CONTINUE FOR
+                    END IF
+                    typeofLabel = "str" + String(context.StringCount)
+                    context.StringCount = context.StringCount + 1
+                    ignored = Array.Push(context.RodataLines, typeofLabel + ":")
+                    ignored = Array.Push(context.RodataLines, "    .asciz \"" + typeName + "\"")
+                    ignored = Array.Push(textLines, "    lea " + typeofLabel + "(%rip), %rax")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
                 ' The real host-function bridge (see Fission_X86_64
                 ' HostFunctionTable's own comment for the full design) --
                 ' checked by `callee`'s own EXACT dotted name (e.g.
@@ -2774,7 +2914,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 ' resolution below ever runs, since "String" is never a
                 ' real tracked variable and would otherwise just fall
                 ' through to "not a user-declared function".
-                hostEntry = Object.Get(Fission_X86_64HostFunctionTable(), callee, NULL)
+                hostEntry = Object.Get(Fission_X86_64HostFunctionTable(), Upper(callee), NULL)
                 IF hostEntry != NULL THEN
                     IF LEN(args) != LEN(hostEntry.ParamKinds) THEN
                         ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected " + String(LEN(hostEntry.ParamKinds)) + ")")
@@ -2978,7 +3118,7 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
-    context = {RodataLines: [], StringCount: 0, DispatchCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesArrayPrintString: FALSE, UsesBoolPrint: FALSE, UsesObjectAlloc: FALSE, UsesHostBridge: FALSE}
+    context = {RodataLines: [], StringCount: 0, DispatchCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesArrayPrintString: FALSE, UsesBoolPrint: FALSE, UsesObjectAlloc: FALSE, UsesHostBridge: FALSE, UsesBoolToString: FALSE}
     ' Real inter-procedural string-parameter/return-value inference, run
     ' to a full fixed point BEFORE any real emission -- see
     ' Fission_X86_64InferSignatures' own header comment. Every function's
@@ -3093,6 +3233,16 @@ FUNCTION Fission_AmirToX86_64(amirModule)
         ignored = Array.Push(rodataLines, "    .ascii \"TRUE\\n\"")
         ignored = Array.Push(rodataLines, "bool_false_text:")
         ignored = Array.Push(rodataLines, "    .ascii \"FALSE\\n\"")
+    END IF
+    ' `String(TRUE/FALSE)` needs real, genuinely NUL-terminated strings a
+    ' native String value can actually BE (unlike bool_true_text/
+    ' bool_false_text just above, which carry a trailing newline and no
+    ' NUL terminator, built only for direct syscall printing).
+    IF context.UsesBoolToString THEN
+        ignored = Array.Push(rodataLines, "bool_true_str:")
+        ignored = Array.Push(rodataLines, "    .asciz \"TRUE\"")
+        ignored = Array.Push(rodataLines, "bool_false_str:")
+        ignored = Array.Push(rodataLines, "    .asciz \"FALSE\"")
     END IF
 
     lines = ["    .section .rodata"]

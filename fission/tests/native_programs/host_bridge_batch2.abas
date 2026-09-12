@@ -1,0 +1,60 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises the SECOND real batch
+' of host-function-bridge coverage (fission/native_runtime/host_bridge.c),
+' plus two real NATIVE special cases that could not go through the
+' uniform host-function table at all: `String(x)` -- a genuine gap found
+' only by trying to use it, this whole language's own most common
+' Number/Bool-to-String conversion, needing real compile-time dispatch by
+' `x`'s own kind (String identity, Bool real runtime branching to a fixed
+' rodata string, Number a real host-bridge itoa) -- and `TYPEOF(x)`, a
+' real compile-time-constant result. Also exercises a real, genuine
+' PRE-EXISTING BUG this batch found and fixed: host/builtin function
+' dispatch is case-INSENSITIVE on the oracle (`len(a)`/`string.length(s)`
+' lowercase both really work), which native codegen's own `LEN`
+' detection did not account for at all before this.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+n = 42
+PRINT String(n) + "!"
+PRINT String(3)
+PRINT String(TRUE)
+PRINT String(FALSE)
+PRINT TYPEOF(5)
+PRINT TYPEOF("s")
+PRINT TYPEOF(TRUE)
+PRINT Upper("Hello")
+PRINT Lower("Hello")
+PRINT String.Delete("Hello World", 5, 6)
+PRINT String.Insert("Hello World", 5, "!!!")
+PRINT String.Replace("Hello World", "World", "There")
+PRINT String.Replace("aXbXcX", "X", "-")
+PRINT NUMBER("42")
+PRINT NUMBER("-17")
+PRINT Bit.And(6, 3)
+PRINT Bit.Or(6, 3)
+PRINT Bit.Xor(6, 3)
+PRINT Bit.Not(6)
+PRINT Bit.ShiftLeft(1, 4)
+PRINT Bit.ShiftRight(16, 4)
+PRINT Bit.ShiftRight(-8, 1)
+PRINT BITCOUNT(7)
+PRINT SETBIT(0, 3)
+PRINT CLEARBIT(15, 1)
+PRINT TOGGLEBIT(8, 3)
+PRINT BIT(5, 2)
+PRINT ROTATELEFT(1, 4)
+PRINT ROTATERIGHT(16, 4)
+PRINT SHIFT(1, 4)
+PRINT SHIFT(16, -4)
+PRINT BytesToHex("Hi")
+PRINT Path.BaseName("/a/b/c.txt")
+PRINT Path.DirName("/a/b/c.txt")
+PRINT Path.Extension("/a/b/c.txt")
+
+' The real case-insensitivity fix, exercised directly.
+a = [1, 2, 3]
+PRINT len(a)
+PRINT string.length("hi")

@@ -724,3 +724,72 @@ HostCallBadKindSir = Fission_ArcoBasicAstToSir(HostCallBadKindAst)
 HostCallBadKindAmir = Fission_SirToAmir(HostCallBadKindSir)
 HostCallBadKindProgram = Fission_AmirToX86_64(HostCallBadKindAmir)
 PRINT HostCallBadKindProgram.Diagnostics.HasErrors()
+
+' Real, case-INSENSITIVE host/builtin function dispatch -- USED TO be a
+' real, pre-existing bug (found while extending the host bridge to a
+' second batch of functions): `len(a)`/`string.length(s)`, lowercase,
+' are real, legal, working ArcoBASIC on the oracle (confirmed via a
+' direct probe), but native codegen's own `LEN`/host-table lookups
+' compared the raw AMIR callee text with no case normalization at all,
+' silently rejecting a real, common, valid program. Checked here
+' structurally for both a lowercase LEN and a lowercase host-function
+' call.
+LowerLenSource = "a = [1, 2, 3]\nPRINT len(a)"
+LowerLenTokens = Fission_ArcoBasicLex(LowerLenSource)
+LowerLenAst = Fission_ArcoBasicParse(LowerLenTokens, "x86-64-lower-len-smoke.abas")
+LowerLenSir = Fission_ArcoBasicAstToSir(LowerLenAst)
+LowerLenAmir = Fission_SirToAmir(LowerLenSir)
+LowerLenProgram = Fission_AmirToX86_64(LowerLenAmir)
+PRINT LowerLenProgram.Diagnostics.HasErrors()
+
+LowerHostCallSource = "PRINT string.length(\"hi\")"
+LowerHostCallTokens = Fission_ArcoBasicLex(LowerHostCallSource)
+LowerHostCallAst = Fission_ArcoBasicParse(LowerHostCallTokens, "x86-64-lower-host-call-smoke.abas")
+LowerHostCallSir = Fission_ArcoBasicAstToSir(LowerHostCallAst)
+LowerHostCallAmir = Fission_SirToAmir(LowerHostCallSir)
+LowerHostCallProgram = Fission_AmirToX86_64(LowerHostCallAmir)
+PRINT LowerHostCallProgram.Diagnostics.HasErrors()
+
+' Real `String(x)` -- deliberately NOT in the uniform host-function
+' table (see Fission_X86_64LowerFunction's own comment): a real,
+' compile-time dispatch by `x`'s own kind, previously a genuine gap
+' (`s = String(42)` failed to compile at all before this). Checked here
+' for all three real sub-cases (Number via a real host-bridge itoa,
+' String identity, Bool real runtime branching to a fixed rodata string)
+' plus the real diagnostic for an unsupported kind (Array). Real
+' execution verified separately by fission/tests/native_programs/
+' host_bridge_batch2.abas.
+StringConvNumberSource = "n = 42\nPRINT String(n)"
+StringConvNumberAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(StringConvNumberSource), "x86-64-string-conv-number-smoke.abas")))
+StringConvNumberProgram = Fission_AmirToX86_64(StringConvNumberAmir)
+PRINT StringConvNumberProgram.Diagnostics.HasErrors()
+PRINT String.Contains(StringConvNumberProgram.Render(), "call arco_host_number_to_string")
+
+StringConvStringSource = "s = \"hi\"\nPRINT String(s)"
+StringConvStringAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(StringConvStringSource), "x86-64-string-conv-string-smoke.abas")))
+StringConvStringProgram = Fission_AmirToX86_64(StringConvStringAmir)
+PRINT StringConvStringProgram.Diagnostics.HasErrors()
+
+StringConvBoolSource = "b = 1 == 1\nPRINT String(b)"
+StringConvBoolAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(StringConvBoolSource), "x86-64-string-conv-bool-smoke.abas")))
+StringConvBoolProgram = Fission_AmirToX86_64(StringConvBoolAmir)
+PRINT StringConvBoolProgram.Diagnostics.HasErrors()
+PRINT String.Contains(StringConvBoolProgram.Render(), "bool_true_str")
+
+StringConvArraySource = "a = [1, 2]\nPRINT String(a)"
+StringConvArrayAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(StringConvArraySource), "x86-64-string-conv-array-smoke.abas")))
+StringConvArrayProgram = Fission_AmirToX86_64(StringConvArrayAmir)
+PRINT StringConvArrayProgram.Diagnostics.HasErrors()
+
+' Real `TYPEOF(x)` -- a compile-time-constant result once `x`'s own kind
+' is known, checked here for all three supported kinds plus the real
+' diagnostic for an unsupported one (Array).
+TypeofNumberSource = "PRINT TYPEOF(5)"
+TypeofNumberAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(TypeofNumberSource), "x86-64-typeof-number-smoke.abas")))
+TypeofNumberProgram = Fission_AmirToX86_64(TypeofNumberAmir)
+PRINT TypeofNumberProgram.Diagnostics.HasErrors()
+
+TypeofArraySource = "a = [1, 2]\nPRINT TYPEOF(a)"
+TypeofArrayAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(TypeofArraySource), "x86-64-typeof-array-smoke.abas")))
+TypeofArrayProgram = Fission_AmirToX86_64(TypeofArrayAmir)
+PRINT TypeofArrayProgram.Diagnostics.HasErrors()
