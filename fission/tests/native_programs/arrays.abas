@@ -7,6 +7,11 @@
 ' accumulating over an array inside a WHILE loop, passing an indexed
 ' element as a function argument, and a larger (10-element) array.
 '
+' Also exercises PRINT of a BARE array (`PRINT arr` rendering `[1, 2, 3]`,
+' including the `[]` empty-array and negative-number cases) -- a real
+' oracle feature landed right after this file's own initial construction/
+' indexing/LEN coverage.
+'
 ' Expected output verified against legacy `ArcoFission compile-run` on this
 ' identical source as the equivalence-testing oracle.
 a = [10, 20, 30]
@@ -40,3 +45,10 @@ PRINT big[9]
 PRINT big[0]
 j = 5
 PRINT big[j]
+
+PRINT a
+PRINT squares
+empty = []
+PRINT empty
+negatives = [-5, 0, 100]
+PRINT negatives

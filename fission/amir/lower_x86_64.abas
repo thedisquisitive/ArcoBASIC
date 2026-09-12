@@ -738,6 +738,104 @@ FUNCTION Fission_X86_64ArrayAllocSubroutine()
     RETURN lines
 END FUNCTION
 
+' Same internal-only call/ret convention as itoa_print, but writes the
+' decimal digits with NO trailing newline -- itoa_print's own buffer always
+' has a newline baked in right after the digits (see that subroutine's own
+' comment/layout), which array_print (below) cannot reuse: a comma-space
+' or closing bracket must come right after each number's own digits
+' instead. Otherwise identical digit-conversion logic (signed 64-bit,
+' repeated unsigned division by 10).
+FUNCTION Fission_X86_64ItoaWriteSubroutine()
+    lines = [
+        "itoa_write:",
+        "    sub $32, %rsp",
+        "    mov $1, %r8",
+        "    test %rax, %rax",
+        "    jns .Litoaw_positive",
+        "    neg %rax",
+        "    mov $0, %r8",
+        ".Litoaw_positive:",
+        "    lea 32(%rsp), %rsi",
+        "    mov $10, %rcx",
+        ".Litoaw_digit_loop:",
+        "    xor %rdx, %rdx",
+        "    div %rcx",
+        "    add $48, %rdx",
+        "    dec %rsi",
+        "    mov %dl, (%rsi)",
+        "    test %rax, %rax",
+        "    jnz .Litoaw_digit_loop",
+        "    test %r8, %r8",
+        "    jnz .Litoaw_skip_sign",
+        "    dec %rsi",
+        "    movb $45, (%rsi)",
+        ".Litoaw_skip_sign:",
+        "    lea 32(%rsp), %rdx",
+        "    sub %rsi, %rdx",
+        "    mov %rsi, %r9",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    mov %r9, %rsi",
+        "    syscall",
+        "    add $32, %rsp",
+        "    ret"
+    ]
+    RETURN lines
+END FUNCTION
+
+' `PRINT arr` on a real numeric array -- a real oracle feature (renders
+' `[1, 2, 3]`, `[]` for an empty array, confirmed via direct oracle probes,
+' including that Runtime.Print's own always-append-a-trailing-newline
+' behavior applies to the whole rendered array once, not per element).
+' Input: %rdi = array pointer (its own length header, then elements, same
+' layout array_alloc/INDEX/STORE_INDEX already use). Loops over elements
+' with %rbx/%r12/%r13 (callee-saved, so they survive the itoa_write/write-
+' syscall calls inside the loop -- this internal convention's usual
+' "freely clobber scratch registers" rule does not extend to registers a
+' loop needs to keep live across its own body).
+FUNCTION Fission_X86_64ArrayPrintSubroutine()
+    lines = [
+        "array_print:",
+        "    push %rbx",
+        "    push %r12",
+        "    push %r13",
+        "    mov %rdi, %rbx",
+        "    mov (%rbx), %r13",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    lea array_print_open(%rip), %rsi",
+        "    mov $1, %rdx",
+        "    syscall",
+        "    xor %r12, %r12",
+        ".Larrprint_loop:",
+        "    cmp %r13, %r12",
+        "    jge .Larrprint_done",
+        "    test %r12, %r12",
+        "    jz .Larrprint_skip_comma",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    lea array_print_comma(%rip), %rsi",
+        "    mov $2, %rdx",
+        "    syscall",
+        ".Larrprint_skip_comma:",
+        "    mov 8(%rbx,%r12,8), %rax",
+        "    call itoa_write",
+        "    inc %r12",
+        "    jmp .Larrprint_loop",
+        ".Larrprint_done:",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    lea array_print_close(%rip), %rsi",
+        "    mov $2, %rdx",
+        "    syscall",
+        "    pop %r13",
+        "    pop %r12",
+        "    pop %rbx",
+        "    ret"
+    ]
+    RETURN lines
+END FUNCTION
+
 ' Lowers one function (Main or a real user-declared one) to GAS text.
 ' `labelPrefix` is "" for Main (matches this backend's earlier, already-
 ' tested Phase 1/2 output exactly -- Main's blocks stay bare) and
@@ -1036,15 +1134,9 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 END IF
                 printKind = Fission_X86_64OperandKind(kinds, argRef)
                 IF printKind == "Array" THEN
-                    ' A real oracle feature (`PRINT arr` renders
-                    ' `[10, 20, 30]`) deliberately NOT implemented here --
-                    ' would need real runtime string-building (itoa per
-                    ' element plus separators/brackets), a genuinely
-                    ' separate piece of machinery from anything this phase
-                    ' added. Explicitly rejected rather than silently
-                    ' itoa-printing the array's own pointer value as if it
-                    ' were a number.
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "PRINT of an array is not yet supported by native x86-64 codegen (PRINT of an indexed element is): " + argRef)
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rdi"))
+                    ignored = Array.Push(textLines, "    call array_print")
+                    context.UsesArrayPrint = TRUE
                     CONTINUE FOR
                 END IF
                 IF printKind == "String" THEN
@@ -1181,7 +1273,7 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
-    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE}
+    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE}
 
     allTextLines = []
     FOR fn IN amirModule.Functions
@@ -1225,6 +1317,19 @@ FUNCTION Fission_AmirToX86_64(amirModule)
             ignored = Array.Push(allTextLines, line)
         NEXT
     END IF
+    ' array_print itself calls itoa_write (a distinct helper from itoa_print
+    ' -- see that subroutine's own comment for why it can't be reused
+    ' as-is), so both are emitted together here regardless of whether a
+    ' plain PRINT of a computed integer (UsesItoa) also appears anywhere in
+    ' this module.
+    IF context.UsesArrayPrint THEN
+        FOR line IN Fission_X86_64ItoaWriteSubroutine()
+            ignored = Array.Push(allTextLines, line)
+        NEXT
+        FOR line IN Fission_X86_64ArrayPrintSubroutine()
+            ignored = Array.Push(allTextLines, line)
+        NEXT
+    END IF
 
     ignored = program.Diagnostics.AppendMany(amirModule.Diagnostics)
 
@@ -1232,6 +1337,14 @@ FUNCTION Fission_AmirToX86_64(amirModule)
     IF context.UsesStrPrint THEN
         ignored = Array.Push(rodataLines, "newline_byte:")
         ignored = Array.Push(rodataLines, "    .byte 10")
+    END IF
+    IF context.UsesArrayPrint THEN
+        ignored = Array.Push(rodataLines, "array_print_open:")
+        ignored = Array.Push(rodataLines, "    .ascii \"[\"")
+        ignored = Array.Push(rodataLines, "array_print_comma:")
+        ignored = Array.Push(rodataLines, "    .ascii \", \"")
+        ignored = Array.Push(rodataLines, "array_print_close:")
+        ignored = Array.Push(rodataLines, "    .ascii \"]\\n\"")
     END IF
 
     lines = ["    .section .rodata"]

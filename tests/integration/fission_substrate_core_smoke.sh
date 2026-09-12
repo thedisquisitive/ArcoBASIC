@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^91$" <<<"$fission_self_semantic_output"
 grep -q "^138$" <<<"$fission_self_semantic_output"
-grep -q "^2974$" <<<"$fission_self_semantic_output"
+grep -q "^2978$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -700,7 +700,7 @@ test "$string_equality_native_output" = "$oracle_string_equality_output"
 # pointer to a bump-allocated [length][elem0][elem1]...] block on the same shared .bss arena
 # string concatenation already uses, with real x86-64 SIB scaled addressing for element access.
 arrays_native_output="$("$SOURCE_DIR/build/fission-native-programs/arrays")"
-expected_arrays_output="$(printf '10\n20\n30\n99\n3\n140\n40\n20\n3\n1000\n100\n600')"
+expected_arrays_output="$(printf '10\n20\n30\n99\n3\n140\n40\n20\n3\n1000\n100\n600\n[10, 99, 30]\n[1, 4, 9, 16, 25, 36, 49]\n[]\n[-5, 0, 100]')"
 test "$arrays_native_output" = "$expected_arrays_output"
 oracle_arrays_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/arrays.abas")"
 test "$arrays_native_output" = "$oracle_arrays_output"

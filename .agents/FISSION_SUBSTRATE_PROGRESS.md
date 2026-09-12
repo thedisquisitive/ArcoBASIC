@@ -80,10 +80,12 @@ also affecting the bytecode backend). **Phase 6: real string EQUALITY**
 even for a concatenation result compared against a same-spelled literal.
 **Phase 7: real numeric ARRAYS** -- construction (`[1, 2, 3]`), indexed
 read/write (`arr[i]` / `arr[i] = v`, both constant and dynamically-computed
-indices), and `LEN(arr)`, represented as a pointer to a bump-allocated
-`[length][elem0][elem1]...]` block on the same shared `.bss` arena
-concatenation already uses, with real x86-64 SIB scaled addressing
-(`8(%rax,%rcx,8)`) for element access. **ForEach and EXIT/CONTINUE** --
+indices), `LEN(arr)`, and PRINT of a bare array (rendering `[1, 2, 3]`,
+including `[]` for an empty array), represented as a pointer to a
+bump-allocated `[length][elem0][elem1]...]` block on the same shared
+`.bss` arena concatenation already uses, with real x86-64 SIB scaled
+addressing (`8(%rax,%rcx,8)`) for element access.
+**ForEach and EXIT/CONTINUE** --
 ForEach needed zero dedicated codegen once arrays existed (same "already
 works" precedent FOR-range/DO set); EXIT/CONTINUE was a real,
 previously-undiscovered gap in the SHARED A-MIR lowering pass (affects
@@ -92,9 +94,9 @@ real surprise (CONTINUE in a post-condition-only DO loop bypasses its own
 post-condition check, unlike every other loop shape) found only by
 comparing native execution against the oracle. Strings as function
 parameters/return values, string ORDERING comparison (`<`/`<=`/`>`/`>=`),
-branching on a string, PRINT of a bare array, and arrays of anything but
-plain numbers each remain their own real, disclosed diagnostic-reported
-gap rather than silently wrong behavior.
+branching on a string, and arrays of anything but plain numbers each
+remain their own real, disclosed diagnostic-reported gap rather than
+silently wrong behavior.
 **WP-011 (Linux Runtime -- objects, the general host-function
 bridge for everything else this backend cannot hand-roll itself) remains
 real, substantial follow-on
@@ -1217,6 +1219,64 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   updated to match. `fission/fissure.ab`'s watched-files list extended with
   both new native fixtures and the new smoke fixture. Verified with plain
   `fissure run`.
+- Native x86-64 codegen: real PRINT of a bare numeric ARRAY -- closing
+  Phase 7's own last disclosed gap, picked as the next well-scoped
+  increment right after ForEach/LoopControl landed. `PRINT arr` now
+  genuinely renders `[1, 2, 3]` (confirmed via direct oracle probes,
+  including the `[]` empty-array and negative-number cases, exactly
+  matching legacy `ArcoFission compile-run`'s own real output format), not
+  just a diagnostic anymore.
+  Two new runtime helpers (same internal-only call/ret convention as
+  itoa_print/str_print/str_concat/str_equals/array_alloc): `itoa_write`
+  (converts a signed 64-bit integer to decimal ASCII and writes it via a
+  raw `write` syscall, with NO trailing newline -- itoa_print's own
+  existing buffer layout always bakes a newline in right after the digits,
+  which cannot be reused here since a comma-space or closing bracket must
+  follow each number's own digits instead, so this is a genuinely separate
+  subroutine, not a parameterized itoa_print) and `array_print` (writes
+  `[`, then loops over the array's own elements -- real SIB scaled
+  addressing, the same `8(%rbx,%r12,8)` layout indexing already uses --
+  writing `, ` before every element but the first and calling `itoa_write`
+  per element, then writes `]\n`). The loop index/length/array pointer are
+  kept in callee-saved registers (`%rbx`/`%r12`/`%r13`) across the
+  `itoa_write`/write-syscall calls inside the loop -- this internal
+  convention's usual "freely clobber scratch registers" rule does not
+  extend to registers a loop needs to keep live across its own body, a
+  real, disclosed exception to the pattern documented directly in the new
+  subroutine's own comment.
+  PRINT's existing kind dispatch (which already had an explicit
+  Array-kind branch, added proactively during Phase 7 specifically to
+  avoid ever silently itoa-printing an array's own pointer as a number)
+  now emits `call array_print` there instead of a diagnostic.
+  Verified via real execution, not just that assembly renders: PRINT of a
+  freshly-constructed array literal, an array after an element was
+  mutated, PRINT after a WHILE-loop accumulation left other variables of
+  the same array kind untouched, an empty array literal (`[]`), and an
+  array containing negative numbers -- all byte-for-byte identical to
+  legacy `ArcoFission compile-run`, zero debugging iterations needed (the
+  exact output format was confirmed against the oracle BEFORE writing any
+  codegen, avoiding a guess-then-fix cycle). Extended the existing
+  permanent regression fixture `fission/tests/native_programs/arrays.abas`
+  (rather than adding a new one, since this closes that same file's own
+  previously-disclosed remaining gap) with four new PRINT-of-array cases;
+  re-verified every earlier native demo (hello-native, strings, FizzBuzz,
+  Fibonacci, many_params, concat, do_loops, string_equality, for_each,
+  loop_control) unaffected.
+  `fission/tests/amir_x86_64_smoke.abas`'s old "PRINT of a bare array is a
+  diagnostic" check flipped to its opposite (zero diagnostics; asserts the
+  rendered assembly contains `call array_print`); header comment updated
+  to drop this from the disclosed-gaps list. Self-parse/self-semantic
+  corpus grew with the two new subroutines and the new smoke-test
+  assertion (symbol count 2974 -> 2978); golden values in
+  `tests/integration/fission_substrate_core_smoke.sh` (both the
+  `arrays.abas` expected-output string and the self-semantic symbol count)
+  updated to match. Verified with plain `fissure run` (620s, passing) --
+  the environment was under sustained, unrelated memory pressure this
+  pass (several backgrounded `fissure run`/trace attempts were killed by
+  the low-memory watchdog before a retry finally completed cleanly); the
+  direct integration script itself (a sanctioned interactive-tracing use,
+  per the standing `fissure`-workflow correction) was run twice, both
+  green, while waiting for a clean `fissure run` window.
 
 ## In-Progress Components
 
@@ -1917,9 +1977,9 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
      `ArcoFission compile-run` fails at runtime with "value is not a
      number"), so this backend's existing "non-numeric operand" diagnostic
      is correct, complete behavior -- not an incompleteness worth closing.
-   - PRINT of a bare array (`PRINT arr` rendering `[1, 2, 3]`, a real oracle
-     feature) and arrays of anything but plain numbers (string/nested
-     arrays) both remain real, disclosed gaps left open by Phase 7.
+   - DONE -- PRINT of a bare array (`PRINT arr` rendering `[1, 2, 3]`), see
+     Completed Components. Arrays of anything but plain numbers (string/
+     nested arrays) remains a real, disclosed gap left open by Phase 7.
    - DONE -- ForEach (was blocked on arrays not existing; needed zero
      dedicated codegen once Phase 7 landed) and EXIT/CONTINUE across every
      loop shape, see Completed Components.

@@ -2,20 +2,21 @@
 #IMPORT "fission/amir/lower_x86_64.abas"
 
 ' fission/amir/lower_x86_64.abas's own header comment records this backend's
-' current (through Phase 7, plus DO loops confirmed and two real bugs
-' fixed) scope: PRINT of string literals, variables/arithmetic/comparisons/
-' IF/WHILE/FOR/DO over plain numbers, PRINT of a computed integer, real
-' user-declared FUNCTIONs with a genuine SysV calling convention (including
-' stack-passed arguments beyond the first 6), real string VARIABLES
-' (assign/PRINT/reassign/copy), real string CONCATENATION and EQUALITY
-' (`==`/`!=`, real content comparison; a bump-allocated `.bss` arena
-' shared with arrays), and real numeric ARRAYS (construction, indexed
-' read/write, `LEN`) -- function-local only: string function parameters/
-' return values, string ORDERING comparison (`<`/`<=`/`>`/`>=`), branching
-' on a string, PRINT of a bare array, and arrays of anything but plain
-' numbers all remain real, disclosed gaps. Real execution verified
-' separately by fission/tests/native_programs/*.abas (built as real ELF64s
-' via FissionNativeCapsuleTarget and run directly -- see
+' current scope: PRINT of string literals, variables/arithmetic/
+' comparisons/IF/WHILE/FOR/DO (all four shapes)/ForEach over plain numbers
+' and arrays, EXIT/CONTINUE across every loop shape, PRINT of a computed
+' integer, real user-declared FUNCTIONs with a genuine SysV calling
+' convention (including stack-passed arguments beyond the first 6), real
+' string VARIABLES (assign/PRINT/reassign/copy), real string CONCATENATION
+' and EQUALITY (`==`/`!=`, real content comparison; a bump-allocated
+' `.bss` arena shared with arrays), and real numeric ARRAYS (construction,
+' indexed read/write, `LEN`, and PRINT of a bare array rendering
+' `[1, 2, 3]`) -- function-local only: string function parameters/return
+' values, string ORDERING comparison (`<`/`<=`/`>`/`>=`), branching on a
+' string, and arrays of anything but plain numbers all remain real,
+' disclosed gaps. Real execution verified separately by
+' fission/tests/native_programs/*.abas (built as real ELF64s via
+' FissionNativeCapsuleTarget and run directly -- see
 ' tests/integration/fission_substrate_core_smoke.sh). This file checks the
 ' lowering pass's own text output and its diagnostics.
 Source = "PRINT \"Hello, native!\"\nPRINT \"Second line\""
@@ -145,13 +146,13 @@ StringBranchAmir = Fission_SirToAmir(StringBranchSir)
 StringBranchProgram = Fission_AmirToX86_64(StringBranchAmir)
 PRINT StringBranchProgram.Diagnostics.HasErrors()
 
-' PRINT of a BARE array remains a real, disclosed gap (a real oracle
-' feature -- `PRINT arr` renders `[1, 2, 3]` -- deliberately not
-' implemented; needs real runtime string-building machinery, genuinely
-' separate from array indexing itself) -- must still report a diagnostic,
-' not silently misinterpret the array's own pointer as a number. Array
-' construction/indexing themselves are Phase 7 (see below) and do NOT
-' report a diagnostic any more.
+' PRINT of a BARE array is a real oracle feature (`PRINT arr` renders
+' `[1, 2, 3]`, confirmed via a direct oracle probe including the `[]`
+' empty-array and negative-number cases) -- real runtime string-building
+' (array_print/itoa_write) landed the session right after Phase 7 (see
+' below); zero diagnostics now, not a diagnostic-fail path. Checked here:
+' zero diagnostics, and that the rendered assembly actually contains
+' `call array_print`.
 ArraySource = "a = [1, 2, 3]\nPRINT a"
 ArrayTokens = Fission_ArcoBasicLex(ArraySource)
 ArrayAst = Fission_ArcoBasicParse(ArrayTokens, "x86-64-array-smoke.abas")
@@ -159,6 +160,7 @@ ArraySir = Fission_ArcoBasicAstToSir(ArrayAst)
 ArrayAmir = Fission_SirToAmir(ArraySir)
 ArrayProgram = Fission_AmirToX86_64(ArrayAmir)
 PRINT ArrayProgram.Diagnostics.HasErrors()
+PRINT String.Contains(ArrayProgram.Render(), "call array_print")
 
 ' Phase 3: real user-declared FUNCTIONs, a genuine SysV-shaped calling
 ' convention (arguments in %rdi/%rsi/..., return value in %rax), and real
