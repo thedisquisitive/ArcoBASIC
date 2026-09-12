@@ -354,15 +354,52 @@ FUNCTION Fission_X86_64AsmEncodeInstruction(buffer, fixups, diagnostics, mnemoni
         src = operands[0]
         dst = operands[1]
         IF src.Kind == "imm" THEN
-            ' C7 /0 id -- MOV r/m64, imm32 (sign-extended). Works
-            ' identically whether dst is a register (mod=11) or a memory
-            ' operand (mod=10 disp32 then the imm32 value) since
-            ' Fission_X86_64AsmEmitModRM already handles both uniformly.
-            rmBits = Fission_X86_64AsmRmIndexBits(dst)
-            ignored = Fission_X86_64AsmEmitRex(buffer, 1, 0, -1, rmBits.Base)
-            ignored = buffer.EmitByte(199)
-            ignored = Fission_X86_64AsmEmitModRM(buffer, 0, dst)
-            ignored = buffer.EmitU32(src.Value)
+            IF Fission_X86_64AsmFitsSigned32(src.Value) THEN
+                ' C7 /0 id -- MOV r/m64, imm32 (sign-extended). Works
+                ' identically whether dst is a register (mod=11) or a
+                ' memory operand (mod=10 disp32 then the imm32 value)
+                ' since Fission_X86_64AsmEmitModRM already handles both
+                ' uniformly.
+                rmBits = Fission_X86_64AsmRmIndexBits(dst)
+                ignored = Fission_X86_64AsmEmitRex(buffer, 1, 0, -1, rmBits.Base)
+                ignored = buffer.EmitByte(199)
+                ignored = Fission_X86_64AsmEmitModRM(buffer, 0, dst)
+                ignored = buffer.EmitU32(src.Value)
+                RETURN
+            END IF
+            ' A real, PREVIOUSLY genuinely-crashing bug: an immediate
+            ' outside the signed 32-bit range (e.g. `mov $4294967295,
+            ' %rax`) has no correct encoding via C7 /0 id at all -- that
+            ' opcode's own imm32 operand is ALWAYS sign-extended into the
+            ' 64-bit destination, a real x86-64 ISA constraint, not a
+            ' choice this backend made (confirmed directly: this exact
+            ' bug made `PRINT 4294967295` silently print `-1`, and made
+            ' `Random.Integer(0, 4294967295, h)` crash with SIGFPE
+            ' downstream). A register destination has a real, correct
+            ' full-width encoding instead: REX.W + B8+rd io (`MOV r64,
+            ' imm64`, 10 bytes, no sign-extension at all) --
+            ' Fission_X86_64AsmFitsSigned32/FissionX86_64Buffer's own
+            ' EmitU64Full already existed for exactly this, just never
+            ' wired into this dispatch until now.
+            IF dst.Kind == "reg" THEN
+                ignored = Fission_X86_64AsmEmitRex(buffer, 1, 0, -1, dst.Index)
+                ignored = buffer.EmitByte(184 + (dst.Index BITAND 7))
+                ignored = buffer.EmitU64Full(src.Value)
+                RETURN
+            END IF
+            ' A memory destination has NO real 64-bit-immediate MOV
+            ' encoding on x86-64 at all (there is no `MOV r/m64, imm64`);
+            ' the correct real fix there is loading into a scratch
+            ' register first and storing that, but this codegen never
+            ' actually needs that shape (every literal this backend emits
+            ' reaches memory only via a register first -- see
+            ' Fission_X86_64OperandLoadLine/Fission_X86_64StoreRaxLine) --
+            ' a real, reported diagnostic here instead of silently
+            ' truncating, matching this whole file's own "diagnose an
+            ' unsupported shape rather than mis-encode it" discipline
+            ' (the RIP-relative-source case right below already does the
+            ' same).
+            ignored = diagnostics.ReportError("FISSION_X86_64_ASM_UNSUPPORTED", "mov with a 64-bit immediate directly to memory is not supported")
             RETURN
         END IF
         IF src.Kind == "riprel" THEN

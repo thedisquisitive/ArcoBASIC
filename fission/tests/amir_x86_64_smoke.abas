@@ -864,3 +864,30 @@ RandomChoiceBadKindSource = "h = Random.Create(1)\nPRINT Random.Choice(5, h)"
 RandomChoiceBadKindAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(RandomChoiceBadKindSource), "x86-64-random-choice-bad-kind-smoke.abas")))
 RandomChoiceBadKindProgram = Fission_AmirToX86_64(RandomChoiceBadKindAmir)
 PRINT RandomChoiceBadKindProgram.Diagnostics.HasErrors()
+
+' A real, PREVIOUSLY genuinely-crashing bug, fixed for real: an integer
+' literal outside the signed 32-bit range used to be silently corrupted
+' (`MOV r/m64, imm32` always sign-extends -- a real x86-64 ISA constraint
+' this backend's own assembler never worked around) -- see
+' fission/tests/native_programs/large_integer_literals.abas's own header
+' comment for the full story. A bare PRINT of such a literal routes
+' through the ordinary register-load text form unchanged (`mov $N, %rax`
+' -- the ASSEMBLER now chooses the correct 64-bit-immediate encoding for
+' it, a later stage this text-level check can't see, but real execution
+' is verified separately by that fixture); a variable ASSIGNMENT of one
+' (a `Const` instruction) used to emit a special-cased, uncorrectable
+' direct-to-memory immediate (`movq $N, offset(%rbp)`) and is now routed
+' through that SAME register-load-then-store text form instead, checked
+' here by confirming the old, broken pattern is genuinely GONE.
+LargeLiteralSource = "PRINT 4294967295"
+LargeLiteralAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(LargeLiteralSource), "x86-64-large-literal-smoke.abas")))
+LargeLiteralProgram = Fission_AmirToX86_64(LargeLiteralAmir)
+PRINT LargeLiteralProgram.Diagnostics.HasErrors()
+PRINT String.Contains(LargeLiteralProgram.Render(), "mov $4294967295, %rax")
+
+LargeLiteralAssignSource = "x = 4294967295\nPRINT x"
+LargeLiteralAssignAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(LargeLiteralAssignSource), "x86-64-large-literal-assign-smoke.abas")))
+LargeLiteralAssignProgram = Fission_AmirToX86_64(LargeLiteralAssignAmir)
+PRINT LargeLiteralAssignProgram.Diagnostics.HasErrors()
+PRINT String.Contains(LargeLiteralAssignProgram.Render(), "mov $4294967295, %rax")
+PRINT String.Contains(LargeLiteralAssignProgram.Render(), "movq $4294967295")

@@ -1,0 +1,54 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. A dedicated REGRESSION fixture for
+' a real, genuine bug found while verifying the Random.* host-function
+' bridge (fission/tests/native_programs/host_bridge_random.abas): ANY
+' integer literal outside the signed 32-bit range (roughly +/- 2.1
+' billion) was silently corrupted by this backend's own operand-loading
+' path, because the only real x86-64 immediate-to-register/immediate-to-
+' memory MOV encoding (`MOV r/m64, imm32`) always sign-extends its imm32
+' operand into the 64-bit destination -- a real ISA constraint, not a
+' choice this backend made. Confirmed directly: `PRINT 4294967295` used
+' to silently print `-1`, and `Random.Integer(0, 4294967295, handle)`
+' used to CRASH the compiled binary outright with SIGFPE (a downstream
+' divide-by-zero once the corrupted "width" argument reached
+' `arco_host_random_integer`'s own bounded-rejection loop).
+'
+' Fixed for real, not worked around: a register destination has a REAL,
+' correct full-width encoding (REX.W + B8+rd io, `MOV r64, imm64`, no
+' sign-extension at all -- fission/amir/x86_64_assembler.abas's own `mov`
+' handling now uses it whenever the immediate does not fit in a signed
+' 32-bit value), and the one direct immediate-to-MEMORY store this
+' backend's own codegen ever emitted (a bare `Const` instruction's own
+' stack-slot initialization, fission/amir/lower_x86_64.abas) is now routed
+' through that same real register-destination encoding first (load into a
+' scratch register, then store the register to memory -- the exact same
+' two-step pattern every OTHER value in this whole file already uses, not
+' a special case).
+'
+' Exercises: a bare PRINT of a large positive/negative literal, a variable
+' assignment (the exact `Const`-instruction code path that crashed),
+' arithmetic on a large literal, and the large-literal-as-host-bridge-
+' argument shape that originally crashed with SIGFPE.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+PRINT 4294967295
+PRINT -4294967296
+PRINT 2147483647
+PRINT 2147483648
+PRINT -2147483648
+PRINT -2147483649
+
+x = 4294967295
+PRINT x
+
+y = x + 1
+PRINT y
+
+z = x - 4294967295
+PRINT z
+
+h = Random.Create(100)
+PRINT Random.Integer(0, 4294967295, h)

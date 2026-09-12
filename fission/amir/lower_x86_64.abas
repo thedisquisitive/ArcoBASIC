@@ -2405,7 +2405,30 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, dest))
                     CONTINUE FOR
                 END IF
-                ignored = Array.Push(textLines, "    movq $" + value + ", " + Object.Get(offsets, dest, "0") + "(%rbp)")
+                ' A real, PREVIOUSLY genuinely-crashing bug lived right
+                ' here: a bare `movq $N, offset(%rbp)` immediate-to-memory
+                ' store has no correct x86-64 encoding at all for an `N`
+                ' outside the signed 32-bit range (`MOV r/m64, imm32`
+                ' -- the only immediate-to-memory MOV that exists --
+                ' always sign-extends its imm32 operand into the 64-bit
+                ' destination, a real ISA constraint, not a choice this
+                ' backend made), so any literal that large silently
+                ' became the wrong value (confirmed directly: `x =
+                ' 4294967295` printed `-1`). Routed through the exact
+                ' same real, already-correct LOAD-then-STORE sequence
+                ' every other value in this whole file already uses
+                ' (Fission_X86_64OperandLoadLine into a scratch register,
+                ' safe to clobber here -- a Const always starts a fresh
+                ' value, never continues a live expression -- then
+                ' Fission_X86_64StoreRaxLine) instead of a special-cased
+                ' direct-to-memory immediate: a register destination DOES
+                ' have a real correct full-width encoding (REX.W + B8+rd
+                ' io, no sign-extension at all -- see
+                ' fission/amir/x86_64_assembler.abas's own `mov`
+                ' handling), so this Just Works for every value now, not
+                ' only values that happened to fit in 32 bits before.
+                ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, value, "rax"))
+                ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, dest))
                 CONTINUE FOR
             END IF
             IF kind == "Object" THEN

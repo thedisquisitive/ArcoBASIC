@@ -2558,13 +2558,70 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   `/etc/localtime`/DST rules) this freestanding backend has no path to
   without either a real libc dependency or a from-scratch tzdata port,
   neither attempted here; `Time.Timestamp` (UTC, unambiguous) was
-  implemented instead. THE NEW, MOST IMPORTANT DISCLOSED ITEM: the real,
-  pre-existing large-integer-literal encoding bug described above (any
-  literal outside signed 32-bit range is silently corrupted by this
-  backend's own `mov $imm, reg` encoding) is a genuine, cross-cutting
-  correctness gap independent of the host bridge, and should be the next
-  priority fix regardless of which host-function category is tackled
-  next.
+  implemented instead. The large-integer-literal encoding bug described
+  above was FIXED in the very next entry below, immediately, at the
+  user's own explicit request ("Fix the bugs") -- see that entry.
+- **Fixed: the real, pre-existing large-integer-literal encoding bug.**
+  Root cause: this backend's own assembler (`fission/amir/
+  x86_64_assembler.abas`) encoded EVERY `mov $imm, dst` as a plain `C7
+  /0 id` (`MOV r/m64, imm32`), a real x86-64 ISA instruction that always
+  SIGN-EXTENDS its 32-bit immediate into the 64-bit destination -- there
+  is no `MOV r/m64, imm64` at all on this architecture. Any literal
+  outside the signed 32-bit range (roughly +/- 2.1 billion) was silently
+  corrupted; `fission/amir/lower_x86_64.abas`'s own `Const` instruction
+  handling made this worse for a variable assignment specifically, by
+  emitting a SPECIAL-CASED, uncorrectable direct-immediate-to-MEMORY
+  store (`movq $N, offset(%rbp)`) that could never be fixed with a
+  register-destination-only encoding at all. Confirmed real severity via
+  a direct probe: `PRINT 4294967295` silently printed `-1`;
+  `Random.Integer(0, 4294967295, handle)` (this session's own Batch 4
+  work) crashed outright with `SIGFPE` (a downstream divide-by-zero once
+  the corrupted "width" argument reached `arco_host_random_integer`'s own
+  bounded-rejection loop).
+  Two real fixes, layered correctly: (1) the assembler's own `mov`
+  handling now checks `Fission_X86_64AsmFitsSigned32` (a helper that
+  ALREADY existed in this file, unused, before this fix) and, for a
+  register destination whose immediate does not fit, emits the real,
+  correct full-width `MOV r64, imm64` encoding instead (`REX.W + B8+rd
+  io`, 10 bytes, no sign-extension at all) via `EmitU64Full` (also an
+  already-existing, unused helper on `FissionX86_64Buffer` -- both
+  pieces of real infrastructure for exactly this fix existed already,
+  just never wired together until now); a memory destination that still
+  doesn't fit is a real, reported diagnostic (`FISSION_X86_64_ASM_
+  UNSUPPORTED`) rather than a silent mis-encoding, since no correct
+  single-instruction encoding exists for that shape at all. (2)
+  `Fission_X86_64LowerFunction`'s own `Const` handling no longer emits
+  the special-cased direct-to-memory immediate store at all -- it now
+  reuses the exact same LOAD-into-a-scratch-register-THEN-store sequence
+  (`Fission_X86_64OperandLoadLine` + `Fission_X86_64StoreRaxLine`) every
+  OTHER value in this whole file already uses, which inherits fix (1)
+  automatically and removes an entire special-cased code path rather
+  than adding a second one.
+  Verified: every edge case directly probed against the oracle and
+  matched byte-for-byte, including values at/around the signed-32-bit
+  and full-64-bit boundaries (`2147483647`/`2147483648`/`-2147483648`/
+  `-2147483649`/`9223372036854775807`, the last of which the ORACLE
+  ITSELF wraps to `-9223372036854775808` -- matched exactly, confirming
+  this fix tracks the oracle's own real behavior, not an idealized
+  "correct" one), arithmetic on a large literal, and the exact
+  `Random.Integer(0, 4294967295, handle)` shape that used to crash (now
+  returns the real, correct value with no crash at all). All 25 existing
+  native fixtures (24 plus this fix's own new one) re-verified matching
+  the oracle byte-for-byte. New dedicated regression fixture
+  `fission/tests/native_programs/large_integer_literals.abas`;
+  `fission/tests/native_programs/host_bridge_random.abas` restored to
+  its ORIGINALLY-INTENDED `Random.Integer(0, 4294967295, ...)` call (no
+  longer needs the `999999999` workaround its own header comment
+  disclosed before this fix). Extended `fission/tests/
+  amir_x86_64_smoke.abas` with real structural checks proving the old,
+  broken direct-to-memory-immediate text pattern is genuinely gone.
+  Self-parse/self-semantic corpus symbol count grew 3849 -> 3855; golden
+  value updated. Verified with `fissure run`.
+  This was a genuine, cross-cutting CORE correctness bug (reachable from
+  ordinary arithmetic/assignment, not specific to the host bridge) --
+  fixing it immediately, rather than deferring it, was the right call
+  once found; no further known-but-unfixed correctness bugs remain
+  disclosed in this ledger as of this entry.
 
 ## In-Progress Components
 
