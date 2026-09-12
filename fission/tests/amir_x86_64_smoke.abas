@@ -18,10 +18,12 @@
 ' analysis, real STRING FUNCTION PARAMETERS AND RETURN VALUES -- a genuine
 ' Number/String kind CONFLICT across different call sites (real
 ' polymorphism, not representable here) is still a real diagnostic, not
-' guessed at. Remaining real, disclosed gaps: arrays crossing a function
-' boundary, string ORDERING comparison (`<`/`<=`/`>`/`>=`), branching on a
-' string, arrays of anything but plain numbers, SAR (a real oracle
-' limitation, not just this backend's own), and real integer division
+' guessed at -- and real PRINT of a Bool-kind value (a comparison result,
+' or a bare TRUE/FALSE literal) rendering `TRUE`/`FALSE` like the oracle
+' does, not the raw 0/1. Remaining real, disclosed gaps: arrays crossing a
+' function boundary, string ORDERING comparison (`<`/`<=`/`>`/`>=`),
+' branching on a string, arrays of anything but plain numbers, SAR (a real
+' oracle limitation, not just this backend's own), and real integer division
 ' (`\`, likewise a real oracle limitation). Real execution verified
 ' separately by
 ' fission/tests/native_programs/*.abas (built as real ELF64s via
@@ -386,3 +388,24 @@ IntDivSir = Fission_ArcoBasicAstToSir(IntDivAst)
 IntDivAmir = Fission_SirToAmir(IntDivSir)
 IntDivProgram = Fission_AmirToX86_64(IntDivAmir)
 PRINT IntDivProgram.Diagnostics.HasErrors()
+
+' Real PRINT of a Bool-kind value (a bare TRUE/FALSE literal, or a
+' comparison result) renders `TRUE`/`FALSE`, closing a real bug found
+' while verifying string function parameters -- this backend previously
+' itoa'd the raw 0/1 like any other number. Real execution verified
+' separately by fission/tests/native_programs/bool_print.abas. Checked
+' here: zero diagnostics, and that the rendered assembly actually contains
+' `call bool_print`. A bitwise AND of two comparisons does NOT preserve
+' Bool-ness (confirmed against the oracle) -- `w = x > 0 AND y > 0` prints
+' `1`, not `TRUE`, so PRINTing it must still go through the ordinary
+' itoa_print path, not bool_print.
+BoolPrintSource = "x = 1\ny = 2\nb = x < y\nPRINT b\nPRINT TRUE\nw = x > 0 AND y > 0\nPRINT w"
+BoolPrintTokens = Fission_ArcoBasicLex(BoolPrintSource)
+BoolPrintAst = Fission_ArcoBasicParse(BoolPrintTokens, "x86-64-bool-print-smoke.abas")
+BoolPrintSir = Fission_ArcoBasicAstToSir(BoolPrintAst)
+BoolPrintAmir = Fission_SirToAmir(BoolPrintSir)
+BoolPrintProgram = Fission_AmirToX86_64(BoolPrintAmir)
+PRINT BoolPrintProgram.Diagnostics.HasErrors()
+BoolPrintAssembly = BoolPrintProgram.Render()
+PRINT String.Contains(BoolPrintAssembly, "call bool_print")
+PRINT String.Contains(BoolPrintAssembly, "call itoa_print")

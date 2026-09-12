@@ -1,0 +1,41 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. Exercises real PRINT of a Bool-kind
+' value -- a bare TRUE/FALSE literal, a comparison result stored in a
+' variable, a bare comparison expression, and a comparison propagated
+' through a plain variable-to-variable copy -- rendering `TRUE`/`FALSE`
+' the way the oracle does, closing a real bug found while verifying string
+' function parameters: this backend previously itoa'd the raw 0/1 like any
+' other number. Also confirms a real, subtle detail: bitwise AND does NOT
+' preserve Bool-ness the way a genuine comparison does (`x > 0 AND y > 0`
+' still prints `1`, not `TRUE`) -- confirmed directly against the oracle,
+' not assumed.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+PRINT TRUE
+PRINT FALSE
+
+x = 1
+y = 2
+b = x < y
+PRINT b
+PRINT x > y
+
+c = TRUE
+PRINT c
+
+IF b THEN
+    PRINT "yes"
+END IF
+
+z = b
+PRINT z
+
+d = x == 1
+e = d
+PRINT e
+
+w = x > 0 AND y > 0
+PRINT w

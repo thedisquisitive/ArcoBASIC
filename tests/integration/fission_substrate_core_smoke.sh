@@ -393,7 +393,7 @@ fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic
 
 grep -q "^92$" <<<"$fission_self_semantic_output"
 grep -q "^140$" <<<"$fission_self_semantic_output"
-grep -q "^3249$" <<<"$fission_self_semantic_output"
+grep -q "^3262$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"
@@ -750,5 +750,16 @@ expected_string_params_output="$(printf 'plain string\nHello, World!\nreused\n[[
 test "$string_params_native_output" = "$expected_string_params_output"
 oracle_string_params_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/string_params.abas")"
 test "$string_params_native_output" = "$oracle_string_params_output"
+
+# fission/tests/native_programs/bool_print.abas exercises real PRINT of a Bool-kind value -- a bare
+# TRUE/FALSE literal, a comparison result, and comparison propagation through a plain variable copy
+# -- rendering TRUE/FALSE the way the oracle does, closing a real bug found while verifying string
+# function parameters. Also confirms bitwise AND does NOT preserve Bool-ness the way a genuine
+# comparison does.
+bool_print_native_output="$("$SOURCE_DIR/build/fission-native-programs/bool_print")"
+expected_bool_print_output="$(printf 'TRUE\nFALSE\nTRUE\nFALSE\nTRUE\nyes\nTRUE\nTRUE\n1')"
+test "$bool_print_native_output" = "$expected_bool_print_output"
+oracle_bool_print_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/bool_print.abas")"
+test "$bool_print_native_output" = "$oracle_bool_print_output"
 
 echo "fission_substrate_core_smoke: all checks passed"

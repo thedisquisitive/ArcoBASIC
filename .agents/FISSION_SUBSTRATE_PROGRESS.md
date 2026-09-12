@@ -101,9 +101,12 @@ still, correctly, a real diagnostic -- a parameter has exactly one
 physical kind). String ORDERING comparison (`<`/`<=`/`>`/`>=`), branching
 on a string, arrays crossing a function boundary, and arrays of anything
 but plain numbers each remain their own real, disclosed diagnostic-
-reported gap rather than silently wrong behavior. A real, separate,
-pre-existing bug was found (not yet fixed): `PRINT` of a bare boolean
-comparison result prints `0`/`1` instead of `FALSE`/`TRUE`.
+reported gap rather than silently wrong behavior. **Real PRINT of a
+Bool-kind value** now also works (`PRINT x == y` renders `TRUE`/`FALSE`
+like the oracle) -- a real, purely native-side workaround (bare TRUE/
+FALSE literals are structurally recoverable since every genuine number
+always materializes through a real CONST) for a SHARED-substrate root
+cause left unfixed at the source.
 **WP-011 (Linux Runtime -- objects, the general host-function
 bridge for everything else this backend cannot hand-roll itself) remains
 real, substantial follow-on
@@ -1513,6 +1516,71 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   rejected). Self-parse/self-semantic corpus symbol count grew 3196 ->
   3249; golden value in `tests/integration/fission_substrate_core_smoke.sh`
   updated to match. Verified with plain `fissure run` (681s, passing).
+- **Native x86-64 codegen: real PRINT of a Bool-kind value** -- fixing the
+  exact bug disclosed in the previous entry (`PRINT x == y` printed `0`/
+  `1` instead of the oracle's own `FALSE`/`TRUE`), as its own clean,
+  distinct follow-up commit.
+  Root cause, confirmed directly against the SHARED `fission/sir/
+  lower_amir.abas` source, not assumed: a bare `TRUE`/`FALSE` literal
+  lowers to the RAW TEXT "1"/"0" used directly inline as an operand, with
+  NO defining instruction at all -- unlike the real oracle (confirmed via
+  `ArcoFission reveal ... at A-MIR` on the identical source), which
+  materializes a real, distinguishable `CONST true`/`CONST false`. This is
+  a real, disclosed, SHARED-substrate divergence (the same class of
+  finding as the ANDALSO/ORELSE eager-evaluation gap two entries back) --
+  a genuine fix belongs in the shared SIR->A-MIR pass, affecting both
+  backends, and was deliberately NOT attempted there.
+  What WAS fixed, entirely within this backend's own kind-tracking, with
+  ZERO changes to the shared pass: every genuine numeric literal in this
+  whole substrate's A-MIR always materializes through a real `CONST`
+  instruction into its own `%tN` temp (confirmed directly -- `PRINT 5` /
+  `x = 5` / `y = x + 1` all show a real `CONST` for every literal operand,
+  never a bare digit used inline), so a BARE digit string ("0" or "1")
+  appearing directly as an A-MIR operand reference can ONLY ever be a
+  TRUE/FALSE literal in this substrate's current lowering shape -- a
+  reliable, purely structural signal recovered natively. A comparison
+  BinOp's own dest is now real "Bool" kind too (reusing
+  `Fission_X86_64SetInstructionForOp`'s own comparison-operator set rather
+  than a second, possibly-drifting list), propagating through Store/Load
+  exactly the way String/Array kinds already did.
+  Bool behaves EXACTLY like Number everywhere in this backend except one
+  place, PRINT's own dispatch: every other consumption site (branch
+  conditions, array elements, function call arguments, arithmetic/bitwise
+  BinOp operands) normalizes Bool back to Number via a small new
+  `Fission_X86_64NormalizeNumericKind` helper before checking, so a
+  comparison result or bare TRUE/FALSE literal keeps working everywhere it
+  already did before this kind even existed. **Caught immediately by the
+  existing regression suite, not found later**: the first build after
+  adding the Bool kind failed three existing fixtures outright ("Operating
+  on a non-numeric value") -- `x > 0 AND y > 0`-shaped expressions (both
+  operands now genuine Bool-kind from being comparison results) hit the
+  generic BinOp "both operands must be Number" check, which didn't yet
+  know Bool was Number-compatible; found and fixed by auditing every
+  `!= "Number"` check in the file (four total: array-literal elements,
+  StoreIndex's value, the generic BinOp fallback, and branch conditions)
+  and normalizing each one, rather than only the first one hit.
+  A new `bool_print` runtime helper (same internal-only call/ret
+  convention as the others) does the actual rendering: input in %rax (0
+  or 1), a real conditional branch writes one of two fixed rodata strings
+  ("TRUE\n"/"FALSE\n") depending on the runtime value -- genuine branching
+  since a comparison's own outcome is not generally known at compile time.
+  Verified via real execution matching the oracle exactly on every case,
+  including a real, subtle detail confirmed directly against the oracle
+  rather than assumed: bitwise AND does NOT preserve Bool-ness the way a
+  genuine comparison does (`w = x > 0 AND y > 0; PRINT w` still prints
+  `1`, not `TRUE`, on both the oracle and this backend) -- this fell out
+  naturally from only marking real comparison operators as Bool-kind, not
+  bitwise AND/OR/XOR, with no extra special-casing needed. Added a
+  permanent regression fixture, `fission/tests/native_programs/
+  bool_print.abas`; wired into `FissionNativeCapsuleTarget`, `tests/
+  integration/fission_substrate_core_smoke.sh`, and `fission/fissure.ab`'s
+  watched-files list. Re-verified every earlier native demo unaffected.
+  `fission/tests/amir_x86_64_smoke.abas` extended with direct coverage
+  (zero diagnostics; asserts the rendered assembly contains BOTH
+  `call bool_print` and `call itoa_print` for a program mixing a real
+  Bool-kind PRINT with a bitwise-AND PRINT). Self-parse/self-semantic
+  corpus symbol count grew 3249 -> 3262; golden value updated to match.
+  Verified with plain `fissure run` (714s, passing).
 
 ## In-Progress Components
 
@@ -1951,6 +2019,7 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/loop_control.abas`
 - `fission/tests/native_programs/bitops.abas`
 - `fission/tests/native_programs/string_params.abas`
+- `fission/tests/native_programs/bool_print.abas`
 - `fission/amir/x86_64_assembler.abas`
 - `fission/tests/sir_to_amir_loop_control_smoke.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
@@ -2228,12 +2297,15 @@ E. Native x86-64 codegen (WP-009 architecture, WP-010 SysV ABI, WP-011 Linux
      passed to/returned from functions remain a real, disclosed,
      unexplored gap, unaffected by this (rejected unconditionally, not
      silently misinterpreted).
-   - A real, separate, pre-existing bug found (NOT fixed yet) while
-     verifying string parameters: `PRINT` of a bare boolean comparison
-     result (`PRINT x == y`) prints `0`/`1` instead of the oracle's own
-     `FALSE`/`TRUE` -- confirmed independent of strings/function calls via
-     an isolated probe. Comparisons have no distinct "Bool" kind
-     currently, only "Number" -- worth its own well-scoped fix.
+   - DONE -- real PRINT of a Bool-kind value (`PRINT x == y` now renders
+     `TRUE`/`FALSE` like the oracle, not `0`/`1`), see Completed
+     Components. The SHARED root cause (a bare TRUE/FALSE literal lowers
+     to raw "1"/"0" text with no distinguishable type at all in
+     `fission/sir/lower_amir.abas`, unlike the oracle's own `CONST true`)
+     was worked around entirely within native codegen's own kind-tracking,
+     not fixed at the source -- still a real, disclosed SHARED-substrate
+     gap if a future construct needs to distinguish Bool from Number in a
+     way this workaround's own structural-inference trick can't reach.
    - String ORDERING comparison (`<`/`<=`/`>`/`>=` between two strings) --
      confirmed this session (via a real oracle probe) that this is not even
      a real supported ArcoBASIC language feature at all (legacy

@@ -294,7 +294,11 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 names = state.Names
                 seen = state.Seen
                 valueKind = "Number"
-                IF Fission_X86_64IsNumericLiteral(value) == FALSE THEN valueKind = Object.Get(kinds, value, "Number")
+                IF Fission_X86_64IsNumericLiteral(value) == FALSE THEN
+                    valueKind = Object.Get(kinds, value, "Number")
+                ELSE
+                    IF Fission_X86_64OperandIsBoolLiteral(value) THEN valueKind = "Bool"
+                END IF
                 kinds = Object.Set(kinds, name, valueKind)
             END IF
             IF kind == "BinOp" THEN
@@ -318,7 +322,17 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 IF isConcat THEN
                     kinds = Object.Set(kinds, dest, "String")
                 ELSE
-                    kinds = Object.Set(kinds, dest, "Number")
+                    ' A comparison's own dest is real Bool-kind, not plain
+                    ' Number -- see Fission_X86_64OperandIsBoolLiteral's own
+                    ' comment for the full investigation (the oracle prints
+                    ' `TRUE`/`FALSE` for a comparison result, confirmed via
+                    ' a direct probe, a real bug this closes). Reuses
+                    ' Fission_X86_64SetInstructionForOp's own comparison-op
+                    ' set (bare and typed forms both) rather than a second,
+                    ' possibly-drifting list of the same operators.
+                    destKind = "Number"
+                    IF Fission_X86_64SetInstructionForOp(op) != "" THEN destKind = "Bool"
+                    kinds = Object.Set(kinds, dest, destKind)
                 END IF
             END IF
             IF kind == "Call" ANDALSO instruction.Field("Callee") != "Runtime.Args" THEN
@@ -349,7 +363,7 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                     callArgs = Fission_X86_64SplitArgs(instruction.Field("Args"))
                     argIndex = 0
                     FOR callArg IN callArgs
-                        argKind = Fission_X86_64OperandKind(kinds, callArg)
+                        argKind = Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, callArg))
                         ignored = Array.Push(callArgKindRequests, {Callee: callee, ArgIndex: argIndex, Kind: argKind})
                         argIndex = argIndex + 1
                     NEXT
@@ -492,7 +506,51 @@ END FUNCTION
 ' preserving this backend's original Phase 2/3 behavior for purely numeric
 ' programs, where `kinds` never gets populated with "String" for anything
 ' relevant at all).
+' A genuine, real bug found while verifying string function parameters
+' (Fission_X86_64InferSignatures): `PRINT x == y` (or any PRINT of a bare
+' comparison/boolean value) printed `0`/`1` instead of the oracle's own
+' `FALSE`/`TRUE` -- confirmed independent of strings/function calls via an
+' isolated probe. Root cause, confirmed via the SHARED
+' fission/sir/lower_amir.abas source directly, not assumed: a bare `TRUE`/
+' `FALSE` literal lowers to the RAW TEXT "1"/"0" used directly inline as an
+' operand, with NO defining instruction at all (unlike the oracle's own
+' A-MIR, confirmed via `ArcoFission reveal ... at A-MIR` on the identical
+' source, which materializes a real, distinguishable `CONST true`/
+' `CONST false`) -- a real, disclosed, SHARED-substrate divergence, out of
+' scope to fix at the SIR->A-MIR level here (see the note on ANDALSO/
+' ORELSE's own similar divergence in this file's header comment for the
+' same reasoning: a real fix belongs in fission/sir/lower_amir.abas,
+' affecting both backends, not a native-codegen-only patch).
+' What IS fixable here, without touching the shared pass at all: EVERY
+' genuine numeric literal in this whole substrate's A-MIR always
+' materializes through a real CONST instruction into its own %tN temp
+' (confirmed directly: `PRINT 5` / `x = 5` / `y = x + 1` all show a
+' `%tN := CONST ...` for every literal operand, never a bare digit used
+' inline) -- so a BARE digit string ("0" or "1") appearing directly as an
+' A-MIR operand reference (a Store's Value, a Print/Call's Args, a BinOp's
+' Left/Right) can ONLY ever be a TRUE/FALSE literal in this substrate's
+' current lowering shape, never a genuine number. That gives a reliable,
+' purely structural way to recover boolean-ness natively, entirely within
+' this backend's own kind-tracking, with zero changes to the shared pass.
+FUNCTION Fission_X86_64OperandIsBoolLiteral(operand)
+    RETURN operand == "1" ORELSE operand == "0"
+END FUNCTION
+
+' Bool behaves exactly like Number everywhere in this backend EXCEPT one
+' place: PRINT's own dispatch (see Fission_X86_64LowerFunction's own PRINT
+' handling) -- every other consumption site (branch conditions, array
+' elements, function call arguments) normalizes Bool back to Number via
+' this helper before checking, so a comparison result or a bare TRUE/FALSE
+' literal keeps working everywhere it already did before this kind even
+' existed, and only gains real `TRUE`/`FALSE` rendering when PRINTed
+' directly.
+FUNCTION Fission_X86_64NormalizeNumericKind(kind)
+    IF kind == "Bool" THEN RETURN "Number"
+    RETURN kind
+END FUNCTION
+
 FUNCTION Fission_X86_64OperandKind(kinds, operand)
+    IF Fission_X86_64OperandIsBoolLiteral(operand) THEN RETURN "Bool"
     IF Fission_X86_64IsNumericLiteral(operand) THEN RETURN "Number"
     RETURN Object.Get(kinds, operand, "Number")
 END FUNCTION
@@ -1065,6 +1123,34 @@ FUNCTION Fission_X86_64ArrayPrintSubroutine()
     RETURN lines
 END FUNCTION
 
+' `PRINT` of a genuine Bool-kind value (a comparison result, or a bare
+' TRUE/FALSE literal) -- see Fission_X86_64OperandIsBoolLiteral's own
+' comment for the real bug this closes (the oracle prints `TRUE`/`FALSE`,
+' this backend previously itoa'd the raw 0/1 like any other number). Input
+' in %rax (0 or 1, the same representation itoa_print's own callers
+' already use); writes one of two fixed rodata strings depending on the
+' runtime value, real branching since a comparison's own outcome is not
+' generally known at compile time.
+FUNCTION Fission_X86_64BoolPrintSubroutine()
+    lines = [
+        "bool_print:",
+        "    test %rax, %rax",
+        "    jz .Lboolprint_false",
+        "    lea bool_true_text(%rip), %rsi",
+        "    mov $5, %rdx",
+        "    jmp .Lboolprint_write",
+        ".Lboolprint_false:",
+        "    lea bool_false_text(%rip), %rsi",
+        "    mov $6, %rdx",
+        ".Lboolprint_write:",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    syscall",
+        "    ret"
+    ]
+    RETURN lines
+END FUNCTION
+
 ' Lowers one function (Main or a real user-declared one) to GAS text.
 ' `labelPrefix` is "" for Main (matches this backend's earlier, already-
 ' tested Phase 1/2 output exactly -- Main's blocks stay bare) and
@@ -1196,7 +1282,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 nonNumericItem = ""
                 FOR item IN items
                     IF Fission_X86_64OperandIsResolvable(offsets, item) == FALSE THEN unresolvedItem = item
-                    IF Fission_X86_64OperandKind(kinds, item) != "Number" THEN nonNumericItem = item
+                    IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, item)) != "Number" THEN nonNumericItem = item
                 NEXT
                 IF unresolvedItem != "" THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Array element is not supported by native x86-64 codegen: " + unresolvedItem)
@@ -1263,7 +1349,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Indexing a non-array value is not supported by native x86-64 codegen: " + name)
                     CONTINUE FOR
                 END IF
-                IF Fission_X86_64OperandKind(kinds, value) != "Number" THEN
+                IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, value)) != "Number" THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports numeric array elements: " + value)
                     CONTINUE FOR
                 END IF
@@ -1321,7 +1407,14 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     context.UsesStrEquals = TRUE
                     CONTINUE FOR
                 END IF
-                IF leftKind != "Number" ORELSE rightKind != "Number" THEN
+                ' Bool is normalized to Number here -- a comparison result
+                ' or bare TRUE/FALSE feeding an ordinary arithmetic/
+                ' bitwise/comparison BinOp (e.g. `x > 0 AND y > 0`, both
+                ' operands genuine Bool-kind since Fission_X86_64Operand
+                ' IsBoolLiteral/the comparison-dest-kind fix) is perfectly
+                ' ordinary numeric usage as far as codegen is concerned;
+                ' only PRINT ever distinguishes Bool from Number.
+                IF Fission_X86_64NormalizeNumericKind(leftKind) != "Number" ORELSE Fission_X86_64NormalizeNumericKind(rightKind) != "Number" THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Operating on a non-numeric value is not supported by native x86-64 codegen: " + left + ", " + right)
                     CONTINUE FOR
                 END IF
@@ -1341,7 +1434,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Branching on an unsupported condition is not supported by native x86-64 codegen: " + condition)
                     CONTINUE FOR
                 END IF
-                IF Fission_X86_64OperandKind(kinds, condition) != "Number" THEN
+                IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, condition)) != "Number" THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Branching on a string value is not supported by native x86-64 codegen: " + condition)
                     CONTINUE FOR
                 END IF
@@ -1373,11 +1466,17 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rdi"))
                     ignored = Array.Push(textLines, "    call str_print")
                     context.UsesStrPrint = TRUE
-                ELSE
-                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rax"))
-                    ignored = Array.Push(textLines, "    call itoa_print")
-                    context.UsesItoa = TRUE
+                    CONTINUE FOR
                 END IF
+                IF printKind == "Bool" THEN
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rax"))
+                    ignored = Array.Push(textLines, "    call bool_print")
+                    context.UsesBoolPrint = TRUE
+                    CONTINUE FOR
+                END IF
+                ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rax"))
+                ignored = Array.Push(textLines, "    call itoa_print")
+                context.UsesItoa = TRUE
                 CONTINUE FOR
             END IF
             isLenCall = kind == "Call" ANDALSO instruction.Field("Callee") == "LEN"
@@ -1415,7 +1514,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 argPosition = 0
                 FOR arg IN args
                     IF Fission_X86_64OperandIsResolvable(offsets, arg) == FALSE THEN unresolvedArg = arg
-                    argKind = Fission_X86_64OperandKind(kinds, arg)
+                    argKind = Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, arg))
                     ' Real inter-procedural inference (Fission_X86_64
                     ' InferSignatures) means a Number/String argument now
                     ' genuinely just needs to match whatever kind the
@@ -1429,7 +1528,11 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ' converged kind (not just "not Number") is real
                     ' polymorphism this backend cannot represent -- a
                     ' parameter has exactly one physical kind -- reported
-                    ' as its own diagnostic rather than guessed at.
+                    ' as its own diagnostic rather than guessed at. Bool is
+                    ' normalized to Number here (a boolean argument is a
+                    ' perfectly ordinary Number-kind parameter as far as
+                    ' this backend's own signature inference is concerned;
+                    ' only PRINT ever distinguishes Bool from Number).
                     IF argKind == "Array" THEN arrayArg = arg
                     IF argKind != "Array" ANDALSO argPosition < LEN(calleeParamKinds) THEN
                         IF argKind != calleeParamKinds[argPosition] THEN mismatchedArg = arg
@@ -1537,7 +1640,7 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
-    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE}
+    context = {RodataLines: [], StringCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesBoolPrint: FALSE}
     ' Real inter-procedural string-parameter/return-value inference, run
     ' to a full fixed point BEFORE any real emission -- see
     ' Fission_X86_64InferSignatures' own header comment. Every function's
@@ -1604,6 +1707,11 @@ FUNCTION Fission_AmirToX86_64(amirModule)
             ignored = Array.Push(allTextLines, line)
         NEXT
     END IF
+    IF context.UsesBoolPrint THEN
+        FOR line IN Fission_X86_64BoolPrintSubroutine()
+            ignored = Array.Push(allTextLines, line)
+        NEXT
+    END IF
 
     ignored = program.Diagnostics.AppendMany(amirModule.Diagnostics)
 
@@ -1619,6 +1727,12 @@ FUNCTION Fission_AmirToX86_64(amirModule)
         ignored = Array.Push(rodataLines, "    .ascii \", \"")
         ignored = Array.Push(rodataLines, "array_print_close:")
         ignored = Array.Push(rodataLines, "    .ascii \"]\\n\"")
+    END IF
+    IF context.UsesBoolPrint THEN
+        ignored = Array.Push(rodataLines, "bool_true_text:")
+        ignored = Array.Push(rodataLines, "    .ascii \"TRUE\\n\"")
+        ignored = Array.Push(rodataLines, "bool_false_text:")
+        ignored = Array.Push(rodataLines, "    .ascii \"FALSE\\n\"")
     END IF
 
     lines = ["    .section .rodata"]
