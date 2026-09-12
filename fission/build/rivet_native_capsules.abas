@@ -46,3 +46,20 @@ FUNCTION Fission_RivetBuildAllNativeCapsules(compilerTarget)
     NEXT
     RETURN targets
 END FUNCTION
+
+' The Arcology Fusion Linker's own standalone CLI (fission/cli/fusion.abas)
+' -- a genuinely separate, directly invocable program, not just an
+' in-process function fission/cli/compile_to_x86_64.abas happens to call
+' (see that CLI's own header comment). An ordinary ArcoCapsule, the same
+' shape every other first-party Fission CLI tool in this build already
+' uses -- Fusion needs no bytecode-VM-embedding or native-codegen
+' machinery of its OWN to build itself, it's a plain ArcoBASIC program
+' compiled the normal way, same as ArcoFission/rivet/fissure already are.
+FUNCTION Fission_RivetBuildFusionCli(compilerTarget)
+    target = BUILD.ArcoCapsule("fusion")
+    target.Entry = "fission/cli/fusion.abas"
+    target.OutputDirectory = "build"
+    ignored = target.UseCompilerTarget(compilerTarget)
+    ignored = target.Build()
+    RETURN target
+END FUNCTION

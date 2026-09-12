@@ -1,17 +1,17 @@
-' A real, self-contained x86-64 instruction encoder and minimal ELF64
-' executable writer, ported (as a real ArcoBASIC implementation, per this
-' project's own "First-party Fission implementation should be ArcoBASIC
-' wherever technically possible" rule) from the byte-level encoding
-' techniques legacy ArcoFission itself already proved out
-' (systems::x86_64::Assembler, arcology-os/include/arco/x86_64_encoder.hpp
-' -- REX-prefix/ModRM/SIB bit patterns verified there against `nasm -f bin`
-' output). This exists specifically because Arcology is meant to be a
-' self-contained ecosystem: this substrate's native x86-64 backend
-' previously rendered GAS assembly TEXT and shelled out to the system
-' `as`/`ld` toolchain to reach a final ELF64 -- a real external-tool
-' dependency for something as central as "compile ArcoBASIC to a native
-' executable," called out directly by the project owner ("we're passing
-' stuff to GAS... port the machine code gen from legacy fission").
+' A real, self-contained x86-64 instruction ENCODER, ported (as a real
+' ArcoBASIC implementation, per this project's own "First-party Fission
+' implementation should be ArcoBASIC wherever technically possible" rule)
+' from the byte-level encoding techniques legacy ArcoFission itself
+' already proved out (systems::x86_64::Assembler, arcology-os/include/
+' arco/x86_64_encoder.hpp -- REX-prefix/ModRM/SIB bit patterns verified
+' there against `nasm -f bin` output). This exists specifically because
+' Arcology is meant to be a self-contained ecosystem: this substrate's
+' native x86-64 backend previously rendered GAS assembly TEXT and shelled
+' out to the system `as`/`ld` toolchain to reach a final ELF64 -- a real
+' external-tool dependency for something as central as "compile ArcoBASIC
+' to a native executable," called out directly by the project owner
+' ("we're passing stuff to GAS... port the machine code gen from legacy
+' fission").
 '
 ' A genuinely useful finding while scoping this: legacy ArcoFission's OWN
 ' Linux native backend also ends up shelling out to `as`/`ld` for the final
@@ -20,13 +20,7 @@
 ' (used directly by its JIT), then gets rendered BACK to GAS text and
 ' handed to `as`/`ld` for two things it explicitly declined to reimplement:
 ' resolving calls into an external runtime shim, and general ELF section
-' layout/alignment. Fission's own situation is simpler than legacy's
-' general-purpose one: every callee this backend ever emits (user
-' functions, str_print/itoa_print/array_alloc/etc.) lives in the SAME
-' translation unit -- there is no external symbol to resolve at all, only
-' internal labels whose final addresses this same file computes -- so a
-' real ELF64 writer here needs no general relocation/linking machinery,
-' just a standard two-pass "encode with placeholders, then patch" scheme.
+' layout/alignment.
 '
 ' Scope: exactly the ~40 instruction mnemonics/operand shapes
 ' fission/amir/lower_x86_64.abas's own codegen actually emits (confirmed
@@ -40,14 +34,35 @@
 ' every instruction's own byte length is known immediately during a single
 ' encoding pass, with no iterative relaxation needed at all.
 '
+' This file's own job ends at producing a real, independent FRAGMENT (see
+' fission/amir/x86_64_fragment.abas) -- text/rodata bytes, a symbol table,
+' and a relocation list -- not a final ELF64 executable. That used to be
+' one combined pass (encode text, then immediately resolve every label's
+' own final virtual address and write the ELF64 header), but the encoder
+' and the linker are genuinely separate concerns: encoding an instruction
+' needs no idea what the FINAL address of anything will be, and linking
+' needs no idea how any individual instruction got encoded. Splitting them
+' -- requested directly by the project owner -- means a real, independent
+' object-file format (fragments) and a real, separately-named linker
+' (fission/amir/fusion_linker.abas, "The Arcology Fusion Linker") now
+' exist, setting up for genuine per-file incremental native compilation
+' later (each ArcoBASIC file compiles to its own cached fragment once,
+' only the final link step re-runs when something changes -- the same
+' "why rebuild" causality Rivet already proved for C++). This file itself
+' needed NO changes to its own instruction-encoding logic at all for this
+' split -- only its own driver function (Fission_X86_64AssembleFragment,
+' at the bottom of this file) changed, from "resolve+write the final
+' ELF64" to "package up what was encoded into a fragment and hand it to
+' whoever asked for it."
+'
 ' fission/amir/lower_x86_64.abas's OWN codegen logic (which A-MIR
-' instruction becomes which x86 operation) is completely unchanged by this
-' file -- it still renders the exact same text lines as before; this file
-' just parses that text (a small, fully self-defined dialect, not general
-' GAS syntax) into real machine code bytes and a real ELF64 file, replacing
-' fission/cli/compile_to_x86_64.abas's own `as`/`ld` shell-outs.
+' instruction becomes which x86 operation) is completely unchanged by any
+' of this -- it still renders the exact same text lines as always; this
+' file just parses that text (a small, fully self-defined dialect, not
+' general GAS syntax) into real machine code bytes.
 
 #IMPORT "fission/core/diagnostics.abas"
+#IMPORT "fission/amir/x86_64_fragment.abas"
 
 FUNCTION Fission_X86_64AsmRegisterIndex(name)
     table = {rax: 0, rcx: 1, rdx: 2, rbx: 3, rsp: 4, rbp: 5, rsi: 6, rdi: 7,
@@ -78,99 +93,12 @@ FUNCTION Fission_X86_64AsmParseRegisterToken(token)
     RETURN NULL
 END FUNCTION
 
-' A growing byte buffer plus the two-pass bookkeeping (labels and pending
-' fixups) a real assembler needs. `SELF.Bytes` holds every byte emitted so
-' far as a plain Number (0-255) array -- File.WriteBytes' own expected
-' shape.
-CLASS FissionX86_64Buffer
-    CONSTRUCTOR()
-        SELF.Bytes = []
-    END CONSTRUCTOR
-
-    FUNCTION Length()
-        RETURN LEN(SELF.Bytes)
-    END FUNCTION
-
-    FUNCTION EmitByte(value)
-        ignored = Array.Push(SELF.Bytes, value)
-        RETURN SELF
-    END FUNCTION
-
-    ' Little-endian, wrapping a negative value into its real two's-complement
-    ' 32-bit unsigned bit pattern first -- every displacement this backend
-    ' ever needs (a backward jump, a negative stack-slot offset) is a
-    ' genuine negative number until this point.
-    FUNCTION EmitU32(value)
-        v = value
-        IF v < 0 THEN v = v + 4294967296
-        ignored = SELF.EmitByte(v BITAND 255)
-        ignored = SELF.EmitByte((v SHR 8) BITAND 255)
-        ignored = SELF.EmitByte((v SHR 16) BITAND 255)
-        ignored = SELF.EmitByte((v SHR 24) BITAND 255)
-        RETURN SELF
-    END FUNCTION
-
-    ' Every literal immediate this backend's own codegen ever emits (loop
-    ' counters, ASCII codes, small user constants, syscall numbers) fits
-    ' comfortably in a signed 32-bit range -- confirmed by inventorying
-    ' every real fission/tests/native_programs/*.abas fixture's own
-    ' rendered assembly, not assumed -- so `mov $N, %reg64` always uses the
-    ' short REX.W C7 /0 id form (7 bytes: sign-extends the imm32 into the
-    ' full 64-bit register), matching exactly what `as` itself would have
-    ' chosen for these same values. A value outside that range falls back
-    ' to the full 10-byte REX.W B8+rd io form instead of silently
-    ' truncating it.
-    FUNCTION EmitU64Full(value)
-        v = value
-        IF v < 0 THEN v = v + 18446744073709551616
-        remaining = v
-        index = 0
-        WHILE index < 8
-            ignored = SELF.EmitByte(remaining BITAND 255)
-            remaining = remaining SHR 8
-            index = index + 1
-        WEND
-        RETURN SELF
-    END FUNCTION
-
-    ' Patches 4 bytes at `offset` in-place (used once every label's final
-    ' address is known) -- the same little-endian/two's-complement wrapping
-    ' EmitU32 does, just writing into an already-emitted position instead
-    ' of appending.
-    FUNCTION PatchU32(offset, value)
-        v = value
-        IF v < 0 THEN v = v + 4294967296
-        SELF.Bytes[offset] = v BITAND 255
-        SELF.Bytes[offset + 1] = (v SHR 8) BITAND 255
-        SELF.Bytes[offset + 2] = (v SHR 16) BITAND 255
-        SELF.Bytes[offset + 3] = (v SHR 24) BITAND 255
-        RETURN SELF
-    END FUNCTION
-
-    ' Little-endian 2-byte and 8-byte emission -- needed only for the
-    ' ELF64 header/program-header fields (e_type, e_entry, p_vaddr, ...),
-    ' never for real instruction encoding, which is always 32-bit-or-
-    ' narrower per this backend's own "always the widest SAFE, not
-    ' arbitrarily wide, form" rule.
-    FUNCTION EmitU16(value)
-        v = value
-        IF v < 0 THEN v = v + 65536
-        ignored = SELF.EmitByte(v BITAND 255)
-        ignored = SELF.EmitByte((v SHR 8) BITAND 255)
-        RETURN SELF
-    END FUNCTION
-
-    FUNCTION EmitU64(value)
-        remaining = value
-        index = 0
-        WHILE index < 8
-            ignored = SELF.EmitByte(remaining BITAND 255)
-            remaining = remaining SHR 8
-            index = index + 1
-        WEND
-        RETURN SELF
-    END FUNCTION
-END CLASS
+' FissionX86_64Buffer itself now lives in fission/amir/x86_64_fragment.abas
+' (imported above) -- a real, growing byte buffer plus little-endian
+' Emit*/PatchU32 helpers, unchanged in every particular from before this
+' file was split, just relocated to the lowest-level file in this
+' backend's own dependency graph so fission/amir/fusion_linker.abas can
+' use it too without depending on this encoder at all.
 
 FUNCTION Fission_X86_64AsmFitsSigned32(value)
     RETURN value >= -2147483648 ANDALSO value <= 2147483647
@@ -759,39 +687,24 @@ FUNCTION Fission_X86_64AsmSplitMnemonic(trimmedLine)
     RETURN {Mnemonic: mnemonic, OperandsText: rest}
 END FUNCTION
 
-' A label's own final virtual address, given which section defined it and
-' that section's own base offset within the combined text+rodata+bss
-' region -- -1 if `name` was never defined anywhere (a real, reported
-' diagnostic at the call site, not a silently wrong jump target).
-FUNCTION Fission_X86_64AsmResolveVaddr(textLabels, rodataLabels, bssLabels, baseVaddr, headerSize, textLen, rodataLen, name)
-    IF Object.Has(textLabels, name) THEN RETURN baseVaddr + headerSize + Object.Get(textLabels, name, 0)
-    IF Object.Has(rodataLabels, name) THEN RETURN baseVaddr + headerSize + textLen + Object.Get(rodataLabels, name, 0)
-    IF Object.Has(bssLabels, name) THEN RETURN baseVaddr + headerSize + textLen + rodataLen + Object.Get(bssLabels, name, 0)
-    RETURN -1
-END FUNCTION
-
-' The real assembler entry point: parses `assemblyText` (the exact text
+' The real encoder entry point: parses `assemblyText` (the exact text
 ' fission/amir/lower_x86_64.abas's own Fission_AmirToX86_64 already
 ' produces -- this backend's own self-defined dialect, not general GAS)
-' into real machine code and links it into a real minimal ELF64
-' executable, with NO external `as`/`ld` involvement at all. Two real
-' passes: the first walks every line in source order, encoding .text
-' instructions into real bytes immediately (using a placeholder 0 for any
-' rel32/RIP-relative field whose target is a label -- a real fixup is
-' recorded instead) and accumulating .rodata bytes / .bss size, while
-' recording every label's own LOCAL offset within its own section; the
-' second, once every section's final length is known, resolves each
-' recorded fixup's target label to a real virtual address and patches the
-' placeholder in place. Returns {Ok, Bytes, Diagnostics}; `Bytes` is a
-' plain array of byte values (0-255), File.WriteBytes' own expected shape.
-FUNCTION Fission_X86_64Assemble(assemblyText)
+' into real machine code, packaged as a real, independent FRAGMENT (see
+' fission/amir/x86_64_fragment.abas) -- text/rodata bytes, every label
+' this text DEFINES as a real symbol, and every rel32/RIP-relative 4-byte
+' field left as a zero placeholder recorded as a real relocation naming
+' its own target label. This function does NOT resolve any label to a
+' final address or write anything ELF-shaped at all -- that is
+' fission/amir/fusion_linker.abas's own job (The Arcology Fusion Linker),
+' entirely separate from instruction encoding. Returns
+' {Ok, Fragment, Diagnostics}.
+FUNCTION Fission_X86_64AssembleFragment(assemblyText)
     diagnostics = FissionDiagnosticBag()
     textBuffer = FissionX86_64Buffer()
     rodataBuffer = FissionX86_64Buffer()
     textFixups = []
-    textLabels = {}
-    rodataLabels = {}
-    bssLabels = {}
+    symbols = []
     bssOffset = 0
     currentSection = "text"
 
@@ -802,9 +715,9 @@ FUNCTION Fission_X86_64Assemble(assemblyText)
         IF isLabel THEN
             trimmed = String.Trim(rawLine)
             name = String.Slice(trimmed, 0, String.Length(trimmed) - 1)
-            IF currentSection == "text" THEN textLabels = Object.Set(textLabels, name, textBuffer.Length())
-            IF currentSection == "rodata" THEN rodataLabels = Object.Set(rodataLabels, name, rodataBuffer.Length())
-            IF currentSection == "bss" THEN bssLabels = Object.Set(bssLabels, name, bssOffset)
+            IF currentSection == "text" THEN ignored = Array.Push(symbols, {Name: name, Section: "text", Offset: textBuffer.Length()})
+            IF currentSection == "rodata" THEN ignored = Array.Push(symbols, {Name: name, Section: "rodata", Offset: rodataBuffer.Length()})
+            IF currentSection == "bss" THEN ignored = Array.Push(symbols, {Name: name, Section: "bss", Offset: bssOffset})
             CONTINUE FOR
         END IF
 
@@ -854,73 +767,20 @@ FUNCTION Fission_X86_64Assemble(assemblyText)
         ignored = Fission_X86_64AsmEncodeInstruction(textBuffer, textFixups, diagnostics, mnemonic, operandTokens)
     NEXT
 
-    IF diagnostics.HasErrors() THEN RETURN {Ok: FALSE, Bytes: [], Diagnostics: diagnostics}
+    IF diagnostics.HasErrors() THEN RETURN {Ok: FALSE, Fragment: NULL, Diagnostics: diagnostics}
 
-    ' A minimal, statically-linked, non-PIE ELF64 executable: a fixed
-    ' virtual load base (0x400000, the same conventional default `ld`
-    ' itself uses for a non-PIE Linux x86-64 executable) with ONE PT_LOAD
-    ' segment covering the whole file (headers + .text + .rodata) plus a
-    ' zero-filled tail beyond the file's own length for .bss (p_memsz >
-    ' p_filesz is explicitly legal ELF -- the kernel zero-fills the
-    ' difference itself, no file bytes needed for .bss at all). No section
-    ' headers at all (e_shnum=0) -- execve/the kernel loader only ever
-    ' reads program headers, and this substrate has no other tool that
-    ' would need section headers to inspect this file either.
-    headerSize = 120
-    baseVaddr = 4194304
-    textLen = textBuffer.Length()
-    rodataLen = rodataBuffer.Length()
-
+    ' Every fixup this pass recorded (Fission_X86_64AsmEncodeInstruction's
+    ' own {FieldOffset, Target} shape, added the moment a jmp/call/lea
+    ' needed a label it can't yet resolve) becomes a real relocation --
+    ' always Section "text" here, since every rel32/RIP-relative field
+    ' this backend's own codegen ever emits lives in .text (see
+    ' fission/amir/x86_64_fragment.abas's own header comment on why that's
+    ' sound, modeled generally rather than assumed forever).
+    relocations = []
     FOR fixup IN textFixups
-        targetVaddr = Fission_X86_64AsmResolveVaddr(textLabels, rodataLabels, bssLabels, baseVaddr, headerSize, textLen, rodataLen, fixup.Target)
-        IF targetVaddr < 0 THEN
-            ignored = diagnostics.ReportError("FISSION_X86_64_ASM_UNSUPPORTED", "Undefined label referenced by the self-contained assembler: " + fixup.Target)
-            CONTINUE FOR
-        END IF
-        instructionEndVaddr = baseVaddr + headerSize + fixup.FieldOffset + 4
-        ignored = textBuffer.PatchU32(fixup.FieldOffset, targetVaddr - instructionEndVaddr)
-    NEXT
-    IF diagnostics.HasErrors() THEN RETURN {Ok: FALSE, Bytes: [], Diagnostics: diagnostics}
-
-    entryVaddr = baseVaddr + headerSize
-    fileSize = headerSize + textLen + rodataLen
-
-    elf = FissionX86_64Buffer()
-    ' e_ident: magic, ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_SYSV,
-    ' ABI version, 7 bytes padding.
-    identBytes = [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    FOR b IN identBytes
-        ignored = elf.EmitByte(b)
-    NEXT
-    ignored = elf.EmitU16(2)
-    ignored = elf.EmitU16(62)
-    ignored = elf.EmitU32(1)
-    ignored = elf.EmitU64(entryVaddr)
-    ignored = elf.EmitU64(64)
-    ignored = elf.EmitU64(0)
-    ignored = elf.EmitU32(0)
-    ignored = elf.EmitU16(64)
-    ignored = elf.EmitU16(56)
-    ignored = elf.EmitU16(1)
-    ignored = elf.EmitU16(0)
-    ignored = elf.EmitU16(0)
-    ignored = elf.EmitU16(0)
-
-    ignored = elf.EmitU32(1)
-    ignored = elf.EmitU32(7)
-    ignored = elf.EmitU64(0)
-    ignored = elf.EmitU64(baseVaddr)
-    ignored = elf.EmitU64(baseVaddr)
-    ignored = elf.EmitU64(fileSize)
-    ignored = elf.EmitU64(fileSize + bssOffset)
-    ignored = elf.EmitU64(4096)
-
-    FOR b IN textBuffer.Bytes
-        ignored = elf.EmitByte(b)
-    NEXT
-    FOR b IN rodataBuffer.Bytes
-        ignored = elf.EmitByte(b)
+        ignored = Array.Push(relocations, {Section: "text", FieldOffset: fixup.FieldOffset, Target: fixup.Target})
     NEXT
 
-    RETURN {Ok: TRUE, Bytes: elf.Bytes, Diagnostics: diagnostics}
+    fragment = FissionX86_64Fragment(textBuffer.Bytes, rodataBuffer.Bytes, bssOffset, symbols, relocations)
+    RETURN {Ok: TRUE, Fragment: fragment, Diagnostics: diagnostics}
 END FUNCTION

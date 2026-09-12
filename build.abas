@@ -165,6 +165,7 @@ FissionModules = Fission_RivetBuildDefaultModules(ArcoFission)
 FissionTestCapsules = Fission_RivetBuildAllTestCapsules(ArcoFission)
 FissionSubstrateCapsules = Fission_RivetBuildAllSubstrateCapsules(ArcoFission)
 FissionNativeCapsules = Fission_RivetBuildAllNativeCapsules(ArcoFission)
+FissionFusionCli = Fission_RivetBuildFusionCli(ArcoFission)
 
 ArcoCli = BUILD.Executable("arco_cli")
 ArcoCli.OutputDirectory = "build-rivet"

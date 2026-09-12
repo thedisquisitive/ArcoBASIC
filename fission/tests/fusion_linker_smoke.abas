@@ -1,0 +1,91 @@
+#IMPORT "fission/amir/x86_64_fragment.abas"
+#IMPORT "fission/amir/x86_64_assembler.abas"
+#IMPORT "fission/amir/fusion_linker.abas"
+
+' The Arcology Fusion Linker's own regression coverage -- checks Fusion's
+' real, distinguishing behavior directly (multi-fragment linking, real
+' cross-fragment symbol resolution, real diagnostics for a duplicate or
+' undefined symbol, and real fragment serialization round-tripping through
+' actual bytes), separately from fission/tests/amir_x86_64_smoke.abas's
+' own coverage of the ENCODER (instruction-level correctness) and
+' fission/tests/native_programs/*.abas's own real-execution coverage of a
+' full ArcoBASIC-program compile. A genuine cross-fragment link (one
+' fragment's own `call` referencing a label only ANOTHER fragment defines)
+' was verified via real execution directly during this work (two
+' hand-assembled cooperating fragments, linked together, actually run,
+' printing the one fragment's own rodata string through a `call` the
+' other fragment made) -- this file checks the same real mechanics
+' structurally (Ok/Diagnostics), matching this whole session's own
+' established split between "real execution proof" (done directly,
+' verified once) and "permanent structural regression coverage" (this
+' file, run every time).
+
+FUNCTION FissionFusionSmoke_FragmentA()
+    text = "    .section .rodata" + "\n" + "    .section .text" + "\n" + "    .globl _start" + "\n" + "_start:" + "\n" + "    call Helper" + "\n" + "    mov $60, %rax" + "\n" + "    xor %rdi, %rdi" + "\n" + "    syscall"
+    RETURN Fission_X86_64AssembleFragment(text)
+END FUNCTION
+
+FUNCTION FissionFusionSmoke_FragmentB()
+    text = "    .section .rodata" + "\n" + "msg:" + "\n" + "    .asciz \"cross-fragment OK\\n\"" + "\n" + "    .section .text" + "\n" + "Helper:" + "\n" + "    lea msg(%rip), %rsi" + "\n" + "    mov $18, %rdx" + "\n" + "    mov $1, %rax" + "\n" + "    mov $1, %rdi" + "\n" + "    syscall" + "\n" + "    ret"
+    RETURN Fission_X86_64AssembleFragment(text)
+END FUNCTION
+
+' A real, genuine cross-fragment link: Fragment A's own `_start` calls
+' `Helper`, a symbol ONLY Fragment B defines -- Fusion must resolve that
+' relocation against the OTHER fragment's own symbol table, not just its
+' own. Checked here: zero diagnostics, and the final bytes are non-empty
+' (a real ELF64 was actually produced -- real execution of this exact pair
+' was already verified directly, see this file's own header comment).
+assembledA = FissionFusionSmoke_FragmentA()
+PRINT assembledA.Diagnostics.HasErrors()
+assembledB = FissionFusionSmoke_FragmentB()
+PRINT assembledB.Diagnostics.HasErrors()
+linked = Fission_FusionLink([assembledA.Fragment, assembledB.Fragment], "_start")
+PRINT linked.Diagnostics.HasErrors()
+PRINT LEN(linked.Bytes) > 0
+
+' A real fragment serialization round-trip -- write a fragment to real
+' bytes, read them back, and confirm linking the DESERIALIZED fragments
+' produces byte-for-byte identical output to linking the originals
+' directly. This is the real, persistent object-file property the whole
+' point of splitting fragments out as their own format depends on (a
+' cached `.frag` file read back later must link identically to a
+' freshly-compiled one).
+serializedA = Fission_FragmentSerialize(assembledA.Fragment)
+serializedB = Fission_FragmentSerialize(assembledB.Fragment)
+deserializedA = Fission_FragmentDeserialize(serializedA)
+PRINT deserializedA.Diagnostics.HasErrors()
+deserializedB = Fission_FragmentDeserialize(serializedB)
+PRINT deserializedB.Diagnostics.HasErrors()
+relinked = Fission_FusionLink([deserializedA.Fragment, deserializedB.Fragment], "_start")
+PRINT relinked.Diagnostics.HasErrors()
+PRINT Array.Join(relinked.Bytes, ",") == Array.Join(linked.Bytes, ",")
+
+' A genuine "not a real fragment file" is a real, reported diagnostic, not
+' a crash -- confirms Fission_FragmentDeserialize's own magic-byte check.
+notAFragment = Fission_FragmentDeserialize([1, 2, 3, 4, 5])
+PRINT notAFragment.Diagnostics.HasErrors()
+
+' Two fragments defining the SAME symbol name is a real "duplicate
+' symbol" diagnostic -- the same real problem a real linker reports, not
+' silently picking whichever fragment happened to come first.
+dupA = Fission_X86_64AssembleFragment("    .section .text" + "\n" + "Foo:" + "\n" + "    ret")
+dupB = Fission_X86_64AssembleFragment("    .section .text" + "\n" + "Foo:" + "\n" + "    ret")
+dupLinked = Fission_FusionLink([dupA.Fragment, dupB.Fragment], "Foo")
+PRINT dupLinked.Diagnostics.HasErrors()
+
+' A relocation whose own target is never defined by ANY fragment is a
+' real "undefined symbol" diagnostic, not a dangling jump to nowhere.
+undefA = Fission_X86_64AssembleFragment("    .section .text" + "\n" + "_start:" + "\n" + "    call NeverDefined" + "\n" + "    mov $60, %rax" + "\n" + "    xor %rdi, %rdi" + "\n" + "    syscall")
+undefLinked = Fission_FusionLink([undefA.Fragment], "_start")
+PRINT undefLinked.Diagnostics.HasErrors()
+
+' The final entry symbol itself must also be defined by some fragment --
+' a real diagnostic, not silently entering at address 0.
+entryA = Fission_X86_64AssembleFragment("    .section .text" + "\n" + "SomethingElse:" + "\n" + "    ret")
+entryLinked = Fission_FusionLink([entryA.Fragment], "_start")
+PRINT entryLinked.Diagnostics.HasErrors()
+
+' Linking zero fragments at all is a real, reported diagnostic too.
+emptyLinked = Fission_FusionLink([], "_start")
+PRINT emptyLinked.Diagnostics.HasErrors()

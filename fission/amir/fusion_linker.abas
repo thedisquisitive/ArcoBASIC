@@ -1,0 +1,212 @@
+' The Arcology Fusion Linker -- Fission's own real, self-contained linker,
+' replacing the system `ld` for native x86-64 codegen (the second half of
+' the original fission/amir/x86_64_assembler.abas, split out here once it
+' became clear the encoder and the linker are genuinely separate concerns
+' -- named directly by the project owner, along with "fragments" for the
+' object-file format it links, fission/amir/x86_64_fragment.abas).
+'
+' Real linking, not a single-fragment special case dressed up as one:
+' `Fission_FusionLink` takes an ARRAY of one or more fragments (each
+' independently produced -- see fission/amir/x86_64_assembler.abas's own
+' `Fission_X86_64AssembleFragment`, or read back from a real `.frag` file
+' via fission/amir/x86_64_fragment.abas's own Fission_FragmentDeserialize)
+' and a real entry SYMBOL NAME (not hardcoded to "_start" -- Fusion itself
+' has no opinion about which symbol starts the program, that is a decision
+' the caller makes), and produces one final, real ELF64 executable. Every
+' fragment's own text bytes are concatenated (in the order given) into one
+' combined `.text`, then every fragment's own rodata into one combined
+' `.rodata`, then every fragment's own bss size summed -- exactly the
+' "sections come from possibly many object files, laid out end to end"
+' shape a real linker's job always is, just genuinely simple here since
+' this backend's own programs need only one segment, no dynamic linking,
+' and no general relocation types beyond "patch this rel32/RIP-relative
+' 4-byte field once its target's final address is known" (see
+' fission/amir/x86_64_fragment.abas's own header comment for why that
+' scope is sound for everything this backend's own codegen produces).
+'
+' A genuine cross-fragment symbol reference -- a relocation in one
+' fragment naming a symbol only ANOTHER fragment defines -- is resolved
+' here exactly the same way an in-fragment one is (there is no special
+' case for "external" vs "local" relocations at all, matching how a real
+' linker's own symbol table doesn't care which .o a definition came from
+' either): every fragment's own DEFINED symbols are merged into one global
+' table (a genuine, reported diagnostic if two fragments define the same
+' name -- a real "duplicate symbol" error, not silently picking one), then
+' every fragment's own relocations are resolved against that whole table
+' regardless of which fragment the target happens to live in. Today's
+' callers only ever pass a single fragment (this backend still compiles
+' one ArcoBASIC program as one translation unit), but Fusion itself makes
+' no such assumption -- multi-fragment linking is exercised directly by
+' fission/tests/fusion_linker_smoke.abas, proving the real cross-fragment
+' case works before anything in this substrate actually needs it for real
+' per-file incremental native compilation.
+#IMPORT "fission/core/diagnostics.abas"
+#IMPORT "fission/amir/x86_64_fragment.abas"
+
+' Every fragment's own base OFFSET within its own section once all
+' fragments are laid out end to end, in the given order -- fragment i's
+' own text starts right after fragment i-1's own text ends, and so on for
+' rodata/bss independently. Returns {TextBases, RodataBases, BssBases}
+' (one array per section, one entry per fragment, same order as `fragments`)
+' plus the three grand totals.
+FUNCTION Fission_FusionLayout(fragments)
+    textBases = []
+    rodataBases = []
+    bssBases = []
+    totalText = 0
+    totalRodata = 0
+    totalBss = 0
+    FOR fragment IN fragments
+        ignored = Array.Push(textBases, totalText)
+        totalText = totalText + LEN(fragment.TextBytes)
+        ignored = Array.Push(rodataBases, totalRodata)
+        totalRodata = totalRodata + LEN(fragment.RodataBytes)
+        ignored = Array.Push(bssBases, totalBss)
+        totalBss = totalBss + fragment.BssSize
+    NEXT
+    RETURN {TextBases: textBases, RodataBases: rodataBases, BssBases: bssBases, TotalText: totalText, TotalRodata: totalRodata, TotalBss: totalBss}
+END FUNCTION
+
+' The global symbol table -- every symbol every fragment defines, resolved
+' to its own final OFFSET within the combined text+rodata+bss region (not
+' yet a real virtual address -- Fusion adds the load base once, right
+' before writing the ELF64, matching how object-file symbol values are
+' section-relative until the final link step). A name defined by more than
+' one fragment is a real, reported diagnostic (`diagnostics`, mutated in
+' place) -- a genuine "duplicate symbol" error, the same real problem a
+' real linker reports for the same reason, not silently picking whichever
+' fragment happened to come first.
+FUNCTION Fission_FusionGlobalSymbols(fragments, layout, diagnostics)
+    globalSymbols = {}
+    fragIndex = 0
+    FOR fragment IN fragments
+        FOR symbol IN fragment.Symbols
+            combinedOffset = 0
+            IF symbol.Section == "text" THEN combinedOffset = layout.TextBases[fragIndex] + symbol.Offset
+            IF symbol.Section == "rodata" THEN combinedOffset = layout.TotalText + layout.RodataBases[fragIndex] + symbol.Offset
+            IF symbol.Section == "bss" THEN combinedOffset = layout.TotalText + layout.TotalRodata + layout.BssBases[fragIndex] + symbol.Offset
+            IF Object.Has(globalSymbols, symbol.Name) THEN
+                ignored = diagnostics.ReportError("FISSION_FUSION_DUPLICATE_SYMBOL", "The Arcology Fusion Linker found a symbol defined by more than one fragment: " + symbol.Name)
+            ELSE
+                globalSymbols = Object.Set(globalSymbols, symbol.Name, combinedOffset)
+            END IF
+        NEXT
+        fragIndex = fragIndex + 1
+    NEXT
+    RETURN globalSymbols
+END FUNCTION
+
+' The real linking entry point. `fragments` is an array of one or more
+' fragments (see fission/amir/x86_64_fragment.abas's own
+' FissionX86_64Fragment); `entrySymbol` is the name of the symbol the
+' final executable's own entry point resolves to (this backend's own
+' native codegen always names it "_start", but Fusion itself has no
+' hardcoded opinion). Returns {Ok, Bytes, Diagnostics} -- the exact same
+' shape fission/amir/x86_64_assembler.abas's own encoder returns, so a
+' caller threading both together barely notices the seam.
+FUNCTION Fission_FusionLink(fragments, entrySymbol)
+    diagnostics = FissionDiagnosticBag()
+    IF LEN(fragments) == 0 THEN
+        ignored = diagnostics.ReportError("FISSION_FUSION_NO_FRAGMENTS", "The Arcology Fusion Linker was given no fragments to link")
+        RETURN {Ok: FALSE, Bytes: [], Diagnostics: diagnostics}
+    END IF
+
+    layout = Fission_FusionLayout(fragments)
+    globalSymbols = Fission_FusionGlobalSymbols(fragments, layout, diagnostics)
+    IF diagnostics.HasErrors() THEN RETURN {Ok: FALSE, Bytes: [], Diagnostics: diagnostics}
+
+    combinedText = FissionX86_64Buffer()
+    FOR fragment IN fragments
+        FOR b IN fragment.TextBytes
+            ignored = combinedText.EmitByte(b)
+        NEXT
+    NEXT
+    combinedRodata = FissionX86_64Buffer()
+    FOR fragment IN fragments
+        FOR b IN fragment.RodataBytes
+            ignored = combinedRodata.EmitByte(b)
+        NEXT
+    NEXT
+
+    ' A minimal, statically-linked, non-PIE ELF64 executable -- a fixed
+    ' virtual load base (0x400000, the same conventional default `ld`
+    ' itself uses for a non-PIE Linux x86-64 executable), one PT_LOAD
+    ' segment covering the whole file (headers + combined .text +
+    ' combined .rodata) plus a zero-filled tail beyond the file's own
+    ' length for the combined `.bss` (p_memsz > p_filesz is explicitly
+    ' legal ELF -- the kernel zero-fills the difference itself). No
+    ' section headers at all (e_shnum=0) -- execve/the kernel loader only
+    ' ever reads program headers, and this substrate has no other tool
+    ' that would need section headers to inspect this file either.
+    headerSize = 120
+    baseVaddr = 4194304
+
+    fragIndex = 0
+    FOR fragment IN fragments
+        FOR relocation IN fragment.Relocations
+            localSectionBase = layout.TextBases[fragIndex]
+            IF relocation.Section == "rodata" THEN localSectionBase = layout.TotalText + layout.RodataBases[fragIndex]
+            fieldOffset = localSectionBase + relocation.FieldOffset
+            IF Object.Has(globalSymbols, relocation.Target) == FALSE THEN
+                ignored = diagnostics.ReportError("FISSION_FUSION_UNDEFINED_SYMBOL", "The Arcology Fusion Linker found an undefined symbol: " + relocation.Target)
+                CONTINUE FOR
+            END IF
+            targetVaddr = baseVaddr + headerSize + Object.Get(globalSymbols, relocation.Target, 0)
+            instructionEndVaddr = baseVaddr + headerSize + fieldOffset + 4
+            patchValue = targetVaddr - instructionEndVaddr
+            IF relocation.Section == "rodata" THEN
+                ignored = combinedRodata.PatchU32(fieldOffset - layout.TotalText, patchValue)
+            ELSE
+                ignored = combinedText.PatchU32(fieldOffset, patchValue)
+            END IF
+        NEXT
+        fragIndex = fragIndex + 1
+    NEXT
+    IF diagnostics.HasErrors() THEN RETURN {Ok: FALSE, Bytes: [], Diagnostics: diagnostics}
+
+    IF Object.Has(globalSymbols, entrySymbol) == FALSE THEN
+        ignored = diagnostics.ReportError("FISSION_FUSION_UNDEFINED_SYMBOL", "The Arcology Fusion Linker's own entry symbol is not defined by any fragment: " + entrySymbol)
+        RETURN {Ok: FALSE, Bytes: [], Diagnostics: diagnostics}
+    END IF
+    entryVaddr = baseVaddr + headerSize + Object.Get(globalSymbols, entrySymbol, 0)
+    fileSize = headerSize + layout.TotalText + layout.TotalRodata
+
+    elf = FissionX86_64Buffer()
+    ' e_ident: magic, ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_SYSV,
+    ' ABI version, 7 bytes padding.
+    identBytes = [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    FOR b IN identBytes
+        ignored = elf.EmitByte(b)
+    NEXT
+    ignored = elf.EmitU16(2)
+    ignored = elf.EmitU16(62)
+    ignored = elf.EmitU32(1)
+    ignored = elf.EmitU64(entryVaddr)
+    ignored = elf.EmitU64(64)
+    ignored = elf.EmitU64(0)
+    ignored = elf.EmitU32(0)
+    ignored = elf.EmitU16(64)
+    ignored = elf.EmitU16(56)
+    ignored = elf.EmitU16(1)
+    ignored = elf.EmitU16(0)
+    ignored = elf.EmitU16(0)
+    ignored = elf.EmitU16(0)
+
+    ignored = elf.EmitU32(1)
+    ignored = elf.EmitU32(7)
+    ignored = elf.EmitU64(0)
+    ignored = elf.EmitU64(baseVaddr)
+    ignored = elf.EmitU64(baseVaddr)
+    ignored = elf.EmitU64(fileSize)
+    ignored = elf.EmitU64(fileSize + layout.TotalBss)
+    ignored = elf.EmitU64(4096)
+
+    FOR b IN combinedText.Bytes
+        ignored = elf.EmitByte(b)
+    NEXT
+    FOR b IN combinedRodata.Bytes
+        ignored = elf.EmitByte(b)
+    NEXT
+
+    RETURN {Ok: TRUE, Bytes: elf.Bytes, Diagnostics: diagnostics}
+END FUNCTION

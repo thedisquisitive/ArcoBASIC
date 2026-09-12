@@ -386,14 +386,14 @@ grep -q "^0$" <<<"$real_project_output"
 
 fission_self_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_parse_smoke")"
 
-grep -q "^92$" <<<"$fission_self_output"
+grep -q "^95$" <<<"$fission_self_output"
 grep -q "^0$" <<<"$fission_self_output"
 
 fission_self_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_fission_self_semantic_smoke")"
 
-grep -q "^92$" <<<"$fission_self_semantic_output"
-grep -q "^140$" <<<"$fission_self_semantic_output"
-grep -q "^3333$" <<<"$fission_self_semantic_output"
+grep -q "^95$" <<<"$fission_self_semantic_output"
+grep -q "^147$" <<<"$fission_self_semantic_output"
+grep -q "^3458$" <<<"$fission_self_semantic_output"
 grep -q "^FALSE$" <<<"$fission_self_semantic_output"
 
 import_semantic_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_semantic_smoke")"

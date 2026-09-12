@@ -1,0 +1,82 @@
+' The Arcology Fusion Linker's own standalone CLI -- Fusion exposed as a
+' genuinely separate, directly invocable program (not just an in-process
+' function fission/cli/compile_to_x86_64.abas happens to call), reading
+' real `.frag` fragment files from disk and linking them into a real
+' ELF64 executable. Requested directly by the project owner alongside the
+' linker itself: "would it be better to make the linker a separate
+' program?" -- yes, and this is that program.
+'
+' Usage: fusion FRAGMENT [FRAGMENT ...] --entry SYMBOL -o OUTPUT
+'
+' Reads one or more `.frag` files (fission/amir/x86_64_fragment.abas's own
+' serialized format -- see Fission_FragmentDeserialize), links them
+' together (a real, reported diagnostic for a duplicate or undefined
+' symbol across fragments, not silently guessed at -- see
+' fission/amir/fusion_linker.abas's own header comment for the full real-
+' linker semantics), and writes the resulting ELF64 to OUTPUT, marked
+' executable. Every fragment named on the command line is linked into ONE
+' combined program -- this is the tool a real per-file cached native
+' compile would eventually call with N fragments once that lands (see
+' fission/amir/fusion_linker.abas's own header comment); today's own
+' compile_to_x86_64.abas driver still calls Fusion in-process with exactly
+' one fragment instead of shelling out to this CLI, to keep that common
+' "compile one file straight to a binary" path free of any subprocess
+' overhead -- this CLI exists for genuinely standalone linking (fed real,
+' possibly hand-authored or previously cached `.frag` files) and, not
+' incidentally, as this session's own real proof that the split into an
+' encoder and Fusion produced two REAL, separately usable programs, not
+' just a nominal refactor of the same in-process call.
+#IMPORT "fission/amir/x86_64_fragment.abas"
+#IMPORT "fission/amir/fusion_linker.abas"
+
+FUNCTION FissionFusionCli_Fail(message)
+    PRINT "FUSION FAILED"
+    PRINT message
+    ignored = Exit(1)
+END FUNCTION
+
+FUNCTION FissionFusionCli_Usage()
+    PRINT "usage: fusion FRAGMENT [FRAGMENT ...] --entry SYMBOL -o OUTPUT"
+    ignored = Exit(2)
+END FUNCTION
+
+appArgs = Runtime.Args()
+fragmentPaths = []
+entrySymbol = ""
+outputPath = ""
+index = 0
+WHILE index < LEN(appArgs)
+    arg = appArgs[index]
+    IF arg == "--entry" THEN
+        IF index + 1 >= LEN(appArgs) THEN ignored = FissionFusionCli_Usage()
+        entrySymbol = appArgs[index + 1]
+        index = index + 2
+        CONTINUE WHILE
+    END IF
+    IF arg == "-o" THEN
+        IF index + 1 >= LEN(appArgs) THEN ignored = FissionFusionCli_Usage()
+        outputPath = appArgs[index + 1]
+        index = index + 2
+        CONTINUE WHILE
+    END IF
+    ignored = Array.Push(fragmentPaths, arg)
+    index = index + 1
+WEND
+
+IF LEN(fragmentPaths) == 0 ORELSE entrySymbol == "" ORELSE outputPath == "" THEN ignored = FissionFusionCli_Usage()
+
+fragments = []
+FOR fragmentPath IN fragmentPaths
+    fragmentBytes = File.ReadBytes(fragmentPath)
+    deserialized = Fission_FragmentDeserialize(fragmentBytes)
+    IF deserialized.Diagnostics.HasErrors() THEN ignored = FissionFusionCli_Fail(fragmentPath + ": " + deserialized.Diagnostics.Render())
+    ignored = Array.Push(fragments, deserialized.Fragment)
+NEXT
+
+linked = Fission_FusionLink(fragments, entrySymbol)
+IF linked.Diagnostics.HasErrors() THEN ignored = FissionFusionCli_Fail(linked.Diagnostics.Render())
+
+ignored = File.WriteBytes(outputPath, linked.Bytes)
+ignored = File.SetExecutable(outputPath)
+
+PRINT "FUSION LINKED " + outputPath

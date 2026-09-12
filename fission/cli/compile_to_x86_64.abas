@@ -1,27 +1,37 @@
 ' Generic file-based Fission Compiler Substrate driver for real native x86-64
 ' output -- no embedded bytecode VM at all (WP-009/013's own "Linux Native
-' Target" composition), and, as of this file's own real self-contained
-' assembler (fission/amir/x86_64_assembler.abas), no external `as`/`ld`
-' toolchain dependency either -- Arcology is meant to be a self-contained
-' ecosystem, and shelling out to GAS for something as central as "compile
-' ArcoBASIC to a native executable" didn't fit that, called out directly by
-' the project owner. Mirrors compile_to_bytecode.abas's own shape and its
-' reason for existing as its own capsule (`ArcoFission compile-run` does not
-' forward script args, confirmed by reading apps/arcofission/main.cpp -- a
-' generic ENTRY/OUTPUT driver has to run with real argv).
+' Target" composition), and, as of fission/amir/x86_64_assembler.abas (the
+' encoder) plus fission/amir/fusion_linker.abas (The Arcology Fusion
+' Linker), no external `as`/`ld` toolchain dependency either -- Arcology is
+' meant to be a self-contained ecosystem, and shelling out to GAS for
+' something as central as "compile ArcoBASIC to a native executable"
+' didn't fit that, called out directly by the project owner. Mirrors
+' compile_to_bytecode.abas's own shape and its reason for existing as its
+' own capsule (`ArcoFission compile-run` does not forward script args,
+' confirmed by reading apps/arcofission/main.cpp -- a generic ENTRY/OUTPUT
+' driver has to run with real argv).
 '
 ' Unlike compile_to_bytecode.abas, this driver produces the FINAL standalone
 ' ELF64 directly in one shot -- Source -> AST -> SIR -> A-MIR -> x86_64
 ' assembly text (this backend's own internal dialect, not general GAS) ->
-' real machine code bytes + a real ELF64 file, entirely in-process, written
-' with File.WriteBytes/File.SetExecutable -- rather than stopping at an
-' intermediate artifact another step packages later, and with zero
-' subprocess invocations anywhere in this path.
+' one real fragment (the encoder) -> Fusion (linked, today, from exactly
+' that one fragment -- this driver still compiles one ArcoBASIC program as
+' one translation unit, real per-file/multi-fragment native compilation is
+' disclosed, unstarted follow-on work fission/amir/fusion_linker.abas's own
+' header comment sets up for) -> a real ELF64 file, entirely in-process,
+' written with File.WriteBytes/File.SetExecutable -- with zero subprocess
+' invocations anywhere in this path (Fusion is called here as an ordinary
+' in-process function, not a separate program invocation, to keep this
+' common "compile one file straight to a binary" path fast; see
+' fission/cli/fusion.abas for Fusion exposed as its own genuinely
+' standalone, separately invocable CLI tool instead, for linking real
+' `.frag` files directly).
 '
 ' Usage: ArcoFission compile-run fission/cli/compile_to_x86_64.abas -- ENTRY OUTPUT
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 #IMPORT "fission/amir/lower_x86_64.abas"
 #IMPORT "fission/amir/x86_64_assembler.abas"
+#IMPORT "fission/amir/fusion_linker.abas"
 
 FUNCTION FissionNativeCli_Fail(stage, message)
     PRINT "FISSION NATIVE COMPILE FAILED at " + stage
@@ -49,10 +59,13 @@ IF amir.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("A-MIR", am
 program = Fission_AmirToX86_64(amir)
 IF program.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("X86_64", program.Diagnostics.Render())
 
-assembled = Fission_X86_64Assemble(program.Render())
+assembled = Fission_X86_64AssembleFragment(program.Render())
 IF assembled.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("ASSEMBLE", assembled.Diagnostics.Render())
 
-ignored = File.WriteBytes(outputPath, assembled.Bytes)
+linked = Fission_FusionLink([assembled.Fragment], "_start")
+IF linked.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("FUSION", linked.Diagnostics.Render())
+
+ignored = File.WriteBytes(outputPath, linked.Bytes)
 ignored = File.SetExecutable(outputPath)
 
 PRINT "NATIVE ELF64 WRITTEN " + outputPath

@@ -1,0 +1,330 @@
+#IMPORT "fission/core/diagnostics.abas"
+
+' The Arcology Fusion Linker's own object-file format: a "fragment" is one
+' independently-produced unit of real machine code -- text/rodata bytes, a
+' `.bss` size, a table of symbols it DEFINES, and a table of relocations
+' (references to symbols it does NOT define, needing patching once every
+' fragment's final address is known). This is the lowest-level file in the
+' native x86-64 backend's own dependency graph -- deliberately no
+' dependency on fission/amir/x86_64_assembler.abas (the instruction
+' encoder, which PRODUCES fragments) or fission/amir/fusion_linker.abas
+' (Fusion, which CONSUMES fragments to link them into a final ELF64) -- so
+' both of those can depend on this one without any risk of a circular
+' import.
+'
+' Splitting the OLD single-pass "encode text directly into a final ELF64"
+' design (fission/amir/x86_64_assembler.abas's own original shape) into a
+' real, separate encoder-produces-fragments / Fusion-links-fragments
+' pipeline, with fragments as real, independently serializable objects (see
+' Fission_FragmentSerialize/Fission_FragmentDeserialize below), sets up for
+' genuine per-file incremental native compilation later: each ArcoBASIC
+' source file could compile to its own cached `.frag` file once, with only
+' the final link step re-running when something actually changes -- the
+' same "why rebuild" causality Rivet already proved for C++ compilation,
+' now extensible to this backend's own native codegen. Requested directly
+' by the project owner, who also named the linker itself ("The Arcology
+' Fusion Linker") and this object format ("fragments").
+'
+' `Symbols` is an array of {Name, Section ("text"|"rodata"|"bss"), Offset}
+' -- every label THIS fragment defines, with its own offset local to that
+' section within just this fragment (Fusion computes each fragment's own
+' base offset within the final combined layout, then adds it in).
+' `Relocations` is an array of {Section, FieldOffset, Target} -- every
+' rel32/RIP-relative 4-byte field this fragment's own machine code left as
+' a zero placeholder, naming the symbol whose final address belongs there
+' (which may be defined in THIS fragment or another one entirely -- from
+' this fragment's own point of view, a relocation's target is always
+' logically "external," even when Fusion happens to resolve it back to a
+' symbol in the same fragment for today's single-fragment programs).
+' `Section` on a relocation is always "text" for everything this backend's
+' own codegen currently produces (rodata here only ever holds string/byte
+' data, never a pointer needing its own patching) -- modeled generally
+' rather than hardcoded, in case that ever changes.
+FUNCTION FissionX86_64Fragment(textBytes, rodataBytes, bssSize, symbols, relocations)
+    RETURN {TextBytes: textBytes, RodataBytes: rodataBytes, BssSize: bssSize, Symbols: symbols, Relocations: relocations}
+END FUNCTION
+
+' A growing byte buffer plus the two-pass bookkeeping (labels and pending
+' fixups) a real assembler needs. `SELF.Bytes` holds every byte emitted so
+' far as a plain Number (0-255) array -- File.WriteBytes' own expected
+' shape.
+CLASS FissionX86_64Buffer
+    CONSTRUCTOR()
+        SELF.Bytes = []
+    END CONSTRUCTOR
+
+    FUNCTION Length()
+        RETURN LEN(SELF.Bytes)
+    END FUNCTION
+
+    FUNCTION EmitByte(value)
+        ignored = Array.Push(SELF.Bytes, value)
+        RETURN SELF
+    END FUNCTION
+
+    ' Little-endian, wrapping a negative value into its real two's-complement
+    ' 32-bit unsigned bit pattern first -- every displacement this backend
+    ' ever needs (a backward jump, a negative stack-slot offset) is a
+    ' genuine negative number until this point.
+    FUNCTION EmitU32(value)
+        v = value
+        IF v < 0 THEN v = v + 4294967296
+        ignored = SELF.EmitByte(v BITAND 255)
+        ignored = SELF.EmitByte((v SHR 8) BITAND 255)
+        ignored = SELF.EmitByte((v SHR 16) BITAND 255)
+        ignored = SELF.EmitByte((v SHR 24) BITAND 255)
+        RETURN SELF
+    END FUNCTION
+
+    ' Every literal immediate this backend's own codegen ever emits (loop
+    ' counters, ASCII codes, small user constants, syscall numbers) fits
+    ' comfortably in a signed 32-bit range -- confirmed by inventorying
+    ' every real fission/tests/native_programs/*.abas fixture's own
+    ' rendered assembly, not assumed -- so `mov $N, %reg64` always uses the
+    ' short REX.W C7 /0 id form (7 bytes: sign-extends the imm32 into the
+    ' full 64-bit register), matching exactly what `as` itself would have
+    ' chosen for these same values. A value outside that range falls back
+    ' to the full 10-byte REX.W B8+rd io form instead of silently
+    ' truncating it.
+    FUNCTION EmitU64Full(value)
+        v = value
+        IF v < 0 THEN v = v + 18446744073709551616
+        remaining = v
+        index = 0
+        WHILE index < 8
+            ignored = SELF.EmitByte(remaining BITAND 255)
+            remaining = remaining SHR 8
+            index = index + 1
+        WEND
+        RETURN SELF
+    END FUNCTION
+
+    ' Patches 4 bytes at `offset` in-place (used once every label's final
+    ' address is known) -- the same little-endian/two's-complement wrapping
+    ' EmitU32 does, just writing into an already-emitted position instead
+    ' of appending.
+    FUNCTION PatchU32(offset, value)
+        v = value
+        IF v < 0 THEN v = v + 4294967296
+        SELF.Bytes[offset] = v BITAND 255
+        SELF.Bytes[offset + 1] = (v SHR 8) BITAND 255
+        SELF.Bytes[offset + 2] = (v SHR 16) BITAND 255
+        SELF.Bytes[offset + 3] = (v SHR 24) BITAND 255
+        RETURN SELF
+    END FUNCTION
+
+    ' Little-endian 2-byte and 8-byte emission -- needed only for the
+    ' ELF64 header/program-header fields (e_type, e_entry, p_vaddr, ...),
+    ' never for real instruction encoding, which is always 32-bit-or-
+    ' narrower per this backend's own "always the widest SAFE, not
+    ' arbitrarily wide, form" rule.
+    FUNCTION EmitU16(value)
+        v = value
+        IF v < 0 THEN v = v + 65536
+        ignored = SELF.EmitByte(v BITAND 255)
+        ignored = SELF.EmitByte((v SHR 8) BITAND 255)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION EmitU64(value)
+        remaining = value
+        index = 0
+        WHILE index < 8
+            ignored = SELF.EmitByte(remaining BITAND 255)
+            remaining = remaining SHR 8
+            index = index + 1
+        WEND
+        RETURN SELF
+    END FUNCTION
+END CLASS
+
+' A simple forward-only cursor for reading a fragment back out of its own
+' serialized bytes -- the read-side counterpart to FissionX86_64Buffer's
+' own write-side Emit* methods, using the exact same little-endian layout.
+CLASS FissionX86_64ByteReader
+    CONSTRUCTOR(bytes)
+        SELF.Bytes = bytes
+        SELF.Position = 0
+    END CONSTRUCTOR
+
+    FUNCTION ReadU8()
+        value = SELF.Bytes[SELF.Position]
+        SELF.Position = SELF.Position + 1
+        RETURN value
+    END FUNCTION
+
+    FUNCTION ReadU32()
+        b0 = SELF.ReadU8()
+        b1 = SELF.ReadU8()
+        b2 = SELF.ReadU8()
+        b3 = SELF.ReadU8()
+        RETURN b0 BITOR (b1 SHL 8) BITOR (b2 SHL 16) BITOR (b3 SHL 24)
+    END FUNCTION
+
+    FUNCTION ReadBytes(count)
+        result = []
+        index = 0
+        WHILE index < count
+            ignored = Array.Push(result, SELF.ReadU8())
+            index = index + 1
+        WEND
+        RETURN result
+    END FUNCTION
+
+    ' A length-prefixed (u32) plain ASCII string -- every name this whole
+    ' format ever stores (a symbol name, a relocation target, a section
+    ' tag) is a plain ArcoBASIC identifier-shaped label (letters, digits,
+    ' `.`, `_`), confirmed sufficient by this same table already covering
+    ' every real label this backend's own codegen produces.
+    FUNCTION ReadString()
+        length = SELF.ReadU32()
+        bytes = SELF.ReadBytes(length)
+        chars = []
+        FOR b IN bytes
+            ignored = Array.Push(chars, Fission_FragmentCharFromCode(b))
+        NEXT
+        RETURN Array.Join(chars, "")
+    END FUNCTION
+END CLASS
+
+' Plain printable-ASCII byte<->character conversion for fragment
+' serialization -- a small, self-contained table deliberately duplicated
+' from (rather than imported from) fission/amir/x86_64_assembler.abas's
+' own Fission_X86_64AsmCharCode, since this file must stay dependency-free
+' of the assembler (see this file's own header comment on the import
+' graph). Every real label/symbol name this backend ever produces is
+' plain ASCII (letters, digits, `.`, `_`), the same range that table
+' already covers.
+FUNCTION Fission_FragmentPrintableTable()
+    RETURN " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+END FUNCTION
+
+FUNCTION Fission_FragmentCharCode(ch)
+    table = String.ToChars(Fission_FragmentPrintableTable())
+    index = 0
+    WHILE index < LEN(table)
+        IF table[index] == ch THEN RETURN 32 + index
+        index = index + 1
+    WEND
+    RETURN 63
+END FUNCTION
+
+FUNCTION Fission_FragmentCharFromCode(code)
+    RETURN String.Slice(Fission_FragmentPrintableTable(), code - 32, 1)
+END FUNCTION
+
+FUNCTION Fission_FragmentWriteString(buffer, text)
+    chars = String.ToChars(text)
+    ignored = buffer.EmitU32(LEN(chars))
+    FOR ch IN chars
+        ignored = buffer.EmitByte(Fission_FragmentCharCode(ch))
+    NEXT
+END FUNCTION
+
+' Real section tags -- a plain 1-byte enum (0/1/2) rather than storing the
+' section NAME string itself in every symbol/relocation record, since a
+' fragment file can hold a great many of both.
+FUNCTION Fission_FragmentSectionTag(section)
+    IF section == "text" THEN RETURN 0
+    IF section == "rodata" THEN RETURN 1
+    RETURN 2
+END FUNCTION
+
+FUNCTION Fission_FragmentSectionFromTag(tag)
+    IF tag == 0 THEN RETURN "text"
+    IF tag == 1 THEN RETURN "rodata"
+    RETURN "bss"
+END FUNCTION
+
+' Serializes `fragment` into a real, self-contained `.frag` file's own
+' bytes -- MAGIC + VERSION, then TEXT/RODATA (length-prefixed byte blocks),
+' the BSS size, then the symbol table and relocation table (each a
+' length-prefixed list of fixed-shape records). Returns a plain array of
+' byte values (0-255), File.WriteBytes' own expected shape, so a fragment
+' can genuinely be written to and read back from disk -- the real,
+' persistent object-file artifact a per-file cached native compile would
+' need later, not just an in-memory convenience shape.
+FUNCTION Fission_FragmentSerialize(fragment)
+    buffer = FissionX86_64Buffer()
+    magicBytes = [70, 82, 65, 71]
+    FOR b IN magicBytes
+        ignored = buffer.EmitByte(b)
+    NEXT
+    ignored = buffer.EmitByte(1)
+
+    ignored = buffer.EmitU32(LEN(fragment.TextBytes))
+    FOR b IN fragment.TextBytes
+        ignored = buffer.EmitByte(b)
+    NEXT
+    ignored = buffer.EmitU32(LEN(fragment.RodataBytes))
+    FOR b IN fragment.RodataBytes
+        ignored = buffer.EmitByte(b)
+    NEXT
+    ignored = buffer.EmitU32(fragment.BssSize)
+
+    ignored = buffer.EmitU32(LEN(fragment.Symbols))
+    FOR symbol IN fragment.Symbols
+        ignored = buffer.EmitByte(Fission_FragmentSectionTag(symbol.Section))
+        ignored = buffer.EmitU32(symbol.Offset)
+        ignored = Fission_FragmentWriteString(buffer, symbol.Name)
+    NEXT
+
+    ignored = buffer.EmitU32(LEN(fragment.Relocations))
+    FOR relocation IN fragment.Relocations
+        ignored = buffer.EmitByte(Fission_FragmentSectionTag(relocation.Section))
+        ignored = buffer.EmitU32(relocation.FieldOffset)
+        ignored = Fission_FragmentWriteString(buffer, relocation.Target)
+    NEXT
+
+    RETURN buffer.Bytes
+END FUNCTION
+
+' The read-side counterpart of Fission_FragmentSerialize -- returns
+' {Ok, Fragment, Diagnostics}, matching this whole backend's own
+' established {Ok, ..., Diagnostics} result shape, rather than throwing on
+' a malformed/foreign file.
+FUNCTION Fission_FragmentDeserialize(bytes)
+    diagnostics = FissionDiagnosticBag()
+    IF LEN(bytes) < 5 ORELSE bytes[0] != 70 ORELSE bytes[1] != 82 ORELSE bytes[2] != 65 ORELSE bytes[3] != 71 THEN
+        ignored = diagnostics.ReportError("FISSION_FRAGMENT_INVALID", "Not a real Arcology Fusion fragment file (bad magic)")
+        RETURN {Ok: FALSE, Fragment: NULL, Diagnostics: diagnostics}
+    END IF
+    reader = FissionX86_64ByteReader(bytes)
+    ignored = reader.ReadBytes(4)
+    version = reader.ReadU8()
+    IF version != 1 THEN
+        ignored = diagnostics.ReportError("FISSION_FRAGMENT_INVALID", "Unsupported Arcology Fusion fragment version: " + String(version))
+        RETURN {Ok: FALSE, Fragment: NULL, Diagnostics: diagnostics}
+    END IF
+
+    textLen = reader.ReadU32()
+    textBytes = reader.ReadBytes(textLen)
+    rodataLen = reader.ReadU32()
+    rodataBytes = reader.ReadBytes(rodataLen)
+    bssSize = reader.ReadU32()
+
+    symbols = []
+    symbolCount = reader.ReadU32()
+    index = 0
+    WHILE index < symbolCount
+        sectionTag = reader.ReadU8()
+        offset = reader.ReadU32()
+        name = reader.ReadString()
+        ignored = Array.Push(symbols, {Name: name, Section: Fission_FragmentSectionFromTag(sectionTag), Offset: offset})
+        index = index + 1
+    WEND
+
+    relocations = []
+    relocationCount = reader.ReadU32()
+    index = 0
+    WHILE index < relocationCount
+        sectionTag = reader.ReadU8()
+        fieldOffset = reader.ReadU32()
+        target = reader.ReadString()
+        ignored = Array.Push(relocations, {Section: Fission_FragmentSectionFromTag(sectionTag), FieldOffset: fieldOffset, Target: target})
+        index = index + 1
+    WEND
+
+    fragment = FissionX86_64Fragment(textBytes, rodataBytes, bssSize, symbols, relocations)
+    RETURN {Ok: TRUE, Fragment: fragment, Diagnostics: diagnostics}
+END FUNCTION

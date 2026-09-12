@@ -1707,6 +1707,92 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   with plain `fissure run` (499s, passing) -- everything above worked
   correctly on the very first full verification pass after both bugs were
   fixed, no further debugging iterations needed.
+- **The Arcology Fusion Linker** -- splitting the self-contained x86-64
+  backend's own encoder and linker into two real, separately-named
+  components, requested directly by the project owner ("would it be
+  better to make the linker a separate program?" -- yes, and: "let's make
+  the linker. Call the linker 'Fusion' [full title 'The Arcology Fusion
+  Linker']. ... the object files for arcology, fragments."). Real
+  motivation, not a style refactor: with native compilation still
+  whole-program-only (one entry file -> one A-MIR module -> one assembly
+  text -> one final ELF64), there is nothing to genuinely LINK today --
+  splitting the encoder (instruction bytes) from the linker (label
+  resolution + ELF64 writing) into real, separate, independently-testable
+  pieces, with a real, persistent, serializable object-file format
+  (fragments) in between, sets up for genuine PER-FILE INCREMENTAL NATIVE
+  COMPILATION later: each ArcoBASIC source file compiles to its own cached
+  `.frag` file once, with only the final link step re-running when
+  something actually changes -- the same "why rebuild" causality Rivet
+  already proved for C++, now extensible to native codegen, which will
+  matter as soon as "the rest of Arcology" (the user's own stated next
+  goal) means more than a handful of files.
+  Three new files, a clean dependency graph with no circularity:
+  `fission/amir/x86_64_fragment.abas` (lowest level -- the Fragment model
+  itself: `TextBytes`/`RodataBytes`/`BssSize` plus a `Symbols` table
+  {Name, Section, Offset} for everything a fragment DEFINES and a
+  `Relocations` table {Section, FieldOffset, Target} for everything it
+  references but doesn't define; also `FissionX86_64Buffer`, relocated
+  here from the encoder since both the encoder and Fusion need it and
+  neither should depend on the other; a new `FissionX86_64ByteReader` for
+  the read side; and real binary serialize/deserialize -- `.frag` files
+  are genuinely real, persistent files on disk, not just an in-memory
+  convenience shape, confirmed via a real write-to-disk-then-read-back
+  round-trip producing byte-for-byte identical linked output);
+  `fission/amir/fusion_linker.abas` (Fusion itself -- `Fission_FusionLink`
+  takes an array of one or more fragments plus a real entry SYMBOL NAME,
+  no hardcoded "_start" opinion of its own, and produces one final ELF64:
+  lays out every fragment's own text/rodata/bss end to end in the order
+  given, merges every fragment's own defined symbols into one real GLOBAL
+  symbol table -- a genuine, reported "duplicate symbol" diagnostic if two
+  fragments define the same name, not silently picking one -- then
+  resolves every fragment's own relocations against that WHOLE table
+  regardless of which fragment the target actually lives in, a real
+  "undefined symbol" diagnostic if a relocation's target is never defined
+  anywhere); and `fission/amir/x86_64_assembler.abas` (unchanged in its
+  own instruction-encoding logic -- not one opcode/ModRM/SIB bit pattern
+  needed to change for this split -- only its own driver function,
+  renamed `Fission_X86_64AssembleFragment`, changed from "resolve+write
+  the final ELF64 itself" to "package up what got encoded into a fragment
+  and hand it to whoever asked for it").
+  `fission/cli/fusion.abas` (new) exposes Fusion as a genuinely separate,
+  directly invocable CLI program (`fusion FRAGMENT [FRAGMENT ...] --entry
+  SYMBOL -o OUTPUT`, reading real `.frag` files from disk) -- built as its
+  own ordinary ArcoCapsule (`fission/build/rivet_native_capsules.abas`'s
+  new `Fission_RivetBuildFusionCli`), the same shape every other first-
+  party Fission CLI tool already uses, producing a real, standalone
+  `build/fusion` binary alongside ArcoFission/rivet/fissure. Today's own
+  `fission/cli/compile_to_x86_64.abas` still calls `Fission_FusionLink`
+  IN-PROCESS with exactly one fragment (not via a subprocess invocation of
+  this CLI) to keep the common "compile one file straight to a binary"
+  path free of any subprocess overhead -- Fusion is architecturally
+  separate and separately usable, without reintroducing the exact
+  external-process cost this whole native-codegen effort was built to
+  eliminate for the default path.
+  Verified via real execution, not just that linking reports success: two
+  independently hand-assembled, COOPERATING fragments (Fragment A's own
+  `_start` calling `Helper`, a symbol ONLY Fragment B defines, Fragment
+  B's own rodata referenced via a same-fragment RIP-relative `lea`),
+  linked together by Fusion, produced a genuine, running ELF64 that
+  printed Fragment B's own string correctly -- a real, working proof of
+  genuine CROSS-FRAGMENT symbol resolution, not just the single-fragment
+  case every existing native fixture already exercises. Re-verified the
+  exact same two-fragment scenario through a full disk round-trip
+  (serialize both fragments to real bytes, write real `.frag` files,
+  read them back, deserialize, re-link) and through the standalone
+  `fusion` CLI itself operating directly on those real files -- both
+  produced the identical working binary. Re-verified every existing
+  native fixture (all 15) byte-for-byte unaffected by this entirely
+  internal architectural split.
+  Added a permanent regression fixture,
+  `fission/tests/fusion_linker_smoke.abas` (the real cross-fragment link,
+  a real serialization round-trip producing byte-identical linked output,
+  and five real diagnostic paths -- a bad-magic fragment file, a
+  duplicate symbol across fragments, an undefined relocation target, an
+  undefined entry symbol, and linking zero fragments at all); wired into
+  the self-parse/self-semantic corpus and `fission/fissure.ab`'s watched-
+  files list. Self-parse/self-semantic corpus grew 92 -> 95 files, 140 ->
+  147 import edges, 3333 -> 3458 symbols; golden values updated to match.
+  Verified with plain `fissure run` (474s, passing).
 
 ## In-Progress Components
 
@@ -2148,6 +2234,10 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 - `fission/tests/native_programs/bool_print.abas`
 - `fission/tests/native_programs/classes.abas`
 - `fission/amir/x86_64_assembler.abas`
+- `fission/amir/x86_64_fragment.abas`
+- `fission/amir/fusion_linker.abas`
+- `fission/cli/fusion.abas`
+- `fission/tests/fusion_linker_smoke.abas`
 - `fission/tests/sir_to_amir_loop_control_smoke.abas`
 - `fission/tests/amir_x86_64_smoke.abas`
 - `src/runtime/runtime.cpp`
@@ -2191,10 +2281,28 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   project owner: "we're passing stuff to GAS. Arcology is supposed to be
   self contained. It's its own ecosystem. Port the machine code gen from
   legacy fission." `fission/amir/x86_64_assembler.abas` is the real,
-  ArcoBASIC-implemented instruction encoder + minimal ELF64 writer that
-  closed this gap -- see its own Completed Components entry and header
-  comment for the full scope and the real bugs found building it. Do not
-  reintroduce an `as`/`ld`/subprocess dependency into this path.
+  ArcoBASIC-implemented instruction encoder that closed this gap -- see
+  its own Completed Components entry and header comment for the full
+  scope and the real bugs found building it. Do not reintroduce an
+  `as`/`ld`/subprocess dependency into this path.
+- **The linker is its own real, separately-named component: The Arcology
+  Fusion Linker ("Fusion"), and its object-file format is called
+  "fragments."** Named directly by the project owner. `fission/amir/
+  fusion_linker.abas` (Fusion itself) and `fission/amir/
+  x86_64_fragment.abas` (the fragment model + real serialization) are
+  split out from the encoder (`fission/amir/x86_64_assembler.abas`) for a
+  real reason, not just naming: it sets up genuine per-file incremental
+  native compilation later (each ArcoBASIC file compiles to its own
+  cached fragment once, only re-linking when something changes). Fusion
+  is ALSO exposed as its own standalone CLI (`fission/cli/fusion.abas`,
+  built as an ordinary ArcoCapsule, `build/fusion`) -- a real, separately
+  invocable program, not merely an in-process function. The default
+  single-file compile path (`fission/cli/compile_to_x86_64.abas`) still
+  calls Fusion in-process (not via a subprocess invocation of the CLI) to
+  stay free of subprocess overhead for the common case -- this does not
+  reintroduce the external-tool dependency the self-containment decision
+  above eliminated; Fusion is a first-party Fission component either way.
+  See fission/amir/fusion_linker.abas's own Completed Components entry.
 - The first implementation slice uses plain ArcoBASIC classes and functions, not
   a compiler-definition DSL.
 - Fission Core route resolution is based on artifact types (`Consumes` /
