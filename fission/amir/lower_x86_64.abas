@@ -2132,24 +2132,39 @@ FUNCTION Fission_X86_64LowerBinOp(offsets, instruction)
     ' substrate's own bytecode path already computes) -- not introducing a
     ' new native-only divergence, just closing a support gap for an
     ' operator the substrate already lowers this way.
-    isBitAnd = op == "AND" ORELSE op == "BITAND" ORELSE op == "ANDALSO"
+    ' A real, previously-undiscovered bug found and fixed in the SHARED
+    ' parser (fission/language/arcobasic/parser.abas): a bareword operator
+    ' KEYWORD (SHL/SHR/BITAND/BITOR/BITXOR, plus bare AND/OR/XOR) is now
+    ' correctly canonicalized to the oracle's own real symbol form ("<<",
+    ' ">>", "&", "|", "^") at parse time, matching a direct, comprehensive
+    ' oracle probe across every one of these. This dispatch already had
+    ' to accept the OLD bareword text (every existing native fixture,
+    ' e.g. `fission/tests/native_programs/bitops.abas`, was written using
+    ' the bareword spelling directly, since this WAS the only text ever
+    ' produced before the parser fix) -- so both forms are accepted here,
+    ' additively, rather than migrating away from the bareword checks:
+    ' real ArcoBASIC source using the symbol spelling directly
+    ' (`x & y`/`x | y`/`x ^ y`) already reached this exact same text
+    ' unchanged either way, so this was never a purely-bareword-only
+    ' dispatch to begin with.
+    isBitAnd = op == "AND" ORELSE op == "BITAND" ORELSE op == "ANDALSO" ORELSE op == "&"
     IF isBitAnd THEN
         ignored = Array.Push(lines, "    and %rcx, %rax")
         ignored = Array.Push(lines, Fission_X86_64StoreRaxLine(offsets, dest))
         RETURN {Ok: TRUE, Lines: lines}
     END IF
-    isBitOr = op == "OR" ORELSE op == "BITOR" ORELSE op == "ORELSE"
+    isBitOr = op == "OR" ORELSE op == "BITOR" ORELSE op == "ORELSE" ORELSE op == "|"
     IF isBitOr THEN
         ignored = Array.Push(lines, "    or %rcx, %rax")
         ignored = Array.Push(lines, Fission_X86_64StoreRaxLine(offsets, dest))
         RETURN {Ok: TRUE, Lines: lines}
     END IF
-    IF op == "BITXOR" THEN
+    IF op == "BITXOR" ORELSE op == "^" THEN
         ignored = Array.Push(lines, "    xor %rcx, %rax")
         ignored = Array.Push(lines, Fission_X86_64StoreRaxLine(offsets, dest))
         RETURN {Ok: TRUE, Lines: lines}
     END IF
-    IF op == "SHL" THEN
+    IF op == "SHL" ORELSE op == "<<" THEN
         ' x86 variable-count shifts require the count in %cl specifically
         ' -- %rcx already holds the right operand from the common load
         ' above, so no extra move is needed, just a narrower register name
@@ -2175,7 +2190,7 @@ FUNCTION Fission_X86_64LowerBinOp(offsets, instruction)
     ' oracle can never confirm or deny. Real integer division (`\`) is the
     ' same situation (oracle fails the same way) and is likewise left
     ' unsupported here, not implemented and guessed at.
-    IF op == "SHR" THEN
+    IF op == "SHR" ORELSE op == ">>" THEN
         ignored = Array.Push(lines, "    sar %cl, %rax")
         ignored = Array.Push(lines, Fission_X86_64StoreRaxLine(offsets, dest))
         RETURN {Ok: TRUE, Lines: lines}

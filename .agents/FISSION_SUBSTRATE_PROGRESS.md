@@ -3212,6 +3212,112 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   separate, pre-existing, unresolved item), and have not been tried.
   That real "does Fission's own compiler compile itself" attempt remains
   the natural next step, genuinely reachable now for the first time.
+- DONE (partial, real, and precisely disclosed) -- attempted that exact
+  next step: pointed this substrate at Fission's own actual CLI entry
+  points, triggered by the user directly ("Try clearing the cache? ...
+  let's get fission working sometime this year"), including a genuine
+  `rm -rf .rivet && rivet build` full clean-cache rebuild first (149
+  compiled, 13 linked, 0 failed -- confirms the whole project, not just
+  this substrate, builds correctly from an empty cache).
+  **A real G1-level bootstrap milestone**: `fission/cli/fusion.abas` (the
+  Arcology Fusion Linker's own real, separately-invocable CLI -- the
+  smallest real entry point, 54KB expanded) compiled cleanly through the
+  self-hosted `fission-compile-to-bytecode` driver, was packaged into a
+  real standalone binary, and THAT SELF-HOSTED-COMPILED LINKER correctly
+  linked a real `.frag` fragment into a genuine, runnable ELF64 --
+  verified by actually running the result (`hello from a real .frag`
+  printed correctly). `fission/cli/compile_to_bytecode.abas` ITSELF (213KB
+  expanded -- one of the exact two files this whole session's own probes
+  have used as "the real self-hosted compiler driver" throughout) ALSO
+  compiled cleanly through the self-hosted pipeline; the resulting
+  standalone binary -- **a real, working, Fission-compiled Fission** --
+  was then used to compile a fresh ArcoBASIC program, and the bytecode
+  IT produced ran and printed the correct output. `fission/cli/fission.abas`
+  (119KB expanded) also compiled and ran (packaged, exits cleanly) --
+  the large-file frontend performance ceiling previously guessed as the
+  likely blocker did NOT materialize for any of these three (each took
+  real, substantial time -- single-digit minutes -- but completed).
+  A real, significant, previously-undiscovered PARSER bug was found and
+  fixed reaching this point: every bareword bitwise-operator KEYWORD
+  (SHL/SHR/BITAND/BITOR/BITXOR, plus bare AND/OR/XOR -- ArcoBASIC's bare
+  AND/OR are ALWAYS bitwise, never logical short-circuit) was stored on
+  the real Binary AST node's own "Operator" field as its own uppercased
+  KEYWORD TEXT instead of the oracle's real CANONICAL symbol -- confirmed
+  via a direct, comprehensive oracle probe across every one of these:
+  `SHL`->`<<`, `SHR`->`>>`, `BITAND`/bare `AND`->`&`, `BITOR`/bare
+  `OR`->`|`, `BITXOR`/bare `XOR`->`^` (`SAR` is the one real exception --
+  the oracle keeps IT as bareword text too, and the oracle's own bytecode
+  VM does not actually implement SAR execution at all, a real, separate,
+  pre-existing, disclosed gap, unrelated to this fix). This stayed
+  silently latent because every existing fixture happened to only ever
+  exercise the symbol spelling or a logical ANDALSO/ORELSE through this
+  substrate's own real execution -- found only once `fusion.abas`'s own
+  self-hosted-compiled bytecode was actually RUN for the first time and
+  crashed with "unsupported bytecode binary operator: SHL" (from its
+  transitive import of `fission/amir/x86_64_fragment.abas`'s real
+  byte-packing code, `v BITAND 255`). Fixed with a new
+  `Fission_ArcoBasicCanonicalBinaryOperator` (`fission/language/arcobasic/
+  parser.abas`), applied at all four real bareword-operator call sites
+  (`ParseBitOr`/`ParseBitXor`/`ParseBitAnd`/`ParseShift`); the native
+  x86-64 backend's own operator dispatch (`fission/amir/lower_x86_64.abas`)
+  now additionally accepts the canonical symbol forms too, ADDITIVELY --
+  the OLD bareword checks stay, since real ArcoBASIC source using the
+  symbol spelling directly already reached this exact dispatch either
+  way, and every existing native fixture (`bitops.abas`, using the
+  bareword spelling throughout) was written against the pre-fix text.
+  Re-verified byte-for-byte against the oracle after this fix (zero
+  regression). New regression checks added to
+  `fission/tests/amir_gap_fixes_smoke.abas` (7 new checks: SHL/BITAND
+  canonicalize correctly, SAR correctly stays bareword).
+  **A real, deeper, genuinely NEW gap found and NOT yet fixed**: pushing
+  one level further -- using the self-hosted-compiled
+  `compile_to_bytecode.abas` binary (not G0 directly) to compile a
+  SECOND real program that itself declares a CLASS -- surfaces a real,
+  cleanly-reproduced bug: `undefined bytecode local: __instance` at
+  runtime. Isolated to a minimal repro (a trivial `CLASS Point
+  CONSTRUCTOR(x, y) ... END CONSTRUCTOR END CLASS` program): compiled by
+  G0 directly, correct bytecode results (SELF gets LOCALS slot 0, matching
+  `FissionBytecodeFunction.AddParam`'s own documented "SELF is
+  pre-registered first" contract); compiled by the self-hosted-compiled
+  `compile_to_bytecode.abas` binary instead, SELF instead lands at a
+  LATER slot (3 instead of 0, with an extra, unexplained 4th local) and a
+  reference to the class-instantiation wrapper's own internal
+  `__instance` local never resolves. Ruled out array-iteration-order
+  divergence between G0's tree-walking interpreter and its own bytecode
+  VM as the cause (tested directly with a plain array -- both execution
+  modes iterate in the same order). Root cause NOT found this pass --
+  disclosed as real, separate, deeper follow-on work. This fits the SAME
+  general risk category this whole project has hit once before (see
+  [[project_arcobasic_treewalker_global_mutation_bug]]/this ledger's own
+  "ArcoBASIC tree-walker global-mutation bug" precedent): a real,
+  observable behavioral difference between running ArcoBASIC source
+  DIRECTLY under G0's tree-walking interpreter versus running the SAME
+  source AS bytecode under G0's own bytecode VM -- here, specifically,
+  triggered only by running the SELF-HOSTED COMPILER ITSELF (not an
+  ordinary program) as bytecode and having IT compile a class-using
+  target, a genuinely new manifestation not previously observed.
+  Real, current, precise answer to "is Fission able to compile Fission
+  yet": a genuine G1-level bootstrap now exists and is verified working
+  for real, non-trivial, multi-file, non-class Fission programs (a
+  self-hosted-compiled Fission compiler correctly compiles and runs
+  real ArcoBASIC source, and a self-hosted-compiled Fusion correctly
+  links real fragments) -- this is real, substantial, load-bearing
+  progress, not a toy demonstration. The one disclosed remaining gap
+  before this is a COMPLETE, reliable bootstrap: a self-hosted-compiled
+  Fission compiler does not yet correctly compile a CLASS-using program
+  (a real, cleanly-isolated, NOT-yet-root-caused bug). Every OTHER
+  previously-disclosed gap (real `#IMPORT` expansion, the five SIR->A-MIR
+  lowering gaps, the CONST-escaping bug, the bareword-operator
+  canonicalization bug) is now closed.
+  Two real golden-text regressions surfaced by this same fix (the
+  operator-canonicalization change is, correctly, also visible in real
+  AST-dump text): `tests/integration/fission_substrate_core_smoke.sh`'s
+  own `arcobasic_do_bitwise_smoke`/`arcobasic_logic_smoke` checks expected
+  the stale `Operator=SHR`/`Operator=OR` text; updated to the now-correct
+  `Operator=>>`/`Operator=|`. Self-parse/self-semantic corpus symbol
+  count grew 4106 -> 4115 (`fission/language/arcobasic/parser.abas`
+  itself gained a new function; file count 98 and import-edge count 157
+  both unchanged); golden value updated. Verified with `fissure run`.
 
 ## In-Progress Components
 

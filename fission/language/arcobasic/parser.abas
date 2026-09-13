@@ -22,6 +22,37 @@ FUNCTION Fission_ArcoBasicCopyActsUnary(nextToken)
     RETURN TRUE
 END FUNCTION
 
+' A real, previously-undiscovered bug: every bareword bitwise-operator
+' KEYWORD (SHL/SHR/BITAND/BITOR/BITXOR, plus bare AND/OR/XOR -- ArcoBASIC's
+' bare AND/OR are ALWAYS bitwise, never logical short-circuit, see the
+' project's own established "NOT is bitwise" precedent for the sibling
+' footgun) was being stored on the real Binary AST node's own "Operator"
+' field as its own UPPERCASED KEYWORD TEXT ("SHL", "BITAND", "AND", ...)
+' instead of the oracle's own real CANONICAL symbol ("<<", "&", "&", ...)
+' -- confirmed via a direct, comprehensive oracle probe across every one
+' of these (`ArcoFission reveal ... at BYTECODE`): `SHL`->`<<`, `SHR`->
+' `>>`, `BITAND`/bare `AND`->`&`, `BITOR`/bare `OR`->`|`, `BITXOR`/bare
+' `XOR`->`^`. `SAR` (arithmetic shift right) is the one real exception --
+' the oracle keeps IT as bareword text too, confirmed directly (no
+' canonical symbol exists for it). This stayed silently latent because
+' every existing smoke fixture happened to only ever exercise the SYMBOL
+' spelling (`<<`/`&`/`|`/`^`) or a LOGICAL ANDALSO/ORELSE, never the
+' bareword form through this substrate's own real execution -- found only
+' once real multi-file `#IMPORT` expansion let a real Fission source file
+' (`fission/amir/x86_64_fragment.abas`, real byte-packing code using
+' `v BITAND 255`) reach a real standalone self-hosted bytecode-VM RUN for
+' the first time, crashing with "unsupported bytecode binary operator:
+' SHL" from `fission/cli/fusion.abas`'s own transitive import of it.
+FUNCTION Fission_ArcoBasicCanonicalBinaryOperator(tokenText)
+    upper = Upper(tokenText)
+    IF upper == "SHL" THEN RETURN "<<"
+    IF upper == "SHR" THEN RETURN ">>"
+    IF upper == "BITAND" OR upper == "AND" THEN RETURN "&"
+    IF upper == "BITOR" OR upper == "OR" THEN RETURN "|"
+    IF upper == "BITXOR" OR upper == "XOR" THEN RETURN "^"
+    RETURN upper
+END FUNCTION
+
 FUNCTION Fission_ArcoBasicArgumentDefaultText(node)
     IF node.Kind == "Literal" THEN RETURN Object.Get(node.Fields, "Value", "")
     IF node.Kind == "Read" THEN RETURN Object.Get(node.Fields, "Name", "")
@@ -641,7 +672,7 @@ CLASS FissionArcoBasicParser
     FUNCTION ParseBitOr()
         expression = SELF.ParseBitXor()
         WHILE SELF.CheckSymbol("|") OR SELF.CheckKeyword("bitor") OR SELF.CheckKeyword("or")
-            operatorText = Upper(SELF.ReadToken().Text)
+            operatorText = Fission_ArcoBasicCanonicalBinaryOperator(SELF.ReadToken().Text)
             right = SELF.ParseBitXor()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
         WEND
@@ -651,7 +682,7 @@ CLASS FissionArcoBasicParser
     FUNCTION ParseBitXor()
         expression = SELF.ParseBitAnd()
         WHILE SELF.CheckSymbol("^") OR SELF.CheckKeyword("bitxor") OR SELF.CheckKeyword("xor")
-            operatorText = Upper(SELF.ReadToken().Text)
+            operatorText = Fission_ArcoBasicCanonicalBinaryOperator(SELF.ReadToken().Text)
             right = SELF.ParseBitAnd()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
         WEND
@@ -661,7 +692,7 @@ CLASS FissionArcoBasicParser
     FUNCTION ParseBitAnd()
         expression = SELF.ParseEquality()
         WHILE SELF.CheckSymbol("&") OR SELF.CheckKeyword("bitand") OR SELF.CheckKeyword("and")
-            operatorText = Upper(SELF.ReadToken().Text)
+            operatorText = Fission_ArcoBasicCanonicalBinaryOperator(SELF.ReadToken().Text)
             right = SELF.ParseEquality()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
         WEND
@@ -691,7 +722,7 @@ CLASS FissionArcoBasicParser
     FUNCTION ParseShift()
         expression = SELF.ParseAddition()
         WHILE (SELF.PeekToken().Kind == "Symbol" AND Fission_ListContains(["<<", ">>"], SELF.PeekToken().Text)) OR SELF.CheckKeyword("shl") OR SELF.CheckKeyword("shr") OR SELF.CheckKeyword("sar")
-            operatorText = Upper(SELF.ReadToken().Text)
+            operatorText = Fission_ArcoBasicCanonicalBinaryOperator(SELF.ReadToken().Text)
             right = SELF.ParseAddition()
             expression = FissionArcoBasicAstNode("Binary").WithField("Operator", operatorText).AppendChild(expression).AppendChild(right)
         WEND

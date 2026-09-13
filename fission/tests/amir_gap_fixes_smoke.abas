@@ -79,3 +79,41 @@ AddressOfBc = Fission_AmirToBytecode(AddressOfAmir)
 PRINT AddressOfAmir.Diagnostics.HasErrors()
 PRINT AddressOfBc.Diagnostics.HasErrors()
 PRINT String.Contains(AddressOfBc.Render(), "29 ADDRESSOF")
+
+' 6. A real, previously-undiscovered PARSER bug (not a SIR->A-MIR gap
+' like the five above, but found and fixed in the SAME "start on import"
+' self-hosting push, so recorded here alongside them): every bareword
+' bitwise-operator KEYWORD (SHL/SHR/BITAND/BITOR/BITXOR, plus bare
+' AND/OR/XOR -- ArcoBASIC's bare AND/OR are ALWAYS bitwise, never logical
+' short-circuit) was stored on the real Binary AST node's own "Operator"
+' field as its own uppercased KEYWORD TEXT instead of the oracle's real
+' CANONICAL symbol -- confirmed via a direct, comprehensive oracle probe:
+' SHL->"<<", SHR->">>", BITAND/bare AND->"&", BITOR/bare OR->"|",
+' BITXOR/bare XOR->"^". SAR is the one real exception -- the oracle keeps
+' it as bareword text too (and the oracle's own bytecode VM does not
+' actually implement SAR execution at all, a real, separate, disclosed,
+' pre-existing gap). This stayed silently latent because every existing
+' fixture happened to only ever exercise the SYMBOL spelling or a
+' LOGICAL ANDALSO/ORELSE through this substrate's own real execution --
+' found only once real multi-file #IMPORT expansion let a real Fission
+' source file (fission/amir/x86_64_fragment.abas, real byte-packing code
+' using `v BITAND 255`) reach a real standalone self-hosted bytecode-VM
+' RUN for the first time, crashing with "unsupported bytecode binary
+' operator: SHL" from fission/cli/fusion.abas's own transitive import of
+' it -- the exact same self-hosted `fusion.abas` CLI, once fixed,
+' genuinely compiled AND linked a real `.frag` into a real, runnable
+' ELF64 for the first time.
+ShlSource = "x = 1 SHL 3\ny = x BITAND 255"
+ShlAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(ShlSource), "gap-shl-smoke.abas")))
+ShlBc = Fission_AmirToBytecode(ShlAmir)
+PRINT ShlAmir.Diagnostics.HasErrors()
+PRINT ShlBc.Diagnostics.HasErrors()
+PRINT String.Contains(ShlBc.Render(), "BINARY %t3 << %t1 %t2")
+PRINT String.Contains(ShlBc.Render(), "BINARY %t6 & %t4 %t5")
+
+SarSource = "x = 8 SAR 1"
+SarAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(SarSource), "gap-sar-smoke.abas")))
+SarBc = Fission_AmirToBytecode(SarAmir)
+PRINT SarAmir.Diagnostics.HasErrors()
+PRINT SarBc.Diagnostics.HasErrors()
+PRINT String.Contains(SarBc.Render(), "BINARY %t3 SAR %t1 %t2")

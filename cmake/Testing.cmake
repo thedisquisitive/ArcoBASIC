@@ -90,6 +90,15 @@ arco_add_script_test(
     $<TARGET_FILE:ArcoFission>
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+# CTest's own default TIMEOUT (1500s/25min) stopped being enough once this
+# suite started carrying real self-hosting corpus checks (self-parse/self-
+# semantic/self-bytecode, each re-lexing/parsing/analyzing/lowering every
+# one of Fission's own ~98 first-party source files from scratch) -- a
+# real, direct timing confirmed this script genuinely completes
+# successfully ("all checks passed", exit 0) well within this new budget,
+# just past the old default. A generous margin, not a tight fit: this
+# corpus is expected to keep growing.
+set_tests_properties(fission_substrate_core_smoke PROPERTIES TIMEOUT 3600)
 
 arco_add_script_test(
     random_integration_smoke
