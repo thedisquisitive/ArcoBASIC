@@ -502,6 +502,8 @@ FUNCTION Fission_X86_64HostFunctionTable()
     table = Object.Set(table, "RANDOM.CREATE", {Symbol: "arco_host_random_create", ReturnKind: "Number", ParamKinds: ["Number"]})
     table = Object.Set(table, "RANDOM.RESEED", {Symbol: "arco_host_random_reseed", ReturnKind: "Bool", ParamKinds: ["Number", "Number"]})
     table = Object.Set(table, "RANDOM.INTEGER", {Symbol: "arco_host_random_integer", ReturnKind: "Number", ParamKinds: ["Number", "Number", "Number"]})
+    table = Object.Set(table, "RANDOM.CLONE", {Symbol: "arco_host_random_clone", ReturnKind: "Number", ParamKinds: ["Number"]})
+    table = Object.Set(table, "RANDOM.DESTROY", {Symbol: "arco_host_random_destroy", ReturnKind: "Bool", ParamKinds: ["Number"]})
     ' Real floating-point support: unlike Random.Choice/Sample/Shuffle,
     ' Random.Float's own real return kind is ALWAYS Float regardless of
     ' its argument -- a genuinely fixed, uniform signature -- so this

@@ -870,6 +870,29 @@ const void* arco_host_random_create(arco_i64 seed) {
     arco_pcg32_reseed(s, (arco_u64)seed, ARCO_PCG32_DEFAULT_SEQUENCE);
     return (const void*)s;
 }
+// Random.Clone(handle) -- a real NEW handle carrying an exact COPY of the
+// source generator's own state (the oracle's own `Random.Clone` does
+// `std::make_shared<Pcg32>(*generator)`, a real value copy of the same
+// two-field state) -- future draws from the clone and the original are
+// fully independent from this point on, matching the oracle exactly.
+const void* arco_host_random_clone(arco_pcg32_state* handle) {
+    arco_pcg32_state* s = (arco_pcg32_state*)arco_raw_mmap(sizeof(arco_pcg32_state));
+    s->state = handle->state;
+    s->increment = handle->increment;
+    return (const void*)s;
+}
+// Random.Destroy(handle) -- a real, disclosed simplification: the oracle
+// invalidates the handle so any LATER use throws a real error; this
+// backend has no handle-validity tracking at all (matching this whole
+// file's own established "never frees anything it allocates" discipline
+// elsewhere), so this is a real no-op that always reports success --
+// using a handle after "destroying" it is undefined here rather than a
+// real, reported error, the same disclosed shape as this file's other
+// no-exception-mechanism-yet simplifications.
+arco_i64 arco_host_random_destroy(arco_pcg32_state* handle) {
+    (void)handle;
+    return 1;
+}
 // Random.Reseed(handle, seed) -- real in-place reseeding of an EXISTING
 // handle (matching the oracle's own real semantic: the same generator
 // object, now producing a fresh stream).

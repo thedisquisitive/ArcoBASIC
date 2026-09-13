@@ -3485,9 +3485,32 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   `Array.SortBy`/`MinBy`/`MaxBy` are NOT attempted -- they need real
   CALLABLE (function-value) arguments, a separate, larger feature this
   pass does not touch.
+  Real `Random.Clone(handle)`/`Random.Destroy(handle)` -- a RANDOM handle
+  in this backend is already just a raw pointer to a small `{state,
+  increment}` PCG32 struct (see `fission/native_runtime/host_bridge.c`'s
+  own existing `Random.Create` comment), so Clone is a real value-copy
+  into a fresh allocation, confirmed via probe to reproduce the exact
+  SAME draw sequence as the original from the clone point onward
+  (matching the oracle's own `std::make_shared<Pcg32>(*generator)`
+  exactly). Destroy is a real, disclosed simplification: this backend has
+  no handle-validity tracking at all (matching its own established
+  "never frees anything it allocates" discipline), so it is a no-op that
+  always reports success -- using a handle after "destroying" it is
+  undefined here rather than a real, reported error, same as this
+  backend's other no-exception-mechanism-yet simplifications.
+  Considered and correctly NOT pursued this pass (each hits the SAME
+  "needs a runtime, dynamically-kind-tagged Value representation" wall
+  Object.*/REF.*/File.List already established as out of scope): `Bits.*`
+  (a genuinely separate BitVector value kind, not an Array or Number);
+  `Runtime.GetGlobal`/`SetGlobal` (a global store that must hold and
+  return ANY kind dynamically, confirmed directly in the oracle's own
+  `Value()`-typed signature); `REF.Clear`/`Exists`/`Set` (built directly
+  on `Value::as_object()` in the oracle, the exact same blocker as
+  Object.Get/Set).
   New permanent regression fixtures: `host_bridge_batch5.abas`
-  (CLASSOF/HexToBytes), `host_bridge_batch6.abas` (Array.Sort) -- both
-  diffed byte-for-byte against `ArcoFission compile-run` on the identical
+  (CLASSOF/HexToBytes), `host_bridge_batch6.abas` (Array.Sort),
+  `host_bridge_batch7.abas` (Random.Clone/Destroy) -- all diffed
+  byte-for-byte against `ArcoFission compile-run` on the identical
   source.
   One more real golden-value update, same recurring pattern as before:
   the self-hosted semantic corpus symbol count grew again (4115 -> 4125,
