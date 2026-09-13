@@ -27,17 +27,35 @@
 ' involved, which is bit-for-bit identical to real double arithmetic as
 ' long as the result stays within a double's own exact-integer range.
 '
-' Real, disclosed Phase 1 scope: `MOD` and the whole `Bit.*`/`SHL`/`SHR`
-' family are NOT supported on a Float-kind value (real, clean
-' diagnostics, not silently mishandled) -- MOD would need a real `fmod`
-' (the oracle's own MOD IS real floating-point modulo, confirmed via a
-' direct probe: `10.5 MOD 3` -> `1.5`, not integer-only), not
-' implemented yet; Float-kind ARRAY elements are not supported (arrays
-' stay Number(int)-or-String only, a real, disclosed, separate
-' representation limitation, unrelated to floating-point arithmetic
-' itself); `Random.Float`/`Math.Random` remain unimplemented (though the
-' real double-arithmetic groundwork this fixture proves now makes that a
-' much smaller remaining gap than before).
+' Phase 2 (this same fixture, extended): `MOD` is now real floating-point
+' remainder (`arco_host_fmod`, matching the oracle's own real
+' `std::fmod(left, divisor)` exactly -- confirmed via a direct probe:
+' `10.5 MOD 3` -> `1.5`, not integer-only); the whole `Bit.*`/`SHIFT`/
+' `SETBIT`/etc. family now accepts a Float-kind argument too, via a real
+' `cvttsd2si` TRUNCATION before the SAME existing integer host functions
+' (matching the oracle's own `value_to_int()`, a plain
+' `static_cast<long long>(value.as_number())`, confirmed directly in
+' runtime.cpp); Float-kind ARRAY elements are now real (construction,
+' indexing, PRINT via a new `array_print_float` subroutine reusing
+' `arco_host_format_double` per element); `Random.Float` is real (PCG32's
+' own `unit_interval()`, ported byte-for-byte). A real, PRE-EXISTING bug
+' (not Float-specific, just surfaced by it) was found and fixed along the
+' way: a variable's own kind-inference could go stale WITHIN a single
+' collection pass for a LOOP-CARRIED value whose true kind is only
+' revealed by a LATER store in program order (e.g. `total = 0` then,
+' inside a loop, `total = total + 1.5`) -- see Fission_X86_64
+' CollectSlotsConverged's own comment for the full story, exercised
+' directly below by a real accumulation loop.
+'
+' Real, disclosed remaining scope: `Random.Create`'s own zero-argument
+' auto-seed form and `Math.Random()` (the implicit-global-RNG form) both
+' still need real persistent global state, a separate, already-disclosed
+' architectural gap (see host_bridge.c's own comment); Float-kind class
+' FIELDS work correctly already (confirmed directly, via the real
+' `CONSTRUCTOR(...)` syntax -- `FUNCTION Init(...)` is an ORDINARY
+' method, never auto-invoked, a real ArcoBASIC language distinction, not
+' a native-backend gap) but are not exercised in THIS fixture, which
+' stays focused on the free-function/array/loop surface.
 '
 ' Expected output verified against legacy `ArcoFission compile-run` on this
 ' identical source as the equivalence-testing oracle.
@@ -87,3 +105,46 @@ FUNCTION SumHalves(n, acc)
     RETURN SumHalves(n - 1, acc + n / 2.0)
 END FUNCTION
 PRINT SumHalves(5, 0)
+
+' Phase 2: real floating-point MOD (fmod semantics -- sign follows the
+' dividend, matching the oracle exactly).
+PRINT 10.5 MOD 3
+PRINT -10.5 MOD 3
+PRINT 10.5 MOD -3
+
+' Phase 2: Bit.*/SHIFT accept a Float-kind argument via real truncation.
+PRINT Bit.And(3.7, 1)
+PRINT Bit.Or(2.9, 1)
+PRINT SHIFT(2.5, 1)
+
+' Phase 2: real Float-kind arrays -- construction, PRINT, indexed
+' read/write, LEN, ForEach, and crossing a real function-call boundary.
+a = [1.5, 2.5, 3.5]
+PRINT a
+PRINT a[0]
+PRINT a[1] + a[2]
+a[0] = 10.25
+PRINT a
+PRINT LEN(a)
+
+FUNCTION SumArray(arr)
+    total = 0
+    FOR v IN arr
+        total = total + v
+    NEXT
+    RETURN total
+END FUNCTION
+PRINT SumArray(a)
+
+' Phase 2: a real loop-carried Float accumulator -- the exact shape that
+' surfaced the kind-inference staleness bug this phase also fixed.
+running = 0
+FOR i = 1 TO 3
+    running = running + 1.5
+NEXT
+PRINT running
+
+' Phase 2: real Random.Float (PCG32's own unit_interval()).
+h = Random.Create(42)
+PRINT Random.Float(h)
+PRINT Random.Float(h)

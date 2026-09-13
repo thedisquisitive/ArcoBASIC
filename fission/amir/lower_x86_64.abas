@@ -486,6 +486,13 @@ FUNCTION Fission_X86_64HostFunctionTable()
     table = Object.Set(table, "RANDOM.CREATE", {Symbol: "arco_host_random_create", ReturnKind: "Number", ParamKinds: ["Number"]})
     table = Object.Set(table, "RANDOM.RESEED", {Symbol: "arco_host_random_reseed", ReturnKind: "Bool", ParamKinds: ["Number", "Number"]})
     table = Object.Set(table, "RANDOM.INTEGER", {Symbol: "arco_host_random_integer", ReturnKind: "Number", ParamKinds: ["Number", "Number", "Number"]})
+    ' Real floating-point support: unlike Random.Choice/Sample/Shuffle,
+    ' Random.Float's own real return kind is ALWAYS Float regardless of
+    ' its argument -- a genuinely fixed, uniform signature -- so this
+    ' needs no special-case dispatch at all (see
+    ' Fission_X86_64EmitCall's own comment for how a real host-bridge
+    ' Float-kind RETURN is now handled generically, via %xmm0).
+    table = Object.Set(table, "RANDOM.FLOAT", {Symbol: "arco_host_random_float", ReturnKind: "Float", ParamKinds: ["Number"]})
     table = Object.Set(table, "TIME.TIMESTAMP", {Symbol: "arco_host_time_timestamp", ReturnKind: "Number", ParamKinds: []})
     table = Object.Set(table, "SLEEP", {Symbol: "arco_host_sleep", ReturnKind: "Bool", ParamKinds: ["Number"]})
     RETURN table
@@ -854,10 +861,20 @@ END FUNCTION
 ' works correctly for any LOCAL use within the same function (PRINT,
 ' concatenation, a local variable copy), which is what `{}` here
 ' preserves exactly the pre-existing "Number" default for.
-FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn)
+' `seedKinds` -- real floating-point support: pre-populates `kinds`
+' instead of always starting empty, letting Fission_X86_64
+' CollectSlotsConverged (see its own comment) run this SAME real single
+' pass multiple times, feeding a PREVIOUS pass's own final answer back
+' in, so a LOOP-CARRIED variable's kind (discovered LATE in program
+' order, e.g. a Float-promoting store inside a loop body) is visible to
+' an EARLIER Load of that SAME variable within THIS pass -- a real,
+' confirmed failure otherwise (see Fission_X86_64CollectSlotsConverged's
+' own comment for the exact bug). `{}` (empty) reproduces this
+' function's own original behavior exactly for a single, unseeded pass.
+FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn, seedKinds)
     names = []
     seen = {}
-    kinds = {}
+    kinds = seedKinds
     constStringValues = {}
     paramNames = []
     returnKindOut = "Number"
@@ -1285,6 +1302,44 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
     RETURN {Names: names, Kinds: kinds, ConstStringValues: constStringValues, ParamKindsOut: paramKindsOut, ReturnKindOut: returnKindOut, CallArgKindRequests: callArgKindRequests, FieldKindRequests: fieldKindRequests}
 END FUNCTION
 
+' Real floating-point support: runs Fission_X86_64CollectSlots several
+' times over the SAME function, feeding each pass's own final `Kinds`
+' map back in as the next pass' `seedKinds` (Fission_X86_64MergeKinds'
+' own upgrade-only merge -- see its own comment -- means this can only
+' ever refine an ALREADY-discovered kind further, never regress one).
+' This closes a real, confirmed bug: CollectSlots' own single pass scans
+' a function's blocks in plain PROGRAM order, so a LOOP-CARRIED
+' variable's kind, if only revealed by a store LATE in that order (e.g.
+' `total = 0` at the top, then `total = total + 1.5` inside a loop
+' body), is still "Number" as far as an EARLIER Load of that SAME
+' variable within the identical pass is concerned -- confirmed directly:
+' `total = 0 \ FOR i = 1 TO 3 \ total = total + 1.5 \ NEXT \ PRINT
+' total` compiled with zero diagnostics but printed a huge garbage
+' integer (1.5's own raw IEEE-754 bits, reinterpreted as a plain int64)
+' instead of "4.5" -- the generated code correctly treated %t15 (the
+' literal 1.5) as a real double, but WRONGLY treated %t14 (`LOAD total`,
+' frozen at "Number" from this SAME pass' own EARLIER, pre-upgrade
+' snapshot) as needing `cvtsi2sd` promotion from a stale INTEGER
+' reading of `total`'s OWN raw bits, which by the second loop
+' iteration already held a real double. A second pass, seeded with the
+' first pass' own OUTPUT (which correctly shows `total` as Float by the
+' time collection finishes), lets that EARLIER Load see the correct
+' kind this time. Three rounds (not just two) covers a real, if rare,
+' SECOND-ORDER case too (a variable whose own Float-ness depends on
+' ANOTHER variable that itself only converges to Float on the second
+' round) -- cheap either way, since a single CollectSlots pass over one
+' function is not a hot loop, this compiler's own compile time is not
+' the target of this project's own performance discipline.
+FUNCTION Fission_X86_64CollectSlotsConverged(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn)
+    collected = Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn, {})
+    round = 0
+    WHILE round < 2
+        collected = Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn, collected.Kinds)
+        round = round + 1
+    WEND
+    RETURN collected
+END FUNCTION
+
 ' Real inter-procedural kind inference: closes the exact gap this file's
 ' own header comment (and the ledger's "Next Recommended Work") disclosed
 ' since Phase 4 -- a function parameter or return value could only ever be
@@ -1354,6 +1409,26 @@ FUNCTION Fission_X86_64InferSignatures(amirModule, functionNames)
         paramKinds = Object.Set(paramKinds, fn.Name, seedParams)
         returnKinds = Object.Set(returnKinds, fn.Name, "Number")
     NEXT
+    ' Real floating-point support: every host-function-bridge symbol's
+    ' own FIXED ParamKinds/ReturnKind is seeded here too, keyed by its
+    ' real native symbol name (e.g. "arco_host_bit_and", never the
+    ' ArcoBASIC-facing name "Bit.And") -- a host function's own kinds
+    ' never need real cross-call-site convergence (they are already
+    ' fixed, ahead-of-time-compiled C signatures), but seeding them into
+    ' this SAME `paramKinds` table means Fission_X86_64EmitCall's own
+    ' existing generic per-position promotion logic (Number<->Float,
+    ' see its own comment) Just Works for a host call too, with NO
+    ' separate code path needed: a Float-kind argument passed to a host
+    ' function whose own real C signature expects `arco_i64` (every
+    ' Bit.*/SHIFT/SETBIT/... function) is real, required TRUNCATION --
+    ' confirmed matching the oracle's own real `value_to_int()`, a plain
+    ' `static_cast<long long>(value.as_number())` (src/runtime/
+    ' runtime.cpp), not a special case this native backend invented.
+    FOR hostKey IN Object.Keys(Fission_X86_64HostFunctionTable())
+        hostEntry = Object.Get(Fission_X86_64HostFunctionTable(), hostKey, NULL)
+        paramKinds = Object.Set(paramKinds, hostEntry.Symbol, hostEntry.ParamKinds)
+        returnKinds = Object.Set(returnKinds, hostEntry.Symbol, hostEntry.ReturnKind)
+    NEXT
 
     maxRounds = LEN(amirModule.Functions) + 2
     round = 0
@@ -1363,7 +1438,7 @@ FUNCTION Fission_X86_64InferSignatures(amirModule, functionNames)
         FOR fn IN amirModule.Functions
             fnParamKinds = Object.Get(paramKinds, fn.Name, [])
             fnReturnKind = Object.Get(returnKinds, fn.Name, "Number")
-            collected = Fission_X86_64CollectSlots(fn, functionNames, fnParamKinds, returnKinds, fieldKinds, classParents)
+            collected = Fission_X86_64CollectSlotsConverged(fn, functionNames, fnParamKinds, returnKinds, fieldKinds, classParents)
 
             ' A real bug found and fixed while adding CLASS support: this
             ' merge originally only ever recognized "String" as a real
@@ -1560,6 +1635,26 @@ FUNCTION Fission_X86_64MergeKinds(existingKind, newKind)
     IF existingKind == newKind THEN RETURN existingKind
     existingIsObjectish = Fission_X86_64IsObjectKind(existingKind) ORELSE Fission_X86_64IsPolyKind(existingKind)
     newIsObjectish = Fission_X86_64IsObjectKind(newKind) ORELSE Fission_X86_64IsPolyKind(newKind)
+    ' Real floating-point support: when NEITHER kind is object-ish, this
+    ' used to be unconditional "last write wins" -- a real, confirmed
+    ' bug for a loop-carried Float accumulator (`total = 0` then, inside
+    ' a loop, `total = total + 1.5`): "Number" is the one real AMBIGUOUS
+    ' default every value starts as until something more specific is
+    ' known (see Fission_X86_64CollectSlots' own Store handling), so it
+    ' must never downgrade an already-discovered non-Number kind -- the
+    ' SAME "any kind other than Number is upgrade-worthy" rule already
+    ' used for cross-function signature convergence and this file's own
+    ' multi-RETURN-statement fix (see that comment for the matching
+    ' real bug it closed). A genuine Number/String/Array-vs-Object
+    ' mismatch is still a real conflict, left for Fission_X86_64
+    ' LowerFunction's own Store-emission-time check (see its own
+    ' comment) to catch and report -- this only changes which SPECIFIC
+    ' kind wins the internal merge, never whether a real conflict is
+    ' detected at all.
+    IF existingIsObjectish == FALSE ANDALSO newIsObjectish == FALSE THEN
+        IF newKind != "Number" THEN RETURN newKind
+        RETURN existingKind
+    END IF
     IF existingIsObjectish == FALSE ORELSE newIsObjectish == FALSE THEN RETURN newKind
     classes = []
     IF Fission_X86_64IsPolyKind(existingKind) THEN
@@ -1593,6 +1688,16 @@ END FUNCTION
 ' variable-kind string, is what real polymorphism needs here.
 FUNCTION Fission_X86_64KindCompatibleWithVariable(valueKind, variableKind)
     IF valueKind == variableKind THEN RETURN TRUE
+    ' Real floating-point support: a variable whose OWN converged kind
+    ' is Float (SOME store to it somewhere in this function assigned a
+    ' real decimal literal or a Float-kind expression) legitimately
+    ' also receives a plain Number(int)-kind value at ANOTHER store site
+    ' (e.g. `total = 0` initializing an accumulator later fed by real
+    ' Float arithmetic) -- real, required promotion at the actual store
+    ' codegen site (Fission_X86_64LowerFunction's own Store handling),
+    ' not a genuine kind conflict the way Number vs String/Array/Object
+    ' still is.
+    IF valueKind == "Number" ANDALSO variableKind == "Float" THEN RETURN TRUE
     IF Fission_X86_64IsPolyKind(variableKind) ANDALSO Fission_X86_64IsObjectKind(valueKind) THEN
         targetClass = Fission_X86_64ObjectClassOfKind(valueKind)
         FOR c IN Fission_X86_64PolyClassesOfKind(variableKind)
@@ -1831,12 +1936,14 @@ END FUNCTION
 ' `cvtsi2sd` -- ArcoBASIC's own Number is ALWAYS a double at the
 ' language level (there is no separate int type to preserve), so this
 ' is not an approximation, it is what the oracle's own arithmetic
-' already does to that same value internally. Returns {Ok, Lines}
-' exactly like Fission_X86_64LowerBinOp; Ok is FALSE for an operator
-' this pass does not (yet) support on a Float-kind value (MOD needs a
-' real `fmod`, bitwise ops make no obvious sense on a fractional value
-' -- both real, disclosed Phase 1 scope decisions, not silently
-' mishandled).
+' already does to that same value internally. Returns {Ok, Lines,
+' UsesHostBridge} -- UsesHostBridge is TRUE only for MOD (a real
+' `arco_host_fmod` call, matching the oracle's own real
+' `std::fmod(left, divisor)`, confirmed directly in
+' src/compiler/fission.cpp's own comment -- NOT a truncating-integer
+' modulo); Ok is FALSE for a bitwise operator, which makes no obvious
+' sense on a fractional value at all -- a real, disclosed, not-attempted
+' scope decision, not silently mishandled.
 FUNCTION Fission_X86_64LowerFloatBinOp(offsets, kinds, instruction)
     op = instruction.Field("Op")
     left = instruction.Field("Left")
@@ -1862,7 +1969,19 @@ FUNCTION Fission_X86_64LowerFloatBinOp(offsets, kinds, instruction)
         ignored = Array.Push(lines, "    " + setInstruction + " %al")
         ignored = Array.Push(lines, "    movzbq %al, %rax")
         ignored = Array.Push(lines, Fission_X86_64StoreRaxLine(offsets, dest))
-        RETURN {Ok: TRUE, Lines: lines}
+        RETURN {Ok: TRUE, Lines: lines, UsesHostBridge: FALSE}
+    END IF
+
+    ' Real floating-point MOD -- xmm0/xmm1 are ALREADY loaded exactly
+    ' matching the real SysV (double, double) calling convention
+    ' `arco_host_fmod` itself uses (both arguments in XMM registers, in
+    ' order), so this needs no special marshaling at all -- a plain
+    ' `call`, and the real result is already sitting in %xmm0 exactly
+    ' where Fission_X86_64StoreXmm0Line expects it.
+    IF op == "MOD" THEN
+        ignored = Array.Push(lines, "    call arco_host_fmod")
+        ignored = Array.Push(lines, Fission_X86_64StoreXmm0Line(offsets, dest))
+        RETURN {Ok: TRUE, Lines: lines, UsesHostBridge: TRUE}
     END IF
 
     floatOpcode = ""
@@ -1870,10 +1989,10 @@ FUNCTION Fission_X86_64LowerFloatBinOp(offsets, kinds, instruction)
     IF op == "-" THEN floatOpcode = "subsd"
     IF op == "*" THEN floatOpcode = "mulsd"
     IF op == "/" THEN floatOpcode = "divsd"
-    IF floatOpcode == "" THEN RETURN {Ok: FALSE, Lines: []}
+    IF floatOpcode == "" THEN RETURN {Ok: FALSE, Lines: [], UsesHostBridge: FALSE}
     ignored = Array.Push(lines, "    " + floatOpcode + " %xmm1, %xmm0")
     ignored = Array.Push(lines, Fission_X86_64StoreXmm0Line(offsets, dest))
-    RETURN {Ok: TRUE, Lines: lines}
+    RETURN {Ok: TRUE, Lines: lines, UsesHostBridge: FALSE}
 END FUNCTION
 
 ' Lowers one BinOp instruction (dest := left OP right). Returns {Ok, Lines}
@@ -2425,6 +2544,73 @@ FUNCTION Fission_X86_64ArrayPrintStringSubroutine()
     RETURN lines
 END FUNCTION
 
+' `PRINT arr` on a real FLOAT array -- real floating-point support, the
+' typed-array counterpart of Fission_X86_64ArrayPrintStringSubroutine
+' (same shared bracket/comma/close rodata and %rbx/%r12/%r13 callee-
+' saved register discipline this mirrors exactly -- all three survive
+' `call arco_host_format_double` unchanged, per the real SysV ABI). Each
+' element's own raw IEEE-754 bits are loaded directly into %xmm0 via
+' `movsd` (no GP round-trip needed, this array's own storage is already
+' just an 8-byte slot regardless of kind), formatted via the SAME real
+' `arco_host_format_double` PRINT of a bare Float value already uses,
+' then printed via the SAME real NUL-scan-and-write technique
+' array_print_string's own loop already proved correct on the
+' resulting string.
+FUNCTION Fission_X86_64ArrayPrintFloatSubroutine()
+    lines = [
+        "array_print_float:",
+        "    push %rbx",
+        "    push %r12",
+        "    push %r13",
+        "    mov %rdi, %rbx",
+        "    mov (%rbx), %r13",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    lea array_print_open(%rip), %rsi",
+        "    mov $1, %rdx",
+        "    syscall",
+        "    xor %r12, %r12",
+        ".Larrprintflt_loop:",
+        "    cmp %r13, %r12",
+        "    jge .Larrprintflt_done",
+        "    test %r12, %r12",
+        "    jz .Larrprintflt_skip_comma",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    lea array_print_comma(%rip), %rsi",
+        "    mov $2, %rdx",
+        "    syscall",
+        ".Larrprintflt_skip_comma:",
+        "    movsd 8(%rbx,%r12,8), %xmm0",
+        "    call arco_host_format_double",
+        "    mov %rax, %rsi",
+        ".Larrprintflt_strlen_loop:",
+        "    cmpb $0, (%rax)",
+        "    je .Larrprintflt_strlen_done",
+        "    inc %rax",
+        "    jmp .Larrprintflt_strlen_loop",
+        ".Larrprintflt_strlen_done:",
+        "    mov %rax, %rdx",
+        "    sub %rsi, %rdx",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    syscall",
+        "    inc %r12",
+        "    jmp .Larrprintflt_loop",
+        ".Larrprintflt_done:",
+        "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
+        "    mov $1, %rdi",
+        "    lea array_print_close(%rip), %rsi",
+        "    mov $2, %rdx",
+        "    syscall",
+        "    pop %r13",
+        "    pop %r12",
+        "    pop %rbx",
+        "    ret"
+    ]
+    RETURN lines
+END FUNCTION
+
 ' `PRINT` of a genuine Bool-kind value (a comparison result, or a bare
 ' TRUE/FALSE literal) -- see Fission_X86_64OperandIsBoolLiteral's own
 ' comment for the real bug this closes (the oracle prints `TRUE`/`FALSE`,
@@ -2513,7 +2699,16 @@ FUNCTION Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnosti
         ' conflicts). The actual `cvtsi2sd` conversion happens below,
         ' at the real argument-marshaling site.
         isPromotableToFloat = argKind == "Number" ANDALSO argPosition < LEN(calleeParamKinds) ANDALSO calleeParamKinds[argPosition] == "Float"
-        IF isExemptSelfArg == FALSE ANDALSO isPromotableToFloat == FALSE ANDALSO argPosition < LEN(calleeParamKinds) THEN
+        ' The SAME real promotion, the other direction: a Float-kind
+        ' argument at a call site whose OWN callee parameter is
+        ' Number-kind (every real host-bridge integer function --
+        ' Bit.*/SHIFT/SETBIT/... -- has a fixed `arco_i64` C parameter,
+        ' seeded directly into `calleeParamKinds` for a host symbol, see
+        ' Fission_X86_64InferSignatures' own comment) is real, required
+        ' TRUNCATION via `cvttsd2si`, not a conflict -- matching the
+        ' oracle's own real `value_to_int()`.
+        isTruncatableToNumber = argKind == "Float" ANDALSO argPosition < LEN(calleeParamKinds) ANDALSO calleeParamKinds[argPosition] == "Number"
+        IF isExemptSelfArg == FALSE ANDALSO isPromotableToFloat == FALSE ANDALSO isTruncatableToNumber == FALSE ANDALSO argPosition < LEN(calleeParamKinds) THEN
             IF argKind != calleeParamKinds[argPosition] THEN mismatchedArg = arg
         END IF
         argPosition = argPosition + 1
@@ -2551,6 +2746,7 @@ FUNCTION Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnosti
     FOR arg IN reversedStackArgs
         argCalleeIndex = stackArgStartIndex + reversedStackArgIndex
         argNeedsFloatPromotion = argCalleeIndex < LEN(calleeParamKinds) ANDALSO calleeParamKinds[argCalleeIndex] == "Float" ANDALSO Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, arg)) == "Number"
+        argNeedsTruncation = argCalleeIndex < LEN(calleeParamKinds) ANDALSO calleeParamKinds[argCalleeIndex] == "Number" ANDALSO Fission_X86_64OperandKind(kinds, arg) == "Float"
         IF argNeedsFloatPromotion THEN
             ' A Number(int)-kind argument being promoted to a Float(int)
             ' -kind stack-passed (7th+) parameter -- no register is free
@@ -2567,13 +2763,26 @@ FUNCTION Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnosti
             ignored = Array.Push(textLines, "    pop %rax")
             ignored = Array.Push(textLines, "    push %rax")
         ELSE
-            ignored = Array.Push(textLines, Fission_X86_64OperandPushLine(offsets, arg))
+            IF argNeedsTruncation THEN
+                ' The reverse: a Float-kind argument truncated (real
+                ' `cvttsd2si`, matching the oracle's own `value_to_int()`)
+                ' before being pushed for a Number-kind (7th+) parameter.
+                ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, arg, "rax"))
+                ignored = Array.Push(textLines, "    push %rax")
+                ignored = Array.Push(textLines, "    movsd (%rsp), %xmm0")
+                ignored = Array.Push(textLines, "    add $8, %rsp")
+                ignored = Array.Push(textLines, "    cvttsd2si %xmm0, %rax")
+                ignored = Array.Push(textLines, "    push %rax")
+            ELSE
+                ignored = Array.Push(textLines, Fission_X86_64OperandPushLine(offsets, arg))
+            END IF
         END IF
         reversedStackArgIndex = reversedStackArgIndex - 1
     NEXT
     argIndex = 0
     WHILE argIndex < registerArgCount
         argNeedsFloatPromotion = argIndex < LEN(calleeParamKinds) ANDALSO calleeParamKinds[argIndex] == "Float" ANDALSO Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[argIndex])) == "Number"
+        argNeedsTruncation = argIndex < LEN(calleeParamKinds) ANDALSO calleeParamKinds[argIndex] == "Number" ANDALSO Fission_X86_64OperandKind(kinds, args[argIndex]) == "Float"
         ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[argIndex], argRegisters[argIndex]))
         IF argNeedsFloatPromotion THEN
             ' Real int->double promotion at a REAL call boundary: the
@@ -2594,6 +2803,18 @@ FUNCTION Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnosti
             ignored = Array.Push(textLines, "    movsd %xmm0, (%rsp)")
             ignored = Array.Push(textLines, "    pop %" + argRegisters[argIndex])
         END IF
+        IF argNeedsTruncation THEN
+            ' The reverse: a Float-kind argument at a call site whose
+            ' OWN callee parameter is Number-kind (every real
+            ' host-bridge integer function's own fixed `arco_i64` C
+            ' parameter, seeded via Fission_X86_64InferSignatures) --
+            ' real, required TRUNCATION via `cvttsd2si`, matching the
+            ' oracle's own real `value_to_int()` exactly.
+            ignored = Array.Push(textLines, "    push %" + argRegisters[argIndex])
+            ignored = Array.Push(textLines, "    movsd (%rsp), %xmm0")
+            ignored = Array.Push(textLines, "    add $8, %rsp")
+            ignored = Array.Push(textLines, "    cvttsd2si %xmm0, %" + argRegisters[argIndex])
+        END IF
         argIndex = argIndex + 1
     WEND
     ignored = Array.Push(textLines, "    call " + callee)
@@ -2601,7 +2822,29 @@ FUNCTION Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnosti
         ignored = Array.Push(textLines, "    add $" + String(LEN(stackArgs) * 8) + ", %rsp")
     END IF
     IF isVoidCall == FALSE THEN
-        ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+        ' Real floating-point support: a REAL HOST-BRIDGE symbol (always
+        ' named "arco_host_*", confirmed the one consistent naming
+        ' convention every function in host_bridge.c uses) whose own
+        ' converged return kind is Float (e.g.
+        ' `arco_host_random_float`/`arco_host_fmod`, seeded into
+        ' `signatures.ReturnKinds` alongside every other host entry --
+        ' see Fission_X86_64InferSignatures' own comment) returns via
+        ' the real SysV floating-point return register (%xmm0), NEVER
+        ' %rax -- storing %rax here would silently store garbage/
+        ' leftover register content instead of the real result. This
+        ' check is DELIBERATELY narrowed to host symbols only: a real
+        ' USER-declared ArcoBASIC function whose own return kind
+        ' converges to Float still returns its value via %rax, the SAME
+        ' opaque-bits GP-register transport every user-to-user call
+        ' already uses (never a real SysV ABI boundary at all) -- a
+        ' Float-kind user function already worked correctly before this
+        ' whole check existed, and must keep using %rax unchanged.
+        isHostFloatReturn = String.StartsWith(callee, "arco_host_") ANDALSO Object.Get(signatures.ReturnKinds, callee, "Number") == "Float"
+        IF isHostFloatReturn THEN
+            ignored = Array.Push(textLines, Fission_X86_64StoreXmm0Line(offsets, destOperand))
+        ELSE
+            ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+        END IF
     END IF
     RETURN TRUE
 END FUNCTION
@@ -2619,7 +2862,7 @@ END FUNCTION
 ' just this one.
 FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures, classFields, classParents)
     fnParamKinds = Object.Get(signatures.ParamKinds, fn.Name, [])
-    collected = Fission_X86_64CollectSlots(fn, functionNames, fnParamKinds, signatures.ReturnKinds, classFields, classParents)
+    collected = Fission_X86_64CollectSlotsConverged(fn, functionNames, fnParamKinds, signatures.ReturnKinds, classFields, classParents)
     frame = Fission_X86_64BuildFrame(collected.Names)
     offsets = frame.Offsets
     kinds = collected.Kinds
@@ -2813,7 +3056,18 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, value, "rax"))
-                ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, name))
+                ' Real floating-point support: a Number(int)-kind value
+                ' stored into a variable whose OWN converged kind is
+                ' Float needs real `cvtsi2sd` promotion first -- its raw
+                ' bits are an ordinary integer, nothing like the real
+                ' double bit pattern a Float-kind consumer (arithmetic,
+                ' PRINT, ...) expects to find in that slot later.
+                IF valueKind == "Number" ANDALSO variableKind == "Float" THEN
+                    ignored = Array.Push(textLines, "    cvtsi2sd %rax, %xmm0")
+                    ignored = Array.Push(textLines, Fission_X86_64StoreXmm0Line(offsets, name))
+                ELSE
+                    ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, name))
+                END IF
                 CONTINUE FOR
             END IF
             IF kind == "Array" THEN
@@ -2855,14 +3109,20 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 ' attempted here (unverified against the oracle), even
                 ' though the underlying pointer-sized element storage
                 ' would likely tolerate it the same way it does String --
-                ' only Number/String elements are accepted.
-                IF elementKind != "Number" ANDALSO elementKind != "String" THEN nonScalarItem = items[0]
+                ' only Number/String/Float elements are accepted. Float
+                ' is real floating-point support: an array element's own
+                ' raw bits are opaque storage either way (an 8-byte
+                ' `mov`, identical for a Number, a String pointer, or a
+                ' Float's own IEEE-754 bit pattern), so this needed no
+                ' new STORAGE codegen at all -- only INDEX/PRINT (see
+                ' their own comments) need to know it might be Float.
+                IF elementKind != "Number" ANDALSO elementKind != "String" ANDALSO elementKind != "Float" THEN nonScalarItem = items[0]
                 IF unresolvedItem != "" THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Array element is not supported by native x86-64 codegen: " + unresolvedItem)
                     CONTINUE FOR
                 END IF
                 IF nonScalarItem != "" THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports Number or String array elements (not nested arrays or objects): " + nonScalarItem)
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports Number, String, or Float array elements (not nested arrays or objects): " + nonScalarItem)
                     CONTINUE FOR
                 END IF
                 IF mismatchedItem != "" THEN
@@ -3110,12 +3370,13 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     END IF
                     floatLowered = Fission_X86_64LowerFloatBinOp(offsets, kinds, instruction)
                     IF floatLowered.Ok == FALSE THEN
-                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen does not support operator " + op + " on a Float-kind value (MOD and bitwise operators need a real fractional-value semantic not yet implemented): " + instruction.Field("Op"))
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen does not support operator " + op + " on a Float-kind value (bitwise operators make no obvious sense on a fractional value): " + instruction.Field("Op"))
                         CONTINUE FOR
                     END IF
                     FOR line IN floatLowered.Lines
                         ignored = Array.Push(textLines, line)
                     NEXT
+                    IF floatLowered.UsesHostBridge THEN context.UsesHostBridge = TRUE
                     CONTINUE FOR
                 END IF
                 ' Bool is normalized to Number here -- a comparison result
@@ -3190,12 +3451,19 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 printKind = Fission_X86_64OperandKind(kinds, argRef)
                 IF Fission_X86_64IsArrayKind(printKind) THEN
                     ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rdi"))
-                    IF Fission_X86_64ArrayElementKind(printKind) == "String" THEN
+                    arrayPrintElementKind = Fission_X86_64ArrayElementKind(printKind)
+                    IF arrayPrintElementKind == "String" THEN
                         ignored = Array.Push(textLines, "    call array_print_string")
                         context.UsesArrayPrintString = TRUE
                     ELSE
-                        ignored = Array.Push(textLines, "    call array_print")
-                        context.UsesArrayPrint = TRUE
+                        IF arrayPrintElementKind == "Float" THEN
+                            ignored = Array.Push(textLines, "    call array_print_float")
+                            context.UsesArrayPrintFloat = TRUE
+                            context.UsesHostBridge = TRUE
+                        ELSE
+                            ignored = Array.Push(textLines, "    call array_print")
+                            context.UsesArrayPrint = TRUE
+                        END IF
                     END IF
                     CONTINUE FOR
                 END IF
@@ -3457,7 +3725,18 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     FOR arg IN args
                         IF Fission_X86_64OperandIsResolvable(offsets, arg) == FALSE THEN unresolvedHostArg = arg
                         argKind = Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, arg))
-                        IF argKind != hostEntry.ParamKinds[hostArgPosition] THEN mismatchedHostArg = arg
+                        ' Real floating-point support: a Float-kind
+                        ' argument passed where the real C signature
+                        ' expects a plain `arco_i64` (every Bit.*/SHIFT/
+                        ' SETBIT/... function) is real, required
+                        ' TRUNCATION (Fission_X86_64EmitCall's own
+                        ' generic promotion logic performs the actual
+                        ' `cvttsd2si`, now that host-table symbols are
+                        ' seeded into `signatures.ParamKinds` too -- see
+                        ' Fission_X86_64InferSignatures' own comment),
+                        ' not a real kind conflict here either.
+                        isHostArgTruncatable = argKind == "Float" ANDALSO hostEntry.ParamKinds[hostArgPosition] == "Number"
+                        IF isHostArgTruncatable == FALSE ANDALSO argKind != hostEntry.ParamKinds[hostArgPosition] THEN mismatchedHostArg = arg
                         hostArgPosition = hostArgPosition + 1
                     NEXT
                     IF unresolvedHostArg != "" THEN
@@ -3649,7 +3928,7 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
-    context = {RodataLines: [], StringCount: 0, FloatCount: 0, DispatchCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesArrayPrintString: FALSE, UsesBoolPrint: FALSE, UsesObjectAlloc: FALSE, UsesHostBridge: FALSE, UsesBoolToString: FALSE}
+    context = {RodataLines: [], StringCount: 0, FloatCount: 0, DispatchCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesArrayPrintString: FALSE, UsesArrayPrintFloat: FALSE, UsesBoolPrint: FALSE, UsesObjectAlloc: FALSE, UsesHostBridge: FALSE, UsesBoolToString: FALSE}
     ' Real inter-procedural string-parameter/return-value inference, run
     ' to a full fixed point BEFORE any real emission -- see
     ' Fission_X86_64InferSignatures' own header comment. Every function's
@@ -3738,6 +4017,11 @@ FUNCTION Fission_AmirToX86_64(amirModule)
             ignored = Array.Push(allTextLines, line)
         NEXT
     END IF
+    IF context.UsesArrayPrintFloat THEN
+        FOR line IN Fission_X86_64ArrayPrintFloatSubroutine()
+            ignored = Array.Push(allTextLines, line)
+        NEXT
+    END IF
     IF context.UsesBoolPrint THEN
         FOR line IN Fission_X86_64BoolPrintSubroutine()
             ignored = Array.Push(allTextLines, line)
@@ -3751,7 +4035,7 @@ FUNCTION Fission_AmirToX86_64(amirModule)
         ignored = Array.Push(rodataLines, "newline_byte:")
         ignored = Array.Push(rodataLines, "    .byte 10")
     END IF
-    IF context.UsesArrayPrint ORELSE context.UsesArrayPrintString THEN
+    IF context.UsesArrayPrint ORELSE context.UsesArrayPrintString ORELSE context.UsesArrayPrintFloat THEN
         ignored = Array.Push(rodataLines, "array_print_open:")
         ignored = Array.Push(rodataLines, "    .ascii \"[\"")
         ignored = Array.Push(rodataLines, "array_print_comma:")

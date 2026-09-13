@@ -1211,3 +1211,55 @@ const char* arco_host_format_double(double value) {
     while (j <= pos) { result[j] = buf[j]; j = j + 1; }
     return result;
 }
+
+
+// --- Batch 6: finishing real floating-point support -- real fmod (for
+// Float-kind MOD) and Random.Float (PCG32's own real unit_interval()
+// algorithm, now expressible since real double arithmetic exists).
+// Bit.*/SHIFT/SETBIT/etc. accepting a Float-kind argument needs NO new
+// C code at all: the oracle's own value_to_int() is a plain
+// `static_cast<long long>(value.as_number())` (confirmed directly in
+// runtime.cpp) -- a real TRUNCATION, done entirely on the ArcoBASIC/
+// codegen side via a real `cvttsd2si` before calling these SAME
+// existing integer host functions unchanged (see
+// fission/amir/lower_x86_64.abas's own comment on this).
+
+static inline __attribute__((always_inline)) double arco_raw_pow2(int n) {
+    double result = arco_raw_int_to_double(1);
+    int i;
+    for (i = 0; i < n; i = i + 1) result = result + result;
+    return result;
+}
+
+// MOD -- real floating-point remainder, matching the oracle's own
+// `std::fmod(left, divisor)` exactly (confirmed directly in
+// src/compiler/fission.cpp's own comment: real fmod, NOT a truncating-
+// integer modulo): `a - trunc(a / b) * b`, the standard real
+// implementation fmod itself uses, real hardware `roundsd` truncation
+// (via arco_raw_trunc, already defined above for
+// arco_host_format_double) giving a correctly-rounded result -- no
+// software bignum needed, this is the SysV (double, double) -> double
+// signature already exactly matching XMM0/XMM1 in, XMM0 out, so this
+// needs no special calling-convention handling anywhere.
+double arco_host_fmod(double a, double b) {
+    double q = arco_raw_trunc(a / b);
+    return a - q * b;
+}
+
+// Random.Float(handle) -- PCG32's own real `unit_interval()` algorithm,
+// ported byte-for-byte from src/runtime/random.cpp (confirmed identical
+// via a direct probe against the oracle: seed 42 produces
+// 0.6303102186/0.7270080560 on both). 2^26/2^53 are built the same
+// "no floating-point literal, no static rodata" way every other real
+// double constant in this file already is (see arco_raw_int_to_double's
+// own comment for why) -- both are EXACT powers of two, so real
+// doubling from 1.0 introduces zero rounding error either way.
+double arco_host_random_float(arco_pcg32_state* handle) {
+    unsigned int highRaw = arco_pcg32_next(handle) >> 5;
+    unsigned int lowRaw = arco_pcg32_next(handle) >> 6;
+    double high = arco_raw_int_to_double((long)highRaw);
+    double low = arco_raw_int_to_double((long)lowRaw);
+    double scale = arco_raw_pow2(26);
+    double divisor = arco_raw_pow2(53);
+    return (high * scale + low) / divisor;
+}

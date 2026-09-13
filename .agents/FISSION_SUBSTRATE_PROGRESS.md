@@ -2760,6 +2760,109 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   this backend already has, the clear next concrete candidate for
   whichever comes first: extending Random.* or hardening Phase 1's own
   remaining edges.
+- **Real floating-point support, Phase 2 ("finish floats")** -- closes
+  every Phase 1 gap named above except the two still-deferred forms of
+  implicit global RNG state. `MOD` on a Float-kind value is now real
+  `arco_host_fmod` (`a - trunc(a / b) * b`, real hardware `roundsd`
+  truncation, matching the oracle's own real `std::fmod(left, divisor)`
+  exactly -- confirmed the SysV `(double,double)->double` ABI already
+  matches how `Fission_X86_64LowerFloatBinOp` already loads both
+  operands into xmm0/xmm1, so this needed no new argument marshaling at
+  all, just a plain `call`). The whole `Bit.*`/`SHIFT`/`SETBIT`/`BIT`/
+  `ROTATELEFT`/etc. family now accepts a Float-kind argument too, via a
+  real `cvttsd2si` TRUNCATION inserted at the call site (both the
+  register and 7th+ stack-argument marshaling paths in
+  `Fission_X86_64EmitCall`, symmetric to the existing Number->Float
+  promotion) -- made possible by seeding every host-bridge symbol's own
+  fixed `ParamKinds`/`ReturnKind` directly into `signatures.ParamKinds`/
+  `ReturnKinds` (keyed by native symbol name, e.g. `arco_host_bit_and`)
+  in `Fission_X86_64InferSignatures`, so `Fission_X86_64EmitCall`'s own
+  generic per-position promotion/truncation logic applies to a host call
+  with ZERO new code path, and a host-bridge function returning a real
+  `double` (`arco_host_random_float`) is now correctly stored via
+  `%xmm0` instead of `%rax` -- narrowly scoped to symbols literally named
+  `arco_host_*`, since a real USER-declared ArcoBASIC function's own
+  Float-kind return still correctly uses `%rax` unchanged (never a real
+  SysV ABI boundary, always this backend's own opaque-bits GP-register
+  transport). `Random.Float(handle)` is real now (PCG32's own
+  `unit_interval()`, `(high * 2^26 + low) / 2^53`, ported byte-for-byte,
+  both `2^26`/`2^53` built via real exact doubling like every other
+  double constant in host_bridge.c). Float-kind ARRAY elements are real:
+  construction/indexing/STORE_INDEX needed zero new code (already kind-
+  agnostic opaque 8-byte storage), only PRINT needed a genuinely new
+  `array_print_float` subroutine (the SAME real bracket/comma/close
+  rodata and %rbx/%r12/%r13 callee-saved discipline
+  `array_print_string` already established, calling
+  `arco_host_format_double` per element via a real SIB-addressed
+  `movsd 8(%rbx,%r12,8), %xmm0`, confirmed the assembler's own existing
+  generic ModRM/SIB machinery already supported this operand shape for
+  `movsd` with zero new encoder work).
+  A real, PRE-EXISTING, general (not Float-specific) correctness bug was
+  found and fixed while verifying array/loop interaction: confirmed
+  directly that `total = 0` then, inside a loop, `total = total + 1.5`
+  compiled with ZERO diagnostics but printed a huge garbage integer
+  instead of the real accumulated float. Root cause:
+  `Fission_X86_64CollectSlots` scans a function's blocks in one single,
+  PROGRAM-ORDER pass, so a loop-carried variable's TRUE kind -- only
+  revealed by a store LATE in that order (inside the loop body) -- was
+  still stale ("Number") as far as an EARLIER Load of that SAME variable
+  within the IDENTICAL pass was concerned (the loop body's own `total +
+  1.5` BinOp correctly computed a real Float result and correctly
+  upgraded `total`'s own FINAL kind by pass-end, but the specific `LOAD
+  total` feeding THAT SAME BinOp had already been classified using the
+  STALE pre-upgrade snapshot, permanently baking a wrong `cvtsi2sd`
+  promotion decision into the generated code for a value that, by the
+  second real loop iteration, was already a genuine double). Fixed with
+  two changes: (1) `Fission_X86_64MergeKinds` now applies the SAME
+  "any kind other than Number is upgrade-worthy, never downgrade" rule
+  (already used for cross-function signature convergence and this
+  file's own earlier multi-RETURN-statement fix) to ORDINARY LOCAL
+  VARIABLES too, not just object/poly kinds; (2) a new
+  `Fission_X86_64CollectSlotsConverged` wrapper runs the real
+  `Fission_X86_64CollectSlots` pass twice more, each time SEEDING
+  `kinds` with the PREVIOUS pass' own final answer (a new `seedKinds`
+  parameter), letting an EARLIER Load see a kind only DISCOVERED later
+  in a previous pass -- both of `Fission_X86_64InferSignatures`' and
+  `Fission_X86_64LowerFunction`'s own call sites now go through this
+  wrapper. This is a genuine, general correctness fix (a String
+  accumulator, e.g. `s = ""` then `s = s + "x"` in a loop, happened to
+  never trigger it, only because an empty-string CONST is UNAMBIGUOUSLY
+  String-kind from its very first store, unlike `0`, which is
+  genuinely ambiguous until a later value reveals more).
+  A real, SEPARATE investigation during this same pass turned out to be
+  a dead end, disclosed here for completeness rather than silently
+  discarded: a probe using `FUNCTION Init(name) ... END FUNCTION` inside
+  a `CLASS` block (instead of the REAL ArcoBASIC `CONSTRUCTOR(name) ...
+  END CONSTRUCTOR` syntax) appeared to silently fail to pass constructor
+  arguments through to fields -- traced at length before discovering
+  `FUNCTION Init` is simply an ORDINARY, NEVER-AUTO-INVOKED method in
+  real ArcoBASIC (confirmed directly: the SAME probe, corrected to use
+  real `CONSTRUCTOR(...)` syntax, already worked perfectly with NO
+  native-backend changes needed at all -- verified by TEMPORARILY
+  reverting an interim fix attempt and confirming the real, correct
+  syntax still passed). No real bug existed there; a real Float-kind
+  class field (via the correct `CONSTRUCTOR` syntax) already works
+  correctly and needed no changes this pass.
+  Verified: all 26 native fixtures re-verified matching the oracle
+  byte-for-byte, including a real end-to-end extension of
+  `fission/tests/native_programs/floating_point.abas` covering every
+  new capability (MOD sign-follows-dividend semantics, Bit truncation,
+  Float arrays crossing a real function-call boundary via ForEach
+  accumulation, the loop-carried-accumulator fix, and Random.Float) in
+  one real program, matching the oracle byte-for-byte on the first full
+  attempt once the two real bugs above were fixed. Extended
+  `fission/tests/amir_x86_64_smoke.abas` with real structural checks for
+  every new capability, replacing the now-stale Phase 1 "MOD/Float-array
+  are real diagnostics" checks (both now succeed instead). Self-parse/
+  self-semantic corpus symbol count grew 3946 -> 3974; golden value
+  updated. Verified with `fissure run`.
+  Real, disclosed remaining scope, narrower now: `Random.Create`'s own
+  zero-argument auto-seed form and `Math.Random()` (the implicit-global-
+  RNG form) both still need real persistent global state (the same
+  "needs a real static-data relocation, not yet supported" architectural
+  boundary already flagged) -- every OTHER Random.* function that takes
+  an explicit handle is now real. No other Float-related gap remains
+  disclosed as of this entry.
 
 ## In-Progress Components
 

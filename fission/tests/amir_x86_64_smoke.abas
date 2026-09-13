@@ -932,17 +932,50 @@ PRINT FloatCompareProgram.Diagnostics.HasErrors()
 PRINT String.Contains(FloatCompareProgram.Render(), "ucomisd")
 PRINT String.Contains(FloatCompareProgram.Render(), "seta")
 
-' Real, disclosed Phase 1 scope: MOD and Float-kind array elements are
-' both real, reported diagnostics, not silently mishandled.
+' Phase 2 (real, no longer diagnostics): MOD is real floating-point
+' remainder (`arco_host_fmod`, matching the oracle's own real
+' `std::fmod`), and Float-kind array elements are real too (PRINT via a
+' new `array_print_float` subroutine). Real execution verified
+' separately by fission/tests/native_programs/floating_point.abas's own
+' Phase 2 extension.
 FloatModSource = "x = 10.5\nPRINT x MOD 3"
 FloatModAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatModSource), "x86-64-float-mod-smoke.abas")))
 FloatModProgram = Fission_AmirToX86_64(FloatModAmir)
 PRINT FloatModProgram.Diagnostics.HasErrors()
+PRINT String.Contains(FloatModProgram.Render(), "call arco_host_fmod")
 
 FloatArraySource = "a = [1.5, 2.5]\nPRINT a"
 FloatArrayAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatArraySource), "x86-64-float-array-smoke.abas")))
 FloatArrayProgram = Fission_AmirToX86_64(FloatArrayAmir)
 PRINT FloatArrayProgram.Diagnostics.HasErrors()
+PRINT String.Contains(FloatArrayProgram.Render(), "call array_print_float")
+
+' Phase 2: Bit.*/SHIFT accept a Float-kind argument via real
+' `cvttsd2si` truncation (matching the oracle's own `value_to_int()`).
+FloatBitTruncSource = "PRINT Bit.And(3.7, 1)"
+FloatBitTruncAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatBitTruncSource), "x86-64-float-bit-trunc-smoke.abas")))
+FloatBitTruncProgram = Fission_AmirToX86_64(FloatBitTruncAmir)
+PRINT FloatBitTruncProgram.Diagnostics.HasErrors()
+PRINT String.Contains(FloatBitTruncProgram.Render(), "cvttsd2si")
+PRINT String.Contains(FloatBitTruncProgram.Render(), "call arco_host_bit_and")
+
+' Phase 2: real Random.Float (PCG32's own unit_interval()).
+RandomFloatSource = "h = Random.Create(1)\nPRINT Random.Float(h)"
+RandomFloatAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(RandomFloatSource), "x86-64-random-float-smoke.abas")))
+RandomFloatProgram = Fission_AmirToX86_64(RandomFloatAmir)
+PRINT RandomFloatProgram.Diagnostics.HasErrors()
+PRINT String.Contains(RandomFloatProgram.Render(), "call arco_host_random_float")
+
+' Phase 2: the real, pre-existing kind-inference staleness bug this
+' phase found and fixed (Fission_X86_64CollectSlotsConverged's own
+' comment) -- a loop-carried Float accumulator, checked here by
+' confirming the FINAL PRINT correctly renders via the real Float path,
+' not itoa.
+LoopAccumSource = "total = 0\nFOR i = 1 TO 3\n    total = total + 1.5\nNEXT\nPRINT total"
+LoopAccumAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(LoopAccumSource), "x86-64-loop-accum-smoke.abas")))
+LoopAccumProgram = Fission_AmirToX86_64(LoopAccumAmir)
+PRINT LoopAccumProgram.Diagnostics.HasErrors()
+PRINT String.Contains(LoopAccumProgram.Render(), "call arco_host_format_double")
 
 ' `String(x)`/`TYPEOF(x)` both real Float-aware special cases too (see
 ' Fission_X86_64LowerFunction's own comment on each).
