@@ -3512,6 +3512,32 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   `host_bridge_batch7.abas` (Random.Clone/Destroy) -- all diffed
   byte-for-byte against `ArcoFission compile-run` on the identical
   source.
+  A genuine RECLASSIFICATION, found by re-examining the oracle's own
+  real bodies more carefully rather than trusting the earlier "growth-
+  needing" bucket at face value: `Array.Clear`/`Pop`/`Shift`/`RemoveAt`/
+  `Remove` were originally lumped in with Push/Unshift/Insert/Extend/
+  Resize as all needing the deferred growable-array representation
+  change -- they do NOT. Every one of them only ever SHRINKS the array
+  (or leaves its length unchanged), so the existing bump-allocated
+  block's own address never needs to move, meaning this backend's own
+  existing shared-pointer array representation already supports them
+  correctly with real, disclosed, in-place mutation (the SAME real
+  exception to "no array mutation" `Bytes.SetU8` already established).
+  `Array.Clear` resets the length header to 0. `Array.Pop`/`Shift`
+  remove and return the last/first element (0 for an empty array, the
+  same already-accepted First/Last-on-empty divergence). `Array.RemoveAt`
+  removes and returns the element at a Number index, shifting subsequent
+  elements down in place (out-of-range is a disclosed 0, matching this
+  backend's existing unchecked-indexing precedent). `Array.Remove` finds
+  and removes the first element equal to a value (Number/String
+  element-kind dispatch, same disclosed Float-kind gap as Find/Contains),
+  returning a real Bool. Push/Unshift/Insert/Extend/Resize remain the
+  real, disclosed, deliberately UNSTARTED subset -- they genuinely need
+  the array to grow past its current capacity, the actual representation
+  change still not attempted.
+  New permanent regression fixture: `host_bridge_batch8.abas` -- diffed
+  byte-for-byte against `ArcoFission compile-run` on the identical
+  source.
   One more real golden-value update, same recurring pattern as before:
   the self-hosted semantic corpus symbol count grew again (4115 -> 4125,
   file count 98 and import-edge count 157 both unchanged) from this

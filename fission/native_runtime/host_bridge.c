@@ -1394,6 +1394,95 @@ arco_i64 arco_host_array_contains_string(const arco_i64* arr, const char* value)
     return arco_host_array_find_string(arr, value) >= 0 ? 1 : 0;
 }
 
+// Array.Clear/Pop/Shift/RemoveAt/Remove -- real, genuinely DIFFERENT
+// from the deferred Push/Unshift/Insert/Extend/Resize-growing subset:
+// every one of these ONLY EVER SHRINKS the array (or leaves its length
+// unchanged), so the existing bump-allocated block's own address never
+// needs to move -- the SAME real, disclosed EXCEPTION to this file's own
+// "no array mutation" scope line Bytes.SetU8 already established
+// (confirmed directly in the oracle: every one of these takes its array
+// argument BY VALUE but mutates the SAME shared underlying array every
+// other alias also sees, matching a plain in-place header/element write
+// through this backend's own already-shared pointer representation
+// exactly, no new machinery needed).
+
+// Array.Clear -- resets the EXISTING block's own length header to 0.
+// Returns the new size (always 0, matching the oracle's own real
+// `array.clear(); return array.size();`).
+arco_i64 arco_host_array_clear(arco_i64* arr) {
+    arr[0] = 0;
+    return 0;
+}
+
+// Array.Pop -- removes and returns the LAST element (0 for an empty
+// array -- the oracle returns a real NULL, the SAME already-accepted
+// First/Last-on-empty divergence, not a new kind of gap). No element
+// movement needed at all (only the last slot stops being "in range"),
+// kind-agnostic raw slot (works identically for Number/String, same as
+// First/Last/Reverse -- the real result KIND is resolved at compile
+// time by fission/amir/lower_x86_64.abas instead).
+arco_i64 arco_host_array_pop(arco_i64* arr) {
+    arco_i64 count = arr[0];
+    if (count == 0) return 0;
+    arco_i64 value = arr[count];
+    arr[0] = count - 1;
+    return value;
+}
+
+// Array.Shift -- removes and returns the FIRST element, shifting every
+// remaining element down by one slot WITHIN the same block (never needs
+// more space -- the block only ever shrinks). Kind-agnostic raw slot,
+// same reasoning as Pop above.
+arco_i64 arco_host_array_shift(arco_i64* arr) {
+    arco_i64 count = arr[0];
+    if (count == 0) return 0;
+    arco_i64 value = arr[1];
+    arco_i64 i = 1;
+    while (i < count) {
+        arr[i] = arr[i + 1];
+        i = i + 1;
+    }
+    arr[0] = count - 1;
+    return value;
+}
+
+// Array.RemoveAt -- removes and returns the element at `index`, shifting
+// subsequent elements down by one slot. An out-of-range index is a real,
+// disclosed simplification (0, matching this backend's own existing
+// unchecked-indexing precedent) rather than the oracle's real thrown
+// error. Kind-agnostic raw slot, same reasoning as Pop/Shift above.
+arco_i64 arco_host_array_remove_at(arco_i64* arr, arco_i64 index) {
+    arco_i64 count = arr[0];
+    if (index < 0 || index >= count) return 0;
+    arco_i64 value = arr[1 + index];
+    arco_i64 i = index;
+    while (i < count - 1) {
+        arr[1 + i] = arr[1 + i + 1];
+        i = i + 1;
+    }
+    arr[0] = count - 1;
+    return value;
+}
+
+// Array.Remove -- finds the FIRST element equal to `value` and removes
+// it in place (via arco_host_array_remove_at), returning a real Bool
+// (found-and-removed, or not), matching the oracle's own real
+// `array_remove_function` exactly. Element-kind dispatched (Number vs
+// String equality), the same real distinction Find/Contains already
+// make -- Float is the same disclosed narrower remaining gap as those.
+arco_i64 arco_host_array_remove_number(arco_i64* arr, arco_i64 value) {
+    arco_i64 index = arco_host_array_find_number(arr, value);
+    if (index < 0) return 0;
+    (void)arco_host_array_remove_at(arr, index);
+    return 1;
+}
+arco_i64 arco_host_array_remove_string(arco_i64* arr, const char* value) {
+    arco_i64 index = arco_host_array_find_string(arr, value);
+    if (index < 0) return 0;
+    (void)arco_host_array_remove_at(arr, index);
+    return 1;
+}
+
 // Array.Reverse -- a real NEW array (the oracle's own `array_reverse_
 // function` copies `args[0]` into a fresh `Value::Array` before
 // reversing, confirmed directly -- it never mutates the caller's own

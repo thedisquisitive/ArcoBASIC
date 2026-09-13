@@ -1186,7 +1186,14 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 ' called (Number vs String element comparison) depends on
                 ' it, resolved entirely in Fission_X86_64LowerFunction's
                 ' own emission-time dispatch, not here.
-                IF Upper(callee) == "ARRAY.FIRST" ORELSE Upper(callee) == "ARRAY.LAST" ORELSE Upper(callee) == "ARRAY.REVERSE" ORELSE Upper(callee) == "ARRAY.SORT" THEN
+                ' `Array.Pop`/`Array.Shift`/`Array.RemoveAt` join First/
+                ' Last here (return ONE element of the array's own
+                ' element kind) -- these three, unlike Push/Unshift/
+                ' Insert/Extend/Resize, only ever SHRINK the array
+                ' in place, so they need none of the deferred growable-
+                ' array representation change (see host_bridge.c's own
+                ' comment on this real, disclosed distinction).
+                IF Upper(callee) == "ARRAY.FIRST" ORELSE Upper(callee) == "ARRAY.LAST" ORELSE Upper(callee) == "ARRAY.REVERSE" ORELSE Upper(callee) == "ARRAY.SORT" ORELSE Upper(callee) == "ARRAY.POP" ORELSE Upper(callee) == "ARRAY.SHIFT" ORELSE Upper(callee) == "ARRAY.REMOVEAT" THEN
                     arrArgs = Fission_X86_64SplitArgs(instruction.Field("Args"))
                     IF LEN(arrArgs) >= 1 THEN
                         arrBaseKind = Object.Get(kinds, arrArgs[0], "Number")
@@ -1199,8 +1206,9 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                         END IF
                     END IF
                 END IF
-                IF Upper(callee) == "ARRAY.CONTAINS" THEN destKind = "Bool"
+                IF Upper(callee) == "ARRAY.CONTAINS" ORELSE Upper(callee) == "ARRAY.REMOVE" THEN destKind = "Bool"
                 IF Upper(callee) == "ARRAY.EMPTY" ORELSE Upper(callee) == "ARRAY.ISEMPTY" THEN destKind = "Bool"
+                IF Upper(callee) == "ARRAY.CLEAR" THEN destKind = "Number"
                 IF Upper(callee) == "ISNULL" THEN destKind = "Bool"
                 IF Upper(callee) == "CLASSOF" THEN destKind = "String"
                 IF Upper(callee) == "ARRAY.JOIN" ORELSE Upper(callee) == "STRING.JOIN" THEN destKind = "String"
@@ -4089,7 +4097,16 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 ' `Array.First`/`Array.Last`/`Array.Reverse` -- see
                 ' Fission_X86_64CollectSlots' own comment (same wording)
                 ' for why these can't be uniform host-table entries.
-                IF Upper(callee) == "ARRAY.FIRST" ORELSE Upper(callee) == "ARRAY.LAST" ORELSE Upper(callee) == "ARRAY.REVERSE" THEN
+                ' `Array.Pop`/`Array.Shift` join First/Last/Reverse here --
+                ' real IN-PLACE mutation (a real, disclosed EXCEPTION to
+                ' this backend's own "no array mutation" scope line, the
+                ' SAME one Bytes.SetU8 already established), but since
+                ' they only ever SHRINK the array, the existing block's
+                ' own address never needs to move, so they need none of
+                ' the deferred growable-array representation change real
+                ' Push/Unshift/etc. would. Kind-agnostic raw slot (works
+                ' identically for Number/String), same as First/Last.
+                IF Upper(callee) == "ARRAY.FIRST" ORELSE Upper(callee) == "ARRAY.LAST" ORELSE Upper(callee) == "ARRAY.REVERSE" ORELSE Upper(callee) == "ARRAY.POP" ORELSE Upper(callee) == "ARRAY.SHIFT" THEN
                     IF LEN(args) != 1 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
                         ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array)")
                         CONTINUE FOR
@@ -4097,7 +4114,38 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     arrSymbol = "arco_host_array_first"
                     IF Upper(callee) == "ARRAY.LAST" THEN arrSymbol = "arco_host_array_last"
                     IF Upper(callee) == "ARRAY.REVERSE" THEN arrSymbol = "arco_host_array_reverse"
+                    IF Upper(callee) == "ARRAY.POP" THEN arrSymbol = "arco_host_array_pop"
+                    IF Upper(callee) == "ARRAY.SHIFT" THEN arrSymbol = "arco_host_array_shift"
                     ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, arrSymbol, args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.Clear` -- real in-place mutation, resets the
+                ' existing block's own length header to 0 and returns the
+                ' new size. Kind-agnostic (works identically regardless
+                ' of element kind, since it never touches element slots
+                ' at all).
+                IF Upper(callee) == "ARRAY.CLEAR" THEN
+                    IF LEN(args) != 1 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_array_clear", args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.RemoveAt` -- real in-place mutation (real,
+                ' disclosed EXCEPTION to "no array mutation", same
+                ' shrink-only reasoning as Pop/Shift above), removes and
+                ' returns the element at a Number index, shifting
+                ' subsequent elements down within the same block.
+                ' Kind-agnostic raw slot, same as Pop/Shift.
+                IF Upper(callee) == "ARRAY.REMOVEAT" THEN
+                    IF LEN(args) != 2 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE ORELSE Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[1])) != "Number" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array and a Number index)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_array_remove_at", args, destOperand, isVoidCall)
                     context.UsesHostBridge = TRUE
                     CONTINUE FOR
                 END IF
@@ -4227,20 +4275,25 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
                     CONTINUE FOR
                 END IF
-                ' `Array.Find`/`Array.Contains` -- the real host-bridge
-                ' implementation only ever moves raw 8-byte slots, but
-                ' unlike First/Last/Reverse above it genuinely needs a
-                ' DIFFERENT comparison per element kind (numeric equality
-                ' for a Number/Float-kind array, real content comparison
-                ' via `arco_raw_strings_equal` for a String-kind one) --
-                ' so this picks between two real, separate concrete C
-                ' symbols at compile time, the array's own element kind
-                ' already known statically. A Float-kind array is a real,
-                ' narrower, disclosed remaining gap for these two
-                ' specifically (Number and String only for now, matching
-                ' every other Number-vs-String-kind-dispatched host
-                ' function already in this backend).
-                IF Upper(callee) == "ARRAY.FIND" ORELSE Upper(callee) == "ARRAY.CONTAINS" THEN
+                ' `Array.Find`/`Array.Contains`/`Array.Remove` -- the real
+                ' host-bridge implementation only ever moves raw 8-byte
+                ' slots, but unlike First/Last/Reverse above it genuinely
+                ' needs a DIFFERENT comparison per element kind (numeric
+                ' equality for a Number/Float-kind array, real content
+                ' comparison via `arco_raw_strings_equal` for a
+                ' String-kind one) -- so this picks between two real,
+                ' separate concrete C symbols at compile time, the
+                ' array's own element kind already known statically. A
+                ' Float-kind array is a real, narrower, disclosed
+                ' remaining gap for these three specifically (Number and
+                ' String only for now, matching every other Number-vs-
+                ' String-kind-dispatched host function already in this
+                ' backend). `Array.Remove` additionally real-mutates its
+                ' array argument in place (a real, disclosed EXCEPTION to
+                ' "no array mutation", same shrink-only reasoning as Pop/
+                ' Shift/RemoveAt above -- it is implemented in terms of
+                ' `arco_host_array_remove_at`, never needing growth).
+                IF Upper(callee) == "ARRAY.FIND" ORELSE Upper(callee) == "ARRAY.CONTAINS" ORELSE Upper(callee) == "ARRAY.REMOVE" THEN
                     IF LEN(args) != 2 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
                         ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array and a value)")
                         CONTINUE FOR
@@ -4252,6 +4305,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     END IF
                     arrFuncBase = "arco_host_array_find_"
                     IF Upper(callee) == "ARRAY.CONTAINS" THEN arrFuncBase = "arco_host_array_contains_"
+                    IF Upper(callee) == "ARRAY.REMOVE" THEN arrFuncBase = "arco_host_array_remove_"
                     ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, arrFuncBase + Lower(arrElementKind), args, destOperand, isVoidCall)
                     context.UsesHostBridge = TRUE
                     CONTINUE FOR

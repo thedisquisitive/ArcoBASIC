@@ -1,0 +1,54 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's own native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention.
+'
+' Array.Clear/Pop/Shift/RemoveAt/Remove -- a real, disclosed EXCEPTION to
+' this whole session's own "no array mutation" scope line (see
+' fission/native_runtime/host_bridge.c's own header comment on this
+' section): every one of these ONLY EVER SHRINKS the array (or leaves
+' its length unchanged), so the existing bump-allocated block's own
+' address never needs to move, unlike Push/Unshift/Insert/Extend/Resize
+' (which remain a real, disclosed, deliberately UNSTARTED undertaking --
+' they need the array to genuinely GROW past its current capacity, this
+' backend's own real, larger, cross-cutting deferred representation
+' change). Confirmed directly in the oracle: every one of these takes
+' its array argument BY VALUE but mutates the SAME shared underlying
+' array every other alias also sees.
+'
+' Number and String only for Array.Remove (element-kind-dependent
+' equality comparison, same disclosed Float-kind gap as Array.Find/
+' Contains elsewhere in this backend).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+nums = [10, 20, 30, 40]
+popped = Array.Pop(nums)
+PRINT popped
+PRINT nums
+
+nums2 = [10, 20, 30, 40]
+shifted = Array.Shift(nums2)
+PRINT shifted
+PRINT nums2
+
+nums3 = [10, 20, 30, 40]
+removedAt = Array.RemoveAt(nums3, 1)
+PRINT removedAt
+PRINT nums3
+
+nums4 = [10, 20, 30, 20]
+removedFlag = Array.Remove(nums4, 20)
+PRINT removedFlag
+PRINT nums4
+
+strs = ["a", "b", "c"]
+removedStrFlag = Array.Remove(strs, "b")
+PRINT removedStrFlag
+PRINT strs
+
+nums5 = [10, 20, 30]
+newSize = Array.Clear(nums5)
+PRINT newSize
+PRINT nums5
+PRINT Array.Empty(nums5)
