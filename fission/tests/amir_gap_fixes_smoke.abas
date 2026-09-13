@@ -1,0 +1,81 @@
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/amir/lower_bytecode.abas"
+
+' Five real, previously-missing SIR->A-MIR lowering gaps -- see
+' fission/tests/arcobasic_fission_self_bytecode_smoke.abas's own header
+' comment for the full design/history of each (found while chasing "is
+' Fission able to compile Fission yet", closing the self-hosted pipeline's
+' own real construct-coverage gap from 70/96 to 96/96 of Fission's own
+' source files). Each case here is a small, isolated, hand-crafted
+' program verified directly against the real oracle (`ArcoFission
+' compile-run`) AND, for the ones with real runtime behavior to check
+' (not just "does it lower without diagnostics"), against the real
+' bytecode VM (`ArcoFission run`) BEFORE being added here -- this file
+' checks the SIR->A-MIR->bytecode pipeline renders the expected real
+' mechanism, matching this whole project's own "verify in isolation
+' first, then pin it down as a permanent regression fixture" discipline.
+
+' 1. NULL literal -- lowers as a plain `CONST 0`.
+NullSource = "x = NULL\nIF x == NULL THEN\n    PRINT \"yes\"\nEND IF"
+NullAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(NullSource), "gap-null-smoke.abas")))
+NullBc = Fission_AmirToBytecode(NullAmir)
+PRINT NullAmir.Diagnostics.HasErrors()
+PRINT NullBc.Diagnostics.HasErrors()
+PRINT String.Contains(NullBc.Render(), "CONST %t1 K0")
+
+' 2. Unary `!` -- real logical negation (distinct from bitwise NOT),
+' lowers as `1 - operand` (a plain BinOp, reusing existing codegen).
+NotSource = "x = TRUE\ny = !x\nPRINT y"
+NotAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(NotSource), "gap-not-smoke.abas")))
+NotBc = Fission_AmirToBytecode(NotAmir)
+PRINT NotAmir.Diagnostics.HasErrors()
+PRINT NotBc.Diagnostics.HasErrors()
+PRINT String.Contains(NotBc.Render(), "BINARY %t3 - %t2 %t1")
+
+' 3. `obj.Field.Method(...)` -- a multi-level qualified CALL (e.g.
+' `SELF.Diagnostics.ReportError(...)`) lowers to one flat, multi-segment
+' dotted callee TEXT, matching the oracle's own real CALL_VALUE shape
+' exactly (confirmed via a direct oracle probe: `o.Child.Greet(...)` ->
+' `CALL o.Child.Greet ...`).
+ChainCallSource = "CLASS Inner\n    CONSTRUCTOR()\n        SELF.Tag = \"inner\"\n    END CONSTRUCTOR\n    FUNCTION Greet(name)\n        PRINT \"hi \" + name + \" from \" + SELF.Tag\n    END FUNCTION\nEND CLASS\nCLASS Outer\n    CONSTRUCTOR()\n        SELF.Child = Inner()\n    END CONSTRUCTOR\nEND CLASS\no = Outer()\no.Child.Greet(\"world\")"
+ChainCallAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(ChainCallSource), "gap-chain-call-smoke.abas")))
+ChainCallBc = Fission_AmirToBytecode(ChainCallAmir)
+PRINT ChainCallAmir.Diagnostics.HasErrors()
+PRINT ChainCallBc.Diagnostics.HasErrors()
+PRINT String.Contains(ChainCallBc.Render(), "o.Child.Greet")
+
+' 3b. `expr().Method(...)` -- a call chained directly onto ANOTHER call's
+' own return value materializes that receiver into a real named local
+' first (matching the oracle's own `__fission_dynrecv0` naming), since
+' the VM's own CALL_VALUE resolution only ever looks up real named
+' locals, never a bare SSA temp.
+CallOnCallSource = "CLASS Bar\n    FUNCTION Greet()\n        RETURN \"hi from bar\"\n    END FUNCTION\nEND CLASS\nCLASS Foo\n    FUNCTION MakeBar()\n        RETURN Bar()\n    END FUNCTION\nEND CLASS\nf = Foo()\nr = f.MakeBar().Greet()\nPRINT r"
+CallOnCallAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(CallOnCallSource), "gap-call-on-call-smoke.abas")))
+CallOnCallBc = Fission_AmirToBytecode(CallOnCallAmir)
+PRINT CallOnCallAmir.Diagnostics.HasErrors()
+PRINT CallOnCallBc.Diagnostics.HasErrors()
+PRINT String.Contains(CallOnCallBc.Render(), "__fission_dynrecv")
+
+' 4. The SAME two shapes for a real Set/assignment TARGET
+' (`SELF.Bytes[offset] = v`) -- a DIFFERENT mechanism from (3): confirmed
+' via a direct bytecode-execution probe that STORE_INDEX's own "Local"
+' reference is a plain, single LOCAL SLOT lookup with NO dot-walking at
+' all (unlike CALL_VALUE), so every non-bare-Read base is unconditionally
+' materialized into a real named local first here.
+ChainSetSource = "CLASS Holder\n    CONSTRUCTOR()\n        SELF.Bytes = [0, 0, 0]\n    END CONSTRUCTOR\n    FUNCTION SetIt(offset, v)\n        SELF.Bytes[offset] = v\n    END FUNCTION\nEND CLASS\nh = Holder()\nh.SetIt(1, 42)\nPRINT h.Bytes[1]"
+ChainSetAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(ChainSetSource), "gap-chain-set-smoke.abas")))
+ChainSetBc = Fission_AmirToBytecode(ChainSetAmir)
+PRINT ChainSetAmir.Diagnostics.HasErrors()
+PRINT ChainSetBc.Diagnostics.HasErrors()
+PRINT String.Contains(ChainSetBc.Render(), "__fission_dynrecv")
+
+' 5. `ADDRESSOF FuncName` -- a real, dedicated callable-reference value
+' (NOT a plain string, confirmed in the oracle's own bytecode VM), a new
+' A-MIR "Addressof" instruction with matching new bytecode lowering
+' producing the oracle's own real `ADDRESSOF dest name` shape (opcode 29).
+AddressOfSource = "FUNCTION Square(x)\n    RETURN x * x\nEND FUNCTION\nh = ADDRESSOF Square\nPRINT h(5)"
+AddressOfAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(AddressOfSource), "gap-addressof-smoke.abas")))
+AddressOfBc = Fission_AmirToBytecode(AddressOfAmir)
+PRINT AddressOfAmir.Diagnostics.HasErrors()
+PRINT AddressOfBc.Diagnostics.HasErrors()
+PRINT String.Contains(AddressOfBc.Render(), "29 ADDRESSOF")

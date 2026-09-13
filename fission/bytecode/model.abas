@@ -37,6 +37,7 @@ FUNCTION Fission_BytecodeOpcodeNumber(mnemonic)
     IF mnemonic == "DECLARE_CLASS" THEN RETURN 18
     IF mnemonic == "RETURN" THEN RETURN 20
     IF mnemonic == "THROW" THEN RETURN 23
+    IF mnemonic == "ADDRESSOF" THEN RETURN 29
     RETURN -1
 END FUNCTION
 
@@ -87,6 +88,7 @@ CLASS FissionBytecodeInstruction
         IF SELF.Mnemonic == "TRY_BEGIN" THEN RETURN opcode + " " + SELF.Field("Catch") + " " + SELF.Field("Name")
         IF SELF.Mnemonic == "TRY_END" THEN RETURN opcode
         IF SELF.Mnemonic == "THROW" THEN RETURN opcode + " " + SELF.Field("Value")
+        IF SELF.Mnemonic == "ADDRESSOF" THEN RETURN opcode + " " + SELF.Field("Dest") + " " + SELF.Field("Name")
         RETURN opcode + " " + String(SELF.Fields)
     END FUNCTION
 END CLASS

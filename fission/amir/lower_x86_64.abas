@@ -576,14 +576,31 @@ END FUNCTION
 ' variable" diagnostic class Phase 4 originally established for a
 ' variable assigned both a String and a Number, generalized) rather than
 ' silently guessing one class or crashing.
+' The LAST "." in `name`, not the first -- a real, declared function/
+' constructor name (e.g. "ClassName.Method") only ever has exactly one dot,
+' so this is unobservable there, but a real multi-level qualified CALL-SITE
+' callee text (e.g. "SELF.Diagnostics.ReportError", see the shared
+' Fission_AmirMemberCalleeChain's own comment for why the A-MIR layer emits
+' this as one flat dotted string) has more than one -- the METHOD name is
+' always everything after the LAST dot, the "base" is everything before it,
+' regardless of how many field-access segments came before that.
+FUNCTION Fission_X86_64LastDotIndex(name)
+    index = String.Length(name) - 1
+    WHILE index >= 0
+        IF String.Slice(name, index, 1) == "." THEN RETURN index
+        index = index - 1
+    WEND
+    RETURN -1
+END FUNCTION
+
 FUNCTION Fission_X86_64ClassNameFromFunctionName(name)
-    dotIndex = String.IndexOf(name, ".")
+    dotIndex = Fission_X86_64LastDotIndex(name)
     IF dotIndex < 0 THEN RETURN ""
     RETURN String.Slice(name, 0, dotIndex)
 END FUNCTION
 
 FUNCTION Fission_X86_64MethodNameFromFunctionName(name)
-    dotIndex = String.IndexOf(name, ".")
+    dotIndex = Fission_X86_64LastDotIndex(name)
     IF dotIndex < 0 THEN RETURN ""
     RETURN String.Slice(name, dotIndex + 1, String.Length(name) - dotIndex - 1)
 END FUNCTION

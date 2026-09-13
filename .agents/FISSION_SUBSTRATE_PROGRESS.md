@@ -2981,6 +2981,135 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   DegToRad, RadToDeg}`) is also not attempted -- this backend has no
   general Object-literal-return-value support yet, a broader,
   pre-existing gap unrelated to Math specifically.
+- DONE -- closed the self-hosted SIR->A-MIR->BYTECODE pipeline's own
+  construct-coverage gap from 70/96 to a real 96/96 of Fission's own
+  first-party source files (the SAME file list `arcobasic_fission_self_
+  parse_smoke.abas`/`arcobasic_fission_self_semantic_smoke.abas` already
+  carry through Lex/Parse/SIR), triggered directly by the user asking
+  "Is Fission able to compile Fission yet?" A genuinely thorough,
+  first-hand investigation (not a doc-archaeology answer) found the real
+  answer was "no" for three separate, distinct reasons: (1) no real
+  `#IMPORT` expansion exists in this substrate's own codegen path at all
+  (every SIR->A-MIR/bytecode/native run, before and after this entry,
+  compiles ONE file in isolation -- a real, disclosed, UNSTARTED,
+  substantially larger undertaking, deliberately NOT attempted this
+  pass); (2) real, shared SIR->A-MIR lowering gaps hit by Fission's own
+  code; (3) real native x86-64 backend construct gaps (`Array.Push` and
+  similar, already separately disclosed). This entry closes (2)
+  completely for the WHOLE real 96-file corpus -- five real, previously-
+  missing gaps, all in `fission/sir/lower_amir.abas` unless noted, each
+  found via one real file compiling under this pass's own probe and
+  fixed via a direct oracle probe BEFORE being checked against the
+  corpus:
+  1. NULL literal -- lowered as a plain `CONST 0` (every pointer-kind
+     value in this substrate IS a plain integer address already; 0 is a
+     real, safe, never-otherwise-used sentinel, the same "semantically
+     identical, not byte-identical" precedent TRUE/FALSE already use --
+     the oracle's own real A-MIR emits a dedicated `CONST null`).
+  2. Unary `!` (real LOGICAL negation, confirmed via a direct oracle
+     probe to be a genuinely different, DEDICATED typed unary A-MIR
+     instruction from bitwise `NOT`/`~`, see [[project_arcobasic_not_
+     bitwise_footgun]]) -- lowered as `1 - operand` (Bool-kind values are
+     already plain 0/1 integers in this substrate), the same "unfused"
+     precedent unary `-` already established, needing zero new backend
+     codegen on either target.
+  3. `obj.Field.Method(...)` (a multi-level qualified CALL, e.g. `SELF.
+     Diagnostics.ReportError(...)`, confirmed pervasive throughout
+     Fission's own source -- this exact shape alone was what blocked
+     `fission/core/registry.abas`/`component.abas` from compiling at all)
+     and `expr().Method(...)` (a call chained directly onto ANOTHER
+     call's own return value, e.g. `Fission.Compiler().Compile(...)`).
+     Confirmed via direct oracle probes that a pure field-read chain
+     lowers to ONE FLAT, multi-segment dotted callee TEXT (`o.Child.
+     Greet(...)` -> `CALL o.Child.Greet ...`, not a synthesized temp for
+     the intermediate field read -- the VM's own CALL_VALUE resolution
+     walks the whole dotted chain itself at runtime), while a genuinely
+     COMPUTED receiver gets materialized into a real, freshly-STORE'd
+     NAMED local first (`f.MakeBar().Greet()` -> `STORE __fission_
+     dynrecv0, %t14` / `CALL __fission_dynrecv0.Greet`, the oracle's own
+     real synthesized-receiver naming, reused verbatim) -- CALL_VALUE's
+     own resolution only ever looks up real named locals, never a bare
+     SSA temp. New `Fission_AmirMemberCalleeChain` helper (recursive:
+     Read -> its own name; MemberRead -> recurse + join with "."; anything
+     else -> lower normally then materialize via a new `builder.
+     NewDynamicReceiverName()`, reusing the same per-function counter
+     `NewTemp()` already uses) implements both cases uniformly. A callee
+     that still doesn't bottom out at a Read/MemberRead chain at all
+     (calling a bare, non-`.`-qualified computed value directly) remains
+     a real, narrower, disclosed "indirect call target" diagnostic.
+  4. The SAME two base shapes for a real Set/assignment TARGET
+     (`SELF.Bytes[offset] = v`, `o.Inner.Bytes[2] = 99`) -- a real,
+     DIFFERENT mechanism from (3) was required here, confirmed only by
+     actually EXECUTING the result, not by analogy: a flat dotted name
+     like "SELF.Bytes" (which works perfectly as a CALL_VALUE callee)
+     fails at runtime for `STORE_INDEX` with "undefined bytecode local:
+     SELF.Bytes" -- `STORE_INDEX`'s own "Local" reference is a plain,
+     SINGLE bytecode LOCAL SLOT lookup with NO dot-walking at all, unlike
+     CALL_VALUE's own resolution. New `Fission_AmirLowerStoreIndexBase`
+     helper: a bare Read needs nothing extra; ANY other base (a field-read
+     chain, a nested index, a call's own return value, ...) is
+     UNCONDITIONALLY materialized into a real named local first (the
+     oracle's own actual A-MIR for `SELF.Bytes[offset] = v` inside a
+     method uses a plain single-key `STORE_INDEX SELF "Bytes" offset v`
+     against the receiver's own already-real "SELF" local -- a genuinely
+     different, real multi-KEY design this substrate's own existing
+     single-key `StoreIndex`/`STORE_INDEX` opcode does not replicate, a
+     disclosed, narrower scope cut; the dynrecv-materialization approach
+     here is semantically equivalent since every Array/Object value is a
+     real REFERENCE, never copied on read, so writing through the
+     materialized receiver correctly mutates the SAME underlying shared
+     structure -- verified directly, not just reasoned about, including
+     the doubly-nested `o.Inner.Bytes[2] = 99` case).
+  5. `ADDRESSOF FuncName` -- confirmed in the oracle's own bytecode VM
+     that this produces a genuinely DISTINCT runtime Value kind
+     (`runtime.make_callable(...)`, specially recognized by `CALL_VALUE`
+     when dispatching a call through a variable holding one), so, unlike
+     every fix above, a `CONST`-based substitution would NOT be
+     semantically equivalent here -- this is the first case in the whole
+     file where the "compose from an existing instruction" shortcut
+     doesn't apply. Added as a real, dedicated new A-MIR "Addressof"
+     instruction (mirroring the oracle's own `%tN := ADDRESSOF target`
+     exactly), a matching new `Fission_AmirToBytecode` case
+     (`fission/amir/lower_bytecode.abas`), and matching new opcode-number
+     (29, matching the oracle's own real `BytecodeOp::AddressOf`
+     enumerator) plus `Render()` support
+     (`fission/bytecode/model.abas`) producing the oracle's own real
+     `ADDRESSOF dest name` bytecode text shape byte-for-byte.
+  Every fix was verified via a real, isolated, hand-crafted probe run
+  through the REAL bytecode VM (`ArcoFission run`, not just "lowers
+  without diagnostics") BEFORE being checked against the real 96-file
+  corpus -- including, for (4), confirming the write genuinely propagates
+  through a real underlying shared structure rather than just producing
+  no diagnostic. New permanent regression fixtures: `fission/tests/
+  arcobasic_fission_self_bytecode_smoke.abas` (the SAME real 96-file list,
+  now additionally carried all the way through SIR->A-MIR->BYTECODE,
+  asserting 96/96 with zero failures at every stage -- the single
+  strongest existing proof this substrate's own codegen, not just its
+  frontend, now handles every real construct Fission's own source tree
+  uses) and `fission/tests/amir_gap_fixes_smoke.abas` (one isolated,
+  hand-crafted case per fix above, checking both zero diagnostics and the
+  specific expected bytecode shape). Native x86-64 backend re-verified
+  with zero regressions: a defensive fix alongside these (`Fission_X86_64
+  ClassNameFromFunctionName`/`MethodNameFromFunctionName` now split on the
+  LAST "." instead of the first -- unobservable for the single-dot
+  declared-function-name case these already handled correctly, but
+  required for correctness once a call-site's own multi-segment dotted
+  callee text could reach native codegen at all) plus a full `rivet
+  build` (0 failed) and direct byte-for-byte re-verification of 5 existing
+  native fixtures. Self-parse/self-semantic corpus symbol count grew
+  4031 -> 4050 (file count 96 and import-edge count 150 both unchanged);
+  golden values updated, plus new golden checks for the new self-bytecode
+  fixture. Verified with `fissure run`.
+  Real, disclosed, current answer to "is Fission able to compile Fission
+  yet": still no -- but the remaining gap is now exactly one thing, the
+  missing real `#IMPORT`/module expansion in this substrate's own codegen
+  path (item (1) above), not "an unknown number of scattered construct
+  gaps" any more. Every REAL CONSTRUCT the whole 96-file corpus actually
+  uses now lowers correctly through SIR->A-MIR->BYTECODE; what's missing
+  is purely the ability to compile MORE THAN ONE FILE as a single linked
+  program. That is real, substantial, disclosed, unstarted follow-on
+  work, deliberately not attempted this pass -- see "Next Recommended
+  Work".
 
 ## In-Progress Components
 

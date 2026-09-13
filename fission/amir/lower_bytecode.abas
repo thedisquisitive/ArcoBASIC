@@ -112,6 +112,10 @@ FUNCTION Fission_BytecodeLowerInstruction(module, fn, block, amirInstruction)
         ignored = block.Append(FissionBytecodeInstruction("THROW").WithField("Value", amirInstruction.Field("Value")))
         RETURN
     END IF
+    IF kind == "Addressof" THEN
+        ignored = block.Append(FissionBytecodeInstruction("ADDRESSOF").WithField("Dest", amirInstruction.Field("Dest")).WithField("Name", amirInstruction.Field("Name")))
+        RETURN
+    END IF
     ignored = module.Diagnostics.ReportError("FISSION_BYTECODE_UNSUPPORTED", "Unsupported A-MIR instruction for bytecode lowering: " + kind)
 END FUNCTION
 

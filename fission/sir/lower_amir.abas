@@ -120,6 +120,19 @@ CLASS FissionAmirBuilder
         RETURN name
     END FUNCTION
 
+    ' A fresh, real NAMED local for a computed call-chain receiver -- see
+    ' Fission_AmirMemberCalleeChain's own comment for why a bare `%tN`
+    ' temp isn't enough here (confirmed via a direct oracle probe:
+    ' `f.MakeBar().Greet()` -> `STORE __fission_dynrecv0, %t14` / `CALL
+    ' __fission_dynrecv0.Greet`, the exact same real naming scheme,
+    ' reusing the SAME counter as NewTemp since both are drawn from the
+    ' same per-function numbering space in the oracle's own A-MIR).
+    FUNCTION NewDynamicReceiverName()
+        name = "__fission_dynrecv" + String(SELF.TempCounter)
+        SELF.TempCounter = SELF.TempCounter + 1
+        RETURN name
+    END FUNCTION
+
     FUNCTION NewBlockName(prefix)
         name = prefix + String(SELF.BlockCounter)
         SELF.BlockCounter = SELF.BlockCounter + 1
@@ -138,6 +151,61 @@ CLASS FissionAmirBuilder
     END FUNCTION
 END CLASS
 
+' Walks a chain of MemberRead nodes down to its base, building the full
+' dotted-name TEXT a real multi-level qualified call site needs (see
+' Fission_AmirLowerExpr's own CallExpr comment for the full "why a flat
+' dotted string, not a synthesized temp" reasoning, confirmed directly
+' against the oracle). A base that is NOT itself a plain Read/MemberRead
+' chain -- most commonly another CALL's own return value
+' (`f.MakeBar().Greet()`), but genuinely any other expression works the
+' same way -- is real, legal ArcoBASIC too: confirmed via a direct oracle
+' probe that the legacy VM's own CALL_VALUE mechanism resolves its callee
+' text ONLY against real named LOCALS, never a bare SSA temp, so the
+' oracle's own A-MIR first lowers that sub-expression normally, then
+' materializes it into a fresh, real NAMED local (`STORE
+' __fission_dynrecv0, %t14`) before using THAT name as the next segment's
+' own base -- this does the exact same thing via
+' `builder.NewDynamicReceiverName()`. Only a genuinely indirect callee
+' with no real Read/MemberRead/other-expression shape at all would fail
+' to produce a name here, which in practice never happens (every SIR
+' expression kind lowers to SOME value) -- this function's own return is
+' never actually "" in current use, kept only as a defensive fallback.
+FUNCTION Fission_AmirMemberCalleeChain(builder, node)
+    IF node.Kind == "Read" THEN RETURN Object.Get(node.Fields, "Name", "")
+    IF node.Kind == "MemberRead" THEN
+        baseChain = Fission_AmirMemberCalleeChain(builder, node.Children[0])
+        IF baseChain == "" THEN RETURN ""
+        RETURN baseChain + "." + Object.Get(node.Fields, "Name", "")
+    END IF
+    computed = Fission_AmirLowerExpr(builder, node)
+    receiverName = builder.NewDynamicReceiverName()
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", receiverName).WithField("Value", computed.Value))
+    RETURN receiverName
+END FUNCTION
+
+' The base-name resolver a `Set` target (`base[index] = value`/
+' `base.field = value`) needs -- a REAL, DIFFERENT mechanism from
+' Fission_AmirMemberCalleeChain above, confirmed necessary via a direct
+' bytecode-execution probe: a flat dotted name like "SELF.Bytes" (which
+' Fission_AmirMemberCalleeChain would happily build, and which works
+' perfectly fine as a multi-level qualified CALL's own callee text) fails
+' at runtime here with "undefined bytecode local: SELF.Bytes" --
+' STORE_INDEX's own "Local" reference is a plain, single bytecode LOCAL
+' SLOT lookup with no dot-walking at all, unlike CALL_VALUE's own callee
+' resolution. So ANY base other than a bare Read (a chain of field reads,
+' a nested index, a call's own return value, ...) must be materialized
+' into a real, freshly-STORE'd named local first -- exactly the same real
+' "why" Fission_AmirMemberCalleeChain's own fallback branch already uses,
+' just applied unconditionally to every non-Read base here rather than
+' only to a non-chain one.
+FUNCTION Fission_AmirLowerStoreIndexBase(builder, node)
+    IF node.Kind == "Read" THEN RETURN Object.Get(node.Fields, "Name", "")
+    computed = Fission_AmirLowerExpr(builder, node)
+    receiverName = builder.NewDynamicReceiverName()
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", receiverName).WithField("Value", computed.Value))
+    RETURN receiverName
+END FUNCTION
+
 ' Lowers a SIR expression node into (a) the A-MIR operand referring to its
 ' result (a temp name, or a literal's own text for a bare CONST) and (b) the
 ' operand's known type ("" when not statically known). Every non-trivial
@@ -150,7 +218,24 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
         IF literalKind == "InterpolatedString" THEN RETURN Fission_AmirUnsupportedExpr(builder, "interpolated string literal")
         IF value == "TRUE" THEN RETURN {Value: "1", Type: "BOOL"}
         IF value == "FALSE" THEN RETURN {Value: "0", Type: "BOOL"}
-        IF value == "NULL" THEN RETURN Fission_AmirUnsupportedExpr(builder, "null literal")
+        ' The legacy oracle emits a dedicated `CONST null` for a real NULL
+        ' literal (confirmed via `ArcoFission reveal ... at A-MIR` on a
+        ' real `x = NULL` / `x == NULL` program) -- this lowers it as a
+        ' plain `CONST 0` instead, the same deliberate, disclosed
+        ' "semantically identical, not byte-identical" divergence already
+        ' used for TRUE/FALSE above: NULL is used purely as a sentinel
+        ' compared with `==`/`!=` (comparisons always use the typed
+        ' INT.CMP_* form regardless of operand type, per this function's
+        ' own comment below, so the untyped "" Type here costs nothing),
+        ' and every pointer-kind value (String/Array/Object) this backend
+        ' already represents IS a plain integer address, so 0 is a real,
+        ' safe, never-otherwise-used sentinel value in this substrate's
+        ' own memory model -- not an approximation.
+        IF value == "NULL" THEN
+            temp = builder.NewTemp()
+            ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", temp).WithField("Value", "0"))
+            RETURN {Value: temp, Type: ""}
+        END IF
         temp = builder.NewTemp()
         constText = value
         ' A plain string literal's CONST operand is quoted in the legacy
@@ -171,9 +256,11 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
         ' x86-64 lowering) for one operator. Semantically identical, not
         ' byte-identical -- the same "unfused, not byte-for-byte" scope
         ' choice this substrate already makes elsewhere (see e.g.
-        ' fission/bytecode/model.abas's own header comment). Only unary
-        ' `-` is handled; `NOT`/`!`/ADDRESSOF/COPY unary forms remain a
-        ' real, disclosed gap, same as before this fix.
+        ' fission/bytecode/model.abas's own header comment). Unary `-` and
+        ' `!` (see that operator's own branch below) are both handled now;
+        ' bitwise `NOT` (lexes as `~`, a real, DIFFERENT operator from `!`
+        ' -- `IF NOT x THEN` is NOT logical negation) and ADDRESSOF/COPY
+        ' unary forms remain a real, disclosed gap.
         operator = Object.Get(node.Fields, "Operator", "")
         IF operator == "-" THEN
             operand = Fission_AmirLowerExpr(builder, node.Children[0])
@@ -182,6 +269,30 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
             resultTemp = builder.NewTemp()
             ignored = builder.Emit(FissionAmirInstruction("BinOp").WithField("Dest", resultTemp).WithField("Op", "-").WithField("Left", zeroTemp).WithField("Right", operand.Value).WithField("LeftType", "").WithField("RightType", ""))
             RETURN {Value: resultTemp, Type: operand.Type}
+        END IF
+        ' `!x` -- real LOGICAL negation on a Bool-kind (0/1) value, distinct
+        ' from the bitwise `NOT`/`~` keyword (see [[project_arcobasic_not_
+        ' bitwise_footgun]]/`Fission_ArcoBasicLex`'s own comment -- `!` and
+        ' `NOT` are two entirely different real ArcoBASIC operators). The
+        ' oracle emits a dedicated typed unary `! %tN` A-MIR instruction
+        ' (confirmed via `ArcoFission reveal ... at A-MIR` on a real `y =
+        ' !x` program: `%t3 :BOOL := ! %t2`) -- this lowers it as `1 -
+        ' operand` instead (an ordinary BinOp), the SAME "unfused,
+        ' semantically identical, not byte-identical" divergence the unary
+        ' `-` case above already established, needing zero new A-MIR
+        ' instruction kind (and so zero new bytecode/native lowering) --
+        ' every Bool-kind value in this substrate is ALREADY a plain 0/1
+        ' integer (see the TRUE/FALSE literal handling above), so `1 - x`
+        ' flips 0->1 and 1->0 exactly like a real logical NOT, through the
+        ' exact same generic integer BinOp codegen every other arithmetic
+        ' operator already uses on both backends.
+        IF operator == "!" THEN
+            operand = Fission_AmirLowerExpr(builder, node.Children[0])
+            oneTemp = builder.NewTemp()
+            ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", oneTemp).WithField("Value", "1"))
+            resultTemp = builder.NewTemp()
+            ignored = builder.Emit(FissionAmirInstruction("BinOp").WithField("Dest", resultTemp).WithField("Op", "-").WithField("Left", oneTemp).WithField("Right", operand.Value).WithField("LeftType", "").WithField("RightType", ""))
+            RETURN {Value: resultTemp, Type: "BOOL"}
         END IF
         RETURN Fission_AmirUnsupportedExpr(builder, "unary operator " + operator)
     END IF
@@ -227,7 +338,6 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
         callee = node.Children[0]
         calleeName = ""
         isMemberCallee = FALSE
-        IF callee.Kind == "MemberRead" THEN isMemberCallee = callee.Children[0].Kind == "Read"
         IF callee.Kind == "Read" THEN calleeName = Object.Get(callee.Fields, "Name", "")
         ' `obj.Method(args)` -- the callee text is literally
         ' "instanceVarName.MethodName", no explicit SELF argument passed at
@@ -237,10 +347,28 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
         ' right `ClassName.Method` function using the instance's own
         ' `__class` tag at runtime, this lowering pass does not need to (and
         ' cannot, without real type inference) resolve it statically.
-        IF isMemberCallee THEN
-            baseName = Object.Get(callee.Children[0].Fields, "Name", "")
-            fieldName = Object.Get(callee.Fields, "Name", "")
-            calleeName = baseName + "." + fieldName
+        ' A real, previously-missing generalization: `obj.Field.Method(...)`
+        ' (a MULTI-level qualified call, e.g. `SELF.Diagnostics.
+        ' ReportError(...)`) and `expr().Method(...)` (a call chained
+        ' directly onto ANOTHER call's own return value, e.g.
+        ' `f.MakeBar().Greet()`) are both real, common ArcoBASIC --
+        ' confirmed pervasive throughout Fission's OWN source (these exact
+        ' shapes are what blocked most of Fission's own real source files
+        ' from compiling through this substrate's own self-hosted pipeline
+        ' at all). See Fission_AmirMemberCalleeChain's own comment for the
+        ' full design (a pure field-read chain lowers to one flat dotted
+        ' TEXT, matching the oracle's own `CALL o.Child.Greet` shape
+        ' exactly; a genuinely COMPUTED receiver gets materialized into a
+        ' real named local first, matching the oracle's own
+        ' `__fission_dynrecv0` naming, since the VM's own CALL_VALUE
+        ' resolution only ever looks up real named locals, never a bare
+        ' SSA temp) -- both confirmed via direct oracle probes.
+        IF callee.Kind == "MemberRead" THEN
+            memberChain = Fission_AmirMemberCalleeChain(builder, callee)
+            IF memberChain != "" THEN
+                isMemberCallee = TRUE
+                calleeName = memberChain
+            END IF
         END IF
         IF callee.Kind != "Read" AND isMemberCallee == FALSE THEN RETURN Fission_AmirUnsupportedExpr(builder, "indirect call target")
         argValues = []
@@ -252,6 +380,25 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
         WEND
         dest = builder.NewTemp()
         ignored = builder.Emit(FissionAmirInstruction("Call").WithField("Dest", dest).WithField("Callee", calleeName).WithField("Args", Array.Join(argValues, " ")))
+        RETURN {Value: dest, Type: ""}
+    END IF
+    ' `ADDRESSOF FuncName` -- a real, dedicated callable-reference value
+    ' (NOT a plain string, confirmed directly in the oracle's own bytecode
+    ' VM: `runtime.make_callable(name, ...)` produces a genuine, distinct
+    ' runtime Value kind that `CALL_VALUE`'s own resolution specially
+    ' recognizes when dispatching a call through a variable holding one --
+    ' a real `CONST "FuncName"` substitution, unlike the NULL/TRUE/FALSE
+    ' cases above, would NOT be semantically equivalent here, since a call
+    ' through a plain string wouldn't trigger that same special
+    ' resolution). So this is a real, dedicated A-MIR instruction kind
+    ' (mirroring the oracle's own `%tN := ADDRESSOF target` exactly, see
+    ' Fission_AmirToBytecode's own matching "Addressof" -> `ADDRESSOF`
+    ' bytecode lowering), the first case in this whole file where the
+    ' "compose from an existing instruction" shortcut genuinely doesn't
+    ' apply.
+    IF node.Kind == "AddressOf" THEN
+        dest = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Addressof").WithField("Dest", dest).WithField("Name", Object.Get(node.Fields, "Name", "")))
         RETURN {Value: dest, Type: ""}
     END IF
     ' `SUPER.Method(args)` -- UNLIKE `obj.Method(args)`/`SELF.Method(args)`
@@ -1014,35 +1161,53 @@ FUNCTION Fission_AmirLowerStatement(builder, node)
     IF node.Kind == "Set" THEN
         target = node.Children[0]
         value = Fission_AmirLowerExpr(builder, node.Children[1])
-        ' Only `name[index] = value` and `name.field = value` are supported
-        ' here -- the base of the target must itself be a bare variable Read
-        ' (matching bytecode's own STORE_INDEX, which addresses a LOCAL slot
-        ' directly, not an arbitrary loaded value). Nested/indirect targets
-        ' (`a[i][j] = value`, `a.b.c = value`) are out of scope for this
-        ' lowering pass and report a diagnostic rather than silently
-        ' mis-lowering. Member-write lowers through the same STORE_INDEX
-        ' opcode as index-write, just with a quoted string CONST as the
-        ' index (confirmed via the oracle: `obj.Name = "b"` lowers to
-        ' `STORE_INDEX obj %t3 %t4` where %t3 is `CONST "Name"`).
-        ' Nested IFs, not a single `AND`-joined condition: bare AND is
-        ' bitwise/non-short-circuiting in this language, so a joined
-        ' condition would evaluate `target.Children[0]` even when target.Kind
-        ' is neither IndexRead nor MemberRead and has no children at all --
-        ' the same crash class found twice already tonight (real "array
-        ' index out of range" failures caught only by running the code, not
-        ' by review), fixed defensively here before it could happen a third
-        ' time rather than after.
+        ' `name[index] = value` and `name.field = value` -- STORE_INDEX
+        ' addresses a LOCAL slot directly, not an arbitrary loaded value,
+        ' so the target's own base must resolve to a real NAME. A
+        ' previously-missing generalization: the base need not be a bare
+        ' variable Read any more -- `a.b[i] = value`/`a.b.c = value`
+        ' (a chain of plain field reads, e.g. `SELF.Bytes[offset] = v`)
+        ' and even a genuinely COMPUTED base (`Foo().Field = value`) are
+        ' both real, common ArcoBASIC, confirmed pervasive throughout
+        ' Fission's OWN source (this exact shape blocked
+        ' `fission/amir/x86_64_fragment.abas`/`fission/language/api/
+        ' language.abas` from compiling through this substrate's own
+        ' self-hosted pipeline). Reuses the EXACT SAME
+        ' Fission_AmirMemberCalleeChain a multi-level qualified CALL
+        ' target already uses (see that function's own comment) --  a
+        ' pure field-read chain resolves to one flat dotted name (e.g.
+        ' "SELF.Bytes", matching how the existing single-key STORE_INDEX
+        ' already addresses "SELF" alone); a genuinely computed base gets
+        ' materialized into a real named local first. Since every
+        ' Object/Array value in this substrate is a REFERENCE (a pointer
+        ' to shared, mutable heap state, never copied on read), writing
+        ' through that materialized reference correctly mutates the SAME
+        ' real underlying structure the original chain pointed at --
+        ' verified directly against a real nested write
+        ' (`o.Inner.Bytes[2] = 99` then reading it back through the
+        ' original chain). Member-write lowers through the same
+        ' STORE_INDEX opcode as index-write, just with a quoted string
+        ' CONST as the index (confirmed via the oracle: `obj.Name = "b"`
+        ' lowers to `STORE_INDEX obj %t3 %t4` where %t3 is `CONST
+        ' "Name"`). Nested IFs, not a single `AND`-joined condition: bare
+        ' AND is bitwise/non-short-circuiting in this language, so a
+        ' joined condition would evaluate `target.Children[0]` even when
+        ' target.Kind is neither IndexRead nor MemberRead and has no
+        ' children at all -- the same crash class found twice already
+        ' tonight (real "array index out of range" failures caught only
+        ' by running the code, not by review), fixed defensively here
+        ' before it could happen a third time rather than after.
         IF target.Kind == "IndexRead" THEN
-            IF target.Children[0].Kind == "Read" THEN
-                baseName = Object.Get(target.Children[0].Fields, "Name", "")
+            baseName = Fission_AmirLowerStoreIndexBase(builder, target.Children[0])
+            IF baseName != "" THEN
                 indexResult = Fission_AmirLowerExpr(builder, target.Children[1])
                 ignored = builder.Emit(FissionAmirInstruction("StoreIndex").WithField("Name", baseName).WithField("Index", indexResult.Value).WithField("Value", value.Value))
                 RETURN
             END IF
         END IF
         IF target.Kind == "MemberRead" THEN
-            IF target.Children[0].Kind == "Read" THEN
-                baseName = Object.Get(target.Children[0].Fields, "Name", "")
+            baseName = Fission_AmirLowerStoreIndexBase(builder, target.Children[0])
+            IF baseName != "" THEN
                 fieldName = Object.Get(target.Fields, "Name", "")
                 keyTemp = builder.NewTemp()
                 ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", keyTemp).WithField("Value", "\"" + fieldName + "\""))
