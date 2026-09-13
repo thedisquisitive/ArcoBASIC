@@ -1,0 +1,55 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's own native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention.
+'
+' RANGE, Array.Empty/Array.IsEmpty/Array.New, EXIT/ISNULL. RANGE
+' materializes a real Array:Number of every value the real range would
+' iterate (the oracle's own real RangeValue is a genuinely distinct lazy
+' type this backend does not have -- FOR-IN/LEN/indexing all behave
+' identically, PRINTing a bare Range value directly does not, not
+' exercised here). EXIT/ExitProgram/ExitTheProgram are a real, direct
+' `exit(2)` syscall with a real, caller-supplied code.
+'
+' Real, disclosed, ACCEPTED divergence (the SAME one this backend's own
+' NULL-literal support already established, see fission/sir/
+' lower_amir.abas's own comment): `ISNULL(0)` is TRUE here but FALSE in
+' the oracle -- a real Number 0 and a real NULL are indistinguishable in
+' this backend's own representation (every pointer-kind value IS a plain
+' integer, and NULL itself lowers to a real `CONST 0`), so this is
+' deliberately NOT exercised in this byte-for-byte fixture; ISNULL on a
+' genuine NULL, or a genuinely non-zero value, both already match exactly
+' and ARE exercised below.
+'
+' Real, disclosed narrower scope: bare `Exit(code)` as the FIRST token of
+' a STATEMENT (not assigned to anything) does not parse -- "EXIT" is
+' reserved for loop control (EXIT WHILE/FOR/DO) and the self-hosted
+' parser's own statement dispatch only disambiguates it as an ordinary
+' callable identifier in EXPRESSION position (already fixed in an earlier
+' session, see fission/language/arcobasic/parser.abas's own comment on
+' `Fission_ArcoBasicCanName`) -- `ignored = Exit(code)` (the exact form
+' every real Fission CLI driver already uses throughout this codebase)
+' works correctly and is what this fixture exercises.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+r = Range(1, 10, 2)
+FOR x IN r
+    PRINT x
+NEXT
+PRINT LEN(r)
+
+a = Array.New(3, 99)
+PRINT a
+PRINT Array.Empty(a)
+e = Array.New(0, 0)
+PRINT Array.Empty(e)
+PRINT Array.IsEmpty(e)
+
+PRINT ISNULL(5)
+n = NULL
+PRINT ISNULL(n)
+
+PRINT "before exit"
+ignored = Exit(3)
+PRINT "unreachable"

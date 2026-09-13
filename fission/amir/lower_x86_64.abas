@@ -434,6 +434,9 @@ FUNCTION Fission_X86_64HostFunctionTable()
     table = Object.Set(table, "STRING.STARTSWITH", {Symbol: "arco_host_string_starts_with", ReturnKind: "Bool", ParamKinds: ["String", "String"]})
     table = Object.Set(table, "STRING.ENDSWITH", {Symbol: "arco_host_string_ends_with", ReturnKind: "Bool", ParamKinds: ["String", "String"]})
     table = Object.Set(table, "STRING.TRIM", {Symbol: "arco_host_string_trim", ReturnKind: "String", ParamKinds: ["String"]})
+    table = Object.Set(table, "STRING.SPLIT", {Symbol: "arco_host_string_split", ReturnKind: "Array:String", ParamKinds: ["String", "String"]})
+    table = Object.Set(table, "STRING.TOCHARS", {Symbol: "arco_host_string_to_chars", ReturnKind: "Array:String", ParamKinds: ["String"]})
+    table = Object.Set(table, "STRING.LINES", {Symbol: "arco_host_string_lines", ReturnKind: "Array:String", ParamKinds: ["String"]})
     table = Object.Set(table, "STRING.SLICE", {Symbol: "arco_host_string_slice", ReturnKind: "String", ParamKinds: ["String", "Number", "Number"]})
     table = Object.Set(table, "STRING.DELETE", {Symbol: "arco_host_string_delete", ReturnKind: "String", ParamKinds: ["String", "Number", "Number"]})
     table = Object.Set(table, "STRING.INSERT", {Symbol: "arco_host_string_insert", ReturnKind: "String", ParamKinds: ["String", "Number", "String"]})
@@ -456,6 +459,7 @@ FUNCTION Fission_X86_64HostFunctionTable()
     table = Object.Set(table, "ROTATERIGHT", {Symbol: "arco_host_rotate_right", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
     table = Object.Set(table, "SHIFT", {Symbol: "arco_host_shift", ReturnKind: "Number", ParamKinds: ["Number", "Number"]})
     table = Object.Set(table, "BYTESTOHEX", {Symbol: "arco_host_bytes_to_hex", ReturnKind: "String", ParamKinds: ["String"]})
+    table = Object.Set(table, "PATH.JOIN", {Symbol: "arco_host_path_join", ReturnKind: "String", ParamKinds: ["String", "String"]})
     table = Object.Set(table, "PATH.BASENAME", {Symbol: "arco_host_path_basename", ReturnKind: "String", ParamKinds: ["String"]})
     table = Object.Set(table, "PATH.DIRNAME", {Symbol: "arco_host_path_dirname", ReturnKind: "String", ParamKinds: ["String"]})
     table = Object.Set(table, "PATH.EXTENSION", {Symbol: "arco_host_path_extension", ReturnKind: "String", ParamKinds: ["String"]})
@@ -472,6 +476,18 @@ FUNCTION Fission_X86_64HostFunctionTable()
     table = Object.Set(table, "FILE.APPENDTEXT", {Symbol: "arco_host_file_append_text", ReturnKind: "Bool", ParamKinds: ["String", "String"]})
     table = Object.Set(table, "FILE.READBYTES", {Symbol: "arco_host_file_read_bytes", ReturnKind: "Array:Number", ParamKinds: ["String"]})
     table = Object.Set(table, "FILE.WRITEBYTES", {Symbol: "arco_host_file_write_bytes", ReturnKind: "Bool", ParamKinds: ["String", "Array:Number"]})
+    ' Real Bytes.* -- confirmed directly in the oracle that a "Bytes"
+    ' value is just an ordinary Array:Number, no separate runtime
+    ' representation at all. Bytes.New is scoped to its real 2-argument
+    ' form (size, fill) only here -- the oracle's own 0/1-argument forms
+    ' (an implicit `fill=0`) are a real, disclosed, narrower scope cut,
+    ' matching the established Path.Join/Format fixed-arity precedent.
+    table = Object.Set(table, "BYTES.NEW", {Symbol: "arco_host_bytes_new", ReturnKind: "Array:Number", ParamKinds: ["Number", "Number"]})
+    table = Object.Set(table, "BYTES.GETU8", {Symbol: "arco_host_bytes_get_u8", ReturnKind: "Number", ParamKinds: ["Array:Number", "Number"]})
+    table = Object.Set(table, "BYTES.SETU8", {Symbol: "arco_host_bytes_set_u8", ReturnKind: "Array:Number", ParamKinds: ["Array:Number", "Number", "Number"]})
+    table = Object.Set(table, "BYTES.FROMTEXT", {Symbol: "arco_host_bytes_from_text", ReturnKind: "Array:Number", ParamKinds: ["String"]})
+    table = Object.Set(table, "BYTES.TOTEXT", {Symbol: "arco_host_bytes_to_text", ReturnKind: "String", ParamKinds: ["Array:Number"]})
+    table = Object.Set(table, "HEXTOBYTES", {Symbol: "arco_host_hex_to_bytes", ReturnKind: "Array:Number", ParamKinds: ["String"]})
     table = Object.Set(table, "FILE.SETEXECUTABLE", {Symbol: "arco_host_file_set_executable", ReturnKind: "Bool", ParamKinds: ["String"]})
     table = Object.Set(table, "DIRECTORY.CREATE", {Symbol: "arco_host_directory_create", ReturnKind: "Bool", ParamKinds: ["String"]})
     table = Object.Set(table, "DIRECTORY.EXISTS", {Symbol: "arco_host_directory_exists", ReturnKind: "Bool", ParamKinds: ["String"]})
@@ -494,6 +510,14 @@ FUNCTION Fission_X86_64HostFunctionTable()
     ' Float-kind RETURN is now handled generically, via %xmm0).
     table = Object.Set(table, "RANDOM.FLOAT", {Symbol: "arco_host_random_float", ReturnKind: "Float", ParamKinds: ["Number"]})
     table = Object.Set(table, "TIME.TIMESTAMP", {Symbol: "arco_host_time_timestamp", ReturnKind: "Number", ParamKinds: []})
+    ' RANGE(start, stop, step) -- scoped to its real 3-argument form only
+    ' (the oracle's own real 1-argument `Range(stop)` and 2-argument
+    ' `Range(start, stop)` forms, both with real implicit defaults, are a
+    ' real, disclosed, narrower scope cut, matching the established
+    ' fixed-arity precedent). See host_bridge.c's own comment on
+    ' `arco_host_range` for the real "materializes a real array instead
+    ' of the oracle's own lazy RangeValue" divergence.
+    table = Object.Set(table, "RANGE", {Symbol: "arco_host_range", ReturnKind: "Array:Number", ParamKinds: ["Number", "Number", "Number"]})
     table = Object.Set(table, "SLEEP", {Symbol: "arco_host_sleep", ReturnKind: "Bool", ParamKinds: ["Number"]})
     RETURN table
 END FUNCTION
@@ -1144,6 +1168,51 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                                 destKind = randBaseKind
                             END IF
                         END IF
+                    END IF
+                END IF
+                ' `Array.First`/`Array.Last`/`Array.Reverse` are the SAME
+                ' real "native implementation only ever moves raw 8-byte
+                ' slots, compile-time result kind depends on the INPUT
+                ' array's own element kind" case Random.Choice/Sample/
+                ' Shuffle already established -- First/Last return ONE
+                ' element (same kind as the array's own element kind);
+                ' Reverse returns a real NEW array of the array's own SAME
+                ' full kind. `Array.Find`/`Array.Contains` do NOT need this
+                ' treatment -- their own real return kind is ALWAYS Number
+                ' (an index) / Bool respectively, regardless of the array's
+                ' own element kind -- only WHICH concrete host symbol gets
+                ' called (Number vs String element comparison) depends on
+                ' it, resolved entirely in Fission_X86_64LowerFunction's
+                ' own emission-time dispatch, not here.
+                IF Upper(callee) == "ARRAY.FIRST" ORELSE Upper(callee) == "ARRAY.LAST" ORELSE Upper(callee) == "ARRAY.REVERSE" ORELSE Upper(callee) == "ARRAY.SORT" THEN
+                    arrArgs = Fission_X86_64SplitArgs(instruction.Field("Args"))
+                    IF LEN(arrArgs) >= 1 THEN
+                        arrBaseKind = Object.Get(kinds, arrArgs[0], "Number")
+                        IF Fission_X86_64IsArrayKind(arrBaseKind) THEN
+                            IF Upper(callee) == "ARRAY.REVERSE" ORELSE Upper(callee) == "ARRAY.SORT" THEN
+                                destKind = arrBaseKind
+                            ELSE
+                                destKind = Fission_X86_64ArrayElementKind(arrBaseKind)
+                            END IF
+                        END IF
+                    END IF
+                END IF
+                IF Upper(callee) == "ARRAY.CONTAINS" THEN destKind = "Bool"
+                IF Upper(callee) == "ARRAY.EMPTY" ORELSE Upper(callee) == "ARRAY.ISEMPTY" THEN destKind = "Bool"
+                IF Upper(callee) == "ISNULL" THEN destKind = "Bool"
+                IF Upper(callee) == "CLASSOF" THEN destKind = "String"
+                IF Upper(callee) == "ARRAY.JOIN" ORELSE Upper(callee) == "STRING.JOIN" THEN destKind = "String"
+                ' `Array.New(size, fill)` -- the real result kind depends
+                ' on the FILL argument's own kind (the SAME real
+                ' "compile-time result kind from an argument, not a fixed
+                ' ABI signature" case every other special-cased Array.*
+                ' function above already handles, just from the SECOND
+                ' argument instead of the first).
+                IF Upper(callee) == "ARRAY.NEW" THEN
+                    newArgs = Fission_X86_64SplitArgs(instruction.Field("Args"))
+                    IF LEN(newArgs) >= 2 THEN
+                        fillKind = Fission_X86_64NormalizeNumericKind(Object.Get(kinds, newArgs[1], "Number"))
+                        destKind = "Array:" + fillKind
                     END IF
                 END IF
                 hostEntry = Object.Get(Fission_X86_64HostFunctionTable(), Upper(callee), NULL)
@@ -3576,7 +3645,11 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 context.UsesItoa = TRUE
                 CONTINUE FOR
             END IF
-            isLenCall = kind == "Call" ANDALSO Upper(instruction.Field("Callee")) == "LEN"
+            ' `Bytes.Length(arr)` is, confirmed directly in the oracle,
+            ' identical to `LEN(arr)` (a "Bytes" value is just an ordinary
+            ' Array:Number, no separate runtime representation) -- a real
+            ' alias, not a separate host function, matching exactly.
+            isLenCall = kind == "Call" ANDALSO (Upper(instruction.Field("Callee")) == "LEN" ORELSE Upper(instruction.Field("Callee")) == "BYTES.LENGTH" ORELSE Upper(instruction.Field("Callee")) == "ARRAY.LENGTH" ORELSE Upper(instruction.Field("Callee")) == "ARRAY.SIZE")
             IF isLenCall THEN
                 ' `LEN(arr)` is an ordinary CALL to a builtin name, not a
                 ' user-declared function (confirmed via the oracle: `CALL
@@ -4008,6 +4081,197 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                         CONTINUE FOR
                     END IF
                     ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_random_shuffle", args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.First`/`Array.Last`/`Array.Reverse` -- see
+                ' Fission_X86_64CollectSlots' own comment (same wording)
+                ' for why these can't be uniform host-table entries.
+                IF Upper(callee) == "ARRAY.FIRST" ORELSE Upper(callee) == "ARRAY.LAST" ORELSE Upper(callee) == "ARRAY.REVERSE" THEN
+                    IF LEN(args) != 1 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array)")
+                        CONTINUE FOR
+                    END IF
+                    arrSymbol = "arco_host_array_first"
+                    IF Upper(callee) == "ARRAY.LAST" THEN arrSymbol = "arco_host_array_last"
+                    IF Upper(callee) == "ARRAY.REVERSE" THEN arrSymbol = "arco_host_array_reverse"
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, arrSymbol, args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.Sort` -- a real NEW array of the array's own SAME
+                ' full kind (same "no growth needed" shape as Reverse
+                ' above), but the COMPARATOR is element-kind-dependent
+                ' (numeric vs byte-wise string ordering), the same real
+                ' "which concrete symbol to call" case Find/Contains/Join
+                ' below already establish -- Number and String only for
+                ' now, same disclosed Float-kind gap as those.
+                IF Upper(callee) == "ARRAY.SORT" THEN
+                    IF LEN(args) != 1 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array)")
+                        CONTINUE FOR
+                    END IF
+                    sortElementKind = Fission_X86_64ArrayElementKind(Fission_X86_64OperandKind(kinds, args[0]))
+                    IF sortElementKind != "Number" ANDALSO sortElementKind != "String" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " on an array of this element kind is not supported by native x86-64 codegen (expected Number or String)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_array_sort_" + Lower(sortElementKind), args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.Empty`/`Array.IsEmpty` -- same real "works
+                ' identically for any element kind" case as First/Last/
+                ' Reverse above, real Bool result.
+                IF Upper(callee) == "ARRAY.EMPTY" ORELSE Upper(callee) == "ARRAY.ISEMPTY" THEN
+                    IF LEN(args) != 1 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_array_empty", args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.New(size, fill)` -- see Fission_X86_64CollectSlots'
+                ' own comment (same wording) for why its own real result
+                ' kind depends on the FILL argument.
+                IF Upper(callee) == "ARRAY.NEW" THEN
+                    IF LEN(args) != 2 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected 2)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_array_new", args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `EXIT`/`ExitProgram`/`ExitTheProgram` -- a real, direct
+                ' `exit(2)` syscall, no host_bridge.c involvement needed
+                ' at all (this backend's own program epilogue already
+                ' emits the identical `mov $60, %rax` / `syscall` pair
+                ' for a normal return, just with a hardcoded `xor %rdi,
+                ' %rdi` for exit code 0 -- this is that same real
+                ' mechanism with a real, caller-supplied code instead).
+                ' Scoped to the real 1-argument form only -- the oracle's
+                ' own real 0-argument form (implicit code 0) is a real,
+                ' disclosed, narrower scope cut.
+                IF Upper(callee) == "EXIT" ORELSE Upper(callee) == "EXITPROGRAM" ORELSE Upper(callee) == "EXITTHEPROGRAM" THEN
+                    IF LEN(args) != 1 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected 1)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[0], "rdi"))
+                    ignored = Array.Push(textLines, "    mov $60, %rax")
+                    ignored = Array.Push(textLines, "    syscall")
+                    CONTINUE FOR
+                END IF
+                ' `ISNULL(x)` -- a plain `x == 0` integer comparison, no
+                ' host_bridge.c involvement needed: every pointer-kind
+                ' value (String/Array/Object) this backend represents IS
+                ' a plain integer address, and NULL itself already lowers
+                ' to a real `CONST 0` (see fission/sir/lower_amir.abas's
+                ' own comment on its NULL literal handling) -- 0 is a
+                ' real, safe, never-otherwise-used sentinel throughout,
+                ' the same "semantically identical" precedent this whole
+                ' backend's Float/NULL support already established.
+                IF Upper(callee) == "ISNULL" THEN
+                    IF LEN(args) != 1 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected 1)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[0], "rax"))
+                    ignored = Array.Push(textLines, "    test %rax, %rax")
+                    ignored = Array.Push(textLines, "    sete %al")
+                    ignored = Array.Push(textLines, "    movzbq %al, %rax")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                ' `CLASSOF(obj)` -- a plain memory load, no host_bridge.c
+                ' involvement needed at all: `"__class"` is ALWAYS
+                ' allocated at field offset 0 for EVERY real class,
+                ' unconditionally (confirmed directly in
+                ' Fission_X86_64CollectClassFields' own real field-offset
+                ' assignment, `fieldOffsets = {"__class": 0}`, at every
+                ' one of its own real call sites) -- true for a single
+                ' concrete `Object:ClassName` receiver AND a genuinely
+                ' POLYMORPHIC `Poly:Class1,Class2,...` one alike, since
+                ' this is true of every candidate class equally, no
+                ' runtime `__class`-tag dispatch chain needed the way a
+                ' real polymorphic METHOD call needs one.
+                IF Upper(callee) == "CLASSOF" THEN
+                    IF LEN(args) != 1 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with the wrong number of arguments is not supported by native x86-64 codegen")
+                        CONTINUE FOR
+                    END IF
+                    ' The oracle's real CLASSOF returns "" (an empty string,
+                    ' not an error) for any non-object argument -- confirmed
+                    ' directly via probe: `PRINT "[" + CLASSOF(5) + "]"` ->
+                    ' `[]`. A statically-known non-Object/Poly-kind argument
+                    ' can only ever hit that empty-string case, so emit a
+                    ' real empty-string CONST result for it instead of
+                    ' reading a real "__class" field that would not exist.
+                    IF Fission_X86_64IsObjectKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE ANDALSO Fission_X86_64IsPolyKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
+                        IF isVoidCall == FALSE THEN
+                            classofEmptyLabel = "str" + String(context.StringCount)
+                            context.StringCount = context.StringCount + 1
+                            ignored = Array.Push(context.RodataLines, classofEmptyLabel + ":")
+                            ignored = Array.Push(context.RodataLines, "    .asciz \"\"")
+                            ignored = Array.Push(textLines, "    lea " + classofEmptyLabel + "(%rip), %rax")
+                            ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+                        END IF
+                        CONTINUE FOR
+                    END IF
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[0], "rax"))
+                    ignored = Array.Push(textLines, "    mov (%rax), %rax")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                ' `Array.Find`/`Array.Contains` -- the real host-bridge
+                ' implementation only ever moves raw 8-byte slots, but
+                ' unlike First/Last/Reverse above it genuinely needs a
+                ' DIFFERENT comparison per element kind (numeric equality
+                ' for a Number/Float-kind array, real content comparison
+                ' via `arco_raw_strings_equal` for a String-kind one) --
+                ' so this picks between two real, separate concrete C
+                ' symbols at compile time, the array's own element kind
+                ' already known statically. A Float-kind array is a real,
+                ' narrower, disclosed remaining gap for these two
+                ' specifically (Number and String only for now, matching
+                ' every other Number-vs-String-kind-dispatched host
+                ' function already in this backend).
+                IF Upper(callee) == "ARRAY.FIND" ORELSE Upper(callee) == "ARRAY.CONTAINS" THEN
+                    IF LEN(args) != 2 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array and a value)")
+                        CONTINUE FOR
+                    END IF
+                    arrElementKind = Fission_X86_64ArrayElementKind(Fission_X86_64OperandKind(kinds, args[0]))
+                    IF arrElementKind != "Number" ANDALSO arrElementKind != "String" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " on an array of this element kind is not supported by native x86-64 codegen (expected Number or String)")
+                        CONTINUE FOR
+                    END IF
+                    arrFuncBase = "arco_host_array_find_"
+                    IF Upper(callee) == "ARRAY.CONTAINS" THEN arrFuncBase = "arco_host_array_contains_"
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, arrFuncBase + Lower(arrElementKind), args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.Join`/`String.Join` -- confirmed byte-for-byte
+                ' IDENTICAL logic in the oracle (two separate C++
+                ' functions, same body) -- both real ArcoBASIC names
+                ' dispatch to the SAME pair of real host symbols here,
+                ' picked by the array argument's own element kind (Number
+                ' or String only for now, same disclosed Float-kind gap
+                ' as Find/Contains above).
+                IF Upper(callee) == "ARRAY.JOIN" ORELSE Upper(callee) == "STRING.JOIN" THEN
+                    IF LEN(args) != 2 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE ORELSE Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[1])) != "String" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array and a String separator)")
+                        CONTINUE FOR
+                    END IF
+                    joinElementKind = Fission_X86_64ArrayElementKind(Fission_X86_64OperandKind(kinds, args[0]))
+                    IF joinElementKind != "Number" ANDALSO joinElementKind != "String" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " on an array of this element kind is not supported by native x86-64 codegen (expected Number or String)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_array_join_" + Lower(joinElementKind), args, destOperand, isVoidCall)
                     context.UsesHostBridge = TRUE
                     CONTINUE FOR
                 END IF

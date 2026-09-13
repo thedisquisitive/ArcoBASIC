@@ -1,0 +1,25 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's own native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention.
+'
+' Array.Sort -- a real NEW array (the oracle's own `array_sort_function`
+' copies its argument into a fresh array before sorting, never mutating
+' the caller's own array), ascending order. Number-kind sorts
+' numerically; String-kind sorts by ordinary byte-wise ordering (matching
+' `std::string::operator<` -- uppercase letters sort before lowercase
+' ones). Number and String only -- a real, disclosed, narrower remaining
+' scope cut, matching the same Number-vs-String-only precedent already
+' established for Array.Find/Contains/Join elsewhere in this backend.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+nums = [5, 30, 10, 20, -5, 0]
+sortedNums = Array.Sort(nums)
+PRINT sortedNums
+PRINT nums
+
+strs = ["banana", "apple", "Cherry", "apple"]
+sortedStrs = Array.Sort(strs)
+PRINT sortedStrs
+PRINT strs

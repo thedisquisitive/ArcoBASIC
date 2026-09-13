@@ -1,0 +1,38 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's own native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention.
+'
+' Real Bytes.* (confirmed directly in the oracle: a "Bytes" value is just
+' an ordinary Array:Number, no separate runtime representation of its own)
+' and Path.Join (real `std::filesystem::path::operator/=` semantics: an
+' absolute right side replaces the whole path; otherwise the two segments
+' concatenate with exactly one "/" between them). Bytes.SetU8 is a real,
+' disclosed exception to this backend's own "no array mutation" scope --
+' it mutates one EXISTING element in place, never changing the array's own
+' length, so it needs none of the growable-array representation change
+' real Array.Push/etc. would.
+'
+' Real, disclosed scope: Bytes.New is scoped to its real 2-argument form
+' (size, fill) only; Path.Home is NOT implemented at all -- it needs the
+' real process ENVP block, and this backend's own `_start` entry point
+' does not capture argv/envp from the stack yet (a real, separate, larger,
+' disclosed undertaking).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+b = Bytes.New(4, 7)
+PRINT b
+PRINT Bytes.Length(b)
+PRINT Bytes.GetU8(b, 0)
+b2 = Bytes.SetU8(b, 1, 300)
+PRINT b2
+PRINT Bytes.GetU8(b, 1)
+raw = Bytes.FromText("Hi!")
+PRINT raw
+back = Bytes.ToText(raw)
+PRINT back
+PRINT Path.Join("a", "b")
+PRINT Path.Join("a/", "b")
+PRINT Path.Join("a", "/b")
+PRINT Path.Join("", "b")

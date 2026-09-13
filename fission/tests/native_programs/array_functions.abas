@@ -1,0 +1,66 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's own native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention.
+'
+' Real Array.* functions -- the READ-ONLY / SAME-SIZE subset (First, Last,
+' Find, Contains, Reverse, Join). Every one of these either only READS an
+' existing array or builds a brand-NEW array of a size known once at the
+' start of the call, so none of them need this backend's own current
+' fixed-size, no-spare-capacity array representation to change. Real,
+' disclosed, deliberately NOT attempted scope: Array.Push/Pop/Shift/
+' Unshift/Insert/RemoveAt/Remove/Clear/Resize/Extend all need the array to
+' genuinely CHANGE LENGTH in place with real reference semantics (every
+' alias of the array sees the mutation) -- a real, larger, cross-cutting
+' representation change (a stable {length, capacity, dataPointer} header),
+' deliberately deferred. Find/Contains/Join are further scoped to Number
+' and String element kinds only for now -- a Float-kind array is a real,
+' disclosed, narrower remaining gap for these three specifically.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+a = [10, 20, 30]
+PRINT Array.First(a)
+PRINT Array.Last(a)
+PRINT Array.Find(a, 20)
+PRINT Array.Find(a, 99)
+PRINT Array.Contains(a, 30)
+PRINT Array.Contains(a, 99)
+PRINT Array.Reverse(a)
+PRINT a
+PRINT Array.Join(a, ", ")
+
+s = ["apple", "banana", "cherry"]
+PRINT Array.First(s)
+PRINT Array.Last(s)
+PRINT Array.Find(s, "banana")
+PRINT Array.Find(s, "durian")
+PRINT Array.Contains(s, "cherry")
+PRINT Array.Contains(s, "durian")
+PRINT Array.Reverse(s)
+PRINT Array.Join(s, "-")
+PRINT String.Join(s, " | ")
+
+' Array.First/Array.Last on a genuinely EMPTY array are deliberately NOT
+' exercised here: the oracle prints a real "NULL" (its own Value::Storage
+' has a genuine null/empty state), while this backend returns a plain 0
+' (a real, disclosed simplification -- no null/empty Value representation
+' of its own yet, see this file's own header comment) -- a real, known,
+' ACCEPTED divergence, not a regression this byte-for-byte fixture should
+' flag every time it runs.
+
+lines = String.Lines("first\nsecond\nthird")
+PRINT LEN(lines)
+FOR l IN lines
+    PRINT l
+NEXT
+
+parts = String.Split("a,,b,c", ",")
+PRINT LEN(parts)
+PRINT Array.Join(parts, "|")
+
+chars = String.ToChars("hi!")
+PRINT LEN(chars)
+FOR c IN chars
+    PRINT c
+NEXT

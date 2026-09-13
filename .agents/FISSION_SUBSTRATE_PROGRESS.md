@@ -3318,6 +3318,199 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   count grew 4106 -> 4115 (`fission/language/arcobasic/parser.abas`
   itself gained a new function; file count 98 and import-edge count 157
   both unchanged); golden value updated. Verified with `fissure run`.
+- DONE -- a real, sustained autonomous push through the standing "~246-
+  entry host-function-bridge" directive, triggered by the user's own
+  "just start grinding through the host function bridge until we run out
+  of usage." Real, disclosed methodology change this pass: `fissure run`
+  was NOT used for verification (see the "Never QEMU during Fission work"
+  feedback the user gave directly this same session -- touching shared
+  build infra had escalated a prior `fissure run` into the full 134-test
+  QEMU-inclusive sweep) -- every slice below was instead verified via the
+  real standalone native driver binary
+  (`.rivet/fission-native/fission-compile-to-x86-64`) diffed directly
+  against `ArcoFission compile-run` on the identical source, plus a
+  standalone C unit-test harness for every new `host_bridge.c` function
+  BEFORE it ever reached the ArcoBASIC compiler layer (this whole
+  project's own established discipline, just without the `fissure run`
+  step specifically this pass -- a real `fissure run` should still
+  happen before the NEXT commit that touches shared infra).
+  Real Array.* additions (the READ-ONLY / SAME-SIZE subset --
+  Array.Push/Pop/Shift/Unshift/Insert/RemoveAt/Remove/Clear/Resize/
+  Extend remain a real, disclosed, deliberately UNSTARTED undertaking:
+  every one of them needs the array to genuinely CHANGE LENGTH in place
+  with real reference semantics -- confirmed directly in the oracle,
+  `array_push_function` mutates the SAME underlying shared array every
+  OTHER alias also sees -- and this backend's own current array
+  representation is a single fixed-size bump-allocated block with no
+  spare capacity, so a real Push that needs to grow would silently break
+  every other alias of that same array; supporting this correctly needs
+  a genuine representation change, a stable `{length, capacity,
+  dataPointer}` header, a real, larger, cross-cutting undertaking
+  deliberately not attempted this pass):
+  - `Array.First`/`Array.Last`/`Array.Reverse` -- real, kind-agnostic raw
+    slot passthrough/copy (same "native code doesn't interpret the
+    slots, the result KIND is resolved at compile time" pattern
+    Random.Choice/Sample/Shuffle already established), added to that
+    exact same special-case dispatch mechanism (both
+    `Fission_X86_64CollectSlots`' own destKind resolution and
+    `Fission_X86_64LowerFunction`'s own emission).
+  - `Array.Find`/`Array.Contains` -- real linear scan, dispatched at
+    compile time between two real, separate concrete host symbols
+    (`_number`/`_string`) by the array's own STATICALLY-known element
+    kind -- a Float-kind array is a real, disclosed, narrower remaining
+    gap for these two specifically (and for Join below).
+  - `Array.Join`/`String.Join` -- confirmed byte-for-byte IDENTICAL logic
+    in the oracle (two separate C++ functions, same body) -- both real
+    ArcoBASIC names now dispatch to the SAME real pair of host symbols.
+  - `Array.Empty`/`Array.IsEmpty` -- real Bool, kind-agnostic.
+  - `Array.New(size, fill)` -- real, kind-agnostic raw-slot fill; the
+    real result KIND depends on the FILL argument's own kind (the SAME
+    "compile-time result kind from an argument" pattern, just from the
+    SECOND argument instead of the first) -- scoped to its real
+    2-argument form only, the oracle's own 0/1-argument forms (implicit
+    empty array / `fill=NULL` default) are a real, disclosed, narrower
+    scope cut, matching the established Path.Join/Format fixed-arity
+    precedent.
+  - `Array.Length`/`Array.Size`/`Bytes.Length` -- real, but need ZERO new
+    code at all: confirmed identical to the ALREADY-existing `LEN`
+    special-case dispatch (a "Bytes" value, confirmed directly in the
+    oracle, is just an ordinary `Array:Number` with no separate runtime
+    representation of its own), so these are pure NAME ALIASES added to
+    that same existing check.
+  Real Bytes.* (`Bytes.New`/`GetU8`/`SetU8`/`FromText`/`ToText`) -- since
+  a "Bytes" value IS just an ordinary Array:Number, this needed only five
+  small real C functions. `Bytes.SetU8` is a real, disclosed EXCEPTION to
+  this whole pass's own "no array mutation" scope line: it mutates one
+  EXISTING element in place, never changing the array's own LENGTH, so it
+  needs none of the growable-array representation change real Push/etc.
+  would (confirmed directly in the oracle: it takes its array argument BY
+  VALUE but mutates the shared array it references, then returns that
+  SAME array back, not a new size). `GetU8`/`SetU8` on an out-of-range
+  index are a real, disclosed simplification (0 / silently ignored) --
+  this backend's own existing plain `arr[i]` indexing is ALSO unchecked
+  everywhere already, matching that same established behavior rather
+  than inventing a new, inconsistent mechanism just for Bytes.*.
+  Real `Path.Join(a, b)` -- confirmed directly against the oracle's own
+  real `std::filesystem::path::operator/=` semantics (an absolute right
+  side replaces the left entirely; otherwise exactly one `/` separator,
+  never doubled). Scoped to its real 2-argument form only (the oracle's
+  own variadic N-segment form is a real, disclosed, narrower scope cut).
+  `Path.Home` is NOT implemented -- it needs the real process ENVP block
+  (`getenv("HOME")`), and this backend's own `_start` entry point does
+  not capture argv/envp from the stack at all yet, a real, separate,
+  larger, disclosed undertaking (touches every program's own prologue,
+  not a one-function fix) -- `Process.Env`/`Process.Run` share this exact
+  same real blocker.
+  Real `String.Split`/`String.ToChars`/`String.Lines` -- real, matching
+  the oracle's own exact edge-case behavior (confirmed via direct oracle
+  probes, not assumed): `String.Split` with consecutive delimiters
+  produces real empty pieces; `String.ToChars` is real UTF-8-codepoint-
+  aware (never splits a multi-byte codepoint); `String.Lines` strips a
+  trailing `\r` before `\n` (real Windows line endings) and never
+  produces a spurious trailing empty line for text that already ends
+  with a newline, matching `std::getline`'s own real behavior exactly.
+  Real `RANGE(start, stop, step)` -- the oracle's own real RANGE returns
+  a genuinely DISTINCT lazy `RangeValue` (confirmed directly in
+  include/arco/value.hpp), never materialized into a real array unless
+  iterated -- `PRINT Range(1, 5)` shows literal text `Range(1, 5)`, not
+  `[1, 2, 3, 4]`. This backend has no lazy-range Value kind of its own,
+  so this materializes a real Array:Number of every value the real range
+  would iterate instead (matching the oracle's own real `range_length`
+  exactly) -- a real, disclosed, narrower divergence: `FOR x IN
+  Range(...)`/`LEN(Range(...))`/indexing all behave identically to the
+  oracle, PRINTing a bare Range value directly does not. Scoped to its
+  real 3-argument form only.
+  Real `EXIT`/`ExitProgram`/`ExitTheProgram` -- a real, direct `exit(2)`
+  syscall with a real, caller-supplied code, needing zero `host_bridge.c`
+  involvement at all (this backend's own program epilogue already emits
+  the identical `mov $60, %rax` / `syscall` pair for a normal return,
+  just hardcoded to exit code 0). A real, ALREADY-DISCLOSED, narrower
+  parser gap surfaced while verifying this (not introduced by this
+  pass): bare `EXIT(code)` as the FIRST token of a STATEMENT (not
+  assigned to anything) does not parse in the self-hosted frontend --
+  "EXIT" is reserved for loop control (EXIT WHILE/FOR/DO), and statement
+  dispatch only disambiguates it as an ordinary callable identifier in
+  EXPRESSION position (see `fission/language/arcobasic/parser.abas`'s own
+  comment on `Fission_ArcoBasicCanName`, already fixed in an earlier
+  session) -- `ignored = Exit(code)`, the EXACT form every real Fission
+  CLI driver in this codebase already uses, works correctly.
+  Real `ISNULL(x)` -- a plain `x == 0` comparison, needing zero
+  `host_bridge.c` involvement (every pointer-kind value this backend
+  represents already IS a plain integer, and NULL itself already lowers
+  to a real `CONST 0`). A real, disclosed, ACCEPTED divergence for the
+  one genuinely ambiguous case: `ISNULL(0)` is `TRUE` here but `FALSE` in
+  the oracle (a real Number 0 and a real NULL are indistinguishable in
+  this backend's own representation) -- the SAME already-accepted
+  limitation `Array.First`/`Array.Last` on a genuinely empty array
+  already established, not a new kind of gap.
+  New permanent regression fixtures: `fission/tests/native_programs/
+  array_functions.abas`, `host_bridge_batch3.abas` (Bytes.*/Path.Join),
+  `host_bridge_batch4.abas` (RANGE/Array.Empty/IsEmpty/New/EXIT/ISNULL) --
+  every one diffed byte-for-byte (stdout AND exit code where relevant)
+  against `ArcoFission compile-run` on the identical source.
+  Real `CLASSOF(x)` -- a native inline dispatch needing zero
+  `host_bridge.c` involvement: `"__class"` is confirmed to ALWAYS be
+  allocated at field offset 0 for EVERY real class (verified directly via
+  `Fission_X86_64CollectClassFields`'s own real field-offset assignment,
+  `fieldOffsets = {"__class": 0}`, at every one of its own real call
+  sites), so on a real class instance CLASSOF is just `mov (%rax), %rax`.
+  The oracle's real CLASSOF on a non-object argument returns `""` (an
+  empty string, NOT an error -- confirmed directly via probe: `PRINT "["
+  + CLASSOF(5) + "]"` -> `[]`), so a statically-known non-Object/Poly-
+  kind argument emits a real empty-string CONST result instead, matching
+  `TYPEOF`'s own established precedent of resolving purely from static
+  compile-time kind (no runtime branching needed).
+  Real `HexToBytes(text)` -- matches the oracle's own real
+  `hex_to_bytes_function` exactly, including its odd-length-input
+  handling (a leading `'0'` nibble is inserted before decoding, confirmed
+  via oracle probe: `HexToBytes("abc")` -> `[10, 188]`, i.e. `[0x0a,
+  0xbc]`). Invalid hex characters decode as nibble value 0 -- a real,
+  disclosed simplification (this backend has no exception mechanism yet),
+  matching the same precedent already established elsewhere in this pass
+  rather than crashing.
+  Real `Array.Sort(arr)` -- a real NEW array (the oracle's own
+  `array_sort_function` copies its argument into a fresh array before
+  sorting, confirmed directly in its own body, never mutating the
+  caller's own array), ascending order, matching the oracle's own
+  comparator exactly per element kind: Number sorted numerically, String
+  sorted by ordinary byte-wise ordering (the same `std::string::
+  operator<` semantics this backend's own string-equality check already
+  assumes elsewhere -- uppercase letters sort before lowercase ones). A
+  real, hand-rolled insertion sort (this file is built `-nostdlib`, no
+  `qsort` available, and every fixture this backend's own suite exercises
+  is small enough that O(n^2) is the right call, matching this file's own
+  established "simple over clever" discipline). Number and String only --
+  a real, disclosed, narrower scope cut, matching the same Number-vs-
+  String-only precedent Array.Find/Contains/Join already established.
+  `Array.SortBy`/`MinBy`/`MaxBy` are NOT attempted -- they need real
+  CALLABLE (function-value) arguments, a separate, larger feature this
+  pass does not touch.
+  New permanent regression fixtures: `host_bridge_batch5.abas`
+  (CLASSOF/HexToBytes), `host_bridge_batch6.abas` (Array.Sort) -- both
+  diffed byte-for-byte against `ArcoFission compile-run` on the identical
+  source.
+  One more real golden-value update, same recurring pattern as before:
+  the self-hosted semantic corpus symbol count grew again (4115 -> 4125,
+  file count 98 and import-edge count 157 both unchanged) from this
+  pass's own real new local variables/branches added to
+  `fission/amir/lower_x86_64.abas` -- `tests/integration/
+  fission_substrate_core_smoke.sh`'s own `arcobasic_fission_self_
+  semantic_smoke` check updated; this time confirmed via the real DIRECT
+  script invocation (not `fissure run`), full `bash -x` trace read to
+  find the exact failing `grep -q` line, then a full clean rerun
+  confirmed `fission_substrate_core_smoke: all checks passed` / exit 0.
+  Real, disclosed, deliberately NOT attempted this pass (each a separate,
+  larger undertaking): Object.Get/Has/Keys/Set and File.List (both need a
+  real runtime object representation with field-name lookup -- this
+  backend's own class instances use FIXED, compile-time-only field
+  offsets, no runtime field-name tracking exists at all); ISA/IMPLEMENTS
+  (need a real RUNTIME-accessible class-hierarchy table -- `classParents`
+  is compile-time-only today); Date/DATE/Time.Now (need real timezone-
+  aware localtime conversion, a genuinely deep undertaking -- this
+  session's own dev machine is EDT, not UTC, so even a UTC-only
+  simplification would visibly diverge from the oracle); Path.Home/
+  Process.Env/Process.Run (need real ENVP-capture in the native entry
+  point, a separate, cross-cutting undertaking).
 
 ## In-Progress Components
 

@@ -1,0 +1,43 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's own native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention.
+'
+' CLASSOF, HexToBytes.
+'
+' CLASSOF is a native inline dispatch with NO host C function needed --
+' `"__class"` is confirmed to ALWAYS be allocated at field offset 0 for
+' EVERY real class (see Fission_X86_64CollectClassFields' own real
+' field-offset assignment, `fieldOffsets = {"__class": 0}`, at every one
+' of its own real call sites), so a real class instance's CLASSOF is just
+' `mov (%rax), %rax`. The oracle's real CLASSOF on a non-object argument
+' returns "" (an empty string, NOT an error) -- confirmed directly via
+' probe: `PRINT "[" + CLASSOF(5) + "]"` -> `[]` -- so a statically-known
+' non-Object/Poly-kind argument emits a real empty-string CONST result
+' instead, matching TYPEOF's own established precedent of resolving
+' purely from static compile-time kind.
+'
+' HexToBytes matches the oracle's real `hex_to_bytes_function` exactly,
+' including its odd-length-input handling: a leading '0' nibble is
+' inserted before decoding (confirmed via oracle probe:
+' `HexToBytes("abc")` -> `[10, 188]`, i.e. `[0x0a, 0xbc]`). Invalid hex
+' characters decode as nibble value 0 (a real, disclosed simplification --
+' this backend has no exception mechanism yet, matching the same
+' precedent already established elsewhere in this batch of work, rather
+' than crashing).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+PRINT "[" + CLASSOF(5) + "]"
+
+CLASS Foo
+    CONSTRUCTOR()
+        SELF.X = 1
+    END CONSTRUCTOR
+END CLASS
+
+f = Foo()
+PRINT CLASSOF(f)
+
+PRINT HexToBytes("48692100")
+PRINT HexToBytes("abc")

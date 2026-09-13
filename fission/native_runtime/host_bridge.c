@@ -79,6 +79,27 @@ static inline __attribute__((always_inline)) int arco_raw_is_space(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
 }
 
+static inline __attribute__((always_inline)) int arco_raw_strings_equal(const char* a, const char* b) {
+    arco_i64 i = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) return 0;
+        i = i + 1;
+    }
+    return a[i] == b[i];
+}
+
+// Ordinary byte-wise ordering (unsigned-char comparison, matching
+// `std::string::operator<`'s own real semantics -- the comparator
+// Array.Sort/String comparisons in the oracle actually use).
+static inline __attribute__((always_inline)) int arco_raw_strings_less_than(const char* a, const char* b) {
+    arco_i64 i = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if ((unsigned char)a[i] != (unsigned char)b[i]) return (unsigned char)a[i] < (unsigned char)b[i];
+        i = i + 1;
+    }
+    return (unsigned char)a[i] < (unsigned char)b[i];
+}
+
 // A real byte-for-byte substring search (Rabin-Karp would be overkill for
 // this backend's own real workloads; a plain O(n*m) scan is what legacy's
 // own `String.Contains`/`String.IndexOf` semantics were confirmed against
@@ -1262,4 +1283,559 @@ double arco_host_random_float(arco_pcg32_state* handle) {
     double scale = arco_raw_pow2(26);
     double divisor = arco_raw_pow2(53);
     return (high * scale + low) / divisor;
+}
+
+// --- Batch 7: real Array.* -- the READ-ONLY / SAME-SIZE subset only.
+//
+// Real, disclosed scope decision: Array.Push/Pop/Shift/Unshift/Insert/
+// RemoveAt/Remove/Clear/Resize/Extend are NOT implemented here -- every
+// one of them needs the array to genuinely CHANGE LENGTH in place, real
+// reference semantics (confirmed directly in the oracle: `array_push_
+// function` takes `args[0]` BY VALUE but calls `.as_array()` on it,
+// mutating the SAME underlying shared `Value::Array` every other alias
+// of that array ALSO sees, then returns the NEW SIZE, not the array --
+// a real, true "shared mutable object" semantic, not a "returns a new
+// array, caller reassigns" one). This backend's own current array
+// representation (`array_alloc`, fission/amir/lower_x86_64.abas's own
+// comment) is a SINGLE fixed-size bump-allocated block -- `[length]
+// [elem0]...[elemN-1]`, no spare capacity, no separate growable data
+// pointer -- so a real Push that needs to grow past its own original
+// allocation would have to move to a new address, silently breaking
+// every OTHER alias of that same array (a field, another variable, a
+// nested structure) still pointing at the old one. Supporting real
+// growable arrays correctly needs a genuine representation change (a
+// small, STABLE header holding {length, capacity, dataPointer}, so only
+// the data pointer ever needs to move) -- a real, disclosed, larger,
+// cross-cutting undertaking (touches Index/StoreIndex/LEN/ForEach/every
+// existing array-consuming code path), deliberately not attempted here.
+// Everything below either only READS an existing array, or builds a
+// brand-NEW array of a size known once at the start of the call (never
+// growing an EXISTING one), so none of it needs that redesign.
+//
+// Real, disclosed narrower scope for Find/Contains/Join specifically:
+// Number and String element kinds only (matching every other Number-
+// vs-String-kind-dispatched host function already in this file) --
+// dispatched at COMPILE TIME by fission/amir/lower_x86_64.abas's own
+// special-case handling (the array's own element kind is always known
+// statically), the same real "which concrete symbol to call" pattern
+// Random.Choice's own element-kind-agnostic design note already
+// documents; a Float-kind array is a real, disclosed, narrower
+// remaining gap for these three specifically.
+
+// Array.First/Array.Last -- a raw 8-byte slot, verbatim (works
+// identically for a Number, String, or Float-kind array -- the real
+// result KIND is resolved at compile time by the caller, same as
+// Random.Choice). 0 for an empty array: a real, disclosed simplification
+// (this backend has no NULL/empty-Value runtime representation of its
+// own yet), distinguishable from a genuine zero-valued element only via
+// a real `LEN(arr) == 0` check first, matching how every other "no real
+// exception mechanism yet" gap in this file is already handled.
+arco_i64 arco_host_array_first(const arco_i64* arr) {
+    arco_i64 count = arr[0];
+    if (count == 0) return 0;
+    return arr[1];
+}
+arco_i64 arco_host_array_last(const arco_i64* arr) {
+    arco_i64 count = arr[0];
+    if (count == 0) return 0;
+    return arr[count];
+}
+
+// Array.Find -- real linear scan, INDEX of the first match or -1 if
+// none, matching the oracle's own `array_find_function` exactly.
+arco_i64 arco_host_array_find_number(const arco_i64* arr, arco_i64 value) {
+    arco_i64 count = arr[0];
+    arco_i64 i = 0;
+    while (i < count) {
+        if (arr[1 + i] == value) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+arco_i64 arco_host_array_find_string(const arco_i64* arr, const char* value) {
+    arco_i64 count = arr[0];
+    arco_i64 i = 0;
+    while (i < count) {
+        if (arco_raw_strings_equal((const char*)arr[1 + i], value)) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Array.Contains -- real linear scan, a real boolean 0/1, matching the
+// oracle's own `array_contains_function` exactly.
+arco_i64 arco_host_array_contains_number(const arco_i64* arr, arco_i64 value) {
+    return arco_host_array_find_number(arr, value) >= 0 ? 1 : 0;
+}
+arco_i64 arco_host_array_contains_string(const arco_i64* arr, const char* value) {
+    return arco_host_array_find_string(arr, value) >= 0 ? 1 : 0;
+}
+
+// Array.Reverse -- a real NEW array (the oracle's own `array_reverse_
+// function` copies `args[0]` into a fresh `Value::Array` before
+// reversing, confirmed directly -- it never mutates the caller's own
+// array), raw slot copy (kind-agnostic, same as Random.Shuffle).
+const void* arco_host_array_reverse(const arco_i64* arr) {
+    arco_i64 count = arr[0];
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    result[0] = count;
+    arco_i64 i = 0;
+    while (i < count) {
+        result[1 + i] = arr[count - i];
+        i = i + 1;
+    }
+    return (const void*)result;
+}
+
+// Array.Sort -- a real NEW array (the oracle's own `array_sort_function`
+// copies `args[0]` into a fresh `Value::Array` before sorting, confirmed
+// directly in its own body -- `Value::Array result = args[0].as_array();`
+// -- it never mutates the caller's own array), ascending order, matching
+// the oracle's own comparator exactly per element kind (Number sorted
+// numerically, String sorted by ordinary byte-wise ordering, the SAME
+// `std::string::operator<` semantics `arco_raw_strings_less_than` above
+// implements). A real, hand-rolled insertion sort -- this file is built
+// `-nostdlib` (no `qsort` available), and every fixture this backend's
+// own test suite exercises is small enough that the simpler O(n^2)
+// algorithm is the right call (this file's own established "simple over
+// clever" discipline elsewhere). Not required to be stable (the oracle's
+// own `std::sort` isn't either), so plain insertion sort's own natural
+// stability is a bonus, never a requirement.
+const void* arco_host_array_sort_number(const arco_i64* arr) {
+    arco_i64 count = arr[0];
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    result[0] = count;
+    arco_i64 i = 0;
+    while (i < count) { result[1 + i] = arr[1 + i]; i = i + 1; }
+    i = 1;
+    while (i < count) {
+        arco_i64 key = result[1 + i];
+        arco_i64 j = i - 1;
+        while (j >= 0 && result[1 + j] > key) {
+            result[1 + j + 1] = result[1 + j];
+            j = j - 1;
+        }
+        result[1 + j + 1] = key;
+        i = i + 1;
+    }
+    return (const void*)result;
+}
+const void* arco_host_array_sort_string(const arco_i64* arr) {
+    arco_i64 count = arr[0];
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    result[0] = count;
+    arco_i64 i = 0;
+    while (i < count) { result[1 + i] = arr[1 + i]; i = i + 1; }
+    i = 1;
+    while (i < count) {
+        arco_i64 key = result[1 + i];
+        arco_i64 j = i - 1;
+        while (j >= 0 && arco_raw_strings_less_than((const char*)key, (const char*)result[1 + j])) {
+            result[1 + j + 1] = result[1 + j];
+            j = j - 1;
+        }
+        result[1 + j + 1] = key;
+        i = i + 1;
+    }
+    return (const void*)result;
+}
+
+// Array.Join/String.Join -- confirmed byte-for-byte IDENTICAL logic in
+// the oracle (`array_join_function`/`string_join_function` are two
+// separate C++ functions with the exact same body, just different
+// variable names) -- one real implementation per element kind serves
+// both real ArcoBASIC names (fission/amir/lower_x86_64.abas's own
+// dispatch registers both `ARRAY.JOIN` and `STRING.JOIN` against these
+// SAME two symbols). Real two-pass allocate: pass 1 computes the exact
+// total byte length (calling the SAME per-element formatter twice per
+// element is simpler and, given this backend never frees anything it
+// allocates anyway, no real cost worth avoiding -- matching this
+// file's own established "simple over clever" discipline elsewhere),
+// pass 2 fills the single real mmap'd result. Number-kind elements
+// reuse `arco_host_number_to_string` (this backend's Number
+// representation is integer-only, so this is real, complete coverage,
+// same disclosed scope as String(n) above); a Float-kind array needs
+// `arco_host_format_double` instead, a real, disclosed, narrower
+// remaining gap for Join specifically (not yet dispatched to).
+const char* arco_host_array_join_number(const arco_i64* arr, const char* sep) {
+    arco_i64 count = arr[0];
+    arco_i64 sepLen = arco_raw_strlen(sep);
+    arco_i64 totalLen = 0;
+    arco_i64 i = 0;
+    while (i < count) {
+        totalLen = totalLen + arco_raw_strlen(arco_host_number_to_string(arr[1 + i]));
+        if (i != 0) totalLen = totalLen + sepLen;
+        i = i + 1;
+    }
+    char* result = (char*)arco_raw_mmap((arco_u64)(totalLen + 1));
+    arco_i64 pos = 0;
+    i = 0;
+    while (i < count) {
+        if (i != 0) {
+            arco_i64 j = 0;
+            while (j < sepLen) { result[pos] = sep[j]; pos = pos + 1; j = j + 1; }
+        }
+        const char* piece = arco_host_number_to_string(arr[1 + i]);
+        arco_i64 pieceLen = arco_raw_strlen(piece);
+        arco_i64 j = 0;
+        while (j < pieceLen) { result[pos] = piece[j]; pos = pos + 1; j = j + 1; }
+        i = i + 1;
+    }
+    result[pos] = 0;
+    return result;
+}
+const char* arco_host_array_join_string(const arco_i64* arr, const char* sep) {
+    arco_i64 count = arr[0];
+    arco_i64 sepLen = arco_raw_strlen(sep);
+    arco_i64 totalLen = 0;
+    arco_i64 i = 0;
+    while (i < count) {
+        totalLen = totalLen + arco_raw_strlen((const char*)arr[1 + i]);
+        if (i != 0) totalLen = totalLen + sepLen;
+        i = i + 1;
+    }
+    char* result = (char*)arco_raw_mmap((arco_u64)(totalLen + 1));
+    arco_i64 pos = 0;
+    i = 0;
+    while (i < count) {
+        if (i != 0) {
+            arco_i64 j = 0;
+            while (j < sepLen) { result[pos] = sep[j]; pos = pos + 1; j = j + 1; }
+        }
+        const char* piece = (const char*)arr[1 + i];
+        arco_i64 pieceLen = arco_raw_strlen(piece);
+        arco_i64 j = 0;
+        while (j < pieceLen) { result[pos] = piece[j]; pos = pos + 1; j = j + 1; }
+        i = i + 1;
+    }
+    result[pos] = 0;
+    return result;
+}
+
+// Real byte-for-byte match test at a fixed position -- shared by
+// String.Split's own two passes (count delimiter occurrences, then
+// extract the pieces between them) below.
+static inline __attribute__((always_inline)) int arco_raw_match_at(const char* text, arco_i64 textLen, arco_i64 pos, const char* needle, arco_i64 needleLen) {
+    if (pos + needleLen > textLen) return 0;
+    arco_i64 j = 0;
+    while (j < needleLen) {
+        if (text[pos + j] != needle[j]) return 0;
+        j = j + 1;
+    }
+    return 1;
+}
+static inline __attribute__((always_inline)) char* arco_raw_copy_substring(const char* text, arco_i64 start, arco_i64 len) {
+    char* piece = (char*)arco_raw_mmap((arco_u64)(len + 1));
+    arco_i64 k = 0;
+    while (k < len) { piece[k] = text[start + k]; k = k + 1; }
+    piece[len] = 0;
+    return piece;
+}
+
+// String.Split(text, delimiter) -- real, matching the oracle's own
+// `string_split_function` exactly (a real, empty-delimiter diagnostic is
+// the oracle's own behavior too -- not validated here, matching this
+// whole file's own "no exception mechanism yet" gap -- an empty
+// delimiter here would just loop forever finding a zero-width match at
+// every position, a real, disclosed divergence, not silently wrong in a
+// way that could be confused for a correct empty-delimiter semantic,
+// since the oracle has none either).
+const void* arco_host_string_split(const char* text, const char* delimiter) {
+    arco_i64 textLen = arco_raw_strlen(text);
+    arco_i64 delimLen = arco_raw_strlen(delimiter);
+    arco_i64 count = 1;
+    arco_i64 i = 0;
+    while (i < textLen) {
+        if (arco_raw_match_at(text, textLen, i, delimiter, delimLen)) {
+            count = count + 1;
+            i = i + delimLen;
+        } else {
+            i = i + 1;
+        }
+    }
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    result[0] = count;
+    arco_i64 partIndex = 0;
+    arco_i64 partStart = 0;
+    i = 0;
+    while (i < textLen) {
+        if (arco_raw_match_at(text, textLen, i, delimiter, delimLen)) {
+            result[1 + partIndex] = (arco_i64)(long)arco_raw_copy_substring(text, partStart, i - partStart);
+            partIndex = partIndex + 1;
+            i = i + delimLen;
+            partStart = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    result[1 + partIndex] = (arco_i64)(long)arco_raw_copy_substring(text, partStart, textLen - partStart);
+    return (const void*)result;
+}
+
+// String.ToChars(text) -- real, matching the oracle's own
+// `string_to_chars_function` exactly: one real UTF-8-codepoint-aware
+// pass (a continuation byte is `10xxxxxx`, `(byte & 0xc0) == 0x80`),
+// never splitting a multi-byte codepoint across two array elements.
+const void* arco_host_string_to_chars(const char* text) {
+    arco_i64 textLen = arco_raw_strlen(text);
+    arco_i64 count = 0;
+    arco_i64 i = 0;
+    while (i < textLen) {
+        i = i + 1;
+        while (i < textLen && (((unsigned char)text[i]) & 0xc0) == 0x80) i = i + 1;
+        count = count + 1;
+    }
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    result[0] = count;
+    arco_i64 idx = 0;
+    i = 0;
+    while (i < textLen) {
+        arco_i64 start = i;
+        i = i + 1;
+        while (i < textLen && (((unsigned char)text[i]) & 0xc0) == 0x80) i = i + 1;
+        result[1 + idx] = (arco_i64)(long)arco_raw_copy_substring(text, start, i - start);
+        idx = idx + 1;
+    }
+    return (const void*)result;
+}
+
+// String.Lines(text) -- real, matching the oracle's own
+// `string_lines_function` exactly: splits on `\n`, and a trailing `\r`
+// immediately before it (real Windows-style `\r\n` line endings) is
+// stripped, matching `std::getline` + the oracle's own explicit
+// `if (!line.empty() && line.back() == '\r') line.pop_back();`. A
+// string with NO trailing newline still yields its own final line (the
+// oracle's own `std::getline` loop condition already does this
+// naturally); a string ending WITH one does not produce a spurious
+// trailing empty line either, matching `std::getline`'s own real
+// behavior exactly (confirmed via a direct oracle probe).
+const void* arco_host_string_lines(const char* text) {
+    arco_i64 textLen = arco_raw_strlen(text);
+    arco_i64 count = 0;
+    arco_i64 i = 0;
+    while (i < textLen) {
+        arco_i64 start = i;
+        while (i < textLen && text[i] != '\n') i = i + 1;
+        arco_i64 end = i;
+        if (end > start && text[end - 1] == '\r') end = end - 1;
+        count = count + 1;
+        if (i < textLen) i = i + 1;
+    }
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    result[0] = count;
+    arco_i64 idx = 0;
+    i = 0;
+    while (i < textLen) {
+        arco_i64 start = i;
+        while (i < textLen && text[i] != '\n') i = i + 1;
+        arco_i64 end = i;
+        if (end > start && text[end - 1] == '\r') end = end - 1;
+        result[1 + idx] = (arco_i64)(long)arco_raw_copy_substring(text, start, end - start);
+        idx = idx + 1;
+        if (i < textLen) i = i + 1;
+    }
+    return (const void*)result;
+}
+
+// --- Batch 8: real Bytes.* -- a "Bytes" value is, confirmed directly in
+// the oracle, just an ordinary `Value::Array` of Numbers each clamped
+// into [0, 255] -- no separate runtime representation of its own at all
+// (`Bytes.New`'s own C++ body literally constructs a plain
+// `Value::Array`). So this backend's own existing Number-kind array
+// representation already IS a real Bytes value -- these five functions
+// are the only real gap. Bytes.SetU8 is a real, disclosed exception to
+// this whole file's own "no array mutation" scope line (see Batch 7's
+// own header comment): it MUTATES one EXISTING element in place, never
+// changing the array's own LENGTH, so it needs none of the growable-
+// array representation change real Push/Pop/etc. would -- confirmed
+// directly in the oracle: `Bytes.SetU8` takes `args[0]` BY VALUE but
+// mutates the array it holds a reference to, then returns that SAME
+// array back (not a new size the way Array.Push does).
+const void* arco_host_bytes_new(arco_i64 size, arco_i64 fill) {
+    arco_i64 clampedFill = fill < 0 ? 0 : (fill > 255 ? 255 : fill);
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((size + 1) * 8));
+    result[0] = size;
+    arco_i64 i = 0;
+    while (i < size) { result[1 + i] = clampedFill; i = i + 1; }
+    return (const void*)result;
+}
+// Real, disclosed simplification: an out-of-range index returns 0
+// (GetU8) or is silently ignored (SetU8) -- this backend's own existing
+// plain `arr[i]` indexing is ALSO unchecked (no runtime bounds
+// validation anywhere in this native backend yet, a real, separate,
+// pre-existing, disclosed gap), so this matches that same established
+// behavior rather than inventing a new, inconsistent exception-like
+// mechanism just for Bytes.*.
+arco_i64 arco_host_bytes_get_u8(const arco_i64* arr, arco_i64 index) {
+    arco_i64 count = arr[0];
+    if (index < 0 || index >= count) return 0;
+    arco_i64 value = arr[1 + index];
+    return value < 0 ? 0 : (value > 255 ? 255 : value);
+}
+const void* arco_host_bytes_set_u8(arco_i64* arr, arco_i64 index, arco_i64 value) {
+    arco_i64 count = arr[0];
+    if (index >= 0 && index < count) {
+        arr[1 + index] = value < 0 ? 0 : (value > 255 ? 255 : value);
+    }
+    return (const void*)arr;
+}
+// Bytes.FromText/Bytes.ToText -- real RAW BYTES (confirmed directly in
+// the oracle: `bytes_from_string`/`string_from_bytes` iterate `unsigned
+// char` values, never UTF-8 codepoints -- a real, deliberate difference
+// from String.ToChars above), matching exactly.
+const void* arco_host_bytes_from_text(const char* text) {
+    arco_i64 len = arco_raw_strlen(text);
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((len + 1) * 8));
+    result[0] = len;
+    arco_i64 i = 0;
+    while (i < len) { result[1 + i] = (arco_i64)(unsigned char)text[i]; i = i + 1; }
+    return (const void*)result;
+}
+const char* arco_host_bytes_to_text(const arco_i64* arr) {
+    arco_i64 count = arr[0];
+    char* result = (char*)arco_raw_mmap((arco_u64)(count + 1));
+    arco_i64 i = 0;
+    while (i < count) {
+        arco_i64 value = arr[1 + i];
+        result[i] = (char)(unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
+        i = i + 1;
+    }
+    result[count] = 0;
+    return result;
+}
+
+// --- Batch 9: real Path.Join -- confirmed directly against the oracle
+// (real `std::filesystem::path::operator/=` semantics): if the RIGHT
+// side is an ABSOLUTE path (starts with '/'), the result is just that
+// right side, verbatim -- the left side is discarded entirely; otherwise
+// the two are concatenated with EXACTLY one '/' between them (no doubled
+// slash if the left side already ends with one, no separator at all if
+// the left side is empty). Real, disclosed, narrower scope: only the
+// real 2-argument form (`std::filesystem::path::operator/=` is real,
+// variadic -- any number of additional segments), matching the
+// established fixed-arity precedent this backend already uses for other
+// genuinely variadic oracle functions. Path.Home is NOT implemented here
+// -- it needs the real process ENVP block (`getenv("HOME")`), and this
+// backend's own `_start` entry point does not capture argv/envp from the
+// stack at all yet (a real, separate, disclosed, larger undertaking --
+// touches every program's own prologue, not a one-function fix).
+const char* arco_host_path_join(const char* a, const char* b) {
+    if (b[0] == '/') {
+        arco_i64 bLen = arco_raw_strlen(b);
+        return arco_raw_copy_substring(b, 0, bLen);
+    }
+    arco_i64 aLen = arco_raw_strlen(a);
+    int needsSep = aLen > 0 && a[aLen - 1] != '/';
+    arco_i64 bLen = arco_raw_strlen(b);
+    arco_i64 totalLen = aLen + (needsSep ? 1 : 0) + bLen;
+    char* result = (char*)arco_raw_mmap((arco_u64)(totalLen + 1));
+    arco_i64 pos = 0;
+    arco_i64 i = 0;
+    while (i < aLen) { result[pos] = a[i]; pos = pos + 1; i = i + 1; }
+    if (needsSep) { result[pos] = '/'; pos = pos + 1; }
+    i = 0;
+    while (i < bLen) { result[pos] = b[i]; pos = pos + 1; i = i + 1; }
+    result[pos] = 0;
+    return result;
+}
+
+// --- Batch 10: real Array.Empty/Array.New, RANGE, and ISNULL/EXIT (the
+// latter two implemented as real NATIVE inline dispatch in
+// fission/amir/lower_x86_64.abas instead, needing no C code at all --
+// see that file's own comment).
+//
+// RANGE(start, stop, step) -- the oracle's own real RANGE returns a
+// genuinely DISTINCT lazy `RangeValue` (confirmed directly in
+// include/arco/value.hpp: `{start, stop, step, length}`, never
+// materialized into a real array unless iterated), so `PRINT
+// Range(1, 5)` shows literal text `Range(1, 5)`, not `[1, 2, 3, 4]` --
+// this backend has no lazy-range Value kind of its own, so this
+// implementation materializes a real Array:Number of every value the
+// real range would iterate instead (matching real `array_length` exactly,
+// confirmed directly against include/arco/value.hpp's own
+// `range_length`) -- a real, disclosed, narrower divergence: `FOR x IN
+// Range(...)`/`LEN(Range(...))`/indexing all behave identically to the
+// oracle, but `PRINT`ing a bare Range value directly does not. A zero
+// step (the oracle's own real exception case, "no exception mechanism
+// yet" throughout this file) produces a real, safe, EMPTY array here
+// instead of crashing.
+const void* arco_host_range(arco_i64 start, arco_i64 stop, arco_i64 step) {
+    arco_i64 count = 0;
+    if (step > 0 && start < stop) {
+        arco_i64 distance = stop - start;
+        count = (distance + step - 1) / step;
+    } else if (step < 0 && start > stop) {
+        arco_i64 distance = start - stop;
+        arco_i64 stride = 0 - step;
+        count = (distance + stride - 1) / stride;
+    }
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    result[0] = count;
+    arco_i64 i = 0;
+    arco_i64 value = start;
+    while (i < count) {
+        result[1 + i] = value;
+        value = value + step;
+        i = i + 1;
+    }
+    return (const void*)result;
+}
+
+// Array.Empty/Array.IsEmpty -- a real boolean 0/1, matching the oracle's
+// own `array_empty_function` exactly.
+arco_i64 arco_host_array_empty(const arco_i64* arr) {
+    return arr[0] == 0 ? 1 : 0;
+}
+
+// Array.New(size, fill) -- real, matching the oracle's own
+// `array_new_function` exactly (the real 0/1-argument forms -- an
+// implicit empty array, or a `fill=NULL` default -- are a real,
+// disclosed, narrower scope cut here, the same fixed-arity precedent
+// Bytes.New already established). Raw slot fill, kind-agnostic (works
+// identically for a Number, String, or Float-kind fill -- the real
+// result KIND is resolved at compile time by the caller, same as
+// Random.Choice/Array.First).
+const void* arco_host_array_new(arco_i64 size, arco_i64 fill) {
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((size + 1) * 8));
+    result[0] = size;
+    arco_i64 i = 0;
+    while (i < size) { result[1 + i] = fill; i = i + 1; }
+    return (const void*)result;
+}
+
+// --- Batch 11: real HexToBytes -- the real inverse of
+// `arco_host_bytes_to_hex`'s own already-existing hex-digit table, real
+// matching the oracle's own `hex_to_bytes_function` exactly (a leading
+// '0' is inserted for an odd-length input, matching a REAL, disclosed
+// simplification: a genuinely INVALID hex digit character -- the
+// oracle's own `std::stoll(..., 16)` real exception case, "no exception
+// mechanism yet" throughout this file -- is treated as 0 here rather
+// than crashing).
+static inline __attribute__((always_inline)) int arco_raw_hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+const void* arco_host_hex_to_bytes(const char* text) {
+    arco_i64 len = arco_raw_strlen(text);
+    int odd = (len % 2) != 0;
+    arco_i64 count = (len + (odd ? 1 : 0)) / 2;
+    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    result[0] = count;
+    arco_i64 pos = 0;
+    arco_i64 i = 0;
+    if (odd) {
+        result[1] = arco_raw_hex_value(text[0]);
+        pos = 1;
+        i = 1;
+    }
+    while (i < len) {
+        int hi = arco_raw_hex_value(text[i]);
+        int lo = arco_raw_hex_value(text[i + 1]);
+        result[1 + pos] = (hi << 4) | lo;
+        pos = pos + 1;
+        i = i + 2;
+    }
+    return (const void*)result;
 }
