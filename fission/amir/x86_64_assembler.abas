@@ -551,11 +551,18 @@ FUNCTION Fission_X86_64AsmEncodeInstruction(buffer, fixups, diagnostics, mnemoni
         ignored = Fission_X86_64AsmEmitSseRegRm(buffer, 242, 0, 17, src.Index, dst)
         RETURN
     END IF
-    ' Real floating-point arithmetic: ADDSD/SUBSD/MULSD/DIVSD, all
-    ' `xmm1, xmm2/m64` (AT&T source-then-dest order; the dest register is
-    ' ALSO the first real operand of the operation, exactly the same
-    ' 2-operand ALU shape this backend's own integer add/sub already use).
-    sseArithOpcodes = {"addsd": 88, "subsd": 92, "mulsd": 89, "divsd": 94}
+    ' Real floating-point arithmetic: ADDSD/SUBSD/MULSD/DIVSD/MINSD/MAXSD,
+    ' all `xmm1, xmm2/m64` (AT&T source-then-dest order; the dest
+    ' register is ALSO the first real operand of the operation, exactly
+    ' the same 2-operand ALU shape this backend's own integer add/sub
+    ' already use). MINSD/MAXSD are real hardware support for
+    ' Math.Min/Math.Max -- no software comparison-then-branch needed at
+    ' all for the real, common 2-argument case (the oracle's own
+    ' Math.Min/Max are genuinely variadic, 1-64 args -- a real,
+    ' disclosed fixed-arity scope decision, matching this whole file's
+    ' own Path.Join/Format precedent, see fission/amir/lower_x86_64.abas's
+    ' own comment).
+    sseArithOpcodes = {"addsd": 88, "subsd": 92, "mulsd": 89, "divsd": 94, "minsd": 93, "maxsd": 95}
     IF Object.Has(sseArithOpcodes, mnemonic) THEN
         opcode = Object.Get(sseArithOpcodes, mnemonic, 88)
         src = operands[0]
@@ -595,6 +602,44 @@ FUNCTION Fission_X86_64AsmEncodeInstruction(buffer, fixups, diagnostics, mnemoni
         src = operands[0]
         dst = operands[1]
         ignored = Fission_X86_64AsmEmitSseRegRm(buffer, 242, 1, 44, dst.Index, src)
+        RETURN
+    END IF
+    ' SQRTSD xmm1, xmm2/m64 -- real hardware, correctly-rounded square
+    ' root (real IEEE-754, matching `std::sqrt` exactly for every real
+    ' input this instruction is defined for) -- no software Newton-
+    ' Raphson/bignum needed at all, the same "use the real free hardware
+    ' instruction" discipline ROUNDSD/UCOMISD already established.
+    IF mnemonic == "sqrtsd" THEN
+        src = operands[0]
+        dst = operands[1]
+        ignored = Fission_X86_64AsmEmitSseRegRm(buffer, 242, 0, 81, dst.Index, src)
+        RETURN
+    END IF
+    ' `roundsd $mode, src, dst` -- real ROUNDSD xmm1, xmm2/m64, imm8 (a
+    ' genuinely different shape from every other SSE instruction above:
+    ' a MANDATORY `66` prefix instead of `F2`, the real two-byte `0F 3A`
+    ' escape instead of a bare `0F`, and a trailing imm8 mode byte after
+    ' the ModRM -- real hardware, host_bridge.c's own inline-asm
+    ' `roundsd` already proved this exact encoding correct for
+    ' arco_host_format_double/arco_host_fmod; this makes it available to
+    ' NATIVE codegen TEXT too (Math.Floor=1/Math.Ceil=2/Math.Round needs
+    ' a real sign+floor(|x|+0.5) composition, not a single mode -- see
+    ' fission/amir/lower_x86_64.abas's own comment for the real oracle
+    ' semantic, round-HALF-AWAY-FROM-ZERO, confirmed distinct from this
+    ' whole file's own existing round-half-to-EVEN use for PRINT
+    ' formatting).
+    IF mnemonic == "roundsd" THEN
+        modeOperand = operands[0]
+        src = operands[1]
+        dst = operands[2]
+        ignored = buffer.EmitByte(102)
+        rmBits = Fission_X86_64AsmRmIndexBits(src)
+        ignored = Fission_X86_64AsmEmitRex(buffer, 0, dst.Index, rmBits.Index, rmBits.Base)
+        ignored = buffer.EmitByte(15)
+        ignored = buffer.EmitByte(58)
+        ignored = buffer.EmitByte(11)
+        ignored = Fission_X86_64AsmEmitModRM(buffer, dst.Index, src)
+        ignored = buffer.EmitByte(modeOperand.Value)
         RETURN
     END IF
 

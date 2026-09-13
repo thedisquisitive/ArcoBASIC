@@ -1088,6 +1088,21 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 ' fixed ABI signature) always produce a real String result,
                 ' regardless of the argument's own kind.
                 IF Upper(callee) == "STRING" ORELSE Upper(callee) == "TYPEOF" THEN destKind = "String"
+                ' Real hardware-backed Math.* functions (see
+                ' Fission_X86_64LowerFunction's own emission-time handling
+                ' for why these get dedicated inline SSE dispatch instead
+                ' of a uniform host-function-table entry: SQRT/ABS/FLOOR/
+                ' CEIL/ROUND/MIN/MAX/CLAMP/LERP/PI/TAU are all real x86
+                ' hardware instructions or trivial compile-time constants,
+                ' needing zero ABI-crossing C call at all) always produce a
+                ' real Float result -- ArcoBASIC's own Number is ALWAYS a
+                ' double at the language level (confirmed via the oracle:
+                ' every one of these is implemented as `double -> double`
+                ' or built from real double constants), matching the same
+                ' "division is always Float-kind" precedent this backend
+                ' already established for `/`.
+                isHardwareMathCallee = Upper(callee) == "SQRT" ORELSE Upper(callee) == "MATH.SQRT" ORELSE Upper(callee) == "ABS" ORELSE Upper(callee) == "MATH.ABS" ORELSE Upper(callee) == "FLOOR" ORELSE Upper(callee) == "MATH.FLOOR" ORELSE Upper(callee) == "CEIL" ORELSE Upper(callee) == "MATH.CEIL" ORELSE Upper(callee) == "ROUND" ORELSE Upper(callee) == "MATH.ROUND" ORELSE Upper(callee) == "MIN" ORELSE Upper(callee) == "MATH.MIN" ORELSE Upper(callee) == "MAX" ORELSE Upper(callee) == "MATH.MAX" ORELSE Upper(callee) == "CLAMP" ORELSE Upper(callee) == "MATH.CLAMP" ORELSE Upper(callee) == "LERP" ORELSE Upper(callee) == "MATH.LERP" ORELSE Upper(callee) == "PI" ORELSE Upper(callee) == "MATH.PI" ORELSE Upper(callee) == "TAU" ORELSE Upper(callee) == "MATH.TAU"
+                IF isHardwareMathCallee THEN destKind = "Float"
                 ' `Random.Choice`/`Random.Sample`/`Random.Shuffle` are the
                 ' SAME kind of case: their own real native implementation
                 ' (host_bridge.c) only ever moves raw 8-byte element slots
@@ -1925,6 +1940,30 @@ END FUNCTION
 FUNCTION Fission_X86_64StoreXmm0Line(offsets, name)
     offset = Object.Get(offsets, name, "0")
     RETURN "    movsd %xmm0, " + offset + "(%rbp)"
+END FUNCTION
+
+' Loads ANY numeric-kind argument (Number(int) OR Float) into a target XMM
+' register, promoting a Number-kind operand via a real `cvtsi2sd` first --
+' the shared loader every hardware-backed Math.* dispatch below uses (see
+' Fission_X86_64LowerFunction's own "SQRT"/"ABS"/etc. handling), since
+' every one of these is a real x86 instruction that only ever operates on
+' a genuine double, regardless of whether the caller's own argument still
+' happens to be Number(int)-kind (e.g. `SQRT(16)`, a bare integer literal,
+' is real, legal ArcoBASIC -- confirmed via the oracle: `SQRT(16)` -> `4`).
+' Returns a Lines array (this file's own established convention for a
+' helper that can't safely assume mutating its caller's array parameter in
+' place is trustworthy -- see Fission_X86_64LowerFloatBinOp's own Lines
+' array and its call site's own FOR/Array.Push merge loop).
+FUNCTION Fission_X86_64MathLoadArgXmmLines(offsets, kinds, arg, xmmRegisterName)
+    lines = []
+    argKind = Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, arg))
+    IF argKind == "Float" THEN
+        ignored = Array.Push(lines, Fission_X86_64OperandLoadLineXmm(offsets, arg, xmmRegisterName))
+    ELSE
+        ignored = Array.Push(lines, Fission_X86_64OperandLoadLine(offsets, arg, "rax"))
+        ignored = Array.Push(lines, "    cvtsi2sd %rax, %" + xmmRegisterName)
+    END IF
+    RETURN lines
 END FUNCTION
 
 ' Lowers one Float-kind BinOp instruction (dest := left OP right) --
@@ -3658,15 +3697,249 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 ' Fission_X86_64CollectSlots' own comment on why these
                 ' can't be uniform host-table entries (their real result
                 ' kind depends on the INPUT array's own element kind, not
-                ' a single fixed ABI signature); the native symbols
-                ' themselves (host_bridge.c) are fully kind-agnostic,
-                ' since they only ever move raw 8-byte element slots, so
-                ' one real Fission_X86_64EmitCall dispatch per name
-                ' suffices once the arg SHAPE (an Array-kind first
-                ' argument, Number-kind handle/count arguments) is
-                ' validated here, exactly the same real diagnostic
-                ' discipline every other host-bridge call site already
-                ' uses.
+                ' Real hardware-backed Math.* functions -- SQRT/ABS/FLOOR/
+                ' CEIL/ROUND/MIN/MAX/CLAMP/LERP/PI/TAU all have either a
+                ' direct x86 SSE2/SSE4.1 instruction or a trivial
+                ' composition of ones this backend already emits for
+                ' Float arithmetic, needing ZERO ABI-crossing call into
+                ' host_bridge.c at all -- dispatched here, before the
+                ' uniform host-function table below, the same real reason
+                ' String(x)/TYPEOF(x)/Random.Choice above are. Every
+                ' operand is loaded via Fission_X86_64MathLoadArgXmmLines
+                ' (promoting a plain Number(int) argument via real
+                ' `cvtsi2sd` first -- e.g. `SQRT(16)` is real, legal
+                ' ArcoBASIC), and every result is real Float-kind
+                ' (Fission_X86_64CollectSlots' own `isHardwareMathCallee`
+                ' check already seeds that). Transcendental functions
+                ' (SIN/COS/TAN/ASIN/ACOS/ATAN/ATAN2/EXP/LOG/LOG10/POW) have
+                ' NO direct x86 hardware instruction at all -- a real,
+                ' correctly-rounded implementation would need to be built
+                ' from scratch (e.g. a real minimax polynomial + range
+                ' reduction), a separate, harder undertaking with genuine
+                ' precision risk against libm, deliberately deferred and
+                ' disclosed rather than attempted here.
+                mathArgsResolvable = TRUE
+                FOR arg IN args
+                    IF Fission_X86_64OperandIsResolvable(offsets, arg) == FALSE THEN mathArgsResolvable = FALSE
+                    argKind = Fission_X86_64OperandKind(kinds, arg)
+                    IF Fission_X86_64NormalizeNumericKind(argKind) != "Number" ANDALSO argKind != "Float" THEN mathArgsResolvable = FALSE
+                NEXT
+                IF Upper(callee) == "SQRT" ORELSE Upper(callee) == "MATH.SQRT" THEN
+                    IF LEN(args) != 1 ORELSE mathArgsResolvable == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "SQRT(...) is only supported with exactly one numeric argument by native x86-64 codegen: " + instruction.Field("Args"))
+                        CONTINUE FOR
+                    END IF
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[0], "xmm0")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    ignored = Array.Push(textLines, "    sqrtsd %xmm0, %xmm0")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreXmm0Line(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                ' `ABS(x)` -- `max(x, -x)` via real `subsd`/`maxsd`, rather
+                ' than a bit-clear-sign-bit trick (which would need a real
+                ' GP<->XMM `movq`/`andpd` this assembler doesn't have yet)
+                ' -- branch-free, and every instruction it uses is already
+                ' verified.
+                IF Upper(callee) == "ABS" ORELSE Upper(callee) == "MATH.ABS" THEN
+                    IF LEN(args) != 1 ORELSE mathArgsResolvable == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "ABS(...) is only supported with exactly one numeric argument by native x86-64 codegen: " + instruction.Field("Args"))
+                        CONTINUE FOR
+                    END IF
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[0], "xmm0")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    ignored = Array.Push(textLines, "    mov $0, %rax")
+                    ignored = Array.Push(textLines, "    cvtsi2sd %rax, %xmm1")
+                    ignored = Array.Push(textLines, "    subsd %xmm0, %xmm1")
+                    ignored = Array.Push(textLines, "    maxsd %xmm1, %xmm0")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreXmm0Line(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                IF Upper(callee) == "FLOOR" ORELSE Upper(callee) == "MATH.FLOOR" THEN
+                    IF LEN(args) != 1 ORELSE mathArgsResolvable == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "FLOOR(...) is only supported with exactly one numeric argument by native x86-64 codegen: " + instruction.Field("Args"))
+                        CONTINUE FOR
+                    END IF
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[0], "xmm0")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    ignored = Array.Push(textLines, "    roundsd $1, %xmm0, %xmm0")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreXmm0Line(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                IF Upper(callee) == "CEIL" ORELSE Upper(callee) == "MATH.CEIL" THEN
+                    IF LEN(args) != 1 ORELSE mathArgsResolvable == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "CEIL(...) is only supported with exactly one numeric argument by native x86-64 codegen: " + instruction.Field("Args"))
+                        CONTINUE FOR
+                    END IF
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[0], "xmm0")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    ignored = Array.Push(textLines, "    roundsd $2, %xmm0, %xmm0")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreXmm0Line(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                ' `ROUND(x)` -- the oracle's own `std::round` is ROUND-HALF
+                ' -AWAY-FROM-ZERO (confirmed via a direct probe:
+                ' ROUND(2.5)=3, ROUND(-2.5)=-3), NOT any single real
+                ' `roundsd` mode directly (mode 0's "round to nearest,
+                ' ties to even" is a DIFFERENT real rounding rule, already
+                ' used elsewhere in this backend for PRINT formatting) --
+                ' composed instead as the standard `sign(x) *
+                ' floor(|x| + 0.5)` identity, using a real branch to
+                ' reapply the sign (no `andpd`/GP<->XMM `movq` available
+                ' yet for a branch-free copysign).
+                IF Upper(callee) == "ROUND" ORELSE Upper(callee) == "MATH.ROUND" THEN
+                    IF LEN(args) != 1 ORELSE mathArgsResolvable == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "ROUND(...) is only supported with exactly one numeric argument by native x86-64 codegen: " + instruction.Field("Args"))
+                        CONTINUE FOR
+                    END IF
+                    context.DispatchCount = context.DispatchCount + 1
+                    roundId = String(context.DispatchCount)
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[0], "xmm0")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    ignored = Array.Push(textLines, "    movsd %xmm0, %xmm2")
+                    ignored = Array.Push(textLines, "    mov $0, %rax")
+                    ignored = Array.Push(textLines, "    cvtsi2sd %rax, %xmm1")
+                    ignored = Array.Push(textLines, "    subsd %xmm0, %xmm1")
+                    ignored = Array.Push(textLines, "    maxsd %xmm1, %xmm0")
+                    ignored = Array.Push(textLines, "    mov $1, %rax")
+                    ignored = Array.Push(textLines, "    cvtsi2sd %rax, %xmm3")
+                    ignored = Array.Push(textLines, "    mov $2, %rax")
+                    ignored = Array.Push(textLines, "    cvtsi2sd %rax, %xmm4")
+                    ignored = Array.Push(textLines, "    divsd %xmm4, %xmm3")
+                    ignored = Array.Push(textLines, "    addsd %xmm3, %xmm0")
+                    ignored = Array.Push(textLines, "    roundsd $1, %xmm0, %xmm0")
+                    ignored = Array.Push(textLines, "    mov $0, %rax")
+                    ignored = Array.Push(textLines, "    cvtsi2sd %rax, %xmm1")
+                    ignored = Array.Push(textLines, "    ucomisd %xmm1, %xmm2")
+                    ignored = Array.Push(textLines, "    setb %al")
+                    ignored = Array.Push(textLines, "    movzbq %al, %rax")
+                    ignored = Array.Push(textLines, "    test %rax, %rax")
+                    ignored = Array.Push(textLines, "    jz .Lround_pos_" + roundId)
+                    ignored = Array.Push(textLines, "    subsd %xmm0, %xmm1")
+                    ignored = Array.Push(textLines, "    movsd %xmm1, %xmm0")
+                    ignored = Array.Push(textLines, ".Lround_pos_" + roundId + ":")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreXmm0Line(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                ' `MIN(...)`/`MAX(...)` -- the oracle's own real signature
+                ' is VARIADIC (1-64 args, folding left-to-right via
+                ' `std::min`/`std::max`), and unlike Path.Join/Format
+                ' (which need real, non-trivial per-arity marshaling) this
+                ' folds via one real `minsd`/`maxsd` per extra argument --
+                ' cheap enough to support the REAL full variadic arity
+                ' directly, no scope reduction needed at all.
+                IF Upper(callee) == "MIN" ORELSE Upper(callee) == "MATH.MIN" ORELSE Upper(callee) == "MAX" ORELSE Upper(callee) == "MATH.MAX" THEN
+                    IF LEN(args) < 1 ORELSE mathArgsResolvable == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected at least 1 numeric argument)")
+                        CONTINUE FOR
+                    END IF
+                    foldOpcode = "minsd"
+                    IF Upper(callee) == "MAX" ORELSE Upper(callee) == "MATH.MAX" THEN foldOpcode = "maxsd"
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[0], "xmm0")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    minMaxIndex = 1
+                    WHILE minMaxIndex < LEN(args)
+                        FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[minMaxIndex], "xmm1")
+                            ignored = Array.Push(textLines, line)
+                        NEXT
+                        ignored = Array.Push(textLines, "    " + foldOpcode + " %xmm1, %xmm0")
+                        minMaxIndex = minMaxIndex + 1
+                    WEND
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreXmm0Line(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                ' `CLAMP(v, a, b)` -- the oracle's own real implementation
+                ' sorts its OWN bounds first (`lo = min(a,b)`, `hi =
+                ' max(a,b)`, confirmed directly in runtime.cpp), so `a`
+                ' need not already be the smaller bound -- composed here
+                ' from the exact same real `minsd`/`maxsd` this backend's
+                ' MIN/MAX already use.
+                IF Upper(callee) == "CLAMP" ORELSE Upper(callee) == "MATH.CLAMP" THEN
+                    IF LEN(args) != 3 ORELSE mathArgsResolvable == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "CLAMP(...) is only supported with exactly 3 numeric arguments by native x86-64 codegen: " + instruction.Field("Args"))
+                        CONTINUE FOR
+                    END IF
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[0], "xmm0")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[1], "xmm1")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[2], "xmm2")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    ignored = Array.Push(textLines, "    movsd %xmm1, %xmm3")
+                    ignored = Array.Push(textLines, "    minsd %xmm2, %xmm1")
+                    ignored = Array.Push(textLines, "    maxsd %xmm2, %xmm3")
+                    ignored = Array.Push(textLines, "    maxsd %xmm1, %xmm0")
+                    ignored = Array.Push(textLines, "    minsd %xmm3, %xmm0")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreXmm0Line(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                ' `LERP(from, to, amount)` -- `from + (to - from) * amount`,
+                ' composed from the exact same real `subsd`/`mulsd`/`addsd`
+                ' every ordinary Float BinOp already uses.
+                IF Upper(callee) == "LERP" ORELSE Upper(callee) == "MATH.LERP" THEN
+                    IF LEN(args) != 3 ORELSE mathArgsResolvable == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "LERP(...) is only supported with exactly 3 numeric arguments by native x86-64 codegen: " + instruction.Field("Args"))
+                        CONTINUE FOR
+                    END IF
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[0], "xmm0")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[1], "xmm1")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    FOR line IN Fission_X86_64MathLoadArgXmmLines(offsets, kinds, args[2], "xmm2")
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    ignored = Array.Push(textLines, "    subsd %xmm0, %xmm1")
+                    ignored = Array.Push(textLines, "    mulsd %xmm2, %xmm1")
+                    ignored = Array.Push(textLines, "    addsd %xmm1, %xmm0")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreXmm0Line(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                ' `PI()`/`TAU()`/`Math.PI()`/`Math.TAU()` -- real, fixed
+                ' double constants, materialized exactly like a genuine
+                ' decimal LITERAL already is (see Fission_X86_64
+                ' FloatLiteralBits' own comment for why the bit pattern is
+                ' split into two 32-bit halves): opaque bit transport
+                ' through a GP register into the dest slot, no XMM
+                ' involvement needed for mere storage.
+                IF Upper(callee) == "PI" ORELSE Upper(callee) == "MATH.PI" ORELSE Upper(callee) == "TAU" ORELSE Upper(callee) == "MATH.TAU" THEN
+                    IF LEN(args) != 0 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected 0)")
+                        CONTINUE FOR
+                    END IF
+                    piLow = 1413754136
+                    piHigh = 1074340347
+                    tauLow = 1413754136
+                    tauHigh = 1075388923
+                    constLow = piLow
+                    constHigh = piHigh
+                    IF Upper(callee) == "TAU" ORELSE Upper(callee) == "MATH.TAU" THEN
+                        constLow = tauLow
+                        constHigh = tauHigh
+                    END IF
+                    mathConstLabel = "flt" + String(context.FloatCount)
+                    context.FloatCount = context.FloatCount + 1
+                    ignored = Array.Push(context.RodataLines, mathConstLabel + ":")
+                    ignored = Array.Push(context.RodataLines, "    .long " + String(constLow))
+                    ignored = Array.Push(context.RodataLines, "    .long " + String(constHigh))
+                    ignored = Array.Push(textLines, "    mov " + mathConstLabel + "(%rip), %rax")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+                    CONTINUE FOR
+                END IF
+                ' `Random.Choice`/`Random.Sample`/`Random.Shuffle` are the
+                ' real host-bridge functions this comment block originally
+                ' documented -- see Fission_X86_64CollectSlots' own
+                ' comment (same wording) for the full "why these can't be
+                ' uniform host-table entries" reasoning.
                 IF Upper(callee) == "RANDOM.CHOICE" THEN
                     IF LEN(args) != 2 THEN
                         ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected 2)")

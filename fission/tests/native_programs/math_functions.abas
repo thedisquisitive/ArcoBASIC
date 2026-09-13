@@ -1,0 +1,87 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's own native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention.
+'
+' Real, HARDWARE-BACKED Math.* functions: SQRT/ABS/FLOOR/CEIL/ROUND/MIN/
+' MAX/CLAMP/LERP/PI/TAU. Every one of these is dispatched as INLINE SSE2/
+' SSE4.1 instructions (sqrtsd/subsd/maxsd/roundsd/minsd, or a real
+' compile-time constant), never a call into host_bridge.c at all -- see
+' Fission_X86_64LowerFunction's own "SQRT"/"ABS"/etc. handling for the full
+' design. Confirmed against the real oracle (`src/runtime/runtime.cpp`'s
+' own `register_math` lambda):
+'   - SQRT/FLOOR/CEIL are direct hardware instructions (sqrtsd, roundsd
+'     modes 1/2).
+'   - ABS is `max(x, -x)` via real subsd/maxsd (no GP<->XMM `movq`/`andpd`
+'     available in this assembler yet for a bit-clear-sign-bit trick).
+'   - ROUND is the oracle's own real `std::round` -- ROUND-HALF-AWAY-FROM
+'     -ZERO (confirmed via a direct probe: ROUND(2.5)=3, ROUND(-2.5)=-3),
+'     a DIFFERENT rounding rule than the round-half-to-EVEN this backend's
+'     own PRINT formatter already uses -- composed as
+'     `sign(x) * floor(|x| + 0.5)` with a real branch to reapply the sign.
+'   - MIN/MAX are the oracle's own real VARIADIC (1-64 args) signature,
+'     folded left-to-right via one real minsd/maxsd per extra argument --
+'     no scope reduction needed at all, unlike Path.Join/Format.
+'   - CLAMP sorts its OWN bounds first (`lo=min(a,b)`, `hi=max(a,b)`,
+'     confirmed directly in runtime.cpp), composed from the same real
+'     minsd/maxsd.
+'   - LERP is `from + (to - from) * amount`, composed from the exact same
+'     real subsd/mulsd/addsd every ordinary Float BinOp already uses.
+'   - PI()/TAU()/Math.PI()/Math.TAU() are real, fixed double constants,
+'     materialized exactly like a genuine decimal LITERAL already is.
+'
+' Real, disclosed remaining scope: transcendental functions (SIN/COS/TAN/
+' ASIN/ACOS/ATAN/ATAN2/EXP/LOG/LOG10/POW) have NO direct x86 hardware
+' instruction at all -- a real, correctly-rounded implementation would need
+' to be built from scratch (a real minimax polynomial + range reduction), a
+' separate, harder undertaking with genuine precision risk against libm,
+' deliberately deferred and not attempted here.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+PRINT SQRT(16)
+PRINT SQRT(2)
+PRINT ABS(-5)
+PRINT ABS(5.5)
+PRINT ABS(-5.5)
+PRINT FLOOR(3.7)
+PRINT FLOOR(-3.7)
+PRINT CEIL(3.2)
+PRINT CEIL(-3.2)
+PRINT ROUND(3.5)
+PRINT ROUND(2.5)
+PRINT ROUND(-2.5)
+PRINT ROUND(3.4)
+PRINT MIN(3, 7)
+PRINT MIN(7.5, 3.2)
+PRINT MIN(5, 2, 8, 1, 9)
+PRINT MAX(3, 7)
+PRINT MAX(7.5, 3.2)
+PRINT MAX(5, 2, 8, 1, 9)
+PRINT CLAMP(15, 0, 10)
+PRINT CLAMP(-5, 0, 10)
+PRINT CLAMP(5, 0, 10)
+PRINT LERP(0, 10, 0.5)
+PRINT LERP(10, 20, 0.25)
+PRINT Math.PI()
+PRINT Math.TAU()
+PRINT PI()
+PRINT TAU()
+PRINT Math.Sqrt(16)
+PRINT Math.Abs(-5.5)
+PRINT Math.Floor(3.7)
+PRINT Math.Ceil(3.2)
+PRINT Math.Round(2.5)
+PRINT Math.Min(3, 7)
+PRINT Math.Max(3, 7)
+PRINT Math.Clamp(15, 0, 10)
+PRINT Math.Lerp(0, 10, 0.5)
+
+' A real Math.* call crossing a function-call boundary, and mixed with
+' ordinary Float arithmetic (`/ 2`) -- exercising the exact same
+' inter-procedural kind-inference this whole backend's Float support
+' already relies on.
+FUNCTION HalfDistance(a, b)
+    RETURN Math.Abs(a - b) / 2
+END FUNCTION
+PRINT HalfDistance(10, 3)

@@ -2863,6 +2863,124 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   boundary already flagged) -- every OTHER Random.* function that takes
   an explicit handle is now real. No other Float-related gap remains
   disclosed as of this entry.
+- DONE -- real, HARDWARE-BACKED Math.* functions: SQRT, ABS, FLOOR, CEIL,
+  ROUND, MIN, MAX, CLAMP, LERP, PI, TAU (both bare and dotted `Math.X`
+  names, matching the oracle's own `register_math` lambda, which
+  registers both spellings for every one of these). Every one of these
+  is dispatched as INLINE SSE2/SSE4.1 instructions in
+  `Fission_X86_64LowerFunction` (a new special-case block, the same
+  pattern MOD/String(x)/TYPEOF/Random.Choice already use), never a call
+  into `host_bridge.c` at all -- confirmed each has either a direct
+  hardware instruction or a trivial composition of ones this backend's
+  own Float BinOp support already emits:
+  - SQRT/FLOOR/CEIL are direct hardware instructions (`sqrtsd`, `roundsd`
+    modes 1/2). Three new SSE4.1/SSE2 assembler mnemonics needed adding
+    to `fission/amir/x86_64_assembler.abas` first: `sqrtsd` (via the
+    existing shared `Fission_X86_64AsmEmitSseRegRm` helper), `minsd`/
+    `maxsd` (added to the existing `sseArithOpcodes` dispatch table
+    alongside `addsd`/`subsd`/`mulsd`/`divsd`), and `roundsd $mode, src,
+    dst` -- a genuinely different 3-operand instruction shape (mandatory
+    `66` prefix instead of `F2`/none, the `0F 3A` two-byte escape instead
+    of bare `0F`, plus a trailing imm8 mode byte after the ModRM), so it
+    could not reuse `EmitSseRegRm` and got its own dedicated encoding
+    block. All four verified via a real hand-assembled probe (in this
+    session's own established "verify the encoder in isolation first"
+    style) BEFORE being wired into the compiler: `SQRT(16)=4`,
+    `FLOOR(-3.7)=-4`, `CEIL(-3.7)=-3`, `MIN(2.0,3.5)=2`,
+    `MAX(2.0,3.5)=3` (truncated for display), all byte-correct.
+  - ABS is `max(x, -x)` via real `subsd`/`maxsd`, NOT a bit-clear-sign-bit
+    trick -- this assembler has no GP<->XMM `movq`/`andpd` instruction
+    yet (host_bridge.c's own `arco_raw_negate` needs that exact
+    operation, but does it via C inline asm, invisible to this
+    assembler), so the branch-free arithmetic identity was used instead,
+    needing zero new assembler work.
+  - ROUND is the oracle's own real `std::round` -- confirmed via a direct
+    probe this IS round-HALF-AWAY-FROM-ZERO (`ROUND(2.5)=3`,
+    `ROUND(-2.5)=-3`), a DIFFERENT rounding rule than the round-half-to
+    -EVEN this backend's own `arco_host_format_double` PRINT formatter
+    already uses -- NOT any single `roundsd` mode directly. Composed as
+    the standard `sign(x) * floor(|x| + 0.5)` identity: `|x|` via the
+    same `subsd`/`maxsd` trick as ABS, `+0.5` via a real hardware
+    `divsd` of `1.0/2.0` (exact for this value), `roundsd $1` for the
+    floor, then a real branch (`ucomisd` + `setb` against the ORIGINAL
+    sign, a fresh dispatch-id label) to reapply the sign since this
+    assembler has no branch-free copysign primitive available yet.
+  - MIN/MAX support the oracle's own real VARIADIC (1-64 argument)
+    signature, confirmed directly in `runtime.cpp`
+    (`math_min_function`/`math_max_function`, left-to-right fold via
+    `std::min`/`std::max`) -- unlike Path.Join/Format (which need real,
+    non-trivial per-arity marshaling and were disclosed as scoped down
+    to a fixed arity), folding via one real `minsd`/`maxsd` per extra
+    argument is cheap enough that the REAL full variadic arity is
+    supported directly, no scope reduction needed at all.
+  - CLAMP sorts its OWN bounds first (`lo = min(a,b)`, `hi = max(a,b)`,
+    confirmed directly in `runtime.cpp`'s `math_clamp_function` -- the
+    2nd argument need not already be the smaller bound), composed from
+    the same real `minsd`/`maxsd`.
+  - LERP is `from + (to - from) * amount`, composed from the exact same
+    real `subsd`/`mulsd`/`addsd` every ordinary Float BinOp already uses
+    -- needs zero new instructions.
+  - PI()/TAU()/Math.PI()/Math.TAU() are real, fixed double constants,
+    materialized exactly like a genuine decimal LITERAL already is (a
+    rodata `flt` label holding two `.long` halves -- see
+    `Fission_X86_64FloatLiteralBits`' own comment for why the bit
+    pattern is split -- loaded via a RIP-relative `mov`, no XMM
+    involvement needed for mere storage).
+  Every argument is loaded via a new shared
+  `Fission_X86_64MathLoadArgXmmLines` helper, which promotes a plain
+  Number(int) argument via real `cvtsi2sd` first (e.g. `SQRT(16)`, a
+  bare integer literal, is real, legal ArcoBASIC, confirmed via the
+  oracle: `SQRT(16)` -> `4`) -- returns a `Lines` array merged by the
+  caller, this file's own established convention (see
+  `Fission_X86_64LowerFloatBinOp`) rather than assuming a helper can
+  safely mutate its caller's array parameter in place. Dest-kind
+  inference for every one of these callees is a new explicit
+  `isHardwareMathCallee` check in `Fission_X86_64CollectSlots` (the same
+  pattern already used for STRING/TYPEOF), NOT a `Fission_X86_64
+  HostFunctionTable` entry -- these never cross the ABI at all, so a
+  host-table entry (whose whole point is a fixed native ABI signature)
+  would have been the wrong mechanism.
+  A real, genuinely confusing bug hit while writing the MIN/MAX
+  dispatch's own variadic fold loop: a `WHILE ... END WHILE` loop nested
+  inside the new dispatch block failed to PARSE at all
+  ("expected statement" pointing directly at the `END WHILE` token),
+  even with NO nesting inside it whatsoever -- traced via a careful
+  bisection (binary-searching by deleting half the new code block at a
+  time and re-testing, since a naive IF/FOR/WHILE keyword-balance scan
+  found nothing wrong) down to a single minimal repro:
+  `WHILE i < 3 \n i = i + 1 \n END WHILE` alone fails, while the
+  IDENTICAL loop closed with `WEND` instead succeeds. Root cause: this
+  whole native backend's OWN source (`fission/amir/*.abas`) is compiled
+  by the LEGACY C++ `ArcoFission compile-run` oracle
+  (`src/frontend/parser.cpp`), whose real `WHILE` loop parsing
+  (`block_until({TokenType::Wend}); consume(TokenType::Wend, ...)`)
+  supports ONLY `WEND`, never `END WHILE` -- `END WHILE` is real, valid
+  syntax only in the SEPARATE, self-hosted `fission/language/arcobasic/
+  parser.abas` (the ArcoBASIC dialect THIS project is building AS A
+  TARGET, a different program from the legacy compiler that bootstraps
+  it), a real, easy-to-conflate "which parser's dialect am I actually
+  writing in" trap specific to working inside a self-hosted-compiler
+  project. Fixed by using `WEND` (matching every other pre-existing
+  `WHILE` loop in this same file). Verified: a real, dedicated
+  `fission/tests/native_programs/math_functions.abas` fixture (every
+  function above, plus a real Math.* call crossing a function-call
+  boundary mixed with ordinary Float division) matches the oracle
+  byte-for-byte. Extended `fission/tests/amir_x86_64_smoke.abas` with 12
+  new structural checks (one per function/family). Self-parse/self
+  -semantic corpus symbol count grew 3974 -> 4031 (file count 96 and
+  import-edge count 150 both unchanged); golden value updated. Verified
+  with `fissure run` (`project.core-fast` PASS).
+  Real, disclosed, NOT attempted this pass: transcendental functions
+  (SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2, EXP, LOG, LOG10, POW) have NO
+  direct x86 hardware instruction at all -- a real, correctly-rounded
+  implementation would need to be built from scratch (a real minimax
+  polynomial + range reduction, or similar), a separate, harder
+  undertaking with genuine precision risk against libm if done
+  carelessly, deliberately deferred rather than attempted here.
+  `Math.Constants()` (the object-returning form, `{PI, Pi, TAU, Tau, E,
+  DegToRad, RadToDeg}`) is also not attempted -- this backend has no
+  general Object-literal-return-value support yet, a broader,
+  pre-existing gap unrelated to Math specifically.
 
 ## In-Progress Components
 

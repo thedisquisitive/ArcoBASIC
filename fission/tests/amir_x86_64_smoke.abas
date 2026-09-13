@@ -989,3 +989,93 @@ FloatTypeofSource = "PRINT TYPEOF(3.14)"
 FloatTypeofAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatTypeofSource), "x86-64-float-typeof-smoke.abas")))
 FloatTypeofProgram = Fission_AmirToX86_64(FloatTypeofAmir)
 PRINT FloatTypeofProgram.Diagnostics.HasErrors()
+
+' Real hardware-backed Math.* functions -- see
+' fission/tests/native_programs/math_functions.abas's own header comment
+' for the full design (every one of these is dispatched as inline SSE2/
+' SSE4.1 instructions, never a call into host_bridge.c).
+MathSqrtSource = "PRINT SQRT(16)"
+MathSqrtAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathSqrtSource), "x86-64-math-sqrt-smoke.abas")))
+MathSqrtProgram = Fission_AmirToX86_64(MathSqrtAmir)
+PRINT MathSqrtProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathSqrtProgram.Render(), "sqrtsd")
+
+MathAbsSource = "PRINT ABS(-5.5)"
+MathAbsAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathAbsSource), "x86-64-math-abs-smoke.abas")))
+MathAbsProgram = Fission_AmirToX86_64(MathAbsAmir)
+PRINT MathAbsProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathAbsProgram.Render(), "maxsd")
+
+MathFloorSource = "PRINT FLOOR(3.7)"
+MathFloorAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathFloorSource), "x86-64-math-floor-smoke.abas")))
+MathFloorProgram = Fission_AmirToX86_64(MathFloorAmir)
+PRINT MathFloorProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathFloorProgram.Render(), "roundsd $1")
+
+MathCeilSource = "PRINT Math.Ceil(3.2)"
+MathCeilAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathCeilSource), "x86-64-math-ceil-smoke.abas")))
+MathCeilProgram = Fission_AmirToX86_64(MathCeilAmir)
+PRINT MathCeilProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathCeilProgram.Render(), "roundsd $2")
+
+' ROUND is real round-HALF-AWAY-FROM-ZERO (confirmed via the oracle:
+' ROUND(2.5)=3, ROUND(-2.5)=-3, distinct from the round-half-to-EVEN this
+' backend's own PRINT formatter uses) -- composed from `roundsd $1` (floor)
+' plus a real sign-reapplying branch.
+MathRoundSource = "PRINT ROUND(2.5)"
+MathRoundAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathRoundSource), "x86-64-math-round-smoke.abas")))
+MathRoundProgram = Fission_AmirToX86_64(MathRoundAmir)
+PRINT MathRoundProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathRoundProgram.Render(), ".Lround_pos_")
+
+' MIN/MAX support the oracle's own real VARIADIC (1-64 arg) signature,
+' folded via one real minsd/maxsd per extra argument -- no scope reduction.
+MathMinVariadicSource = "PRINT MIN(5, 2, 8, 1, 9)"
+MathMinVariadicAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathMinVariadicSource), "x86-64-math-min-variadic-smoke.abas")))
+MathMinVariadicProgram = Fission_AmirToX86_64(MathMinVariadicAmir)
+PRINT MathMinVariadicProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathMinVariadicProgram.Render(), "minsd")
+
+MathMaxSource = "PRINT MAX(3, 7)"
+MathMaxAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathMaxSource), "x86-64-math-max-smoke.abas")))
+MathMaxProgram = Fission_AmirToX86_64(MathMaxAmir)
+PRINT MathMaxProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathMaxProgram.Render(), "maxsd")
+
+MathClampSource = "PRINT CLAMP(15, 0, 10)"
+MathClampAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathClampSource), "x86-64-math-clamp-smoke.abas")))
+MathClampProgram = Fission_AmirToX86_64(MathClampAmir)
+PRINT MathClampProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathClampProgram.Render(), "minsd") ANDALSO String.Contains(MathClampProgram.Render(), "maxsd")
+
+MathLerpSource = "PRINT LERP(0, 10, 0.5)"
+MathLerpAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathLerpSource), "x86-64-math-lerp-smoke.abas")))
+MathLerpProgram = Fission_AmirToX86_64(MathLerpAmir)
+PRINT MathLerpProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathLerpProgram.Render(), "mulsd")
+
+' PI()/TAU()/Math.PI()/Math.TAU() are real, fixed double constants,
+' materialized exactly like a genuine decimal LITERAL already is (a
+' rodata `flt` label loaded via a RIP-relative `mov`, no XMM involvement
+' needed for mere storage).
+MathPiSource = "PRINT Math.PI()"
+MathPiAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathPiSource), "x86-64-math-pi-smoke.abas")))
+MathPiProgram = Fission_AmirToX86_64(MathPiAmir)
+PRINT MathPiProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathPiProgram.Render(), "flt0(%rip)")
+
+MathTauSource = "PRINT TAU()"
+MathTauAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathTauSource), "x86-64-math-tau-smoke.abas")))
+MathTauProgram = Fission_AmirToX86_64(MathTauAmir)
+PRINT MathTauProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathTauProgram.Render(), "flt0(%rip)")
+
+' A real Math.* call crossing a function-call boundary, mixed with
+' ordinary Float arithmetic (division) -- the exact shape
+' fission/tests/native_programs/math_functions.abas's own HalfDistance
+' exercises end-to-end.
+MathAcrossCallSource = "FUNCTION HalfDistance(a, b)\n    RETURN Math.Abs(a - b) / 2\nEND FUNCTION\nPRINT HalfDistance(10, 3)"
+MathAcrossCallAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(MathAcrossCallSource), "x86-64-math-across-call-smoke.abas")))
+MathAcrossCallProgram = Fission_AmirToX86_64(MathAcrossCallAmir)
+PRINT MathAcrossCallProgram.Diagnostics.HasErrors()
+PRINT String.Contains(MathAcrossCallProgram.Render(), "maxsd") ANDALSO String.Contains(MathAcrossCallProgram.Render(), "divsd")
