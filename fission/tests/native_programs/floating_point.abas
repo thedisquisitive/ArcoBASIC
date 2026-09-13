@@ -1,0 +1,89 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention. THE FIRST real floating-point
+' fixture: ArcoBASIC's own Number is ALWAYS a real IEEE-754 binary64
+' double (see include/arco/value.hpp's own `Value::Storage`) -- this
+' native backend's entire numeric representation, until now, was always
+' an INTEGER special case of that (correct only as long as a value
+' stayed whole and within a double's own exact-integer range). This
+' fixture exercises the real thing: decimal literals, real SSE2
+' arithmetic (+/-/*//), int<->double promotion when a plain integer
+' literal/variable is mixed into Float-kind arithmetic or crosses a REAL
+' function-call boundary into a parameter that OTHER call sites made
+' Float-kind, real floating-point comparisons, and the real
+' `arco_host_format_double` PRINT/String(x) formatter -- verified
+' separately against a real C++ reimplementation of the oracle's own
+' `Value::to_string()` across tens of thousands of randomized values
+' (see host_bridge.c's own comment on `arco_host_format_double`), not
+' just the hand-picked cases below.
+'
+' A genuinely important discovery made while building this: `/` is
+' ALWAYS real double division on the oracle, regardless of whether
+' either operand looks like a whole number (`10 / 2` really is `5.0`
+' under the hood, it just happens to PRINT as "5" per the oracle's own
+' whole-number formatting rule) -- `+`/`-`/`*` stay on the pre-existing
+' fast GP-register integer path unless a real decimal literal is
+' involved, which is bit-for-bit identical to real double arithmetic as
+' long as the result stays within a double's own exact-integer range.
+'
+' Real, disclosed Phase 1 scope: `MOD` and the whole `Bit.*`/`SHL`/`SHR`
+' family are NOT supported on a Float-kind value (real, clean
+' diagnostics, not silently mishandled) -- MOD would need a real `fmod`
+' (the oracle's own MOD IS real floating-point modulo, confirmed via a
+' direct probe: `10.5 MOD 3` -> `1.5`, not integer-only), not
+' implemented yet; Float-kind ARRAY elements are not supported (arrays
+' stay Number(int)-or-String only, a real, disclosed, separate
+' representation limitation, unrelated to floating-point arithmetic
+' itself); `Random.Float`/`Math.Random` remain unimplemented (though the
+' real double-arithmetic groundwork this fixture proves now makes that a
+' much smaller remaining gap than before).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+x = 3.14
+PRINT x
+y = x + 1.5
+PRINT y
+PRINT 10 / 3
+PRINT 100 / 5
+PRINT 5 - 2.5
+PRINT 2.5 * 4
+PRINT 7 / 2
+PRINT x > 1
+PRINT x < 1
+PRINT x == 3.14
+PRINT x != 3.14
+PRINT -3.5
+PRINT 0.1
+PRINT String(3.14)
+PRINT TYPEOF(3.14)
+n = 100
+f = n / 3
+PRINT f
+PRINT TYPEOF(f)
+
+FUNCTION AddOne(v)
+    RETURN v + 1
+END FUNCTION
+PRINT AddOne(3.14)
+
+FUNCTION Avg(a, b)
+    RETURN (a + b) / 2
+END FUNCTION
+PRINT Avg(3.0, 7.0)
+PRINT Avg(10, 3)
+
+FUNCTION Scale(v, factor)
+    RETURN v * factor
+END FUNCTION
+PRINT Scale(2.5, 4)
+PRINT Scale(10, 2.5)
+
+FUNCTION SumHalves(n, acc)
+    IF n <= 0 THEN
+        RETURN acc
+    END IF
+    RETURN SumHalves(n - 1, acc + n / 2.0)
+END FUNCTION
+PRINT SumHalves(5, 0)

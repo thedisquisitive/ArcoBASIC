@@ -948,3 +948,266 @@ arco_i64 arco_host_sleep(arco_i64 milliseconds) {
     }
     return 1;
 }
+
+
+// --- Batch 5: real floating-point support. ArcoBASIC's own Number is
+// ALWAYS a real double (see include/arco/value.hpp's own `Value::
+// Storage`) -- there is no separate int/float type anywhere in the whole
+// language. This whole native backend's own Number representation was,
+// until now, always an INTEGER special case of that (correct as long as
+// a value stayed within a double's own exact-integer range, but not the
+// real thing) -- the compiler side of real floating-point support
+// (decimal literals, real SSE arithmetic/comparisons, int<->double
+// promotion) lives in fission/amir/lower_x86_64.abas/x86_64_assembler.abas;
+// this file's own real, NEW piece is PRINT formatting -- the one part
+// that genuinely needs runtime code, not just a literal's own
+// COMPILE-TIME bit pattern (see Fission_X86_64FloatLiteralBits' own
+// comment for why that lives in the self-hosted compiler instead).
+
+static inline __attribute__((always_inline)) double arco_raw_trunc(double v) {
+    double result;
+    __asm__("roundsd $3, %1, %0" : "=x"(result) : "x"(v));
+    return result;
+}
+static inline __attribute__((always_inline)) double arco_raw_round_even(double v) {
+    double result;
+    __asm__("roundsd $0, %1, %0" : "=x"(result) : "x"(v));
+    return result;
+}
+
+// A real double CONSTANT (10.0, 2.0, ...) built from a genuine integer-
+// to-double CONVERSION INSTRUCTION at runtime -- an ordinary `x <
+// 9223372036854775808.0`-style floating-point literal comparison
+// produces a REAL `.rodata`/PC32-relocation reference (there is no
+// "load a 64-bit float immediate" x86-64 instruction at all), which
+// this whole file's own host-function bridge cannot support yet (see
+// fission/amir/elf_object.abas's own header comment: a real relocation
+// against a SECTION symbol with an addend -- gcc's own convention for
+// referencing static/local rodata -- is a real, disclosed, unimplemented
+// case, deliberately deferred until a real host function needed it).
+// This works around that architectural gap entirely rather than
+// requiring it: every double constant this function needs is
+// synthesized via a real `cvtsi2sd` from a small integer immediate
+// instead. Real, hand-written INLINE ASM, not a `volatile`-local trick
+// (tried first, and confirmed too fragile: GCC's own optimizer
+// respected it, but clang's did not -- clang still saw straight through
+// to the underlying compile-time-constant VALUE and folded the whole
+// squaring chain built from it right back into a `.rodata` constant
+// anyway, reintroducing the exact relocation this exists to avoid; a
+// real compiler CHOICE this project's own build cannot assume, since
+// RIVET.Toolchain.DetectCxx() tries clang++ before g++/c++ -- confirmed
+// by directly reproducing the clang-only regression via a real `clang++
+// -x c` compile of this exact file). Inline asm is opaque to every
+// optimizer by definition -- neither compiler can see through it to
+// fold anything derived from its result, verified directly against
+// BOTH real compilers before trusting it, not assumed from one.
+static inline __attribute__((always_inline)) double arco_raw_int_to_double(long n) {
+    double result;
+    __asm__("cvtsi2sd %1, %0" : "=x"(result) : "r"(n));
+    return result;
+}
+
+// Real IEEE-754 sign-bit negation via raw INTEGER xor (a plain 64-bit
+// immediate, needing no rodata at all) instead of C's own `-value`,
+// which both GCC and clang compile to `xorpd` against a rodata-stored
+// sign-bit mask -- the exact same rodata-relocation problem this
+// function's own header comment already describes for floating-point
+// literals, just reached through negation instead of a numeric
+// constant. A first attempt built this via `__builtin_memcpy` +
+// integer xor instead of `-v` directly -- correct on GCC, but a real,
+// confirmed regression on clang: its optimizer saw straight through the
+// memcpy round-trip to the underlying intent and reintroduced the exact
+// same `xorpd`-against-`.rodata` form anyway. Real, hand-written INLINE
+// ASM (opaque to every optimizer by definition, verified directly
+// against BOTH real compilers) for the GP<->XMM moves; the actual XOR
+// stays plain, compiler-visible integer arithmetic (which never needs
+// rodata regardless of optimization level either way).
+static inline __attribute__((always_inline)) double arco_raw_negate(double v) {
+    arco_u64 bits;
+    __asm__("movq %1, %0" : "=r"(bits) : "x"(v));
+    bits = bits ^ 0x8000000000000000UL;
+    double result;
+    __asm__("movq %1, %0" : "=x"(result) : "r"(bits));
+    return result;
+}
+
+// Real double -> decimal-string formatting, matching the oracle's own
+// Value::to_string() exactly: a whole-number-valued double prints as a
+// plain integer (no decimal point); anything else uses a real
+// 6-significant-digit general (%g-equivalent) format -- round-half-to-
+// EVEN (matching IEEE-754/glibc's own default rounding, confirmed
+// necessary via a direct oracle probe: 123456.5 prints "123456", not
+// "123457" -- a real tie broken toward the EVEN digit, not simple
+// round-half-up), trailing zeros stripped, switching to scientific
+// notation when the real decimal exponent is < -4 or >= 6 (the same
+// %g threshold printf/ostream both use). Real hardware SSE4.1
+// `roundsd` gives correctly-rounded truncation/round-to-nearest-even
+// directly, no software bignum/dtoa library needed at all.
+//
+// Verified against a real C++ reimplementation of Value::to_string()
+// itself (not just hand-picked cases) across tens of thousands of
+// randomized values spanning magnitudes from 1e-20 to 1e20 plus known
+// round-half-to-even tie cases -- zero mismatches within the oracle's
+// own well-defined range. Real, disclosed, bounded divergence: for a
+// whole-number-valued double >= 2^63 (~9.22e18), the oracle's OWN
+// `static_cast<long long>(value)` is genuine undefined behavior in C++
+// (the value does not fit in a `long long` at all) -- confirmed
+// directly (the same stress test that verified everything else shows
+// the oracle producing platform/compiler-dependent garbage there, e.g.
+// INT64_MIN or a wrong digit string) -- this implementation instead
+// produces a real, well-defined 6-significant-digit scientific-notation
+// result for those magnitudes rather than replicating undefined
+// behavior, the same "do not chase a genuinely broken oracle result"
+// discipline already applied to StringToHex/HexToString/NUMBER("abc")
+// elsewhere in this file. No real ArcoBASIC program reaches this
+// magnitude without exponent-notation literals, which this whole
+// language's own lexer does not even tokenize as a number.
+const char* arco_host_format_double(double value) {
+    char buf[64];
+    int pos = 0;
+    int negative = value < 0;
+    double v = negative ? arco_raw_negate(value) : value;
+    double zero = arco_raw_int_to_double(0);
+    double one = arco_raw_int_to_double(1);
+
+    // 2^63, built via 63 real EXACT doublings (multiplying by 2 never
+    // rounds in IEEE-754) -- the real boundary where
+    // `static_cast<long long>` stops being well-defined, see this
+    // function's own header comment.
+    double two63 = one;
+    int di;
+    for (di = 0; di < 63; di = di + 1) two63 = two63 + two63;
+
+    if (arco_raw_trunc(v) == v && v < two63) {
+        long long whole = (long long)v;
+        char tmp[24];
+        int tpos = 24;
+        if (whole == 0) {
+            tmp[--tpos] = '0';
+        } else {
+            while (whole != 0) {
+                tmp[--tpos] = (char)('0' + (whole % 10));
+                whole = whole / 10;
+            }
+        }
+        if (negative) buf[pos++] = '-';
+        while (tpos < 24) buf[pos++] = tmp[tpos++];
+        buf[pos] = 0;
+        char* result = (char*)arco_raw_mmap((arco_u64)(pos + 1));
+        int i = 0;
+        while (i <= pos) { result[i] = buf[i]; i = i + 1; }
+        return result;
+    }
+
+    // Real powers of ten (10^1, 10^2, 10^4, ..., 10^256), each built by
+    // one real EXACT-as-possible squaring of the previous -- minimizes
+    // both the number of runtime rounding operations (versus a
+    // factor-of-10-at-a-time normalization loop, which could accumulate
+    // real error across hundreds of steps for extreme magnitudes) AND
+    // avoids embedding nine separate floating-point literal constants
+    // (each its own real rodata/relocation problem, see this function's
+    // own header comment).
+    // `pow10Exp[i]` (each real exponent this table's own doubling
+    // reaches: 1, 2, 4, ..., 256) is deliberately NOT a second array --
+    // a real, DIRECT confirmed regression: a plain `int[9] = {1, 2, 4,
+    // ...}` local array with a compile-time-constant initializer list
+    // got compiled (by clang, though NOT by gcc -- the same real
+    // cross-compiler divergence arco_raw_int_to_double's own comment
+    // already found) into a genuine static table IN `.rodata`, indexed
+    // via an absolute (not RIP-relative) address -- the exact same
+    // relocation problem, reached a completely different way. `1 << i`
+    // is a real, plain SHIFT instruction, impossible to place in
+    // `.rodata` at all.
+    double pow10[9];
+    pow10[0] = arco_raw_int_to_double(10);
+    int pi;
+    for (pi = 1; pi < 9; pi = pi + 1) pow10[pi] = pow10[pi - 1] * pow10[pi - 1];
+
+    int exp10 = 0;
+    int i;
+    for (i = 8; i >= 0; i = i - 1) {
+        while (v >= pow10[i]) {
+            v = v / pow10[i];
+            exp10 = exp10 + (1 << i);
+        }
+    }
+    for (i = 8; i >= 0 && v > zero; i = i - 1) {
+        while (v < one && v * pow10[i] < pow10[0]) {
+            v = v * pow10[i];
+            exp10 = exp10 - (1 << i);
+        }
+    }
+
+    // v is now in [1, 10) (up to real floating-point slack); scale to a
+    // real 6-significant-digit integer with correct round-half-to-even.
+    // 10^5 = pow10[2] (10^4) * pow10[0] (10^1), reusing the SAME table
+    // above rather than a tenth floating-point constant.
+    double hundredThousand = pow10[2] * pow10[0];
+    double scaled = arco_raw_round_even(v * hundredThousand);
+    long long digits = (long long)scaled;
+    if (digits >= 1000000) {
+        digits = digits / 10;
+        exp10 = exp10 + 1;
+    }
+    if (digits < 100000) {
+        digits = digits * 10;
+        exp10 = exp10 - 1;
+    }
+
+    char digitChars[6];
+    long long d = digits;
+    for (i = 5; i >= 0; i = i - 1) {
+        digitChars[i] = (char)('0' + (d % 10));
+        d = d / 10;
+    }
+
+    int useScientific = exp10 < -4 || exp10 >= 6;
+    if (negative) buf[pos++] = '-';
+    if (useScientific) {
+        buf[pos++] = digitChars[0];
+        int fracEnd = 6;
+        while (fracEnd > 1 && digitChars[fracEnd - 1] == '0') fracEnd = fracEnd - 1;
+        if (fracEnd > 1) {
+            buf[pos++] = '.';
+            for (i = 1; i < fracEnd; i = i + 1) buf[pos++] = digitChars[i];
+        }
+        buf[pos++] = 'e';
+        int e = exp10;
+        if (e < 0) { buf[pos++] = '-'; e = -e; } else { buf[pos++] = '+'; }
+        char expDigits[8];
+        int epos = 8;
+        if (e == 0) {
+            expDigits[--epos] = '0';
+        } else {
+            while (e != 0) { expDigits[--epos] = (char)('0' + (e % 10)); e = e / 10; }
+        }
+        int digitCount = 8 - epos;
+        int padding = digitCount < 2 ? 2 - digitCount : 0;
+        while (padding > 0) { buf[pos++] = '0'; padding = padding - 1; }
+        while (epos < 8) buf[pos++] = expDigits[epos++];
+    } else if (exp10 >= 0) {
+        int intDigits = exp10 + 1;
+        for (i = 0; i < intDigits; i = i + 1) buf[pos++] = digitChars[i];
+        int fracEnd = 6;
+        while (fracEnd > intDigits && digitChars[fracEnd - 1] == '0') fracEnd = fracEnd - 1;
+        if (fracEnd > intDigits) {
+            buf[pos++] = '.';
+            for (i = intDigits; i < fracEnd; i = i + 1) buf[pos++] = digitChars[i];
+        }
+    } else {
+        buf[pos++] = '0';
+        int fracEnd = 6;
+        while (fracEnd > 0 && digitChars[fracEnd - 1] == '0') fracEnd = fracEnd - 1;
+        if (fracEnd > 0) {
+            buf[pos++] = '.';
+            int leadingZeros = -exp10 - 1;
+            for (i = 0; i < leadingZeros; i = i + 1) buf[pos++] = '0';
+            for (i = 0; i < fracEnd; i = i + 1) buf[pos++] = digitChars[i];
+        }
+    }
+    buf[pos] = 0;
+    char* result = (char*)arco_raw_mmap((arco_u64)(pos + 1));
+    int j = 0;
+    while (j <= pos) { result[j] = buf[j]; j = j + 1; }
+    return result;
+}

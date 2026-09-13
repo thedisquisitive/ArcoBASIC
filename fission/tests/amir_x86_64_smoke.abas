@@ -891,3 +891,68 @@ LargeLiteralAssignProgram = Fission_AmirToX86_64(LargeLiteralAssignAmir)
 PRINT LargeLiteralAssignProgram.Diagnostics.HasErrors()
 PRINT String.Contains(LargeLiteralAssignProgram.Render(), "mov $4294967295, %rax")
 PRINT String.Contains(LargeLiteralAssignProgram.Render(), "movq $4294967295")
+
+' Real floating-point support: ArcoBASIC's own Number is ALWAYS a real
+' double (see fission/native_runtime/host_bridge.c's own "Batch 5"
+' header comment) -- a real decimal literal calls the real
+' arco_host_format_double host-bridge formatter when PRINTed; real
+' arithmetic on a Float-kind value uses real SSE2 instructions
+' (addsd/divsd, with a real `cvtsi2sd` int->double promotion when a
+' plain integer literal/variable is mixed in); a real comparison uses
+' `ucomisd` + the UNSIGNED-condition SETcc family (`seta`, not `setg` --
+' see Fission_X86_64FloatSetInstructionForOp's own comment for why the
+' signed integer mnemonics would be wrong here). Real execution
+' (including int<->float promotion crossing a real function-call
+' boundary, and a self-recursive function's own return-kind inference)
+' verified separately by fission/tests/native_programs/
+' floating_point.abas.
+FloatLiteralSource = "x = 3.14\nPRINT x"
+FloatLiteralAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatLiteralSource), "x86-64-float-literal-smoke.abas")))
+FloatLiteralProgram = Fission_AmirToX86_64(FloatLiteralAmir)
+PRINT FloatLiteralProgram.Diagnostics.HasErrors()
+PRINT String.Contains(FloatLiteralProgram.Render(), "call arco_host_format_double")
+
+FloatArithSource = "x = 1.5\ny = x + 2.5\nPRINT y"
+FloatArithAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatArithSource), "x86-64-float-arith-smoke.abas")))
+FloatArithProgram = Fission_AmirToX86_64(FloatArithAmir)
+PRINT FloatArithProgram.Diagnostics.HasErrors()
+PRINT String.Contains(FloatArithProgram.Render(), "addsd")
+
+FloatDivSource = "PRINT 10 / 3"
+FloatDivAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatDivSource), "x86-64-float-div-smoke.abas")))
+FloatDivProgram = Fission_AmirToX86_64(FloatDivAmir)
+PRINT FloatDivProgram.Diagnostics.HasErrors()
+PRINT String.Contains(FloatDivProgram.Render(), "divsd")
+PRINT String.Contains(FloatDivProgram.Render(), "cvtsi2sd")
+
+FloatCompareSource = "x = 1.5\nIF x > 1 THEN\n    PRINT 1\nEND IF"
+FloatCompareAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatCompareSource), "x86-64-float-compare-smoke.abas")))
+FloatCompareProgram = Fission_AmirToX86_64(FloatCompareAmir)
+PRINT FloatCompareProgram.Diagnostics.HasErrors()
+PRINT String.Contains(FloatCompareProgram.Render(), "ucomisd")
+PRINT String.Contains(FloatCompareProgram.Render(), "seta")
+
+' Real, disclosed Phase 1 scope: MOD and Float-kind array elements are
+' both real, reported diagnostics, not silently mishandled.
+FloatModSource = "x = 10.5\nPRINT x MOD 3"
+FloatModAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatModSource), "x86-64-float-mod-smoke.abas")))
+FloatModProgram = Fission_AmirToX86_64(FloatModAmir)
+PRINT FloatModProgram.Diagnostics.HasErrors()
+
+FloatArraySource = "a = [1.5, 2.5]\nPRINT a"
+FloatArrayAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatArraySource), "x86-64-float-array-smoke.abas")))
+FloatArrayProgram = Fission_AmirToX86_64(FloatArrayAmir)
+PRINT FloatArrayProgram.Diagnostics.HasErrors()
+
+' `String(x)`/`TYPEOF(x)` both real Float-aware special cases too (see
+' Fission_X86_64LowerFunction's own comment on each).
+FloatStringSource = "PRINT String(3.14)"
+FloatStringAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatStringSource), "x86-64-float-string-smoke.abas")))
+FloatStringProgram = Fission_AmirToX86_64(FloatStringAmir)
+PRINT FloatStringProgram.Diagnostics.HasErrors()
+PRINT String.Contains(FloatStringProgram.Render(), "call arco_host_format_double")
+
+FloatTypeofSource = "PRINT TYPEOF(3.14)"
+FloatTypeofAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(FloatTypeofSource), "x86-64-float-typeof-smoke.abas")))
+FloatTypeofProgram = Fission_AmirToX86_64(FloatTypeofAmir)
+PRINT FloatTypeofProgram.Diagnostics.HasErrors()

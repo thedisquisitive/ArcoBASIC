@@ -70,26 +70,45 @@ FUNCTION Fission_X86_64AsmRegisterIndex(name)
     RETURN Object.Get(table, name, -1)
 END FUNCTION
 
+' Real, floating-point support: xmm0-xmm15 -- a SEPARATE register FILE
+' from the sixteen GP registers above (its own independent 0-15 index
+' space; REX.R/X/B extend it exactly the same way REX already extends a
+' GP register 8-15, per the real x86-64 ISA, which is why
+' Fission_X86_64AsmParseRegisterToken below can reuse the EXACT SAME
+' ModRM/REX machinery every GP-register instruction already uses --
+' only the MNEMONIC-specific opcode/prefix bytes below (movsd/addsd/...)
+' need to know these are XMM operands at all).
+FUNCTION Fission_X86_64AsmXmmIndex(name)
+    IF String.StartsWith(name, "xmm") == FALSE THEN RETURN -1
+    digits = String.Slice(name, 3, String.Length(name) - 3)
+    IF digits == "" THEN RETURN -1
+    index = NUMBER(digits)
+    IF index < 0 ORELSE index > 15 THEN RETURN -1
+    RETURN index
+END FUNCTION
+
 ' Byte-sized register names this backend's own codegen actually emits:
 ' the four legacy byte registers (al/cl/dl -- never bl, never the
 ' high-byte ah/ch/dh/bh forms, and never spl/bpl/sil/dil, none of which
 ' this backend's own codegen ever needs) plus the numbered r8b..r15b
 ' forms (always available with no legacy ambiguity, unlike al/cl/dl).
-' Returns {Index, IsByteReg} or NULL if `name` isn't a recognized register
-' token at all.
+' Returns {Index, IsByteReg, IsXmm} or NULL if `name` isn't a recognized
+' register token at all.
 FUNCTION Fission_X86_64AsmParseRegisterToken(token)
     name = token
     IF String.StartsWith(name, "%") THEN name = String.Slice(name, 1, String.Length(name) - 1)
+    xmmIndex = Fission_X86_64AsmXmmIndex(name)
+    IF xmmIndex >= 0 THEN RETURN {Index: xmmIndex, IsByteReg: FALSE, IsXmm: TRUE}
     byteTable = {al: 0, cl: 1, dl: 2, bl: 3}
     byteIndex = Object.Get(byteTable, name, -1)
-    IF byteIndex >= 0 THEN RETURN {Index: byteIndex, IsByteReg: TRUE}
+    IF byteIndex >= 0 THEN RETURN {Index: byteIndex, IsByteReg: TRUE, IsXmm: FALSE}
     IF String.EndsWith(name, "b") ANDALSO String.StartsWith(name, "r") THEN
         wideName = String.Slice(name, 0, String.Length(name) - 1)
         wideIndex = Fission_X86_64AsmRegisterIndex(wideName)
-        IF wideIndex >= 8 THEN RETURN {Index: wideIndex, IsByteReg: TRUE}
+        IF wideIndex >= 8 THEN RETURN {Index: wideIndex, IsByteReg: TRUE, IsXmm: FALSE}
     END IF
     plainIndex = Fission_X86_64AsmRegisterIndex(name)
-    IF plainIndex >= 0 THEN RETURN {Index: plainIndex, IsByteReg: FALSE}
+    IF plainIndex >= 0 THEN RETURN {Index: plainIndex, IsByteReg: FALSE, IsXmm: FALSE}
     RETURN NULL
 END FUNCTION
 
@@ -157,7 +176,7 @@ FUNCTION Fission_X86_64AsmParseOperand(token)
     END IF
     IF String.StartsWith(trimmed, "%") THEN
         reg = Fission_X86_64AsmParseRegisterToken(trimmed)
-        RETURN {Kind: "reg", Index: reg.Index, IsByteReg: reg.IsByteReg}
+        RETURN {Kind: "reg", Index: reg.Index, IsByteReg: reg.IsByteReg, IsXmm: reg.IsXmm}
     END IF
     RETURN {Kind: "label", Name: trimmed}
 END FUNCTION
@@ -266,6 +285,28 @@ FUNCTION Fission_X86_64AsmEmitRegRm(buffer, w, opcodeBytes, regIndex, rm)
     FOR b IN opcodeBytes
         ignored = buffer.EmitByte(b)
     NEXT
+    ignored = Fission_X86_64AsmEmitModRM(buffer, regIndex, rm)
+END FUNCTION
+
+' Real floating-point support: every SSE2 scalar-double instruction this
+' backend needs (movsd/addsd/subsd/mulsd/divsd/ucomisd/cvtsi2sd/
+' cvttsd2si) shares this EXACT shape -- a single MANDATORY legacy prefix
+' byte (F2 for the scalar-double forms, 66 for ucomisd), THEN [REX],
+' THEN the 0F escape, THEN one opcode byte, THEN ModRM -- confirmed
+' against the real Intel SDM encoding for each. This is Fission_X86_64
+' AsmEmitRegRm's own exact shape with one prefix byte spliced in before
+' REX (the real, required x86-64 byte ORDER: legacy prefix, then REX,
+' never the other way around) -- XMM and GP registers share the SAME
+' 0-15 index space and the SAME REX.R/X/B extension rule (see
+' Fission_X86_64AsmXmmIndex's own comment), so this needs no XMM-aware
+' branching of its own at all; the MNEMONIC-specific caller below already
+' knows which operands are XMM.
+FUNCTION Fission_X86_64AsmEmitSseRegRm(buffer, prefixByte, w, opcodeByte, regIndex, rm)
+    ignored = buffer.EmitByte(prefixByte)
+    rmBits = Fission_X86_64AsmRmIndexBits(rm)
+    ignored = Fission_X86_64AsmEmitRex(buffer, w, regIndex, rmBits.Index, rmBits.Base)
+    ignored = buffer.EmitByte(15)
+    ignored = buffer.EmitByte(opcodeByte)
     ignored = Fission_X86_64AsmEmitModRM(buffer, regIndex, rm)
 END FUNCTION
 
@@ -403,11 +444,29 @@ FUNCTION Fission_X86_64AsmEncodeInstruction(buffer, fixups, diagnostics, mnemoni
             RETURN
         END IF
         IF src.Kind == "riprel" THEN
-            ' Never actually emitted (`lea`, not `mov`, is always used for
-            ' a label reference in this backend's own codegen) but handled
-            ' for completeness/robustness rather than silently mis-encoding
-            ' it if that ever changes.
-            ignored = diagnostics.ReportError("FISSION_X86_64_ASM_UNSUPPORTED", "mov with a RIP-relative source is not supported")
+            ' Real floating-point support: `mov label(%rip), %reg` loads
+            ' the real 8-byte VALUE stored at a rodata label (a literal's
+            ' own raw IEEE-754 bit pattern) into a GP register -- unlike
+            ' `lea`, which loads the label's own ADDRESS, this loads
+            ' what's actually THERE. Needed only for a Float-kind CONST
+            ' (see fission/amir/lower_x86_64.abas's own Const handling):
+            ' every OTHER value in this whole file already moves an
+            ' opaque 8-byte pattern through a GP register/stack slot
+            ' (a String's own pointer, an Array's own pointer, a Bool, an
+            ' int-kind Number) with no interpretation needed until the
+            ' point of actual USE -- a Float's raw bits are no different,
+            ' only real arithmetic/comparison/PRINT ever need to
+            ' reinterpret them as a genuine double, via a REAL SSE
+            ' register instead (see this file's own new `movsd` handling
+            ' below). Real opcode `8B /r` -- MOV r64, r/m64 -- with the
+            ' SAME real RIP-relative ModRM/relocation-fixup mechanism
+            ' `lea`'s own riprel case above already uses.
+            rmBits = Fission_X86_64AsmRmIndexBits(src)
+            ignored = Fission_X86_64AsmEmitRex(buffer, 1, dst.Index, rmBits.Index, rmBits.Base)
+            ignored = buffer.EmitByte(139)
+            fieldOffset = buffer.Length() + 1
+            ignored = Fission_X86_64AsmEmitModRM(buffer, dst.Index, src)
+            ignored = Array.Push(fixups, FissionX86_64Fixup(fieldOffset, src.Label))
             RETURN
         END IF
         IF src.Kind == "reg" ANDALSO dst.Kind == "reg" THEN
@@ -457,6 +516,85 @@ FUNCTION Fission_X86_64AsmEncodeInstruction(buffer, fixups, diagnostics, mnemoni
         ELSE
             ignored = Fission_X86_64AsmEmitRegRm(buffer, 0, [136], src.Index, dst)
         END IF
+        RETURN
+    END IF
+
+    ' Real floating-point support: `movsd` -- SSE2's own scalar-double
+    ' move, real x86-64 opcode `F2 0F 10 /r` (load: xmm <- xmm/m64) or
+    ' `F2 0F 11 /r` (store: xmm/m64 <- xmm). A RIP-relative SOURCE is a
+    ' real, DIRECT third shape (loading a literal's own raw bit pattern
+    ' straight into an XMM register, real relocation-fixup mechanism
+    ' identical to `lea`'s/the new riprel `mov` case above) -- needed
+    ' whenever a Float-kind CONST is consumed directly by arithmetic
+    ' rather than first landing in a stack slot.
+    IF mnemonic == "movsd" THEN
+        src = operands[0]
+        dst = operands[1]
+        IF src.Kind == "riprel" THEN
+            ignored = buffer.EmitByte(242)
+            rmBits = Fission_X86_64AsmRmIndexBits(src)
+            ignored = Fission_X86_64AsmEmitRex(buffer, 0, dst.Index, rmBits.Index, rmBits.Base)
+            ignored = buffer.EmitByte(15)
+            ignored = buffer.EmitByte(16)
+            fieldOffset = buffer.Length() + 1
+            ignored = Fission_X86_64AsmEmitModRM(buffer, dst.Index, src)
+            ignored = Array.Push(fixups, FissionX86_64Fixup(fieldOffset, src.Label))
+            RETURN
+        END IF
+        IF dst.Kind == "reg" THEN
+            ignored = Fission_X86_64AsmEmitSseRegRm(buffer, 242, 0, 16, dst.Index, src)
+            RETURN
+        END IF
+        ' A memory destination: `movsd %xmmN, offset(%rbp)` -- the STORE
+        ' form (opcode 11, not 10), reg field carries the SOURCE xmm
+        ' register instead of the destination.
+        ignored = Fission_X86_64AsmEmitSseRegRm(buffer, 242, 0, 17, src.Index, dst)
+        RETURN
+    END IF
+    ' Real floating-point arithmetic: ADDSD/SUBSD/MULSD/DIVSD, all
+    ' `xmm1, xmm2/m64` (AT&T source-then-dest order; the dest register is
+    ' ALSO the first real operand of the operation, exactly the same
+    ' 2-operand ALU shape this backend's own integer add/sub already use).
+    sseArithOpcodes = {"addsd": 88, "subsd": 92, "mulsd": 89, "divsd": 94}
+    IF Object.Has(sseArithOpcodes, mnemonic) THEN
+        opcode = Object.Get(sseArithOpcodes, mnemonic, 88)
+        src = operands[0]
+        dst = operands[1]
+        ignored = Fission_X86_64AsmEmitSseRegRm(buffer, 242, 0, opcode, dst.Index, src)
+        RETURN
+    END IF
+    ' UCOMISD xmm1, xmm2/m64 -- real quiet compare, sets EFLAGS (ZF/PF/CF)
+    ' exactly like a GP `cmp`, consumed by the SAME real SETcc/Jcc
+    ' machinery this backend's own integer comparisons already use.
+    ' Prefix 66 (not F2), no REX.W needed.
+    IF mnemonic == "ucomisd" THEN
+        left = operands[0]
+        right = operands[1]
+        ignored = Fission_X86_64AsmEmitSseRegRm(buffer, 102, 0, 46, right.Index, left)
+        RETURN
+    END IF
+    ' CVTSI2SD xmm, r/m64 -- real GP-integer-to-double conversion (needed
+    ' whenever an int-kind Number operand is mixed with a Float-kind one
+    ' in the same real arithmetic expression -- ArcoBASIC's OWN Number is
+    ' ALWAYS a double at the language level, confirmed via the oracle's
+    ' own Value class, so this is real, required promotion, not an
+    ' approximation). REX.W selects the 64-bit GP source form.
+    IF mnemonic == "cvtsi2sd" THEN
+        src = operands[0]
+        dst = operands[1]
+        ignored = Fission_X86_64AsmEmitSseRegRm(buffer, 242, 1, 42, dst.Index, src)
+        RETURN
+    END IF
+    ' CVTTSD2SI r64, xmm/m64 -- real double-to-integer TRUNCATION (needed
+    ' wherever a Float-kind value is consumed by an integer-only site --
+    ' array indexing, LEN, a syscall argument -- confirmed via the
+    ' oracle's own real truncating `static_cast<...>(value.as_number())`
+    ' conversions used throughout runtime.cpp). REX.W selects the 64-bit
+    ' GP destination form.
+    IF mnemonic == "cvttsd2si" THEN
+        src = operands[0]
+        dst = operands[1]
+        ignored = Fission_X86_64AsmEmitSseRegRm(buffer, 242, 1, 44, dst.Index, src)
         RETURN
     END IF
 
@@ -573,7 +711,15 @@ FUNCTION Fission_X86_64AsmEncodeInstruction(buffer, fixups, diagnostics, mnemoni
         RETURN
     END IF
 
-    setccOpcodes = {"sete": 148, "setne": 149, "setl": 156, "setle": 158, "setg": 159, "setge": 157}
+    ' setb/setae/setbe/seta (CF/ZF-based, UNSIGNED conditions) are real
+    ' floating-point support: UCOMISD sets CF/ZF/PF the same way an
+    ' UNSIGNED integer CMP would for magnitude comparison, never SF/OF --
+    ' setl/setle/setg/setge (SF/OF-based, SIGNED conditions) below are
+    ' the wrong condition codes entirely after a real UCOMISD, silently
+    ' testing flags UCOMISD never sets meaningfully. See
+    ' fission/amir/lower_x86_64.abas's own Fission_X86_64FloatSetInstructionForOp.
+    setccOpcodes = {"sete": 148, "setne": 149, "setl": 156, "setle": 158, "setg": 159, "setge": 157,
+                     "setb": 146, "setae": 147, "setbe": 150, "seta": 151}
     IF Object.Has(setccOpcodes, mnemonic) THEN
         opcode = Object.Get(setccOpcodes, mnemonic, 148)
         operand = operands[0]
@@ -779,6 +925,19 @@ FUNCTION Fission_X86_64AssembleFragment(assemblyText)
         END IF
         IF mnemonic == ".byte" THEN
             ignored = rodataBuffer.EmitByte(NUMBER(operandsText))
+            CONTINUE FOR
+        END IF
+        ' Real floating-point support: a literal's own raw IEEE-754
+        ' binary64 bit pattern is emitted as two `.long` (32-bit) halves,
+        ' never one `.quad` -- see fission/amir/lower_x86_64.abas's own
+        ' Fission_X86_64FloatLiteralBits comment for why: ArcoBASIC's own
+        ' Number (used by THIS compiler's own meta-level arithmetic,
+        ' since this whole toolchain is self-hosted) is itself a double,
+        ' exactly representable only up to 2^53 -- a full 64-bit pattern
+        ' generally needs more precision than that to round-trip, a real
+        ' bug confirmed via direct probe before this design was chosen.
+        IF mnemonic == ".long" THEN
+            ignored = rodataBuffer.EmitU32(NUMBER(operandsText))
             CONTINUE FOR
         END IF
         IF mnemonic == ".align" THEN

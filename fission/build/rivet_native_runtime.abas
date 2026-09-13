@@ -32,10 +32,15 @@ FUNCTION Fission_RivetBuildHostBridge()
     IF !detected.Found THEN
         ignored = RIVET.Log.Error("no C/C++ compiler found to build fission/native_runtime/host_bridge.c (the real host-function bridge)")
     END IF
-    args = ["-x", "c", "-ffreestanding", "-fno-stack-protector", "-fno-pic", "-fno-pie", "-fno-asynchronous-unwind-tables", "-nostdlib", "-O1", "-c", sourcePath, "-o", outputPath]
+    ' -msse4.1: real floating-point support (Fission_HostFormatDouble)
+    ' needs `roundsd` (SSE4.1, real hardware on every x86-64 CPU sold
+    ' since ~2008) for correctly-rounded truncation/round-to-nearest-even
+    ' -- there is no software fallback path, this backend's whole
+    ' "no bignum/dtoa library" design depends on the real instruction.
+    args = ["-x", "c", "-ffreestanding", "-fno-stack-protector", "-fno-pic", "-fno-pie", "-fno-asynchronous-unwind-tables", "-nostdlib", "-O1", "-msse4.1", "-c", sourcePath, "-o", outputPath]
     spec = { Type: "Compile", Target: "fission-native-runtime-host-bridge", DisplayName: sourcePath,
              Inputs: [sourcePath], Outputs: [outputPath],
-             Tool: detected.Path, ToolVersion: "host-bridge/1/" + detected.Version,
+             Tool: detected.Path, ToolVersion: "host-bridge/2/" + detected.Version,
              Arguments: args, Dependencies: [], OriginFunction: "Fission_RivetBuildHostBridge" }
     actionId = RIVET.Graph.Action(spec)
     RETURN {OutputPath: outputPath, FinalActionId: actionId}

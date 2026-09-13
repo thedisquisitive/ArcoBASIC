@@ -257,6 +257,105 @@ FUNCTION Fission_X86_64IsNumericLiteral(text)
     RETURN TRUE
 END FUNCTION
 
+' Real floating-point support. ArcoBASIC's own Number is ALWAYS a real
+' double (see include/arco/value.hpp's own `Value::Storage`, a
+' `std::variant` whose only numeric alternative is `double` -- there is
+' NO separate int/float distinction anywhere in the whole language, at
+' the source level or the runtime-value level) -- so a "decimal literal"
+' here is not a second numeric TYPE alongside plain integer literals, it
+' is the SAME Number, just one whose value happens not to be whole. A
+' bare digit sequence still gets the FAST, existing `Fission_X86_64Is
+' NumericLiteral` path (a plain 64-bit-immediate `mov`, no XMM/SSE
+' involved at all) since integer-valued arithmetic on it is bit-for-bit
+' identical to real double arithmetic as long as it stays within a
+' double's own exact-integer range (2^53) -- confirmed correct by every
+' existing native fixture, none of which regress from this addition.
+' Real DIVISION is the one exception: the oracle's own `/` is ALWAYS
+' real double division regardless of whether either operand LOOKS like a
+' whole number (`10 / 2` really is 5.0 under the hood, it just happens
+' to PRINT as "5" per Value::to_string's own whole-number-formatting
+' rule) -- see Fission_X86_64LowerBinOp's own comment for how this
+' pass now honors that.
+'
+' A decimal literal matches `-?digits.digits` ONLY (confirmed the
+' oracle's own lexer does not tokenize exponent notation like "1e3" as a
+' number AT ALL -- a direct probe: `x = 1e3` is a real PARSE ERROR on
+' the oracle itself, so there is no scientific-notation shape to support).
+FUNCTION Fission_X86_64IsFloatLiteral(text)
+    IF text == "" THEN RETURN FALSE
+    chars = String.ToChars(text)
+    digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    index = 0
+    IF chars[0] == "-" THEN index = 1
+    digitsBefore = 0
+    WHILE index < LEN(chars) ANDALSO Fission_ListContains(digits, chars[index])
+        digitsBefore = digitsBefore + 1
+        index = index + 1
+    WEND
+    IF digitsBefore == 0 THEN RETURN FALSE
+    IF index >= LEN(chars) ORELSE chars[index] != "." THEN RETURN FALSE
+    index = index + 1
+    digitsAfter = 0
+    WHILE index < LEN(chars) ANDALSO Fission_ListContains(digits, chars[index])
+        digitsAfter = digitsAfter + 1
+        index = index + 1
+    WEND
+    IF digitsAfter == 0 THEN RETURN FALSE
+    RETURN index == LEN(chars)
+END FUNCTION
+
+' Splits a real decimal literal's own IEEE-754 binary64 bit pattern into
+' two 32-bit HALVES -- {Low, High} -- never the full 64-bit value as one
+' ArcoBASIC Number. This whole COMPILER is itself self-hosted ArcoBASIC
+' (running under the legacy interpreter while it compiles), so its own
+' `NUMBER(text)` call already gives a real, correctly-rounded double
+' (backed by real `std::stod`, confirmed in src/runtime/runtime.cpp) --
+' the real problem is purely mechanical: composing the full 64-bit
+' pattern (sign+exponent+mantissa) into ONE ArcoBASIC Number would
+' silently round it, since ArcoBASIC's own Number is ITSELF a double,
+' exactly representable only up to 2^53 -- confirmed via a direct probe
+' BEFORE this design was chosen: composing 0.1's own real bits as a
+' single 64-bit value corrupted them by roughly +/-100, while a
+' SPARSE-mantissa value like 1.5 or 5.0 happened to survive by luck
+' (few significant bits set). Splitting into two 32-bit halves keeps
+' every intermediate value safely under 2^32, always exactly
+' representable, with NO precision loss anywhere -- verified directly
+' against known IEEE-754 bit patterns for a real spread of values
+' (0.1, 3.14, 100.25, -2.5, 5, 0) before ever being wired into codegen.
+' The normalization loop below (repeated EXACT division/multiplication
+' by 2) and the final `(value - 1) * 2^52` mantissa extraction are both
+' real, EXACT double operations (Sterbenz's lemma covers the
+' subtraction; multiplying/dividing by a power of two never rounds) --
+' this is why `mantissa` itself comes out bit-exact with no rounding
+' step needed at all, confirmed by the same direct probe.
+FUNCTION Fission_X86_64FloatLiteralBits(text)
+    value = NUMBER(text)
+    sign = 0
+    IF value < 0 THEN
+        sign = 1
+        value = -value
+    END IF
+    exponent = 0
+    mantissa = 0
+    biasedExponent = 0
+    IF value != 0 THEN
+        WHILE value >= 2
+            value = value / 2
+            exponent = exponent + 1
+        WEND
+        WHILE value < 1
+            value = value * 2
+            exponent = exponent - 1
+        WEND
+        mantissa = (value - 1) * 4503599627370496
+        biasedExponent = exponent + 1023
+    END IF
+    mantissaLow = mantissa BITAND 4294967295
+    mantissaHigh = mantissa SHR 32
+    high = (sign SHL 31) BITOR (biasedExponent SHL 20) BITOR mantissaHigh
+    RETURN {Low: mantissaLow, High: high}
+END FUNCTION
+
 ' A-MIR joins CALL/CallVoid's Args with a single space
 ' (`Array.Join(argValues, " ")`, fission/sir/lower_amir.abas) -- splits that
 ' back into individual operand references, [] for a no-argument call.
@@ -802,7 +901,11 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                     kinds = Object.Set(kinds, dest, "String")
                     constStringValues = Object.Set(constStringValues, dest, Fission_X86_64UnquoteConstValue(value))
                 ELSE
-                    kinds = Object.Set(kinds, dest, "Number")
+                    IF Fission_X86_64IsFloatLiteral(value) THEN
+                        kinds = Object.Set(kinds, dest, "Float")
+                    ELSE
+                        kinds = Object.Set(kinds, dest, "Number")
+                    END IF
                 END IF
             END IF
             IF kind == "Object" THEN
@@ -895,6 +998,24 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                     ' possibly-drifting list of the same operators.
                     destKind = "Number"
                     IF Fission_X86_64SetInstructionForOp(op) != "" THEN destKind = "Bool"
+                    ' Real floating-point support: `/` is ALWAYS real
+                    ' double division on the oracle, regardless of
+                    ' whether either operand LOOKS like a whole number
+                    ' (confirmed directly: `10 / 2` is really `5.0`
+                    ' under the hood, it just happens to PRINT as "5"),
+                    ' so its own result is ALWAYS Float-kind. `+`/`-`/`*`
+                    ' stay on the existing fast integer path UNLESS
+                    ' either operand is ALREADY Float-kind (a real
+                    ' decimal literal, or the result of an earlier `/`)
+                    ' -- see Fission_X86_64LowerFunction's own BinOp
+                    ' comment for why staying on plain GP-register
+                    ' arithmetic for two Number(int)-kind operands is
+                    ' not a simplification here, it is bit-for-bit
+                    ' identical to real double arithmetic as long as the
+                    ' result stays within a double's own exact-integer
+                    ' range.
+                    isFloatArith = destKind == "Number" ANDALSO (op == "/" ORELSE leftKind == "Float" ORELSE rightKind == "Float")
+                    IF isFloatArith THEN destKind = "Float"
                     kinds = Object.Set(kinds, dest, destKind)
                 END IF
             END IF
@@ -1129,7 +1250,31 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 ' `Counter.Increment` both close with this exact text, not
                 ' a real operand at all) -- never a genuine value to
                 ' resolve a kind from.
-                IF value != "" ANDALSO value != "nothing" THEN returnKindOut = Fission_X86_64OperandKind(kinds, value)
+                ' A real, PRE-EXISTING bug surfaced (not introduced) by
+                ' real floating-point support: a function with MULTIPLE
+                ' `RETURN` statements (e.g. a base case and a recursive
+                ' case) used to let whichever one happened to be LAST in
+                ' block-iteration order unconditionally OVERWRITE
+                ' `returnKindOut`, even downgrading an already-correct
+                ' non-Number kind back to "Number" if that LATER Return
+                ' statement's own kind had not converged yet (a real,
+                ' confirmed failure mode for a self-recursive function:
+                ' `RETURN acc` correctly resolving Float first, then
+                ' `RETURN SumTo(n - 1, ...)` incorrectly resetting it back
+                ' to Number because ITS OWN recursive call target -- this
+                ' same function -- had not converged to Float yet WITHIN
+                ' this same pass). Fixed the same "any kind other than
+                ' Number is upgrade-worthy, never downgrade" way cross-
+                ' function convergence already treats every other kind
+                ' (see this whole fixed point's own comment on Object
+                ' kinds) -- a real, general correctness fix, not Float-
+                ' specific, though only ever OBSERVED via Float (no
+                ' existing fixture happened to have a multi-Return
+                ' function whose OWN iteration order exposed it before).
+                IF value != "" ANDALSO value != "nothing" THEN
+                    candidateReturnKind = Fission_X86_64OperandKind(kinds, value)
+                    IF candidateReturnKind != "Number" ORELSE returnKindOut == "Number" THEN returnKindOut = candidateReturnKind
+                END IF
             END IF
         NEXT
     NEXT
@@ -1626,6 +1771,109 @@ FUNCTION Fission_X86_64SetInstructionForOp(op)
     IF op == ">=" THEN RETURN "setge"
     IF op == "INT.CMP_GE_UNSIGNED" THEN RETURN "setge"
     RETURN ""
+END FUNCTION
+
+' SETcc mnemonic for a comparison Op AFTER a real `ucomisd` (real
+' floating-point support) -- deliberately a SEPARATE table from
+' Fission_X86_64SetInstructionForOp above, not a reuse: UCOMISD sets
+' CF/ZF/PF the same way an UNSIGNED integer CMP would for magnitude
+' comparison, never SF/OF, so the SIGNED mnemonics
+' (setl/setle/setg/setge) the integer path above uses would silently
+' test flags UCOMISD never meaningfully sets -- confirmed against the
+' real Intel SDM's own UCOMISD flag-result table, the same "verify
+' against the real spec/oracle before writing code" discipline this
+' whole backend already follows. `==`/`!=` reuse sete/setne unchanged
+' (ZF-based equality means the same thing either way).
+FUNCTION Fission_X86_64FloatSetInstructionForOp(op)
+    IF op == "==" THEN RETURN "sete"
+    IF op == "INT.CMP_EQ" THEN RETURN "sete"
+    IF op == "!=" THEN RETURN "setne"
+    IF op == "INT.CMP_NE" THEN RETURN "setne"
+    IF op == "<" THEN RETURN "setb"
+    IF op == "INT.CMP_LT_UNSIGNED" THEN RETURN "setb"
+    IF op == "<=" THEN RETURN "setbe"
+    IF op == "INT.CMP_LE_UNSIGNED" THEN RETURN "setbe"
+    IF op == ">" THEN RETURN "seta"
+    IF op == "INT.CMP_GT_UNSIGNED" THEN RETURN "seta"
+    IF op == ">=" THEN RETURN "setae"
+    IF op == "INT.CMP_GE_UNSIGNED" THEN RETURN "setae"
+    RETURN ""
+END FUNCTION
+
+' Loads a Float-kind operand DIRECTLY into an XMM register via a real
+' `movsd` -- always a stack-slot load, never a bare literal (every real
+' decimal literal is materialized by its own CONST instruction first,
+' confirmed via a direct probe of this substrate's own real SIR->A-MIR
+' lowering: a BinOp's own Left/Right are always `%tN` temp references,
+' never raw literal text -- the same "literals never reach a BinOp
+' operand directly" property Fission_X86_64LowerBinOp's own header
+' comment already relies on for the plain integer path).
+FUNCTION Fission_X86_64OperandLoadLineXmm(offsets, operand, xmmRegisterName)
+    offset = Object.Get(offsets, operand, "0")
+    RETURN "    movsd " + offset + "(%rbp), %" + xmmRegisterName
+END FUNCTION
+
+' Stores %xmm0 (a real Float-kind BinOp's own result) directly to a stack
+' slot via `movsd` -- the exact same role Fission_X86_64StoreRaxLine
+' plays for every other kind of value, just through the SSE register
+' file instead of a GP one.
+FUNCTION Fission_X86_64StoreXmm0Line(offsets, name)
+    offset = Object.Get(offsets, name, "0")
+    RETURN "    movsd %xmm0, " + offset + "(%rbp)"
+END FUNCTION
+
+' Lowers one Float-kind BinOp instruction (dest := left OP right) --
+' `left`/`right` are already known to be Number-or-Float-kind by the
+' caller (Fission_X86_64LowerFunction's own BinOp handling), with at
+' least one of them real Float-kind or `op` being `/` (see
+' Fission_X86_64CollectSlots' own comment for the exact trigger). A
+' Number(int)-kind operand mixed in is real, required PROMOTION via
+' `cvtsi2sd` -- ArcoBASIC's own Number is ALWAYS a double at the
+' language level (there is no separate int type to preserve), so this
+' is not an approximation, it is what the oracle's own arithmetic
+' already does to that same value internally. Returns {Ok, Lines}
+' exactly like Fission_X86_64LowerBinOp; Ok is FALSE for an operator
+' this pass does not (yet) support on a Float-kind value (MOD needs a
+' real `fmod`, bitwise ops make no obvious sense on a fractional value
+' -- both real, disclosed Phase 1 scope decisions, not silently
+' mishandled).
+FUNCTION Fission_X86_64LowerFloatBinOp(offsets, kinds, instruction)
+    op = instruction.Field("Op")
+    left = instruction.Field("Left")
+    right = instruction.Field("Right")
+    dest = instruction.Field("Dest")
+    lines = []
+    IF Fission_X86_64OperandKind(kinds, left) == "Float" THEN
+        ignored = Array.Push(lines, Fission_X86_64OperandLoadLineXmm(offsets, left, "xmm0"))
+    ELSE
+        ignored = Array.Push(lines, Fission_X86_64OperandLoadLine(offsets, left, "rax"))
+        ignored = Array.Push(lines, "    cvtsi2sd %rax, %xmm0")
+    END IF
+    IF Fission_X86_64OperandKind(kinds, right) == "Float" THEN
+        ignored = Array.Push(lines, Fission_X86_64OperandLoadLineXmm(offsets, right, "xmm1"))
+    ELSE
+        ignored = Array.Push(lines, Fission_X86_64OperandLoadLine(offsets, right, "rax"))
+        ignored = Array.Push(lines, "    cvtsi2sd %rax, %xmm1")
+    END IF
+
+    setInstruction = Fission_X86_64FloatSetInstructionForOp(op)
+    IF setInstruction != "" THEN
+        ignored = Array.Push(lines, "    ucomisd %xmm1, %xmm0")
+        ignored = Array.Push(lines, "    " + setInstruction + " %al")
+        ignored = Array.Push(lines, "    movzbq %al, %rax")
+        ignored = Array.Push(lines, Fission_X86_64StoreRaxLine(offsets, dest))
+        RETURN {Ok: TRUE, Lines: lines}
+    END IF
+
+    floatOpcode = ""
+    IF op == "+" THEN floatOpcode = "addsd"
+    IF op == "-" THEN floatOpcode = "subsd"
+    IF op == "*" THEN floatOpcode = "mulsd"
+    IF op == "/" THEN floatOpcode = "divsd"
+    IF floatOpcode == "" THEN RETURN {Ok: FALSE, Lines: []}
+    ignored = Array.Push(lines, "    " + floatOpcode + " %xmm1, %xmm0")
+    ignored = Array.Push(lines, Fission_X86_64StoreXmm0Line(offsets, dest))
+    RETURN {Ok: TRUE, Lines: lines}
 END FUNCTION
 
 ' Lowers one BinOp instruction (dest := left OP right). Returns {Ok, Lines}
@@ -2255,7 +2503,17 @@ FUNCTION Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnosti
         ' comparison, not per-branch static narrowing, is what picks the
         ' right one) -- exempt exactly like a plain Object-kind SELF.
         isExemptSelfArg = argPosition == 0 ANDALSO (Fission_X86_64IsObjectKind(argKind) ORELSE Fission_X86_64IsPolyKind(argKind))
-        IF isExemptSelfArg == FALSE ANDALSO argPosition < LEN(calleeParamKinds) THEN
+        ' Real floating-point support: a Number(int)-kind argument at a
+        ' call site whose OWN callee parameter converged to Float-kind
+        ' (because SOME OTHER call site passed a real decimal literal
+        ' there) is NOT a real kind conflict -- ArcoBASIC's own Number is
+        ' ALWAYS a double at the language level, so this is real,
+        ' required promotion, not two genuinely incompatible kinds
+        ' (unlike Number vs String/Array/Object, which stay real
+        ' conflicts). The actual `cvtsi2sd` conversion happens below,
+        ' at the real argument-marshaling site.
+        isPromotableToFloat = argKind == "Number" ANDALSO argPosition < LEN(calleeParamKinds) ANDALSO calleeParamKinds[argPosition] == "Float"
+        IF isExemptSelfArg == FALSE ANDALSO isPromotableToFloat == FALSE ANDALSO argPosition < LEN(calleeParamKinds) THEN
             IF argKind != calleeParamKinds[argPosition] THEN mismatchedArg = arg
         END IF
         argPosition = argPosition + 1
@@ -2288,12 +2546,54 @@ FUNCTION Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnosti
         argPos = argPos + 1
     NEXT
     reversedStackArgs = Array.Reverse(stackArgs)
+    stackArgStartIndex = LEN(argRegisters)
+    reversedStackArgIndex = LEN(reversedStackArgs) - 1
     FOR arg IN reversedStackArgs
-        ignored = Array.Push(textLines, Fission_X86_64OperandPushLine(offsets, arg))
+        argCalleeIndex = stackArgStartIndex + reversedStackArgIndex
+        argNeedsFloatPromotion = argCalleeIndex < LEN(calleeParamKinds) ANDALSO calleeParamKinds[argCalleeIndex] == "Float" ANDALSO Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, arg)) == "Number"
+        IF argNeedsFloatPromotion THEN
+            ' A Number(int)-kind argument being promoted to a Float(int)
+            ' -kind stack-passed (7th+) parameter -- no register is free
+            ' to push directly (Fission_X86_64OperandPushLine's own
+            ' plain `push` needs no register at all normally), so this
+            ' loads, converts, and pushes the real converted bits
+            ' through %rax instead (safe to clobber -- see this whole
+            ' function's own "arguments are marshaled before the call,
+            ' nothing else is live" convention).
+            ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, arg, "rax"))
+            ignored = Array.Push(textLines, "    cvtsi2sd %rax, %xmm0")
+            ignored = Array.Push(textLines, "    sub $8, %rsp")
+            ignored = Array.Push(textLines, "    movsd %xmm0, (%rsp)")
+            ignored = Array.Push(textLines, "    pop %rax")
+            ignored = Array.Push(textLines, "    push %rax")
+        ELSE
+            ignored = Array.Push(textLines, Fission_X86_64OperandPushLine(offsets, arg))
+        END IF
+        reversedStackArgIndex = reversedStackArgIndex - 1
     NEXT
     argIndex = 0
     WHILE argIndex < registerArgCount
+        argNeedsFloatPromotion = argIndex < LEN(calleeParamKinds) ANDALSO calleeParamKinds[argIndex] == "Float" ANDALSO Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[argIndex])) == "Number"
         ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[argIndex], argRegisters[argIndex]))
+        IF argNeedsFloatPromotion THEN
+            ' Real int->double promotion at a REAL call boundary: the
+            ' callee's own parameter converged to Float-kind (some OTHER
+            ' call site passed a real decimal literal there), but THIS
+            ' call site's own argument is still Number(int)-kind -- its
+            ' raw bits are the wrong representation entirely (an integer
+            ' 10's own bit pattern is nothing like the double 10.0's),
+            ' so a real `cvtsi2sd` + a stack round-trip (this backend has
+            ' no GP<->XMM `movq` encoding yet, and does not need one:
+            ' every OTHER value already flows through memory between
+            ' operations, so bouncing through the stack here is not a
+            ' special case, it is this same convention) converts it
+            ' before the argument register is left holding the WRONG
+            ' bits for the callee's own Float-kind arithmetic to use.
+            ignored = Array.Push(textLines, "    cvtsi2sd %" + argRegisters[argIndex] + ", %xmm0")
+            ignored = Array.Push(textLines, "    sub $8, %rsp")
+            ignored = Array.Push(textLines, "    movsd %xmm0, (%rsp)")
+            ignored = Array.Push(textLines, "    pop %" + argRegisters[argIndex])
+        END IF
         argIndex = argIndex + 1
     WEND
     ignored = Array.Push(textLines, "    call " + callee)
@@ -2402,6 +2702,28 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ignored = Array.Push(context.RodataLines, label + ":")
                     ignored = Array.Push(context.RodataLines, "    .asciz \"" + Fission_X86_64EscapeAscii(text) + "\"")
                     ignored = Array.Push(textLines, "    lea " + label + "(%rip), %rax")
+                    ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, dest))
+                    CONTINUE FOR
+                END IF
+                ' Real floating-point support: a decimal literal's own
+                ' raw IEEE-754 bit pattern (see Fission_X86_64
+                ' FloatLiteralBits' own comment for why it is split into
+                ' two 32-bit halves) lands in rodata exactly like a
+                ' string constant does, just holding a real 8-byte VALUE
+                ' instead of pointing at one -- loaded into a GP register
+                ' via the SAME new `mov label(%rip), %reg` this backend's
+                ' large-integer-literal fix already added (opaque 8-byte
+                ' transport, no XMM/SSE involvement needed for mere
+                ' storage; only real arithmetic/comparison/PRINT ever
+                ' reinterpret these bits as a genuine double).
+                IF Fission_X86_64IsFloatLiteral(value) THEN
+                    bits = Fission_X86_64FloatLiteralBits(value)
+                    label = "flt" + String(context.FloatCount)
+                    context.FloatCount = context.FloatCount + 1
+                    ignored = Array.Push(context.RodataLines, label + ":")
+                    ignored = Array.Push(context.RodataLines, "    .long " + String(bits.Low))
+                    ignored = Array.Push(context.RodataLines, "    .long " + String(bits.High))
+                    ignored = Array.Push(textLines, "    mov " + label + "(%rip), %rax")
                     ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, dest))
                     CONTINUE FOR
                 END IF
@@ -2769,6 +3091,33 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     context.UsesStrEquals = TRUE
                     CONTINUE FOR
                 END IF
+                ' Real floating-point support: `/` is ALWAYS real double
+                ' division (see Fission_X86_64CollectSlots' own comment),
+                ' and `+`/`-`/`*` need it too whenever EITHER operand is
+                ' already Float-kind -- checked and dispatched here,
+                ' BEFORE the generic "both operands must normalize to
+                ' Number" diagnostic below, since a real Float-kind
+                ' operand is legitimate here, not an error (that generic
+                ' check exists for String/Array/Object/Poly operands,
+                ' which genuinely cannot feed an arithmetic BinOp).
+                isFloatArith = leftKind == "Float" ORELSE rightKind == "Float" ORELSE op == "/"
+                IF isFloatArith THEN
+                    leftIsNumberish = Fission_X86_64NormalizeNumericKind(leftKind) == "Number" ORELSE leftKind == "Float"
+                    rightIsNumberish = Fission_X86_64NormalizeNumericKind(rightKind) == "Number" ORELSE rightKind == "Float"
+                    IF leftIsNumberish == FALSE ORELSE rightIsNumberish == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Operating on a non-numeric value is not supported by native x86-64 codegen: " + left + ", " + right)
+                        CONTINUE FOR
+                    END IF
+                    floatLowered = Fission_X86_64LowerFloatBinOp(offsets, kinds, instruction)
+                    IF floatLowered.Ok == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen does not support operator " + op + " on a Float-kind value (MOD and bitwise operators need a real fractional-value semantic not yet implemented): " + instruction.Field("Op"))
+                        CONTINUE FOR
+                    END IF
+                    FOR line IN floatLowered.Lines
+                        ignored = Array.Push(textLines, line)
+                    NEXT
+                    CONTINUE FOR
+                END IF
                 ' Bool is normalized to Number here -- a comparison result
                 ' or bare TRUE/FALSE feeding an ordinary arithmetic/
                 ' bitwise/comparison BinOp (e.g. `x > 0 AND y > 0`, both
@@ -2862,6 +3211,27 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     context.UsesBoolPrint = TRUE
                     CONTINUE FOR
                 END IF
+                ' Real floating-point support: PRINT of a Float-kind
+                ' value calls a real host-bridge C function
+                ' (arco_host_format_double, see host_bridge.c's own
+                ' comment for the full formatting-algorithm design) that
+                ' formats it exactly like the oracle's own
+                ' `Value::to_string` does (a whole-number-valued double
+                ' prints bare, e.g. "5" not "5.0"; anything else uses a
+                ' real 6-significant-digit general/scientific format,
+                ' round-half-to-even) -- then reuses `str_print`
+                ' UNCHANGED on the real, freshly-allocated result string,
+                ' the SAME real mechanism every other PRINT of a String
+                ' value already goes through, not a bespoke print path.
+                IF printKind == "Float" THEN
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLineXmm(offsets, argRef, "xmm0"))
+                    ignored = Array.Push(textLines, "    call arco_host_format_double")
+                    ignored = Array.Push(textLines, "    mov %rax, %rdi")
+                    ignored = Array.Push(textLines, "    call str_print")
+                    context.UsesStrPrint = TRUE
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, argRef, "rax"))
                 ignored = Array.Push(textLines, "    call itoa_print")
                 context.UsesItoa = TRUE
@@ -2949,6 +3319,27 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                         context.UsesHostBridge = TRUE
                         CONTINUE FOR
                     END IF
+                    ' Real floating-point support: a Float-kind argument
+                    ' reuses arco_host_format_double directly -- the
+                    ' EXACT same real formatting PRINT of a Float value
+                    ' already goes through (see that code's own comment),
+                    ' since ArcoBASIC's own Number is ALWAYS a double and
+                    ' String(x) is genuinely the SAME conversion either
+                    ' way, confirmed via the oracle: `String(3.14)` ->
+                    ' `"3.14"`, `String(10 / 3)` -> `"3.33333"`, matching
+                    ' `Value::to_string()` exactly. A direct call, not
+                    ' Fission_X86_64EmitCall (which only knows how to
+                    ' marshal GP-register arguments) -- the real SysV
+                    ' floating-point argument convention (XMM0) matters
+                    ' here because this crosses a REAL ABI boundary into
+                    ' a genuinely externally-compiled C function.
+                    IF stringConvArgKind == "Float" THEN
+                        ignored = Array.Push(textLines, Fission_X86_64OperandLoadLineXmm(offsets, args[0], "xmm0"))
+                        ignored = Array.Push(textLines, "    call arco_host_format_double")
+                        IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+                        context.UsesHostBridge = TRUE
+                        CONTINUE FOR
+                    END IF
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen does not support String(...) on this kind of value: " + args[0])
                     CONTINUE FOR
                 END IF
@@ -2972,6 +3363,16 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     ELSE
                         IF typeofArgKind == "String" THEN typeName = "String"
                         IF typeofArgKind == "Number" THEN typeName = "Number"
+                        ' Real floating-point support: Float is still
+                        ' real, ordinary "Number" as far as TYPEOF is
+                        ' concerned -- ArcoBASIC has ONE numeric type at
+                        ' the language level (confirmed via the oracle:
+                        ' `TYPEOF(3.14)` -> `"Number"`, the exact same
+                        ' result as `TYPEOF(5)`), Float is purely this
+                        ' native backend's OWN internal representation
+                        ' distinction for choosing SSE vs GP-register
+                        ' codegen, never a real, separate ArcoBASIC type.
+                        IF typeofArgKind == "Float" THEN typeName = "Number"
                     END IF
                     IF typeName == "" THEN
                         ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen does not support TYPEOF(...) on this kind of value: " + args[0])
@@ -3248,7 +3649,7 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
-    context = {RodataLines: [], StringCount: 0, DispatchCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesArrayPrintString: FALSE, UsesBoolPrint: FALSE, UsesObjectAlloc: FALSE, UsesHostBridge: FALSE, UsesBoolToString: FALSE}
+    context = {RodataLines: [], StringCount: 0, FloatCount: 0, DispatchCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesArrayPrintString: FALSE, UsesBoolPrint: FALSE, UsesObjectAlloc: FALSE, UsesHostBridge: FALSE, UsesBoolToString: FALSE}
     ' Real inter-procedural string-parameter/return-value inference, run
     ' to a full fixed point BEFORE any real emission -- see
     ' Fission_X86_64InferSignatures' own header comment. Every function's

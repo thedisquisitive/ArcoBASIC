@@ -2622,6 +2622,144 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   fixing it immediately, rather than deferring it, was the right call
   once found; no further known-but-unfixed correctness bugs remain
   disclosed in this ledger as of this entry.
+- **Real floating-point support (Phase 1)** -- the single largest gap
+  named in this backend's own status assessment (the user's own words:
+  "let's get floating point shit working"), and a genuine architectural
+  correction, not merely a missing feature: ArcoBASIC's own Number is
+  ALWAYS a real IEEE-754 binary64 double (confirmed via
+  `include/arco/value.hpp`'s own `Value::Storage`, a `std::variant` whose
+  ONLY numeric alternative is `double` -- there is no separate int/float
+  type anywhere in the language, at the source level or the runtime-
+  value level). This whole native backend's previous "Number = i64"
+  representation was a real, larger-than-disclosed simplification from
+  day one, not just "missing decimals" -- confirmed the hard way: a
+  fresh probe made specifically to answer the user's own "how far are
+  we" question found `x = 3.14` compiled successfully and silently
+  PRINTED "0" (no diagnostic at all), and `/` (division) was entirely
+  UNSUPPORTED (a real, clean diagnostic, at least not silent) since a
+  quotient is genuinely fractional and this backend had no
+  representation for that at all.
+  Delivered this session, fully verified against the oracle, not merely
+  self-consistent: real decimal literals (compile-time IEEE-754 bit
+  computation, done in the self-hosted compiler ITSELF, not at program
+  runtime -- see `Fission_X86_64FloatLiteralBits`'s own comment for a
+  real precision trap found and fixed along the way: composing a
+  literal's full 64-bit pattern as ONE ArcoBASIC Number silently
+  corrupted it, since ArcoBASIC's own Number -- used by this
+  self-hosted compiler's OWN meta-level arithmetic -- is itself only
+  exactly representable up to 2^53; splitting into two 32-bit halves
+  fixed it, verified against known bit patterns for a real spread of
+  values before ever touching codegen); real SSE2 arithmetic
+  (add/sub/mul/divsd) and comparisons (`ucomisd` + the real UNSIGNED
+  SETcc family -- `seta`/`setae`/`setb`/`setbe`, NOT the signed
+  `setg`/`setl`/... the existing integer path uses, a real, easy-to-get-
+  wrong distinction caught by checking the real Intel SDM's own UCOMISD
+  flag semantics directly); real `/` division that is ALWAYS Float-kind
+  regardless of whether either operand looks like a whole number
+  (matching the oracle's own real, always-double division semantics --
+  `10 / 2` really is `5.0` under the hood); real int<->double promotion
+  (`cvtsi2sd`) both WITHIN an expression (mixing a plain integer literal
+  into Float-kind arithmetic) and at a REAL function-call boundary
+  (a Number(int)-kind argument at a call site whose OWN callee parameter
+  converged to Float-kind because some OTHER call site passed a real
+  decimal literal there); a real, from-scratch `arco_host_format_double`
+  double-to-string formatter (host_bridge.c's own "Batch 5") matching
+  the oracle's `Value::to_string()` exactly (a whole-number-valued
+  double prints bare; anything else uses a real 6-significant-digit
+  general/scientific format, round-half-to-EVEN via real SSE4.1
+  `roundsd`, no software bignum/dtoa library at all) -- reused directly
+  by `String(x)` and `TYPEOF(x)` (which now correctly reports "Number"
+  for a Float-kind value, matching the oracle: Float is purely this
+  backend's OWN internal representation choice, never a real, separate
+  ArcoBASIC type).
+  Two real, non-obvious infrastructure problems solved along the way,
+  both found via direct verification, not assumed:
+  (1) `fission/amir/elf_object.abas` cannot yet resolve a real
+  relocation against a SECTION symbol with an addend (gcc's own
+  convention for referencing static/local rodata) -- flagged as a real,
+  disclosed, deliberately-deferred gap since this whole host bridge's
+  first four batches never needed static data at all. Rather than
+  building that (a genuinely separate, large undertaking), every double
+  CONSTANT `arco_host_format_double` needs (powers of ten, the 2^63
+  int64-range boundary, etc.) is synthesized at runtime from small
+  integer immediates via real `cvtsi2sd`/squaring instead of embedded as
+  floating-point literals, which would otherwise force exactly that
+  unimplemented relocation kind.
+  (2) That workaround was NOT reliable using a `volatile`-local trick on
+  its own -- confirmed directly, the hard way: GCC's optimizer respected
+  it, but `RIVET.Toolchain.DetectCxx()` tries `clang++` BEFORE `g++`/`c++`,
+  and clang's optimizer saw straight through the `volatile` (and,
+  separately, through a `__builtin_memcpy`-based bit-negation trick) and
+  reintroduced the exact same rodata-dependent code anyway -- reproduced
+  directly via a real `clang++ -x c` compile of the exact file before
+  trusting any fix. Fixed for real with genuine INLINE ASSEMBLY
+  (opaque to every optimizer by definition), verified clean (zero
+  relocations) against BOTH real compilers, not just whichever one
+  happened to be picked first. A `static const int[9]` local array with
+  a compile-time-constant initializer list turned out to be a THIRD,
+  independent way to reach the same relocation problem (clang placed it
+  directly in `.rodata`, gcc did not) -- replaced with a plain `1 << i`
+  shift, needing no array at all.
+  Also fixed, a real, PRE-EXISTING bug surfaced by (not introduced by)
+  this work: a function with multiple `RETURN` statements let whichever
+  one was LAST in block-iteration order unconditionally overwrite the
+  function's own inferred return kind, even downgrading an
+  already-correct non-Number kind back to "Number" -- a real, confirmed
+  failure for a self-recursive function (`SumHalves`'s own base-case
+  `RETURN acc` correctly resolving Float, then the recursive
+  `RETURN SumHalves(n - 1, ...)` incorrectly resetting it because ITS OWN
+  call target's return kind had not converged yet within that same
+  pass). Fixed the same "any kind other than Number is upgrade-worthy,
+  never downgrade" way this fixed point already treats every other kind
+  -- a real, general fix, not Float-specific, though never OBSERVED
+  before (no existing fixture happened to expose it).
+  Verified: `arco_host_format_double` against a direct C++
+  reimplementation of `Value::to_string()` itself across tens of
+  thousands of randomized values spanning 1e-20 to 1e20 plus known
+  round-half-to-even tie cases (e.g. `123456.5` -> `"123456"`, not
+  `"123457"` -- confirmed a real tie-break-to-even requirement, not
+  simple round-half-up) -- zero mismatches within the oracle's own
+  well-defined range; a real, disclosed, bounded divergence for a
+  whole-number-valued double >= 2^63, where the oracle's OWN
+  `static_cast<long long>` is genuine undefined behavior in C++ (real
+  platform/compiler-dependent garbage confirmed directly, not a claim),
+  matching the same "do not chase a genuinely broken oracle result"
+  discipline already applied to StringToHex/HexToString/NUMBER("abc").
+  A real end-to-end probe (literals, mixed arithmetic, comparisons,
+  function-boundary promotion, self-recursion, String(x)/TYPEOF(x))
+  matched the oracle byte-for-byte on the first full attempt after the
+  two bugs above were fixed; all 26 native fixtures (25 plus this
+  work's own new one) re-verified matching the oracle. New fixture
+  `fission/tests/native_programs/floating_point.abas`. Extended
+  `fission/tests/amir_x86_64_smoke.abas` with real structural checks
+  (including catching a real mistake in the SMOKE TEST ITSELF while
+  writing it: checking for `setb` on a `>` comparison instead of the
+  real `seta` the correct codegen actually emits -- caught by re-running
+  and re-reading the actual output rather than trusting the first
+  transcription). Self-parse/self-semantic corpus symbol count grew
+  3855 -> 3946; golden value updated. Verified with `fissure run`.
+  Real, disclosed remaining scope for Phase 2 (a real, deliberate
+  boundary, not an oversight): `MOD` and the whole `Bit.*`/`SHL`/`SHR`
+  family are NOT supported on a Float-kind value (real, clean
+  diagnostics) -- `MOD` needs a real `fmod` (confirmed the oracle's own
+  MOD is real floating-point modulo too: `10.5 MOD 3` -> `1.5`, not
+  integer-only), not attempted this pass. Float-kind ARRAY elements are
+  NOT supported (arrays stay Number(int)-or-String only, a real,
+  disclosed, SEPARATE representation limitation already on this
+  ledger's own list, unrelated to floating-point arithmetic itself) --
+  a real, clean diagnostic. Class fields are untested with a Float
+  value (fields are tracked as a Number-or-String union; whether a
+  Float-kind field write is accepted or diagnosed has not been directly
+  verified). `Random.Float`/`Math.Random` remain unimplemented, but the
+  real double-arithmetic groundwork this phase built (real SSE
+  arithmetic, real int<->double promotion, a real host-bridge double
+  return path already proven by `arco_host_format_double`) makes this a
+  MUCH smaller remaining gap than before -- PCG32's own real
+  `unit_interval()` algorithm (`(high * 67108864.0 + low) /
+  9007199254740992.0`) is now fully expressible with real instructions
+  this backend already has, the clear next concrete candidate for
+  whichever comes first: extending Random.* or hardening Phase 1's own
+  remaining edges.
 
 ## In-Progress Components
 
