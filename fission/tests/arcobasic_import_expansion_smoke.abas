@@ -1,0 +1,86 @@
+#IMPORT "fission/language/arcobasic/preprocess.abas"
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/amir/lower_bytecode.abas"
+
+' Real `#IMPORT "path.abas"` EXPANSION -- until this fixture's own
+' companion fix landed, `Fission_ArcoBasicPreprocess` only recorded an
+' `#IMPORT` directive as metadata (for the cross-file SEMANTIC symbol
+' graph) and left the literal directive LINE itself in its own output,
+' which the lexer/parser downstream has no idea how to handle -- meaning
+' this substrate's own codegen path (SIR->A-MIR->bytecode/native) could
+' only ever compile ONE file in isolation, never a real multi-file whole
+' program the way every real first-party Fission source file (which
+' always starts with a real `#IMPORT "..."` line) is actually built. This
+' was the single largest remaining blocker toward real self-hosting,
+' found while investigating "is Fission able to compile Fission yet?"
+' (see .agents/FISSION_SUBSTRATE_PROGRESS.md's own Completed Components
+' entry for the full history/investigation).
+'
+' Confirmed directly against the oracle (`Runtime::preprocess_source`'s
+' own real `IMPORT` handling, src/runtime/runtime.cpp) that a real
+' `#IMPORT "path"` behaves EXACTLY like `#INCLUDE` -- recursively
+' preprocesses the imported file's own content and inlines the RESULT
+' directly at that point, with NO deduplication by path at all (confirmed
+' via a direct oracle probe: importing two files that both transitively
+' import a THIRD common file duplicates that third file's own
+' declarations in the flattened output, and this is silently FINE --
+' ArcoBASIC tolerates redeclaration of the same function/class, later
+' wins). `Fission_ArcoBasicPreprocess`'s own `IMPORT` handling now matches
+' this exactly, reusing its OWN existing `INCLUDE` recursion.
+ImportSource = "#IMPORT \"fission/core/capability.abas\"\nPRINT Fission_ListContains([1, 2, 3], 2)\nPRINT Fission_ListContains([1, 2, 3], 9)"
+ImportPreprocessed = Fission_ArcoBasicPreprocess(ImportSource, [])
+PRINT ImportPreprocessed.Diagnostics.HasErrors()
+PRINT String.Contains(ImportPreprocessed.Source, "#IMPORT")
+PRINT String.Contains(ImportPreprocessed.Source, "FUNCTION Fission_ListContains")
+ImportTokens = Fission_ArcoBasicLex(ImportPreprocessed.Source)
+ImportAst = Fission_ArcoBasicParse(ImportTokens, "import-expansion-smoke.abas")
+ImportSir = Fission_ArcoBasicAstToSir(ImportAst)
+ImportAmir = Fission_SirToAmir(ImportSir)
+ImportBc = Fission_AmirToBytecode(ImportAmir)
+PRINT ImportAst.Diagnostics.HasErrors()
+PRINT ImportAmir.Diagnostics.HasErrors()
+PRINT ImportBc.Diagnostics.HasErrors()
+
+' A real, previously-latent bug FOUND by turning real #IMPORT expansion
+' on for the first time and feeding it real multi-file Fission source: a
+' Const instruction's own "Value" field is deliberately RAW runtime
+' content (a real newline is a real newline BYTE, not the two characters
+' "\"/"n" -- relied on directly by the native x86-64 backend's own
+' Fission_X86_64EscapeAscii round-trip). That representation is exactly
+' right for in-memory use, but was never safe to serialize as TEXT
+' directly: a raw embedded newline inside a quoted "..." span, written
+' straight into a LINE-BASED text format (a real `.arcof-text` bytecode
+' file), split that one constant across two physical lines and corrupted
+' the format -- confirmed directly: `fission/core/registry.abas` (which
+' transitively pulls in a real "\n"-containing string literal via
+' fission/core/diagnostics.abas's own Render()) crashed the legacy
+' bytecode VM's own loader with a bare "stod" exception once real
+' #IMPORT expansion started feeding it real multi-file source for the
+' first time. Fixed via a new `Fission_AmirEscapeConstTextForSerialization`
+' (fission/amir/model.abas), used ONLY at the TEXT-SERIALIZATION boundary
+' (A-MIR's own Render() and this file's own InternConstant call) -- the
+' Const instruction's own in-memory "Value" field, and the native
+' backend's existing raw-content assumption, are both completely
+' unaffected.
+NewlineSource = "x = \"a\" + \"\\n\" + \"b\"\nPRINT x"
+NewlineAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(NewlineSource), "import-expansion-newline-smoke.abas")))
+NewlineBc = Fission_AmirToBytecode(NewlineAmir)
+PRINT NewlineBc.Diagnostics.HasErrors()
+PRINT String.Contains(NewlineBc.Render(), "K1 \"\\n\"")
+PRINT String.Contains(NewlineBc.Render(), "K1 \"\n\"") == FALSE
+
+' The real acid test: a genuine first-party Fission source file (used AS
+' its own multi-file program, real `#IMPORT` chain and all) compiles and
+' RUNS correctly through this substrate's own self-hosted pipeline,
+' verified byte-for-byte against the oracle.
+RegistrySource = File.ReadText("fission/core/registry.abas") + "\nreg = FissionRegistry()\nc = FissionComponent(\"test\", \"kind\")\nignored = reg.Register(c)\nPRINT reg.HasComponent(\"test\")\nPRINT reg.Describe()"
+RegistryPreprocessed = Fission_ArcoBasicPreprocess(RegistrySource, [])
+RegistryTokens = Fission_ArcoBasicLex(RegistryPreprocessed.Source)
+RegistryAst = Fission_ArcoBasicParse(RegistryTokens, "import-expansion-registry-smoke.abas")
+RegistrySir = Fission_ArcoBasicAstToSir(RegistryAst)
+RegistryAmir = Fission_SirToAmir(RegistrySir)
+RegistryBc = Fission_AmirToBytecode(RegistryAmir)
+PRINT RegistryPreprocessed.Diagnostics.HasErrors()
+PRINT RegistryAst.Diagnostics.HasErrors()
+PRINT RegistryAmir.Diagnostics.HasErrors()
+PRINT RegistryBc.Diagnostics.HasErrors()

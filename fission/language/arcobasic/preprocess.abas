@@ -228,7 +228,50 @@ FUNCTION Fission_ArcoBasicPreprocess(source, initialDefines)
             CONTINUE FOR
         END IF
 
-        IF name == "IMPORT" THEN ignored = Array.Push(metadata.Imports, args)
+        ' Real `#IMPORT "path.abas"` expansion -- until now this only
+        ' recorded the import path as metadata (for the cross-file
+        ' SEMANTIC symbol graph, see fission/language/arcobasic/
+        ' semantic.abas's own Imports handling) and left the literal
+        ' "#IMPORT ..." directive LINE itself in the preprocessed output,
+        ' which the lexer/parser downstream has no idea how to handle --
+        ' meaning this substrate's own codegen path (SIR->A-MIR->bytecode/
+        ' native) could only ever compile ONE file in isolation, never a
+        ' real multi-file whole program the way Fission's own actual CLI
+        ' entry points are built. Confirmed directly against the oracle
+        ' (`Runtime::preprocess_source`'s own real `IMPORT` handling,
+        ' src/runtime/runtime.cpp) that a real `#IMPORT "path"` behaves
+        ' EXACTLY like `#INCLUDE` -- recursively preprocesses the
+        ' imported file's own content and inlines the RESULT directly at
+        ' this point, no deduplication at all (confirmed via a direct
+        ' oracle probe: importing two files that both transitively import
+        ' a THIRD common file duplicates that third file's own
+        ' declarations in the flattened output, and this is silently
+        ' FINE -- ArcoBASIC tolerates redeclaration of the same function/
+        ' class, later wins). The ONLY real divergence from #INCLUDE this
+        ' substrate makes: `#IMPORT "name" AS Alias` (a built-in/stdlib
+        ' MODULE reference, not a real file path, resolved via the
+        ' oracle's own separate `alias_import_wrappers` namespacing
+        ' mechanism) is a genuinely different, more complex feature NONE
+        ' of Fission's own real first-party source uses (confirmed: every
+        ' real `#IMPORT` in `fission/` is a plain file path, never `AS`)
+        ' -- a real, disclosed, narrower scope cut, not attempted here.
+        IF name == "IMPORT" THEN
+            ignored = Array.Push(metadata.Imports, args)
+            importPath = Fission_ArcoBasicUnquote(args)
+            IF File.Exists(importPath) THEN
+                imported = Fission_ArcoBasicPreprocess(File.ReadText(importPath), defines)
+                ignored = diagnostics.AppendMany(imported.Diagnostics)
+                FOR importedDefine IN imported.Defines
+                    IF Fission_ListContains(defines, importedDefine) == FALSE THEN ignored = Array.Push(defines, importedDefine)
+                NEXT
+                ignored = Array.Push(output, imported.Source)
+            ELSE
+                ignored = diagnostics.ReportError("FISSION_ARCOBASIC_IMPORT_NOT_FOUND", "#IMPORT file not found: " + importPath)
+                ignored = Array.Push(output, "")
+            END IF
+            lineNumber = lineNumber + 1
+            CONTINUE FOR
+        END IF
         ignored = Fission_ArcoBasicRecordDirective(metadata, diagnostics, name, args)
 
         ignored = Array.Push(output, line)

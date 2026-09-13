@@ -18,6 +18,66 @@ FUNCTION Fission_AmirCallArgsSuffix(argsText)
     RETURN " " + argsText
 END FUNCTION
 
+' A real, previously-latent bug this fixes: a Const instruction's own
+' "Value" field, for a String literal, is deliberately RAW runtime content
+' (a real newline is a real newline BYTE, not the two characters "\"/"n"
+' -- confirmed via fission/sir/lower_amir.abas's own Literal handling and
+' relied on directly by the native x86-64 backend's own
+' Fission_X86_64EscapeAscii round-trip, which correctly re-escapes it for
+' a GAS `.asciz` directive). That representation is exactly right for
+' in-memory use, but never safe to serialize as TEXT directly -- a raw
+' embedded newline inside a quoted "..." span, written straight into a
+' LINE-BASED text format (A-MIR reveal output, or a real `.arcof-text`
+' bytecode file), splits that one constant across two physical lines and
+' corrupts the format (confirmed directly: a real multi-file Fission
+' program pulling in any string literal containing "\n" crashed the
+' legacy bytecode VM's own loader with a bare "stod" exception once
+' real #IMPORT expansion started feeding real multi-file source through
+' this pipeline for the first time). The oracle's own real A-MIR/bytecode
+' TEXT rendering always escapes these back to `\n`/`\t`/`\r`/`\\`/`\"`
+' (confirmed via `ArcoFission reveal ... at A-MIR`: `CONST "\n"`, a
+' literal 4-character span, not a raw newline byte) -- this function
+' matches that exactly, used ONLY at the TEXT-SERIALIZATION boundary
+' (this file's own Const Render() below, and
+' fission/amir/lower_bytecode.abas's own InternConstant call), never
+' touching the Const instruction's own in-memory "Value" field, so the
+' native backend's existing raw-content assumption stays completely
+' unaffected.
+FUNCTION Fission_AmirIsQuotedConstValue(value)
+    RETURN LEN(value) >= 2 ANDALSO String.Slice(value, 0, 1) == "\""
+END FUNCTION
+
+FUNCTION Fission_AmirEscapeConstTextForSerialization(value)
+    IF Fission_AmirIsQuotedConstValue(value) == FALSE THEN RETURN value
+    inner = String.Slice(value, 1, LEN(value) - 2)
+    chars = String.ToChars(inner)
+    parts = []
+    FOR ch IN chars
+        IF ch == "\"" THEN
+            ignored = Array.Push(parts, "\\\"")
+            CONTINUE FOR
+        END IF
+        IF ch == "\\" THEN
+            ignored = Array.Push(parts, "\\\\")
+            CONTINUE FOR
+        END IF
+        IF ch == "\n" THEN
+            ignored = Array.Push(parts, "\\n")
+            CONTINUE FOR
+        END IF
+        IF ch == "\t" THEN
+            ignored = Array.Push(parts, "\\t")
+            CONTINUE FOR
+        END IF
+        IF ch == "\r" THEN
+            ignored = Array.Push(parts, "\\r")
+            CONTINUE FOR
+        END IF
+        ignored = Array.Push(parts, ch)
+    NEXT
+    RETURN "\"" + Array.Join(parts, "") + "\""
+END FUNCTION
+
 ' The legacy oracle shows the `[LeftType,RightType]` bracket exactly when the
 ' instruction used a typed INT.* opcode at all -- including a typed
 ' comparison whose operand types are BOTH unknown (`INT.CMP_EQ %t5, %t6
@@ -66,7 +126,7 @@ CLASS FissionAmirInstruction
                 destPart = dest + " := "
             END IF
         END IF
-        IF SELF.Kind == "Const" THEN RETURN destPart + "CONST " + SELF.Field("Value")
+        IF SELF.Kind == "Const" THEN RETURN destPart + "CONST " + Fission_AmirEscapeConstTextForSerialization(SELF.Field("Value"))
         IF SELF.Kind == "Load" THEN RETURN destPart + "LOAD " + SELF.Field("Name")
         IF SELF.Kind == "Store" THEN RETURN "STORE " + SELF.Field("Name") + ", " + SELF.Field("Value")
         IF SELF.Kind == "BinOp" THEN RETURN destPart + SELF.Field("Op") + " " + SELF.Field("Left") + ", " + SELF.Field("Right") + Fission_AmirBinOpTypeSuffix(SELF.Field("ShowBracket"), SELF.Field("LeftType"), SELF.Field("RightType"))

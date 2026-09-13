@@ -39,7 +39,15 @@ END FUNCTION
 FUNCTION Fission_BytecodeLowerInstruction(module, fn, block, amirInstruction)
     kind = amirInstruction.Kind
     IF kind == "Const" THEN
-        constRef = module.InternConstant(amirInstruction.Field("Value"))
+        ' See Fission_AmirEscapeConstTextForSerialization's own comment
+        ' (fission/amir/model.abas) for why this Const's own "Value" field
+        ' -- deliberately RAW runtime content, e.g. a real newline BYTE,
+        ' not the two characters "\"/"n" -- must be escaped here before
+        ' being interned into the bytecode CONSTANTS pool text, or a real
+        ' string literal containing one of these characters corrupts the
+        ' `.arcof-text` format and crashes the legacy VM's own loader at
+        ' runtime.
+        constRef = module.InternConstant(Fission_AmirEscapeConstTextForSerialization(amirInstruction.Field("Value")))
         ignored = block.Append(FissionBytecodeInstruction("CONST").WithField("Dest", amirInstruction.Field("Dest")).WithField("Const", constRef))
         RETURN
     END IF

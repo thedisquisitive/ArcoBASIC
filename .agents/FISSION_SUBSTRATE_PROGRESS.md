@@ -3110,6 +3110,108 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   program. That is real, substantial, disclosed, unstarted follow-on
   work, deliberately not attempted this pass -- see "Next Recommended
   Work".
+- DONE -- closed that exact remaining gap: real `#IMPORT "path.abas"`
+  expansion now works in this substrate's own codegen path, triggered
+  directly by the user's own "start on import" (following straight on
+  from the previous entry's own disclosed next step). Until this,
+  `Fission_ArcoBasicPreprocess` (`fission/language/arcobasic/
+  preprocess.abas`) only RECORDED an `#IMPORT` directive as metadata (for
+  the cross-file semantic symbol graph) and left the literal directive
+  LINE itself in its own output -- meaning every real first-party Fission
+  source file (which always starts with a real `#IMPORT "..."` line)
+  could never actually reach this substrate's own SIR->A-MIR->bytecode/
+  native codegen at all; both real CLI drivers
+  (`fission/cli/compile_to_bytecode.abas`/`compile_to_x86_64.abas`) read
+  an entry file's raw text and lexed it directly, never preprocessing.
+  Confirmed directly against the oracle (`Runtime::preprocess_source`'s
+  own real `IMPORT` handling, `src/runtime/runtime.cpp`) that a real
+  `#IMPORT "path"` behaves EXACTLY like the self-hosted preprocessor's
+  own already-working `#INCLUDE`: recursively preprocesses the imported
+  file's content and inlines the RESULT directly, with NO deduplication
+  by path at all -- confirmed via a direct oracle probe that importing
+  two files which both transitively import a THIRD common file
+  duplicates that file's own declarations in the flattened output, and
+  this is silently FINE (ArcoBASIC tolerates redeclaration of the same
+  function/class, later wins) -- so `Fission_ArcoBasicPreprocess`'s own
+  `IMPORT` handling now reuses its OWN existing `INCLUDE` recursion
+  verbatim, plus both CLI drivers now call it before lexing. The
+  genuinely different `#IMPORT "name" AS Alias` form (a built-in/stdlib
+  MODULE reference, not a real file path, resolved via the oracle's own
+  separate `alias_import_wrappers` namespacing mechanism) is a real,
+  disclosed, narrower scope cut -- confirmed NONE of Fission's own real
+  first-party source uses it (every real `#IMPORT` in `fission/` is a
+  plain file path, never `AS`).
+  A second real, previously-latent bug was found and fixed along the
+  way, discovered only because turning on real multi-file compilation
+  for the first time finally fed a real string literal containing an
+  actual embedded newline (from `fission/core/diagnostics.abas`'s own
+  `Render()`, pulled in transitively) through the bytecode text
+  serializer: an A-MIR Const instruction's own "Value" field is
+  deliberately RAW runtime content (a real newline is a real newline
+  BYTE, not the two characters `\`/`n` -- the native x86-64 backend's own
+  `Fission_X86_64EscapeAscii` correctly re-escapes this for a GAS
+  `.asciz` directive, and was never broken), but this was NEVER safe to
+  serialize as TEXT directly -- a raw embedded newline inside a quoted
+  `"..."` span, written into the LINE-BASED `.arcof-text` bytecode
+  format, split that one constant across two physical lines and
+  corrupted it, crashing the legacy bytecode VM's own loader at runtime
+  with a bare `stod` exception (confirmed: `fission/core/registry.abas`,
+  compiled as a real standalone multi-file program via the real
+  self-hosted CLI driver, hit exactly this). The oracle's own real A-MIR/
+  bytecode TEXT rendering always escapes these back to `\n`/`\t`/`\r`/
+  `\\`/`\"` (confirmed via `ArcoFission reveal ... at A-MIR`: a real
+  `CONST "\n"`, a literal 4-character span, never a raw newline byte).
+  Fixed with a new `Fission_AmirEscapeConstTextForSerialization`
+  (`fission/amir/model.abas`), used ONLY at the two real TEXT-
+  SERIALIZATION boundaries (A-MIR's own `Render()`, and
+  `fission/amir/lower_bytecode.abas`'s own `InternConstant` call) --
+  the Const instruction's own in-memory "Value" field, and the native
+  backend's existing raw-content round-trip, are both completely
+  unaffected (verified directly: a full `rivet build`, 0 failed).
+  Verified end to end, not just "lowers without diagnostics": built and
+  ran the REAL standalone self-hosted CLI driver binaries
+  (`.rivet/fission-substrate/fission-compile-to-bytecode`) against
+  genuine multi-file programs, including `fission/core/registry.abas`
+  itself (importing `component.abas`, itself importing `artifact.abas`/
+  `diagnostics.abas`, real classes/methods/cross-file calls throughout)
+  and `fission/tests/core_smoke.abas` (a real, substantial existing
+  multi-file program exercising the WHOLE component/registry/pipeline/
+  resolver system) -- both compile AND RUN correctly through this
+  substrate's own self-hosted pipeline for the first time, matching the
+  oracle's own output with ONE disclosed, narrow exception: a bare
+  `TRUE`/`FALSE` literal (as opposed to a computed comparison result,
+  which already prints correctly as `TRUE`/`FALSE`) still PRINTs as
+  `1`/`0` through the self-hosted bytecode path specifically -- a real,
+  separate, pre-existing, NOT-yet-fixed cosmetic gap (the bytecode CONST
+  pool has no Bool type tag for a bare literal the way a runtime
+  comparison result does; a DIFFERENT, already-fixed issue from the
+  NATIVE backend's own earlier "Real PRINT of a Bool-kind value" entry),
+  left disclosed rather than silently accepted or chased this pass.
+  New permanent regression fixture:
+  `fission/tests/arcobasic_import_expansion_smoke.abas` (13 checks: real
+  `#IMPORT` expansion, the newline-escaping fix's own exact bytecode
+  shape, and the real `registry.abas` multi-file program compiling clean
+  through every stage). Added to the self-hosting corpus file lists
+  (`arcobasic_fission_self_parse_smoke.abas`/`_self_semantic_smoke.abas`/
+  `_self_bytecode_smoke.abas`, alongside the previous entry's own
+  `amir_gap_fixes_smoke.abas`, which had been created but not yet added)
+  -- corpus grew 96 -> 98 files, semantic symbol count 4050 -> 4106,
+  import-edge count 150 -> 157; golden values updated. Verified with
+  `fissure run`.
+  Real, disclosed, current answer to "is Fission able to compile Fission
+  yet": genuinely closer, but still not a full G1 bootstrap. What's now
+  proven: a real, substantial, MULTI-FILE Fission program (using real
+  classes, cross-file calls, and a diamond-shaped import graph) compiles
+  and runs correctly through this substrate's own self-hosted pipeline.
+  What's NOT yet attempted: pointing this substrate at one of Fission's
+  own actual CLI entry points (`fission/cli/compile_to_bytecode.abas`
+  itself, or any of its siblings) and having it produce a working
+  compiler -- these pull in the ENTIRE `fission/sir`/`fission/amir`/
+  `fission/language` tree, likely large enough to hit the already-
+  disclosed self-hosted-frontend large-file performance ceiling (a real,
+  separate, pre-existing, unresolved item), and have not been tried.
+  That real "does Fission's own compiler compile itself" attempt remains
+  the natural next step, genuinely reachable now for the first time.
 
 ## In-Progress Components
 
@@ -3173,7 +3275,13 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   substrate. `#STRICT` converts unresolved references into diagnostics.
 - Unsupported ArcoBASIC statements are now surfaced into the top-level compile
   result diagnostics.
-- No G1/G2/G3 self-host path exists yet.
+- No full G1/G2/G3 self-host BOOTSTRAP exists yet (this substrate has
+  never compiled one of Fission's OWN CLI entry points, i.e. itself, into
+  a working compiler). Real progress since this was first written: real
+  multi-file compilation (via real `#IMPORT` expansion) now works and is
+  verified against genuine multi-file Fission programs -- see the
+  "start on import" Completed Components entry for the current, precise
+  state.
 - The WP-001 compiler facade executes simple transform callbacks, but there is no
   persistent component package discovery, advanced artifact storage, version
   negotiation, or real target backend yet.

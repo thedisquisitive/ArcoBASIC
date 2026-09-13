@@ -28,6 +28,7 @@
 ' `.frag` files directly).
 '
 ' Usage: ArcoFission compile-run fission/cli/compile_to_x86_64.abas -- ENTRY OUTPUT
+#IMPORT "fission/language/arcobasic/preprocess.abas"
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 #IMPORT "fission/amir/lower_x86_64.abas"
 #IMPORT "fission/amir/x86_64_assembler.abas"
@@ -48,7 +49,15 @@ END IF
 entryPath = appArgs[0]
 outputPath = appArgs[1]
 
-source = File.ReadText(entryPath)
+' Real `#IMPORT "path.abas"` expansion -- see Fission_ArcoBasicPreprocess's
+' own comment on its "IMPORT" directive handling. Before this, this driver
+' read the entry file's own raw text directly and lexed it as-is, so a
+' real multi-file Fission program (anything starting with a real
+' `#IMPORT "..."` line) could never actually compile through this
+' backend at all.
+preprocessed = Fission_ArcoBasicPreprocess(File.ReadText(entryPath), [])
+IF preprocessed.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("PREPROCESS", preprocessed.Diagnostics.Render())
+source = preprocessed.Source
 tokens = Fission_ArcoBasicLex(source)
 ast = Fission_ArcoBasicParse(tokens, entryPath)
 IF ast.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("AST", ast.Diagnostics.Render())

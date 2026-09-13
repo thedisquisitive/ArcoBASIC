@@ -113,6 +113,8 @@ Files = [
     "fission/tests/amir_bytecode_object_try_smoke.abas",
     "fission/tests/amir_to_bytecode_smoke.abas",
     "fission/tests/amir_x86_64_smoke.abas",
+    "fission/tests/amir_gap_fixes_smoke.abas",
+    "fission/tests/arcobasic_import_expansion_smoke.abas",
     "fission/tests/arcobasic_access_interface_smoke.abas",
     "fission/tests/arcobasic_binding_semantic_smoke.abas",
     "fission/tests/arcobasic_call_statement_smoke.abas",

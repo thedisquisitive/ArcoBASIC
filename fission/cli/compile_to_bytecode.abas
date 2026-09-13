@@ -12,6 +12,7 @@
 ' Diagnostics from any stage abort with a non-zero exit and a printed report
 ' instead of writing a bytecode file -- never silently emit bytecode for a
 ' program this substrate could not actually validate.
+#IMPORT "fission/language/arcobasic/preprocess.abas"
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 #IMPORT "fission/amir/lower_bytecode.abas"
 
@@ -29,7 +30,18 @@ END IF
 entryPath = appArgs[0]
 outputPath = appArgs[1]
 
-source = File.ReadText(entryPath)
+' Real `#IMPORT "path.abas"` expansion -- see Fission_ArcoBasicPreprocess's
+' own comment on its "IMPORT" directive handling for the full design
+' (recursive, matching the oracle's own real preprocessor exactly). Before
+' this, every driver here read the entry file's own raw text directly and
+' lexed it as-is -- meaning a real multi-file Fission program (anything
+' starting with a real `#IMPORT "..."` line, which is EVERY real
+' first-party Fission source file) could never actually compile through
+' this substrate's own codegen path at all, only ever a single
+' self-contained file with no imports.
+preprocessed = Fission_ArcoBasicPreprocess(File.ReadText(entryPath), [])
+IF preprocessed.Diagnostics.HasErrors() THEN ignored = FissionCli_Fail("PREPROCESS", preprocessed.Diagnostics)
+source = preprocessed.Source
 tokens = Fission_ArcoBasicLex(source)
 ast = Fission_ArcoBasicParse(tokens, entryPath)
 IF ast.Diagnostics.HasErrors() THEN ignored = FissionCli_Fail("AST", ast.Diagnostics)
