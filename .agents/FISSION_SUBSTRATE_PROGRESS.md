@@ -3560,6 +3560,78 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   simplification would visibly diverge from the oracle); Path.Home/
   Process.Env/Process.Run (need real ENVP-capture in the native entry
   point, a separate, cross-cutting undertaking).
+- DONE -- the real growable-array representation change, the single
+  biggest remaining native-x86-64-backend gap disclosed repeatedly across
+  the preceding "grinding" entries: `Array.Push`/`Add`/`Append`/
+  `Unshift`/`Insert`/`Extend`/`Resize` all now work correctly, WITH real
+  reference semantics preserved. Triggered by the user's own explicit
+  choice, offered directly ("start the growable-array redesign") after
+  disclosing the tractable host-function-bridge subset was exhausted.
+  The real representation change: an array/Bytes "value" is now a
+  STABLE 2-slot header `{length, dataPtr}` whose own ADDRESS never moves
+  once allocated, with the actual elements living in a SEPARATE data
+  buffer only `dataPtr` points to -- Push/Unshift/Insert/Extend/Resize
+  reallocate a fresh, EXACTLY-sized data buffer (real, deliberate
+  "simple over clever": no separate capacity tracking or amortized-
+  doubling growth, O(n) per call, matching this file's own established
+  discipline elsewhere, e.g. Array.Sort's insertion sort) and overwrite
+  ONLY the header's own two slots in place, so every OTHER alias of the
+  same array -- which only ever holds the header's own address --
+  observes the growth immediately, confirmed directly via a real
+  `b = a` aliasing probe (`Array.Push(a, ...)` afterward is visible
+  through `b` too, byte-for-byte identical to the oracle) and a
+  9-iteration growth-in-a-WHILE-loop probe (the header's own address
+  survives every one of its own data buffer's reallocations).
+  Real, wide-reaching, CAREFULLY re-verified touch surface (every site
+  the OLD single-block `[length][elem0]...[elemN-1]` layout touched):
+  core codegen in `fission/amir/lower_x86_64.abas` -- `array_alloc`
+  (now allocates the 2-slot header + contiguous data in one bump),
+  array-LITERAL element writes (`[1,2,3]`), INDEX read, STORE_INDEX
+  write, and all three `array_print`/`array_print_string`/
+  `array_print_float` subroutines (`PRINT arr`) -- plus a REWRITE of
+  every existing array-consuming function in `fission/native_runtime/
+  host_bridge.c` (~25 functions: File.ReadBytes/WriteBytes, Random.
+  Choice/Shuffle/Sample, Array.First/Last/Find/Contains/Clear/Pop/
+  Shift/RemoveAt/Remove/Reverse/Sort/Join, String.Split/ToChars/Lines,
+  Bytes.New/GetU8/SetU8/FromText/ToText, RANGE, Array.Empty/New,
+  HexToBytes) to go through two new tiny `static inline` helpers
+  (`arco_array_length`/`arco_array_data`) instead of the old direct
+  `arr[0]`/`arr[1+i]` offsets, plus a new `arco_array_alloc(length)`
+  builder every "return a brand-new array" function now uses.
+  Real verification discipline for a change this wide, BEFORE touching
+  the compiler at all: a comprehensive standalone C harness
+  (`test_growable.c`) exercising every REWRITTEN function (First/Last/
+  Reverse/Sort/Clear/Pop/Shift/RemoveAt/Remove/Join, confirming
+  byte-identical behavior to before) AND every NEW growth function
+  (Push/Unshift/Insert/Extend/Resize, including a real header-address-
+  stability assertion across repeated Pushes) -- all passed before any
+  ArcoBASIC-level codegen edit was made. After the codegen changes: the
+  ENTIRE existing `fission/tests/native_programs/` suite (34 pre-
+  existing fixtures, not just the new one) was re-run and diffed against
+  the oracle -- confirmed ZERO regressions -- before a single new
+  fixture was added, precisely because a representation change this
+  wide had real potential to silently break something already working.
+  Real, disclosed, narrower scope: `Array.Resize` is scoped to its real
+  3-argument form only (the oracle's own 2-argument form defaults `fill`
+  to a real NULL, matching the established fixed-arity precedent this
+  backend already uses for Bytes.New/Array.New/RANGE/Path.Join); an
+  out-of-range `Array.Insert` index is a real, disclosed no-op (unchanged
+  size returned) rather than the oracle's real thrown error, matching
+  this backend's "no exception mechanism yet" precedent elsewhere.
+  `Array.SortBy`/`MinBy`/`MaxBy` remain NOT attempted -- they need real
+  CALLABLE arguments, a genuinely separate, still-unstarted feature.
+  New permanent regression fixture: `array_growth.abas` -- diffed
+  byte-for-byte against `ArcoFission compile-run`, including the real
+  aliasing/reference-semantics assertion and a Float-kind array Push.
+  Another golden-value update, same recurring pattern: the self-hosted
+  semantic corpus symbol count grew again (4125 -> 4129, file count 98
+  and import-edge count 157 both unchanged) -- confirmed via the direct
+  script's own full `bash -x` trace, then a clean rerun confirmed
+  `fission_substrate_core_smoke: all checks passed` / exit 0. Verified
+  throughout via the real standalone native driver diffed against
+  `ArcoFission compile-run`, plus the direct
+  `tests/integration/fission_substrate_core_smoke.sh` script -- never
+  the broad `fissure run`, per this session's standing directive.
 
 ## In-Progress Components
 

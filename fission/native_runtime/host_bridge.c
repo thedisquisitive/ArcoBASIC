@@ -69,6 +69,50 @@ static inline __attribute__((always_inline)) void* arco_raw_mmap(arco_u64 length
     return (void*)ret;
 }
 
+// This backend's own real array/Bytes representation: a STABLE 2-slot
+// header {length, dataPtr} whose own ADDRESS never changes once
+// allocated, with the actual elements living in a SEPARATE data buffer
+// only `dataPtr` points to (a fresh array literal/host-function result
+// still returns the HEADER's address as "the array value", exactly as
+// before). This is what makes real, correct array GROWTH possible while
+// preserving the oracle's own true reference semantics: every alias of
+// an array shares the SAME header address, so Array.Push/Unshift/
+// Insert/Extend/Resize -- which reallocate a differently-sized data
+// buffer and update the header's own two SLOTS in place -- are
+// immediately visible through every alias, since only `dataPtr` (and
+// `length`) ever change, never the header's own address. (An earlier,
+// simpler single-block `[length][elem0]...[elemN-1]` layout could not
+// support this: growing past the block's own existing size would have
+// to move to a new address, silently breaking every OTHER alias still
+// pointing at the old one -- confirmed directly in the oracle:
+// `array_push_function` takes its array argument BY VALUE but mutates
+// the SAME underlying shared array every other alias also sees.)
+// A length-0 array's own `dataPtr` is a real NULL (`mmap` with a
+// zero length is invalid on Linux) -- safe because every consumer
+// already checks `length == 0` before ever touching `dataPtr` (the same
+// established "empty array" precedent Array.First/Last/Pop/Shift
+// already use). `fission/amir/lower_x86_64.abas`'s own array_alloc/
+// array-literal/INDEX/STORE_INDEX/array_print codegen uses this exact
+// same layout -- see that file's own comment on `array_alloc`.
+static inline __attribute__((always_inline)) arco_i64 arco_array_length(const arco_i64* header) {
+    return header[0];
+}
+static inline __attribute__((always_inline)) arco_i64* arco_array_data(const arco_i64* header) {
+    return (arco_i64*)header[1];
+}
+// Allocates a real NEW header + a real NEW, exactly-sized data buffer of
+// `length` slots (uninitialized -- every real caller fills every slot
+// before a result is ever returned, matching this file's own existing
+// "no partial results" discipline elsewhere). Returns the header
+// pointer -- this IS the real array/Bytes "value" every host function
+// returning a new array/Bytes uses.
+static inline __attribute__((always_inline)) arco_i64* arco_array_alloc(arco_i64 length) {
+    arco_i64* header = (arco_i64*)arco_raw_mmap(16);
+    header[0] = length;
+    header[1] = length > 0 ? (arco_i64)arco_raw_mmap((arco_u64)(length * 8)) : 0;
+    return header;
+}
+
 static inline __attribute__((always_inline)) arco_i64 arco_raw_strlen(const char* s) {
     arco_i64 n = 0;
     while (s[n] != 0) n = n + 1;
@@ -690,8 +734,8 @@ const void* arco_host_file_read_bytes(const char* path) {
         if (size < 0) size = 0;
         arco_raw_syscall3(ARCO_SYS_LSEEK, fd, 0, 0);
     }
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((size + 1) * 8));
-    result[0] = size;
+    arco_i64* result = arco_array_alloc(size);
+    arco_i64* data = arco_array_data(result);
     if (fd >= 0 && size > 0) {
         char* scratch = (char*)arco_raw_mmap((arco_u64)size);
         long totalRead = 0;
@@ -701,32 +745,33 @@ const void* arco_host_file_read_bytes(const char* path) {
             totalRead = totalRead + n;
         }
         long i = 0;
-        while (i < totalRead) { result[1 + i] = (arco_i64)(unsigned char)scratch[i]; i = i + 1; }
-        while (i < size) { result[1 + i] = 0; i = i + 1; }
+        while (i < totalRead) { data[i] = (arco_i64)(unsigned char)scratch[i]; i = i + 1; }
+        while (i < size) { data[i] = 0; i = i + 1; }
     }
     if (fd >= 0) arco_raw_syscall1(ARCO_SYS_CLOSE, fd);
     return (const void*)result;
 }
 
 // File.WriteBytes(path, bytes) -- `bytes` is a real Array:Number, this
-// batch's own first real Array-CONSUMING host function: `arr[0]` is the
-// real element-count header array_alloc/File.ReadBytes both already
-// write, `arr[1 + i]` each real element slot, each element's own low byte
-// the real byte value written (matching the oracle's own real
-// File.WriteBytes semantics: a Number 0-255 per element, confirmed via a
-// direct probe against the oracle -- an out-of-0-255-range element is not
-// specially validated here, matching the oracle's own lack of validation
-// too, just masked to its own low byte the same way any other byte-sized
-// write truncates a wider value).
+// batch's own first real Array-CONSUMING host function: `arco_array_
+// length(arr)` the real element count, `arco_array_data(arr)[i]` each
+// real element slot, each element's own low byte the real byte value
+// written (matching the oracle's own real File.WriteBytes semantics: a
+// Number 0-255 per element, confirmed via a direct probe against the
+// oracle -- an out-of-0-255-range element is not specially validated
+// here, matching the oracle's own lack of validation too, just masked to
+// its own low byte the same way any other byte-sized write truncates a
+// wider value).
 arco_i64 arco_host_file_write_bytes(const char* path, const arco_i64* arr) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
+    const arco_i64* data = arco_array_data(arr);
     long fd = arco_raw_syscall3(ARCO_SYS_OPEN, (long)path, ARCO_O_WRONLY | ARCO_O_CREAT | ARCO_O_TRUNC, 0644);
     if (fd < 0) return 0;
     arco_i64 ok = 1;
     if (count > 0) {
         char* scratch = (char*)arco_raw_mmap((arco_u64)count);
         arco_i64 i = 0;
-        while (i < count) { scratch[i] = (char)(arr[1 + i] & 0xFF); i = i + 1; }
+        while (i < count) { scratch[i] = (char)(data[i] & 0xFF); i = i + 1; }
         long written = 0;
         while (written < count) {
             long n = arco_raw_syscall3(ARCO_SYS_WRITE, fd, (long)(scratch + written), count - written);
@@ -913,9 +958,9 @@ arco_i64 arco_host_random_integer(arco_i64 minimum, arco_i64 maximum, arco_pcg32
 // own header comment -- the real result KIND is resolved at compile time
 // by fission/amir/lower_x86_64.abas instead).
 arco_i64 arco_host_random_choice(const arco_i64* arr, arco_pcg32_state* handle) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
     arco_u64 index = arco_pcg32_bounded(handle, (arco_u64)count);
-    return arr[1 + index];
+    return arco_array_data(arr)[index];
 }
 // Random.Shuffle(array, handle) -- a real NEW array (the oracle's own
 // Shuffle returns a fresh `Value::Array` by value, confirmed via a direct
@@ -924,17 +969,18 @@ arco_i64 arco_host_random_choice(const arco_i64* arr, arco_pcg32_state* handle) 
 // Fisher-Yates, matching the oracle's own exact iteration order and RNG
 // consumption.
 const void* arco_host_random_shuffle(const arco_i64* arr, arco_pcg32_state* handle) {
-    arco_i64 count = arr[0];
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
-    result[0] = count;
+    arco_i64 count = arco_array_length(arr);
+    const arco_i64* srcData = arco_array_data(arr);
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* data = arco_array_data(result);
     arco_i64 i = 0;
-    while (i < count) { result[1 + i] = arr[1 + i]; i = i + 1; }
+    while (i < count) { data[i] = srcData[i]; i = i + 1; }
     arco_i64 remaining = count;
     while (remaining > 1) {
         arco_u64 selected = arco_pcg32_bounded(handle, (arco_u64)remaining);
-        arco_i64 tmp = result[remaining];
-        result[remaining] = result[1 + selected];
-        result[1 + selected] = tmp;
+        arco_i64 tmp = data[remaining - 1];
+        data[remaining - 1] = data[selected];
+        data[selected] = tmp;
         remaining = remaining - 1;
     }
     return (const void*)result;
@@ -945,11 +991,12 @@ const void* arco_host_random_shuffle(const arco_i64* arr, arco_pcg32_state* hand
 // selected = index + bounded(size - index); swap(values[index],
 // values[selected])`, then truncate to `count`).
 const void* arco_host_random_sample(const arco_i64* arr, arco_i64 count, arco_pcg32_state* handle) {
-    arco_i64 total = arr[0];
+    arco_i64 total = arco_array_length(arr);
+    const arco_i64* srcData = arco_array_data(arr);
     char* workRaw = (char*)arco_raw_mmap((arco_u64)(total > 0 ? total * 8 : 8));
     arco_i64* work = (arco_i64*)workRaw;
     arco_i64 i = 0;
-    while (i < total) { work[i] = arr[1 + i]; i = i + 1; }
+    while (i < total) { work[i] = srcData[i]; i = i + 1; }
     i = 0;
     while (i < count) {
         arco_u64 selected = (arco_u64)i + arco_pcg32_bounded(handle, (arco_u64)(total - i));
@@ -958,10 +1005,10 @@ const void* arco_host_random_sample(const arco_i64* arr, arco_i64 count, arco_pc
         work[selected] = tmp;
         i = i + 1;
     }
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
-    result[0] = count;
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* data = arco_array_data(result);
     i = 0;
-    while (i < count) { result[1 + i] = work[i]; i = i + 1; }
+    while (i < count) { data[i] = work[i]; i = i + 1; }
     return (const void*)result;
 }
 
@@ -1354,32 +1401,34 @@ double arco_host_random_float(arco_pcg32_state* handle) {
 // a real `LEN(arr) == 0` check first, matching how every other "no real
 // exception mechanism yet" gap in this file is already handled.
 arco_i64 arco_host_array_first(const arco_i64* arr) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
     if (count == 0) return 0;
-    return arr[1];
+    return arco_array_data(arr)[0];
 }
 arco_i64 arco_host_array_last(const arco_i64* arr) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
     if (count == 0) return 0;
-    return arr[count];
+    return arco_array_data(arr)[count - 1];
 }
 
 // Array.Find -- real linear scan, INDEX of the first match or -1 if
 // none, matching the oracle's own `array_find_function` exactly.
 arco_i64 arco_host_array_find_number(const arco_i64* arr, arco_i64 value) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
+    const arco_i64* data = arco_array_data(arr);
     arco_i64 i = 0;
     while (i < count) {
-        if (arr[1 + i] == value) return i;
+        if (data[i] == value) return i;
         i = i + 1;
     }
     return -1;
 }
 arco_i64 arco_host_array_find_string(const arco_i64* arr, const char* value) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
+    const arco_i64* data = arco_array_data(arr);
     arco_i64 i = 0;
     while (i < count) {
-        if (arco_raw_strings_equal((const char*)arr[1 + i], value)) return i;
+        if (arco_raw_strings_equal((const char*)data[i], value)) return i;
         i = i + 1;
     }
     return -1;
@@ -1394,19 +1443,22 @@ arco_i64 arco_host_array_contains_string(const arco_i64* arr, const char* value)
     return arco_host_array_find_string(arr, value) >= 0 ? 1 : 0;
 }
 
-// Array.Clear/Pop/Shift/RemoveAt/Remove -- real, genuinely DIFFERENT
-// from the deferred Push/Unshift/Insert/Extend/Resize-growing subset:
-// every one of these ONLY EVER SHRINKS the array (or leaves its length
-// unchanged), so the existing bump-allocated block's own address never
-// needs to move -- the SAME real, disclosed EXCEPTION to this file's own
-// "no array mutation" scope line Bytes.SetU8 already established
-// (confirmed directly in the oracle: every one of these takes its array
-// argument BY VALUE but mutates the SAME shared underlying array every
-// other alias also sees, matching a plain in-place header/element write
-// through this backend's own already-shared pointer representation
-// exactly, no new machinery needed).
+// Array.Clear/Pop/Shift/RemoveAt/Remove -- real, disclosed EXCEPTIONS to
+// this file's own "no array mutation" scope line (the SAME one
+// Bytes.SetU8 already established): every one of these mutates the
+// EXISTING header IN PLACE (never its own address), confirmed directly
+// in the oracle: every one of these takes its array argument BY VALUE
+// but mutates the SAME shared underlying array every other alias also
+// sees. Now that a real header/data split exists (see this file's own
+// header comment on `arco_array_alloc`), these could equally reallocate
+// a smaller data buffer on every shrink -- they deliberately do NOT,
+// since shrinking in place (just decrementing `length`, or sliding
+// elements down WITHIN the existing data buffer) is strictly simpler
+// and never wrong: nothing ever reads past the new, shorter `length`
+// again, matching this file's own established "simple over clever"
+// discipline.
 
-// Array.Clear -- resets the EXISTING block's own length header to 0.
+// Array.Clear -- resets the EXISTING header's own length to 0.
 // Returns the new size (always 0, matching the oracle's own real
 // `array.clear(); return array.size();`).
 arco_i64 arco_host_array_clear(arco_i64* arr) {
@@ -1422,24 +1474,25 @@ arco_i64 arco_host_array_clear(arco_i64* arr) {
 // First/Last/Reverse -- the real result KIND is resolved at compile
 // time by fission/amir/lower_x86_64.abas instead).
 arco_i64 arco_host_array_pop(arco_i64* arr) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
     if (count == 0) return 0;
-    arco_i64 value = arr[count];
+    arco_i64 value = arco_array_data(arr)[count - 1];
     arr[0] = count - 1;
     return value;
 }
 
 // Array.Shift -- removes and returns the FIRST element, shifting every
-// remaining element down by one slot WITHIN the same block (never needs
-// more space -- the block only ever shrinks). Kind-agnostic raw slot,
-// same reasoning as Pop above.
+// remaining element down by one slot WITHIN the same data buffer (never
+// needs more space -- the array only ever shrinks). Kind-agnostic raw
+// slot, same reasoning as Pop above.
 arco_i64 arco_host_array_shift(arco_i64* arr) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
     if (count == 0) return 0;
-    arco_i64 value = arr[1];
-    arco_i64 i = 1;
-    while (i < count) {
-        arr[i] = arr[i + 1];
+    arco_i64* data = arco_array_data(arr);
+    arco_i64 value = data[0];
+    arco_i64 i = 0;
+    while (i < count - 1) {
+        data[i] = data[i + 1];
         i = i + 1;
     }
     arr[0] = count - 1;
@@ -1452,12 +1505,13 @@ arco_i64 arco_host_array_shift(arco_i64* arr) {
 // unchecked-indexing precedent) rather than the oracle's real thrown
 // error. Kind-agnostic raw slot, same reasoning as Pop/Shift above.
 arco_i64 arco_host_array_remove_at(arco_i64* arr, arco_i64 index) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
     if (index < 0 || index >= count) return 0;
-    arco_i64 value = arr[1 + index];
+    arco_i64* data = arco_array_data(arr);
+    arco_i64 value = data[index];
     arco_i64 i = index;
     while (i < count - 1) {
-        arr[1 + i] = arr[1 + i + 1];
+        data[i] = data[i + 1];
         i = i + 1;
     }
     arr[0] = count - 1;
@@ -1488,12 +1542,13 @@ arco_i64 arco_host_array_remove_string(arco_i64* arr, const char* value) {
 // reversing, confirmed directly -- it never mutates the caller's own
 // array), raw slot copy (kind-agnostic, same as Random.Shuffle).
 const void* arco_host_array_reverse(const arco_i64* arr) {
-    arco_i64 count = arr[0];
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
-    result[0] = count;
+    arco_i64 count = arco_array_length(arr);
+    const arco_i64* srcData = arco_array_data(arr);
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* data = arco_array_data(result);
     arco_i64 i = 0;
     while (i < count) {
-        result[1 + i] = arr[count - i];
+        data[i] = srcData[count - 1 - i];
         i = i + 1;
     }
     return (const void*)result;
@@ -1514,39 +1569,41 @@ const void* arco_host_array_reverse(const arco_i64* arr) {
 // own `std::sort` isn't either), so plain insertion sort's own natural
 // stability is a bonus, never a requirement.
 const void* arco_host_array_sort_number(const arco_i64* arr) {
-    arco_i64 count = arr[0];
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
-    result[0] = count;
+    arco_i64 count = arco_array_length(arr);
+    const arco_i64* srcData = arco_array_data(arr);
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* data = arco_array_data(result);
     arco_i64 i = 0;
-    while (i < count) { result[1 + i] = arr[1 + i]; i = i + 1; }
+    while (i < count) { data[i] = srcData[i]; i = i + 1; }
     i = 1;
     while (i < count) {
-        arco_i64 key = result[1 + i];
+        arco_i64 key = data[i];
         arco_i64 j = i - 1;
-        while (j >= 0 && result[1 + j] > key) {
-            result[1 + j + 1] = result[1 + j];
+        while (j >= 0 && data[j] > key) {
+            data[j + 1] = data[j];
             j = j - 1;
         }
-        result[1 + j + 1] = key;
+        data[j + 1] = key;
         i = i + 1;
     }
     return (const void*)result;
 }
 const void* arco_host_array_sort_string(const arco_i64* arr) {
-    arco_i64 count = arr[0];
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
-    result[0] = count;
+    arco_i64 count = arco_array_length(arr);
+    const arco_i64* srcData = arco_array_data(arr);
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* data = arco_array_data(result);
     arco_i64 i = 0;
-    while (i < count) { result[1 + i] = arr[1 + i]; i = i + 1; }
+    while (i < count) { data[i] = srcData[i]; i = i + 1; }
     i = 1;
     while (i < count) {
-        arco_i64 key = result[1 + i];
+        arco_i64 key = data[i];
         arco_i64 j = i - 1;
-        while (j >= 0 && arco_raw_strings_less_than((const char*)key, (const char*)result[1 + j])) {
-            result[1 + j + 1] = result[1 + j];
+        while (j >= 0 && arco_raw_strings_less_than((const char*)key, (const char*)data[j])) {
+            data[j + 1] = data[j];
             j = j - 1;
         }
-        result[1 + j + 1] = key;
+        data[j + 1] = key;
         i = i + 1;
     }
     return (const void*)result;
@@ -1570,12 +1627,13 @@ const void* arco_host_array_sort_string(const arco_i64* arr) {
 // `arco_host_format_double` instead, a real, disclosed, narrower
 // remaining gap for Join specifically (not yet dispatched to).
 const char* arco_host_array_join_number(const arco_i64* arr, const char* sep) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
+    const arco_i64* data = arco_array_data(arr);
     arco_i64 sepLen = arco_raw_strlen(sep);
     arco_i64 totalLen = 0;
     arco_i64 i = 0;
     while (i < count) {
-        totalLen = totalLen + arco_raw_strlen(arco_host_number_to_string(arr[1 + i]));
+        totalLen = totalLen + arco_raw_strlen(arco_host_number_to_string(data[i]));
         if (i != 0) totalLen = totalLen + sepLen;
         i = i + 1;
     }
@@ -1587,7 +1645,7 @@ const char* arco_host_array_join_number(const arco_i64* arr, const char* sep) {
             arco_i64 j = 0;
             while (j < sepLen) { result[pos] = sep[j]; pos = pos + 1; j = j + 1; }
         }
-        const char* piece = arco_host_number_to_string(arr[1 + i]);
+        const char* piece = arco_host_number_to_string(data[i]);
         arco_i64 pieceLen = arco_raw_strlen(piece);
         arco_i64 j = 0;
         while (j < pieceLen) { result[pos] = piece[j]; pos = pos + 1; j = j + 1; }
@@ -1597,12 +1655,13 @@ const char* arco_host_array_join_number(const arco_i64* arr, const char* sep) {
     return result;
 }
 const char* arco_host_array_join_string(const arco_i64* arr, const char* sep) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
+    const arco_i64* data = arco_array_data(arr);
     arco_i64 sepLen = arco_raw_strlen(sep);
     arco_i64 totalLen = 0;
     arco_i64 i = 0;
     while (i < count) {
-        totalLen = totalLen + arco_raw_strlen((const char*)arr[1 + i]);
+        totalLen = totalLen + arco_raw_strlen((const char*)data[i]);
         if (i != 0) totalLen = totalLen + sepLen;
         i = i + 1;
     }
@@ -1614,7 +1673,7 @@ const char* arco_host_array_join_string(const arco_i64* arr, const char* sep) {
             arco_i64 j = 0;
             while (j < sepLen) { result[pos] = sep[j]; pos = pos + 1; j = j + 1; }
         }
-        const char* piece = (const char*)arr[1 + i];
+        const char* piece = (const char*)data[i];
         arco_i64 pieceLen = arco_raw_strlen(piece);
         arco_i64 j = 0;
         while (j < pieceLen) { result[pos] = piece[j]; pos = pos + 1; j = j + 1; }
@@ -1665,14 +1724,14 @@ const void* arco_host_string_split(const char* text, const char* delimiter) {
             i = i + 1;
         }
     }
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
-    result[0] = count;
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* data = arco_array_data(result);
     arco_i64 partIndex = 0;
     arco_i64 partStart = 0;
     i = 0;
     while (i < textLen) {
         if (arco_raw_match_at(text, textLen, i, delimiter, delimLen)) {
-            result[1 + partIndex] = (arco_i64)(long)arco_raw_copy_substring(text, partStart, i - partStart);
+            data[partIndex] = (arco_i64)(long)arco_raw_copy_substring(text, partStart, i - partStart);
             partIndex = partIndex + 1;
             i = i + delimLen;
             partStart = i;
@@ -1680,7 +1739,7 @@ const void* arco_host_string_split(const char* text, const char* delimiter) {
             i = i + 1;
         }
     }
-    result[1 + partIndex] = (arco_i64)(long)arco_raw_copy_substring(text, partStart, textLen - partStart);
+    data[partIndex] = (arco_i64)(long)arco_raw_copy_substring(text, partStart, textLen - partStart);
     return (const void*)result;
 }
 
@@ -1697,15 +1756,15 @@ const void* arco_host_string_to_chars(const char* text) {
         while (i < textLen && (((unsigned char)text[i]) & 0xc0) == 0x80) i = i + 1;
         count = count + 1;
     }
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
-    result[0] = count;
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* data = arco_array_data(result);
     arco_i64 idx = 0;
     i = 0;
     while (i < textLen) {
         arco_i64 start = i;
         i = i + 1;
         while (i < textLen && (((unsigned char)text[i]) & 0xc0) == 0x80) i = i + 1;
-        result[1 + idx] = (arco_i64)(long)arco_raw_copy_substring(text, start, i - start);
+        data[idx] = (arco_i64)(long)arco_raw_copy_substring(text, start, i - start);
         idx = idx + 1;
     }
     return (const void*)result;
@@ -1733,8 +1792,8 @@ const void* arco_host_string_lines(const char* text) {
         count = count + 1;
         if (i < textLen) i = i + 1;
     }
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
-    result[0] = count;
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* data = arco_array_data(result);
     arco_i64 idx = 0;
     i = 0;
     while (i < textLen) {
@@ -1742,7 +1801,7 @@ const void* arco_host_string_lines(const char* text) {
         while (i < textLen && text[i] != '\n') i = i + 1;
         arco_i64 end = i;
         if (end > start && text[end - 1] == '\r') end = end - 1;
-        result[1 + idx] = (arco_i64)(long)arco_raw_copy_substring(text, start, end - start);
+        data[idx] = (arco_i64)(long)arco_raw_copy_substring(text, start, end - start);
         idx = idx + 1;
         if (i < textLen) i = i + 1;
     }
@@ -1765,10 +1824,10 @@ const void* arco_host_string_lines(const char* text) {
 // array back (not a new size the way Array.Push does).
 const void* arco_host_bytes_new(arco_i64 size, arco_i64 fill) {
     arco_i64 clampedFill = fill < 0 ? 0 : (fill > 255 ? 255 : fill);
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((size + 1) * 8));
-    result[0] = size;
+    arco_i64* result = arco_array_alloc(size);
+    arco_i64* data = arco_array_data(result);
     arco_i64 i = 0;
-    while (i < size) { result[1 + i] = clampedFill; i = i + 1; }
+    while (i < size) { data[i] = clampedFill; i = i + 1; }
     return (const void*)result;
 }
 // Real, disclosed simplification: an out-of-range index returns 0
@@ -1779,15 +1838,15 @@ const void* arco_host_bytes_new(arco_i64 size, arco_i64 fill) {
 // behavior rather than inventing a new, inconsistent exception-like
 // mechanism just for Bytes.*.
 arco_i64 arco_host_bytes_get_u8(const arco_i64* arr, arco_i64 index) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
     if (index < 0 || index >= count) return 0;
-    arco_i64 value = arr[1 + index];
+    arco_i64 value = arco_array_data(arr)[index];
     return value < 0 ? 0 : (value > 255 ? 255 : value);
 }
 const void* arco_host_bytes_set_u8(arco_i64* arr, arco_i64 index, arco_i64 value) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
     if (index >= 0 && index < count) {
-        arr[1 + index] = value < 0 ? 0 : (value > 255 ? 255 : value);
+        arco_array_data(arr)[index] = value < 0 ? 0 : (value > 255 ? 255 : value);
     }
     return (const void*)arr;
 }
@@ -1797,18 +1856,19 @@ const void* arco_host_bytes_set_u8(arco_i64* arr, arco_i64 index, arco_i64 value
 // from String.ToChars above), matching exactly.
 const void* arco_host_bytes_from_text(const char* text) {
     arco_i64 len = arco_raw_strlen(text);
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((len + 1) * 8));
-    result[0] = len;
+    arco_i64* result = arco_array_alloc(len);
+    arco_i64* data = arco_array_data(result);
     arco_i64 i = 0;
-    while (i < len) { result[1 + i] = (arco_i64)(unsigned char)text[i]; i = i + 1; }
+    while (i < len) { data[i] = (arco_i64)(unsigned char)text[i]; i = i + 1; }
     return (const void*)result;
 }
 const char* arco_host_bytes_to_text(const arco_i64* arr) {
-    arco_i64 count = arr[0];
+    arco_i64 count = arco_array_length(arr);
+    const arco_i64* data = arco_array_data(arr);
     char* result = (char*)arco_raw_mmap((arco_u64)(count + 1));
     arco_i64 i = 0;
     while (i < count) {
-        arco_i64 value = arr[1 + i];
+        arco_i64 value = data[i];
         result[i] = (char)(unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
         i = i + 1;
     }
@@ -1881,12 +1941,12 @@ const void* arco_host_range(arco_i64 start, arco_i64 stop, arco_i64 step) {
         arco_i64 stride = 0 - step;
         count = (distance + stride - 1) / stride;
     }
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
-    result[0] = count;
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* data = arco_array_data(result);
     arco_i64 i = 0;
     arco_i64 value = start;
     while (i < count) {
-        result[1 + i] = value;
+        data[i] = value;
         value = value + step;
         i = i + 1;
     }
@@ -1896,7 +1956,7 @@ const void* arco_host_range(arco_i64 start, arco_i64 stop, arco_i64 step) {
 // Array.Empty/Array.IsEmpty -- a real boolean 0/1, matching the oracle's
 // own `array_empty_function` exactly.
 arco_i64 arco_host_array_empty(const arco_i64* arr) {
-    return arr[0] == 0 ? 1 : 0;
+    return arco_array_length(arr) == 0 ? 1 : 0;
 }
 
 // Array.New(size, fill) -- real, matching the oracle's own
@@ -1908,10 +1968,10 @@ arco_i64 arco_host_array_empty(const arco_i64* arr) {
 // result KIND is resolved at compile time by the caller, same as
 // Random.Choice/Array.First).
 const void* arco_host_array_new(arco_i64 size, arco_i64 fill) {
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((size + 1) * 8));
-    result[0] = size;
+    arco_i64* result = arco_array_alloc(size);
+    arco_i64* data = arco_array_data(result);
     arco_i64 i = 0;
-    while (i < size) { result[1 + i] = fill; i = i + 1; }
+    while (i < size) { data[i] = fill; i = i + 1; }
     return (const void*)result;
 }
 
@@ -1933,21 +1993,144 @@ const void* arco_host_hex_to_bytes(const char* text) {
     arco_i64 len = arco_raw_strlen(text);
     int odd = (len % 2) != 0;
     arco_i64 count = (len + (odd ? 1 : 0)) / 2;
-    arco_i64* result = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
-    result[0] = count;
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* data = arco_array_data(result);
     arco_i64 pos = 0;
     arco_i64 i = 0;
     if (odd) {
-        result[1] = arco_raw_hex_value(text[0]);
+        data[0] = arco_raw_hex_value(text[0]);
         pos = 1;
         i = 1;
     }
     while (i < len) {
         int hi = arco_raw_hex_value(text[i]);
         int lo = arco_raw_hex_value(text[i + 1]);
-        result[1 + pos] = (hi << 4) | lo;
+        data[pos] = (hi << 4) | lo;
         pos = pos + 1;
         i = i + 2;
     }
     return (const void*)result;
+}
+
+// --- Batch 12: real Array.Push/Add/Append/Unshift/Insert/Extend/Resize
+// -- the growable-array representation change this whole file's own
+// "no growth needed" scope line always disclosed as a real, separate,
+// deliberately-deferred undertaking, finally landed: see this file's
+// own header comment on `arco_array_alloc` for the real header/data
+// split that makes this possible (a STABLE header whose own address
+// never moves, only its own `dataPtr` slot ever gets reallocated) --
+// every one of these mutates the EXISTING header IN PLACE, immediately
+// visible through every alias, matching the oracle's own real reference
+// semantics exactly (confirmed directly: `array_push_function` takes
+// its array argument BY VALUE but mutates the SAME underlying shared
+// array every other alias also sees). Every one reallocates a fresh,
+// EXACTLY-sized data buffer on every single call rather than tracking a
+// separate capacity with amortized-doubling growth -- real, deliberate
+// "simple over clever" (O(n) per call, O(n^2) total for N successive
+// Pushes) -- this file's own established discipline elsewhere (e.g.
+// Array.Sort's own insertion sort) given every fixture this backend's
+// own test suite exercises is small; a real amortized scheme is a
+// legitimate future optimization, never a correctness requirement.
+// Every one is kind-agnostic (a raw 8-byte slot move, works identically
+// for Number/String/Float -- fission/amir/lower_x86_64.abas's own
+// compile-time check already ensures the pushed/inserted/filled value
+// matches the array's own established element kind before this is ever
+// called, the same real check STORE_INDEX already makes).
+
+// Array.Push/Array.Add/Array.Append -- confirmed real ALIASES of the
+// exact same oracle function (`register_function("Array.Add",
+// array_push_function); register_function("Array.Append",
+// array_push_function);`), so one real implementation serves all three
+// real ArcoBASIC names. Returns the NEW size, matching the oracle.
+arco_i64 arco_host_array_push(arco_i64* header, arco_i64 value) {
+    arco_i64 count = arco_array_length(header);
+    arco_i64* newData = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    const arco_i64* oldData = arco_array_data(header);
+    arco_i64 i = 0;
+    while (i < count) { newData[i] = oldData[i]; i = i + 1; }
+    newData[count] = value;
+    header[0] = count + 1;
+    header[1] = (arco_i64)newData;
+    return count + 1;
+}
+
+// Array.Unshift -- prepends `value`, shifting every existing element up
+// by one slot in a fresh data buffer. Returns the NEW size, matching
+// the oracle's own real `array_unshift_function` exactly.
+arco_i64 arco_host_array_unshift(arco_i64* header, arco_i64 value) {
+    arco_i64 count = arco_array_length(header);
+    arco_i64* newData = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    const arco_i64* oldData = arco_array_data(header);
+    newData[0] = value;
+    arco_i64 i = 0;
+    while (i < count) { newData[i + 1] = oldData[i]; i = i + 1; }
+    header[0] = count + 1;
+    header[1] = (arco_i64)newData;
+    return count + 1;
+}
+
+// Array.Insert(arr, index, value) -- inserts `value` at a Number
+// `index` (0 <= index <= length), shifting subsequent elements up by
+// one slot in a fresh data buffer. Returns the NEW size, matching the
+// oracle's own real `array_insert_function` exactly. An out-of-range
+// index is a real, disclosed simplification (a no-op, returning the
+// UNCHANGED current size) rather than the oracle's real thrown error.
+arco_i64 arco_host_array_insert(arco_i64* header, arco_i64 index, arco_i64 value) {
+    arco_i64 count = arco_array_length(header);
+    if (index < 0 || index > count) return count;
+    arco_i64* newData = (arco_i64*)arco_raw_mmap((arco_u64)((count + 1) * 8));
+    const arco_i64* oldData = arco_array_data(header);
+    arco_i64 i = 0;
+    while (i < index) { newData[i] = oldData[i]; i = i + 1; }
+    newData[index] = value;
+    while (i < count) { newData[i + 1] = oldData[i]; i = i + 1; }
+    header[0] = count + 1;
+    header[1] = (arco_i64)newData;
+    return count + 1;
+}
+
+// Array.Extend(arr, other) -- appends every element of `other` onto
+// `arr` in a fresh data buffer sized for both. Returns the NEW size,
+// matching the oracle's own real `array_extend_function` exactly
+// (`array.insert(array.end(), other.begin(), other.end())`). Both
+// arrays share the same real header/data representation, so `other` is
+// read the exact same way `arr` itself is.
+arco_i64 arco_host_array_extend(arco_i64* header, const arco_i64* other) {
+    arco_i64 count = arco_array_length(header);
+    arco_i64 otherCount = arco_array_length(other);
+    arco_i64 newCount = count + otherCount;
+    arco_i64* newData = newCount > 0 ? (arco_i64*)arco_raw_mmap((arco_u64)(newCount * 8)) : 0;
+    const arco_i64* oldData = arco_array_data(header);
+    const arco_i64* otherData = arco_array_data(other);
+    arco_i64 i = 0;
+    while (i < count) { newData[i] = oldData[i]; i = i + 1; }
+    i = 0;
+    while (i < otherCount) { newData[count + i] = otherData[i]; i = i + 1; }
+    header[0] = newCount;
+    header[1] = (arco_i64)newData;
+    return newCount;
+}
+
+// Array.Resize(arr, size, fill) -- grows OR shrinks to exactly `size`
+// elements in a fresh data buffer, matching the oracle's own real
+// `array_resize_function` exactly (`array.resize(size, fill)`):
+// existing elements up to `min(count, size)` are preserved, any NEW
+// slots beyond the old length are set to `fill`. Scoped to the real
+// 3-argument form only (the oracle's own 2-argument form defaults
+// `fill` to a real NULL, a real, disclosed, narrower scope cut matching
+// the established fixed-arity precedent Bytes.New/Array.New already
+// use). A negative `size` is a real, disclosed simplification (treated
+// as 0, an empty array) rather than the oracle's real thrown error.
+arco_i64 arco_host_array_resize(arco_i64* header, arco_i64 size, arco_i64 fill) {
+    arco_i64 count = arco_array_length(header);
+    arco_i64 newCount = size < 0 ? 0 : size;
+    arco_i64* newData = newCount > 0 ? (arco_i64*)arco_raw_mmap((arco_u64)(newCount * 8)) : 0;
+    const arco_i64* oldData = arco_array_data(header);
+    arco_i64 copyCount = count < newCount ? count : newCount;
+    arco_i64 i = 0;
+    while (i < copyCount) { newData[i] = oldData[i]; i = i + 1; }
+    while (i < newCount) { newData[i] = fill; i = i + 1; }
+    header[0] = newCount;
+    header[1] = (arco_i64)newData;
+    return newCount;
 }

@@ -1208,7 +1208,17 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 END IF
                 IF Upper(callee) == "ARRAY.CONTAINS" ORELSE Upper(callee) == "ARRAY.REMOVE" THEN destKind = "Bool"
                 IF Upper(callee) == "ARRAY.EMPTY" ORELSE Upper(callee) == "ARRAY.ISEMPTY" THEN destKind = "Bool"
-                IF Upper(callee) == "ARRAY.CLEAR" THEN destKind = "Number"
+                ' `Array.Clear`/`Push`/`Add`/`Append`/`Unshift`/`Insert`/
+                ' `Extend`/`Resize` all return the array's NEW SIZE --
+                ' fixed "Number" regardless of the array's own element
+                ' kind (unlike First/Last/Pop/Shift/RemoveAt above, which
+                ' return an ELEMENT of the array). The growth-needing
+                ' subset (Push/Add/Append/Unshift/Insert/Extend/Resize) is
+                ' the real, disclosed representation change landed this
+                ' pass -- see fission/native_runtime/host_bridge.c's own
+                ' header comment on `arco_array_alloc` for the full
+                ' reasoning.
+                IF Upper(callee) == "ARRAY.CLEAR" ORELSE Upper(callee) == "ARRAY.PUSH" ORELSE Upper(callee) == "ARRAY.ADD" ORELSE Upper(callee) == "ARRAY.APPEND" ORELSE Upper(callee) == "ARRAY.UNSHIFT" ORELSE Upper(callee) == "ARRAY.INSERT" ORELSE Upper(callee) == "ARRAY.EXTEND" ORELSE Upper(callee) == "ARRAY.RESIZE" THEN destKind = "Number"
                 IF Upper(callee) == "ISNULL" THEN destKind = "Bool"
                 IF Upper(callee) == "CLASSOF" THEN destKind = "String"
                 IF Upper(callee) == "ARRAY.JOIN" ORELSE Upper(callee) == "STRING.JOIN" THEN destKind = "String"
@@ -2472,14 +2482,29 @@ END FUNCTION
 
 ' Real array allocation. Same internal-only call/ret convention as
 ' itoa_print/str_print/str_concat/str_equals (input: %rdi = element count
-' N; output: %rax = pointer to a newly bump-allocated `(N+1)*8`-byte block
-' on the SAME shared heap string concatenation already uses -- untyped raw
-' bytes, so nothing about the bump allocator itself needs to change for a
-' second kind of value to live there; clobbers %rax/%rcx/%r8). Writes N as
-' an 8-byte length header at `[pointer]` (read back directly by `LEN`, no
-' runtime scan); the N element slots starting at `[pointer+8]` are left
-' uninitialized for the caller (the ARRAY instruction's own inline codegen
-' in Fission_X86_64LowerFunction, which already knows each element's own
+' N; output: %rax = pointer to a newly bump-allocated header on the SAME
+' shared heap string concatenation already uses -- untyped raw bytes, so
+' nothing about the bump allocator itself needs to change for a second
+' kind of value to live there; clobbers %rax/%rcx/%r8).
+'
+' Real, STABLE 2-slot header {length, dataPtr} (this backend's own real
+' growable-array representation -- see fission/native_runtime/
+' host_bridge.c's own header comment on `arco_array_alloc` for the full
+' reasoning): `[pointer]` is the length (read back directly by `LEN`, no
+' runtime scan, unchanged from before), `[pointer+8]` a pointer to the
+' actual element data, which for a FRESH allocation immediately follows
+' the header at `pointer+16` (a real, deliberate choice: contiguous for a
+' brand-new array, exactly like the single-block layout this replaced,
+' but now the header's own address and the data's own address are two
+' independently-trackable things -- Array.Push/Unshift/Insert/Extend/
+' Resize's own real host-bridge implementations reallocate a NEW data
+' buffer elsewhere and overwrite ONLY `[pointer+8]` in place when an
+' array needs to grow past its current size, never touching `[pointer]`
+' itself, so every OTHER alias of the same array -- which only ever
+' holds the header's own address -- observes the growth immediately).
+' The N element slots starting at `[pointer+16]` are left uninitialized
+' for the caller (the ARRAY instruction's own inline codegen in
+' Fission_X86_64LowerFunction, which already knows each element's own
 ' source operand at compile time) to fill in directly, one plain `mov`
 ' per element, no loop needed here at all.
 FUNCTION Fission_X86_64ArrayAllocSubroutine()
@@ -2492,9 +2517,11 @@ FUNCTION Fission_X86_64ArrayAllocSubroutine()
         "    lea string_heap(%rip), %rax",
         ".Lalloc_top_ready:",
         "    mov %rdi, (%rax)",
+        "    lea 16(%rax), %rcx",
+        "    mov %rcx, 8(%rax)",
         "    mov %rdi, %rcx",
-        "    inc %rcx",
         "    shl $3, %rcx",
+        "    add $16, %rcx",
         "    add %rax, %rcx",
         "    mov %rcx, (%r8)",
         "    ret"
@@ -2580,12 +2607,17 @@ END FUNCTION
 ' `[1, 2, 3]`, `[]` for an empty array, confirmed via direct oracle probes,
 ' including that Runtime.Print's own always-append-a-trailing-newline
 ' behavior applies to the whole rendered array once, not per element).
-' Input: %rdi = array pointer (its own length header, then elements, same
-' layout array_alloc/INDEX/STORE_INDEX already use). Loops over elements
-' with %rbx/%r12/%r13 (callee-saved, so they survive the itoa_write/write-
-' syscall calls inside the loop -- this internal convention's usual
-' "freely clobber scratch registers" rule does not extend to registers a
-' loop needs to keep live across its own body).
+' Input: %rdi = array pointer (its own real 2-slot {length, dataPtr}
+' header -- see array_alloc's own comment for the full growable-array
+' representation). Loops over elements with %rbx/%r12/%r13 (callee-
+' saved, so they survive the itoa_write/write-syscall calls inside the
+' loop -- this internal convention's usual "freely clobber scratch
+' registers" rule does not extend to registers a loop needs to keep live
+' across its own body); %rbx holds the header pointer just long enough
+' to read the length, then is immediately overwritten with the header's
+' own dataPtr (its length is already safely captured in %r13 by then),
+' so the loop body itself indexes directly off %rbx with no header
+' pointer needed any more.
 FUNCTION Fission_X86_64ArrayPrintSubroutine()
     lines = [
         "array_print:",
@@ -2594,6 +2626,7 @@ FUNCTION Fission_X86_64ArrayPrintSubroutine()
         "    push %r13",
         "    mov %rdi, %rbx",
         "    mov (%rbx), %r13",
+        "    mov 8(%rbx), %rbx",
         "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
         "    mov $1, %rdi",
         "    lea array_print_open(%rip), %rsi",
@@ -2611,7 +2644,7 @@ FUNCTION Fission_X86_64ArrayPrintSubroutine()
         "    mov $2, %rdx",
         "    syscall",
         ".Larrprint_skip_comma:",
-        "    mov 8(%rbx,%r12,8), %rax",
+        "    mov (%rbx,%r12,8), %rax",
         "    call itoa_write",
         "    inc %r12",
         "    jmp .Larrprint_loop",
@@ -2648,6 +2681,7 @@ FUNCTION Fission_X86_64ArrayPrintStringSubroutine()
         "    push %r13",
         "    mov %rdi, %rbx",
         "    mov (%rbx), %r13",
+        "    mov 8(%rbx), %rbx",
         "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
         "    mov $1, %rdi",
         "    lea array_print_open(%rip), %rsi",
@@ -2665,7 +2699,7 @@ FUNCTION Fission_X86_64ArrayPrintStringSubroutine()
         "    mov $2, %rdx",
         "    syscall",
         ".Larrprintstr_skip_comma:",
-        "    mov 8(%rbx,%r12,8), %rsi",
+        "    mov (%rbx,%r12,8), %rsi",
         "    mov %rsi, %rax",
         ".Larrprintstr_strlen_loop:",
         "    cmpb $0, (%rax)",
@@ -2714,6 +2748,7 @@ FUNCTION Fission_X86_64ArrayPrintFloatSubroutine()
         "    push %r13",
         "    mov %rdi, %rbx",
         "    mov (%rbx), %r13",
+        "    mov 8(%rbx), %rbx",
         "    mov $" + Fission_X86_64SyscallWrite() + ", %rax",
         "    mov $1, %rdi",
         "    lea array_print_open(%rip), %rsi",
@@ -2731,7 +2766,7 @@ FUNCTION Fission_X86_64ArrayPrintFloatSubroutine()
         "    mov $2, %rdx",
         "    syscall",
         ".Larrprintflt_skip_comma:",
-        "    movsd 8(%rbx,%r12,8), %xmm0",
+        "    movsd (%rbx,%r12,8), %xmm0",
         "    call arco_host_format_double",
         "    mov %rax, %rsi",
         ".Larrprintflt_strlen_loop:",
@@ -3222,15 +3257,17 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
             END IF
             IF kind == "Array" THEN
                 ' Phase 7: a real array literal. array_alloc bump-allocates
-                ' (element count + 1) * 8 bytes on the same shared heap
-                ' string concatenation already uses (see its own comment),
-                ' writes the element count as a length header at [pointer],
-                ' and returns the pointer in %rax -- element count is
+                ' a real 2-slot {length, dataPtr} header PLUS its own
+                ' element data, contiguous, on the same shared heap string
+                ' concatenation already uses (see its own comment for the
+                ' full real growable-array representation reasoning), and
+                ' returns the HEADER pointer in %rax -- element count is
                 ' always compile-time-known here (A-MIR materializes each
                 ' item into its own %tN before the ARRAY instruction
                 ' itself, confirmed via the oracle), so each element is
-                ' just one `mov` into its own fixed offset, no runtime loop
-                ' needed.
+                ' just one `mov` into its own fixed offset (`16 +
+                ' index*8`, past the header's own two slots) from that
+                ' SAME header pointer, no runtime loop needed.
                 ' Real typed arrays (Fission_X86_64IsArrayKind's own
                 ' comment): every element must share the SAME kind (the
                 ' first item's own kind decides it, matching
@@ -3284,7 +3321,7 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 itemIndex = 0
                 FOR item IN items
                     ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, item, "rcx"))
-                    ignored = Array.Push(textLines, "    mov %rcx, " + String(8 + itemIndex * 8) + "(%rax)")
+                    ignored = Array.Push(textLines, "    mov %rcx, " + String(16 + itemIndex * 8) + "(%rax)")
                     itemIndex = itemIndex + 1
                 NEXT
                 ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Dest")))
@@ -3295,9 +3332,12 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 ' `arr[i]` -- Base is already a %tN (a prior LOAD of the
                 ' array variable, confirmed via the oracle), so it resolves
                 ' through the exact same operand machinery as any other
-                ' temp; the element address is `base + 8 (length header) +
-                ' index*8`, a single `lea` using real x86-64 SIB scaled
-                ' addressing, no extra arithmetic instructions needed.
+                ' temp. Real growable-array representation (see
+                ' array_alloc's own comment): `base` is a HEADER pointer,
+                ' `8(base)` its own dataPtr slot, so the element address is
+                ' `dataPtr + index*8` -- one extra `mov` to dereference the
+                ' header's own dataPtr slot, then real x86-64 SIB scaled
+                ' addressing for the element itself.
                 base = instruction.Field("Base")
                 index = instruction.Field("Index")
                 baseOk = Fission_X86_64OperandIsResolvable(offsets, base)
@@ -3361,7 +3401,8 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, base, "rax"))
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, index, "rcx"))
-                ignored = Array.Push(textLines, "    mov 8(%rax,%rcx,8), %rax")
+                ignored = Array.Push(textLines, "    mov 8(%rax), %rax")
+                ignored = Array.Push(textLines, "    mov (%rax,%rcx,8), %rax")
                 ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, instruction.Field("Dest")))
                 CONTINUE FOR
             END IF
@@ -3450,7 +3491,8 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, name, "rax"))
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, index, "rcx"))
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, value, "rdx"))
-                ignored = Array.Push(textLines, "    mov %rdx, 8(%rax,%rcx,8)")
+                ignored = Array.Push(textLines, "    mov 8(%rax), %rax")
+                ignored = Array.Push(textLines, "    mov %rdx, (%rax,%rcx,8)")
                 CONTINUE FOR
             END IF
             IF kind == "BinOp" THEN
@@ -4146,6 +4188,89 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                         CONTINUE FOR
                     END IF
                     ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_array_remove_at", args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.Push`/`Array.Add`/`Array.Append`/`Array.Unshift`
+                ' -- the real growable-array representation change (see
+                ' fission/native_runtime/host_bridge.c's own header
+                ' comment on `arco_array_alloc`): a real IN-PLACE mutation
+                ' of the EXISTING header (its own address never moves,
+                ' only its own length/dataPtr slots do), matching the
+                ' oracle's own true reference semantics exactly. `Add`/
+                ' `Append` are confirmed real ALIASES of `Push` in the
+                ' oracle (same registered C++ function), so all three
+                ' dispatch to the SAME host symbol. Kind-agnostic (a raw
+                ' 8-byte slot move, works identically for Number/String/
+                ' Float), but the pushed VALUE's own kind must match the
+                ' array's own established element kind -- the same real
+                ' check STORE_INDEX already makes.
+                IF Upper(callee) == "ARRAY.PUSH" ORELSE Upper(callee) == "ARRAY.ADD" ORELSE Upper(callee) == "ARRAY.APPEND" ORELSE Upper(callee) == "ARRAY.UNSHIFT" THEN
+                    IF LEN(args) != 2 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array and a value)")
+                        CONTINUE FOR
+                    END IF
+                    pushElementKind = Fission_X86_64ArrayElementKind(Fission_X86_64OperandKind(kinds, args[0]))
+                    IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[1])) != pushElementKind THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports an array element value matching the array's own established kind (" + pushElementKind + "): " + args[1])
+                        CONTINUE FOR
+                    END IF
+                    pushSymbol = "arco_host_array_push"
+                    IF Upper(callee) == "ARRAY.UNSHIFT" THEN pushSymbol = "arco_host_array_unshift"
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, pushSymbol, args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.Insert(arr, index, value)` -- same real in-place
+                ' growth as Push/Unshift above, inserting at a Number
+                ' index instead of a fixed end.
+                IF Upper(callee) == "ARRAY.INSERT" THEN
+                    IF LEN(args) != 3 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE ORELSE Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[1])) != "Number" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array, a Number index, and a value)")
+                        CONTINUE FOR
+                    END IF
+                    insertElementKind = Fission_X86_64ArrayElementKind(Fission_X86_64OperandKind(kinds, args[0]))
+                    IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[2])) != insertElementKind THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports an array element value matching the array's own established kind (" + insertElementKind + "): " + args[2])
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_array_insert", args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.Extend(arr, other)` -- appends every element of
+                ' `other` onto `arr` in place (same real growth as Push
+                ' above). Both arrays must share the exact same full
+                ' array kind (element-for-element compatible), the real
+                ' check the oracle's own `array.insert(array.end(),
+                ' other.begin(), other.end())` implicitly relies on too.
+                IF Upper(callee) == "ARRAY.EXTEND" THEN
+                    IF LEN(args) != 2 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE ORELSE Fission_X86_64OperandKind(kinds, args[1]) != Fission_X86_64OperandKind(kinds, args[0]) THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected two arrays of the same kind)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_array_extend", args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.Resize(arr, size, fill)` -- grows OR shrinks to
+                ' exactly `size` elements in place (same real growth as
+                ' Push above when growing; a real, disclosed narrower
+                ' scope than the oracle's own real 2-argument form, which
+                ' defaults `fill` to NULL -- matching the fixed-arity
+                ' precedent Bytes.New/Array.New/RANGE/Path.Join already
+                ' established).
+                IF Upper(callee) == "ARRAY.RESIZE" THEN
+                    IF LEN(args) != 3 ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE ORELSE Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[1])) != "Number" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array, a Number size, and a fill value)")
+                        CONTINUE FOR
+                    END IF
+                    resizeElementKind = Fission_X86_64ArrayElementKind(Fission_X86_64OperandKind(kinds, args[0]))
+                    IF Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, args[2])) != resizeElementKind THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Native x86-64 codegen only supports an array element value matching the array's own established kind (" + resizeElementKind + "): " + args[2])
+                        CONTINUE FOR
+                    END IF
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_array_resize", args, destOperand, isVoidCall)
                     context.UsesHostBridge = TRUE
                     CONTINUE FOR
                 END IF

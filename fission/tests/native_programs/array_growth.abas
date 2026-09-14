@@ -1,0 +1,79 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's own native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention.
+'
+' The real growable-array representation: Array.Push/Add/Append/Unshift/
+' Insert/Extend/Resize. This backend's array/Bytes "value" is now a
+' STABLE 2-slot header {length, dataPtr} whose own address never moves
+' once allocated, with the actual elements living in a SEPARATE data
+' buffer only `dataPtr` points to (see fission/native_runtime/
+' host_bridge.c's own header comment on `arco_array_alloc` for the full
+' reasoning) -- this is what makes real, correct GROWTH possible while
+' preserving the oracle's own true reference semantics: an ALIAS of an
+' array (`b = a`) sees a later `Array.Push(a, ...)` immediately, exactly
+' like the oracle, confirmed below (`b` prints the pushed element too).
+' Growing a single array across many successive Pushes (inside a WHILE
+' loop) is also exercised, confirming the header's own address survives
+' every reallocation of its own data buffer.
+'
+' Add/Append are confirmed real ALIASES of Push in the oracle (the exact
+' same registered C++ function). Resize is scoped to its real
+' 3-argument form only (a real, disclosed, narrower scope cut, matching
+' the fixed-arity precedent Bytes.New/Array.New/RANGE/Path.Join already
+' established -- the oracle's own 2-argument form defaults `fill` to a
+' real NULL).
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+a = [1, 2, 3]
+b = a
+PRINT Array.Push(a, 4)
+PRINT a
+PRINT b
+
+n = [10]
+i = 1
+WHILE i < 10
+    ignored = Array.Push(n, n[i - 1] + 10)
+    i = i + 1
+WEND
+PRINT n
+PRINT LEN(n)
+
+c = [2, 3, 4]
+PRINT Array.Unshift(c, 1)
+PRINT c
+
+d = [1, 2, 4, 5]
+PRINT Array.Insert(d, 2, 3)
+PRINT d
+
+e = [1, 2]
+PRINT Array.Insert(e, 0, 0)
+PRINT e
+
+f = [1, 2]
+PRINT Array.Insert(f, 2, 3)
+PRINT f
+
+g = [1, 2]
+h = [3, 4, 5]
+PRINT Array.Extend(g, h)
+PRINT g
+
+j = [1, 2, 3]
+PRINT Array.Resize(j, 5, 99)
+PRINT j
+PRINT Array.Resize(j, 2, 0)
+PRINT j
+
+k = [1, 2, 3]
+PRINT Array.Add(k, 4)
+PRINT k
+PRINT Array.Append(k, 5)
+PRINT k
+
+strs = ["a", "b"]
+PRINT Array.Push(strs, "c")
+PRINT strs
