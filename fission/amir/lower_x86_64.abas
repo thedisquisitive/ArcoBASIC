@@ -538,6 +538,55 @@ FUNCTION Fission_X86_64CollectFunctionNames(amirModule)
     RETURN names
 END FUNCTION
 
+' Real CALLABLE support (`ADDRESSOF Foo` / calling through a variable that
+' holds one): the SIR/A-MIR layers already produce a real, dedicated
+' `Addressof` instruction (`fission/sir/lower_amir.abas`'s own comment:
+' "mirroring the oracle's own `%tN := ADDRESSOF target` exactly"), and a
+' call THROUGH a callable variable lowers to an ordinary `Call`/`CallVoid`
+' whose own Callee text is just the bare variable name (SAME shape as a
+' plain named-function call -- `fission/sir/lower_amir.abas`'s own
+' `callee.Kind == "Read"` case never distinguishes the two) -- this
+' backend's job is purely to notice, AT COMPILE TIME, when a Call's own
+' Callee is NOT a declared function but IS a Callable-kind local/param,
+' and dispatch accordingly. A callable's own runtime identity is just a
+' STRING naming the target function (reusing this backend's ordinary
+' String representation and CONST-string machinery verbatim, no new
+' value representation needed at all), tagged with a real, PARAMETERIZED
+' "Callable:Func1,Func2,..." compile-time kind -- the CLOSED,
+' compile-time-enumerable set of targets THIS EXACT variable/parameter
+' was ever actually observed holding (see Fission_X86_64IsCallableKind's
+' own header comment for why this must be scoped PER-VARIABLE, mirroring
+' "Poly:Class1,Class2,..." exactly, rather than "every ADDRESSOF anywhere
+' in the whole module" -- an earlier, too-broad design caused a real,
+' confirmed cross-contamination bug between unrelated same-arity
+' functions). A call through it dispatches via the SAME real runtime
+' string-comparison-against-a-closed-candidate-set technique this
+' backend's own polymorphic instance-method dispatch already uses
+' (`str_equals` against each candidate in turn) -- sidestepping the need
+' for a genuine indirect function-pointer call / uniform calling-
+' convention thunk entirely, and the SAME real design the legacy native
+' x86-64 backend (`src/compiler/fission.cpp`, RFC-0049) already
+' established for this exact feature.
+' The real, WHOLE-MODULE parameter COUNT for every declared function
+' (`{fnName: paramCount}`) -- needed because `paramKindsIn` as threaded
+' into `Fission_X86_64CollectSlots` is only ever THIS ONE function's own
+' per-position param-kind list (`fnParamKinds`, sliced out of the real
+' whole-module `paramKinds` map by its OWN caller before ever reaching
+' here) -- there is no other way to learn a DIFFERENT candidate
+' function's own arity from inside CollectSlots. A real, previously-
+' missing arity filter on the CALLABLE-dispatch dest-kind resolution
+' below was found to be a genuine bug without this (see that check's own
+' comment for the exact reproduction): a 0-argument candidate could
+' "win" a call site's own dest kind even though it could never actually
+' be what that call site's callable held at runtime.
+FUNCTION Fission_X86_64CollectFunctionParamCounts(amirModule)
+    counts = {}
+    FOR fn IN amirModule.Functions
+        counts = Object.Set(counts, fn.Name, LEN(fn.Params))
+    NEXT
+    RETURN counts
+END FUNCTION
+
 ' Real CLASS support: a CLASS entirely desugars (in the SHARED fission/sir/
 ' lower_amir.abas, confirmed via `ArcoFission reveal ... at A-MIR` on a
 ' real `CLASS Counter ... END CLASS` -- the same oracle-comparison
@@ -914,7 +963,7 @@ END FUNCTION
 ' confirmed failure otherwise (see Fission_X86_64CollectSlotsConverged's
 ' own comment for the exact bug). `{}` (empty) reproduces this
 ' function's own original behavior exactly for a single, unseeded pass.
-FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn, seedKinds)
+FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn, seedKinds, functionParamCounts)
     names = []
     seen = {}
     kinds = seedKinds
@@ -967,6 +1016,26 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                         kinds = Object.Set(kinds, dest, "Number")
                     END IF
                 END IF
+            END IF
+            ' Real CALLABLE support -- see Fission_X86_64IsCallableKind's
+            ' own header comment for the full design. A callable's own
+            ' runtime identity is physically just a String (a rodata name
+            ' naming the target function), but it gets its own DISTINCT
+            ' "Callable:Name" parameterized kind (mirroring "Poly:
+            ' Class1,Class2..." exactly, never plain "String") so a
+            ' Call's own dest-kind resolution below, and the actual
+            ' call-site dispatch in Fission_X86_64LowerFunction, can
+            ' resolve the real, CLOSED, per-VARIABLE candidate set this
+            ' exact value could hold (Fission_X86_64MergeKinds' own
+            ' Callable branch grows this set across multiple Store sites
+            ' to the same variable, the identical mechanism real class
+            ' polymorphism already uses for "Poly:...").
+            IF kind == "Addressof" THEN
+                dest = instruction.Field("Dest")
+                state = Fission_X86_64Remember(names, seen, dest)
+                names = state.Names
+                seen = state.Seen
+                kinds = Object.Set(kinds, dest, "Callable:" + instruction.Field("Name"))
             END IF
             IF kind == "Object" THEN
                 ' `OBJECT` only ever appears inside `ClassName.__new`
@@ -1259,6 +1328,42 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                                 owner = Fission_X86_64ResolveMethodOwner(classParentsIn, functionNames, candidateClass, methodName)
                                 IF owner != "" THEN destKind = Object.Get(returnKindsIn, owner + "." + methodName, "Number")
                             END IF
+                        ELSE
+                            ' Real CALLABLE support: `callee` is a bare
+                            ' name that is NEITHER a declared function NOR
+                            ' dotted -- if it's a Callable-kind local/
+                            ' param, this call is a real dispatch THROUGH
+                            ' that variable (see Fission_X86_64
+                            ' IsCallableKind's own header comment). Its
+                            ' own dest kind resolves from the FIRST
+                            ' candidate in THIS VARIABLE'S OWN candidate
+                            ' set (never the whole module's -- a real,
+                            ' previously-found bug: an EARLIER, too-broad
+                            ' design considered every ADDRESSOF target
+                            ' anywhere in the module, so an UNRELATED
+                            ' function that merely happened to share the
+                            ' same arity could "win" this call site's own
+                            ' dest kind purely by arity, even though no
+                            ' real ArcoBASIC variable ever actually held
+                            ' it -- closed by scoping the candidate set to
+                            ' "Callable:Func1,Func2,..." itself, the exact
+                            ' set THIS variable was ever really observed
+                            ' holding) that is itself a real declared
+                            ' function whose own arity matches this call
+                            ' site (defensive -- normally already implied
+                            ' by construction, but never assumed) -- the
+                            ' same "first candidate decides" simplification
+                            ' the polymorphic receiver case just above
+                            ' already makes for a genuine per-candidate
+                            ' return-kind disagreement.
+                            IF Fission_X86_64IsCallableKind(Object.Get(kinds, callee, "")) THEN
+                                callArgs = Fission_X86_64SplitArgs(instruction.Field("Args"))
+                                FOR candidateName IN Fission_X86_64CallableTargetsOfKind(Object.Get(kinds, callee, ""))
+                                    IF destKind == "Number" ANDALSO Object.Has(functionNames, candidateName) ANDALSO Object.Get(functionParamCounts, candidateName, -1) == LEN(callArgs) THEN
+                                        destKind = Object.Get(returnKindsIn, candidateName, "Number")
+                                    END IF
+                                NEXT
+                            END IF
                         END IF
                     END IF
                 END IF
@@ -1278,6 +1383,37 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                         ignored = Array.Push(callArgKindRequests, {Callee: callee, ArgIndex: argIndex, Kind: argKind})
                         argIndex = argIndex + 1
                     NEXT
+                ELSE
+                    ' Real CALLABLE support: a call THROUGH a Callable-
+                    ' kind variable (`callee` is never itself a real
+                    ' function name, so the check just above never fires)
+                    ' is REAL evidence too -- for every arity-matching
+                    ' candidate in THIS VARIABLE'S OWN candidate set
+                    ' (never the whole module's -- see this block's
+                    ' sibling above for the exact real bug scoping this
+                    ' down to a per-variable set closed, the same
+                    ' reasoning applies here identically: an UNRELATED
+                    ' function sharing the same arity must never receive
+                    ' evidence from a call site that could never actually
+                    ' reach it). Without this at all, a function called
+                    ' ONLY through a callable variable (never once by its
+                    ' own real name anywhere in the module) would never
+                    ' receive ANY real argument-kind evidence, so its own
+                    ' parameters would stay stuck at their seeded
+                    ' "Number" default forever -- a real, confirmed bug.
+                    IF Fission_X86_64IsCallableKind(Object.Get(kinds, callee, "")) THEN
+                        callArgs = Fission_X86_64SplitArgs(instruction.Field("Args"))
+                        FOR candidateName IN Fission_X86_64CallableTargetsOfKind(Object.Get(kinds, callee, ""))
+                            IF Object.Has(functionNames, candidateName) ANDALSO Object.Get(functionParamCounts, candidateName, -1) == LEN(callArgs) THEN
+                                argIndex = 0
+                                FOR callArg IN callArgs
+                                    argKind = Fission_X86_64NormalizeNumericKind(Fission_X86_64OperandKind(kinds, callArg))
+                                    ignored = Array.Push(callArgKindRequests, {Callee: candidateName, ArgIndex: argIndex, Kind: argKind})
+                                    argIndex = argIndex + 1
+                                NEXT
+                            END IF
+                        NEXT
+                    END IF
                 END IF
             END IF
             IF kind == "Array" THEN
@@ -1451,11 +1587,11 @@ END FUNCTION
 ' round) -- cheap either way, since a single CollectSlots pass over one
 ' function is not a hot loop, this compiler's own compile time is not
 ' the target of this project's own performance discipline.
-FUNCTION Fission_X86_64CollectSlotsConverged(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn)
-    collected = Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn, {})
+FUNCTION Fission_X86_64CollectSlotsConverged(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn, functionParamCounts)
+    collected = Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn, {}, functionParamCounts)
     round = 0
     WHILE round < 2
-        collected = Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn, collected.Kinds)
+        collected = Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKindsIn, classFieldsIn, classParentsIn, collected.Kinds, functionParamCounts)
         round = round + 1
     WEND
     RETURN collected
@@ -1495,7 +1631,7 @@ END FUNCTION
 ' own emission-time check runs -- reported there as a real diagnostic
 ' (see that function's own Call-argument handling), not silently
 ' misinterpreted.
-FUNCTION Fission_X86_64InferSignatures(amirModule, functionNames)
+FUNCTION Fission_X86_64InferSignatures(amirModule, functionNames, functionParamCounts)
     ' Needed here too (not just by Fission_X86_64CollectClassFields/
     ' Fission_X86_64LowerFunction) so a METHOD call's own dest kind can
     ' resolve through a real EXTENDS chain during convergence itself --
@@ -1559,7 +1695,7 @@ FUNCTION Fission_X86_64InferSignatures(amirModule, functionNames)
         FOR fn IN amirModule.Functions
             fnParamKinds = Object.Get(paramKinds, fn.Name, [])
             fnReturnKind = Object.Get(returnKinds, fn.Name, "Number")
-            collected = Fission_X86_64CollectSlotsConverged(fn, functionNames, fnParamKinds, returnKinds, fieldKinds, classParents)
+            collected = Fission_X86_64CollectSlotsConverged(fn, functionNames, fnParamKinds, returnKinds, fieldKinds, classParents, functionParamCounts)
 
             ' A real bug found and fixed while adding CLASS support: this
             ' merge originally only ever recognized "String" as a real
@@ -1739,6 +1875,29 @@ FUNCTION Fission_X86_64PolyClassesOfKind(kind)
     RETURN String.Split(String.Slice(kind, 5, String.Length(kind) - 5), ",")
 END FUNCTION
 
+' Real CALLABLE support -- a "Callable:Func1,Func2,..." parameterized
+' kind, mirroring "Poly:Class1,Class2,..." exactly (same first-seen,
+' deduplicated candidate-set-per-VARIABLE shape, same MergeKinds
+' machinery below): a real, previously-found bug (see MergeKinds' own
+' comment) showed that a single generic "Callable" kind with a
+' WHOLE-MODULE candidate set was too broad -- two UNRELATED functions
+' that merely happen to share the same arity (e.g. a Number-param
+' `Square` and a String-param `Greet`) could pollute each other's own
+' converged parameter kinds purely by virtue of arity matching, even
+' though no real ArcoBASIC variable ever actually held both. Scoping
+' the candidate set to "every target THIS EXACT variable/parameter was
+' ever observed holding" (grown incrementally from real ADDRESSOF/Store
+' evidence, the identical mechanism real class polymorphism already
+' uses) closes that gap the same way Poly's own per-variable candidate
+' set already does for class instances.
+FUNCTION Fission_X86_64IsCallableKind(kind)
+    RETURN String.StartsWith(kind, "Callable:")
+END FUNCTION
+
+FUNCTION Fission_X86_64CallableTargetsOfKind(kind)
+    RETURN String.Split(String.Slice(kind, 9, String.Length(kind) - 9), ",")
+END FUNCTION
+
 ' Merges two kinds observed for the SAME variable at two different Store
 ' sites within one function -- used by Fission_X86_64CollectSlots so a
 ' variable assigned `Dog` down one branch and `Animal` down another
@@ -1754,6 +1913,27 @@ END FUNCTION
 ' still catches and reports it correctly.
 FUNCTION Fission_X86_64MergeKinds(existingKind, newKind)
     IF existingKind == newKind THEN RETURN existingKind
+    ' Real CALLABLE support -- the exact same union-of-candidates merge
+    ' Poly gets below, just for "Callable:Func1,Func2,..." instead of
+    ' "Poly:Class1,Class2,...", handled here BEFORE the object-ish
+    ' branches so two Callable kinds never fall into the plain "last
+    ' non-Number kind wins" path every other non-object kind uses (see
+    ' Fission_X86_64IsCallableKind's own comment for why a per-variable
+    ' UNION, not an overwrite, is required here).
+    IF Fission_X86_64IsCallableKind(existingKind) ANDALSO Fission_X86_64IsCallableKind(newKind) THEN
+        targets = []
+        FOR t IN Fission_X86_64CallableTargetsOfKind(existingKind)
+            ignored = Array.Push(targets, t)
+        NEXT
+        FOR t IN Fission_X86_64CallableTargetsOfKind(newKind)
+            alreadyPresent = FALSE
+            FOR existing IN targets
+                IF existing == t THEN alreadyPresent = TRUE
+            NEXT
+            IF alreadyPresent == FALSE THEN ignored = Array.Push(targets, t)
+        NEXT
+        RETURN "Callable:" + Array.Join(targets, ",")
+    END IF
     existingIsObjectish = Fission_X86_64IsObjectKind(existingKind) ORELSE Fission_X86_64IsPolyKind(existingKind)
     newIsObjectish = Fission_X86_64IsObjectKind(newKind) ORELSE Fission_X86_64IsPolyKind(newKind)
     ' Real floating-point support: when NEITHER kind is object-ish, this
@@ -1824,6 +2004,23 @@ FUNCTION Fission_X86_64KindCompatibleWithVariable(valueKind, variableKind)
         FOR c IN Fission_X86_64PolyClassesOfKind(variableKind)
             IF c == targetClass THEN RETURN TRUE
         NEXT
+    END IF
+    ' Real CALLABLE support -- the exact same real reasoning as the Poly
+    ' case just above, just for "Callable:Func1,Func2,..." instead of
+    ' "Poly:Class1,Class2,...": every individual Store site only ever
+    ' assigns ONE `ADDRESSOF` target's own single-target kind (e.g.
+    ' "Callable:Square"), which must be checked as MEMBERSHIP in the
+    ' variable's own final, fully-converged, UNIONED candidate set
+    ' ("Callable:Square,Double"), not literal string equality against it.
+    IF Fission_X86_64IsCallableKind(variableKind) ANDALSO Fission_X86_64IsCallableKind(valueKind) THEN
+        FOR target IN Fission_X86_64CallableTargetsOfKind(valueKind)
+            targetIsMember = FALSE
+            FOR c IN Fission_X86_64CallableTargetsOfKind(variableKind)
+                IF c == target THEN targetIsMember = TRUE
+            NEXT
+            IF targetIsMember == FALSE THEN RETURN FALSE
+        NEXT
+        RETURN TRUE
     END IF
     RETURN FALSE
 END FUNCTION
@@ -3045,9 +3242,9 @@ END FUNCTION
 ' a string can appear in any function), and whether itoa_print/str_print
 ' (shared, emitted once at the very end) are needed by ANY function, not
 ' just this one.
-FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures, classFields, classParents)
+FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures, classFields, classParents, functionParamCounts)
     fnParamKinds = Object.Get(signatures.ParamKinds, fn.Name, [])
-    collected = Fission_X86_64CollectSlotsConverged(fn, functionNames, fnParamKinds, signatures.ReturnKinds, classFields, classParents)
+    collected = Fission_X86_64CollectSlotsConverged(fn, functionNames, fnParamKinds, signatures.ReturnKinds, classFields, classParents, functionParamCounts)
     frame = Fission_X86_64BuildFrame(collected.Names)
     offsets = frame.Offsets
     kinds = collected.Kinds
@@ -3178,6 +3375,38 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 ' handling), so this Just Works for every value now, not
                 ' only values that happened to fit in 32 bits before.
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, value, "rax"))
+                ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, dest))
+                CONTINUE FOR
+            END IF
+            ' Real CALLABLE support (`ADDRESSOF Foo`) -- see
+            ' Fission_X86_64IsCallableKind' own header comment
+            ' for the full design. A callable value's own runtime
+            ' identity is physically just a String naming the target
+            ' function -- emitted via the exact same rodata `.asciz` +
+            ' `lea` pattern an ordinary string CONST above already uses,
+            ' no new representation needed. Real, disclosed scope
+            ' reduction matching the legacy native x86-64 backend's own
+            ' identical restriction: only a plain function name is
+            ' supported (a dotted target -- SUPER-style class-qualified,
+            ' or a bound instance method, e.g. `ADDRESSOF instance.
+            ' Method` -- is real, unattempted future work, matching the
+            ' call-site dispatch's own identical restriction below).
+            IF kind == "Addressof" THEN
+                name = instruction.Field("Name")
+                dest = instruction.Field("Dest")
+                IF String.Contains(name, ".") THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "ADDRESSOF " + name + " (a class-qualified or bound instance method) is not supported by native x86-64 codegen -- only a plain function name is supported")
+                    CONTINUE FOR
+                END IF
+                IF Object.Has(functionNames, name) == FALSE THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "ADDRESSOF cannot resolve callable: \"" + name + "\" is not a declared function")
+                    CONTINUE FOR
+                END IF
+                label = "str" + String(context.StringCount)
+                context.StringCount = context.StringCount + 1
+                ignored = Array.Push(context.RodataLines, label + ":")
+                ignored = Array.Push(context.RodataLines, "    .asciz \"" + Fission_X86_64EscapeAscii(name) + "\"")
+                ignored = Array.Push(textLines, "    lea " + label + "(%rip), %rax")
                 ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, dest))
                 CONTINUE FOR
             END IF
@@ -4607,6 +4836,68 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                         args = rewrittenArgs
                     END IF
                 END IF
+                ' Real CALLABLE support: `callee` is a bare, non-dotted
+                ' name that is NOT a declared function -- if it is
+                ' tracked as Callable-kind, this call is a real dispatch
+                ' THROUGH the variable/parameter holding it (see
+                ' Fission_X86_64IsCallableKind' own header
+                ' comment for the full design). The candidate set is
+                ' every ADDRESSOF target anywhere in the WHOLE MODULE,
+                ' filtered down to real declared functions whose own
+                ' arity matches THIS call site's own argument count (a
+                ' genuine arity mismatch could never actually be what
+                ' this callable holds at runtime, matching the identical
+                ' arity-filtering reasoning the legacy native x86-64
+                ' backend's own equivalent feature already established,
+                ' see src/compiler/fission.cpp's own "candidate_could_
+                ' match" comment) -- each compared, at runtime, against
+                ' the callable's own STRING value via `str_equals`, the
+                ' SAME real technique the polymorphic-receiver dispatch
+                ' above already uses for a `__class` tag, just comparing
+                ' the callable's own value directly instead of a field
+                ' read (a callable IS physically just a string naming its
+                ' target function -- see Fission_X86_64CollectSlots' own
+                ' "Addressof" comment).
+                IF Fission_X86_64IsCallableKind(Fission_X86_64OperandKind(kinds, callee)) THEN
+                    matchingCandidates = []
+                    FOR candidateName IN Fission_X86_64CallableTargetsOfKind(Fission_X86_64OperandKind(kinds, callee))
+                        IF Object.Has(functionNames, candidateName) ANDALSO LEN(Object.Get(signatures.ParamKinds, candidateName, [])) == LEN(args) THEN
+                            ignored = Array.Push(matchingCandidates, candidateName)
+                        END IF
+                    NEXT
+                    IF LEN(matchingCandidates) == 0 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " through a callable variable is not supported by native x86-64 codegen: no candidate this variable could ever hold matches this call site's own argument count")
+                        CONTINUE FOR
+                    END IF
+                    context.DispatchCount = context.DispatchCount + 1
+                    dispatchId = String(context.DispatchCount)
+                    doneLabel = "callable_dispatch_done_" + dispatchId
+                    candidateIndex = 0
+                    WHILE candidateIndex < LEN(matchingCandidates)
+                        isLastCandidate = candidateIndex == LEN(matchingCandidates) - 1
+                        nextLabel = "callable_dispatch_next_" + dispatchId + "_" + String(candidateIndex)
+                        IF isLastCandidate == FALSE THEN
+                            candidateLabel = "str" + String(context.StringCount)
+                            context.StringCount = context.StringCount + 1
+                            ignored = Array.Push(context.RodataLines, candidateLabel + ":")
+                            ignored = Array.Push(context.RodataLines, "    .asciz \"" + Fission_X86_64EscapeAscii(matchingCandidates[candidateIndex]) + "\"")
+                            ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, callee, "rdi"))
+                            ignored = Array.Push(textLines, "    lea " + candidateLabel + "(%rip), %rsi")
+                            ignored = Array.Push(textLines, "    call str_equals")
+                            ignored = Array.Push(textLines, "    test %rax, %rax")
+                            ignored = Array.Push(textLines, "    jz " + nextLabel)
+                            context.UsesStrEquals = TRUE
+                        END IF
+                        ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, matchingCandidates[candidateIndex], args, destOperand, isVoidCall)
+                        IF isLastCandidate == FALSE THEN
+                            ignored = Array.Push(textLines, "    jmp " + doneLabel)
+                            ignored = Array.Push(textLines, nextLabel + ":")
+                        END IF
+                        candidateIndex = candidateIndex + 1
+                    WEND
+                    ignored = Array.Push(textLines, doneLabel + ":")
+                    CONTINUE FOR
+                END IF
                 IF Object.Has(functionNames, callee) == FALSE THEN
                     ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Call to a function native x86-64 codegen does not know how to lower (not a user-declared ArcoBASIC function): " + callee)
                     CONTINUE FOR
@@ -4678,6 +4969,10 @@ END FUNCTION
 FUNCTION Fission_AmirToX86_64(amirModule)
     program = FissionX86_64Program()
     functionNames = Fission_X86_64CollectFunctionNames(amirModule)
+    ' Real CALLABLE support -- see Fission_X86_64IsCallableKind'
+    ' own header comment. Computed once, module-wide, exactly like
+    ' `functionNames`/`classParents` themselves.
+    functionParamCounts = Fission_X86_64CollectFunctionParamCounts(amirModule)
     context = {RodataLines: [], StringCount: 0, FloatCount: 0, DispatchCount: 0, UsesItoa: FALSE, UsesStrPrint: FALSE, UsesConcat: FALSE, UsesStrEquals: FALSE, UsesArrayAlloc: FALSE, UsesArrayPrint: FALSE, UsesArrayPrintString: FALSE, UsesArrayPrintFloat: FALSE, UsesBoolPrint: FALSE, UsesObjectAlloc: FALSE, UsesHostBridge: FALSE, UsesBoolToString: FALSE}
     ' Real inter-procedural string-parameter/return-value inference, run
     ' to a full fixed point BEFORE any real emission -- see
@@ -4688,7 +4983,7 @@ FUNCTION Fission_AmirToX86_64(amirModule)
     ' kind, so a string parameter/return value now Just Works through the
     ' exact same LOAD/STORE/mov machinery Phase 4 already built for string
     ' VARIABLES -- moving a pointer is no different from moving a number.
-    signatures = Fission_X86_64InferSignatures(amirModule, functionNames)
+    signatures = Fission_X86_64InferSignatures(amirModule, functionNames, functionParamCounts)
     ' Real inheritance: {ChildClassName: ParentClassName}, from every real
     ' EXTENDS clause this module declares -- see Fission_X86_64
     ' CollectClassParents' own comment. Feeds BOTH real inheritance-aware
@@ -4707,7 +5002,7 @@ FUNCTION Fission_AmirToX86_64(amirModule)
         isMain = fn.Name == "Main"
         labelPrefix = ""
         IF isMain == FALSE THEN labelPrefix = fn.Name + "_"
-        functionLines = Fission_X86_64LowerFunction(program.Diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures, classFields, classParents)
+        functionLines = Fission_X86_64LowerFunction(program.Diagnostics, fn, isMain, labelPrefix, functionNames, context, signatures, classFields, classParents, functionParamCounts)
         FOR line IN functionLines
             ignored = Array.Push(allTextLines, line)
         NEXT

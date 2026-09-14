@@ -1,0 +1,72 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's own native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention.
+'
+' Real CALLABLE support: `ADDRESSOF Foo` and calling through a variable
+' that holds one. A callable's own runtime identity is physically just a
+' String naming its target function (reusing this backend's ordinary
+' String representation verbatim), and a call through it dispatches via
+' a real, closed, compile-time-enumerable candidate set (every ADDRESSOF
+' target anywhere in the WHOLE MODULE, filtered by arity per call site)
+' compared at runtime via `str_equals` -- the SAME real technique this
+' backend's own polymorphic instance-method dispatch already uses for a
+' `__class` tag, and the SAME real design the legacy native x86-64
+' backend (src/compiler/fission.cpp, RFC-0049) already established for
+' this exact feature. Only a plain function name is supported (a
+' class-qualified or bound-instance-method ADDRESSOF target is real,
+' disclosed, unattempted future work, matching the legacy backend's own
+' identical restriction) -- not exercised here.
+'
+' Exercises: reassigning the SAME callable variable to different
+' 1-argument targets; a 0-argument callable returning a String
+' (disjoint-arity candidate set correctly does not interfere with a
+' 1-argument callable elsewhere in the same module -- a real bug found
+' and fixed this session, both for a call's own DEST kind and for
+' argument-kind evidence feeding a callee whose ONLY real invocation is
+' through a callable, never by its own name); a callable passed as an
+' ordinary function PARAMETER and called from inside that function; a
+' void call through a callable (no captured result) for both a
+' 0-argument and a 1-argument target.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+FUNCTION Square(x)
+    RETURN x * x
+END FUNCTION
+
+FUNCTION Double(x)
+    RETURN x * 2
+END FUNCTION
+
+FUNCTION Hello()
+    RETURN "hi"
+END FUNCTION
+
+FUNCTION SayHi()
+    PRINT "hi from SayHi"
+END FUNCTION
+
+FUNCTION Greet(name)
+    PRINT "hello " + name
+END FUNCTION
+
+FUNCTION ApplyTwice(fn, x)
+    RETURN fn(fn(x))
+END FUNCTION
+
+f = ADDRESSOF Square
+PRINT f(5)
+f = ADDRESSOF Double
+PRINT f(5)
+
+g = ADDRESSOF Hello
+PRINT g()
+
+PRINT ApplyTwice(ADDRESSOF Double, 3)
+
+h = ADDRESSOF SayHi
+ignored = h()
+
+k = ADDRESSOF Greet
+ignored = k("world")

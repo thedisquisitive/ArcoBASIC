@@ -3632,6 +3632,79 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   `ArcoFission compile-run`, plus the direct
   `tests/integration/fission_substrate_core_smoke.sh` script -- never
   the broad `fissure run`, per this session's standing directive.
+- DONE -- real CALLABLE support (`ADDRESSOF Foo` and calling through a
+  variable/parameter holding one), triggered directly by the user's own
+  "Fix the missing CALLABLEs, coulda sworn we had that already." A real,
+  correct recollection: `src/compiler/fission.cpp` (the LEGACY native
+  x86-64 backend, RFC-0049) already has this feature -- the NEW,
+  self-hosted Fission Compiler Substrate (this whole ledger) is a
+  from-scratch reimplementation that had not yet ported it. The SIR/A-MIR
+  layers already produced a real, dedicated `Addressof` instruction
+  (`fission/sir/lower_amir.abas`, pre-existing, unused by this backend
+  until now); this pass is what actually LOWERS it.
+  Real design, deliberately ported from the legacy backend's own
+  approach rather than invented fresh: a callable's runtime identity is
+  physically just a String naming its target function (reusing this
+  backend's ordinary String representation and CONST-string machinery
+  verbatim -- no new value representation at all), tagged with a real,
+  PARAMETERIZED "Callable:Func1,Func2,..." compile-time kind, mirroring
+  "Poly:Class1,Class2,..." exactly (same `Fission_X86_64MergeKinds`
+  union-of-candidates machinery, same per-VARIABLE-not-whole-module
+  candidate-set scoping, same `Fission_X86_64KindCompatibleWithVariable`
+  membership check). A call through a callable dispatches via the SAME
+  real runtime `str_equals`-against-a-closed-candidate-set technique
+  this backend's own polymorphic instance-method dispatch already uses,
+  sidestepping the need for a genuine indirect function-pointer call or
+  uniform calling-convention thunk entirely.
+  A real, INSTRUCTIVE debugging arc, not a clean first try: the FIRST
+  design used a single generic "Callable" kind with a WHOLE-MODULE
+  candidate set (every `ADDRESSOF` target anywhere, filtered by arity
+  per call site) -- this compiled and even passed an initial probe, but
+  a fuller probe combining a 1-argument Number-returning callable and an
+  UNRELATED 0-argument String-returning one in the SAME module exposed
+  two real, confirmed bugs: (1) a call site's own DEST KIND could be
+  hijacked by a same-arity candidate that variable never actually held
+  (`PRINT f(5)` misrendered via `str_print` instead of `itoa_print`);
+  (2) a function called ONLY through a callable (never once by its own
+  real name) never received real argument-kind evidence at all, so its
+  own parameters stayed stuck at "Number", causing a spurious "cannot be
+  both Number and String" conflict against its REAL other call site.
+  Both root-caused via a real `bash -x`-style debugging tool built for
+  this (a small ArcoBASIC script driving this backend's own pipeline
+  functions in-process and printing `program.Render()`, since this
+  self-hosted backend has no separate `.s`-file/GAS step to inspect).
+  Root cause: candidates were being collected MODULE-WIDE instead of
+  PER-VARIABLE. Fixed by re-deriving the whole feature on the SAME
+  per-variable "Poly:..." pattern real class polymorphism already
+  proved correct, closing both bugs at once (confirmed via the same two
+  probes, byte-for-byte against the oracle, plus the full existing
+  34-fixture suite re-verified with zero regressions before the new
+  fixture was added -- the same discipline the growable-array pass
+  established).
+  Real, disclosed scope, matching the legacy backend's own identical
+  restriction: only a plain function name is supported as an ADDRESSOF
+  target (a class-qualified or bound-instance-method target, e.g.
+  `ADDRESSOF instance.Method`, is real, unattempted future work,
+  verified to produce a real, clean diagnostic rather than a crash).
+  `Array.SortBy`/`MinBy`/`MaxBy` were NOT additionally attempted this
+  pass -- calling a callback from a HOST C function needs a genuine
+  indirect function-pointer ABI (the string-comparison dispatch this
+  pass built only works from INLINE ArcoBASIC-generated call sites,
+  where the candidate set is compile-time-visible); a real, deliberately
+  separate, larger undertaking, now unblocked as a well-scoped next step
+  if wanted (inline the sort/argmin/argmax loop directly into the
+  caller's own generated code, dispatching each comparison via this same
+  new machinery, rather than a C host function).
+  New permanent regression fixture: `callables.abas` -- diffed
+  byte-for-byte against `ArcoFission compile-run`, including a real
+  aliasing-through-reassignment case, a 0-argument String-returning
+  callable coexisting with 1-argument Number-returning ones (the exact
+  shape that exposed both bugs above), a callable passed as an ordinary
+  function parameter and called from inside that function, and void
+  calls through a callable.
+  Another golden-value update, same recurring pattern: the self-hosted
+  semantic corpus symbol count grew again (4129 -> 4150, file count 98
+  and import-edge count 157 both unchanged).
 
 ## In-Progress Components
 
