@@ -1,0 +1,74 @@
+' A real, ordinary ArcoBASIC program meant to be compiled BY the Fission
+' Compiler Substrate's own native x86-64 backend (fission/amir/lower_x86_64.abas)
+' -- see fission/tests/native_programs/hello_native.abas's own header
+' comment for the directory convention.
+'
+' Array.SortBy/MinBy/MaxBy -- real CALLABLE support (see
+' fission/tests/native_programs/callables.abas's own header comment for
+' the general ADDRESSOF/callable design this builds on). Each calls the
+' user's own key function back once per array element, a genuine
+' dispatch through the SAME closed-candidate-set `str_equals` chain
+' `callables.abas` already exercises, hand-emitted as real INLINE native
+' codegen directly in the caller's own function body (a plain host C
+' function has no way to call back into ArcoBASIC-compiled code at all).
+'
+' Exercises: SortBy ascending/descending with a Number key on a Number
+' array, SortBy with a Number key on a String array (also exercises the
+' real `LEN(string)` fix this same pass found and closed -- a
+' previously-missing case since bare LEN only ever supported arrays
+' before), MinBy/MaxBy on both; a real STABILITY check (many elements
+' sharing the SAME key must keep their original relative order, matching
+' the oracle's own real `std::stable_sort`); a callable variable
+' reassigned to a DIFFERENT key function between two SortBy calls; a
+' void SortBy call (result discarded); SortBy on a genuinely empty array
+' (a real, safe, disclosed simplification -- no crash, an empty result).
+'
+' Number and String key kinds only (a real, disclosed, narrower scope,
+' matching the established Array.Sort/Find/Contains precedent) -- not
+' exercised here since every fixture in this file already stays within
+' that supported subset.
+'
+' Expected output verified against legacy `ArcoFission compile-run` on this
+' identical source as the equivalence-testing oracle.
+FUNCTION Negate(x)
+    RETURN 0 - x
+END FUNCTION
+
+FUNCTION StrLen(s)
+    RETURN LEN(s)
+END FUNCTION
+
+FUNCTION Parity(x)
+    RETURN x MOD 2
+END FUNCTION
+
+FUNCTION Zero(x)
+    RETURN 0
+END FUNCTION
+
+nums = [5, 1, 4, 2, 3]
+PRINT Array.SortBy(nums, ADDRESSOF Negate)
+PRINT Array.SortBy(nums, ADDRESSOF Negate, TRUE)
+PRINT nums
+
+words = ["banana", "kiwi", "fig", "apple"]
+PRINT Array.SortBy(words, ADDRESSOF StrLen)
+
+PRINT Array.MinBy(nums, ADDRESSOF Negate)
+PRINT Array.MaxBy(nums, ADDRESSOF Negate)
+PRINT Array.MinBy(words, ADDRESSOF StrLen)
+PRINT Array.MaxBy(words, ADDRESSOF StrLen)
+
+vals = [10, 21, 32, 43, 54, 65]
+PRINT Array.SortBy(vals, ADDRESSOF Parity)
+
+f = ADDRESSOF Parity
+PRINT Array.SortBy(vals, f)
+f = ADDRESSOF Zero
+PRINT Array.SortBy(vals, f)
+
+ignored = Array.SortBy(vals, ADDRESSOF Parity)
+
+e = Array.New(0, 0)
+PRINT Array.SortBy(e, ADDRESSOF Negate)
+PRINT LEN(Array.SortBy(e, ADDRESSOF Negate))

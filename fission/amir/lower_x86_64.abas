@@ -1262,16 +1262,59 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 ' in place, so they need none of the deferred growable-
                 ' array representation change (see host_bridge.c's own
                 ' comment on this real, disclosed distinction).
-                IF Upper(callee) == "ARRAY.FIRST" ORELSE Upper(callee) == "ARRAY.LAST" ORELSE Upper(callee) == "ARRAY.REVERSE" ORELSE Upper(callee) == "ARRAY.SORT" ORELSE Upper(callee) == "ARRAY.POP" ORELSE Upper(callee) == "ARRAY.SHIFT" ORELSE Upper(callee) == "ARRAY.REMOVEAT" THEN
+                ' `Array.SortBy` joins Reverse/Sort here (a real NEW array
+                ' of the array's own SAME full kind); `Array.MinBy`/
+                ' `Array.MaxBy` join First/Last/Pop/Shift/RemoveAt (return
+                ' ONE element of the array's own element kind) -- all
+                ' three's real CALLABLE key-function argument never
+                ' affects the RESULT's own kind, only HOW it gets
+                ' computed (see Fission_X86_64LowerFunction's own
+                ' "ARRAY.SORTBY/MINBY/MAXBY" comment for the real inline
+                ' dispatch this needs).
+                IF Upper(callee) == "ARRAY.FIRST" ORELSE Upper(callee) == "ARRAY.LAST" ORELSE Upper(callee) == "ARRAY.REVERSE" ORELSE Upper(callee) == "ARRAY.SORT" ORELSE Upper(callee) == "ARRAY.POP" ORELSE Upper(callee) == "ARRAY.SHIFT" ORELSE Upper(callee) == "ARRAY.REMOVEAT" ORELSE Upper(callee) == "ARRAY.SORTBY" ORELSE Upper(callee) == "ARRAY.MINBY" ORELSE Upper(callee) == "ARRAY.MAXBY" THEN
                     arrArgs = Fission_X86_64SplitArgs(instruction.Field("Args"))
                     IF LEN(arrArgs) >= 1 THEN
                         arrBaseKind = Object.Get(kinds, arrArgs[0], "Number")
                         IF Fission_X86_64IsArrayKind(arrBaseKind) THEN
-                            IF Upper(callee) == "ARRAY.REVERSE" ORELSE Upper(callee) == "ARRAY.SORT" THEN
+                            IF Upper(callee) == "ARRAY.REVERSE" ORELSE Upper(callee) == "ARRAY.SORT" ORELSE Upper(callee) == "ARRAY.SORTBY" THEN
                                 destKind = arrBaseKind
                             ELSE
                                 destKind = Fission_X86_64ArrayElementKind(arrBaseKind)
                             END IF
+                        END IF
+                    END IF
+                END IF
+                ' Real CALLABLE support: `Array.SortBy`/`MinBy`/`MaxBy`'s
+                ' own key-function argument is called via a real, hand-
+                ' emitted INLINE dispatch loop (see Fission_X86_64
+                ' LowerFunction's own comment), never an ordinary AMIR
+                ' `Call` instruction -- so the generic "an argument is
+                ' real evidence for the callee's own parameter kind"
+                ' mechanism a few lines below never sees it at all. A
+                ' real, confirmed bug found while testing: a key function
+                ' called ONLY this way (never once by its own real name)
+                ' never received ANY evidence that its own parameter
+                ' should match the array's element kind, so it stayed
+                ' stuck at the seeded "Number" default -- `LEN(s)` inside
+                ' a key function receiving a real String array element
+                ' then failed to compile, even though the SAME `LEN` on a
+                ' genuinely String-kind operand elsewhere already works.
+                ' Fixed the same way ordinary callable-argument evidence
+                ' is: feed the array's own element kind as real evidence
+                ' for EVERY arity-matching candidate this key-function
+                ' callable could hold, directly here.
+                IF Upper(callee) == "ARRAY.SORTBY" ORELSE Upper(callee) == "ARRAY.MINBY" ORELSE Upper(callee) == "ARRAY.MAXBY" THEN
+                    keyByArgs = Fission_X86_64SplitArgs(instruction.Field("Args"))
+                    IF LEN(keyByArgs) >= 2 THEN
+                        keyByArrKind = Object.Get(kinds, keyByArgs[0], "Number")
+                        keyByFnKind = Object.Get(kinds, keyByArgs[1], "")
+                        IF Fission_X86_64IsArrayKind(keyByArrKind) ANDALSO Fission_X86_64IsCallableKind(keyByFnKind) THEN
+                            keyByElementKind = Fission_X86_64ArrayElementKind(keyByArrKind)
+                            FOR candidateName IN Fission_X86_64CallableTargetsOfKind(keyByFnKind)
+                                IF Object.Has(functionNames, candidateName) ANDALSO Object.Get(functionParamCounts, candidateName, -1) == 1 THEN
+                                    ignored = Array.Push(callArgKindRequests, {Callee: candidateName, ArgIndex: 0, Kind: keyByElementKind})
+                                END IF
+                            NEXT
                         END IF
                     END IF
                 END IF
@@ -3940,8 +3983,26 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                 ' by array_alloc at allocation time) sits at [pointer],
                 ' read directly, no runtime scan needed.
                 args = Fission_X86_64SplitArgs(instruction.Field("Args"))
-                IF LEN(args) != 1 ORELSE Fission_X86_64OperandIsResolvable(offsets, args[0]) == FALSE ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
-                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "LEN is only supported on an array by native x86-64 codegen: " + instruction.Field("Args"))
+                IF LEN(args) != 1 ORELSE Fission_X86_64OperandIsResolvable(offsets, args[0]) == FALSE THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "LEN is only supported on an array or a string by native x86-64 codegen: " + instruction.Field("Args"))
+                    CONTINUE FOR
+                END IF
+                ' Bare `LEN(x)` also works on a real String (confirmed
+                ' via the oracle: `LEN("hello")` -> 5) -- real, previously
+                ' missing, found while building Array.SortBy/MinBy/MaxBy's
+                ' own test fixture (a key function using `LEN(s)` on a
+                ' String parameter). Dispatches to the SAME real
+                ' `arco_host_string_length` symbol `String.Length` already
+                ' uses; `Bytes.Length`/`Array.Length`/`Array.Size` stay
+                ' array-only (their own real ArcoBASIC names never apply
+                ' to a String value anyway).
+                IF Fission_X86_64OperandKind(kinds, args[0]) == "String" ANDALSO Upper(instruction.Field("Callee")) == "LEN" THEN
+                    ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_string_length", args, instruction.Field("Dest"), FALSE)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                IF Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE THEN
+                    ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "LEN is only supported on an array or a string by native x86-64 codegen: " + instruction.Field("Args"))
                     CONTINUE FOR
                 END IF
                 ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[0], "rax"))
@@ -4521,6 +4582,155 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                         CONTINUE FOR
                     END IF
                     ignored = Fission_X86_64EmitCall(textLines, offsets, kinds, signatures, diagnostics, "arco_host_array_sort_" + Lower(sortElementKind), args, destOperand, isVoidCall)
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                ' `Array.SortBy`/`Array.MinBy`/`Array.MaxBy` -- real
+                ' CALLABLE support: each calls the user's own key
+                ' function back once per element, a genuine dispatch
+                ' through this backend's own closed-candidate-set
+                ' `str_equals` chain (see Fission_X86_64IsCallableKind's
+                ' own header comment) that a plain host C function has no
+                ' way to do at all -- so the per-element KEY COMPUTATION
+                ' loop is hand-emitted here, real inline native codegen
+                ' directly in the CALLER's own function body (mirroring
+                ' array_print's own %rbx/%r12/%r13 callee-saved-register-
+                ' across-calls discipline, extended to %r14/%r15 -- all
+                ' five safe to use freely as pure scratch here: NOTHING
+                ' in this backend's OWN generated code, or `str_equals`,
+                ' ever keeps a value live in them ACROSS instructions,
+                ' and any host C function called from here automatically
+                ' preserves them too, real ordinary SysV ABI compliance).
+                ' Register plan: %rbx = array's own data pointer, %r12 =
+                ' the freshly allocated keys array's own HEADER, %r13 =
+                ' loop index, %r14 = element count, %r15 = the key
+                ' function's own callable VALUE (constant across the
+                ' loop, reloaded into %rdi before each candidate
+                ' comparison since `str_equals` clobbers it). Everything
+                ' AFTER the keys array is fully computed -- sorting/
+                ' reordering by it (SortBy) or finding the best index
+                ' (MinBy/MaxBy) -- needs no callback at all, so it
+                ' delegates to an ordinary host C function exactly like
+                ' every other Array.* function in this backend (see
+                ' fission/native_runtime/host_bridge.c's own comment on
+                ' this same split). Number and String key kinds only,
+                ' matching the established Array.Sort/Find/Contains
+                ' precedent (Float keys, and a key-function candidate set
+                ' whose own return kinds disagree, are real, disclosed,
+                ' narrower remaining gaps -- the FIRST candidate's own
+                ' return kind decides, the same simplification ordinary
+                ' Callable dispatch already makes).
+                IF Upper(callee) == "ARRAY.SORTBY" ORELSE Upper(callee) == "ARRAY.MINBY" ORELSE Upper(callee) == "ARRAY.MAXBY" THEN
+                    isSortBy = Upper(callee) == "ARRAY.SORTBY"
+                    maxArgsAllowed = 2
+                    IF isSortBy THEN maxArgsAllowed = 3
+                    IF LEN(args) < 2 ORELSE LEN(args) > maxArgsAllowed ORELSE Fission_X86_64IsArrayKind(Fission_X86_64OperandKind(kinds, args[0])) == FALSE ORELSE Fission_X86_64IsCallableKind(Fission_X86_64OperandKind(kinds, args[1])) == FALSE THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected an array and a callable key function)")
+                        CONTINUE FOR
+                    END IF
+                    sortByElementKind = Fission_X86_64ArrayElementKind(Fission_X86_64OperandKind(kinds, args[0]))
+                    IF sortByElementKind != "Number" ANDALSO sortByElementKind != "String" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " on an array of this element kind is not supported by native x86-64 codegen (expected Number or String)")
+                        CONTINUE FOR
+                    END IF
+                    keyCandidates = []
+                    FOR candidateName IN Fission_X86_64CallableTargetsOfKind(Fission_X86_64OperandKind(kinds, args[1]))
+                        IF Object.Has(functionNames, candidateName) ANDALSO Object.Get(functionParamCounts, candidateName, -1) == 1 THEN
+                            ignored = Array.Push(keyCandidates, candidateName)
+                        END IF
+                    NEXT
+                    IF LEN(keyCandidates) == 0 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with this key function is not supported by native x86-64 codegen: no candidate this variable could ever hold takes exactly one argument")
+                        CONTINUE FOR
+                    END IF
+                    keyReturnKind = Object.Get(signatures.ReturnKinds, keyCandidates[0], "Number")
+                    IF keyReturnKind != "Number" ANDALSO keyReturnKind != "String" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with a key function returning this kind is not supported by native x86-64 codegen (expected Number or String)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Array.Push(textLines, "    push %rbx")
+                    ignored = Array.Push(textLines, "    push %r12")
+                    ignored = Array.Push(textLines, "    push %r13")
+                    ignored = Array.Push(textLines, "    push %r14")
+                    ignored = Array.Push(textLines, "    push %r15")
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[0], "rax"))
+                    ignored = Array.Push(textLines, "    mov (%rax), %r14")
+                    ignored = Array.Push(textLines, "    mov 8(%rax), %rbx")
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[1], "r15"))
+                    ignored = Array.Push(textLines, "    mov %r14, %rdi")
+                    ignored = Array.Push(textLines, "    call arco_host_array_alloc_raw")
+                    ignored = Array.Push(textLines, "    mov %rax, %r12")
+                    ignored = Array.Push(textLines, "    xor %r13, %r13")
+                    context.DispatchCount = context.DispatchCount + 1
+                    dispatchId = String(context.DispatchCount)
+                    keyLoopLabel = "keyloop_start_" + dispatchId
+                    keyLoopDoneLabel = "keyloop_done_" + dispatchId
+                    ignored = Array.Push(textLines, keyLoopLabel + ":")
+                    ignored = Array.Push(textLines, "    cmp %r14, %r13")
+                    ignored = Array.Push(textLines, "    jge " + keyLoopDoneLabel)
+                    keyCandidateIndex = 0
+                    keyDispatchDoneLabel = "keyloop_dispatch_done_" + dispatchId
+                    WHILE keyCandidateIndex < LEN(keyCandidates)
+                        isLastKeyCandidate = keyCandidateIndex == LEN(keyCandidates) - 1
+                        keyNextLabel = "keyloop_dispatch_next_" + dispatchId + "_" + String(keyCandidateIndex)
+                        IF isLastKeyCandidate == FALSE THEN
+                            keyCandidateLabel = "str" + String(context.StringCount)
+                            context.StringCount = context.StringCount + 1
+                            ignored = Array.Push(context.RodataLines, keyCandidateLabel + ":")
+                            ignored = Array.Push(context.RodataLines, "    .asciz \"" + Fission_X86_64EscapeAscii(keyCandidates[keyCandidateIndex]) + "\"")
+                            ignored = Array.Push(textLines, "    mov %r15, %rdi")
+                            ignored = Array.Push(textLines, "    lea " + keyCandidateLabel + "(%rip), %rsi")
+                            ignored = Array.Push(textLines, "    call str_equals")
+                            ignored = Array.Push(textLines, "    test %rax, %rax")
+                            ignored = Array.Push(textLines, "    jz " + keyNextLabel)
+                            context.UsesStrEquals = TRUE
+                        END IF
+                        ignored = Array.Push(textLines, "    mov (%rbx,%r13,8), %rdi")
+                        ignored = Array.Push(textLines, "    call " + keyCandidates[keyCandidateIndex])
+                        IF isLastKeyCandidate == FALSE THEN
+                            ignored = Array.Push(textLines, "    jmp " + keyDispatchDoneLabel)
+                            ignored = Array.Push(textLines, keyNextLabel + ":")
+                        END IF
+                        keyCandidateIndex = keyCandidateIndex + 1
+                    WEND
+                    ignored = Array.Push(textLines, keyDispatchDoneLabel + ":")
+                    ignored = Array.Push(textLines, "    mov %rax, %rcx")
+                    ignored = Array.Push(textLines, "    mov 8(%r12), %rdx")
+                    ignored = Array.Push(textLines, "    mov %rcx, (%rdx,%r13,8)")
+                    ignored = Array.Push(textLines, "    inc %r13")
+                    ignored = Array.Push(textLines, "    jmp " + keyLoopLabel)
+                    ignored = Array.Push(textLines, keyLoopDoneLabel + ":")
+                    IF isSortBy THEN
+                        ignored = Array.Push(textLines, "    mov 8(%r12), %rdi")
+                        ignored = Array.Push(textLines, "    mov %r14, %rsi")
+                        IF LEN(args) == 3 THEN
+                            ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[2], "rdx"))
+                        ELSE
+                            ignored = Array.Push(textLines, "    mov $0, %rdx")
+                        END IF
+                        ignored = Array.Push(textLines, "    call arco_host_array_sort_indices_" + Lower(keyReturnKind))
+                        ignored = Array.Push(textLines, "    mov %rax, %r15")
+                        ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[0], "rdi"))
+                        ignored = Array.Push(textLines, "    mov %r15, %rsi")
+                        ignored = Array.Push(textLines, "    call arco_host_array_reorder")
+                    ELSE
+                        maximumFlag = "0"
+                        IF Upper(callee) == "ARRAY.MAXBY" THEN maximumFlag = "1"
+                        ignored = Array.Push(textLines, "    mov 8(%r12), %rdi")
+                        ignored = Array.Push(textLines, "    mov %r14, %rsi")
+                        ignored = Array.Push(textLines, "    mov $" + maximumFlag + ", %rdx")
+                        ignored = Array.Push(textLines, "    call arco_host_array_argbest_" + Lower(keyReturnKind))
+                        ignored = Array.Push(textLines, "    mov %rax, %rcx")
+                        ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[0], "rdi"))
+                        ignored = Array.Push(textLines, "    mov %rcx, %rsi")
+                        ignored = Array.Push(textLines, "    call arco_host_array_element_at")
+                    END IF
+                    ignored = Array.Push(textLines, "    pop %r15")
+                    ignored = Array.Push(textLines, "    pop %r14")
+                    ignored = Array.Push(textLines, "    pop %r13")
+                    ignored = Array.Push(textLines, "    pop %r12")
+                    ignored = Array.Push(textLines, "    pop %rbx")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
                     context.UsesHostBridge = TRUE
                     CONTINUE FOR
                 END IF

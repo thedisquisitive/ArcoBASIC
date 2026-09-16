@@ -2134,3 +2134,149 @@ arco_i64 arco_host_array_resize(arco_i64* header, arco_i64 size, arco_i64 fill) 
     header[1] = (arco_i64)newData;
     return newCount;
 }
+
+// Array.SortBy/MinBy/MaxBy -- real CALLABLE support (see
+// fission/amir/lower_x86_64.abas' own comment on `Fission_X86_64
+// IsCallableKind` for the full design). Calling the user's own key
+// function back once per element needs a genuine dispatch through this
+// backend's own closed-candidate-set `str_equals` chain, which only
+// works from INLINE ArcoBASIC-generated call sites (the candidate set is
+// resolved at COMPILE TIME from the callable operand's own tracked kind)
+// -- a plain host C function like every other one in this file has no
+// way to do that at all. So these three are split in two: the per-
+// element KEY COMPUTATION loop (calling the user's key function through
+// the real dispatch chain) is real, INLINE native codegen emitted
+// directly into the caller's own function body (see
+// Fission_X86_64LowerFunction's own "ARRAY.SORTBY/MINBY/MAXBY" comment);
+// everything else here -- sorting/reordering by an ALREADY-COMPUTED keys
+// array, which needs no callback at all -- is an ordinary host C
+// function exactly like every other one in this file.
+
+// arco_host_array_alloc_raw -- a real, callable NATIVE SYMBOL wrapper
+// around this file's own internal `arco_array_alloc` (normally a
+// `static inline` helper other C functions in this file call directly,
+// never itself a real linkable symbol) -- the inline key-computation
+// loop above needs to allocate a real new keys array directly from
+// GENERATED ASSEMBLY (`call arco_host_array_alloc_raw`), which can only
+// ever reach a real, non-inlined symbol, never a C-level inline helper.
+const void* arco_host_array_alloc_raw(arco_i64 length) {
+    return (const void*)arco_array_alloc(length);
+}
+
+// Array.SortBy's own real sorting step, GIVEN an already-computed keys
+// array (one key per element, same order): returns a real NEW
+// Array:Number of PERMUTATION INDICES `[0, count)`, ordered so that
+// `keys[permutation[i]]` is sorted (ascending, or descending when
+// `descending` is truthy) -- the caller (real inline codegen) then
+// reorders the ORIGINAL array by this same permutation via
+// `arco_host_array_reorder` below. A real, hand-rolled STABLE insertion
+// sort (strict `>`/`<` comparisons only, matching the oracle's own real
+// `std::stable_sort` -- ties never swap, preserving original relative
+// order), matching this file's own established "simple over clever"
+// discipline (no `qsort` under `-nostdlib`).
+const void* arco_host_array_sort_indices_number(const arco_i64* keys, arco_i64 count, arco_i64 descending) {
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* idx = arco_array_data(result);
+    arco_i64 i = 0;
+    while (i < count) { idx[i] = i; i = i + 1; }
+    i = 1;
+    while (i < count) {
+        arco_i64 currentIdx = idx[i];
+        arco_i64 currentKey = keys[currentIdx];
+        arco_i64 j = i - 1;
+        while (j >= 0) {
+            arco_i64 cmpKey = keys[idx[j]];
+            int shouldMove = descending ? (cmpKey < currentKey) : (cmpKey > currentKey);
+            if (!shouldMove) break;
+            idx[j + 1] = idx[j];
+            j = j - 1;
+        }
+        idx[j + 1] = currentIdx;
+        i = i + 1;
+    }
+    return (const void*)result;
+}
+// Same real stable insertion sort, comparing String-kind keys via
+// ordinary byte-wise ordering (`arco_raw_strings_less_than`, the SAME
+// real comparator Array.Sort's own String variant already uses).
+const void* arco_host_array_sort_indices_string(const arco_i64* keys, arco_i64 count, arco_i64 descending) {
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* idx = arco_array_data(result);
+    arco_i64 i = 0;
+    while (i < count) { idx[i] = i; i = i + 1; }
+    i = 1;
+    while (i < count) {
+        arco_i64 currentIdx = idx[i];
+        const char* currentKey = (const char*)keys[currentIdx];
+        arco_i64 j = i - 1;
+        while (j >= 0) {
+            const char* cmpKey = (const char*)keys[idx[j]];
+            int shouldMove = descending ? arco_raw_strings_less_than(cmpKey, currentKey) : arco_raw_strings_less_than(currentKey, cmpKey);
+            if (!shouldMove) break;
+            idx[j + 1] = idx[j];
+            j = j - 1;
+        }
+        idx[j + 1] = currentIdx;
+        i = i + 1;
+    }
+    return (const void*)result;
+}
+
+// Array.SortBy's own final step: builds a real NEW array by reading
+// `arr`'s own elements in the order `indices` (a real Array:Number of
+// permutation indices, e.g. from `arco_host_array_sort_indices_number`/
+// `_string` above) specifies -- kind-agnostic raw slot copy, same as
+// Array.Reverse/Sort.
+const void* arco_host_array_reorder(const arco_i64* arr, const arco_i64* indices) {
+    arco_i64 count = arco_array_length(indices);
+    const arco_i64* srcData = arco_array_data(arr);
+    const arco_i64* idx = arco_array_data(indices);
+    arco_i64* result = arco_array_alloc(count);
+    arco_i64* data = arco_array_data(result);
+    arco_i64 i = 0;
+    while (i < count) { data[i] = srcData[idx[i]]; i = i + 1; }
+    return (const void*)result;
+}
+
+// Array.MinBy/MaxBy's own real "which index has the best key" step,
+// GIVEN an already-computed keys array -- a real linear scan, matching
+// the oracle's own real `extrema_by` exactly (first element is the
+// initial best; a STRICTLY better later key replaces it, so among EQUAL
+// keys the FIRST one found wins, matching `bool better = ... > ...`/
+// `... < ...`, never `>=`/`<=`). Real, disclosed simplification for a
+// genuinely empty array (0, matching this backend's own established
+// First/Last/Pop/Shift-on-empty precedent, never reached from real
+// generated code anyway -- the caller's own inline codegen only emits
+// this call after confirming a non-zero element count).
+arco_i64 arco_host_array_argbest_number(const arco_i64* keys, arco_i64 count, arco_i64 maximum) {
+    if (count == 0) return 0;
+    arco_i64 best = 0;
+    arco_i64 bestKey = keys[0];
+    arco_i64 i = 1;
+    while (i < count) {
+        int better = maximum ? (keys[i] > bestKey) : (keys[i] < bestKey);
+        if (better) { best = i; bestKey = keys[i]; }
+        i = i + 1;
+    }
+    return best;
+}
+arco_i64 arco_host_array_argbest_string(const arco_i64* keys, arco_i64 count, arco_i64 maximum) {
+    if (count == 0) return 0;
+    arco_i64 best = 0;
+    const char* bestKey = (const char*)keys[0];
+    arco_i64 i = 1;
+    while (i < count) {
+        const char* candidateKey = (const char*)keys[i];
+        int better = maximum ? arco_raw_strings_less_than(bestKey, candidateKey) : arco_raw_strings_less_than(candidateKey, bestKey);
+        if (better) { best = i; bestKey = candidateKey; }
+        i = i + 1;
+    }
+    return best;
+}
+
+// A plain indexed read, kind-agnostic raw slot -- used by Array.MinBy/
+// MaxBy's own inline codegen to read the ORIGINAL element (not the key)
+// at the winning index `arco_host_array_argbest_number`/`_string` found.
+arco_i64 arco_host_array_element_at(const arco_i64* arr, arco_i64 index) {
+    return arco_array_data(arr)[index];
+}
