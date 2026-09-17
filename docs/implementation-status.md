@@ -2,6 +2,17 @@
 
 This repository now contains the first runnable slice of ArcoBASIC.
 
+> **ArcoSH status:** every "ArcoSH ..." bullet below describes the retired `src/shell/arcosh.cpp`
+> implementation, which no longer builds as a product (the `arcosh` executable target was removed).
+> ArcoSH is restarting from scratch, governed by
+> [RFC-0052](../arcosh/rfcs/RFC-0052_The_Arcology_Shell.md), as the standalone, Linux-focused
+> [`arcosh/`](../arcosh/README.md) project, authored in ArcoBASIC itself. WP-001 (shell skeleton:
+> interactive loop, prompt, `--version`/`--diagnostic`, terminal capability query, no-color mode)
+> and WP-002 (Arcology colon-path <-> Linux path translation, `cd`) are done; WP-004 onward (real
+> command execution, history/`oops`, resident program, themes, plugins, job control) has not
+> started. Treat this section as a historical record of the old implementation's scope, not
+> current status.
+
 Implemented:
 
 * C++ runtime object with sandbox-style instruction limits

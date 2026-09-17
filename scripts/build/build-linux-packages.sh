@@ -286,7 +286,6 @@ build_tarball() {
 ArcoBASIC portable Linux package
 
 Run tools directly from:
-  usr/bin/arcosh
   usr/bin/arco_cli
   usr/bin/ArcoFission
 
@@ -331,7 +330,6 @@ mkdir -p %{buildroot}
 cp -a "$install_root"/* %{buildroot}/
 
 %files
-/usr/bin/arcosh
 /usr/bin/arco_cli
 /usr/bin/ArcoFission
 /usr/share/arcobasic
@@ -395,7 +393,7 @@ do_build() {
 }
 
 do_check() {
-	ctest --test-dir build --output-on-failure -R 'arcosh_alpha_smoke|arcofission_alpha_smoke'
+	ctest --test-dir build --output-on-failure -R 'arcofission_alpha_smoke'
 }
 
 do_install() {

@@ -268,10 +268,17 @@ books/                Long-form technical references for Arcology components
 arcology-os/          Arcology OS systems library, UEFI examples, tests, tooling, RFCs, and docs
 arcology-commons/     Standalone Arcology Commons social network written in ArcoBASIC
 lazarus/              Arcology Lazarus recovery appliance and live environment
+arcosh/               Arcology Shell restart: standalone, Linux-focused, independently built
 ```
 
 See [`docs/project-layout.md`](docs/project-layout.md) for library boundaries, dependency rules,
 and guidance for placing new files.
+
+> **ArcoSH is being rewritten.** Development restarted as the standalone project in
+> [`arcosh/`](arcosh/README.md); the previous `arcosh` executable no longer builds from this root
+> project. The many `arcosh examples/...` commands shown throughout this README (ArcoNet, ArcoNav,
+> mods, ArcoMart, etc.) describe that previous implementation's behavior and won't run until the
+> new shell reaches parity.
 
 ---
 

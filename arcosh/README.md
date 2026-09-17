@@ -1,0 +1,211 @@
+# Arcology Shell (arcosh)
+
+This is a fresh, Linux-focused restart of ArcoSH, now governed by
+[RFC-0052 "The Arcology Shell"](rfcs/RFC-0052_The_Arcology_Shell.md). It is developed as its own
+standalone CMake project independent of the umbrella ArcoBASIC build (it is not
+`add_subdirectory`'d from the root `CMakeLists.txt`).
+
+Per RFC-0052 section 6, `arcosh` is authored **in ArcoBASIC itself** and compiled through
+ArcoFission, not hand-written in C++.
+
+## Status: WP-001 (Shell Skeleton) through WP-011 (Pipelines and Redirection)
+
+`src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
+
+* an interactive read loop with a basic prompt (`arcosh:<arcology-cwd>> `);
+* `--version` and `--diagnostic` flags;
+* clean exit (`exit`/`quit`, or EOF/Ctrl-D);
+* current directory (`pwd`, and shown in the prompt);
+* terminal capability query (`Console.IsTTY`) with graceful degradation for piped/non-interactive
+  input and dumb terminals;
+* explicit no-color mode (`--no-color`, or the `NO_COLOR` environment variable).
+
+and AP-0052-005 (WP-002), the single Arcology colon-path <-> Linux host-path translation service
+(`Path.IsArcology`/`Path.ToHost`/`Path.ToArcology`/`Path.Normalize` in `src/arcosh.abas` — RFC
+section 7.3: "Path conversion MUST be implemented through one path service... Built-ins MUST NOT
+each implement colon-path parsing independently"):
+
+* `:` / `:home:` / `:home:user:` / `:home:user:Desktop:` <-> `/` / `/home/` / `/home/user/` /
+  `/home/user/Desktop/`, including file paths (no trailing colon/slash), `.`/`..` collapsing,
+  surrounding whitespace and one enclosing pair of quotes, and malformed input (`::`) degrading to
+  root instead of erroring;
+* ordinary Linux paths (no leading colon / no leading slash for the reverse direction) pass through
+  unchanged;
+* `cd` (accepting either an Arcology or a Linux path; bare `cd` goes to `Path.Home()`) and the
+  prompt are the only current consumers — anything added later that needs colon-path handling must
+  call these functions, not re-parse `:segments:` itself.
+
+and AP-0052-006/007 (WP-003 Structured Command Parser + WP-004 Linux Process Layer):
+
+* `TokenizeCommand`/`ParseCommand` in `src/arcosh.abas` parse a command line into
+  `{Executable, Arguments, Redirections, PipelineStages, Background, Source}` — quote/escape-aware
+  word splitting, with `|`/`>`/`>>`/`<`/trailing `&` recognized structurally;
+* `Process.Execute` (`arco_runtime`, `src/runtime/runtime.cpp`) runs a plain foreground command for
+  real — `fork`/`execvp`/`waitpid` with correct job-control terminal handoff (verified under a real
+  pty: Ctrl-C during a foreground child interrupts the child, not the shell, which stays responsive
+  afterward), `$PATH` lookup, and a clean "command not found" distinct from the program's own exit
+  status (the standard self-pipe technique — see the function's own comment);
+* a command with any pipeline stage, redirection, or trailing `&` is refused with a clear message
+  naming the RFC section that will implement it (WP-011/WP-012), rather than being silently
+  mis-run.
+
+and AP-0052-008 (WP-005 Structured History + `oops`):
+
+* every non-empty command (built-ins included) appends a `MakeHistoryEntry` record
+  (`SourceText`/`Executable`/`Arguments`/`Redirections`/`PipelineStages`/`Background`/
+  `WorkingDirectory`/`Timestamp`/`ResultKind`/`ExitCode` — RFC section 14's own field list) to a
+  `history` array; `history` (the built-in) lists them;
+* `oops <command>` replaces only the immediately-preceding `COMMAND_NOT_FOUND` command's
+  executable, operating on its *parsed* `Arguments`/`Redirections`/`PipelineStages` — never its raw
+  text — so a quoted argument that happens to contain the failed executable's own name survives
+  untouched (RFC section 15.2's explicit requirement, and its own regression test: `gti commit -m
+  "gti must remain inside this message"` then `oops git` really does `git commit` with that exact
+  message, confirmed against a real repo, not just the `--selftest-oops` structural check).
+
+and AP-0052-009 (WP-006 Resident ArcoBASIC Program):
+
+* a line typed at the prompt that starts with a number is classified before shell-command parsing
+  even runs (`ParseLeadingLineNumber`) and inserted/replaced/deleted (empty text deletes) into an
+  in-memory `resident_program` array kept in numeric order (`SetProgramLine`) — it is never
+  executed immediately, matching classic BASIC line-editing semantics (RFC section 8/9);
+* `LIST` prints the resident program back in order; `NEW` clears it;
+* `RUN` (with no filename argument — `RUN <file>` is WP-007, refused with a clear message for now)
+  reassembles the resident program into source text and hands it to the new `Runtime.RunString`
+  host function, which compiles and executes it in a fresh, isolated `arco::Runtime` instance — so
+  `GOTO`-based line-number control flow works exactly as classic BASIC, without arcosh's own REPL
+  loop needing to interpret it itself;
+* verified against the RFC section 9 worked example exactly (`10 PRINT "ONE"` / `20 PRINT "TWO"` /
+  replace `20 PRINT "THREE"` / `LIST` / bare `20` deletes it / `LIST` / `RUN` / `NEW`), plus a
+  multi-digit-line-number `GOTO` counting loop, both against the real native binary.
+
+and AP-0052-010 (WP-007 Script Execution):
+
+* `RUN <file>` (`RunScriptFile` in `src/arcosh.abas`) reads the raw file text and hands it
+  directly to `Runtime.RunString` — the SAME canonical compiler/parser path every other ArcoBASIC
+  program goes through, never a hand-rolled preprocessor for numbered source (the RFC's own
+  explicit requirement: "do not preprocess numbered source into a different language");
+* numbered lines, unnumbered lines, and a mix of both in one file all work with zero special
+  casing here, since `Parser::statement()` (`src/frontend/parser.cpp`) already accepts an
+  optional leading line-number label on any statement, not only inside some special "classic
+  mode";
+* proven against three real, checked-in fixture files (`tests/fixtures/wp007_*.abas`) — pure
+  unnumbered structured code, a classic numbered `GOTO` loop, and a file mixing an unnumbered
+  `FUNCTION` declaration with numbered top-level statements that call it — each calling
+  `ExitTheProgram` with its own distinctive code so the self-test can verify the RIGHT program
+  actually ran, not just that some program didn't error;
+* a missing file produces a clean `arcosh: run: no such file: ...` message rather than an
+  uncaught panic.
+
+and AP-0052-014 (WP-011 Pipelines and Redirection):
+
+* `ParseCommand` now splits a real pipeline into per-stage `{Executable, Arguments}` objects
+  (`PipelineStages`) instead of only recording that a pipe token was present — the first stage
+  stays in the existing `Executable`/`Arguments` fields, unchanged, for the plain-command case;
+* `Process.ExecutePipeline` (`src/runtime/runtime.cpp`) does the real fork/pipe/`dup2` plumbing —
+  one process group for the WHOLE pipeline (so Ctrl-C stops every stage, not just the last), real
+  files opened for `<`/`>`/`>>` (the same primitive handles plain redirection with no pipe at all,
+  as a one-stage "pipeline"); returns one result per stage so an earlier stage's
+  command-not-found can be reported without changing the pipeline's own exit status (which always
+  reflects the LAST stage, matching real shell `$?` semantics);
+* `ExecutePipelineAndRecord` (`src/arcosh.abas`) records exactly one history entry per typed
+  pipeline/redirection command, classified from the last stage;
+* verified against real `cat`/`grep`/`wc` processes and real files on disk — a pipeline with output
+  redirected to a file, plain `>`/`>>`/`<` redirection, `<` and `>` combined in one command, and a
+  pipeline surviving an earlier stage's command-not-found — per AP-0052-014's own explicit rule:
+  "Tests MUST inspect actual execution/output behavior. Parser-only tests are insufficient."
+
+It does not yet implement themes, plugins, completion, or job control beyond a single foreground
+pipeline (background jobs, `jobs`/`fg`/`bg`, suspend/resume) — later work packages (WP-008, WP-009,
+WP-010, WP-012).
+
+See `.agents/reports/ARCO_SH_RFC0052_WP000_REPOSITORY_AUDIT.md` (in the repo root's `.agents/`
+directory) for the mandatory pre-implementation audit this work was built against.
+
+### New runtime primitives added across these work packages
+
+`arco_runtime` had no way for a hosted ArcoBASIC program to read interactive stdin, query terminal
+capability, read/change the current working directory before this RFC. Per the audit's finding that
+process/terminal primitives already existed but only inside the retired `arco_shell` library, and
+following the existing extraction pattern for `Path.*`/`Process.*` in `src/runtime/runtime.cpp`,
+small primitives were added there (colon-path translation itself is pure ArcoBASIC, per RFC section
+2.5 — only the host syscalls below needed C++):
+
+* `Console.ReadLine()` -> `{Ok, Text}`, `Ok = FALSE` at EOF
+* `Console.Write(text)` -> writes without a trailing newline (PRINT always appends one)
+* `Console.IsTTY()` -> bool
+* `Path.Cwd()` -> string
+* `Directory.Change(path)` -> `{Ok, Error}`
+* `Process.Execute(executable, args)` -> `{Ok, Found, ExitCode, Signaled, TermSignal, Error}`
+  (WP-004; distinct from the pre-existing `Process.Run`, which shells out via `popen` for a one-shot
+  capture with no terminal control — see that function's own comment for why an interactive shell
+  needs the real thing instead)
+* `Runtime.RunString(code)` -> `{Ok, Error, Exited, ExitCode}` (WP-006; constructs a fresh, isolated
+  `arco::Runtime` and calls its own `run_string()` — the same interpreter `tests/unit/
+  runtime_tests.cpp` exercises directly — so a hosted/native ArcoBASIC program can dynamically
+  compile and execute new ArcoBASIC source, including numbered-line `GOTO` control flow, at
+  runtime)
+* `Process.ExecutePipeline(stages, stdinPath, stdoutPath, appendStdout)` -> an ARRAY of one
+  `{Ok, Found, ExitCode, Signaled, TermSignal, Error}` per stage (WP-011; real fork/pipe/`dup2`
+  plumbing, one process group for the whole pipeline — see the function's own much larger comment
+  in `src/runtime/runtime.cpp` for the job-control design and why it returns one result per stage
+  rather than a single combined one)
+
+## Relationship to the previous implementation
+
+The original ArcoSH implementation (`../src/shell/arcosh.cpp`, ~5,900 lines, plus
+`../apps/arcosh/main.cpp`) is retired as a product but left in place in the umbrella repo:
+
+* The `arcosh` executable target and its install/packaging/smoke-test wiring have been removed from
+  the root build.
+* The `arco_shell` static library still compiles internally, purely because
+  `../tests/unit/runtime_tests.cpp` exercises `arco::shell::*` directly. It is not installed and no
+  executable uses it.
+* Nothing here was ported forward from that file. Its C++ logic (fork/exec/job control, ANSI/color
+  handling, mods) is a *behavioral* reference for later work packages, not code this project builds
+  on directly — RFC-0052 requires those capabilities to become small `arco_runtime` bindings a
+  Fission-compiled ArcoBASIC program can call, the same way `Console.*`/`Path.Cwd` were added above.
+
+See `../docs/arcosh.md` for the earlier design vision and `../docs/alpha-known-limitations.md` for
+the gaps that earlier implementation actually had. RFC-0052 supersedes both where they conflict.
+
+## Building
+
+```sh
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+This locates an already-built `ArcoFission` executable from the umbrella project (via
+`../build/ArcoFission`, or `-DARCOFISSION_EXECUTABLE=/path/to/ArcoFission`), builds that project's
+opt-in `ArcoNativeRuntimeCoreProbe` target on demand (needed for the host-function bridge below),
+and compiles `src/arcosh.abas` straight to **native x86-64 machine code** — no bytecode VM. Build
+the umbrella project first if you haven't:
+
+```sh
+cmake -S .. -B ../build && cmake --build ../build --target ArcoFission
+```
+
+### Native codegen, per RFC-0052 section 6
+
+`arcosh` compiles via `ArcoFission build ... --target linux-x86_64` (ported onto master from
+`origin/agent/arcfs-admin-suite` — see `arcology-os/rfcs/RFC-0053_Native_Hosted_ArcoBASIC_
+Compilation_and_System_Runtime.md`), not the bytecode-VM capsule format. Getting there required
+fixing one real, confirmed miscompilation this project's own interactive loop shape exposed: `!x`
+on a dynamically-typed (Boxed) value — e.g. `!line.Ok`, straight out of `Console.ReadLine()` — read
+the raw heap-pointer bits of the boxed value directly instead of unboxing it first, an answer that
+happened to stay constant across a loop's steady-state allocation pattern and so looked correct
+right up until a second host call anywhere in the same loop body shifted that pattern and flipped
+it to the other wrong-but-stable answer (EOF silently stopped being detected, spinning forever).
+Full root-cause and fix: `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` Entries 25 (found) and 26
+(fixed). Two narrower, separate gaps in the same backend remain open and are avoided directly in
+`src/arcosh.abas`'s own ArcoBASIC style rather than worked around at the codegen level: booleans
+can't be compared against `TRUE`/`FALSE` literals (use `!x` instead), and a host-returned bool
+crashes if fed directly into `ANDALSO`/`ORELSE` (use nested `IF` instead).
+
+Implementing WP-003's tokenizer found a second, unrelated real miscompilation: `LEN(text)` on a
+hosted `AS STRING` parameter took a freestanding-only (UEFI) fast path that treats the argument as
+a raw UTF-16 buffer pointer instead of the real Boxed string it is under System V, silently
+producing a small wrong length with no crash -- any `WHILE i < LEN(text)`-shaped loop with a host
+call in its body would stop after one iteration. Fixed by gating that fast path on the freestanding
+convention, which it should always have been. Full write-up: Entry 27.

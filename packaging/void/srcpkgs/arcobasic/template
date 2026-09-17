@@ -35,7 +35,7 @@ do_build() {
 }
 
 do_check() {
-	ctest --test-dir build --output-on-failure -R 'arcosh_alpha_smoke|arcofission_alpha_smoke'
+	ctest --test-dir build --output-on-failure -R 'arcofission_alpha_smoke'
 }
 
 do_install() {

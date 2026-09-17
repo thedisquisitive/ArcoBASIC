@@ -1,0 +1,9 @@
+FUNCTION Double(value)
+    RETURN value * 2
+END FUNCTION
+
+10 total = 0
+20 total = total + Double(3)
+30 IF total < 10 THEN GOTO 20
+40 PRINT "mixed:" + STRING(total)
+50 ExitTheProgram(43)

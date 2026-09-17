@@ -217,41 +217,41 @@ main() {
     say "Post-Install Doctor"
     if [[ -x "$ARCOSH_BIN" ]]; then
         "$ARCOSH_BIN" --doctor || true
-    else
-        echo "arcosh is not on PATH yet. Expected at $arcosh_path"
-    fi
 
-    local profile_home="${ARCOSH_HOME:-$HOME/.arcosh}"
-    if ask_yes_no "Initialize ArcoSH profile at $profile_home" "y"; then
-        "$ARCOSH_BIN" --init-profile
-    fi
-
-    if ask_yes_no "Configure prompt with live preview" "y"; then
-        local prompt
-        prompt="$(choose_prompt)"
-        say "Selected Prompt"
-        printf '%s\n' "$(preview_prompt "$prompt")"
-        if ask_yes_no "Write this prompt to rc.abas" "y"; then
-            write_prompt_config "$profile_home" "$prompt"
-            echo "Updated $profile_home/rc.abas"
+        local profile_home="${ARCOSH_HOME:-$HOME/.arcosh}"
+        if ask_yes_no "Initialize ArcoSH profile at $profile_home" "y"; then
+            "$ARCOSH_BIN" --init-profile
         fi
-    fi
 
-    if ask_yes_no "Install and activate ArcoGotchi terminal pet mod" "n"; then
-        install_builtin_mod arcogotchi
-    fi
+        if ask_yes_no "Configure prompt with live preview" "y"; then
+            local prompt
+            prompt="$(choose_prompt)"
+            say "Selected Prompt"
+            printf '%s\n' "$(preview_prompt "$prompt")"
+            if ask_yes_no "Write this prompt to rc.abas" "y"; then
+                write_prompt_config "$profile_home" "$prompt"
+                echo "Updated $profile_home/rc.abas"
+            fi
+        fi
 
-    if ask_yes_no "Configure ArcoSH as a login shell" "n"; then
-        local shell_path user_name
-        shell_path="$(ask "Path to arcosh" "$arcosh_path")"
-        user_name="$(ask "User for chsh" "${USER:-}")"
-        configure_login_shell "$shell_path" "$user_name"
+        if ask_yes_no "Install and activate ArcoGotchi terminal pet mod" "n"; then
+            install_builtin_mod arcogotchi
+        fi
+
+        if ask_yes_no "Configure ArcoSH as a login shell" "n"; then
+            local shell_path user_name
+            shell_path="$(ask "Path to arcosh" "$arcosh_path")"
+            user_name="$(ask "User for chsh" "${USER:-}")"
+            configure_login_shell "$shell_path" "$user_name"
+        fi
+    else
+        # ArcoSH is being restarted as the standalone arcosh/ project and no longer ships with
+        # this package; skip the shell-specific setup steps until a new `arcosh` binary exists.
+        echo "arcosh is not on PATH (ArcoSH is being restarted; see arcosh/README.md). Skipping shell setup."
     fi
 
     say "Finish"
     echo "Installed ArcoBASIC from $(shell_quote "$deb")."
-    echo "Try: arcosh --doctor"
-    echo "Recovery: arcosh --safe"
 }
 
 main "$@"

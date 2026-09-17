@@ -1,0 +1,1191 @@
+#DESCRIPTION "The Arcology Shell -- WP-001..WP-011 (RFC-0052)"
+
+' RFC-0052 ("The Arcology Shell", see ../rfcs/RFC-0052_The_Arcology_Shell.md), WP-001 through WP-011.
+'
+' WP-001 (shell skeleton): interactive loop, prompt, clean exit, current directory, diagnostic
+' output, terminal capability query, explicit no-color mode.
+'
+' WP-002 (path layer): Path.IsArcology/Path.ToHost/Path.ToArcology/Path.Normalize below are the
+' ONE Arcology colon-path <-> Linux host-path translation service (RFC section 7.3 -- "Path
+' conversion MUST be implemented through one path service... Built-ins MUST NOT each implement
+' colon-path parsing independently"). `cd` and the prompt are the only current consumers; anything
+' added later that needs colon-path handling must call these, not re-parse ":segments:" itself.
+'
+' WP-003 (structured command parser): TokenizeCommand/ParseCommand below. Real Linux commands are
+' parsed into a structure (Executable/Arguments/Redirections/PipelineStages/Background/Source),
+' not executed by reparsing the raw source text.
+'
+' WP-004 (Linux process layer): Process.Execute (arco_runtime, src/runtime/runtime.cpp) does the
+' real fork/execvp/waitpid work with correct foreground job-control terminal handoff, for the
+' plain single-command case (still used unchanged when a command has no pipeline stage or
+' redirection at all -- see WP-011 below for when it does). A background ("&") flag is still
+' refused with a clear message instead of being silently run in the foreground -- that's WP-012,
+' not this pass.
+'
+' WP-005 (structured history + oops): MakeHistoryEntry/ClassifyProcessResult/RunOops below. Every
+' non-empty command (built-ins included) appends one history entry; `oops <name>` replaces only the
+' immediately-preceding COMMAND_NOT_FOUND command's executable, operating on its parsed structure
+' (never its text), per RFC section 15.2's explicit "MUST NOT perform blind text replacement."
+'
+' WP-006 (resident ArcoBASIC program): ParseLeadingLineNumber/SetProgramLine below implement the
+' RFC section 8/9 numbered-line editor -- a line typed at the prompt that starts with a number is
+' inserted/replaced/deleted (empty text) into an in-memory `resident_program` array kept in
+' numeric order, never executed immediately. `LIST` prints it back; `RUN` reassembles it into
+' source text and hands it to the new Runtime.RunString host function (arco_runtime,
+' src/runtime/runtime.cpp), which compiles and executes it in a fresh, isolated interpreter --
+' so GOTO/line-number control flow works exactly as classic BASIC, without arcosh's own REPL loop
+' having to interpret it; `NEW` clears the resident program.
+'
+' WP-007 (script execution): RunScriptFile below. `RUN <file>` reads the raw file text and hands
+' it directly to Runtime.RunString -- the SAME canonical compiler/parser path every other
+' ArcoBASIC program goes through, never a hand-rolled preprocessor for numbered source
+' (AP-0052-010's own explicit requirement). Numbered lines, unnumbered lines, and a mix of both in
+' one file all work with zero special-casing here, since Parser::statement() itself already
+' accepts an optional leading line-number label on any statement -- see
+' arcosh/tests/fixtures/wp007_*.abas and RunScriptExecutionSelfTest below.
+'
+' WP-011 (pipelines and redirection): Process.ExecutePipeline (arco_runtime, src/runtime/
+' runtime.cpp) does the real fork/pipe/dup2 plumbing -- one process group for the WHOLE pipeline
+' (so Ctrl-C stops every stage, not just the last), real files opened for "<"/">"/">>". See
+' ExecutePipelineAndRecord below and Process.ExecutePipeline's own comment in runtime.cpp for the
+' job-control/fd design. `$?`-equivalent semantics: a pipeline's own exit status is its LAST
+' stage's, matching real shells; an earlier stage that fails to exec is reported on its own line
+' ("command not found: ...") without changing that overall status.
+'
+' Still not implemented: themes, plugins, completion, job control beyond a single foreground
+' pipeline (background jobs, `jobs`/`fg`/`bg`, suspend/resume) -- later work packages (WP-008,
+' WP-009, WP-010, WP-012).
+
+FUNCTION HasFlag(flagList AS ARRAY, flagName AS STRING)
+    FOR flag IN flagList
+        IF flag == flagName THEN RETURN TRUE
+    NEXT
+    RETURN FALSE
+END FUNCTION
+
+' `--selftest-script-execution <fixtures-dir>` (WP-007) needs a value, not just presence, unlike
+' every other --selftest-* flag -- the fixtures live as real files in the repo (arcosh/tests/
+' fixtures/) rather than being synthesized in-memory, so the ctest invocation passes their
+' directory as the argument right after the flag.
+FUNCTION ArgumentAfterFlag(args AS ARRAY, flagName AS STRING)
+    i = 0
+    WHILE i < LEN(args)
+        IF args[i] == flagName THEN
+            IF i + 1 < LEN(args) THEN RETURN args[i + 1]
+            RETURN ""
+        END IF
+        i = i + 1
+    WEND
+    RETURN ""
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Path Layer (RFC-0052 WP-002)
+' ---------------------------------------------------------------------------------------------
+
+FUNCTION Path.IsArcology(rawPath AS STRING)
+    RETURN LEN(rawPath) > 0 ANDALSO String.Slice(rawPath, 0, 1) == ":"
+END FUNCTION
+
+' Strips surrounding whitespace and, if present, one enclosing pair of double quotes. Internal
+' spaces inside a path segment (e.g. ":home:user:My Documents:") are left untouched.
+FUNCTION Path.Normalize(rawPath AS STRING)
+    text = String.Trim(rawPath)
+    IF LEN(text) >= 2 THEN
+        first = String.Slice(text, 0, 1)
+        last = String.Slice(text, LEN(text) - 1, 1)
+        IF first == "\"" ANDALSO last == "\"" THEN
+            text = String.Slice(text, 1, LEN(text) - 2)
+        END IF
+    END IF
+    RETURN text
+END FUNCTION
+
+' Shared by Path.ToHost and Path.ToArcology: drops empty segments (so "a::b" / "a//b" degrade to
+' "a:b" / "a/b" instead of erroring) and collapses "." / ".." the same way for either separator.
+FUNCTION PathCollapseSegments(rawSegments AS ARRAY)
+    result = []
+    FOR segment IN rawSegments
+        IF segment == "" ORELSE segment == "." THEN
+            CONTINUE FOR
+        END IF
+
+        IF segment == ".." THEN
+            IF LEN(result) > 0 THEN ignored = Array.Pop(result)
+            CONTINUE FOR
+        END IF
+
+        ignored = Array.Push(result, segment)
+    NEXT
+    RETURN result
+END FUNCTION
+
+' :                     -> /
+' :home:                -> /home/
+' :home:user:           -> /home/user/
+' :home:user:Desktop:   -> /home/user/Desktop/
+' Non-Arcology input (no leading colon) passes through unchanged -- RFC section 7.2, ordinary
+' Linux paths remain valid and are not this function's concern.
+FUNCTION Path.ToHost(rawPath AS STRING)
+    path = Path.Normalize(rawPath)
+    IF !Path.IsArcology(path) THEN RETURN path
+
+    body = String.Slice(path, 1, LEN(path))
+    trailing = LEN(body) > 0 ANDALSO String.Slice(body, LEN(body) - 1, 1) == ":"
+    IF trailing THEN body = String.Slice(body, 0, LEN(body) - 1)
+
+    segments = PathCollapseSegments(String.Split(body, ":"))
+    IF LEN(segments) == 0 THEN RETURN "/"
+
+    result = "/" + String.Join(segments, "/")
+    IF trailing THEN result = result + "/"
+    RETURN result
+END FUNCTION
+
+' Inverse of Path.ToHost. Non-absolute host input (no leading "/") passes through unchanged --
+' there is no absolute Arcology path to map it to (RFC section 7.1: Arcology paths are absolute).
+FUNCTION Path.ToArcology(rawPath AS STRING)
+    path = Path.Normalize(rawPath)
+    IF LEN(path) == 0 ORELSE String.Slice(path, 0, 1) <> "/" THEN RETURN path
+
+    trailing = LEN(path) > 1 ANDALSO String.Slice(path, LEN(path) - 1, 1) == "/"
+    body = String.Slice(path, 1, LEN(path))
+    IF trailing THEN body = String.Slice(body, 0, LEN(body) - 1)
+
+    segments = PathCollapseSegments(String.Split(body, "/"))
+    IF LEN(segments) == 0 THEN RETURN ":"
+
+    result = ":" + String.Join(segments, ":")
+    IF trailing THEN result = result + ":"
+    RETURN result
+END FUNCTION
+
+FUNCTION Prompt(cwd AS STRING)
+    RETURN "arcosh:" + Path.ToArcology(cwd) + "> "
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Structured Command Parser (RFC-0052 WP-003)
+' ---------------------------------------------------------------------------------------------
+
+' Single/double-quote and backslash-escape aware word splitting (behavioral reference: the retired
+' ../src/shell/arcosh.cpp's split_shell_words -- not ported, rewritten fresh here). Also emits
+' "|", ">", ">>", "<", and "&" as their own tokens when they appear unquoted, rather than folding
+' them into adjacent words, so ParseCommand below can actually see pipeline/redirection/background
+' syntax instead of passing it through as literal argument text.
+FUNCTION TokenizeCommand(text AS STRING)
+    tokens = []
+    current = ""
+    in_single = FALSE
+    in_double = FALSE
+    escaping = FALSE
+    i = 0
+    length = LEN(text)
+
+    WHILE i < length
+        ch = String.Slice(text, i, 1)
+
+        IF escaping THEN
+            current = current + ch
+            escaping = FALSE
+            i = i + 1
+            CONTINUE WHILE
+        END IF
+
+        IF ch == "\\" ANDALSO !in_single THEN
+            escaping = TRUE
+            i = i + 1
+            CONTINUE WHILE
+        END IF
+
+        IF ch == "'" ANDALSO !in_double THEN
+            in_single = !in_single
+            i = i + 1
+            CONTINUE WHILE
+        END IF
+
+        IF ch == "\"" ANDALSO !in_single THEN
+            in_double = !in_double
+            i = i + 1
+            CONTINUE WHILE
+        END IF
+
+        is_space = FALSE
+        IF ch == " " ORELSE ch == "\t" THEN is_space = TRUE
+        IF is_space ANDALSO !in_single ANDALSO !in_double THEN
+            IF current <> "" THEN
+                ignored = Array.Push(tokens, current)
+                current = ""
+            END IF
+            i = i + 1
+            CONTINUE WHILE
+        END IF
+
+        is_operator = FALSE
+        IF !in_single ANDALSO !in_double THEN
+            IF ch == "|" ORELSE ch == ">" ORELSE ch == "<" ORELSE ch == "&" THEN
+                is_operator = TRUE
+            END IF
+        END IF
+
+        IF is_operator THEN
+            IF current <> "" THEN
+                ignored = Array.Push(tokens, current)
+                current = ""
+            END IF
+            IF ch == ">" ANDALSO i + 1 < length ANDALSO String.Slice(text, i + 1, 1) == ">" THEN
+                ignored = Array.Push(tokens, ">>")
+                i = i + 2
+                CONTINUE WHILE
+            END IF
+            ignored = Array.Push(tokens, ch)
+            i = i + 1
+            CONTINUE WHILE
+        END IF
+
+        current = current + ch
+        i = i + 1
+    WEND
+
+    IF current <> "" THEN ignored = Array.Push(tokens, current)
+    RETURN tokens
+END FUNCTION
+
+' Consumes TokenizeCommand's output into {Executable, Arguments, Redirections, PipelineStages,
+' Background, Source} -- exactly WP-003's own field list. Executable/Arguments are always the
+' FIRST pipeline stage (the plain, no-pipe case this shape originally described, unchanged);
+' PipelineStages holds every stage AFTER the first, each a real {Executable, Arguments} object
+' (RFC-0052 WP-011 -- before that pass this only recorded one "|" marker per pipe, structurally
+' enough to detect and refuse a pipeline, not enough to actually run one). Redirections/Background
+' are recognized here; background jobs are still refused at execution time (WP-012, not this
+' pass), and redirection targets carry no `AS STRING`-vs-Arcology-path distinction of their own --
+' RunCommand below resolves each Target through Path.ToHost just like everything else in this
+' file does.
+FUNCTION ParseCommand(text AS STRING)
+    tokens = TokenizeCommand(text)
+    redirections = []
+    pipelineStages = []
+    background = FALSE
+
+    tokenCount = LEN(tokens)
+    IF tokenCount > 0 THEN
+        lastToken = tokens[tokenCount - 1]
+        IF lastToken == "&" THEN
+            background = TRUE
+            ignored = Array.Pop(tokens)
+            tokenCount = tokenCount - 1
+        END IF
+    END IF
+
+    currentExecutable = ""
+    currentArguments = []
+    haveCurrentStage = FALSE
+
+    i = 0
+    WHILE i < tokenCount
+        token = tokens[i]
+
+        IF token == "|" THEN
+            IF haveCurrentStage THEN
+                ignored = Array.Push(pipelineStages, {"Executable": currentExecutable, "Arguments": currentArguments})
+            END IF
+            currentExecutable = ""
+            currentArguments = []
+            haveCurrentStage = FALSE
+            i = i + 1
+            CONTINUE WHILE
+        END IF
+
+        IF token == ">" ORELSE token == ">>" ORELSE token == "<" THEN
+            target = ""
+            IF i + 1 < tokenCount THEN target = tokens[i + 1]
+            ignored = Array.Push(redirections, {"Operator": token, "Target": target})
+            i = i + 2
+            CONTINUE WHILE
+        END IF
+
+        haveCurrentStage = TRUE
+        IF currentExecutable == "" THEN
+            currentExecutable = token
+        ELSE
+            ignored = Array.Push(currentArguments, token)
+        END IF
+        i = i + 1
+    WEND
+
+    IF haveCurrentStage THEN
+        ignored = Array.Push(pipelineStages, {"Executable": currentExecutable, "Arguments": currentArguments})
+    END IF
+
+    executable = ""
+    arguments = []
+    IF LEN(pipelineStages) > 0 THEN
+        first = pipelineStages[0]
+        executable = first.Executable
+        arguments = first.Arguments
+        ignored = Array.RemoveAt(pipelineStages, 0)
+    END IF
+
+    RETURN {
+        "Executable": executable,
+        "Arguments": arguments,
+        "Redirections": redirections,
+        "PipelineStages": pipelineStages,
+        "Background": background,
+        "Source": text
+    }
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Structured History + oops (RFC-0052 WP-005)
+' ---------------------------------------------------------------------------------------------
+
+' RFC section 14's own field list, plus the parsed command's own structured fields so `oops` (and
+' anything else that ever reads history) never needs to re-parse SourceText.
+FUNCTION MakeHistoryEntry(parsed AS OBJECT, resultKind AS STRING, exitCode)
+    RETURN {
+        "SourceText": parsed.Source,
+        "Executable": parsed.Executable,
+        "Arguments": parsed.Arguments,
+        "Redirections": parsed.Redirections,
+        "PipelineStages": parsed.PipelineStages,
+        "Background": parsed.Background,
+        "WorkingDirectory": Path.Cwd(),
+        "Timestamp": Time.Timestamp(),
+        "ResultKind": resultKind,
+        "ExitCode": exitCode
+    }
+END FUNCTION
+
+' Maps what WP-003/WP-004 can actually produce onto RFC section 14's result kinds. PLUGIN_FAILED/
+' SCRIPT_FAILED have no producer yet (no plugin system, no script execution) -- not faked here.
+FUNCTION ClassifyProcessResult(execResult AS OBJECT)
+    IF !execResult.Found THEN
+        IF String.Contains(execResult.Error, "Permission denied") THEN RETURN "PERMISSION_DENIED"
+        RETURN "COMMAND_NOT_FOUND"
+    END IF
+    IF execResult.Signaled THEN RETURN "PROCESS_FAILED"
+    IF execResult.ExitCode == 0 THEN RETURN "SUCCESS"
+    RETURN "PROCESS_FAILED"
+END FUNCTION
+
+' Cosmetic reconstruction for display only (RFC 15.3: "clearly shows what command is being
+' retried") -- oops/history print this, but execution always runs off the structured
+' Executable/Arguments fields directly, never by re-parsing this string.
+FUNCTION FormatCommandForDisplay(executable AS STRING, arguments AS ARRAY)
+    parts = [executable]
+    FOR a IN arguments
+        formatted = a
+        IF String.Contains(a, " ") THEN formatted = "\"" + a + "\""
+        ignored = Array.Push(parts, formatted)
+    NEXT
+    RETURN String.Join(parts, " ")
+END FUNCTION
+
+' Runs a plain external command and records its outcome. Returns the exit code (or -1 if the
+' command was never found) so the CALLER can assign its own top-level `last_exit_code` --
+' deliberately not set from in here: an ArcoBASIC FUNCTION has no reliable way to write back to an
+' enclosing script-level variable on this backend, so every top-level mutation in this program
+' happens at top level, by design, never inside a called function (arrays are the one safe
+' exception -- Array.Push mutates the shared underlying array through a normal parameter, not
+' through script-global scoping, which is why `history` itself can safely be passed around and
+' pushed to from inside these functions).
+FUNCTION ExecuteAndRecord(history AS ARRAY, parsed AS OBJECT)
+    execResult = Process.Execute(parsed.Executable, parsed.Arguments)
+    resultKind = ClassifyProcessResult(execResult)
+    exitCode = -1
+    IF execResult.Found THEN exitCode = execResult.ExitCode
+    IF !execResult.Found THEN
+        PRINT "arcosh: command not found: " + parsed.Executable
+    END IF
+    entry = MakeHistoryEntry(parsed, resultKind, exitCode)
+    ignored = Array.Push(history, entry)
+    RETURN exitCode
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Pipelines and Redirection (RFC-0052 WP-011)
+' ---------------------------------------------------------------------------------------------
+
+' The LAST "<" redirection wins if a command somehow has more than one (matching real shells);
+' "" means no input redirection was requested.
+FUNCTION FindStdinRedirection(redirections AS ARRAY)
+    target = ""
+    FOR r IN redirections
+        IF r.Operator == "<" THEN target = r.Target
+    NEXT
+    RETURN target
+END FUNCTION
+
+' The LAST ">" or ">>" wins, preserving whichever ONE of the two it actually was (unlike checking
+' each operator separately and letting one unconditionally override the other regardless of
+' which came later in the actual command text).
+FUNCTION FindStdoutRedirection(redirections AS ARRAY)
+    target = ""
+    append = FALSE
+    FOR r IN redirections
+        IF r.Operator == ">" THEN
+            target = r.Target
+            append = FALSE
+        END IF
+        IF r.Operator == ">>" THEN
+            target = r.Target
+            append = TRUE
+        END IF
+    NEXT
+    RETURN {"Target": target, "Append": append}
+END FUNCTION
+
+' Runs a real pipeline (one stage if there's no "|" at all -- Process.ExecutePipeline handles
+' plain redirection with no pipe through the exact same fd-plumbing, see its own comment) and
+' records ONE history entry for the whole command, classified from the LAST stage's result --
+' matching real shell `$?` semantics (a pipeline's own exit status is its last command's, not
+' merged from every stage). An earlier stage failing to exec is reported separately, per stage,
+' the same "command not found" message ExecuteAndRecord's own single-command path already prints.
+FUNCTION ExecutePipelineAndRecord(history AS ARRAY, parsed AS OBJECT)
+    stages = [{"Executable": parsed.Executable, "Arguments": parsed.Arguments}]
+    FOR stage IN parsed.PipelineStages
+        ignored = Array.Push(stages, stage)
+    NEXT
+
+    stdinTarget = FindStdinRedirection(parsed.Redirections)
+    stdinPath = ""
+    IF stdinTarget <> "" THEN stdinPath = Path.ToHost(stdinTarget)
+
+    stdoutInfo = FindStdoutRedirection(parsed.Redirections)
+    stdoutPath = ""
+    appendStdout = FALSE
+    IF stdoutInfo.Target <> "" THEN
+        stdoutPath = Path.ToHost(stdoutInfo.Target)
+        appendStdout = stdoutInfo.Append
+    END IF
+
+    results = Process.ExecutePipeline(stages, stdinPath, stdoutPath, appendStdout)
+
+    i = 0
+    WHILE i < LEN(results)
+        stageResult = results[i]
+        IF !stageResult.Found THEN
+            PRINT "arcosh: command not found: " + stages[i].Executable
+        END IF
+        i = i + 1
+    WEND
+
+    lastResult = results[LEN(results) - 1]
+    resultKind = ClassifyProcessResult(lastResult)
+    exitCode = -1
+    IF lastResult.Found THEN exitCode = lastResult.ExitCode
+
+    entry = MakeHistoryEntry(parsed, resultKind, exitCode)
+    ignored = Array.Push(history, entry)
+    RETURN exitCode
+END FUNCTION
+
+' AP-0052-014's own explicit rule: "Tests MUST inspect actual execution/output behavior. Parser-
+' only tests are insufficient." Every case here really forks/pipes/execs real Linux programs
+' (cat/grep/wc) and reads back a REAL file the pipeline/redirection actually wrote, rather than
+' just checking ParseCommand's parsed structure -- that's already covered by ParseCommand being
+' plain, structure-only ArcoBASIC, no need to re-test it here.
+FUNCTION RunPipelineSelfTest()
+    failures = 0
+    history = []
+    base = Path.Cwd()
+    inputPath = base + "/wp011_selftest_input.txt"
+    outPath = base + "/wp011_selftest_output.txt"
+    ignored = File.WriteText(inputPath, "apple\nbanana\ncherry\navocado\n")
+
+    ' Real pipeline: cat | grep -c, output redirected so this can read back the REAL count grep
+    ' itself computed, not something ArcoBASIC derived independently.
+    ignored = File.WriteText(outPath, "")
+    parsed1 = ParseCommand("cat " + inputPath + " | grep -c a > " + outPath)
+    exitCode1 = ExecutePipelineAndRecord(history, parsed1)
+    out1 = String.Trim(File.ReadText(outPath))
+    IF exitCode1 == 0 ANDALSO out1 == "3" THEN
+        PRINT "ok   pipeline (cat | grep -c) exit=0 output=" + out1
+    ELSE
+        PRINT "FAIL pipeline (cat | grep -c) exit=" + STRING(exitCode1) + " output=[" + out1 + "] (expected exit=0 output=3)"
+        failures = failures + 1
+    END IF
+
+    ' Plain redirection, no pipe at all: wc -l > file.
+    ignored = File.WriteText(outPath, "")
+    parsed2 = ParseCommand("wc -l " + inputPath + " > " + outPath)
+    exitCode2 = ExecutePipelineAndRecord(history, parsed2)
+    out2 = File.ReadText(outPath)
+    IF exitCode2 == 0 ANDALSO String.Contains(out2, "4") THEN
+        PRINT "ok   redirection (wc -l > file) exit=0 output contains 4"
+    ELSE
+        PRINT "FAIL redirection (wc -l > file) exit=" + STRING(exitCode2) + " output=[" + out2 + "] (expected exit=0, output containing 4)"
+        failures = failures + 1
+    END IF
+
+    ' Append: run the SAME redirect twice with >>, the real file on disk must show it happened
+    ' twice -- not something a mocked/faked redirection could get right by accident.
+    appendPath = base + "/wp011_selftest_append.txt"
+    ignored = File.WriteText(appendPath, "")
+    parsed3a = ParseCommand("cat " + inputPath + " >> " + appendPath)
+    ignored = ExecutePipelineAndRecord(history, parsed3a)
+    parsed3b = ParseCommand("cat " + inputPath + " >> " + appendPath)
+    ignored = ExecutePipelineAndRecord(history, parsed3b)
+    appended = File.ReadText(appendPath)
+    appendedLines = String.Split(appended, "\n")
+    IF LEN(appendedLines) == 9 THEN
+        PRINT "ok   append (>>) twice produced 9 newline-separated fields (4 lines x2 + trailing)"
+    ELSE
+        PRINT "FAIL append (>>) produced " + STRING(LEN(appendedLines)) + " fields (expected 9)"
+        failures = failures + 1
+    END IF
+
+    ' Input redirection combined with output redirection in the SAME command: wc -l < file > file.
+    ignored = File.WriteText(outPath, "")
+    parsed4 = ParseCommand("wc -l < " + inputPath + " > " + outPath)
+    exitCode4 = ExecutePipelineAndRecord(history, parsed4)
+    out4 = String.Trim(File.ReadText(outPath))
+    IF exitCode4 == 0 ANDALSO out4 == "4" THEN
+        PRINT "ok   combined input+output redirection (wc -l < file > file) == 4"
+    ELSE
+        PRINT "FAIL combined input+output redirection == [" + out4 + "] exit=" + STRING(exitCode4) + " (expected 4, exit 0)"
+        failures = failures + 1
+    END IF
+
+    ' An earlier pipeline stage failing to exec must not change the pipeline's OWN exit status
+    ' (matching real shell semantics -- see ExecutePipelineAndRecord's own comment) while still
+    ' being reported.
+    parsed5 = ParseCommand("totally-not-a-real-command-arcosh-wp011 | cat")
+    exitCode5 = ExecutePipelineAndRecord(history, parsed5)
+    IF exitCode5 == 0 THEN
+        PRINT "ok   pipeline survives an earlier stage's command-not-found, exit == 0"
+    ELSE
+        PRINT "FAIL pipeline exit after earlier command-not-found == " + STRING(exitCode5) + " (expected 0)"
+        failures = failures + 1
+    END IF
+
+    IF LEN(history) == 6 THEN
+        PRINT "ok   each pipeline/redirection command recorded exactly one history entry"
+    ELSE
+        PRINT "FAIL history has " + STRING(LEN(history)) + " entries (expected 6)"
+        failures = failures + 1
+    END IF
+
+    RETURN failures
+END FUNCTION
+
+' RFC section 15, version 1 rules: applies only to the immediately preceding command, requires
+' that command to have failed with COMMAND_NOT_FOUND, preserves arguments/redirections/pipeline
+' structure/quoting semantics by construction (it operates on the parsed STRUCTURE, never on
+' text -- see FormatCommandForDisplay's own comment), and replaces only the executable field.
+FUNCTION RunOops(history AS ARRAY, oopsCommand AS OBJECT)
+    IF LEN(oopsCommand.Arguments) == 0 THEN
+        PRINT "arcosh: oops: usage: oops <command>"
+        ignored = Array.Push(history, MakeHistoryEntry(oopsCommand, "INVALID_SYNTAX", -1))
+        RETURN -1
+    END IF
+
+    IF LEN(history) == 0 THEN
+        PRINT "arcosh: oops: no previous command"
+        ignored = Array.Push(history, MakeHistoryEntry(oopsCommand, "INVALID_SYNTAX", -1))
+        RETURN -1
+    END IF
+
+    previous = history[LEN(history) - 1]
+    IF previous.ResultKind <> "COMMAND_NOT_FOUND" THEN
+        PRINT "arcosh: oops: previous command did not fail with command not found"
+        ignored = Array.Push(history, MakeHistoryEntry(oopsCommand, "INVALID_SYNTAX", -1))
+        RETURN -1
+    END IF
+
+    newExecutable = oopsCommand.Arguments[0]
+    displayText = FormatCommandForDisplay(newExecutable, previous.Arguments)
+    PRINT "arcosh: retrying: " + displayText
+    ignored = Array.Push(history, MakeHistoryEntry(oopsCommand, "SUCCESS", 0))
+
+    retried = {
+        "Executable": newExecutable,
+        "Arguments": previous.Arguments,
+        "Redirections": previous.Redirections,
+        "PipelineStages": previous.PipelineStages,
+        "Background": previous.Background,
+        "Source": displayText
+    }
+    RETURN ExecuteAndRecord(history, retried)
+END FUNCTION
+
+' Structural regression test for RFC-0052 AP-0052-008's own required scenario -- drives the exact
+' same MakeHistoryEntry/RunOops logic the real REPL uses, without spawning real processes, so it
+' proves the STRUCTURAL guarantee (only Executable changes; a quoted argument that happens to
+' contain the failed executable's own name is untouched) independent of any real "git"/"gti"
+' binary's behavior.
+FUNCTION RunOopsSelfTest()
+    failures = 0
+    history = []
+
+    failed = ParseCommand("gti commit -m \"gti must remain inside this message\"")
+    ignored = Array.Push(history, MakeHistoryEntry(failed, "COMMAND_NOT_FOUND", -1))
+
+    oopsCommand = ParseCommand("oops git")
+    IF LEN(oopsCommand.Arguments) == 0 THEN
+        PRINT "FAIL oops parsed with no argument"
+        failures = failures + 1
+        RETURN failures
+    END IF
+
+    newExecutable = oopsCommand.Arguments[0]
+    previous = history[LEN(history) - 1]
+
+    IF newExecutable == "git" THEN
+        PRINT "ok   oops replacement executable == git"
+    ELSE
+        PRINT "FAIL oops replacement executable == " + newExecutable + " (expected git)"
+        failures = failures + 1
+    END IF
+
+    expectedArgs = ["commit", "-m", "gti must remain inside this message"]
+    IF LEN(previous.Arguments) == LEN(expectedArgs) THEN
+        PRINT "ok   preserved argument count == " + STRING(LEN(expectedArgs))
+    ELSE
+        PRINT "FAIL preserved argument count == " + STRING(LEN(previous.Arguments)) + " (expected " + STRING(LEN(expectedArgs)) + ")"
+        failures = failures + 1
+    END IF
+
+    i = 0
+    WHILE i < LEN(expectedArgs)
+        actual = ""
+        IF i < LEN(previous.Arguments) THEN actual = previous.Arguments[i]
+        IF actual == expectedArgs[i] THEN
+            PRINT "ok   argument " + STRING(i) + " == " + expectedArgs[i]
+        ELSE
+            PRINT "FAIL argument " + STRING(i) + " == " + actual + " (expected " + expectedArgs[i] + ")"
+            failures = failures + 1
+        END IF
+        i = i + 1
+    WEND
+
+    displayText = FormatCommandForDisplay(newExecutable, previous.Arguments)
+    expectedDisplay = "git commit -m \"gti must remain inside this message\""
+    IF displayText == expectedDisplay THEN
+        PRINT "ok   display text == " + displayText
+    ELSE
+        PRINT "FAIL display text == " + displayText + " (expected " + expectedDisplay + ")"
+        failures = failures + 1
+    END IF
+
+    RETURN failures
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Resident ArcoBASIC Program (RFC-0052 WP-006)
+' ---------------------------------------------------------------------------------------------
+
+' RFC section 8 (Input Classification): a numbered program line is recognized BEFORE shell-command
+' parsing ever runs -- classic BASIC line-number syntax isn't shell-word-splitting syntax (it has
+' its own grammar), so this scans the raw trimmed input directly rather than reusing
+' TokenizeCommand/ParseCommand for something they were never meant to parse.
+FUNCTION ParseLeadingLineNumber(command AS STRING)
+    i = 0
+    length = LEN(command)
+    digits = ""
+    WHILE i < length
+        ch = String.Slice(command, i, 1)
+        IF !String.Contains("0123456789", ch) THEN EXIT WHILE
+        digits = digits + ch
+        i = i + 1
+    WEND
+
+    IF digits == "" THEN RETURN {"IsNumbered": FALSE, "Number": -1, "Rest": command}
+
+    rest = String.Trim(String.Slice(command, i, length))
+    RETURN {"IsNumbered": TRUE, "Number": NUMBER(digits), "Rest": rest}
+END FUNCTION
+
+' RFC section 9's own rules: new numbered line -> insert; existing numbered line -> replace; bare
+' line number (empty `text`) -> delete; lines remain numerically ordered. A reusable abstraction
+' (this function plus the plain {Number, Text} array it operates on) rather than the old, retired
+' arcosh.cpp's inline, non-reusable REPL-local version -- see RFC section 9's own note on this and
+' the WP-000 audit finding it confirmed.
+FUNCTION SetProgramLine(program AS ARRAY, lineNumber AS NUMBER, text AS STRING)
+    existingIndex = -1
+    insertAt = LEN(program)
+    i = 0
+    WHILE i < LEN(program)
+        existing = program[i]
+        IF existing.Number == lineNumber THEN
+            existingIndex = i
+            insertAt = i
+            EXIT WHILE
+        END IF
+        IF existing.Number > lineNumber THEN
+            insertAt = i
+            EXIT WHILE
+        END IF
+        i = i + 1
+    WEND
+
+    IF existingIndex >= 0 THEN ignored = Array.RemoveAt(program, existingIndex)
+
+    IF text <> "" THEN
+        ignored = Array.Insert(program, insertAt, {"Number": lineNumber, "Text": text})
+    END IF
+END FUNCTION
+
+' Structural regression test for RFC-0052 AP-0052-009's own required scenario (section 9's exact
+' example): insert, replace, delete-by-bare-number, and out-of-order insertion staying numerically
+' ordered -- plus one real RUN through Runtime.RunString, proving the resident program actually
+' executes (GOTO included), not just that the line buffer itself is maintained correctly.
+FUNCTION RunResidentProgramSelfTest()
+    failures = 0
+    program = []
+
+    line1 = ParseLeadingLineNumber("10 PRINT \"ONE\"")
+    SetProgramLine(program, line1.Number, line1.Rest)
+    line2 = ParseLeadingLineNumber("20 PRINT \"TWO\"")
+    SetProgramLine(program, line2.Number, line2.Rest)
+
+    IF LEN(program) == 2 THEN
+        PRINT "ok   initial insert count == 2"
+    ELSE
+        PRINT "FAIL initial insert count == " + STRING(LEN(program)) + " (expected 2)"
+        failures = failures + 1
+    END IF
+
+    line3 = ParseLeadingLineNumber("20 PRINT \"THREE\"")
+    SetProgramLine(program, line3.Number, line3.Rest)
+
+    IF LEN(program) == 2 THEN
+        PRINT "ok   replace keeps count == 2"
+    ELSE
+        PRINT "FAIL replace count == " + STRING(LEN(program)) + " (expected 2)"
+        failures = failures + 1
+    END IF
+
+    IF program[1].Text == "PRINT \"THREE\"" THEN
+        PRINT "ok   line 20 replaced with THREE"
+    ELSE
+        PRINT "FAIL line 20 text == " + program[1].Text + " (expected PRINT \"THREE\")"
+        failures = failures + 1
+    END IF
+
+    lineDel = ParseLeadingLineNumber("20")
+    SetProgramLine(program, lineDel.Number, lineDel.Rest)
+
+    IF LEN(program) == 1 THEN
+        PRINT "ok   delete-by-bare-number leaves count == 1"
+    ELSE
+        PRINT "FAIL delete count == " + STRING(LEN(program)) + " (expected 1)"
+        failures = failures + 1
+    END IF
+
+    IF program[0].Number == 10 THEN
+        PRINT "ok   remaining line is 10"
+    ELSE
+        PRINT "FAIL remaining line number == " + STRING(program[0].Number) + " (expected 10)"
+        failures = failures + 1
+    END IF
+
+    program2 = []
+    a = ParseLeadingLineNumber("30 PRINT \"C\"")
+    SetProgramLine(program2, a.Number, a.Rest)
+    b = ParseLeadingLineNumber("10 PRINT \"A\"")
+    SetProgramLine(program2, b.Number, b.Rest)
+    c = ParseLeadingLineNumber("20 PRINT \"B\"")
+    SetProgramLine(program2, c.Number, c.Rest)
+
+    orderedOk = TRUE
+    IF program2[0].Number <> 10 THEN orderedOk = FALSE
+    IF program2[1].Number <> 20 THEN orderedOk = FALSE
+    IF program2[2].Number <> 30 THEN orderedOk = FALSE
+    IF orderedOk THEN
+        PRINT "ok   numerical ordering after out-of-order insert"
+    ELSE
+        PRINT "FAIL numerical ordering: " + STRING(program2[0].Number) + "," + STRING(program2[1].Number) + "," + STRING(program2[2].Number)
+        failures = failures + 1
+    END IF
+
+    runProgram = []
+    r1 = ParseLeadingLineNumber("10 x = 1")
+    SetProgramLine(runProgram, r1.Number, r1.Rest)
+    r2 = ParseLeadingLineNumber("20 x = x + 1")
+    SetProgramLine(runProgram, r2.Number, r2.Rest)
+    r3 = ParseLeadingLineNumber("30 IF x < 3 THEN GOTO 20")
+    SetProgramLine(runProgram, r3.Number, r3.Rest)
+    r4 = ParseLeadingLineNumber("40 PRINT \"resident-run-ok:\" + STRING(x)")
+    SetProgramLine(runProgram, r4.Number, r4.Rest)
+
+    lines = []
+    FOR entry IN runProgram
+        ignored = Array.Push(lines, STRING(entry.Number) + " " + entry.Text)
+    NEXT
+    runResult = Runtime.RunString(String.Join(lines, "\n"))
+    IF runResult.Ok THEN
+        PRINT "ok   RUN executed the resident program (GOTO loop included) without error"
+    ELSE
+        PRINT "FAIL RUN error: " + runResult.Error
+        failures = failures + 1
+    END IF
+
+    RETURN failures
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Script Execution (RFC-0052 WP-007)
+' ---------------------------------------------------------------------------------------------
+
+' `RUN <file>` (a real path, host or Arcology-colon-style -- Path.ToHost handles either, see the
+' Path Layer's own header comment). Reads the raw file text and hands it directly to
+' Runtime.RunString -- the SAME canonical compiler/parser path every other ArcoBASIC program goes
+' through, never a hand-rolled preprocessor for numbered source (AP-0052-010's own explicit
+' requirement). Numbered lines, unnumbered lines, and a mix of both in one file all just work
+' because Parser::statement() (src/frontend/parser.cpp) already accepts an optional leading
+' line-number label on ANY statement, not only inside some special "classic mode" -- confirmed
+' directly against three fixture files (arcosh/tests/fixtures/wp007_*.abas, exercised by
+' RunScriptExecutionSelfTest below): pure unnumbered structured code, a classic numbered GOTO
+' loop, and a file mixing an unnumbered FUNCTION declaration with numbered top-level statements
+' that call it, all producing correct results with zero special-casing here.
+FUNCTION RunScriptFile(path AS STRING)
+    hostPath = Path.ToHost(path)
+    IF !File.Exists(hostPath) THEN
+        RETURN {"Ok": FALSE, "Error": "no such file: " + path, "Exited": FALSE, "ExitCode": 0}
+    END IF
+    source = File.ReadText(hostPath)
+    RETURN Runtime.RunString(source)
+END FUNCTION
+
+' Each fixture calls ExitTheProgram with its own distinctive code so this can verify the RIGHT
+' program actually ran (Ok alone only proves SOME valid program ran without erroring) without
+' needing to capture PRINT output or touch the filesystem from inside the nested Runtime. Nested
+' IF rather than ANDALSO throughout -- Ok/Exited are Boxed booleans (object fields off
+' Runtime.RunString's returned OBJECT), and this file avoids combining a Boxed bool with
+' ANDALSO/ORELSE everywhere else too (see the color_ok comment above for the disclosed reason).
+FUNCTION AssertScriptRanOk(label AS STRING, outcome AS OBJECT, expectedExitCode)
+    IF !outcome.Ok THEN
+        PRINT "FAIL " + label + ": " + outcome.Error
+        RETURN FALSE
+    END IF
+    IF !outcome.Exited THEN
+        PRINT "FAIL " + label + ": script finished without calling ExitTheProgram"
+        RETURN FALSE
+    END IF
+    IF outcome.ExitCode <> expectedExitCode THEN
+        PRINT "FAIL " + label + ": exit code " + STRING(outcome.ExitCode) + " (expected " + STRING(expectedExitCode) + ")"
+        RETURN FALSE
+    END IF
+    PRINT "ok   " + label
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION RunScriptExecutionSelfTest(fixturesDir AS STRING)
+    failures = 0
+
+    missing = RunScriptFile(fixturesDir + "/does-not-exist.abas")
+    IF missing.Ok THEN
+        PRINT "FAIL RunScriptFile reported Ok for a nonexistent file"
+        failures = failures + 1
+    ELSE
+        PRINT "ok   RunScriptFile reports a clean error for a nonexistent file"
+    END IF
+
+    IF !AssertScriptRanOk("unnumbered .abas source ran through the canonical compiler path", RunScriptFile(fixturesDir + "/wp007_unnumbered.abas"), 41) THEN
+        failures = failures + 1
+    END IF
+    IF !AssertScriptRanOk("classic numbered GOTO source ran through the canonical compiler path", RunScriptFile(fixturesDir + "/wp007_numbered.abas"), 42) THEN
+        failures = failures + 1
+    END IF
+    IF !AssertScriptRanOk("mixed numbered/unnumbered source ran through the canonical compiler path", RunScriptFile(fixturesDir + "/wp007_mixed.abas"), 43) THEN
+        failures = failures + 1
+    END IF
+
+    RETURN failures
+END FUNCTION
+
+FUNCTION RunPathLayerSelfTest()
+    cases = [
+        [":", "/"],
+        [":home:", "/home/"],
+        [":home:user:", "/home/user/"],
+        [":home:user:Desktop:", "/home/user/Desktop/"],
+        [":home:user:Desktop:file.txt", "/home/user/Desktop/file.txt"],
+        ["  :home:user:  ", "/home/user/"],
+        ["\":home:user:\"", "/home/user/"],
+        [":home:user:My Documents:", "/home/user/My Documents/"],
+        [":home:user:..:other:", "/home/other/"],
+        [":home:.:user:", "/home/user/"],
+        ["::", "/"],
+        ["/usr/bin", "/usr/bin"],
+        ["./relative", "./relative"]
+    ]
+
+    failures = 0
+    FOR testCase IN cases
+        input = testCase[0]
+        expected = testCase[1]
+        actual = Path.ToHost(input)
+        IF actual == expected THEN
+            PRINT "ok   Path.ToHost(" + input + ") == " + expected
+        ELSE
+            PRINT "FAIL Path.ToHost(" + input + ") == " + actual + " (expected " + expected + ")"
+            failures = failures + 1
+        END IF
+    NEXT
+
+    roundtrips = [
+        ["/home/user/", ":home:user:"],
+        ["/", ":"],
+        ["relative/path", "relative/path"]
+    ]
+    FOR testCase IN roundtrips
+        input = testCase[0]
+        expected = testCase[1]
+        actual = Path.ToArcology(input)
+        IF actual == expected THEN
+            PRINT "ok   Path.ToArcology(" + input + ") == " + expected
+        ELSE
+            PRINT "FAIL Path.ToArcology(" + input + ") == " + actual + " (expected " + expected + ")"
+            failures = failures + 1
+        END IF
+    NEXT
+
+    RETURN failures
+END FUNCTION
+
+version = "0.7.0-wp011"
+no_color_flag = HasFlag(Args, "--no-color")
+no_color_env = Process.Env("NO_COLOR") <> ""
+term = Process.Env("TERM")
+is_tty = Console.IsTTY()
+
+' NOTE: this backend's generic host-function bridge (src/native/host_bridge.cpp) has a real,
+' disclosed bug where a bool RETURNED DIRECTLY FROM A HOST FUNCTION crashes if fed straight into
+' ANDALSO/ORELSE (confirmed with plain File.Exists() too, not specific to Console.IsTTY -- see
+' arcology-os/rfcs/RFC-0053... progress notes). A bare `IF is_tty THEN` / `IF !is_tty THEN` is
+' fine; only the short-circuit combination is affected. Worked around here with nested IF instead
+' of ANDALSO wherever a host-returned bool (is_tty) is involved; comparison-expression results
+' (term <> "dumb", String.Slice(...) == ":", etc.) combine via ANDALSO/ORELSE without issue
+' throughout the rest of this file.
+color_ok = FALSE
+IF is_tty THEN
+    IF !no_color_flag THEN
+        IF !no_color_env THEN
+            IF term <> "dumb" ANDALSO term <> "" THEN
+                color_ok = TRUE
+            END IF
+        END IF
+    END IF
+END IF
+
+IF HasFlag(Args, "--version") THEN
+    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-011)"
+    ExitTheProgram(0)
+END IF
+
+IF HasFlag(Args, "--diagnostic") THEN
+    PRINT "ArcoSH diagnostic"
+    PRINT "  version:        " + version
+    PRINT "  cwd (host):     " + Path.Cwd()
+    PRINT "  cwd (arcology): " + Path.ToArcology(Path.Cwd())
+    PRINT "  stdout is tty:  " + STRING(is_tty)
+    PRINT "  TERM:           " + term
+    PRINT "  NO_COLOR set:   " + STRING(no_color_env)
+    PRINT "  --no-color:     " + STRING(no_color_flag)
+    PRINT "  color enabled:  " + STRING(color_ok)
+    ExitTheProgram(0)
+END IF
+
+IF HasFlag(Args, "--selftest-paths") THEN
+    failures = RunPathLayerSelfTest()
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " path layer test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all path layer tests passed"
+    ExitTheProgram(0)
+END IF
+
+IF HasFlag(Args, "--selftest-oops") THEN
+    failures = RunOopsSelfTest()
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " oops test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all oops tests passed"
+    ExitTheProgram(0)
+END IF
+
+IF HasFlag(Args, "--selftest-resident") THEN
+    failures = RunResidentProgramSelfTest()
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " resident program test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all resident program tests passed"
+    ExitTheProgram(0)
+END IF
+
+IF HasFlag(Args, "--selftest-script-execution") THEN
+    fixturesDir = ArgumentAfterFlag(Args, "--selftest-script-execution")
+    failures = RunScriptExecutionSelfTest(fixturesDir)
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " script execution test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all script execution tests passed"
+    ExitTheProgram(0)
+END IF
+
+IF HasFlag(Args, "--selftest-pipeline") THEN
+    failures = RunPipelineSelfTest()
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " pipeline/redirection test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all pipeline/redirection tests passed"
+    ExitTheProgram(0)
+END IF
+
+' Reduced terminal capability (piped stdin, dumb terminal, no color) must degrade gracefully
+' rather than fail: no ANSI codes are ever emitted by this skeleton, so color_ok currently only
+' affects the banner line below. Real semantic styling (Display.*/Terminal.* per RFC-0052 section
+' 17) is WP-008, not this skeleton.
+IF color_ok THEN
+    PRINT "Arcology Shell (arcosh) " + version
+ELSE
+    PRINT "Arcology Shell (arcosh) " + version + " [no-color]"
+END IF
+
+IF !is_tty THEN
+    PRINT "(non-interactive input; reading commands from stdin)"
+END IF
+
+running = TRUE
+history = []
+resident_program = []
+last_exit_code = 0
+WHILE running
+    cwd = Path.Cwd()
+    IF is_tty THEN Console.Write(Prompt(cwd))
+
+    line = Console.ReadLine()
+    IF !line.Ok THEN
+        IF is_tty THEN PRINT ""
+        running = FALSE
+        CONTINUE WHILE
+    END IF
+
+    command = String.Trim(line.Text)
+    IF command == "" THEN CONTINUE WHILE
+
+    ' RFC section 8 (Input Classification): a numbered program line is recognized before shell-
+    ' command parsing ever runs -- it isn't shell syntax, so it never reaches ParseCommand at all.
+    lineNumberInfo = ParseLeadingLineNumber(command)
+    IF lineNumberInfo.IsNumbered THEN
+        SetProgramLine(resident_program, lineNumberInfo.Number, lineNumberInfo.Rest)
+        CONTINUE WHILE
+    END IF
+
+    parsed = ParseCommand(command)
+
+    ' RFC section 12's resolution order starts with "protected ArcoSH built-ins" -- checked first,
+    ' against the PARSED executable name (not the raw string), so quoting/extra-whitespace behave
+    ' the same way for a builtin as for any real command. Every branch records exactly one
+    ' history entry (RFC-0052 WP-005) -- built-ins included, for a consistent, inspectable record.
+    IF parsed.Executable == "exit" ORELSE parsed.Executable == "EXIT" ORELSE parsed.Executable == "quit" THEN
+        ignored = Array.Push(history, MakeHistoryEntry(parsed, "SUCCESS", 0))
+        running = FALSE
+        CONTINUE WHILE
+    END IF
+
+    IF parsed.Executable == "pwd" THEN
+        PRINT Path.Cwd()
+        ignored = Array.Push(history, MakeHistoryEntry(parsed, "SUCCESS", 0))
+        CONTINUE WHILE
+    END IF
+
+    IF parsed.Executable == "history" THEN
+        index = 0
+        FOR entry IN history
+            PRINT STRING(index) + ": " + entry.SourceText
+            index = index + 1
+        NEXT
+        ignored = Array.Push(history, MakeHistoryEntry(parsed, "SUCCESS", 0))
+        CONTINUE WHILE
+    END IF
+
+    IF parsed.Executable == "cd" THEN
+        target = Path.Home()
+        IF LEN(parsed.Arguments) > 0 THEN target = parsed.Arguments[0]
+        hostTarget = Path.ToHost(target)
+        changeResult = Directory.Change(hostTarget)
+        IF changeResult.Ok THEN
+            ignored = Array.Push(history, MakeHistoryEntry(parsed, "SUCCESS", 0))
+        ELSE
+            PRINT "arcosh: cd: " + target + ": " + changeResult.Error
+            ignored = Array.Push(history, MakeHistoryEntry(parsed, "PATH_NOT_FOUND", -1))
+        END IF
+        CONTINUE WHILE
+    END IF
+
+    IF parsed.Executable == "oops" THEN
+        last_exit_code = RunOops(history, parsed)
+        CONTINUE WHILE
+    END IF
+
+    ' RFC-0052 WP-006: classic BASIC keywords, checked case-insensitively (LIST/RUN/NEW are always
+    ' uppercase by RFC section 9's own examples, unlike the lowercase UNIX-style shell built-ins
+    ' above) -- not recorded into `history`, which RFC section 14 scopes to shell commands, not
+    ' resident-program editing.
+    IF Upper(parsed.Executable) == "LIST" THEN
+        FOR entry IN resident_program
+            PRINT STRING(entry.Number) + " " + entry.Text
+        NEXT
+        CONTINUE WHILE
+    END IF
+
+    IF Upper(parsed.Executable) == "RUN" THEN
+        IF LEN(parsed.Arguments) > 0 THEN
+            scriptResult = RunScriptFile(parsed.Arguments[0])
+            IF !scriptResult.Ok THEN
+                PRINT "arcosh: run: " + scriptResult.Error
+            END IF
+            CONTINUE WHILE
+        END IF
+        IF LEN(resident_program) > 0 THEN
+            lines = []
+            FOR entry IN resident_program
+                ignored = Array.Push(lines, STRING(entry.Number) + " " + entry.Text)
+            NEXT
+            runResult = Runtime.RunString(String.Join(lines, "\n"))
+            IF !runResult.Ok THEN
+                PRINT "arcosh: run: " + runResult.Error
+            END IF
+        END IF
+        CONTINUE WHILE
+    END IF
+
+    IF Upper(parsed.Executable) == "NEW" THEN
+        resident_program = []
+        CONTINUE WHILE
+    END IF
+
+    ' RFC-0052 WP-012 (background jobs) is still out of scope -- refuse clearly rather than
+    ' silently running a "&"-suffixed command in the foreground as if the "&" had been ignored.
+    ' Checked BEFORE pipeline/redirection execution below: `slow-thing & > out` is still refused
+    ' whole, not partially run.
+    IF parsed.Background THEN
+        PRINT "arcosh: background jobs are not implemented yet (see RFC-0052 WP-012)"
+        ignored = Array.Push(history, MakeHistoryEntry(parsed, "INVALID_SYNTAX", -1))
+        CONTINUE WHILE
+    END IF
+
+    IF parsed.Executable == "" THEN CONTINUE WHILE
+
+    ' RFC-0052 WP-011: a real pipeline stage or redirection routes through Process.ExecutePipeline
+    ' (real fork/pipe/dup2 plumbing -- see its own comment); the common plain-command case keeps
+    ' using ExecuteAndRecord/Process.Execute unchanged, the same already-verified-under-a-real-pty
+    ' code path WP-004 established, rather than routing everything through the pipeline-capable
+    ' primitive just to reduce code paths.
+    IF LEN(parsed.PipelineStages) > 0 ORELSE LEN(parsed.Redirections) > 0 THEN
+        last_exit_code = ExecutePipelineAndRecord(history, parsed)
+    ELSE
+        last_exit_code = ExecuteAndRecord(history, parsed)
+    END IF
+WEND
+
+ExitTheProgram(0)

@@ -20,5 +20,4 @@ echo "Installing $DEB ..."
 "$SCRIPT_DIR/../install/install-deb-wizard.sh" "$DEB"
 
 echo
-arcosh --version
-echo "Installed. Try: arcosh --doctor"
+echo "Installed."

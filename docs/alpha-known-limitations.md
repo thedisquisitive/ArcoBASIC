@@ -1,5 +1,10 @@
 # ArcoSH Alpha Known Limitations
 
+> **Status:** This describes the retired implementation (`src/shell/arcosh.cpp`). ArcoSH is being
+> restarted from scratch as the standalone, Linux-focused [`arcosh/`](../arcosh/README.md) project;
+> the gaps below no longer apply to an active build, but are kept as a record of what the previous
+> implementation actually covered versus its design vision (`arcosh.md`).
+
 ArcoSH is usable for alpha testing, scripting, and profile experimentation, but it is not a complete POSIX shell.
 
 Known alpha gaps:

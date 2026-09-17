@@ -167,8 +167,7 @@ $exeDir = if ($generator -like "Visual Studio*") {
 
 Write-Host ""
 Write-Host "Build complete." -ForegroundColor Green
-Write-Host "ArcoSH:    $(Join-Path $exeDir 'arcosh.exe')"
 Write-Host "ArcoBASIC: $(Join-Path $exeDir 'arco_cli.exe')"
 Write-Host ""
 Write-Host "Example:"
-Write-Host "  $(Join-Path $exeDir 'arcosh.exe') --version"
+Write-Host "  $(Join-Path $exeDir 'arco_cli.exe') --version"

@@ -4,6 +4,12 @@
 
 Version: Draft 0.1
 
+> **Status:** Active development has moved to the standalone, Linux-focused restart at
+> [`arcosh/`](../arcosh/README.md). The previous implementation this document was written against
+> (`src/shell/arcosh.cpp`, `apps/arcosh/main.cpp`) is retired as a product. This document remains
+> the design-vision reference; see `alpha-known-limitations.md` for the gaps that implementation
+> actually had.
+
 ---
 
 # Overview
