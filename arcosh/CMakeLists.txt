@@ -84,4 +84,12 @@ if(BUILD_TESTING)
     # with variable state persisting across two SEPARATE Runtime.EvalImmediate calls -- see
     # RunImmediateInputSelfTest in src/arcosh.abas.
     add_test(NAME arcosh_immediate_input_selftest COMMAND ${ARCOSH_BINARY} --selftest-immediate)
+    # RFC-0052 AP-0052-015 (WP-012): real POSIX job control against real processes and real
+    # signals (background jobs polled to completion, an external `kill -STOP`/SIGCONT exercising
+    # the exact same WUNTRACED stop-detection code path a real Ctrl-Z would, `bg` resuming a
+    # genuinely stopped job) -- ctest has no controlling terminal, so a real Ctrl-Z itself is
+    # verified manually against the compiled binary under a real pty instead (see arcosh/README.md
+    # and .agents/reports/ARCO_SH_RFC0052_WP012_JOB_CONTROL_RESEARCH.md) -- see
+    # RunJobControlSelfTest in src/arcosh.abas.
+    add_test(NAME arcosh_job_control_selftest COMMAND ${ARCOSH_BINARY} --selftest-jobcontrol)
 endif()

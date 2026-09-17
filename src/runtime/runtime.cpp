@@ -704,6 +704,393 @@ Value process_execute_pipeline(const std::vector<std::pair<std::string, std::vec
     }
     return Value(results);
 }
+
+// RFC-0052 WP-012: real POSIX job control -- see .agents/reports/
+// ARCO_SH_RFC0052_WP012_JOB_CONTROL_RESEARCH.md for the full protocol this implements (process
+// groups, controlling-terminal hand-off, WUNTRACED stop detection, SIGCONT). A job here is one
+// pipeline (one or more processes sharing one process group, exactly what process_execute_pipeline
+// above already builds) whose START and WAIT are DELIBERATELY separate calls -- Process.Execute/
+// ExecutePipeline above always do both together and block until the whole thing exits, which is
+// fundamentally incompatible with a job that can be (a) backgrounded (started, never waited
+// synchronously) or (b) stopped mid-wait (Ctrl-Z) and resumed/re-waited an arbitrary number of
+// prompt-loop iterations later. Keyed by pgid (the job's own process group id) -- already a unique,
+// stable, kernel-assigned identifier for exactly this concept, so no separate handle/registry ID
+// scheme is needed the way Random.Create/TCP clients need one for their own multiple-instances case.
+struct JobRecord {
+    // Still-alive, not-yet-reaped members, in PIPELINE STAGE ORDER (never reordered) -- a
+    // just-detected stop leaves every member from that point on in this list untouched (still
+    // alive, just not running); reaping removes finished members from the FRONT as waitpid finds
+    // them, so by the time the list is empty every member has actually exited/died.
+    std::vector<pid_t> pending_pids;
+    std::vector<std::string> executables;
+};
+
+std::unordered_map<pid_t, JobRecord>& job_registry() {
+    static std::unordered_map<pid_t, JobRecord> registry;
+    return registry;
+}
+
+// Ignores SIGTTOU around a tcsetpgrp call -- the shell itself may transiently not be the
+// foreground process group at the exact moment it makes this call (a real race, not a
+// theoretical one: e.g. resuming a job that's about to hand the terminal right back), and
+// SIGTTOU's default action would stop the shell for doing the very thing that's supposed to fix
+// that. Every direct tcsetpgrp call in this file goes through this helper for that reason --
+// Process.SetupShellJobControl also leaves SIGTTOU permanently ignored for the shell's own
+// lifetime (see its own comment), so in practice this save/restore is close to a no-op once that
+// has run, but every job-control function here stays correct even if called before it (or from a
+// context that never calls it, e.g. a future non-arcosh consumer of these same primitives).
+void tcsetpgrp_ignoring_sigttou(int fd, pid_t pgid) {
+    if (!isatty(fd)) return;
+    struct sigaction ignore{};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    struct sigaction previous{};
+    sigaction(SIGTTOU, &ignore, &previous);
+    tcsetpgrp(fd, pgid);
+    sigaction(SIGTTOU, &previous, nullptr);
+}
+
+// One-time interactive setup (RFC-0052 research doc Section 3): claims the controlling terminal
+// for the shell's own process group and leaves SIGINT/SIGQUIT/SIGTSTP/SIGTTIN/SIGTTOU ignored
+// PERMANENTLY (never saved-and-restored per command the way Process.Execute/ExecutePipeline's own
+// narrower, non-job-control save/restore dance does) -- a real job-control shell's own top-level
+// process is never interrupted/stopped by a terminal signal for its entire interactive lifetime,
+// including while it's simply sitting at the prompt blocked in Console.ReadLine with no job
+// running at all. Every forked child still resets all five back to SIG_DFL before exec (see
+// process_start_job below), unaffected by this.
+Value process_setup_shell_job_control() {
+    if (!isatty(STDIN_FILENO)) {
+        // No controlling terminal to own (piped/redirected stdin -- every earlier WP's own
+        // non-interactive mode, ctest included) -- nothing to seize, not an error.
+        return Value::Object{{"Ok", true}, {"Error", ""}};
+    }
+    // APUE 9.14's own idiom: if arcosh was itself started in the BACKGROUND of another job-control
+    // shell (`arcosh &`), it must wait until it's actually brought to the foreground before seizing
+    // job control -- sending itself SIGTTIN (still SIG_DFL at this exact point, default action
+    // Stop) is what "wait until foregrounded" means for a process that isn't reading the terminal
+    // itself yet.
+    pid_t shell_pgrp = getpgrp();
+    while (tcgetpgrp(STDIN_FILENO) != shell_pgrp) {
+        kill(-shell_pgrp, SIGTTIN);
+        shell_pgrp = getpgrp();
+    }
+    if (setpgid(0, 0) != 0 && errno != EPERM) {
+        // EPERM means this process is already a session leader and cannot change its own group --
+        // true for a genuine login shell, not a real failure.
+        return Value::Object{{"Ok", false}, {"Error", std::string("setpgid: ") + std::strerror(errno)}};
+    }
+    shell_pgrp = getpgrp();
+    tcsetpgrp_ignoring_sigttou(STDIN_FILENO, shell_pgrp);
+    struct sigaction ignore{};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    sigaction(SIGINT, &ignore, nullptr);
+    sigaction(SIGQUIT, &ignore, nullptr);
+    sigaction(SIGTSTP, &ignore, nullptr);
+    sigaction(SIGTTIN, &ignore, nullptr);
+    sigaction(SIGTTOU, &ignore, nullptr);
+    return Value::Object{{"Ok", true}, {"Error", ""}};
+}
+
+// Starts one job's processes (identical fork/pipe/dup2/self-pipe plumbing to
+// process_execute_pipeline above -- see that function's own much larger comment for the full
+// design rationale) but never waits for any of them -- WAITING is process_wait_job/
+// process_poll_job's job below, deliberately separate so a backgrounded job can be started now
+// and waited on (or never waited on synchronously at all) an arbitrary number of prompt-loop
+// iterations later.
+Value process_start_job(const std::vector<std::pair<std::string, std::vector<std::string>>>& stages,
+                         const std::string& stdin_path, const std::string& stdout_path,
+                         bool append_stdout, bool foreground) {
+    std::cout << std::flush;
+    std::cerr << std::flush;
+
+    const std::size_t stage_count = stages.size();
+    const auto start_error = [](const std::string& message) {
+        return Value::Object{{"Ok", false}, {"Error", message}, {"Pgid", -1.0}, {"NotFound", Value(Value::Array{})}};
+    };
+    if (stage_count == 0) {
+        return start_error("job has no stages");
+    }
+
+    std::vector<std::array<int, 2>> stage_pipes(stage_count > 1 ? stage_count - 1 : 0);
+    std::vector<std::array<int, 2>> self_pipes(stage_count);
+    const auto close_all = [&]() {
+        for (auto& fds : stage_pipes) { close(fds[0]); close(fds[1]); }
+        for (auto& fds : self_pipes) { close(fds[0]); close(fds[1]); }
+    };
+    for (auto& fds : stage_pipes) {
+        if (pipe(fds.data()) != 0) {
+            const std::string error = std::strerror(errno);
+            close_all();
+            return start_error(error);
+        }
+    }
+    for (auto& fds : self_pipes) {
+        if (pipe(fds.data()) != 0) {
+            const std::string error = std::strerror(errno);
+            close_all();
+            return start_error(error);
+        }
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    }
+
+    std::vector<pid_t> pids(stage_count, -1);
+    pid_t pgid = 0;
+    bool fork_failed = false;
+    std::string fork_error;
+
+    for (std::size_t i = 0; i < stage_count && !fork_failed; ++i) {
+        const pid_t pid = fork();
+        if (pid < 0) {
+            fork_failed = true;
+            fork_error = std::strerror(errno);
+            break;
+        }
+
+        if (pid == 0) {
+            setpgid(0, i == 0 ? 0 : pgid);
+
+            struct sigaction default_action {};
+            default_action.sa_handler = SIG_DFL;
+            sigemptyset(&default_action.sa_mask);
+            sigaction(SIGINT, &default_action, nullptr);
+            sigaction(SIGQUIT, &default_action, nullptr);
+            sigaction(SIGTSTP, &default_action, nullptr);
+            sigaction(SIGTTIN, &default_action, nullptr);
+            sigaction(SIGTTOU, &default_action, nullptr);
+
+            bool redirect_failed = false;
+            int redirect_errno = 0;
+            if (i == 0) {
+                if (!stdin_path.empty()) {
+                    const int fd = open(stdin_path.c_str(), O_RDONLY);
+                    if (fd < 0) { redirect_failed = true; redirect_errno = errno; }
+                    else { dup2(fd, STDIN_FILENO); close(fd); }
+                }
+            } else {
+                dup2(stage_pipes[i - 1][0], STDIN_FILENO);
+            }
+            if (!redirect_failed) {
+                if (i + 1 == stage_count) {
+                    if (!stdout_path.empty()) {
+                        const int flags = O_WRONLY | O_CREAT | (append_stdout ? O_APPEND : O_TRUNC);
+                        const int fd = open(stdout_path.c_str(), flags, 0644);
+                        if (fd < 0) { redirect_failed = true; redirect_errno = errno; }
+                        else { dup2(fd, STDOUT_FILENO); close(fd); }
+                    }
+                } else {
+                    dup2(stage_pipes[i][1], STDOUT_FILENO);
+                }
+            }
+
+            for (auto& fds : stage_pipes) { close(fds[0]); close(fds[1]); }
+            for (std::size_t k = 0; k < self_pipes.size(); ++k) {
+                close(self_pipes[k][0]);
+                if (k != i) close(self_pipes[k][1]);
+            }
+
+            if (redirect_failed) {
+                ssize_t written = write(self_pipes[i][1], &redirect_errno, sizeof(redirect_errno));
+                (void)written;
+                _exit(127);
+            }
+
+            std::vector<char*> argv;
+            argv.reserve(stages[i].second.size() + 2);
+            argv.push_back(const_cast<char*>(stages[i].first.c_str()));
+            for (const auto& value : stages[i].second) argv.push_back(const_cast<char*>(value.c_str()));
+            argv.push_back(nullptr);
+            execvp(stages[i].first.c_str(), argv.data());
+
+            const int exec_errno = errno;
+            ssize_t written = write(self_pipes[i][1], &exec_errno, sizeof(exec_errno));
+            (void)written;
+            _exit(127);
+        }
+
+        if (i == 0) pgid = pid;
+        setpgid(pid, pgid);
+        pids[i] = pid;
+    }
+
+    if (fork_failed) {
+        for (std::size_t i = 0; i < stage_count; ++i) {
+            if (pids[i] > 0) kill(pids[i], SIGKILL);
+        }
+        for (std::size_t i = 0; i < stage_count; ++i) {
+            if (pids[i] > 0) { int status = 0; waitpid(pids[i], &status, 0); }
+        }
+        close_all();
+        return start_error(fork_error);
+    }
+
+    for (auto& fds : stage_pipes) { close(fds[0]); close(fds[1]); }
+    for (auto& fds : self_pipes) { close(fds[1]); }
+
+    if (foreground) {
+        tcsetpgrp_ignoring_sigttou(STDIN_FILENO, pgid);
+    }
+
+    // {Executable, Error} objects, not bare names -- the specific errno string (e.g. "Permission
+    // denied" vs "No such file or directory") is what lets the ArcoBASIC caller tell a genuinely
+    // missing command apart from one that exists but can't be run, the same distinction
+    // ClassifyProcessResult already makes for Process.Execute's own single-command result.
+    Value::Array not_found;
+    for (std::size_t i = 0; i < stage_count; ++i) {
+        int stage_errno = 0;
+        const ssize_t read_count = read(self_pipes[i][0], &stage_errno, sizeof(stage_errno));
+        close(self_pipes[i][0]);
+        if (read_count > 0) {
+            not_found.push_back(Value(Value::Object{{"Executable", stages[i].first}, {"Error", std::string(std::strerror(stage_errno))}}));
+        }
+    }
+
+    JobRecord record;
+    record.pending_pids = pids;
+    for (const auto& stage : stages) record.executables.push_back(stage.first);
+    job_registry()[pgid] = std::move(record);
+
+    return Value::Object{{"Ok", true}, {"Error", ""}, {"Pgid", static_cast<double>(pgid)}, {"NotFound", Value(not_found)}};
+}
+
+// Blocking wait for a job started by process_start_job -- WUNTRACED is what turns a SIGTSTP/
+// SIGTTIN-caused stop into a normal waitpid return (WIFSTOPPED) instead of leaving this call
+// blocked until the job fully exits, which would make Ctrl-Z during a foreground job do nothing
+// observable (the exact "faked" job control AP-0052-015 rules out). Reaps pending members in
+// STAGE ORDER (never -pgid, which reaps in arbitrary/kernel-chosen order) so the job's own final
+// reported status is always its LAST STAGE's, matching real shell `$?` pipeline semantics --
+// identical reasoning to ExecutePipelineAndRecord's own per-stage waitpid loop, just able to stop
+// partway through and resume later instead of always running to completion in one call.
+Value process_wait_job(pid_t pgid, bool foreground) {
+    auto found = job_registry().find(pgid);
+    if (found == job_registry().end()) {
+        return Value::Object{{"Ok", false}, {"Error", "unknown job"}, {"Stopped", false}, {"Done", true},
+                              {"ExitCode", -1.0}, {"Signaled", false}, {"TermSignal", 0.0}};
+    }
+    JobRecord& record = found->second;
+
+    bool stopped = false;
+    int last_exit_code = -1;
+    bool last_signaled = false;
+    int last_term_signal = 0;
+    std::vector<pid_t> still_pending;
+
+    for (std::size_t i = 0; i < record.pending_pids.size(); ++i) {
+        const pid_t pid = record.pending_pids[i];
+        int status = 0;
+        pid_t result;
+        while ((result = waitpid(pid, &status, WUNTRACED)) < 0 && errno == EINTR) {
+            // retry
+        }
+        if (result < 0) {
+            // Already gone (shouldn't normally happen -- this record is the only owner of this
+            // pid) -- nothing left to reap for it, just drop it.
+            continue;
+        }
+        if (WIFSTOPPED(status)) {
+            stopped = true;
+            for (std::size_t j = i; j < record.pending_pids.size(); ++j) still_pending.push_back(record.pending_pids[j]);
+            break;
+        }
+        if (WIFSIGNALED(status)) {
+            last_signaled = true;
+            last_term_signal = WTERMSIG(status);
+            last_exit_code = -1;
+        } else if (WIFEXITED(status)) {
+            last_signaled = false;
+            last_exit_code = WEXITSTATUS(status);
+        }
+    }
+
+    const bool done = !stopped;
+    if (stopped) {
+        record.pending_pids = still_pending;
+    } else {
+        job_registry().erase(found);
+    }
+
+    if (foreground) {
+        tcsetpgrp_ignoring_sigttou(STDIN_FILENO, getpgrp());
+    }
+
+    return Value::Object{{"Ok", true}, {"Error", ""}, {"Stopped", stopped}, {"Done", done},
+                          {"ExitCode", static_cast<double>(last_exit_code)}, {"Signaled", last_signaled},
+                          {"TermSignal", static_cast<double>(last_term_signal)}};
+}
+
+// Non-blocking (WNOHANG) equivalent of process_wait_job, for a BACKGROUND job the shell isn't
+// actively waiting on -- polled once per prompt line (and inside `jobs` itself) so a background
+// job finishing or stopping on its own schedule (e.g. it tried to read the terminal and got
+// SIGTTIN'd) is discovered and reported "as soon as reasonably possible", never by blocking the
+// shell's own prompt.
+Value process_poll_job(pid_t pgid) {
+    auto found = job_registry().find(pgid);
+    if (found == job_registry().end()) {
+        return Value::Object{{"Ok", true}, {"Changed", false}, {"Stopped", false}, {"Done", true},
+                              {"ExitCode", -1.0}, {"Signaled", false}, {"TermSignal", 0.0}};
+    }
+    JobRecord& record = found->second;
+
+    bool changed = false;
+    bool stopped = false;
+    int last_exit_code = -1;
+    bool last_signaled = false;
+    int last_term_signal = 0;
+    std::vector<pid_t> still_pending;
+
+    for (std::size_t i = 0; i < record.pending_pids.size(); ++i) {
+        const pid_t pid = record.pending_pids[i];
+        int status = 0;
+        const pid_t result = waitpid(pid, &status, WNOHANG | WUNTRACED);
+        if (result == 0) {
+            still_pending.push_back(pid);
+            continue;
+        }
+        if (result < 0) {
+            continue;
+        }
+        changed = true;
+        if (WIFSTOPPED(status)) {
+            stopped = true;
+            still_pending.push_back(pid);
+            for (std::size_t j = i + 1; j < record.pending_pids.size(); ++j) still_pending.push_back(record.pending_pids[j]);
+            break;
+        }
+        if (WIFSIGNALED(status)) {
+            last_signaled = true;
+            last_term_signal = WTERMSIG(status);
+            last_exit_code = -1;
+        } else if (WIFEXITED(status)) {
+            last_signaled = false;
+            last_exit_code = WEXITSTATUS(status);
+        }
+    }
+
+    const bool done = still_pending.empty() && !stopped;
+    if (done) {
+        job_registry().erase(found);
+    } else {
+        record.pending_pids = still_pending;
+    }
+
+    return Value::Object{{"Ok", true}, {"Changed", changed}, {"Stopped", stopped}, {"Done", done},
+                          {"ExitCode", static_cast<double>(last_exit_code)}, {"Signaled", last_signaled},
+                          {"TermSignal", static_cast<double>(last_term_signal)}};
+}
+
+// Resumes a stopped (or already-running, in which case this is a harmless no-op -- SIGCONT on a
+// process that was never stopped has no observable effect) job's process group -- `bg`/`fg` both
+// route through this, differing only in `foreground` (whether it also reclaims the terminal).
+// Never waits; the caller calls process_wait_job/process_poll_job separately if it wants to block.
+Value process_continue_job(pid_t pgid, bool foreground) {
+    if (foreground) {
+        tcsetpgrp_ignoring_sigttou(STDIN_FILENO, pgid);
+    }
+    if (kill(-pgid, SIGCONT) != 0) {
+        return Value::Object{{"Ok", false}, {"Error", std::strerror(errno)}};
+    }
+    return Value::Object{{"Ok", true}, {"Error", ""}};
+}
 #endif
 
 #if defined(ARCO_NETWORK_CURL)
@@ -3125,6 +3512,95 @@ Runtime::Runtime()
         const std::string stdout_path = args[2].to_string();
         const bool append_stdout = args[3].truthy();
         return process_execute_pipeline(stages, stdin_path, stdout_path, append_stdout);
+#endif
+    });
+    // RFC-0052 WP-012: real POSIX job control. See .agents/reports/
+    // ARCO_SH_RFC0052_WP012_JOB_CONTROL_RESEARCH.md and process_setup_shell_job_control's own
+    // comment. Called once, at interactive startup -- idempotent and safe to call again (or not at
+    // all, e.g. non-interactively), but only needs to run once for the shell's whole lifetime.
+    register_function("Process.SetupShellJobControl", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Process.SetupShellJobControl", 0, 0);
+#ifdef _WIN32
+        (void)args;
+        return Value::Object{{"Ok", false}, {"Error", "job control is not implemented on Windows"}};
+#else
+        return process_setup_shell_job_control();
+#endif
+    });
+    // Starts a job (one or more pipeline stages, identical shape to Process.ExecutePipeline's own
+    // `stages` argument) WITHOUT waiting for it -- see process_start_job's own comment for why
+    // this is a separate primitive from Process.ExecutePipeline rather than an extra flag on it.
+    // `foreground` hands the new job the controlling terminal immediately; a backgrounded job
+    // keeps the shell itself as the foreground group. Returns the job's pgid (the handle every
+    // other Process.*Job primitive below takes) and which stage(s), if any, failed to exec.
+    register_function("Process.StartJob", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Process.StartJob", 5, 5);
+#ifdef _WIN32
+        (void)args;
+        return Value::Object{{"Ok", false}, {"Error", "job control is not implemented on Windows"}, {"Pgid", -1.0}, {"NotFound", Value(Value::Array{})}};
+#else
+        std::vector<std::pair<std::string, std::vector<std::string>>> stages;
+        for (const auto& stage_value : args[0].as_array()) {
+            const auto& stage_object = stage_value.as_object();
+            const auto executable_it = stage_object.find("Executable");
+            const auto arguments_it = stage_object.find("Arguments");
+            std::string executable = executable_it != stage_object.end() ? executable_it->second.to_string() : std::string();
+            std::vector<std::string> arguments;
+            if (arguments_it != stage_object.end()) {
+                for (const auto& value : arguments_it->second.as_array()) arguments.push_back(value.to_string());
+            }
+            stages.emplace_back(std::move(executable), std::move(arguments));
+        }
+        const std::string stdin_path = args[1].to_string();
+        const std::string stdout_path = args[2].to_string();
+        const bool append_stdout = args[3].truthy();
+        const bool foreground = args[4].truthy();
+        return process_start_job(stages, stdin_path, stdout_path, append_stdout, foreground);
+#endif
+    });
+    // Blocking wait on a job Process.StartJob returned a pgid for -- see process_wait_job's own
+    // comment. `foreground` controls whether this reclaims the terminal for the shell once the
+    // job stops or finishes (never meaningful for a job that was never given the terminal in the
+    // first place, but harmless either way since it only ever hands the terminal BACK to the
+    // shell's own group, never away from it).
+    register_function("Process.WaitJob", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Process.WaitJob", 2, 2);
+#ifdef _WIN32
+        (void)args;
+        return Value::Object{{"Ok", false}, {"Error", "job control is not implemented on Windows"}, {"Stopped", false},
+                              {"Done", true}, {"ExitCode", -1.0}, {"Signaled", false}, {"TermSignal", 0.0}};
+#else
+        const pid_t pgid = static_cast<pid_t>(args[0].as_number());
+        const bool foreground = args[1].truthy();
+        return process_wait_job(pgid, foreground);
+#endif
+    });
+    // Non-blocking poll on a job -- see process_poll_job's own comment. Used for background jobs
+    // so the shell can notice one finished/stopped on its own schedule without ever blocking the
+    // prompt.
+    register_function("Process.PollJob", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Process.PollJob", 1, 1);
+#ifdef _WIN32
+        (void)args;
+        return Value::Object{{"Ok", false}, {"Changed", false}, {"Stopped", false}, {"Done", true},
+                              {"ExitCode", -1.0}, {"Signaled", false}, {"TermSignal", 0.0}};
+#else
+        const pid_t pgid = static_cast<pid_t>(args[0].as_number());
+        return process_poll_job(pgid);
+#endif
+    });
+    // Resumes a stopped job's process group (`bg`/`fg` both use this, differing only in whether
+    // `foreground` also reclaims the terminal) -- see process_continue_job's own comment. Never
+    // waits; call Process.WaitJob/PollJob separately to actually block on (or poll) the result.
+    register_function("Process.ContinueJob", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Process.ContinueJob", 2, 2);
+#ifdef _WIN32
+        (void)args;
+        return Value::Object{{"Ok", false}, {"Error", "job control is not implemented on Windows"}};
+#else
+        const pid_t pgid = static_cast<pid_t>(args[0].as_number());
+        const bool foreground = args[1].truthy();
+        return process_continue_job(pgid, foreground);
 #endif
     });
     // RFC-0052 (arcosh/rfcs/RFC-0052_The_Arcology_Shell.md) WP-006: the resident numbered-program

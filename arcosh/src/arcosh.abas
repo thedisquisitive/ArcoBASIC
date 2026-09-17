@@ -1,6 +1,6 @@
-#DESCRIPTION "The Arcology Shell -- WP-001..WP-011 (RFC-0052)"
+#DESCRIPTION "The Arcology Shell -- WP-001..WP-012 (RFC-0052)"
 
-' RFC-0052 ("The Arcology Shell", see ../rfcs/RFC-0052_The_Arcology_Shell.md), WP-001 through WP-011.
+' RFC-0052 ("The Arcology Shell", see ../rfcs/RFC-0052_The_Arcology_Shell.md), WP-001 through WP-012.
 '
 ' WP-001 (shell skeleton): interactive loop, prompt, clean exit, current directory, diagnostic
 ' output, terminal capability query, explicit no-color mode.
@@ -16,11 +16,10 @@
 ' not executed by reparsing the raw source text.
 '
 ' WP-004 (Linux process layer): Process.Execute (arco_runtime, src/runtime/runtime.cpp) does the
-' real fork/execvp/waitpid work with correct foreground job-control terminal handoff, for the
-' plain single-command case (still used unchanged when a command has no pipeline stage or
-' redirection at all -- see WP-011 below for when it does). A background ("&") flag is still
-' refused with a clear message instead of being silently run in the foreground -- that's WP-012,
-' not this pass.
+' real fork/execvp/waitpid work with correct foreground job-control terminal handoff. Superseded
+' inside arcosh itself by WP-012's Process.StartJob/WaitJob below (real job control needs stop
+' detection Process.Execute never had) but left in place, unchanged, as a simpler primitive for
+' any OTHER ArcoBASIC program that just wants a one-shot blocking run with no job table.
 '
 ' WP-005 (structured history + oops): MakeHistoryEntry/ClassifyProcessResult/RunOops below. Every
 ' non-empty command (built-ins included) appends one history entry; `oops <name>` replaces only the
@@ -50,17 +49,25 @@
 ' accepts an optional leading line-number label on any statement -- see
 ' arcosh/tests/fixtures/wp007_*.abas and RunScriptExecutionSelfTest below.
 '
-' WP-011 (pipelines and redirection): Process.ExecutePipeline (arco_runtime, src/runtime/
-' runtime.cpp) does the real fork/pipe/dup2 plumbing -- one process group for the WHOLE pipeline
-' (so Ctrl-C stops every stage, not just the last), real files opened for "<"/">"/">>". See
-' ExecutePipelineAndRecord below and Process.ExecutePipeline's own comment in runtime.cpp for the
-' job-control/fd design. `$?`-equivalent semantics: a pipeline's own exit status is its LAST
-' stage's, matching real shells; an earlier stage that fails to exec is reported on its own line
-' ("command not found: ...") without changing that overall status.
+' WP-011 (pipelines and redirection): the fd-plumbing design (one process group per pipeline, real
+' files opened for "<"/">"/">>") is now built into Process.StartJob (WP-012 below) directly; see
+' its own comment in runtime.cpp. `$?`-equivalent semantics: a pipeline's own exit status is its
+' LAST stage's, matching real shells; an earlier stage that fails to exec is reported on its own
+' line ("command not found: ...") without changing that overall status.
 '
-' Still not implemented: themes, plugins, completion, job control beyond a single foreground
-' pipeline (background jobs, `jobs`/`fg`/`bg`, suspend/resume) -- later work packages (WP-008,
-' WP-009, WP-010, WP-012).
+' WP-012 (job control): Process.SetupShellJobControl/StartJob/WaitJob/PollJob/ContinueJob
+' (arco_runtime, src/runtime/runtime.cpp -- see .agents/reports/
+' ARCO_SH_RFC0052_WP012_JOB_CONTROL_RESEARCH.md for the full POSIX protocol these implement)
+' replace WP-004/WP-011's Process.Execute/ExecutePipeline as the ONE real execution path for every
+' external command arcosh runs, foreground or background: RunForegroundJob (real WUNTRACED stop
+' detection -- Ctrl-Z on ANY foreground command, not just something explicitly backgrounded),
+' RunBackgroundJob (`command &`, a real process group tracked in `jobs_table`, never a detached
+' fire-and-forget child), PollBackgroundJobs (polled once per prompt line so a background job
+' finishing/stopping on its own schedule is reported without ever blocking the prompt), and the
+' `jobs`/`fg`/`bg` built-ins below.
+'
+' Still not implemented: themes, plugins, completion -- later work packages (WP-008, WP-009,
+' WP-010).
 
 FUNCTION HasFlag(flagList AS ARRAY, flagName AS STRING)
     FOR flag IN flagList
@@ -348,7 +355,7 @@ END FUNCTION
 
 ' RFC section 14's own field list, plus the parsed command's own structured fields so `oops` (and
 ' anything else that ever reads history) never needs to re-parse SourceText.
-FUNCTION MakeHistoryEntry(parsed AS OBJECT, resultKind AS STRING, exitCode)
+FUNCTION MakeHistoryEntry(parsed AS OBJECT, resultKind AS STRING, exitCode AS NUMBER)
     RETURN {
         "SourceText": parsed.Source,
         "Executable": parsed.Executable,
@@ -388,27 +395,6 @@ FUNCTION FormatCommandForDisplay(executable AS STRING, arguments AS ARRAY)
     RETURN String.Join(parts, " ")
 END FUNCTION
 
-' Runs a plain external command and records its outcome. Returns the exit code (or -1 if the
-' command was never found) so the CALLER can assign its own top-level `last_exit_code` --
-' deliberately not set from in here: an ArcoBASIC FUNCTION has no reliable way to write back to an
-' enclosing script-level variable on this backend, so every top-level mutation in this program
-' happens at top level, by design, never inside a called function (arrays are the one safe
-' exception -- Array.Push mutates the shared underlying array through a normal parameter, not
-' through script-global scoping, which is why `history` itself can safely be passed around and
-' pushed to from inside these functions).
-FUNCTION ExecuteAndRecord(history AS ARRAY, parsed AS OBJECT)
-    execResult = Process.Execute(parsed.Executable, parsed.Arguments)
-    resultKind = ClassifyProcessResult(execResult)
-    exitCode = -1
-    IF execResult.Found THEN exitCode = execResult.ExitCode
-    IF !execResult.Found THEN
-        PRINT "arcosh: command not found: " + parsed.Executable
-    END IF
-    entry = MakeHistoryEntry(parsed, resultKind, exitCode)
-    ignored = Array.Push(history, entry)
-    RETURN exitCode
-END FUNCTION
-
 ' ---------------------------------------------------------------------------------------------
 ' Pipelines and Redirection (RFC-0052 WP-011)
 ' ---------------------------------------------------------------------------------------------
@@ -442,17 +428,96 @@ FUNCTION FindStdoutRedirection(redirections AS ARRAY)
     RETURN {"Target": target, "Append": append}
 END FUNCTION
 
-' Runs a real pipeline (one stage if there's no "|" at all -- Process.ExecutePipeline handles
-' plain redirection with no pipe through the exact same fd-plumbing, see its own comment) and
-' records ONE history entry for the whole command, classified from the LAST stage's result --
-' matching real shell `$?` semantics (a pipeline's own exit status is its last command's, not
-' merged from every stage). An earlier stage failing to exec is reported separately, per stage,
-' the same "command not found" message ExecuteAndRecord's own single-command path already prints.
-FUNCTION ExecutePipelineAndRecord(history AS ARRAY, parsed AS OBJECT)
+' Shared by RunForegroundJob/RunBackgroundJob: the full stage list (first stage + every
+' PipelineStages entry after it -- ONE stage for a plain command with no "|" at all) and the
+' resolved stdin/stdout redirection targets, everything Process.StartJob's own signature needs.
+FUNCTION BuildJobStages(parsed AS OBJECT)
     stages = [{"Executable": parsed.Executable, "Arguments": parsed.Arguments}]
     FOR stage IN parsed.PipelineStages
         ignored = Array.Push(stages, stage)
     NEXT
+    RETURN stages
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Job Control (RFC-0052 WP-012)
+' ---------------------------------------------------------------------------------------------
+
+' Job numbers only ever increase for the life of the shell (never reused after a job finishes) --
+' simpler than real shells' "reuse the lowest free number" convention and not worth the extra
+' bookkeeping for this RFC's own minimal target list (jobs/fg/bg/suspend-resume), which says
+' nothing about numbering reuse.
+FUNCTION NextJobNumber(jobsTable AS ARRAY)
+    highest = 0
+    FOR job IN jobsTable
+        IF job.Number > highest THEN highest = job.Number
+    NEXT
+    RETURN highest + 1
+END FUNCTION
+
+FUNCTION FindJobIndex(jobsTable AS ARRAY, jobNumber AS NUMBER)
+    i = 0
+    WHILE i < LEN(jobsTable)
+        IF jobsTable[i].Number == jobNumber THEN RETURN i
+        i = i + 1
+    WEND
+    RETURN -1
+END FUNCTION
+
+' `fg`/`fg %3`/`bg %3` all need "which job" resolved the same way: an explicit `%N` argument, or
+' (bare `fg`/`bg`) the most recently added entry -- real shells call this the "current job".
+FUNCTION MostRecentJobIndex(jobsTable AS ARRAY)
+    IF LEN(jobsTable) == 0 THEN RETURN -1
+    RETURN LEN(jobsTable) - 1
+END FUNCTION
+
+FUNCTION ResolveJobIndex(jobsTable AS ARRAY, arguments AS ARRAY)
+    IF LEN(arguments) == 0 THEN RETURN MostRecentJobIndex(jobsTable)
+    spec = arguments[0]
+    IF LEN(spec) > 0 ANDALSO String.Slice(spec, 0, 1) == "%" THEN spec = String.Slice(spec, 1, LEN(spec))
+    RETURN FindJobIndex(jobsTable, NUMBER(spec))
+END FUNCTION
+
+' Polled once per prompt line (RFC-0052 section 23's own "background jobs" requirement -- a
+' background job finishing or stopping itself, e.g. it tried to read the terminal and got
+' SIGTTIN'd, must be discovered without the shell ever blocking its own prompt to find out).
+' Removes a job from the table the moment it's reported Done -- matching real shells, which show
+' a finished background job's status exactly once, not on every subsequent `jobs`.
+FUNCTION PollBackgroundJobs(jobsTable AS ARRAY)
+    stillPending = []
+    FOR job IN jobsTable
+        poll = Process.PollJob(job.Pgid)
+        IF poll.Changed THEN
+            IF poll.Done THEN
+                PRINT "[" + STRING(job.Number) + "]+  Done                    " + job.Command
+            END IF
+            IF poll.Stopped THEN
+                PRINT "[" + STRING(job.Number) + "]+  Stopped                 " + job.Command
+                job.State = "Stopped"
+                ignored = Array.Push(stillPending, job)
+            END IF
+        ELSE
+            ignored = Array.Push(stillPending, job)
+        END IF
+    NEXT
+    ignored = Array.Resize(jobsTable, 0)
+    FOR job IN stillPending
+        ignored = Array.Push(jobsTable, job)
+    NEXT
+END FUNCTION
+
+' The one real fork/pipe/dup2 entry point for EVERY external command this shell runs, foreground
+' or background, single command or pipeline -- Process.StartJob already treats a plain command as
+' a one-stage job (see its own comment), so there is no separate non-job-control code path left:
+' WP-012's own "suspend/resume" requirement means Ctrl-Z has to work on an ORDINARY foreground
+' command too (`sleep 100`, no "&"), not only on something explicitly backgrounded, so every
+' foreground command needs the same WUNTRACED-aware wait this uses. Supersedes the old WP-004/
+' WP-011 ExecuteAndRecord/ExecutePipelineAndRecord, which called the older, non-job-control
+' Process.Execute/Process.ExecutePipeline directly -- those two host functions are unchanged and
+' still exported for any OTHER ArcoBASIC program that just wants a one-shot blocking run with no
+' job-table bookkeeping, but arcosh itself now needs the job-control-aware primitives everywhere.
+FUNCTION RunForegroundJob(history AS ARRAY, jobsTable AS ARRAY, parsed AS OBJECT)
+    stages = BuildJobStages(parsed)
 
     stdinTarget = FindStdinRedirection(parsed.Redirections)
     stdinPath = ""
@@ -466,25 +531,273 @@ FUNCTION ExecutePipelineAndRecord(history AS ARRAY, parsed AS OBJECT)
         appendStdout = stdoutInfo.Append
     END IF
 
-    results = Process.ExecutePipeline(stages, stdinPath, stdoutPath, appendStdout)
+    started = Process.StartJob(stages, stdinPath, stdoutPath, appendStdout, TRUE)
+    IF !started.Ok THEN
+        PRINT "arcosh: " + started.Error
+        ignored = Array.Push(history, MakeHistoryEntry(parsed, "PROCESS_FAILED", -1))
+        RETURN -1
+    END IF
 
-    i = 0
-    WHILE i < LEN(results)
-        stageResult = results[i]
-        IF !stageResult.Found THEN
-            PRINT "arcosh: command not found: " + stages[i].Executable
+    lastStageExecutable = stages[LEN(stages) - 1].Executable
+    lastStageFound = TRUE
+    lastStageError = ""
+    FOR failure IN started.NotFound
+        PRINT "arcosh: command not found: " + failure.Executable
+        IF failure.Executable == lastStageExecutable THEN
+            lastStageFound = FALSE
+            lastStageError = failure.Error
         END IF
-        i = i + 1
-    WEND
+    NEXT
 
-    lastResult = results[LEN(results) - 1]
-    resultKind = ClassifyProcessResult(lastResult)
+    waited = Process.WaitJob(started.Pgid, TRUE)
+
+    IF waited.Stopped THEN
+        jobNumber = NextJobNumber(jobsTable)
+        ignored = Array.Push(jobsTable, {"Number": jobNumber, "Pgid": started.Pgid, "Command": parsed.Source, "State": "Stopped"})
+        PRINT "[" + STRING(jobNumber) + "]+  Stopped                 " + parsed.Source
+        ' 148 == 128 + SIGTSTP(20), matching real shells' own $? convention for a foreground job
+        ' that stopped rather than exiting -- there is no real "exit code" yet (the job is still
+        ' alive), but a caller checking `last_exit_code == 0` must see this as non-success.
+        ignored = Array.Push(history, MakeHistoryEntry(parsed, "SUCCESS", 148))
+        RETURN 148
+    END IF
+
+    resultShape = {"Found": lastStageFound, "Signaled": waited.Signaled, "ExitCode": waited.ExitCode, "Error": lastStageError}
+    resultKind = ClassifyProcessResult(resultShape)
     exitCode = -1
-    IF lastResult.Found THEN exitCode = lastResult.ExitCode
+    IF lastStageFound THEN exitCode = waited.ExitCode
 
-    entry = MakeHistoryEntry(parsed, resultKind, exitCode)
-    ignored = Array.Push(history, entry)
+    ignored = Array.Push(history, MakeHistoryEntry(parsed, resultKind, exitCode))
     RETURN exitCode
+END FUNCTION
+
+' `command &`. Starts the job without giving it the terminal and without waiting -- registers it
+' in the job table immediately as Running and returns to the prompt, per AP-0052-015's explicit
+' "Background execution MUST NOT be faked merely by spawning detached child processes" (this job
+' has its own real process group and a live job-table entry PollBackgroundJobs can act on, not a
+' fire-and-forget child arcosh loses track of).
+FUNCTION RunBackgroundJob(history AS ARRAY, jobsTable AS ARRAY, parsed AS OBJECT)
+    stages = BuildJobStages(parsed)
+
+    stdinTarget = FindStdinRedirection(parsed.Redirections)
+    stdinPath = ""
+    IF stdinTarget <> "" THEN stdinPath = Path.ToHost(stdinTarget)
+
+    stdoutInfo = FindStdoutRedirection(parsed.Redirections)
+    stdoutPath = ""
+    appendStdout = FALSE
+    IF stdoutInfo.Target <> "" THEN
+        stdoutPath = Path.ToHost(stdoutInfo.Target)
+        appendStdout = stdoutInfo.Append
+    END IF
+
+    started = Process.StartJob(stages, stdinPath, stdoutPath, appendStdout, FALSE)
+    IF !started.Ok THEN
+        PRINT "arcosh: " + started.Error
+        ignored = Array.Push(history, MakeHistoryEntry(parsed, "PROCESS_FAILED", -1))
+        RETURN -1
+    END IF
+
+    FOR failure IN started.NotFound
+        PRINT "arcosh: command not found: " + failure.Executable
+    NEXT
+
+    jobNumber = NextJobNumber(jobsTable)
+    ignored = Array.Push(jobsTable, {"Number": jobNumber, "Pgid": started.Pgid, "Command": parsed.Source, "State": "Running"})
+    PRINT "[" + STRING(jobNumber) + "] " + STRING(started.Pgid)
+
+    ' Real shells report `$?` as 0 immediately for `cmd &` regardless of what the job eventually
+    ' does -- starting it successfully is the whole observable action of this statement.
+    ignored = Array.Push(history, MakeHistoryEntry(parsed, "SUCCESS", 0))
+    RETURN 0
+END FUNCTION
+
+' `jobs`: re-polls first so its own listing is never stale, then prints every remaining entry.
+FUNCTION RunJobsCommand(jobsTable AS ARRAY)
+    ignored = PollBackgroundJobs(jobsTable)
+    FOR job IN jobsTable
+        PRINT "[" + STRING(job.Number) + "]+  " + job.State + "                 " + job.Command
+    NEXT
+END FUNCTION
+
+' `fg [%N]`: resumes (harmless no-op if it wasn't actually stopped) and gives the job the
+' terminal, then blocks exactly like RunForegroundJob does for a brand-new command -- a job
+' resumed to the foreground can stop AGAIN (another Ctrl-Z) just as validly as a fresh one can.
+FUNCTION RunForegroundResume(history AS ARRAY, jobsTable AS ARRAY, arguments AS ARRAY)
+    index = ResolveJobIndex(jobsTable, arguments)
+    IF index < 0 THEN
+        PRINT "arcosh: fg: no such job"
+        RETURN -1
+    END IF
+    job = jobsTable[index]
+    PRINT job.Command
+    ignored = Array.RemoveAt(jobsTable, index)
+
+    resumed = Process.ContinueJob(job.Pgid, TRUE)
+    IF !resumed.Ok THEN
+        PRINT "arcosh: fg: " + resumed.Error
+        RETURN -1
+    END IF
+
+    waited = Process.WaitJob(job.Pgid, TRUE)
+    IF waited.Stopped THEN
+        PRINT "[" + STRING(job.Number) + "]+  Stopped                 " + job.Command
+        ignored = Array.Push(jobsTable, {"Number": job.Number, "Pgid": job.Pgid, "Command": job.Command, "State": "Stopped"})
+        RETURN 148
+    END IF
+
+    resultShape = {"Found": TRUE, "Signaled": waited.Signaled, "ExitCode": waited.ExitCode, "Error": ""}
+    resultKind = ClassifyProcessResult(resultShape)
+    exitCode = waited.ExitCode
+    ignored = Array.Push(history, MakeHistoryEntry({"Source": job.Command, "Executable": "", "Arguments": [],
+        "Redirections": [], "PipelineStages": [], "Background": FALSE}, resultKind, exitCode))
+    RETURN exitCode
+END FUNCTION
+
+' `bg [%N]`: resumes a STOPPED job in the background -- unlike `fg`, never touches the terminal
+' and never waits, matching RunBackgroundJob's own "start it and return to the prompt" shape.
+FUNCTION RunBackgroundResume(jobsTable AS ARRAY, arguments AS ARRAY)
+    index = ResolveJobIndex(jobsTable, arguments)
+    IF index < 0 THEN
+        PRINT "arcosh: bg: no such job"
+        RETURN
+    END IF
+    job = jobsTable[index]
+    IF job.State <> "Stopped" THEN
+        PRINT "arcosh: bg: job " + STRING(job.Number) + " is already running"
+        RETURN
+    END IF
+
+    resumed = Process.ContinueJob(job.Pgid, FALSE)
+    IF !resumed.Ok THEN
+        PRINT "arcosh: bg: " + resumed.Error
+        RETURN
+    END IF
+
+    ignored = Array.RemoveAt(jobsTable, index)
+    ignored = Array.Push(jobsTable, {"Number": job.Number, "Pgid": job.Pgid, "Command": job.Command, "State": "Running"})
+    PRINT "[" + STRING(job.Number) + "]+ " + job.Command + " &"
+END FUNCTION
+
+' AP-0052-015's own "do not fake it" bar, same standard AP-0052-014 set for pipelines: real
+' processes, real signals, real waitpid -- structural checks alone are insufficient. ctest has no
+' controlling terminal, so a real Ctrl-Z can't be simulated here (that part is verified manually
+' against the real compiled binary under a real pty -- see arcosh/README.md's own WP-012 section
+' for the transcript) -- but Process.WaitJob's WUNTRACED stop detection doesn't care WHICH signal
+' caused the stop, so a real external `kill -STOP` against a job's own process group exercises the
+' EXACT same stop/resume code path a real Ctrl-Z would, deterministically and without a terminal.
+FUNCTION RunJobControlSelfTest()
+    failures = 0
+    history = []
+    jobsTable = []
+
+    ' Background job via the real "&" parser path, polled until it actually finishes.
+    backgroundParsed = ParseCommand("sleep 0.2 &")
+    backgroundExitCode = RunBackgroundJob(history, jobsTable, backgroundParsed)
+    IF backgroundExitCode == 0 ANDALSO LEN(jobsTable) == 1 THEN
+        PRINT "ok   background job started and registered in the job table"
+    ELSE
+        failMessage = "FAIL background job start: exitCode=" + STRING(backgroundExitCode)
+        failMessage = failMessage + " table size=" + STRING(LEN(jobsTable))
+        PRINT failMessage
+        failures = failures + 1
+    END IF
+
+    pollCount = 0
+    WHILE LEN(jobsTable) > 0 ANDALSO pollCount < 100
+        ignored = PollBackgroundJobs(jobsTable)
+        IF LEN(jobsTable) > 0 THEN Sleep(10)
+        pollCount = pollCount + 1
+    WEND
+    IF LEN(jobsTable) == 0 THEN
+        PRINT "ok   background job finished and was reaped by polling"
+    ELSE
+        PRINT "FAIL background job still pending after " + STRING(pollCount) + " polls"
+        failures = failures + 1
+    END IF
+
+    ' Suspend/resume against a real job, via Process.StartJob/WaitJob/ContinueJob directly (the
+    ' same primitives RunForegroundJob/fg/bg wrap).
+    stopStages = [{"Executable": "sleep", "Arguments": ["2"]}]
+    stopStarted = Process.StartJob(stopStages, "", "", FALSE, FALSE)
+    IF !stopStarted.Ok THEN
+        PRINT "FAIL could not start suspend/resume test job: " + stopStarted.Error
+        failures = failures + 1
+    ELSE
+        ignored = Process.Execute("kill", ["-STOP", "-" + STRING(stopStarted.Pgid)])
+        Sleep(100)
+        stopWaited = Process.WaitJob(stopStarted.Pgid, FALSE)
+        IF stopWaited.Stopped THEN
+            PRINT "ok   an external stop signal was detected as a job stop (WUNTRACED)"
+        ELSE
+            PRINT "FAIL job was not detected as stopped (Done=" + STRING(stopWaited.Done) + ")"
+            failures = failures + 1
+        END IF
+
+        stopResumed = Process.ContinueJob(stopStarted.Pgid, FALSE)
+        IF !stopResumed.Ok THEN
+            PRINT "FAIL Process.ContinueJob failed: " + stopResumed.Error
+            failures = failures + 1
+        END IF
+
+        Sleep(100)
+        stillRunning = Process.PollJob(stopStarted.Pgid)
+        IF !stillRunning.Done THEN
+            PRINT "ok   job kept running after being resumed, not falsely reported done"
+        ELSE
+            PRINT "FAIL job reported done almost immediately after resume"
+            failures = failures + 1
+        END IF
+
+        resumeWaitCount = 0
+        WHILE !stillRunning.Done ANDALSO resumeWaitCount < 200
+            Sleep(20)
+            stillRunning = Process.PollJob(stopStarted.Pgid)
+            resumeWaitCount = resumeWaitCount + 1
+        WEND
+        IF stillRunning.Done ANDALSO stillRunning.ExitCode == 0 THEN
+            PRINT "ok   job completed normally after being resumed"
+        ELSE
+            PRINT "FAIL job did not complete normally after resume (Done=" + STRING(stillRunning.Done) + ")"
+            failures = failures + 1
+        END IF
+    END IF
+
+    ' `bg` on a genuinely stopped job.
+    bgStages = [{"Executable": "sleep", "Arguments": ["0.3"]}]
+    bgStarted = Process.StartJob(bgStages, "", "", FALSE, FALSE)
+    ignored = Process.Execute("kill", ["-STOP", "-" + STRING(bgStarted.Pgid)])
+    Sleep(100)
+    ignored = Process.WaitJob(bgStarted.Pgid, FALSE)
+    bgJobsTable = []
+    ignored = Array.Push(bgJobsTable, {"Number": 1, "Pgid": bgStarted.Pgid, "Command": "sleep 0.3", "State": "Stopped"})
+    ignored = RunBackgroundResume(bgJobsTable, [])
+    IF LEN(bgJobsTable) == 1 THEN
+        IF bgJobsTable[0].State == "Running" THEN
+            PRINT "ok   bg resumed a stopped job into the Running state"
+        ELSE
+            PRINT "FAIL bg did not mark the job Running (state=" + bgJobsTable[0].State + ")"
+            failures = failures + 1
+        END IF
+    ELSE
+        PRINT "FAIL bg changed the job table size unexpectedly (" + STRING(LEN(bgJobsTable)) + ")"
+        failures = failures + 1
+    END IF
+
+    bgPollCount = 0
+    WHILE LEN(bgJobsTable) > 0 ANDALSO bgPollCount < 100
+        ignored = PollBackgroundJobs(bgJobsTable)
+        IF LEN(bgJobsTable) > 0 THEN Sleep(10)
+        bgPollCount = bgPollCount + 1
+    WEND
+    IF LEN(bgJobsTable) == 0 THEN
+        PRINT "ok   bg-resumed job finished and was reaped"
+    ELSE
+        PRINT "FAIL bg-resumed job never finished"
+        failures = failures + 1
+    END IF
+
+    RETURN failures
 END FUNCTION
 
 ' AP-0052-014's own explicit rule: "Tests MUST inspect actual execution/output behavior. Parser-
@@ -495,6 +808,7 @@ END FUNCTION
 FUNCTION RunPipelineSelfTest()
     failures = 0
     history = []
+    jobsTable = []
     base = Path.Cwd()
     inputPath = base + "/wp011_selftest_input.txt"
     outPath = base + "/wp011_selftest_output.txt"
@@ -504,7 +818,7 @@ FUNCTION RunPipelineSelfTest()
     ' itself computed, not something ArcoBASIC derived independently.
     ignored = File.WriteText(outPath, "")
     parsed1 = ParseCommand("cat " + inputPath + " | grep -c a > " + outPath)
-    exitCode1 = ExecutePipelineAndRecord(history, parsed1)
+    exitCode1 = RunForegroundJob(history, jobsTable, parsed1)
     out1 = String.Trim(File.ReadText(outPath))
     IF exitCode1 == 0 ANDALSO out1 == "3" THEN
         PRINT "ok   pipeline (cat | grep -c) exit=0 output=" + out1
@@ -516,7 +830,7 @@ FUNCTION RunPipelineSelfTest()
     ' Plain redirection, no pipe at all: wc -l > file.
     ignored = File.WriteText(outPath, "")
     parsed2 = ParseCommand("wc -l " + inputPath + " > " + outPath)
-    exitCode2 = ExecutePipelineAndRecord(history, parsed2)
+    exitCode2 = RunForegroundJob(history, jobsTable, parsed2)
     out2 = File.ReadText(outPath)
     IF exitCode2 == 0 ANDALSO String.Contains(out2, "4") THEN
         PRINT "ok   redirection (wc -l > file) exit=0 output contains 4"
@@ -530,9 +844,9 @@ FUNCTION RunPipelineSelfTest()
     appendPath = base + "/wp011_selftest_append.txt"
     ignored = File.WriteText(appendPath, "")
     parsed3a = ParseCommand("cat " + inputPath + " >> " + appendPath)
-    ignored = ExecutePipelineAndRecord(history, parsed3a)
+    ignored = RunForegroundJob(history, jobsTable, parsed3a)
     parsed3b = ParseCommand("cat " + inputPath + " >> " + appendPath)
-    ignored = ExecutePipelineAndRecord(history, parsed3b)
+    ignored = RunForegroundJob(history, jobsTable, parsed3b)
     appended = File.ReadText(appendPath)
     appendedLines = String.Split(appended, "\n")
     IF LEN(appendedLines) == 9 THEN
@@ -545,7 +859,7 @@ FUNCTION RunPipelineSelfTest()
     ' Input redirection combined with output redirection in the SAME command: wc -l < file > file.
     ignored = File.WriteText(outPath, "")
     parsed4 = ParseCommand("wc -l < " + inputPath + " > " + outPath)
-    exitCode4 = ExecutePipelineAndRecord(history, parsed4)
+    exitCode4 = RunForegroundJob(history, jobsTable, parsed4)
     out4 = String.Trim(File.ReadText(outPath))
     IF exitCode4 == 0 ANDALSO out4 == "4" THEN
         PRINT "ok   combined input+output redirection (wc -l < file > file) == 4"
@@ -555,10 +869,10 @@ FUNCTION RunPipelineSelfTest()
     END IF
 
     ' An earlier pipeline stage failing to exec must not change the pipeline's OWN exit status
-    ' (matching real shell semantics -- see ExecutePipelineAndRecord's own comment) while still
-    ' being reported.
+    ' (matching real shell semantics -- see RunForegroundJob's own comment) while still being
+    ' reported.
     parsed5 = ParseCommand("totally-not-a-real-command-arcosh-wp011 | cat")
-    exitCode5 = ExecutePipelineAndRecord(history, parsed5)
+    exitCode5 = RunForegroundJob(history, jobsTable, parsed5)
     IF exitCode5 == 0 THEN
         PRINT "ok   pipeline survives an earlier stage's command-not-found, exit == 0"
     ELSE
@@ -580,7 +894,17 @@ END FUNCTION
 ' that command to have failed with COMMAND_NOT_FOUND, preserves arguments/redirections/pipeline
 ' structure/quoting semantics by construction (it operates on the parsed STRUCTURE, never on
 ' text -- see FormatCommandForDisplay's own comment), and replaces only the executable field.
-FUNCTION RunOops(history AS ARRAY, oopsCommand AS OBJECT)
+'
+' KNOWN LIMITATION (predates WP-012, not fixed by it): "the executable field" always means the
+' FIRST pipeline stage's, paired with that same first stage's own Arguments -- section 15 was
+' written before pipelines existed and never says which stage to target otherwise. Since a
+' pipeline's own ResultKind always reflects its LAST stage (matching real shell `$?` semantics --
+' see RunForegroundJob), COMMAND_NOT_FOUND can only ever be reached when the LAST stage is the one
+' that actually failed to exec -- exactly the one case this function does NOT correctly retry for
+' a multi-stage pipeline (it replaces stage 0's name with the fix, keeps stage 0's own arguments,
+' and leaves the real broken LAST stage completely untouched). Single-command oops (no pipeline at
+' all, the only shape RFC section 15 actually describes) is unaffected and works correctly.
+FUNCTION RunOops(history AS ARRAY, jobsTable AS ARRAY, oopsCommand AS OBJECT)
     IF LEN(oopsCommand.Arguments) == 0 THEN
         PRINT "arcosh: oops: usage: oops <command>"
         ignored = Array.Push(history, MakeHistoryEntry(oopsCommand, "INVALID_SYNTAX", -1))
@@ -613,7 +937,7 @@ FUNCTION RunOops(history AS ARRAY, oopsCommand AS OBJECT)
         "Background": previous.Background,
         "Source": displayText
     }
-    RETURN ExecuteAndRecord(history, retried)
+    RETURN RunForegroundJob(history, jobsTable, retried)
 END FUNCTION
 
 ' Structural regression test for RFC-0052 AP-0052-008's own required scenario -- drives the exact
@@ -1053,7 +1377,7 @@ FUNCTION RunPathLayerSelfTest()
     RETURN failures
 END FUNCTION
 
-version = "0.7.0-wp011"
+version = "0.8.0-wp012"
 no_color_flag = HasFlag(Args, "--no-color")
 no_color_env = Process.Env("NO_COLOR") <> ""
 term = Process.Env("TERM")
@@ -1079,7 +1403,7 @@ IF is_tty THEN
 END IF
 
 IF HasFlag(Args, "--version") THEN
-    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-011)"
+    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012)"
     ExitTheProgram(0)
 END IF
 
@@ -1157,6 +1481,16 @@ IF HasFlag(Args, "--selftest-immediate") THEN
     ExitTheProgram(0)
 END IF
 
+IF HasFlag(Args, "--selftest-jobcontrol") THEN
+    failures = RunJobControlSelfTest()
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " job control test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all job control tests passed"
+    ExitTheProgram(0)
+END IF
+
 ' Reduced terminal capability (piped stdin, dumb terminal, no color) must degrade gracefully
 ' rather than fail: no ANSI codes are ever emitted by this skeleton, so color_ok currently only
 ' affects the banner line below. Real semantic styling (Display.*/Terminal.* per RFC-0052 section
@@ -1171,11 +1505,23 @@ IF !is_tty THEN
     PRINT "(non-interactive input; reading commands from stdin)"
 END IF
 
+' RFC-0052 WP-012: claims the controlling terminal for this process group and leaves
+' SIGINT/SIGQUIT/SIGTSTP/SIGTTIN/SIGTTOU ignored for the shell's own entire interactive lifetime
+' (never saved-and-restored per command) -- see Process.SetupShellJobControl's own much larger
+' comment in runtime.cpp. Safe to call even non-interactively (piped stdin, ctest): it detects that
+' itself and is a no-op.
+ignored = Process.SetupShellJobControl()
+
 running = TRUE
 history = []
 resident_program = []
+jobs_table = []
 last_exit_code = 0
 WHILE running
+    ' A background job finishing or stopping on its own schedule is reported here, before the
+    ' next prompt is drawn -- never mid-command, and never by blocking the prompt to find out.
+    ignored = PollBackgroundJobs(jobs_table)
+
     cwd = Path.Cwd()
     IF is_tty THEN Console.Write(Prompt(cwd))
 
@@ -1240,7 +1586,25 @@ WHILE running
     END IF
 
     IF parsed.Executable == "oops" THEN
-        last_exit_code = RunOops(history, parsed)
+        last_exit_code = RunOops(history, jobs_table, parsed)
+        CONTINUE WHILE
+    END IF
+
+    ' RFC-0052 section 23 (Job Control). `jobs`/`fg`/`bg` are lowercase like every other UNIX-style
+    ' shell built-in above (cd/pwd/exit/history/oops), not uppercase like the classic-BASIC
+    ' LIST/RUN/NEW keywords below -- they're shell vocabulary, not ArcoBASIC language keywords.
+    IF parsed.Executable == "jobs" THEN
+        ignored = RunJobsCommand(jobs_table)
+        CONTINUE WHILE
+    END IF
+
+    IF parsed.Executable == "fg" THEN
+        last_exit_code = RunForegroundResume(history, jobs_table, parsed.Arguments)
+        CONTINUE WHILE
+    END IF
+
+    IF parsed.Executable == "bg" THEN
+        ignored = RunBackgroundResume(jobs_table, parsed.Arguments)
         CONTINUE WHILE
     END IF
 
@@ -1291,27 +1655,18 @@ WHILE running
         CONTINUE WHILE
     END IF
 
-    ' RFC-0052 WP-012 (background jobs) is still out of scope -- refuse clearly rather than
-    ' silently running a "&"-suffixed command in the foreground as if the "&" had been ignored.
-    ' Checked BEFORE pipeline/redirection execution below: `slow-thing & > out` is still refused
-    ' whole, not partially run.
-    IF parsed.Background THEN
-        PRINT "arcosh: background jobs are not implemented yet (see RFC-0052 WP-012)"
-        ignored = Array.Push(history, MakeHistoryEntry(parsed, "INVALID_SYNTAX", -1))
-        CONTINUE WHILE
-    END IF
-
     IF parsed.Executable == "" THEN CONTINUE WHILE
 
-    ' RFC-0052 WP-011: a real pipeline stage or redirection routes through Process.ExecutePipeline
-    ' (real fork/pipe/dup2 plumbing -- see its own comment); the common plain-command case keeps
-    ' using ExecuteAndRecord/Process.Execute unchanged, the same already-verified-under-a-real-pty
-    ' code path WP-004 established, rather than routing everything through the pipeline-capable
-    ' primitive just to reduce code paths.
-    IF LEN(parsed.PipelineStages) > 0 ORELSE LEN(parsed.Redirections) > 0 THEN
-        last_exit_code = ExecutePipelineAndRecord(history, parsed)
+    ' RFC-0052 WP-012: `command &` starts a real, job-table-tracked background job
+    ' (RunBackgroundJob) rather than being refused; everything else -- a single command or a real
+    ' pipeline, with or without redirection -- goes through RunForegroundJob, which now handles
+    ' suspend/resume (Ctrl-Z) for ANY foreground command, not just something explicitly
+    ' backgrounded. See RunForegroundJob's own comment for why there is only one code path left
+    ' here instead of separate plain-command/pipeline branches.
+    IF parsed.Background THEN
+        last_exit_code = RunBackgroundJob(history, jobs_table, parsed)
     ELSE
-        last_exit_code = ExecuteAndRecord(history, parsed)
+        last_exit_code = RunForegroundJob(history, jobs_table, parsed)
     END IF
 WEND
 

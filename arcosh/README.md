@@ -8,7 +8,7 @@ standalone CMake project independent of the umbrella ArcoBASIC build (it is not
 Per RFC-0052 section 6, `arcosh` is authored **in ArcoBASIC itself** and compiled through
 ArcoFission, not hand-written in C++.
 
-## Status: WP-001 (Shell Skeleton) through WP-011 (Pipelines and Redirection)
+## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control)
 
 `src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
 
@@ -119,16 +119,54 @@ and AP-0052-014 (WP-011 Pipelines and Redirection):
   as a one-stage "pipeline"); returns one result per stage so an earlier stage's
   command-not-found can be reported without changing the pipeline's own exit status (which always
   reflects the LAST stage, matching real shell `$?` semantics);
-* `ExecutePipelineAndRecord` (`src/arcosh.abas`) records exactly one history entry per typed
-  pipeline/redirection command, classified from the last stage;
+* records exactly one history entry per typed pipeline/redirection command, classified from the
+  last stage (now `RunForegroundJob`, see AP-0052-015 below — WP-012 folded this into the same
+  job-control-aware execution path every command uses);
 * verified against real `cat`/`grep`/`wc` processes and real files on disk — a pipeline with output
   redirected to a file, plain `>`/`>>`/`<` redirection, `<` and `>` combined in one command, and a
   pipeline surviving an earlier stage's command-not-found — per AP-0052-014's own explicit rule:
   "Tests MUST inspect actual execution/output behavior. Parser-only tests are insufficient."
 
-It does not yet implement themes, plugins, completion, or job control beyond a single foreground
-pipeline (background jobs, `jobs`/`fg`/`bg`, suspend/resume) — later work packages (WP-008, WP-009,
-WP-010, WP-012).
+and AP-0052-015 (WP-012 Job Control — full research write-up at `.agents/reports/
+ARCO_SH_RFC0052_WP012_JOB_CONTROL_RESEARCH.md`, written before any implementation per the RFC's
+own explicit requirement):
+
+* `Process.SetupShellJobControl`/`StartJob`/`WaitJob`/`PollJob`/`ContinueJob` (`src/runtime/
+  runtime.cpp`) replace `Process.Execute`/`ExecutePipeline` as arcosh's own real execution path —
+  every job (single command or pipeline, foreground or background) gets its own process group, and
+  every foreground wait uses `WUNTRACED` so a real Ctrl-Z is detected as a STOP, not left blocking
+  the shell until the job fully exits (the exact "faked" job control AP-0052-015 explicitly rules
+  out — "Background execution MUST NOT be faked merely by spawning detached child processes");
+* `RunForegroundJob` (superseding WP-004/WP-011's `ExecuteAndRecord`/`ExecutePipelineAndRecord`)
+  now handles suspend (Ctrl-Z stops ANY foreground command, not only something explicitly
+  backgrounded) alongside the ordinary run-to-completion case; `RunBackgroundJob` (`command &`)
+  starts a real, job-table-tracked background job without ever waiting on it;
+  `PollBackgroundJobs` (polled once per prompt line) discovers a background job finishing or
+  stopping on its own schedule without ever blocking the prompt to find out; `jobs`/`fg [%N]`/
+  `bg [%N]` are real shell built-ins operating on that same job table;
+  `Process.SetupShellJobControl` claims the controlling terminal once at startup and leaves
+  `SIGINT`/`SIGQUIT`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` ignored for the shell's own entire interactive
+  lifetime (never saved-and-restored per command);
+  as a side effect of unifying execution into one function, `oops` retrying a failed pipeline
+  command now at least PRESERVES the rest of the pipeline across the retry (it previously silently
+  dropped every stage but the first) — but `oops` still only ever replaces the FIRST stage's
+  executable using the FIRST stage's own arguments, a pre-existing WP-005/WP-011-era limitation
+  this pass did not fully fix: RFC section 15's own "version 1 rules" were written before
+  pipelines existed and say nothing about which stage to target when the FAILING one isn't the
+  first, so a not-found LAST stage in a multi-stage pipeline (the only shape that actually reaches
+  `COMMAND_NOT_FOUND`, since a pipeline's own result always reflects its last stage) is not
+  correctly retried by `oops` yet — a real, disclosed gap, not silently papered over;
+* verified two ways, matching AP-0052-014's own standard: `--selftest-jobcontrol` (real background
+  jobs polled to completion, an external `kill -STOP`/`SIGCONT` exercising the exact same
+  `WUNTRACED` stop-detection code path a real Ctrl-Z uses — ctest has no controlling terminal, so
+  the signal itself is simulated externally rather than via a real keypress) plus manual
+  verification against the real compiled native binary under a real pty: typing `sleep 5`, Ctrl-Z
+  (`[1]+  Stopped                 sleep 5`, shell stays fully responsive), `jobs`, `fg` (blocks
+  until the job actually finishes), and separately `bg` (resumes into the background, `jobs` shows
+  `Running` until it completes on its own).
+
+It does not yet implement themes, plugins, or completion — later work packages (WP-008, WP-009,
+WP-010).
 
 See `.agents/reports/ARCO_SH_RFC0052_WP000_REPOSITORY_AUDIT.md` (in the repo root's `.agents/`
 directory) for the mandatory pre-implementation audit this work was built against.
@@ -164,7 +202,24 @@ small primitives were added there (colon-path translation itself is pure ArcoBAS
   `{Ok, Found, ExitCode, Signaled, TermSignal, Error}` per stage (WP-011; real fork/pipe/`dup2`
   plumbing, one process group for the whole pipeline — see the function's own much larger comment
   in `src/runtime/runtime.cpp` for the job-control design and why it returns one result per stage
-  rather than a single combined one)
+  rather than a single combined one; superseded inside arcosh itself by the WP-012 primitives
+  below, kept as a simpler one-shot-blocking-run primitive for other ArcoBASIC programs)
+* `Process.SetupShellJobControl()` -> `{Ok, Error}` (WP-012; one-time interactive setup — claims
+  the controlling terminal and leaves `SIGINT`/`SIGQUIT`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` ignored for
+  the shell's own entire lifetime; a no-op, not an error, without a controlling terminal)
+* `Process.StartJob(stages, stdinPath, stdoutPath, appendStdout, foreground)` ->
+  `{Ok, Error, Pgid, NotFound}` (WP-012; starts a job's processes — one shared process group,
+  identical fd-plumbing to `Process.ExecutePipeline` — WITHOUT waiting for them; `NotFound` is an
+  array of `{Executable, Error}` for any stage that failed to exec)
+* `Process.WaitJob(pgid, foreground)` -> `{Ok, Error, Stopped, Done, ExitCode, Signaled,
+  TermSignal}` (WP-012; blocking wait with `WUNTRACED` stop detection — a real Ctrl-Z during this
+  call returns `Stopped: TRUE` without reaping the job, instead of blocking until it fully exits)
+* `Process.PollJob(pgid)` -> `{Ok, Changed, Stopped, Done, ExitCode, Signaled, TermSignal}`
+  (WP-012; non-blocking `WNOHANG` equivalent, for a background job the shell isn't actively
+  waiting on)
+* `Process.ContinueJob(pgid, foreground)` -> `{Ok, Error}` (WP-012; sends `SIGCONT` to a job's
+  process group — harmless no-op if it wasn't actually stopped — and, if `foreground`, also
+  reclaims the terminal for it; backs both `fg` and `bg`)
 
 ## Relationship to the previous implementation
 
