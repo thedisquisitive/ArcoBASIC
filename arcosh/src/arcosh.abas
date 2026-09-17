@@ -395,6 +395,17 @@ FUNCTION FormatCommandForDisplay(executable AS STRING, arguments AS ARRAY)
     RETURN String.Join(parts, " ")
 END FUNCTION
 
+' A full pipeline's display text -- every stage through FormatCommandForDisplay, joined the same
+' way the real syntax would read. `stages` is the uniform {Executable, Arguments} shape
+' BuildJobStages/RunOops both use (the first stage plus every PipelineStages entry after it).
+FUNCTION FormatPipelineForDisplay(stages AS ARRAY)
+    parts = []
+    FOR stage IN stages
+        ignored = Array.Push(parts, FormatCommandForDisplay(stage.Executable, stage.Arguments))
+    NEXT
+    RETURN String.Join(parts, " | ")
+END FUNCTION
+
 ' ---------------------------------------------------------------------------------------------
 ' Pipelines and Redirection (RFC-0052 WP-011)
 ' ---------------------------------------------------------------------------------------------
@@ -893,17 +904,14 @@ END FUNCTION
 ' RFC section 15, version 1 rules: applies only to the immediately preceding command, requires
 ' that command to have failed with COMMAND_NOT_FOUND, preserves arguments/redirections/pipeline
 ' structure/quoting semantics by construction (it operates on the parsed STRUCTURE, never on
-' text -- see FormatCommandForDisplay's own comment), and replaces only the executable field.
-'
-' KNOWN LIMITATION (predates WP-012, not fixed by it): "the executable field" always means the
-' FIRST pipeline stage's, paired with that same first stage's own Arguments -- section 15 was
-' written before pipelines existed and never says which stage to target otherwise. Since a
-' pipeline's own ResultKind always reflects its LAST stage (matching real shell `$?` semantics --
-' see RunForegroundJob), COMMAND_NOT_FOUND can only ever be reached when the LAST stage is the one
-' that actually failed to exec -- exactly the one case this function does NOT correctly retry for
-' a multi-stage pipeline (it replaces stage 0's name with the fix, keeps stage 0's own arguments,
-' and leaves the real broken LAST stage completely untouched). Single-command oops (no pipeline at
-' all, the only shape RFC section 15 actually describes) is unaffected and works correctly.
+' text -- see FormatCommandForDisplay's own comment), and replaces only the executable field --
+' but never necessarily the FIRST stage's: a pipeline's own ResultKind always reflects its LAST
+' stage (matching real shell `$?` semantics -- see RunForegroundJob), so COMMAND_NOT_FOUND can
+' only ever be reached when the LAST stage is the one that actually failed to exec. This targets
+' that stage specifically -- the only stage for a plain command with no pipeline at all, or the
+' final PipelineStages entry otherwise -- replacing just its executable and keeping its own
+' arguments, while every earlier stage (a different command entirely, e.g. `cat file | gerp -c o`
+' -- `cat file` is untouched, only `gerp -c o` gets fixed) passes through unchanged.
 FUNCTION RunOops(history AS ARRAY, jobsTable AS ARRAY, oopsCommand AS OBJECT)
     IF LEN(oopsCommand.Arguments) == 0 THEN
         PRINT "arcosh: oops: usage: oops <command>"
@@ -925,15 +933,40 @@ FUNCTION RunOops(history AS ARRAY, jobsTable AS ARRAY, oopsCommand AS OBJECT)
     END IF
 
     newExecutable = oopsCommand.Arguments[0]
-    displayText = FormatCommandForDisplay(newExecutable, previous.Arguments)
+
+    fixedExecutable = previous.Executable
+    fixedArguments = previous.Arguments
+    fixedPipelineStages = []
+
+    stageCount = LEN(previous.PipelineStages)
+    IF stageCount == 0 THEN
+        fixedExecutable = newExecutable
+    ELSE
+        i = 0
+        WHILE i < stageCount
+            stage = previous.PipelineStages[i]
+            IF i == stageCount - 1 THEN
+                ignored = Array.Push(fixedPipelineStages, {"Executable": newExecutable, "Arguments": stage.Arguments})
+            ELSE
+                ignored = Array.Push(fixedPipelineStages, stage)
+            END IF
+            i = i + 1
+        WEND
+    END IF
+
+    allStages = [{"Executable": fixedExecutable, "Arguments": fixedArguments}]
+    FOR stage IN fixedPipelineStages
+        ignored = Array.Push(allStages, stage)
+    NEXT
+    displayText = FormatPipelineForDisplay(allStages)
     PRINT "arcosh: retrying: " + displayText
     ignored = Array.Push(history, MakeHistoryEntry(oopsCommand, "SUCCESS", 0))
 
     retried = {
-        "Executable": newExecutable,
-        "Arguments": previous.Arguments,
+        "Executable": fixedExecutable,
+        "Arguments": fixedArguments,
         "Redirections": previous.Redirections,
-        "PipelineStages": previous.PipelineStages,
+        "PipelineStages": fixedPipelineStages,
         "Background": previous.Background,
         "Source": displayText
     }
@@ -996,6 +1029,47 @@ FUNCTION RunOopsSelfTest()
         PRINT "ok   display text == " + displayText
     ELSE
         PRINT "FAIL display text == " + displayText + " (expected " + expectedDisplay + ")"
+        failures = failures + 1
+    END IF
+
+    ' A real, end-to-end regression for the multi-stage-pipeline bug found via manual testing: the
+    ' failing stage in a pipeline is always the LAST one (ClassifyProcessResult's COMMAND_NOT_FOUND
+    ' can only come from there -- see RunOops's own comment), so this drives RunOops for REAL (real
+    ' fork/exec, not just structure) against a pipeline whose FIRST stage's own argument happens to
+    ' contain the failing executable's name -- proving both that the right (last) stage gets fixed
+    ' AND that the unrelated earlier stage survives completely untouched, extending the
+    ' single-command guarantee above to pipelines.
+    jobsTableForPipelineOops = []
+    pipelineFailed = {
+        "Executable": "grep",
+        "Arguments": ["gerp must survive this message", "missing-file-for-oops-selftest.txt"],
+        "Redirections": [],
+        "PipelineStages": [{"Executable": "gerp", "Arguments": ["-c", "x"]}],
+        "Background": FALSE,
+        "Source": "grep \"gerp must survive this message\" missing-file-for-oops-selftest.txt | gerp -c x"
+    }
+    ignored = Array.Push(history, MakeHistoryEntry(pipelineFailed, "COMMAND_NOT_FOUND", -1))
+
+    pipelineOopsCommand = ParseCommand("oops grep")
+    ignored = RunOops(history, jobsTableForPipelineOops, pipelineOopsCommand)
+
+    fixedEntry = history[LEN(history) - 1]
+    expectedFixedSource = "grep \"gerp must survive this message\" missing-file-for-oops-selftest.txt | grep -c x"
+    IF fixedEntry.SourceText == expectedFixedSource THEN
+        PRINT "ok   pipeline oops fixed only the failing (last) stage: " + fixedEntry.SourceText
+    ELSE
+        PRINT "FAIL pipeline oops produced: " + fixedEntry.SourceText + " (expected " + expectedFixedSource + ")"
+        failures = failures + 1
+    END IF
+
+    ' Not asserting a specific exit code -- the fixed second stage is a real `grep -c x` with
+    ' nothing on its stdin to match (the first stage's own file genuinely doesn't exist), so its
+    ' real exit status is grep's own "no match" (1), not "success" (0). What matters here is that
+    ' it was FOUND and ran at all, proving the fix, not what it found.
+    IF fixedEntry.ResultKind <> "COMMAND_NOT_FOUND" THEN
+        PRINT "ok   the corrected pipeline's last stage was found and actually ran"
+    ELSE
+        PRINT "FAIL the corrected pipeline still reports COMMAND_NOT_FOUND"
         failures = failures + 1
     END IF
 

@@ -148,14 +148,14 @@ own explicit requirement):
   `SIGINT`/`SIGQUIT`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` ignored for the shell's own entire interactive
   lifetime (never saved-and-restored per command);
   as a side effect of unifying execution into one function, `oops` retrying a failed pipeline
-  command now at least PRESERVES the rest of the pipeline across the retry (it previously silently
-  dropped every stage but the first) — but `oops` still only ever replaces the FIRST stage's
-  executable using the FIRST stage's own arguments, a pre-existing WP-005/WP-011-era limitation
-  this pass did not fully fix: RFC section 15's own "version 1 rules" were written before
-  pipelines existed and say nothing about which stage to target when the FAILING one isn't the
-  first, so a not-found LAST stage in a multi-stage pipeline (the only shape that actually reaches
-  `COMMAND_NOT_FOUND`, since a pipeline's own result always reflects its last stage) is not
-  correctly retried by `oops` yet — a real, disclosed gap, not silently papered over;
+  command now correctly preserves and re-runs the WHOLE pipeline (it previously silently dropped
+  every stage but the first) — a pre-existing WP-005/WP-011-era gap this pass also closed properly:
+  since a pipeline's own result always reflects its LAST stage (matching real shell `$?`
+  semantics), `COMMAND_NOT_FOUND` can only ever be reached when the LAST stage is the one that
+  actually failed to exec, so `oops` now targets THAT stage specifically — replacing just its
+  executable, keeping its own arguments, leaving every earlier stage (a different command
+  entirely) untouched — rather than always assuming the first stage was the failure, which is all
+  RFC section 15's own "version 1 rules" ever needed to say before pipelines existed;
 * verified two ways, matching AP-0052-014's own standard: `--selftest-jobcontrol` (real background
   jobs polled to completion, an external `kill -STOP`/`SIGCONT` exercising the exact same
   `WUNTRACED` stop-detection code path a real Ctrl-Z uses — ctest has no controlling terminal, so
