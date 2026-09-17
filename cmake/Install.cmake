@@ -7,7 +7,7 @@ install(TARGETS
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
-install(TARGETS arcosh arco_cli ArcoFission
+install(TARGETS arco_cli ArcoFission
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
@@ -57,11 +57,6 @@ install(DIRECTORY stdlib/
 install(DIRECTORY tutorials/
     DESTINATION share/arcosh/tutorials
     FILES_MATCHING PATTERN "*.abas" PATTERN "*.arc" PATTERN "*.bas"
-)
-
-install(DIRECTORY scripts/arcosh/
-    DESTINATION share/arcosh/scripts
-    FILES_MATCHING PATTERN "*.abas" PATTERN "*.arc" PATTERN "*.bas" PATTERN "*.arcsh"
 )
 
 install(PROGRAMS scripts/install/install-deb-wizard.sh

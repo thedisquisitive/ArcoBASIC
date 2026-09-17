@@ -1,5 +1,9 @@
 add_executable(arcology_os_tests arcology-os/tests/unit/arcology_os_tests.cpp)
-target_link_libraries(arcology_os_tests PRIVATE arcology_os)
+# arcology_os (the old STATIC lib carrying graphics.cpp/pe_image.cpp) is gone -- those two moved to
+# arco_runtime/arco_compiler respectively (see root CMakeLists.txt), which this test now needs for
+# their real implementations (CreateSurface/PutPixel/... and write_pe32plus_efi_image); arco_compiler
+# pulls in arco_runtime and arcology_os_headers (uefi_bindings.hpp) transitively.
+target_link_libraries(arcology_os_tests PRIVATE arco_compiler)
 add_test(NAME arcology_os_unit_tests COMMAND arcology_os_tests)
 
 arco_add_script_test(

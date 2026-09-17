@@ -48,14 +48,10 @@ function(arco_add_script_test name script)
     )
 endfunction()
 
-arco_add_script_test(
-    arcosh_alpha_smoke
-    tests/integration/arcosh_alpha_smoke.sh
-    $<TARGET_FILE:arcosh>
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_BINARY_DIR}
-    ${CMAKE_COMMAND}
-)
+# arcosh_alpha_smoke retired along with the arcosh executable target -- ArcoSH development
+# restarted as the standalone arcosh/ project. tests/integration/arcosh_alpha_smoke.sh is left in
+# place, unregistered, as a reference for the old CLI's end-to-end behavior.
+
 arco_add_script_test(
     arcofission_alpha_smoke
     tests/integration/arcofission_alpha_smoke.sh
@@ -77,6 +73,27 @@ arco_add_script_test(
     $<TARGET_FILE:ArcoFission>
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+arco_add_script_test(
+    linux_native_backend_smoke
+    tests/integration/linux_native_backend_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+if(TARGET ArcoNativeRuntimeCoreProbe)
+    # ArcoNativeRuntimeCoreProbe is EXCLUDE_FROM_ALL (same reasoning as the pre-existing
+    # ArcoFissionCapsuleCoreProbe: it exists purely so fission.cpp can read its link.txt, and
+    # forcing arco_runtime_core to build on every ordinary `cmake --build` for that alone isn't
+    # worth the extra compile cost) -- but linux_native_backend_smoke's host-function-bridge
+    # coverage hard-fails without it. A CTest fixture makes `ctest` build it on demand instead of
+    # requiring everyone to remember a separate `--target ArcoNativeRuntimeCoreProbe` step.
+    add_test(
+        NAME linux_native_backend_smoke_probe_setup
+        COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ArcoNativeRuntimeCoreProbe
+    )
+    set_tests_properties(linux_native_backend_smoke_probe_setup PROPERTIES FIXTURES_SETUP native_backend_probe)
+    set_tests_properties(linux_native_backend_smoke PROPERTIES FIXTURES_REQUIRED native_backend_probe)
+endif()
 
 include(arcology-os/cmake/Testing.cmake)
 include(arcology-commons/cmake/Testing.cmake)

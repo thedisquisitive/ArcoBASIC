@@ -7,7 +7,14 @@ developer documentation live together here. The separate Arcology Commons social
 
 ## Layout
 
-- `src/` and `include/` — the Arcology UEFI/PE backend and systems interfaces.
+- `include/` — genuinely OS-specific public systems interfaces (currently just `uefi_bindings.hpp`,
+  real UEFI struct/vtable layouts). Generic compiler/runtime infrastructure that doesn't actually
+  concern Arcology OS as a product (the x86-64 encoder, calling-convention math, the PE32+ writer,
+  the pixel/surface graphics library, UTF-16 encoding, fixed-width type metadata) lives at the
+  project root's `include/arco/` and `src/` instead — see `docs/project-layout.md`'s "Shared
+  infrastructure lives at the project root, not inside a component" note. Anything genuinely
+  specific to booting/running Arcology OS belongs here; generic infrastructure a component happens
+  to need does not.
 - `examples/` — runnable Arcology OS and UEFI programs.
 - `scripts/` — hardware-image builders plus QEMU/OVMF and development launchers.
 - `tests/` — systems integration tests and boot fixtures.
@@ -17,10 +24,12 @@ developer documentation live together here. The separate Arcology Commons social
 
 ## Shared ArcoBASIC Integration Points
 
-The generic ArcoBASIC frontend and ArcoFission pipeline remain under `src/` because hosted programs
-and Arcology programs use the same parser, canonical AST, A-MIR, and bytecode implementation.
-Arcology-specific directives and lowering hooks in those shared files are integration points; the
-concrete UEFI interfaces, encoder, PE writer, tests, and tooling are owned by this subtree.
+The generic ArcoBASIC frontend and ArcoFission pipeline remain under the project root's `src/`
+because hosted programs and Arcology programs use the same parser, canonical AST, A-MIR, and
+bytecode implementation. Arcology-specific directives and lowering hooks in those shared files are
+integration points; UEFI-specific interfaces (`uefi_bindings.hpp`), tests, and tooling are owned by
+this subtree — the encoder, PE writer, and other genuinely generic codegen infrastructure those
+same shared files use are not, and live at the project root instead (see above).
 
-The top-level build exposes `ArcologyOS::headers` and `ArcologyOS::backend`. The latter produces
-`libarcology_os.a` and is linked by `arco_compiler`.
+The top-level build exposes `ArcologyOS::headers` (header-only, `uefi_bindings.hpp`), linked by
+`arco_runtime`/`arco_compiler` for their UEFI-target support.

@@ -2,6 +2,17 @@ cmake_minimum_required(VERSION 3.16)
 
 project(ArcoBASIC VERSION 0.1.0 LANGUAGES CXX C)
 
+# NOTE: a RelWithDebInfo-by-default block was considered here (ported from
+# origin/agent/arcfs-admin-suite, motivated by a real "unoptimized dev build -> slower bytecode VM
+# inside every capsule" finding) but reverted: building at that optimization level exposes a
+# pre-existing, real undefined-behavior bug in the retired src/shell/arcosh.cpp (confirmed by
+# building unpatched master at the same optimization level in an isolated worktree -- same
+# hang/segfault in tests/unit/runtime_tests.cpp's shell-builtin block, so this is not a regression
+# from anything in this tree, just newly exposed). Since that file is being kept alive only long
+# enough for its existing test coverage to keep passing (see arcosh/README.md), not invested in
+# further, revisit enabling this once arco_shell is fully removed rather than debugging legacy code
+# on its way out.
+
 include(GNUInstallDirs)
 include(CTest)
 
@@ -44,10 +55,14 @@ add_library(arco_runtime STATIC
     src/runtime/random.cpp
     src/runtime/runtime_handles.cpp
     src/runtime/resource_registry.cpp
+    src/gui/graphics.cpp
     ${ARCO_GUI_BACKEND_SOURCE}
 )
 arco_configure_library(arco_runtime)
-target_link_libraries(arco_runtime PUBLIC arcology_os)
+# arcology_os_headers, not the (removed) arcology_os static lib: parser.cpp (one of this library's
+# own sources) still uses uefi_bindings.hpp, the one genuinely OS-specific header that stayed under
+# arcology-os/ -- see docs/project-layout.md's shared-infrastructure note.
+target_link_libraries(arco_runtime PUBLIC arcology_os_headers)
 add_library(ArcoBASIC::runtime ALIAS arco_runtime)
 
 if(ARCO_GUI_BACKEND_AVAILABLE AND EMSCRIPTEN)
@@ -74,9 +89,10 @@ endif()
 
 add_library(arco_compiler STATIC
     src/compiler/fission.cpp
+    src/compiler/pe_image.cpp
 )
 arco_configure_library(arco_compiler)
-target_link_libraries(arco_compiler PUBLIC arco_runtime arcology_os)
+target_link_libraries(arco_compiler PUBLIC arco_runtime arcology_os_headers)
 target_compile_definitions(arco_compiler PRIVATE ARCO_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
 add_library(ArcoBASIC::compiler ALIAS arco_compiler)
 
@@ -101,18 +117,28 @@ if(ARCO_GUI_BACKEND_AVAILABLE OR CURL_FOUND)
         src/runtime/random.cpp
         src/runtime/runtime_handles.cpp
         src/runtime/resource_registry.cpp
+        src/gui/graphics.cpp
         src/gui/stub_backend.cpp
     )
     arco_configure_library(arco_runtime_core)
-    target_link_libraries(arco_runtime_core PUBLIC arcology_os)
+    target_link_libraries(arco_runtime_core PUBLIC arcology_os_headers)
 
-    add_library(arco_compiler_core STATIC EXCLUDE_FROM_ALL src/compiler/fission.cpp)
+    add_library(arco_compiler_core STATIC EXCLUDE_FROM_ALL src/compiler/fission.cpp src/compiler/pe_image.cpp)
     arco_configure_library(arco_compiler_core)
-    target_link_libraries(arco_compiler_core PUBLIC arco_runtime_core arcology_os)
+    target_link_libraries(arco_compiler_core PUBLIC arco_runtime_core arcology_os_headers)
     target_compile_definitions(arco_compiler_core PRIVATE ARCO_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
 
     add_executable(ArcoFissionCapsuleCoreProbe EXCLUDE_FROM_ALL apps/arcofission/capsule_core_probe.cpp)
     target_link_libraries(ArcoFissionCapsuleCoreProbe PRIVATE arco_compiler_core)
+
+    # Same probe trick, but for arco_runtime_core ALONE (no arco_compiler_core/fission.cpp) -- the
+    # native (no-bytecode-VM) Linux backend's own generic host-function bridge (arco_call_host,
+    # src/native/host_bridge.cpp) needs a real arco::Runtime but must NOT drag ArcoFission's own
+    # compiler implementation into every generated native binary the way
+    # ArcoFissionCapsuleCoreProbe's own link.txt would. Opt in with
+    # `cmake --build . --target ArcoNativeRuntimeCoreProbe`.
+    add_executable(ArcoNativeRuntimeCoreProbe EXCLUDE_FROM_ALL apps/arcofission/runtime_core_probe.cpp)
+    target_link_libraries(ArcoNativeRuntimeCoreProbe PRIVATE arco_runtime_core)
 endif()
 
 add_library(arco_shell STATIC src/shell/arcosh.cpp)
@@ -134,8 +160,9 @@ add_library(ArcoBASIC::all ALIAS arco)
 add_executable(arco_cli apps/arco/main.cpp)
 target_link_libraries(arco_cli PRIVATE arco_runtime)
 
-add_executable(arcosh apps/arcosh/main.cpp)
-target_link_libraries(arcosh PRIVATE arco_shell)
+# The `arcosh` executable (apps/arcosh/main.cpp) is retired: ArcoSH development restarted as the
+# standalone arcosh/ project. arco_shell itself keeps building because tests/unit/runtime_tests.cpp
+# still exercises arco::shell::* directly; see docs/arcosh.md and arcosh/README.md.
 
 add_executable(ArcoFission apps/arcofission/main.cpp)
 target_link_libraries(ArcoFission PRIVATE arco_compiler)
