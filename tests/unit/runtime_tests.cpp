@@ -1524,24 +1524,8 @@ int main() {
     require(doctor_output.str().find("ArcoSH doctor") != std::string::npos, "doctor prints header");
     require(doctor_output.str().find("stdlib import") != std::string::npos, "doctor checks stdlib imports");
 
-    const auto cli_rc = std::filesystem::temp_directory_path() / "arcosh-cli-rc.abas";
-    const auto cli_out = std::filesystem::temp_directory_path() / "arcosh-cli-out.txt";
-    const auto cli_err = std::filesystem::temp_directory_path() / "arcosh-cli-err.txt";
-    write_text(cli_rc, "PRINT \"explicit rc loaded\"\n");
-    std::filesystem::remove(cli_out);
-    std::filesystem::remove(cli_err);
-    const std::string cli_command = "./arcosh --safe --rc " + cli_rc.string() + " -c \"printf cli-ok\" > " + cli_out.string() + " 2> " + cli_err.string();
-    require(std::system(cli_command.c_str()) == 0, "runs arcosh with --safe and explicit --rc");
-    const std::string cli_text = read_text(cli_out);
-    require(cli_text.find("explicit rc loaded") != std::string::npos && cli_text.find("cli-ok") != std::string::npos, "loads explicit rc and command in CLI safe mode");
-
-    const auto doctor_out = std::filesystem::temp_directory_path() / "arcosh-doctor-out.txt";
-    const auto doctor_err = std::filesystem::temp_directory_path() / "arcosh-doctor-err.txt";
-    std::filesystem::remove(doctor_out);
-    std::filesystem::remove(doctor_err);
-    const std::string doctor_command = "ARCOSH_HOME=" + init_home.string() + " ./arcosh --doctor > " + doctor_out.string() + " 2> " + doctor_err.string();
-    require(std::system(doctor_command.c_str()) == 0, "runs arcosh --doctor");
-    require(read_text(doctor_out).find("ArcoSH doctor") != std::string::npos, "CLI doctor prints report");
+    // The `./arcosh` CLI subprocess this used to shell out to is retired (see arcosh/README.md);
+    // in-process arco::shell:: API coverage above/below still exercises the same code paths.
 
     std::ostringstream history_output;
     std::istringstream history_input("PRINT \"hist-one\"\nhistory\nhistory clear\nhistory\nEXIT\n");

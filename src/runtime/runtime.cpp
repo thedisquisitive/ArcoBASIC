@@ -37,10 +37,17 @@
 
 #ifndef _WIN32
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
+#endif
+
+#ifdef _WIN32
+#include <io.h>
 #endif
 
 namespace arco {
@@ -372,6 +379,332 @@ Value process_run(const std::string& command) {
     }
     return Value::Object{{"Ok", code == 0}, {"Output", output}, {"ExitCode", static_cast<double>(code)}, {"Error", ""}};
 }
+
+#ifndef _WIN32
+// RFC-0052 (arcosh/rfcs/RFC-0052_The_Arcology_Shell.md) WP-004: the real Linux process layer a
+// hosted ArcoBASIC shell needs -- fork/execvp/waitpid with correct foreground job-control terminal
+// handoff, distinct from process_run() above (which shells out via popen and captures output; no
+// PATH-lookup-vs-real-exit-status distinction, no terminal control, fine for a one-shot IDE "Run"
+// button, wrong for an interactive shell's own foreground commands). Behavioral reference only
+// (not ported code): the retired src/shell/arcosh.cpp's run_foreground_shell_command.
+Value process_execute_foreground(const std::string& executable, const std::vector<std::string>& argv_strings) {
+    std::cout << std::flush;
+    std::cerr << std::flush;
+
+    // Self-pipe, write end CLOEXEC: if execvp succeeds the pipe closes on exec and this read()
+    // returns 0 immediately; if it fails, the child writes its errno before _exit(127), so the
+    // parent can tell "command not found/not executable" apart from the program itself legitimately
+    // exiting 127 -- indistinguishable from the exit status alone, which is why every real shell
+    // does this rather than just checking for a 127 exit code.
+    int pipe_fds[2];
+    if (pipe(pipe_fds) != 0) {
+        return Value::Object{{"Ok", false}, {"Found", false}, {"ExitCode", -1.0}, {"Signaled", false},
+                              {"TermSignal", 0.0}, {"Error", std::strerror(errno)}};
+    }
+    fcntl(pipe_fds[1], F_SETFD, FD_CLOEXEC);
+
+    struct sigaction ignore {};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    struct sigaction previous_int {};
+    struct sigaction previous_ttou {};
+    sigaction(SIGINT, &ignore, &previous_int);
+    sigaction(SIGTTOU, &ignore, &previous_ttou);
+
+    const bool interactive = isatty(STDIN_FILENO) != 0;
+    const pid_t shell_pgrp = getpgrp();
+    const pid_t previous_foreground_pgrp = interactive ? tcgetpgrp(STDIN_FILENO) : -1;
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        const int fork_errno = errno;
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        sigaction(SIGINT, &previous_int, nullptr);
+        sigaction(SIGTTOU, &previous_ttou, nullptr);
+        return Value::Object{{"Ok", false}, {"Found", false}, {"ExitCode", -1.0}, {"Signaled", false},
+                              {"TermSignal", 0.0}, {"Error", std::strerror(fork_errno)}};
+    }
+
+    if (pid == 0) {
+        close(pipe_fds[0]);
+        setpgid(0, 0);
+        struct sigaction default_action {};
+        default_action.sa_handler = SIG_DFL;
+        sigemptyset(&default_action.sa_mask);
+        sigaction(SIGINT, &default_action, nullptr);
+        sigaction(SIGQUIT, &default_action, nullptr);
+        sigaction(SIGTSTP, &default_action, nullptr);
+        sigaction(SIGTTIN, &default_action, nullptr);
+        sigaction(SIGTTOU, &default_action, nullptr);
+
+        std::vector<char*> argv;
+        argv.reserve(argv_strings.size() + 1);
+        for (const auto& value : argv_strings) argv.push_back(const_cast<char*>(value.c_str()));
+        argv.push_back(nullptr);
+        execvp(executable.c_str(), argv.data());
+
+        const int exec_errno = errno;
+        ssize_t written = write(pipe_fds[1], &exec_errno, sizeof(exec_errno));
+        (void)written; // nothing to do if even this fails -- _exit(127) still gives a sane fallback
+        _exit(127);
+    }
+
+    close(pipe_fds[1]);
+    setpgid(pid, pid);
+    if (interactive) tcsetpgrp(STDIN_FILENO, pid);
+
+    int exec_errno = 0;
+    const ssize_t read_count = read(pipe_fds[0], &exec_errno, sizeof(exec_errno));
+    close(pipe_fds[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        // retry
+    }
+
+    if (interactive) tcsetpgrp(STDIN_FILENO, previous_foreground_pgrp >= 0 ? previous_foreground_pgrp : shell_pgrp);
+    sigaction(SIGINT, &previous_int, nullptr);
+    sigaction(SIGTTOU, &previous_ttou, nullptr);
+
+    if (read_count > 0) {
+        // execvp failed in the child before it ever became the intended program.
+        return Value::Object{{"Ok", false}, {"Found", false}, {"ExitCode", -1.0}, {"Signaled", false},
+                              {"TermSignal", 0.0}, {"Error", std::strerror(exec_errno)}};
+    }
+
+    if (WIFSIGNALED(status)) {
+        return Value::Object{{"Ok", true}, {"Found", true}, {"ExitCode", -1.0}, {"Signaled", true},
+                              {"TermSignal", static_cast<double>(WTERMSIG(status))}, {"Error", ""}};
+    }
+    const int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    return Value::Object{{"Ok", true}, {"Found", true}, {"ExitCode", static_cast<double>(exit_code)},
+                          {"Signaled", false}, {"TermSignal", 0.0}, {"Error", ""}};
+}
+
+// RFC-0052 WP-011: real pipelines and redirection. A separate primitive from
+// process_execute_foreground above, not a loop calling it once per stage -- every stage must be
+// forked with its pipe plumbing already wired BEFORE any of them exec, and the WHOLE pipeline
+// (not just its last stage) needs to be one process group for foreground job-control purposes:
+// Ctrl-C during `slow | grep x` must stop `slow` too, not just `grep`. Also backs plain
+// redirection with no pipe at all (`program > file`) -- a single-stage "pipeline" through the
+// same open()/dup2 plumbing, rather than a second, mostly-duplicate code path.
+//
+// Returns one result object per stage (same {Ok, Found, ExitCode, Signaled, TermSignal, Error}
+// shape Process.Execute's own single-command result already has), in order -- not one combined
+// result -- so the ArcoBASIC caller can report "command not found" for whichever stage(s) failed
+// to exec (any stage can, not only the first) while still classifying the pipeline's own overall
+// outcome from the LAST stage's result, matching real shell semantics: `$?` reflects the last
+// command in a pipeline; an earlier stage failing to exec is reported separately and does not
+// change the pipeline's own exit status (`nonexistent-cmd | true` still exits 0).
+Value process_execute_pipeline(const std::vector<std::pair<std::string, std::vector<std::string>>>& stages,
+                                const std::string& stdin_path, const std::string& stdout_path,
+                                bool append_stdout) {
+    std::cout << std::flush;
+    std::cerr << std::flush;
+
+    const std::size_t stage_count = stages.size();
+    const auto error_result = [](const std::string& message) {
+        return Value::Object{{"Ok", false}, {"Found", false}, {"ExitCode", -1.0}, {"Signaled", false},
+                              {"TermSignal", 0.0}, {"Error", message}};
+    };
+    if (stage_count == 0) {
+        return Value(Value::Array{});
+    }
+
+    // One real pipe between each adjacent pair of stages, plus one SELF-pipe per stage (the same
+    // exec-failure-detection technique process_execute_foreground uses -- write-end CLOEXEC, so a
+    // successful execvp closes it and the parent's read returns 0 immediately, while a failed one
+    // lets the child report its own errno before _exit(127)). One self-pipe per stage, not one
+    // total, because any stage -- not only the first -- can fail to exec or fail to open a
+    // redirection target.
+    std::vector<std::array<int, 2>> stage_pipes(stage_count > 1 ? stage_count - 1 : 0);
+    std::vector<std::array<int, 2>> self_pipes(stage_count);
+    const auto close_all = [&]() {
+        for (auto& fds : stage_pipes) { close(fds[0]); close(fds[1]); }
+        for (auto& fds : self_pipes) { close(fds[0]); close(fds[1]); }
+    };
+    for (auto& fds : stage_pipes) {
+        if (pipe(fds.data()) != 0) {
+            const std::string error = std::strerror(errno);
+            close_all();
+            Value::Array results;
+            for (std::size_t i = 0; i < stage_count; ++i) results.push_back(error_result(error));
+            return Value(results);
+        }
+    }
+    for (auto& fds : self_pipes) {
+        if (pipe(fds.data()) != 0) {
+            const std::string error = std::strerror(errno);
+            close_all();
+            Value::Array results;
+            for (std::size_t i = 0; i < stage_count; ++i) results.push_back(error_result(error));
+            return Value(results);
+        }
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    }
+
+    struct sigaction ignore {};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    struct sigaction previous_int {};
+    struct sigaction previous_ttou {};
+    sigaction(SIGINT, &ignore, &previous_int);
+    sigaction(SIGTTOU, &ignore, &previous_ttou);
+
+    const bool interactive = isatty(STDIN_FILENO) != 0;
+    const pid_t shell_pgrp = getpgrp();
+    const pid_t previous_foreground_pgrp = interactive ? tcgetpgrp(STDIN_FILENO) : -1;
+
+    std::vector<pid_t> pids(stage_count, -1);
+    pid_t pgid = 0;
+    bool fork_failed = false;
+    std::string fork_error;
+
+    for (std::size_t i = 0; i < stage_count && !fork_failed; ++i) {
+        const pid_t pid = fork();
+        if (pid < 0) {
+            fork_failed = true;
+            fork_error = std::strerror(errno);
+            break;
+        }
+
+        if (pid == 0) {
+            // Child. Join the pipeline's own process group -- called here too, not just in the
+            // parent below, so whichever of the two runs first (a real race across fork()) still
+            // has the group correctly formed before anything (a signal, tcsetpgrp) depends on it.
+            setpgid(0, i == 0 ? 0 : pgid);
+
+            struct sigaction default_action {};
+            default_action.sa_handler = SIG_DFL;
+            sigemptyset(&default_action.sa_mask);
+            sigaction(SIGINT, &default_action, nullptr);
+            sigaction(SIGQUIT, &default_action, nullptr);
+            sigaction(SIGTSTP, &default_action, nullptr);
+            sigaction(SIGTTIN, &default_action, nullptr);
+            sigaction(SIGTTOU, &default_action, nullptr);
+
+            bool redirect_failed = false;
+            int redirect_errno = 0;
+            if (i == 0) {
+                if (!stdin_path.empty()) {
+                    const int fd = open(stdin_path.c_str(), O_RDONLY);
+                    if (fd < 0) { redirect_failed = true; redirect_errno = errno; }
+                    else { dup2(fd, STDIN_FILENO); close(fd); }
+                }
+            } else {
+                dup2(stage_pipes[i - 1][0], STDIN_FILENO);
+            }
+            if (!redirect_failed) {
+                if (i + 1 == stage_count) {
+                    if (!stdout_path.empty()) {
+                        const int flags = O_WRONLY | O_CREAT | (append_stdout ? O_APPEND : O_TRUNC);
+                        const int fd = open(stdout_path.c_str(), flags, 0644);
+                        if (fd < 0) { redirect_failed = true; redirect_errno = errno; }
+                        else { dup2(fd, STDOUT_FILENO); close(fd); }
+                    }
+                } else {
+                    dup2(stage_pipes[i][1], STDOUT_FILENO);
+                }
+            }
+
+            for (auto& fds : stage_pipes) { close(fds[0]); close(fds[1]); }
+            for (std::size_t k = 0; k < self_pipes.size(); ++k) {
+                close(self_pipes[k][0]);
+                if (k != i) close(self_pipes[k][1]);
+            }
+
+            if (redirect_failed) {
+                ssize_t written = write(self_pipes[i][1], &redirect_errno, sizeof(redirect_errno));
+                (void)written;
+                _exit(127);
+            }
+
+            std::vector<char*> argv;
+            argv.reserve(stages[i].second.size() + 2);
+            argv.push_back(const_cast<char*>(stages[i].first.c_str()));
+            for (const auto& value : stages[i].second) argv.push_back(const_cast<char*>(value.c_str()));
+            argv.push_back(nullptr);
+            execvp(stages[i].first.c_str(), argv.data());
+
+            const int exec_errno = errno;
+            ssize_t written = write(self_pipes[i][1], &exec_errno, sizeof(exec_errno));
+            (void)written;
+            _exit(127);
+        }
+
+        if (i == 0) pgid = pid;
+        setpgid(pid, pgid);
+        pids[i] = pid;
+    }
+
+    if (fork_failed) {
+        for (std::size_t i = 0; i < stage_count; ++i) {
+            if (pids[i] > 0) kill(pids[i], SIGKILL);
+        }
+        for (std::size_t i = 0; i < stage_count; ++i) {
+            if (pids[i] > 0) { int status = 0; waitpid(pids[i], &status, 0); }
+        }
+        close_all();
+        sigaction(SIGINT, &previous_int, nullptr);
+        sigaction(SIGTTOU, &previous_ttou, nullptr);
+        Value::Array results;
+        for (std::size_t i = 0; i < stage_count; ++i) results.push_back(error_result(fork_error));
+        return Value(results);
+    }
+
+    // Every child has its own copy of every fd via fork(); now that all of them have started
+    // (and dup2'd whichever ones they actually need), the parent's copies are all redundant --
+    // holding them open here would keep every pipe's write end alive even after the writing
+    // child exits, so the reading child would never see end-of-file.
+    for (auto& fds : stage_pipes) { close(fds[0]); close(fds[1]); }
+    for (auto& fds : self_pipes) { close(fds[1]); }
+
+    if (interactive) tcsetpgrp(STDIN_FILENO, pgid);
+
+    std::vector<bool> stage_found(stage_count, true);
+    std::vector<std::string> stage_error(stage_count);
+    for (std::size_t i = 0; i < stage_count; ++i) {
+        int stage_errno = 0;
+        const ssize_t read_count = read(self_pipes[i][0], &stage_errno, sizeof(stage_errno));
+        close(self_pipes[i][0]);
+        if (read_count > 0) {
+            stage_found[i] = false;
+            stage_error[i] = std::strerror(stage_errno);
+        }
+    }
+
+    std::vector<int> stage_status(stage_count, 0);
+    for (std::size_t i = 0; i < stage_count; ++i) {
+        while (waitpid(pids[i], &stage_status[i], 0) < 0 && errno == EINTR) {
+            // retry
+        }
+    }
+
+    if (interactive) tcsetpgrp(STDIN_FILENO, previous_foreground_pgrp >= 0 ? previous_foreground_pgrp : shell_pgrp);
+    sigaction(SIGINT, &previous_int, nullptr);
+    sigaction(SIGTTOU, &previous_ttou, nullptr);
+
+    Value::Array results;
+    results.reserve(stage_count);
+    for (std::size_t i = 0; i < stage_count; ++i) {
+        if (!stage_found[i]) {
+            results.push_back(error_result(stage_error[i]));
+            continue;
+        }
+        const int status = stage_status[i];
+        if (WIFSIGNALED(status)) {
+            results.push_back(Value::Object{{"Ok", true}, {"Found", true}, {"ExitCode", -1.0}, {"Signaled", true},
+                                             {"TermSignal", static_cast<double>(WTERMSIG(status))}, {"Error", ""}});
+            continue;
+        }
+        const int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        results.push_back(Value::Object{{"Ok", true}, {"Found", true}, {"ExitCode", static_cast<double>(exit_code)},
+                                         {"Signaled", false}, {"TermSignal", 0.0}, {"Error", ""}});
+    }
+    return Value(results);
+}
+#endif
 
 #if defined(ARCO_NETWORK_CURL)
 std::size_t curl_write_string(char* data, std::size_t size, std::size_t count, void* user) {
@@ -2744,10 +3077,122 @@ Runtime::Runtime()
         expect_arg_count(args, "Process.Run", 1, 1);
         return process_run(args[0].to_string());
     });
+    // RFC-0052 WP-004: real foreground execution with job-control terminal handoff -- see
+    // process_execute_foreground's own comment for how this differs from Process.Run above.
+    register_function("Process.Execute", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Process.Execute", 2, 2);
+#ifdef _WIN32
+        (void)args;
+        return Value::Object{{"Ok", false}, {"Found", false}, {"ExitCode", -1.0}, {"Signaled", false},
+                              {"TermSignal", 0.0}, {"Error", "Process.Execute is not implemented on Windows yet"}};
+#else
+        const std::string executable = args[0].to_string();
+        std::vector<std::string> argv_strings;
+        argv_strings.push_back(executable);
+        for (const auto& value : args[1].as_array()) argv_strings.push_back(value.to_string());
+        return process_execute_foreground(executable, argv_strings);
+#endif
+    });
+    // RFC-0052 WP-011: real pipelines and redirection -- see process_execute_pipeline's own much
+    // larger comment for the job-control/fd-plumbing design. `stages` is an array of
+    // {Executable, Arguments} objects (built by arcosh.abas's own ParseCommand -- the first
+    // pipeline stage plus every PipelineStages entry after it, always at least one stage, even for
+    // plain redirection with no real pipe); stdinPath/stdoutPath are "" for "no redirection here,
+    // inherit the shell's own stdin/stdout" (stdinPath only meaningful for the FIRST stage,
+    // stdoutPath only for the LAST -- intermediate stages are always pipe-connected to each other
+    // regardless). Returns an ARRAY of per-stage results, not one combined result -- see the
+    // function's own comment for why.
+    register_function("Process.ExecutePipeline", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Process.ExecutePipeline", 4, 4);
+#ifdef _WIN32
+        (void)args;
+        return Value(Value::Array{Value::Object{{"Ok", false}, {"Found", false}, {"ExitCode", -1.0}, {"Signaled", false},
+                              {"TermSignal", 0.0}, {"Error", "Process.ExecutePipeline is not implemented on Windows yet"}}});
+#else
+        std::vector<std::pair<std::string, std::vector<std::string>>> stages;
+        for (const auto& stage_value : args[0].as_array()) {
+            const auto& stage_object = stage_value.as_object();
+            const auto executable_it = stage_object.find("Executable");
+            const auto arguments_it = stage_object.find("Arguments");
+            std::string executable = executable_it != stage_object.end() ? executable_it->second.to_string() : std::string();
+            std::vector<std::string> arguments;
+            if (arguments_it != stage_object.end()) {
+                for (const auto& value : arguments_it->second.as_array()) arguments.push_back(value.to_string());
+            }
+            stages.emplace_back(std::move(executable), std::move(arguments));
+        }
+        const std::string stdin_path = args[1].to_string();
+        const std::string stdout_path = args[2].to_string();
+        const bool append_stdout = args[3].truthy();
+        return process_execute_pipeline(stages, stdin_path, stdout_path, append_stdout);
+#endif
+    });
+    // RFC-0052 (arcosh/rfcs/RFC-0052_The_Arcology_Shell.md) WP-006: the resident numbered-program
+    // editor (LIST/RUN/NEW) needs a way to actually EXECUTE the accumulated program text -- classic
+    // BASIC line numbers/GOTO already parse and run correctly through this same interpreter (see
+    // Runtime::run_string, used throughout tests/unit/runtime_tests.cpp for exactly this), but
+    // nothing exposed that capability to a hosted ArcoBASIC program itself. A fresh, isolated
+    // Runtime per call (not `this`, not the native backend's own shared host-bridge Runtime) --
+    // classic RUN starts clean, and the resident program's variables have no business leaking into
+    // or out of the caller's own state.
+    register_function("Runtime.RunString", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Runtime.RunString", 1, 1);
+        Runtime nested;
+        const RunResult run_result = nested.run_string(args[0].to_string());
+        return Value::Object{{"Ok", run_result.ok}, {"Error", run_result.error},
+                              {"Exited", run_result.exited}, {"ExitCode", static_cast<double>(run_result.exit_code)}};
+    });
     register_function("Process.Env", [](const std::vector<Value>& args) -> Value {
         expect_arg_count(args, "Process.Env", 1, 1);
         const char* value = std::getenv(args[0].to_string().c_str());
         return value ? Value(value) : Value("");
+    });
+    // Console.ReadLine/Console.IsTTY and Path.Cwd did not exist anywhere before RFC-0052
+    // (arcosh/rfcs/RFC-0052_The_Arcology_Shell.md, WP-001) -- the new arcosh is a hosted ArcoBASIC
+    // program compiled by Fission rather than hand-written C++ like the retired arco_shell, so its
+    // interactive loop needs a way to read stdin and query terminal capability as ordinary runtime
+    // primitives. Same extraction/addition pattern as Process.Run/Process.Env/Path.* above.
+    register_function("Console.ReadLine", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Console.ReadLine", 0, 0);
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            return Value::Object{{"Ok", false}, {"Text", std::string()}};
+        }
+        return Value::Object{{"Ok", true}, {"Text", line}};
+    });
+    // PRINT always appends a newline (PrintStmt::exec in parser.cpp), so an interactive prompt
+    // that must share a line with the user's typed input (e.g. "arcosh:/home/user> ") needs a
+    // newline-free write. Goes through Runtime::output() like PRINT so test redirection still
+    // works.
+    register_function("Console.Write", [this](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Console.Write", 1, 1);
+        output() << args[0].to_string();
+        output().flush();
+        return Value();
+    });
+    register_function("Console.IsTTY", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Console.IsTTY", 0, 0);
+#ifdef _WIN32
+        return _isatty(_fileno(stdout)) != 0;
+#else
+        return isatty(fileno(stdout)) != 0;
+#endif
+    });
+    register_function("Path.Cwd", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Path.Cwd", 0, 0);
+        std::error_code ec;
+        const auto path = std::filesystem::current_path(ec);
+        return ec ? Value(std::string()) : Value(path.string());
+    });
+    // RFC-0052 (arcosh/rfcs/RFC-0052_The_Arcology_Shell.md) WP-002/`cd`: changing the process's
+    // own working directory needs a real chdir syscall, so -- like Console.*/Path.Cwd above --
+    // this one small primitive lives here even though colon-path translation itself stays in
+    // ArcoBASIC (arcosh/src/arcosh.abas).
+    register_function("Directory.Change", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Directory.Change", 1, 1);
+        std::error_code ec;
+        std::filesystem::current_path(args[0].to_string(), ec);
+        return Value::Object{{"Ok", !ec}, {"Error", ec ? ec.message() : std::string()}};
     });
     // Not meant to be called directly from ArcoBASIC source -- the AMIR builder emits a call to
     // this as Main's first instructions (see AstAmirBuilder::build in fission.cpp) so a bare

@@ -336,6 +336,29 @@ inline bool values_equal(const Value& left, const Value& right) {
     return left.to_string() == right.to_string();
 }
 
+// Ordering for "<"/"<="/">"/">=". Mirrors the "+" operator's own "either side a string wins"
+// dispatch (Value::operator+ is not a real method, but apply_binary's Plus case does exactly
+// this): if either operand is a string, both sides are stringified and compared lexicographically
+// (byte-wise, matching std::string::operator<) -- otherwise both are coerced to numbers exactly
+// like every other numeric operator here, throwing "value is not a number" for anything that is
+// neither a number, bool, nor string (arrays/objects/handles have never supported ordering and
+// still don't). Returns -1/0/1 rather than a bool so ONE function can back all four operators, on
+// both the interpreter (apply_binary) and the native backend's ABI (arco_value_compare).
+inline int values_compare(const Value& left, const Value& right) {
+    if (left.is_string() || right.is_string()) {
+        const std::string left_text = left.to_string();
+        const std::string right_text = right.to_string();
+        if (left_text < right_text) return -1;
+        if (left_text > right_text) return 1;
+        return 0;
+    }
+    const double left_number = left.as_number();
+    const double right_number = right.as_number();
+    if (left_number < right_number) return -1;
+    if (left_number > right_number) return 1;
+    return 0;
+}
+
 inline long long exact_slice_integer(double number, const std::string& role) {
     if (!std::isfinite(number) || std::floor(number) != number ||
         number < static_cast<double>(std::numeric_limits<long long>::min()) ||
