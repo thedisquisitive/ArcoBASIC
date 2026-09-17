@@ -62,7 +62,7 @@ and AP-0052-008 (WP-005 Structured History + `oops`):
   "gti must remain inside this message"` then `oops git` really does `git commit` with that exact
   message, confirmed against a real repo, not just the `--selftest-oops` structural check).
 
-and AP-0052-009 (WP-006 Resident ArcoBASIC Program):
+and AP-0052-009 (WP-006 Resident ArcoBASIC Program + Immediate Input):
 
 * a line typed at the prompt that starts with a number is classified before shell-command parsing
   even runs (`ParseLeadingLineNumber`) and inserted/replaced/deleted (empty text deletes) into an
@@ -76,7 +76,19 @@ and AP-0052-009 (WP-006 Resident ArcoBASIC Program):
   loop needing to interpret it itself;
 * verified against the RFC section 9 worked example exactly (`10 PRINT "ONE"` / `20 PRINT "TWO"` /
   replace `20 PRINT "THREE"` / `LIST` / bare `20` deletes it / `LIST` / `RUN` / `NEW`), plus a
-  multi-digit-line-number `GOTO` counting loop, both against the real native binary.
+  multi-digit-line-number `GOTO` counting loop, both against the real native binary;
+* RFC section 8's "Input Classification" also requires **ArcoBASIC immediate input** as its own
+  category, distinct from a shell command — typing `PRINT "hello"` or `x = 5` directly at the
+  prompt runs it right away (`IsArcoBasicImmediateInput`/`RunImmediateInput`), classified by shape
+  (a leading ArcoBASIC statement keyword, or a plain/compound assignment) rather than by trying to
+  parse the line and seeing if it happens to succeed — a bare `ls` is syntactically a valid
+  ArcoBASIC expression-statement (an identifier reference) that would only fail at runtime
+  ("undefined variable"), so parse-then-see-if-it-works would misclassify ordinary commands.
+  Backed by the new `Runtime.EvalImmediate` host function, a SINGLE persistent interpreter for the
+  whole session (unlike `Runtime.RunString`'s deliberately fresh one per `RUN`) — a variable set on
+  one line stays visible on the next, real REPL/classic-BASIC-immediate-mode semantics, verified
+  directly: `PRINT "hello"` prints `hello`, `x = 5` / `PRINT x` / `x = x + 1` / `PRINT x` prints
+  `5` then `6`, and ordinary shell commands (`ls`, etc.) keep working unaffected in between.
 
 and AP-0052-010 (WP-007 Script Execution):
 
@@ -144,6 +156,10 @@ small primitives were added there (colon-path translation itself is pure ArcoBAS
   runtime_tests.cpp` exercises directly — so a hosted/native ArcoBASIC program can dynamically
   compile and execute new ArcoBASIC source, including numbered-line `GOTO` control flow, at
   runtime)
+* `Runtime.EvalImmediate(code)` -> `{Ok, Error, Exited, ExitCode}` (WP-006; the opposite lifetime
+  from `Runtime.RunString` above — ONE persistent `arco::Runtime` reused for the whole process,
+  since `run_string()` never resets its own global variables between calls, so a variable set by
+  one call is still visible on the next — backs ArcoSH's own ArcoBASIC immediate-input mode)
 * `Process.ExecutePipeline(stages, stdinPath, stdoutPath, appendStdout)` -> an ARRAY of one
   `{Ok, Found, ExitCode, Signaled, TermSignal, Error}` per stage (WP-011; real fork/pipe/`dup2`
   plumbing, one process group for the whole pipeline — see the function's own much larger comment

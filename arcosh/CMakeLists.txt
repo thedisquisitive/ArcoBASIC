@@ -79,4 +79,9 @@ if(BUILD_TESTING)
     # own explicit rule ("Tests MUST inspect actual execution/output behavior. Parser-only tests are
     # insufficient.") -- see RunPipelineSelfTest in src/arcosh.abas.
     add_test(NAME arcosh_pipeline_selftest COMMAND ${ARCOSH_BINARY} --selftest-pipeline)
+    # RFC-0052 AP-0052-009 (WP-006): "immediate ArcoBASIC input where supported" -- classification
+    # (a PRINT/assignment line is ArcoBASIC, a bare external command is not) plus real execution
+    # with variable state persisting across two SEPARATE Runtime.EvalImmediate calls -- see
+    # RunImmediateInputSelfTest in src/arcosh.abas.
+    add_test(NAME arcosh_immediate_input_selftest COMMAND ${ARCOSH_BINARY} --selftest-immediate)
 endif()

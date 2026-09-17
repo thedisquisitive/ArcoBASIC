@@ -27,14 +27,20 @@
 ' immediately-preceding COMMAND_NOT_FOUND command's executable, operating on its parsed structure
 ' (never its text), per RFC section 15.2's explicit "MUST NOT perform blind text replacement."
 '
-' WP-006 (resident ArcoBASIC program): ParseLeadingLineNumber/SetProgramLine below implement the
-' RFC section 8/9 numbered-line editor -- a line typed at the prompt that starts with a number is
-' inserted/replaced/deleted (empty text) into an in-memory `resident_program` array kept in
-' numeric order, never executed immediately. `LIST` prints it back; `RUN` reassembles it into
-' source text and hands it to the new Runtime.RunString host function (arco_runtime,
-' src/runtime/runtime.cpp), which compiles and executes it in a fresh, isolated interpreter --
-' so GOTO/line-number control flow works exactly as classic BASIC, without arcosh's own REPL loop
-' having to interpret it; `NEW` clears the resident program.
+' WP-006 (resident ArcoBASIC program + immediate input): ParseLeadingLineNumber/SetProgramLine
+' below implement the RFC section 8/9 numbered-line editor -- a line typed at the prompt that
+' starts with a number is inserted/replaced/deleted (empty text) into an in-memory
+' `resident_program` array kept in numeric order, never executed immediately. `LIST` prints it
+' back; `RUN` reassembles it into source text and hands it to the new Runtime.RunString host
+' function (arco_runtime, src/runtime/runtime.cpp), which compiles and executes it in a fresh,
+' isolated interpreter -- so GOTO/line-number control flow works exactly as classic BASIC, without
+' arcosh's own REPL loop having to interpret it; `NEW` clears the resident program. Section 8's
+' "Input Classification" also requires "ArcoBASIC immediate input" as its own category, distinct
+' from a shell command: IsArcoBasicImmediateInput/RunImmediateInput classify and run an unnumbered
+' line typed directly at the prompt (`PRINT "hello"`, `x = 5`) via the new Runtime.EvalImmediate
+' host function -- a SINGLE persistent interpreter for the whole session (unlike Runtime.RunString's
+' deliberately fresh one per RUN), so a variable set on one line is still visible on the next, the
+' way any real REPL/classic BASIC immediate mode behaves.
 '
 ' WP-007 (script execution): RunScriptFile below. `RUN <file>` reads the raw file text and hands
 ' it directly to Runtime.RunString -- the SAME canonical compiler/parser path every other
@@ -697,6 +703,43 @@ FUNCTION ParseLeadingLineNumber(command AS STRING)
     RETURN {"IsNumbered": TRUE, "Number": NUMBER(digits), "Rest": rest}
 END FUNCTION
 
+' RFC section 8's "Input Classification" lists FOUR categories, not three: Shell command,
+' ArcoBASIC immediate input, Numbered ArcoBASIC program line, Shell built-in/control command --
+' AP-0052-009 explicitly requires proving "immediate ArcoBASIC input where supported" as part of
+' WP-006, alongside the resident-program editor above. Classified on the ALREADY-parsed structure
+' (never re-tokenizing) by shape, not by trying to compile the line and seeing if it happens to
+' parse: a bare `ls` is syntactically a perfectly valid ArcoBASIC expression-statement (an
+' identifier reference) that would only fail at RUNTIME ("undefined variable: ls") -- parsing it
+' successfully and only discovering the mismatch after already committing to the ArcoBASIC path
+' would make ordinary commands like bare `ls` throw a confusing ArcoBASIC error instead of running
+' the real program every real shell user expects. A leading ArcoBASIC statement keyword (`PRINT`,
+' `IF`, ...) or a plain/compound assignment shape (`x = ...`, `x += ...`) can never legitimately be
+' the start of a real Linux command line, so those are the only two shapes trusted here.
+FUNCTION IsArcoBasicImmediateInput(parsed AS OBJECT)
+    IF parsed.Executable == "" THEN RETURN FALSE
+    leadingKeywords = ["PRINT", "LET", "IF", "SELECT", "WHILE", "DO", "FOR", "FUNCTION", "RETURN",
+        "TRY", "THROW", "GOTO", "STOP", "CLASS", "INTERFACE", "FLAGS"]
+    IF Array.Contains(leadingKeywords, Upper(parsed.Executable)) THEN RETURN TRUE
+    IF LEN(parsed.Arguments) > 0 THEN
+        assignmentOperators = ["=", "+=", "-=", "*=", "/="]
+        IF Array.Contains(assignmentOperators, parsed.Arguments[0]) THEN RETURN TRUE
+    END IF
+    RETURN FALSE
+END FUNCTION
+
+' Runs ONE line of immediate ArcoBASIC input for real (Runtime.EvalImmediate, arco_runtime --
+' variables persist across separate calls, unlike Runtime.RunString's fresh-Runtime-per-call
+' resident-program RUN just below). Takes the RAW trimmed command text, never anything rebuilt
+' from `parsed`'s own tokens -- TokenizeCommand strips quotes the way ordinary shell word-splitting
+' does (correct for a real command's arguments), which would silently turn `PRINT "hello"` into
+' `PRINT hello` (a bare, undefined-variable identifier, not the string literal it has to stay) if
+' this reconstructed the source from parsed.Executable/Arguments instead of using the original text
+' directly.
+FUNCTION RunImmediateInput(command AS STRING)
+    result = Runtime.EvalImmediate(command)
+    IF !result.Ok THEN PRINT "arcosh: " + result.Error
+END FUNCTION
+
 ' RFC section 9's own rules: new numbered line -> insert; existing numbered line -> replace; bare
 ' line number (empty `text`) -> delete; lines remain numerically ordered. A reusable abstraction
 ' (this function plus the plain {Number, Text} array it operates on) rather than the old, retired
@@ -896,6 +939,70 @@ FUNCTION RunScriptExecutionSelfTest(fixturesDir AS STRING)
     RETURN failures
 END FUNCTION
 
+' AP-0052-009's own "immediate ArcoBASIC input where supported" requirement (RFC section 8).
+FUNCTION RunImmediateInputSelfTest()
+    failures = 0
+
+    printParsed = ParseCommand("PRINT \"x\"")
+    IF IsArcoBasicImmediateInput(printParsed) THEN
+        PRINT "ok   a PRINT statement classifies as ArcoBASIC immediate input"
+    ELSE
+        PRINT "FAIL a PRINT statement did not classify as ArcoBASIC immediate input"
+        failures = failures + 1
+    END IF
+
+    assignParsed = ParseCommand("total = 5")
+    IF IsArcoBasicImmediateInput(assignParsed) THEN
+        PRINT "ok   a plain assignment classifies as ArcoBASIC immediate input"
+    ELSE
+        PRINT "FAIL a plain assignment did not classify as ArcoBASIC immediate input"
+        failures = failures + 1
+    END IF
+
+    compoundParsed = ParseCommand("total += 5")
+    IF IsArcoBasicImmediateInput(compoundParsed) THEN
+        PRINT "ok   a compound assignment classifies as ArcoBASIC immediate input"
+    ELSE
+        PRINT "FAIL a compound assignment did not classify as ArcoBASIC immediate input"
+        failures = failures + 1
+    END IF
+
+    lsParsed = ParseCommand("ls -la /tmp")
+    IF IsArcoBasicImmediateInput(lsParsed) THEN
+        PRINT "FAIL a bare external command misclassified as ArcoBASIC immediate input"
+        failures = failures + 1
+    ELSE
+        PRINT "ok   a bare external command classifies as a shell command, not ArcoBASIC"
+    END IF
+
+    ' Real execution, not just classification -- and persistence across two SEPARATE calls, the
+    ' actual point of Runtime.EvalImmediate over Runtime.RunString: a real REPL-immediate-mode
+    ' variable set on one line must still be visible on the next.
+    setResult = Runtime.EvalImmediate("__wp006_immediate_selftest_var = 41 + 1")
+    IF !setResult.Ok THEN
+        PRINT "FAIL Runtime.EvalImmediate assignment failed: " + setResult.Error
+        failures = failures + 1
+    END IF
+
+    checkResult = Runtime.EvalImmediate(
+        "IF __wp006_immediate_selftest_var == 42 THEN ExitTheProgram(77) ELSE ExitTheProgram(78)")
+    persisted = FALSE
+    IF checkResult.Exited THEN
+        IF checkResult.ExitCode == 77 THEN persisted = TRUE
+    END IF
+    IF persisted THEN
+        PRINT "ok   a variable set by one immediate-input line persisted to the next"
+    ELSE
+        failMessage = "FAIL variable did not persist across separate Runtime.EvalImmediate calls ("
+        failMessage = failMessage + "Ok=" + STRING(checkResult.Ok) + " Exited=" + STRING(checkResult.Exited)
+        failMessage = failMessage + " ExitCode=" + STRING(checkResult.ExitCode) + " Error=" + checkResult.Error + ")"
+        PRINT failMessage
+        failures = failures + 1
+    END IF
+
+    RETURN failures
+END FUNCTION
+
 FUNCTION RunPathLayerSelfTest()
     cases = [
         [":", "/"],
@@ -1040,6 +1147,16 @@ IF HasFlag(Args, "--selftest-pipeline") THEN
     ExitTheProgram(0)
 END IF
 
+IF HasFlag(Args, "--selftest-immediate") THEN
+    failures = RunImmediateInputSelfTest()
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " immediate-input test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all immediate-input tests passed"
+    ExitTheProgram(0)
+END IF
+
 ' Reduced terminal capability (piped stdin, dumb terminal, no color) must degrade gracefully
 ' rather than fail: no ANSI codes are ever emitted by this skeleton, so color_ok currently only
 ' affects the banner line below. Real semantic styling (Display.*/Terminal.* per RFC-0052 section
@@ -1161,6 +1278,16 @@ WHILE running
 
     IF Upper(parsed.Executable) == "NEW" THEN
         resident_program = []
+        CONTINUE WHILE
+    END IF
+
+    ' RFC-0052 section 8 (Input Classification) / AP-0052-009: unnumbered ArcoBASIC input typed
+    ' directly at the prompt runs immediately, its own category distinct from a shell command --
+    ' checked after every classic-BASIC/shell built-in above (so e.g. bare `RUN` still means "run
+    ' the resident program", not ArcoBASIC's own RUN statement) and before background/pipeline
+    ' handling below, which has no meaning for an ArcoBASIC statement.
+    IF IsArcoBasicImmediateInput(parsed) THEN
+        ignored = RunImmediateInput(command)
         CONTINUE WHILE
     END IF
 

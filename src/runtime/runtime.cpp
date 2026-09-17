@@ -3142,6 +3142,28 @@ Runtime::Runtime()
         return Value::Object{{"Ok", run_result.ok}, {"Error", run_result.error},
                               {"Exited", run_result.exited}, {"ExitCode", static_cast<double>(run_result.exit_code)}};
     });
+    // RFC-0052 AP-0052-009 (WP-006) also explicitly requires "immediate ArcoBASIC input where
+    // supported" (section 8's own "Input Classification" -- Shell command / ArcoBASIC immediate
+    // input / Numbered ArcoBASIC program line / Shell built-in are four SEPARATE categories, not
+    // three) -- typing `PRINT "hello"` or `x = 5` directly at the prompt and having it run right
+    // away, the same way a numbered line gets recorded rather than run. Unlike Runtime.RunString
+    // just above (a FRESH Runtime every call, correct for "run the whole resident program again
+    // from scratch"), immediate input needs the OPPOSITE lifetime: one variable set on one line
+    // (`x = 5`) must still be visible on the NEXT line (`PRINT x`), exactly like classic BASIC
+    // immediate mode / any ordinary REPL. A single function-local static Runtime, reused for the
+    // life of the process, gives exactly that -- Runtime::run_string() itself never resets
+    // `globals_` between calls (only its own instruction-count bookkeeping), so calling it
+    // repeatedly on the SAME instance naturally accumulates state with no extra plumbing needed
+    // here. arcosh owns exactly one such session (there is only ever one interactive prompt), so a
+    // handle/registry (the pattern Random.Create/TCP clients use for multiple concurrent
+    // instances) would be unneeded complexity for this singleton case.
+    register_function("Runtime.EvalImmediate", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Runtime.EvalImmediate", 1, 1);
+        static Runtime session;
+        const RunResult run_result = session.run_string(args[0].to_string());
+        return Value::Object{{"Ok", run_result.ok}, {"Error", run_result.error},
+                              {"Exited", run_result.exited}, {"ExitCode", static_cast<double>(run_result.exit_code)}};
+    });
     register_function("Process.Env", [](const std::vector<Value>& args) -> Value {
         expect_arg_count(args, "Process.Env", 1, 1);
         const char* value = std::getenv(args[0].to_string().c_str());
