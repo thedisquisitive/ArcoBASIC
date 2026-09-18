@@ -3042,6 +3042,56 @@ int UserError::source_column() const noexcept {
     return source_column_;
 }
 
+// ArcoSH's plugin system (RFC-0052 section 19 / WP-009): ONE dedicated, process-lifetime Runtime
+// used ONLY for compiling/running plugin `.abas` source, never the disposable per-call one
+// Runtime.RunString already provides for ITS OWN, different purpose (re-running the resident
+// numbered program from a clean slate every RUN). This split is load-bearing, not a style choice --
+// see .agents/reports/ARCO_SH_RFC0052_WP009_PLUGIN_SYSTEM_RESEARCH.md for the full finding:
+// Runtime::call_callable resolves a CALLABLE by name against WHICHEVER Runtime instance is doing
+// the invoking, so a callable produced by RunString's own throwaway `nested` Runtime becomes a
+// dangling reference ("value is not a live CALLABLE") the instant RunString returns -- a plugin's
+// registered command/prompt-segment/completer callback needs to keep working long after its own
+// LoadPlugin call returned, which only a genuinely persistent instance can do.
+//
+// A free function, NOT a static local declared directly in Runtime::Runtime()'s own body -- that
+// ordering would try to construct a Runtime (to satisfy the static) WHILE THE VERY FIRST Runtime
+// constructor call is still running, a self-referential deadlock the C++ runtime correctly detects
+// and aborts on (std::recursive_init_error). Wrapped in a free function instead, the static is
+// lazily constructed the first time this function is actually CALLED (i.e. the first time some
+// lambda registered inside a constructor that already finished executing invokes it), exactly
+// matching Runtime.EvalImmediate's own already-working `static Runtime session` pattern one level
+// up -- the only difference is this one is reachable from more than one lambda.
+Runtime& plugin_runtime() {
+    static Runtime instance;
+    return instance;
+}
+
+// Which plugin's own top-level code is currently executing, set by Shell.LoadPlugin immediately
+// before (and cleared immediately after) running that plugin's source -- read by
+// Shell.PluginRegister so every capability a plugin registers is tagged with WHO registered it,
+// for `plugins`'s own enumeration (RFC-0052 section 19.2's own "GitTools: command.gitstatus, ..."
+// example groups capabilities by plugin name). Empty outside of an active LoadPlugin call (a
+// capability registered directly by native host code rather than a real plugin, which nothing
+// does today, would simply be tagged with an empty plugin name).
+std::string& current_loading_plugin() {
+    static std::string name;
+    return name;
+}
+
+struct PluginCapabilityEntry {
+    std::string capability;
+    std::string name;
+    std::string plugin;
+    Value value;
+};
+
+// keyed on "capability:name" -- a plugin re-registering the same (capability, name) pair (e.g.
+// reloading itself) simply overwrites its own previous entry rather than accumulating duplicates.
+std::unordered_map<std::string, PluginCapabilityEntry>& plugin_capability_registry() {
+    static std::unordered_map<std::string, PluginCapabilityEntry> registry;
+    return registry;
+}
+
 Runtime::Runtime()
     : output_(&std::cout),
       default_random_(std::make_shared<Pcg32>(automatic_random_seed(), Pcg32::default_sequence)) {
@@ -3809,6 +3859,89 @@ Runtime::Runtime()
         if (!user) user = std::getenv("LOGNAME");
         return Value(std::string(user ? user : ""));
 #endif
+    });
+    // `Shell.LoadPlugin(pluginName, source)` -- runs a plugin's ENTIRE source through the one
+    // persistent plugin_runtime() (see its own much larger comment above for why this exact
+    // instance, and no other, is what keeps a registered callable genuinely invokable afterward).
+    // Tags every Shell.PluginRegister call the plugin's own top-level code makes while it runs
+    // with `pluginName`, via current_loading_plugin(), so `plugins`'s own enumeration can group
+    // capabilities by which plugin registered them (RFC-0052 section 19.2). Same {Ok, Error}
+    // result shape as Runtime.RunString/EvalImmediate.
+    register_function("Shell.LoadPlugin", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Shell.LoadPlugin", 2, 2);
+        current_loading_plugin() = args[0].to_string();
+        const RunResult run_result = plugin_runtime().run_string(args[1].to_string());
+        current_loading_plugin().clear();
+        return Value::Object{{"Ok", run_result.ok}, {"Error", run_result.error}};
+    });
+    // `Shell.PluginRegister(capability, name, value)` -- the primitive underneath every
+    // RFC-0052-section-19.1-named wrapper (`Shell.RegisterCommand`, `Shell.RegisterPromptSegment`,
+    // `Shell.RegisterTheme`, `Shell.RegisterCompleter` -- all plain ArcoBASIC functions in
+    // arcosh.abas itself, matching section 19.1's own "the precise API SHALL be proven by
+    // implementation before being frozen"). `value` is a CALLABLE for a callback-shaped capability
+    // (command/prompt.segment/completion) or a plain OBJECT for a pure-data one (theme) -- this
+    // primitive itself doesn't need to know which, since Shell.PluginInvoke is what actually
+    // calls a callable, never this one.
+    register_function("Shell.PluginRegister", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Shell.PluginRegister", 3, 3);
+        const std::string capability = args[0].to_string();
+        const std::string name = args[1].to_string();
+        plugin_capability_registry()[capability + ":" + name] =
+            PluginCapabilityEntry{capability, name, current_loading_plugin(), args[2]};
+        return Value();
+    });
+    // `Shell.PluginInvoke(capability, name, arg)` -- looks up a registered CALLABLE and invokes it
+    // with exactly one argument (matching this whole file's own established "bundle everything a
+    // callback needs into one context object" convention -- see arcosh.abas's own
+    // MakePromptContext), via plugin_runtime() specifically, never `this`/whichever Runtime
+    // instance happens to be doing the invoking (see plugin_runtime()'s own comment for why that
+    // distinction is load-bearing here). Throws a plain, catchable runtime_error (arcosh.abas's
+    // own call sites are expected to wrap this in TRY/CATCH -- RFC-0052 section 19.3's "a broken
+    // optional plugin SHOULD NOT make the shell unrecoverable" applies just as much to a plugin
+    // that throws when INVOKED, e.g. rendering a prompt segment, as it does to one that fails to
+    // LOAD at all) for an unregistered capability/name, exactly like calling any unknown host
+    // function already does elsewhere in this file.
+    register_function("Shell.PluginInvoke", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Shell.PluginInvoke", 3, 3);
+        const std::string key = args[0].to_string() + ":" + args[1].to_string();
+        const auto found = plugin_capability_registry().find(key);
+        if (found == plugin_capability_registry().end()) {
+            throw std::runtime_error("no such " + args[0].to_string() + " plugin capability: " + args[1].to_string());
+        }
+        return plugin_runtime().call_callable(found->second.value, {args[2]});
+    });
+    register_function("Shell.PluginHasCapability", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Shell.PluginHasCapability", 2, 2);
+        return plugin_capability_registry().count(args[0].to_string() + ":" + args[1].to_string()) != 0;
+    });
+    // `Shell.PluginCapabilities()` -- backs the `plugins` command's own enumeration (RFC-0052
+    // section 19.2): every currently-registered {Capability, Name, Plugin} triple, in no
+    // particular order (arcosh.abas's own RunPluginsCommand sorts/groups it for display).
+    // Deliberately omits the raw Value -- a callable is meaningless outside Shell.PluginInvoke,
+    // and a plugin-contributed theme's own content is read back through the ordinary theme
+    // commands, not this enumeration.
+    register_function("Shell.PluginCapabilities", [](const std::vector<Value>&) -> Value {
+        Value::Array entries;
+        for (const auto& [key, entry] : plugin_capability_registry()) {
+            entries.push_back(Value::Object{{"Capability", entry.capability}, {"Name", entry.name}, {"Plugin", entry.plugin}});
+        }
+        return entries;
+    });
+    // Returns a registered theme/data-shaped capability's own VALUE directly (unlike
+    // PluginCapabilities' deliberately Value-less enumeration) -- e.g. `theme use gittools:neon`
+    // needs the plugin-contributed theme OBJECT itself, not just proof that it exists.
+    register_function("Shell.PluginCapabilityValue", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Shell.PluginCapabilityValue", 2, 2);
+        const auto found = plugin_capability_registry().find(args[0].to_string() + ":" + args[1].to_string());
+        return found != plugin_capability_registry().end() ? found->second.value : Value();
+    });
+    // Testing-only: clears every registered capability so --selftest-plugin's own separate load
+    // scenarios don't see each other's leftover registrations within the one process a ctest run
+    // is. Never called by arcosh's own ordinary startup/runtime path -- plugins are loaded once,
+    // deliberately, and nothing in this pass reloads them mid-session.
+    register_function("Shell.PluginResetForTesting", [](const std::vector<Value>&) -> Value {
+        plugin_capability_registry().clear();
+        return Value();
     });
     // Not meant to be called directly from ArcoBASIC source -- the AMIR builder emits a call to
     // this as Main's first instructions (see AstAmirBuilder::build in fission.cpp) so a bare
