@@ -9,7 +9,8 @@ Per RFC-0052 section 6, `arcosh` is authored **in ArcoBASIC itself** and compile
 ArcoFission, not hand-written in C++.
 
 ## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes),
-a built-in HELP command, and profile/theme/prompt customization (RFC-0052 sections 20/22)
+a built-in HELP command, profile/theme/prompt customization (RFC-0052 sections 20/22), and
+interactive theme/prompt editors on top of it
 
 `src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
 
@@ -254,6 +255,32 @@ and profile/theme/prompt customization (RFC-0052 sections 20 "Prompt Architectur
 Two new general-purpose `arco_runtime` primitives back this: `Directory.Create` (recursive `mkdir
 -p`-style creation) and `Directory.List` (enumerate a directory's entries by name), plus
 `Host.Hostname()` for the `hostname` prompt segment.
+
+and interactive `theme edit` / `prompt edit` editors on top of the commands above, so designing a
+look and feel never requires knowing a raw ANSI SGR code:
+
+* `theme edit` — a menu loop: pick a role by number or name, then pick a color by NAME (red,
+  green, yellow, blue, magenta, cyan, white, gray, orange, purple, pink, teal) with an optional
+  bold toggle, or `default` to reset that role to `DefaultTheme`'s own value, or `custom` to fall
+  back to entering raw per-tier codes directly for full control; every change applies to the
+  active theme immediately (a live swatch reprints after each edit) and `s` saves it under a name
+  exactly like `theme save` does, refusing to overwrite the built-in `"default"` name;
+* `prompt edit` — a menu loop: `add <segment>`, `remove <number>`, `move <number> up|down`, with
+  the segment list and a live rendered preview reprinted after every change; `s` persists the
+  result as the default for new sessions (the same file `profile save` writes to);
+* every mutation the two loops perform (`ApplyNamedColorToRole`, `ResolveRoleSelection`,
+  `AddPromptSegment`, `RemovePromptSegmentAt`, `MovePromptSegment`) is a small, pure function with
+  no globals or I/O, specifically so `--selftest-editor` can exercise all of them directly; the
+  `Console.ReadLine`-driven menu loops themselves are verified manually against the compiled
+  binary under a real pty instead, the same split `RunJobControlSelfTest`'s own comment explains
+  for a real Ctrl-Z — a full `theme edit` session (pick "error" by name, pick "teal", toggle bold,
+  go back, save as a new name) and a full `prompt edit` session (add/remove/reorder segments,
+  save) were both run end-to-end against the real binary, confirmed correct in the raw captured
+  output AND by reading back the resulting `~/.arcosh/themes/<name>` and `~/.arcosh/config` files.
+
+Building the editors and their self-test also surfaced, and fixed, a second real native-backend
+compiler performance regression of the same shape Entry 31 (above) first found and only partly
+fixed — see Entry 33 in `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md`.
 
 It does not yet implement plugins or completion — later work packages (WP-009, WP-010).
 

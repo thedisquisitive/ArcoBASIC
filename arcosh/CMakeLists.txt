@@ -103,4 +103,11 @@ if(BUILD_TESTING)
     # numbered work packages) -- config/theme file round-tripping and prompt segment rendering,
     # against a real temporary profile directory -- see RunProfileSelfTest in src/arcosh.abas.
     add_test(NAME arcosh_profile_selftest COMMAND ${ARCOSH_BINARY} --selftest-profile)
+    # `theme edit` / `prompt edit`, arcosh's own interactive editors for the profile/theme/prompt
+    # commands above (not one of RFC-0052's own numbered work packages) -- every mutator the
+    # interactive loops delegate to (named-color lookup, role selection, segment add/remove/move)
+    # is pure and tested directly here; the Console.ReadLine-driven loops themselves are verified
+    # manually against the compiled binary under a real pty instead -- see RunEditorSelfTest in
+    # src/arcosh.abas.
+    add_test(NAME arcosh_editor_selftest COMMAND ${ARCOSH_BINARY} --selftest-editor)
 endif()

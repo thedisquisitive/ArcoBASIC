@@ -1,10 +1,11 @@
-#DESCRIPTION "The Arcology Shell -- WP-001..WP-012 + WP-008 + HELP + Profiles (RFC-0052)"
+#DESCRIPTION "The Arcology Shell -- WP-001..WP-012 + WP-008 + HELP + Profiles + Editors (RFC-0052)"
 
 ' RFC-0052 ("The Arcology Shell", see ../rfcs/RFC-0052_The_Arcology_Shell.md), WP-001 through
 ' WP-012, plus WP-008 (Display and Themes), implemented out of numeric order alongside them, plus
 ' a built-in HELP command and RFC-0052 sections 20/22 (Prompt Architecture / Configuration --
-' see the "Profiles" section below) added directly on request -- neither is one of RFC-0052's
-' own numbered work packages.
+' see the "Profiles" section below, which also has "theme edit"/"prompt edit", interactive
+' editors built on top of the same profile/theme/prompt commands) added directly on request --
+' none of these are one of RFC-0052's own numbered work packages.
 '
 ' WP-001 (shell skeleton): interactive loop, prompt, clean exit, current directory, diagnostic
 ' output, terminal capability query, explicit no-color mode.
@@ -1568,8 +1569,11 @@ FUNCTION HelpTopics()
                 "terminal never loses any information, just the color.",
                 "",
                 "    theme                       shows the active theme and previews every role",
+                "    theme edit                  interactive editor: pick a role, pick a color by",
+                "                                NAME (red, blue, teal, ...), see it live -- no",
+                "                                ANSI codes required",
                 "    theme list                  lists built-in and saved themes",
-                "    theme set <role> <tier> <code>   edits one role/tier of the active theme",
+                "    theme set <role> <tier> <code>   edits one role/tier directly by raw code",
                 "    theme save <name>           saves the active theme under a name",
                 "    theme use <name>            switches to a built-in or saved theme",
                 "",
@@ -1588,7 +1592,9 @@ FUNCTION HelpTopics()
                 "sees any change.",
                 "",
                 "    prompt                      shows the active segments and a live preview",
-                "    prompt set <seg1,seg2,...>   changes the segment list for this session",
+                "    prompt edit                 interactive editor: add/remove/reorder segments",
+                "                                one step at a time with a live preview after each",
+                "    prompt set <seg1,seg2,...>   replaces the whole segment list in one go",
                 "",
                 "Known segments:",
                 "    classic     \"arcosh:\" followed by the current Arcology path (the default)",
@@ -2073,23 +2079,238 @@ FUNCTION ApplyStartupConfig()
     RETURN config.NoColor
 END FUNCTION
 
-' `theme` [list | set <role> <tier> <code> | save <name> | use <name>]. Bare form previews the
-' active theme by printing every required role's own name IN that role's own current color --
+' Small general-purpose helper (also used by the theme/prompt editors below): true only if every
+' character is an ASCII digit, so a menu number can be safely handed to NUMBER() -- NUMBER()
+' itself calls the C++ std::stod under the hood (src/runtime/runtime.cpp), which throws on
+' anything that isn't a valid numeral, so this must be checked FIRST rather than caught after.
+FUNCTION IsAllDigits(text AS STRING)
+    IF text == "" THEN RETURN FALSE
+    i = 0
+    WHILE i < LEN(text)
+        IF !String.Contains("0123456789", String.Slice(text, i, 1)) THEN RETURN FALSE
+        i = i + 1
+    WEND
+    RETURN TRUE
+END FUNCTION
+
+' A small curated palette of NAMED colors (not raw ANSI codes) so "design your look and feel" is
+' "pick red" rather than "know that TrueColor red is 38;2;224;108;117 and Color256 red is
+' 38;5;167 and Color16 red is 31" -- the whole reason a from-scratch "theme set" (still available,
+' unchanged, for scripting/automation) never really counted as an EDITOR. Several of these
+' deliberately reuse the exact codes DefaultTheme already uses for its own roles (red/error,
+' green/success, yellow/warning, cyan/path, blue/prompt, gray/muted) so "pick red for a role"
+' looks exactly as good as the bundled theme's own red.
+FUNCTION NamedColorPalette()
+    RETURN [
+        {"Name": "red",     "TrueColor": "38;2;224;108;117", "Color256": "38;5;167", "Color16": "31"},
+        {"Name": "green",   "TrueColor": "38;2;98;209;150",  "Color256": "38;5;71",  "Color16": "32"},
+        {"Name": "yellow",  "TrueColor": "38;2;229;192;123", "Color256": "38;5;179", "Color16": "33"},
+        {"Name": "blue",    "TrueColor": "38;2;97;175;239",  "Color256": "38;5;75",  "Color16": "34"},
+        {"Name": "magenta", "TrueColor": "38;2;198;120;221", "Color256": "38;5;170", "Color16": "35"},
+        {"Name": "cyan",    "TrueColor": "38;2;86;182;194",  "Color256": "38;5;73",  "Color16": "36"},
+        {"Name": "white",   "TrueColor": "38;2;220;223;228", "Color256": "38;5;188", "Color16": "37"},
+        {"Name": "gray",    "TrueColor": "2;38;2;150;150;150", "Color256": "2;38;5;244", "Color16": "2"},
+        {"Name": "orange",  "TrueColor": "38;2;209;154;102", "Color256": "38;5;173", "Color16": "33"},
+        {"Name": "purple",  "TrueColor": "38;2;171;142;255", "Color256": "38;5;141", "Color16": "35"},
+        {"Name": "pink",    "TrueColor": "38;2;255;135;170", "Color256": "38;5;211", "Color16": "35"},
+        {"Name": "teal",    "TrueColor": "38;2;86;194;173",  "Color256": "38;5;80",  "Color16": "36"}
+    ]
+END FUNCTION
+
+FUNCTION NamedColorNames()
+    names = []
+    FOR entry IN NamedColorPalette()
+        ignored = Array.Push(names, entry.Name)
+    NEXT
+    RETURN names
+END FUNCTION
+
+FUNCTION FindNamedColor(name AS STRING)
+    needle = Lower(name)
+    FOR entry IN NamedColorPalette()
+        IF Lower(entry.Name) == needle THEN RETURN entry
+    NEXT
+    RETURN {"IsNothing": TRUE}
+END FUNCTION
+
+' Pure (no globals touched, no I/O) so it can be unit-tested directly -- see RunEditorSelfTest --
+' independent of the interactive loop that calls it. Unknown color name: {"Ok": FALSE}, theme
+' unchanged. "bold" prefixes "1;" onto all three tiers' codes, the same convention DefaultTheme's
+' own "error" role already uses for its bold-red.
+FUNCTION ApplyNamedColorToRole(theme AS OBJECT, role AS STRING, colorName AS STRING, bold AS BOOL)
+    color = FindNamedColor(colorName)
+    IF Object.Has(color, "IsNothing") THEN RETURN {"Theme": theme, "Ok": FALSE}
+    prefix = ""
+    IF bold THEN prefix = "1;"
+    roleEntry = {"TrueColor": prefix + color.TrueColor, "Color256": prefix + color.Color256, "Color16": prefix + color.Color16}
+    theme = Object.Set(theme, role, roleEntry)
+    RETURN {"Theme": theme, "Ok": TRUE}
+END FUNCTION
+
+' Accepts either a 1-based menu number (as printed by RunThemeEditor) or the role's own name,
+' case-insensitively -- "" for anything that resolves to neither, which every caller treats as
+' "not a valid selection" rather than guessing.
+FUNCTION ResolveRoleSelection(input AS STRING, roles AS ARRAY)
+    trimmed = String.Trim(input)
+    IF trimmed == "" THEN RETURN ""
+    IF IsAllDigits(trimmed) THEN
+        index = NUMBER(trimmed) - 1
+        IF index >= 0 ANDALSO index < LEN(roles) THEN RETURN roles[index]
+        RETURN ""
+    END IF
+    needle = Lower(trimmed)
+    FOR role IN roles
+        IF Lower(role) == needle THEN RETURN role
+    NEXT
+    RETURN ""
+END FUNCTION
+
+FUNCTION PrintThemePreview()
+    ignored = Display.Style("prompt")
+    ignored = Display.Line("active theme: " + ActiveThemeName())
+    ignored = Display.Reset()
+    FOR roleName IN ThemeRoleOrder()
+        ignored = Display.Style(roleName)
+        ignored = Display.Line("  " + roleName)
+        ignored = Display.Reset()
+    NEXT
+END FUNCTION
+
+' The per-role sub-editor `theme edit` drops into once a role is picked -- loops until the user
+' backs out ("b") or hits EOF (Ctrl-D), which is treated as "stop editing" everywhere in this file
+' Console.ReadLine is used, never as an error. Every change here is applied to the ACTIVE theme
+' immediately (SetActiveTheme, live -- the same "theme set" already does), so the top-level
+' editor's own preview reflects it right away; nothing is written to disk until "theme edit"'s own
+' save step (or a separate "theme save"/"profile save").
+FUNCTION RunThemeRoleEditor(role AS STRING)
+    WHILE TRUE
+        theme = ActiveTheme()
+        roleEntry = Object.Get(theme, role)
+        ignored = Display.Style(role)
+        ignored = Display.Line("-- editing role: " + role + " --")
+        ignored = Display.Reset()
+        FOR tierName IN ThemeTierOrder()
+            PRINT "  " + tierName + ": " + Object.Get(roleEntry, tierName)
+        NEXT
+        PRINT ""
+        PRINT "colors: " + String.Join(NamedColorNames(), ", ") + ", default"
+        PRINT "Pick a color by name, \"custom\" for raw per-tier codes, or \"b\" to go back."
+        ignored = Console.Write(role + " color> ")
+        line = Console.ReadLine()
+        IF !line.Ok THEN RETURN
+        choice = String.Trim(line.Text)
+        lowered = Lower(choice)
+        IF lowered == "" THEN CONTINUE WHILE
+        IF lowered == "b" ORELSE lowered == "back" THEN RETURN
+
+        IF lowered == "custom" THEN
+            ignored = Console.Write("  TrueColor code: ")
+            trueLine = Console.ReadLine()
+            IF !trueLine.Ok THEN RETURN
+            ignored = Console.Write("  Color256 code:  ")
+            c256Line = Console.ReadLine()
+            IF !c256Line.Ok THEN RETURN
+            ignored = Console.Write("  Color16 code:   ")
+            c16Line = Console.ReadLine()
+            IF !c16Line.Ok THEN RETURN
+            newEntry = {"TrueColor": String.Trim(trueLine.Text), "Color256": String.Trim(c256Line.Text),
+                "Color16": String.Trim(c16Line.Text)}
+            theme = Object.Set(theme, role, newEntry)
+            ignored = SetActiveTheme(ActiveThemeName(), theme)
+            CONTINUE WHILE
+        END IF
+
+        IF lowered == "default" THEN
+            baseTheme = DefaultTheme()
+            theme = Object.Set(theme, role, Object.Get(baseTheme, role))
+            ignored = SetActiveTheme(ActiveThemeName(), theme)
+            ignored = Display.Style(role)
+            ignored = Display.Line("  reset to default -- preview: " + role)
+            ignored = Display.Reset()
+            CONTINUE WHILE
+        END IF
+
+        bold = FALSE
+        ignored = Console.Write("  bold? (y/N): ")
+        boldLine = Console.ReadLine()
+        IF !boldLine.Ok THEN RETURN
+        IF Lower(String.Trim(boldLine.Text)) == "y" THEN bold = TRUE
+
+        applied = ApplyNamedColorToRole(theme, role, choice, bold)
+        IF !applied.Ok THEN
+            ignored = DisplayError("arcosh: theme: unknown color: " + choice)
+            CONTINUE WHILE
+        END IF
+        theme = applied.Theme
+        ignored = SetActiveTheme(ActiveThemeName(), theme)
+        ignored = Display.Style(role)
+        ignored = Display.Line("  updated -- preview: " + role)
+        ignored = Display.Reset()
+    WEND
+END FUNCTION
+
+' The interactive `theme edit` top-level menu: preview, pick a role by number or name (see
+' ResolveRoleSelection), or save/quit. Nothing here writes to disk except the explicit "s" step,
+' which mirrors "theme save <name>" exactly (refusing to overwrite the built-in "default" name).
+FUNCTION RunThemeEditor()
+    WHILE TRUE
+        ignored = PrintThemePreview()
+        roles = ThemeRoleOrder()
+        PRINT ""
+        PRINT "Select a role to edit by number or name, \"s\" to save this theme, or \"q\" to stop editing."
+        i = 0
+        WHILE i < LEN(roles)
+            PRINT "  " + STRING(i + 1) + ". " + roles[i]
+            i = i + 1
+        WEND
+        ignored = Console.Write("theme> ")
+        line = Console.ReadLine()
+        IF !line.Ok THEN RETURN
+        choice = String.Trim(line.Text)
+        lowered = Lower(choice)
+        IF lowered == "" THEN CONTINUE WHILE
+        IF lowered == "q" ORELSE lowered == "quit" THEN RETURN
+
+        IF lowered == "s" ORELSE lowered == "save" THEN
+            ignored = Console.Write("save as (blank keeps current name \"" + ActiveThemeName() + "\"): ")
+            nameLine = Console.ReadLine()
+            IF !nameLine.Ok THEN RETURN
+            name = String.Trim(nameLine.Text)
+            IF name == "" THEN name = ActiveThemeName()
+            IF name == "default" THEN
+                ignored = DisplayError("arcosh: theme: cannot save over the built-in \"default\" theme; choose another name")
+                CONTINUE WHILE
+            END IF
+            ignored = SaveTheme(name, ActiveTheme())
+            ignored = SetActiveTheme(name, ActiveTheme())
+            ignored = DisplaySuccess("arcosh: theme: saved " + name)
+            CONTINUE WHILE
+        END IF
+
+        role = ResolveRoleSelection(choice, roles)
+        IF role == "" THEN
+            ignored = DisplayError("arcosh: theme: not a role or command: " + choice)
+            CONTINUE WHILE
+        END IF
+        ignored = RunThemeRoleEditor(role)
+    WEND
+END FUNCTION
+
+' `theme` [edit | list | set <role> <tier> <code> | save <name> | use <name>]. Bare form previews
+' the active theme by printing every required role's own name IN that role's own current color --
 ' a real, live swatch, not a description of one.
 FUNCTION RunThemeCommand(arguments AS ARRAY)
     IF LEN(arguments) == 0 THEN
-        ignored = Display.Style("prompt")
-        ignored = Display.Line("active theme: " + ActiveThemeName())
-        ignored = Display.Reset()
-        FOR roleName IN ThemeRoleOrder()
-            ignored = Display.Style(roleName)
-            ignored = Display.Line("  " + roleName)
-            ignored = Display.Reset()
-        NEXT
+        ignored = PrintThemePreview()
         RETURN
     END IF
 
     subcommand = Upper(arguments[0])
+
+    IF subcommand == "EDIT" THEN
+        ignored = RunThemeEditor()
+        RETURN
+    END IF
 
     IF subcommand == "LIST" THEN
         names = ["default"]
@@ -2163,8 +2384,137 @@ FUNCTION RunThemeCommand(arguments AS ARRAY)
     ignored = DisplayError("arcosh: theme: unknown subcommand: " + arguments[0] + " (see \"help themes\")")
 END FUNCTION
 
-' `prompt` [set <seg1,seg2,...>]. Bare form shows the active segment list and a live preview of
-' the resulting prompt text.
+' Pure (no globals, no I/O) segment-list mutators shared by RunPromptEditor and RunEditorSelfTest.
+' Array.Push/RemoveAt/Insert all mutate their first argument'S UNDERLYING ARRAY IN PLACE
+' (Value::Array is a shared_ptr, unlike Value::Object -- see the comment on ParseThemeText's own
+' Object.Set usage above for the opposite case), so "Segments" in the result is the SAME array as
+' the "segments" argument, already updated -- returned anyway so every call site can use the
+' result uniformly whether or not the input happened to be freshly constructed.
+FUNCTION AddPromptSegment(segments AS ARRAY, name AS STRING)
+    IF !Array.Contains(KnownPromptSegments(), name) THEN
+        RETURN {"Ok": FALSE, "Segments": segments,
+            "Error": "unknown segment: " + name + " (known: " + String.Join(KnownPromptSegments(), ", ") + ")"}
+    END IF
+    IF Array.Contains(segments, name) THEN
+        RETURN {"Ok": FALSE, "Segments": segments, "Error": "segment already active: " + name}
+    END IF
+    ignored = Array.Push(segments, name)
+    RETURN {"Ok": TRUE, "Segments": segments, "Error": ""}
+END FUNCTION
+
+FUNCTION RemovePromptSegmentAt(segments AS ARRAY, index AS NUMBER)
+    IF index < 0 ORELSE index >= LEN(segments) THEN
+        RETURN {"Ok": FALSE, "Segments": segments, "Error": "no such segment number: " + STRING(index + 1)}
+    END IF
+    IF LEN(segments) <= 1 THEN
+        RETURN {"Ok": FALSE, "Segments": segments, "Error": "at least one segment must remain"}
+    END IF
+    ignored = Array.RemoveAt(segments, index)
+    RETURN {"Ok": TRUE, "Segments": segments, "Error": ""}
+END FUNCTION
+
+FUNCTION MovePromptSegment(segments AS ARRAY, index AS NUMBER, direction AS STRING)
+    IF index < 0 ORELSE index >= LEN(segments) THEN
+        RETURN {"Ok": FALSE, "Segments": segments, "Error": "no such segment number: " + STRING(index + 1)}
+    END IF
+    target = index - 1
+    IF direction == "down" THEN target = index + 1
+    IF target < 0 ORELSE target >= LEN(segments) THEN
+        RETURN {"Ok": FALSE, "Segments": segments, "Error": "can't move that far"}
+    END IF
+    moving = Array.RemoveAt(segments, index)
+    ignored = Array.Insert(segments, target, moving)
+    RETURN {"Ok": TRUE, "Segments": segments, "Error": ""}
+END FUNCTION
+
+' The interactive `prompt edit` loop: add/remove/reorder one segment at a time with a live preview
+' after every change, until "q" (or EOF) or an explicit "s" to persist it as the default for future
+' sessions (the same thing "profile save" does with the whole session's settings, offered here too
+' since a persisted prompt is the entire point of designing one).
+FUNCTION RunPromptEditor(cwd AS STRING)
+    WHILE TRUE
+        segments = ActivePromptSegments()
+        PRINT ""
+        PRINT "Active prompt segments (in order):"
+        i = 0
+        WHILE i < LEN(segments)
+            PRINT "  " + STRING(i + 1) + ". " + segments[i]
+            i = i + 1
+        WEND
+        PRINT "Preview: " + Prompt(cwd, 0, [])
+        PRINT ""
+        PRINT "Known segments: " + String.Join(KnownPromptSegments(), ", ")
+        PRINT "Commands: add <segment>, remove <number>, move <number> up|down, s(ave), q(uit)"
+        ignored = Console.Write("prompt> ")
+        line = Console.ReadLine()
+        IF !line.Ok THEN RETURN
+        raw = String.Trim(line.Text)
+        IF raw == "" THEN CONTINUE WHILE
+        lowered = Lower(raw)
+        IF lowered == "q" ORELSE lowered == "quit" THEN RETURN
+
+        IF lowered == "s" ORELSE lowered == "save" THEN
+            ignored = SaveConfig(CurrentConfigFromSession())
+            ignored = DisplaySuccess("arcosh: prompt: saved (this is now the default for new sessions)")
+            CONTINUE WHILE
+        END IF
+
+        parts = String.Split(raw, " ")
+        verb = Lower(parts[0])
+
+        IF verb == "add" THEN
+            IF LEN(parts) < 2 THEN
+                ignored = DisplayError("arcosh: prompt: usage: add <segment>")
+                CONTINUE WHILE
+            END IF
+            result = AddPromptSegment(segments, Lower(parts[1]))
+            IF !result.Ok THEN
+                ignored = DisplayError("arcosh: prompt: " + result.Error)
+                CONTINUE WHILE
+            END IF
+            ignored = SetActivePromptSegments(result.Segments)
+            CONTINUE WHILE
+        END IF
+
+        IF verb == "remove" THEN
+            IF LEN(parts) < 2 ORELSE !IsAllDigits(parts[1]) THEN
+                ignored = DisplayError("arcosh: prompt: usage: remove <number>")
+                CONTINUE WHILE
+            END IF
+            result = RemovePromptSegmentAt(segments, NUMBER(parts[1]) - 1)
+            IF !result.Ok THEN
+                ignored = DisplayError("arcosh: prompt: " + result.Error)
+                CONTINUE WHILE
+            END IF
+            ignored = SetActivePromptSegments(result.Segments)
+            CONTINUE WHILE
+        END IF
+
+        IF verb == "move" THEN
+            IF LEN(parts) < 3 ORELSE !IsAllDigits(parts[1]) THEN
+                ignored = DisplayError("arcosh: prompt: usage: move <number> up|down")
+                CONTINUE WHILE
+            END IF
+            direction = Lower(parts[2])
+            IF direction <> "up" ANDALSO direction <> "down" THEN
+                ignored = DisplayError("arcosh: prompt: usage: move <number> up|down")
+                CONTINUE WHILE
+            END IF
+            result = MovePromptSegment(segments, NUMBER(parts[1]) - 1, direction)
+            IF !result.Ok THEN
+                ignored = DisplayError("arcosh: prompt: " + result.Error)
+                CONTINUE WHILE
+            END IF
+            ignored = SetActivePromptSegments(result.Segments)
+            CONTINUE WHILE
+        END IF
+
+        ignored = DisplayError("arcosh: prompt: unknown command: " + raw)
+    WEND
+END FUNCTION
+
+' `prompt` [edit | set <seg1,seg2,...>]. Bare form shows the active segment list and a live
+' preview of the resulting prompt text.
 FUNCTION RunPromptCommand(cwd AS STRING, arguments AS ARRAY)
     IF LEN(arguments) == 0 THEN
         PRINT "active segments: " + String.Join(ActivePromptSegments(), ", ")
@@ -2174,6 +2524,12 @@ FUNCTION RunPromptCommand(cwd AS STRING, arguments AS ARRAY)
     END IF
 
     subcommand = Upper(arguments[0])
+
+    IF subcommand == "EDIT" THEN
+        ignored = RunPromptEditor(cwd)
+        RETURN
+    END IF
+
     IF subcommand == "SET" THEN
         IF LEN(arguments) < 2 THEN
             ignored = DisplayError("arcosh: prompt: usage: prompt set <seg1,seg2,...>")
@@ -2351,6 +2707,152 @@ FUNCTION RunProfileSelfTest()
     END IF
 
     ignored = Process.Execute("rm", ["-rf", testHome])
+    RETURN failures
+END FUNCTION
+
+' Structural coverage for the theme/prompt EDITORS ("theme edit" / "prompt edit"): every function
+' the interactive loops delegate to for actual color/segment mutation is pure (no globals, no I/O)
+' by design specifically so it can be tested directly here, without needing to fake stdin for the
+' loops themselves -- the loops' own Console.ReadLine-driven menu behavior is verified manually
+' against the compiled binary under a real pty instead (see arcosh/README.md), the same split
+' WP-012's own RunJobControlSelfTest comment explains for a real Ctrl-Z.
+FUNCTION RunEditorSelfTest()
+    failures = 0
+
+    IF IsAllDigits("42") THEN
+        PRINT "ok   IsAllDigits accepts a plain number"
+    ELSE
+        PRINT "FAIL IsAllDigits rejected a plain number"
+        failures = failures + 1
+    END IF
+    IF !IsAllDigits("") ANDALSO !IsAllDigits("4a") ANDALSO !IsAllDigits("q") THEN
+        PRINT "ok   IsAllDigits rejects empty/mixed/non-numeric text"
+    ELSE
+        PRINT "FAIL IsAllDigits accepted non-numeric text"
+        failures = failures + 1
+    END IF
+
+    IF Object.Has(FindNamedColor("not-a-real-color"), "IsNothing") THEN
+        PRINT "ok   FindNamedColor reports an unrecognized name as not found"
+    ELSE
+        PRINT "FAIL FindNamedColor did not reject an unrecognized name"
+        failures = failures + 1
+    END IF
+    red = FindNamedColor("RED")
+    IF !Object.Has(red, "IsNothing") ANDALSO red.Name == "red" THEN
+        PRINT "ok   FindNamedColor is case-insensitive and finds a real color"
+    ELSE
+        PRINT "FAIL FindNamedColor did not find \"RED\""
+        failures = failures + 1
+    END IF
+
+    applied = ApplyNamedColorToRole(DefaultTheme(), "path", "purple", FALSE)
+    appliedOk = applied.Ok
+    IF appliedOk THEN appliedOk = Object.Get(applied.Theme, "path").TrueColor == FindNamedColor("purple").TrueColor
+    IF appliedOk THEN
+        PRINT "ok   ApplyNamedColorToRole sets the role to the named color's codes"
+    ELSE
+        PRINT "FAIL ApplyNamedColorToRole did not apply purple to path"
+        failures = failures + 1
+    END IF
+
+    boldApplied = ApplyNamedColorToRole(DefaultTheme(), "path", "purple", TRUE)
+    IF boldApplied.Ok ANDALSO Object.Get(boldApplied.Theme, "path").Color16 == "1;35" THEN
+        PRINT "ok   ApplyNamedColorToRole prefixes 1; for bold"
+    ELSE
+        PRINT "FAIL ApplyNamedColorToRole did not apply the bold prefix"
+        failures = failures + 1
+    END IF
+
+    unknownApplied = ApplyNamedColorToRole(DefaultTheme(), "path", "not-a-real-color", FALSE)
+    IF !unknownApplied.Ok THEN
+        PRINT "ok   ApplyNamedColorToRole reports failure for an unrecognized color, theme untouched"
+    ELSE
+        PRINT "FAIL ApplyNamedColorToRole accepted an unrecognized color"
+        failures = failures + 1
+    END IF
+
+    roles = ThemeRoleOrder()
+    IF ResolveRoleSelection("1", roles) == roles[0] THEN
+        PRINT "ok   ResolveRoleSelection accepts a 1-based menu number"
+    ELSE
+        PRINT "FAIL ResolveRoleSelection did not resolve menu number 1"
+        failures = failures + 1
+    END IF
+    IF ResolveRoleSelection("ERROR", roles) == "error" THEN
+        PRINT "ok   ResolveRoleSelection accepts a role name, case-insensitively"
+    ELSE
+        PRINT "FAIL ResolveRoleSelection did not resolve \"ERROR\""
+        failures = failures + 1
+    END IF
+    IF ResolveRoleSelection("99", roles) == "" ANDALSO ResolveRoleSelection("nope", roles) == "" THEN
+        PRINT "ok   ResolveRoleSelection returns \"\" for an out-of-range number or unknown name"
+    ELSE
+        PRINT "FAIL ResolveRoleSelection accepted an invalid selection"
+        failures = failures + 1
+    END IF
+
+    added = AddPromptSegment(["classic"], "hostname")
+    IF added.Ok ANDALSO LEN(added.Segments) == 2 ANDALSO added.Segments[1] == "hostname" THEN
+        PRINT "ok   AddPromptSegment appends a known, not-yet-active segment"
+    ELSE
+        PRINT "FAIL AddPromptSegment did not append hostname"
+        failures = failures + 1
+    END IF
+    IF !AddPromptSegment(["classic"], "not-a-real-segment").Ok THEN
+        PRINT "ok   AddPromptSegment rejects an unknown segment name"
+    ELSE
+        PRINT "FAIL AddPromptSegment accepted an unknown segment name"
+        failures = failures + 1
+    END IF
+    IF !AddPromptSegment(["classic", "path"], "path").Ok THEN
+        PRINT "ok   AddPromptSegment rejects a segment that's already active"
+    ELSE
+        PRINT "FAIL AddPromptSegment accepted a duplicate segment"
+        failures = failures + 1
+    END IF
+
+    removed = RemovePromptSegmentAt(["path", "hostname", "jobs"], 1)
+    IF removed.Ok ANDALSO LEN(removed.Segments) == 2 ANDALSO removed.Segments[0] == "path" ANDALSO removed.Segments[1] == "jobs" THEN
+        PRINT "ok   RemovePromptSegmentAt removes the segment at the given index"
+    ELSE
+        PRINT "FAIL RemovePromptSegmentAt did not remove index 1 correctly"
+        failures = failures + 1
+    END IF
+    IF !RemovePromptSegmentAt(["classic"], 0).Ok THEN
+        PRINT "ok   RemovePromptSegmentAt refuses to remove the last remaining segment"
+    ELSE
+        PRINT "FAIL RemovePromptSegmentAt allowed removing the last segment"
+        failures = failures + 1
+    END IF
+    IF !RemovePromptSegmentAt(["path"], 5).Ok THEN
+        PRINT "ok   RemovePromptSegmentAt refuses an out-of-range index"
+    ELSE
+        PRINT "FAIL RemovePromptSegmentAt accepted an out-of-range index"
+        failures = failures + 1
+    END IF
+
+    movedUp = MovePromptSegment(["path", "hostname", "jobs"], 2, "up")
+    IF movedUp.Ok ANDALSO movedUp.Segments[0] == "path" ANDALSO movedUp.Segments[1] == "jobs" ANDALSO movedUp.Segments[2] == "hostname" THEN
+        PRINT "ok   MovePromptSegment moves a segment up (toward index 0)"
+    ELSE
+        PRINT "FAIL MovePromptSegment did not move the segment up correctly"
+        failures = failures + 1
+    END IF
+    movedDown = MovePromptSegment(["path", "hostname", "jobs"], 0, "down")
+    IF movedDown.Ok ANDALSO movedDown.Segments[0] == "hostname" ANDALSO movedDown.Segments[1] == "path" THEN
+        PRINT "ok   MovePromptSegment moves a segment down"
+    ELSE
+        PRINT "FAIL MovePromptSegment did not move the segment down correctly"
+        failures = failures + 1
+    END IF
+    IF !MovePromptSegment(["path", "hostname"], 0, "up").Ok THEN
+        PRINT "ok   MovePromptSegment refuses to move past the start of the list"
+    ELSE
+        PRINT "FAIL MovePromptSegment allowed moving past the start of the list"
+        failures = failures + 1
+    END IF
+
     RETURN failures
 END FUNCTION
 
@@ -2729,7 +3231,7 @@ FUNCTION RunPathLayerSelfTest()
     RETURN failures
 END FUNCTION
 
-version = "0.10.0-profiles"
+version = "0.11.0-editors"
 no_color_flag = HasFlag(Args, "--no-color")
 no_color_env = Process.Env("NO_COLOR") <> ""
 term = Process.Env("TERM")
@@ -2759,7 +3261,7 @@ color_tier = DetectColorTier(is_tty, effective_no_color_flag, no_color_env, term
 ignored = Runtime.SetGlobal("arcosh_color_tier", color_tier)
 
 IF HasFlag(Args, "--version") THEN
-    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008, HELP, Profiles)"
+    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008, HELP, Profiles, Editors)"
     ExitTheProgram(0)
 END IF
 
@@ -2875,6 +3377,16 @@ IF HasFlag(Args, "--selftest-profile") THEN
         ExitTheProgram(1)
     END IF
     PRINT "all profile/theme/prompt tests passed"
+    ExitTheProgram(0)
+END IF
+
+IF HasFlag(Args, "--selftest-editor") THEN
+    failures = RunEditorSelfTest()
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " theme/prompt editor test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all theme/prompt editor tests passed"
     ExitTheProgram(0)
 END IF
 
