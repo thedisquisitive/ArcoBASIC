@@ -9,8 +9,8 @@ Per RFC-0052 section 6, `arcosh` is authored **in ArcoBASIC itself** and compile
 ArcoFission, not hand-written in C++.
 
 ## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes),
-a built-in HELP command, profile/theme/prompt customization (RFC-0052 sections 20/22), and
-interactive theme/prompt editors on top of it
+a built-in HELP command, profile/theme/prompt customization (RFC-0052 sections 20/22), interactive
+theme/prompt editors on top of it, and date/time prompt segments with per-segment color tags
 
 `src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
 
@@ -281,6 +281,38 @@ look and feel never requires knowing a raw ANSI SGR code:
 Building the editors and their self-test also surfaced, and fixed, a second real native-backend
 compiler performance regression of the same shape Entry 31 (above) first found and only partly
 fixed — see Entry 33 in `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md`.
+
+and two more prompt segments plus per-segment color tags, so a prompt can show more at a glance
+and make the parts that matter impossible to miss:
+
+* `date` (`YYYY-MM-DD`) and `time` (`HH:MM:SS`) segments, both built by slicing `Time.Now()`'s
+  own fixed-format string rather than adding a dedicated date-only/time-only host primitive;
+* every segment normally renders in its own default color, but `prompt tag <segment> <role>`
+  pins any active segment to one of the theme's 8 roles instead (`prompt tag hostname error`
+  makes the hostname segment always render in the alarming "error" color, regardless of anything
+  else happening on screen) — `role "default"` clears a tag back to the segment's own default;
+  `exitcode` can be tagged too, which replaces its own dynamic success/error coloring with the
+  fixed tagged color instead. Aimed squarely at making a specific machine or piece of context
+  impossible to miss — e.g. a sysadmin who moves between several hosts tagging `hostname` (or
+  `path`) with `error`/`warning` on the one host they most need to always notice they're on;
+  `theme` decides what each role actually LOOKS like, so switching themes re-colors every tag
+  consistently rather than the tag hardcoding its own raw color;
+  `prompt edit` also grew a `tag <segment> <color|default>` command, listing each active
+  segment's current tag (if any) alongside it;
+* tags persist the same way segments do — `profile save`/`profile load` (and `~/.arcosh/config`'s
+  own `PromptTags:` line) carry them across sessions;
+  a real, disclosed bug was caught and fixed while building this: `Object.Get(obj, key)`'s
+  2-argument form returns a genuine NULL for a missing key, not `""` — three call sites
+  (`ResolveSegmentRole`, `SerializePromptTags`, the `prompt edit` segment listing) had assumed the
+  latter, which would have made every UNTAGGED segment misbehave (a `--selftest-profile` run
+  caught it immediately: `ResolveSegmentRole` returned the literal null instead of `"success"`/
+  `"error"` for an untagged `exitcode`); fixed by using `Object.Get(obj, key, "")`'s 3-argument
+  default form at all three sites;
+* verified via the same `--selftest-profile`/`--selftest-editor` split as everything else in this
+  section, plus manual verification against the real compiled binary under a real pty with
+  `TERM=xterm-256color`/`COLORTERM=truecolor`: `date`/`time` rendered correctly, `hostname`
+  switched to the tagged "error" red immediately and stayed that way, and an untagged `exitcode`
+  still switched from green to red on its own after a real failing command.
 
 It does not yet implement plugins or completion — later work packages (WP-009, WP-010).
 
