@@ -1,0 +1,25 @@
+' Proof plugin for RFC-0052 WP-009 (Plugin System), AP-0052-012's own explicit "provide at least
+' one proof plugin" requirement. Not a real git integration -- a small, honest demonstration that
+' registers all three consumed capability classes (command, prompt.segment, theme) through the
+' RFC's own literal Shell.RegisterX API, available automatically inside every plugin's own source.
+'
+' Try it: copy this file into your own arcosh plugins directory and enable it --
+'   plugins install arcosh/tests/fixtures/wp009_gittools_plugin.abas gittools
+'   plugins enable gittools
+'   gitstatus
+'   prompt set git,path
+'   theme use neon
+
+FUNCTION RenderGitBranch(context AS OBJECT)
+    RETURN "git:demo-branch"
+END FUNCTION
+
+FUNCTION RunGitStatus(args AS OBJECT)
+    RETURN "nothing to commit, working tree clean"
+END FUNCTION
+
+ignoredRegisterSegment = Shell.RegisterPromptSegment("git", ADDRESSOF RenderGitBranch)
+ignoredRegisterCommand = Shell.RegisterCommand("gitstatus", ADDRESSOF RunGitStatus)
+ignoredRegisterTheme = Shell.RegisterTheme("neon", {
+    "error": {"TrueColor": "1;38;2;255;0;255", "Color256": "1;38;5;201", "Color16": "1;35"}
+})

@@ -1,11 +1,14 @@
-#DESCRIPTION "The Arcology Shell -- WP-001..WP-012 + WP-008 + HELP + Profiles + Editors (RFC-0052)"
+#DESCRIPTION "The Arcology Shell -- WP-001..WP-012 + WP-008/WP-009 + HELP + Profiles + Editors (RFC-0052)"
 
 ' RFC-0052 ("The Arcology Shell", see ../rfcs/RFC-0052_The_Arcology_Shell.md), WP-001 through
-' WP-012, plus WP-008 (Display and Themes), implemented out of numeric order alongside them, plus
-' a built-in HELP command and RFC-0052 sections 20/22 (Prompt Architecture / Configuration --
-' see the "Profiles" section below, which also has "theme edit"/"prompt edit", interactive
-' editors built on top of the same profile/theme/prompt commands) added directly on request --
-' none of these are one of RFC-0052's own numbered work packages.
+' WP-012, plus WP-008 (Display and Themes) and WP-009 (Plugin System), implemented out of numeric
+' order alongside them, plus a built-in HELP command and RFC-0052 sections 20/22 (Prompt
+' Architecture / Configuration -- see the "Profiles" section below, which also has "theme
+' edit"/"prompt edit", interactive editors built on top of the same profile/theme/prompt commands)
+' added directly on request -- none of the latter are one of RFC-0052's own numbered work
+' packages. WP-009 (Plugin System) needed real research before implementation (see
+' .agents/reports/ARCO_SH_RFC0052_WP009_PLUGIN_SYSTEM_RESEARCH.md) -- see the "Plugins" section
+' below for the finding and the resulting design.
 '
 ' WP-001 (shell skeleton): interactive loop, prompt, clean exit, current directory, diagnostic
 ' output, terminal capability query, explicit no-color mode.
@@ -1664,6 +1667,48 @@ FUNCTION HelpTopics()
             ], "\n")
         },
         {
+            "Name": "plugins",
+            "Aliases": ["plugin"],
+            "Summary": "installing/enabling real plugin .abas files that add commands/prompt segments/themes",
+            "Body": String.Join([
+                "Plugins are ordinary .abas files under ~/.arcosh/plugins (or $ARCOSH_HOME/plugins)",
+                "that register real capabilities arcosh actually calls -- a new command, a new",
+                "prompt segment, a new theme -- not just static text.",
+                "",
+                "    plugins                     lists installed plugins, enabled/disabled, any",
+                "                                load failures, and every capability each loaded",
+                "                                plugin has registered",
+                "    plugins install <path> [name]   copies a .abas file in as a named plugin",
+                "    plugins enable <name>        activates it (now, and on every future start)",
+                "    plugins disable <name>       deactivates it for future starts",
+                "",
+                "A plugin registers capabilities with four functions, available automatically",
+                "inside every plugin's own source (no import needed):",
+                "",
+                "    Shell.RegisterCommand(name, ADDRESSOF MyFunction)",
+                "    Shell.RegisterPromptSegment(name, ADDRESSOF MyFunction)",
+                "    Shell.RegisterTheme(name, {\"error\": {\"TrueColor\": \"...\", ...}, ...})",
+                "    Shell.RegisterCompleter(name, ADDRESSOF MyFunction)",
+                "",
+                "A registered command becomes a real shell built-in (\"help commands\") -- it takes",
+                "precedence over a same-named real program on PATH, and never sees pipes,",
+                "redirection, or backgrounding, only its own arguments. A registered prompt segment",
+                "works exactly like a built-in one in \"prompt set\"/\"prompt edit\" (\"help",
+                "prompt-customization\"). A registered theme can be selected with \"theme use",
+                "<name>\" exactly like a saved one, filled in with DefaultTheme's own values for",
+                "any role/tier it doesn't specify.",
+                "",
+                "Completer capabilities can be registered and listed today, but nothing in arcosh",
+                "yet CALLS one -- there is no tab-completion system at all yet (a separate, later",
+                "work package). Disclosed here rather than pretending it does something.",
+                "",
+                "A broken plugin (fails to load, or throws when a registered command/segment runs)",
+                "is reported clearly and never crashes the shell or blocks other plugins from",
+                "loading. Start with \"arcosh --no-plugins\" to skip loading plugins entirely if",
+                "one is causing real trouble."
+            ], "\n")
+        },
+        {
             "Name": "arcobasic",
             "Aliases": ["basic", "syntax", "language"],
             "Summary": "a short introduction to ArcoBASIC syntax for scripting",
@@ -1852,6 +1897,18 @@ FUNCTION ProfilePath(name AS STRING)
     RETURN ProfilesDir() + "/" + name
 END FUNCTION
 
+FUNCTION PluginsDir()
+    RETURN ProfileHome() + "/plugins"
+END FUNCTION
+
+FUNCTION PluginsEnabledPath()
+    RETURN PluginsDir() + "/enabled.txt"
+END FUNCTION
+
+FUNCTION PluginFilePath(name AS STRING)
+    RETURN PluginsDir() + "/" + name + ".abas"
+END FUNCTION
+
 ' Created lazily, only when something is actually about to be written -- a plain interactive
 ' session that never touches theme/prompt/profile commands never creates ~/.arcosh at all,
 ' matching how the rest of this file only ever does real filesystem work in response to a real
@@ -1859,6 +1916,10 @@ END FUNCTION
 FUNCTION EnsureProfileDirectories()
     ignored = Directory.Create(ThemesDir())
     ignored = Directory.Create(ProfilesDir())
+END FUNCTION
+
+FUNCTION EnsurePluginsDirectory()
+    ignored = Directory.Create(PluginsDir())
 END FUNCTION
 
 ' Shared by both config and theme files: trims each line, skips blank lines and "#" comments,
@@ -1966,11 +2027,37 @@ END FUNCTION
 ' DefaultTheme() too (a typo in "theme use" is reported by RunThemeCommand itself, which checks
 ' existence separately -- this loader's own job is just "give me a usable theme object no matter
 ' what", never failing outright).
+' Fills in DefaultTheme()'s own values for any role/tier a PARTIAL theme object doesn't supply --
+' the same defaulting ParseThemeText already does for a theme FILE's text, factored out so a
+' plugin-registered "theme" capability (RFC-0052 WP-009, a raw OBJECT, not file text) gets the
+' identical guarantee: every role/tier StyleCode ever looks up is always present.
+FUNCTION FillThemeDefaults(partial AS OBJECT)
+    base = DefaultTheme()
+    result = {}
+    FOR roleName IN ThemeRoleOrder()
+        baseRole = Object.Get(base, roleName)
+        suppliedRole = Object.Get(partial, roleName, {})
+        roleResult = {}
+        FOR tierName IN ThemeTierOrder()
+            tierValue = Object.Get(suppliedRole, tierName, "")
+            IF tierValue == "" THEN tierValue = Object.Get(baseRole, tierName)
+            roleResult = Object.Set(roleResult, tierName, tierValue)
+        NEXT
+        result = Object.Set(result, roleName, roleResult)
+    NEXT
+    RETURN result
+END FUNCTION
+
+' "default" is always the built-in DefaultTheme(); a name saved to disk (theme save/theme edit's
+' own "s") wins next; a plugin-registered "theme" capability (RFC-0052 WP-009) is the last
+' fallback before giving up and using DefaultTheme() anyway -- a typo in "theme use" is reported by
+' RunThemeCommand itself, which checks existence/registration separately.
 FUNCTION LoadTheme(name AS STRING)
     IF name == "default" THEN RETURN DefaultTheme()
     path = ThemePath(name)
-    IF !File.Exists(path) THEN RETURN DefaultTheme()
-    RETURN ParseThemeText(File.ReadText(path))
+    IF File.Exists(path) THEN RETURN ParseThemeText(File.ReadText(path))
+    IF Shell.PluginHasCapability("theme", name) THEN RETURN FillThemeDefaults(Shell.PluginCapabilityValue("theme", name))
+    RETURN DefaultTheme()
 END FUNCTION
 
 FUNCTION SaveTheme(name AS STRING, theme AS OBJECT)
@@ -2006,9 +2093,18 @@ END FUNCTION
 ' reproduce it exactly (see Prompt's own comment) rather than every existing session's prompt
 ' changing shape just because segments now exist as a concept, plus "date"/"time" (today's date,
 ' the current wall-clock time) built on Time.Now()'s own fixed "YYYY-MM-DD HH:MM:SS" format.
+' Includes every currently-registered "prompt.segment" plugin capability (RFC-0052 WP-009) on top
+' of the built-ins, so a plugin segment is accepted by "prompt set"/"prompt edit"'s own
+' Array.Contains validation exactly like a real built-in -- a plugin that hasn't loaded (or failed
+' to load) simply never adds its name here, matching Shell.PluginCapabilities' own "only what's
+' actually registered right now" contract.
 FUNCTION KnownPromptSegments()
-    RETURN ["classic", "path", "hostname", "user", "exitcode", "jobs", "date", "time",
+    names = ["classic", "path", "hostname", "user", "exitcode", "jobs", "date", "time",
         "year", "year2", "month", "day", "hour", "minute", "second", "millisecond"]
+    FOR cap IN Shell.PluginCapabilities()
+        IF cap.Capability == "prompt.segment" THEN ignored = Array.Push(names, cap.Name)
+    NEXT
+    RETURN names
 END FUNCTION
 
 FUNCTION DefaultPromptSegments()
@@ -2155,6 +2251,18 @@ FUNCTION RenderPromptSegment(name AS STRING, context AS OBJECT)
     ' a fixed 3 digits (STRING(7) is "7", not "007") the same way every other field above already
     ' is by std::put_time.
     IF name == "millisecond" THEN RETURN style + PadNumber(Time.Milliseconds(), 3) + resetCode
+    ' Nothing built-in matched -- fall back to a plugin-registered "prompt.segment" capability
+    ' (RFC-0052 WP-009). A plugin segment that throws when INVOKED (not just when loaded) renders
+    ' as nothing rather than breaking the whole prompt, the same section 19.3 "a broken optional
+    ' plugin SHOULD NOT make the shell unrecoverable" guarantee LoadEnabledPlugins already gives
+    ' load failures.
+    IF Shell.PluginHasCapability("prompt.segment", name) THEN
+        TRY
+            RETURN style + Shell.PluginInvoke("prompt.segment", name, context) + resetCode
+        CATCH err
+            RETURN ""
+        END TRY
+    END IF
     RETURN ""
 END FUNCTION
 
@@ -2504,6 +2612,13 @@ FUNCTION RunThemeCommand(arguments AS ARRAY)
             IF themeName == activeName THEN marker = "* "
             PRINT marker + themeName
         NEXT
+        FOR cap IN Shell.PluginCapabilities()
+            IF cap.Capability == "theme" THEN
+                marker = "  "
+                IF cap.Name == activeName THEN marker = "* "
+                PRINT marker + cap.Name + " (plugin: " + cap.Plugin + ")"
+            END IF
+        NEXT
         RETURN
     END IF
 
@@ -2552,7 +2667,18 @@ FUNCTION RunThemeCommand(arguments AS ARRAY)
             RETURN
         END IF
         name = arguments[1]
-        IF name <> "default" ANDALSO !File.Exists(ThemePath(name)) THEN
+        ' File.Exists/Shell.PluginHasCapability are both Boxed host-function results -- combined
+        ' here via nested IF, never ANDALSO/ORELSE directly on the raw Boxed value, for the same
+        ' disclosed reason established throughout this file (see is_tty's own startup detection).
+        themeKnown = FALSE
+        IF name == "default" THEN themeKnown = TRUE
+        IF !themeKnown THEN
+            IF File.Exists(ThemePath(name)) THEN themeKnown = TRUE
+        END IF
+        IF !themeKnown THEN
+            IF Shell.PluginHasCapability("theme", name) THEN themeKnown = TRUE
+        END IF
+        IF !themeKnown THEN
             ignored = DisplayError("arcosh: theme: no such theme: " + name)
             RETURN
         END IF
@@ -3228,6 +3354,414 @@ FUNCTION RunEditorSelfTest()
 END FUNCTION
 
 ' ---------------------------------------------------------------------------------------------
+' Plugins (RFC-0052 WP-009, section 19). Real, dynamically-loaded `.abas` plugin files, discovered
+' under ~/.arcosh/plugins (or $ARCOSH_HOME/plugins), that register genuine, repeatedly-invokable
+' capabilities across four typed classes (`command`, `prompt.segment`, `theme`, `completion`) --
+' not just static data. This needed real research before implementation (AP-0052-012's own
+' requirement, matching WP-012's precedent): see
+' .agents/reports/ARCO_SH_RFC0052_WP009_PLUGIN_SYSTEM_RESEARCH.md for the load-bearing finding --
+' a plugin's callback stays genuinely invokable, later, from this natively-compiled program, ONLY
+' because plugin source is run through one dedicated, process-lifetime interpreter
+' (Shell.LoadPlugin/PluginRegister/PluginInvoke/PluginCapabilities/PluginHasCapability/
+' PluginCapabilityValue, src/runtime/runtime.cpp), never Runtime.RunString's own disposable one.
+'
+' Plugins register through plain ArcoBASIC wrapper functions matching RFC-0052 section 19.1's own
+' conceptual API literally (`Shell.RegisterCommand`, `Shell.RegisterPromptSegment`,
+' `Shell.RegisterTheme`, `Shell.RegisterCompleter`) -- these are defined by PluginPrelude() below
+' and prepended to every plugin's own source before it runs, so a plugin author never needs to know
+' about the underlying Shell.PluginRegister primitive at all.
+'
+' `completion` is registered and enumerable today (satisfying section 19's own capability-class
+' list) but nothing in ArcoSH yet CONSUMES a registered completer -- there is no tab-completion
+' system at all yet (that is WP-010's own, separate work package). Disclosed here and in "help
+' plugins" rather than silently pretending it does something.
+' ---------------------------------------------------------------------------------------------
+
+' Prepended to every plugin's own source (see LoadOnePlugin) so plugin authors write the RFC's own
+' literal `Shell.RegisterX(name, ...)` calls -- each just forwards to the real Shell.PluginRegister
+' primitive with the right capability-class string baked in.
+FUNCTION PluginPrelude()
+    RETURN String.Join([
+        "FUNCTION Shell.RegisterCommand(name AS STRING, callback AS CALLABLE)",
+        "    pluginPreludeIgnored = Shell.PluginRegister(" + Chr(34) + "command" + Chr(34) + ", name, callback)",
+        "END FUNCTION",
+        "FUNCTION Shell.RegisterPromptSegment(name AS STRING, callback AS CALLABLE)",
+        "    pluginPreludeIgnored = Shell.PluginRegister(" + Chr(34) + "prompt.segment" + Chr(34) + ", name, callback)",
+        "END FUNCTION",
+        "FUNCTION Shell.RegisterTheme(name AS STRING, theme AS OBJECT)",
+        "    pluginPreludeIgnored = Shell.PluginRegister(" + Chr(34) + "theme" + Chr(34) + ", name, theme)",
+        "END FUNCTION",
+        "FUNCTION Shell.RegisterCompleter(name AS STRING, callback AS CALLABLE)",
+        "    pluginPreludeIgnored = Shell.PluginRegister(" + Chr(34) + "completion" + Chr(34) + ", name, callback)",
+        "END FUNCTION"
+    ], "\n")
+END FUNCTION
+
+' Every installed plugin's own base name (filename without ".abas"), sorted -- AP-0052-012's own
+' "deterministic load order" requirement -- regardless of enabled/disabled state; RunPluginsCommand
+' and LoadEnabledPlugins both filter this same list down to what they each need.
+FUNCTION DiscoverPluginNames()
+    names = []
+    listed = Directory.List(PluginsDir())
+    FOR entry IN listed.Entries
+        IF String.EndsWith(entry, ".abas") THEN
+            ignored = Array.Push(names, String.Slice(entry, 0, LEN(entry) - 5))
+        END IF
+    NEXT
+    RETURN Array.Sort(names)
+END FUNCTION
+
+' enabled.txt: one plugin name per line, blank lines and "#" comments skipped -- plain text, same
+' spirit as config/theme files (RFC-0052 section 22), since which plugins are active is themselves
+' a piece of configuration, not executable code.
+FUNCTION ParsePluginNameList(text AS STRING)
+    names = []
+    FOR rawLine IN String.Split(text, "\n")
+        line = String.Trim(rawLine)
+        IF line == "" THEN CONTINUE FOR
+        IF String.Slice(line, 0, 1) == "#" THEN CONTINUE FOR
+        IF !Array.Contains(names, line) THEN ignored = Array.Push(names, line)
+    NEXT
+    RETURN names
+END FUNCTION
+
+FUNCTION SerializePluginNameList(names AS ARRAY)
+    RETURN String.Join(names, "\n")
+END FUNCTION
+
+FUNCTION LoadEnabledPluginNames()
+    path = PluginsEnabledPath()
+    IF !File.Exists(path) THEN RETURN []
+    RETURN ParsePluginNameList(File.ReadText(path))
+END FUNCTION
+
+FUNCTION SaveEnabledPluginNames(names AS ARRAY)
+    ignored = EnsurePluginsDirectory()
+    ignored = File.WriteText(PluginsEnabledPath(), SerializePluginNameList(names))
+END FUNCTION
+
+' Loads exactly one named, already-installed plugin: prepends PluginPrelude() so its own
+' Shell.RegisterX calls resolve, then runs the whole thing through Shell.LoadPlugin (the one
+' persistent plugin interpreter -- see this section's own header comment). Never throws -- a
+' missing file is reported the same {Name, Ok, Error} way a real load failure is, so every caller
+' can treat "not installed" and "installed but broken" uniformly.
+FUNCTION LoadOnePlugin(name AS STRING)
+    path = PluginFilePath(name)
+    IF !File.Exists(path) THEN
+        RETURN {"Name": name, "Ok": FALSE, "Error": "plugin file not found: " + path}
+    END IF
+    fullSource = PluginPrelude() + "\n" + File.ReadText(path)
+    result = Shell.LoadPlugin(name, fullSource)
+    RETURN {"Name": name, "Ok": result.Ok, "Error": result.Error}
+END FUNCTION
+
+' Called once at startup (unless --no-plugins -- RFC-0052 section 19.3's own required "recovery
+' launch with optional plugins disabled"): loads every ENABLED, discovered plugin in deterministic
+' (sorted) order, printing a warning for each one that fails to load but continuing with the rest
+' -- section 19.3's own "a broken optional plugin SHOULD NOT make the shell unrecoverable" -- and
+' records the whole outcome for "plugins" to display later without reloading anything.
+FUNCTION LoadEnabledPlugins()
+    report = []
+    enabledNames = LoadEnabledPluginNames()
+    FOR name IN DiscoverPluginNames()
+        IF Array.Contains(enabledNames, name) THEN
+            outcome = LoadOnePlugin(name)
+            ignored = Array.Push(report, outcome)
+            IF !outcome.Ok THEN ignored = DisplayWarning("arcosh: plugin " + name + " failed to load: " + outcome.Error)
+        END IF
+    NEXT
+    ignored = Runtime.SetGlobal("arcosh_plugin_load_report", report)
+    RETURN report
+END FUNCTION
+
+FUNCTION PluginLoadReport()
+    report = Runtime.GetGlobal("arcosh_plugin_load_report")
+    IF TYPEOF(report) <> "Array" THEN RETURN []
+    RETURN report
+END FUNCTION
+
+' Pure (no globals/I/O -- see RunPluginSelfTest): {Capability, Name, Plugin} triples from
+' Shell.PluginCapabilities(), grouped by which plugin registered each one, as
+' {pluginName: ["capability.name", ...]} -- matches RFC-0052 section 19.2's own worked example
+' ("GitTools" / "command.gitstatus", "completion.git", "prompt.segment.git" / "Neon" /
+' "theme.neon") almost exactly.
+FUNCTION GroupCapabilitiesByPlugin(capabilities AS ARRAY)
+    grouped = {}
+    FOR cap IN capabilities
+        pluginName = cap.Plugin
+        IF pluginName == "" THEN pluginName = "(unknown)"
+        existing = Object.Get(grouped, pluginName, [])
+        ignored = Array.Push(existing, cap.Capability + "." + cap.Name)
+        grouped = Object.Set(grouped, pluginName, existing)
+    NEXT
+    RETURN grouped
+END FUNCTION
+
+' `plugins` [install <path> [name] | enable <name> | disable <name>]. Bare form lists every
+' installed plugin with its enabled/disabled status and any load failure, then every currently
+' registered capability grouped by plugin (section 19.2's own inspectability requirement).
+FUNCTION RunPluginsCommand(arguments AS ARRAY)
+    IF LEN(arguments) == 0 THEN
+        discovered = DiscoverPluginNames()
+        enabledNames = LoadEnabledPluginNames()
+        IF LEN(discovered) == 0 THEN
+            PRINT "(no plugins installed -- see \"help plugins\")"
+        END IF
+        FOR name IN discovered
+            status = "disabled"
+            IF Array.Contains(enabledNames, name) THEN status = "enabled"
+            PRINT name + " (" + status + ")"
+        NEXT
+        FOR outcome IN PluginLoadReport()
+            IF !outcome.Ok THEN PRINT "  " + outcome.Name + ": FAILED to load: " + outcome.Error
+        NEXT
+        grouped = GroupCapabilitiesByPlugin(Shell.PluginCapabilities())
+        FOR pluginName IN Object.Keys(grouped)
+            PRINT ""
+            PRINT pluginName
+            FOR capLabel IN Object.Get(grouped, pluginName, [])
+                PRINT "  " + capLabel
+            NEXT
+        NEXT
+        RETURN
+    END IF
+
+    subcommand = Upper(arguments[0])
+
+    IF subcommand == "INSTALL" THEN
+        IF LEN(arguments) < 2 THEN
+            ignored = DisplayError("arcosh: plugins: usage: plugins install <path> [name]")
+            RETURN
+        END IF
+        sourcePath = arguments[1]
+        IF !File.Exists(sourcePath) THEN
+            ignored = DisplayError("arcosh: plugins: no such file: " + sourcePath)
+            RETURN
+        END IF
+        name = ""
+        IF LEN(arguments) >= 3 THEN
+            name = arguments[2]
+        ELSE
+            base = Path.BaseName(sourcePath)
+            ext = Path.Extension(sourcePath)
+            name = base
+            IF ext <> "" THEN name = String.Slice(base, 0, LEN(base) - LEN(ext))
+        END IF
+        ignored = EnsurePluginsDirectory()
+        ignored = File.WriteText(PluginFilePath(name), File.ReadText(sourcePath))
+        ignored = DisplaySuccess("arcosh: plugins: installed \"" + name + "\" (run \"plugins enable " + name + "\" to activate it)")
+        RETURN
+    END IF
+
+    IF subcommand == "ENABLE" THEN
+        IF LEN(arguments) < 2 THEN
+            ignored = DisplayError("arcosh: plugins: usage: plugins enable <name>")
+            RETURN
+        END IF
+        name = arguments[1]
+        IF !File.Exists(PluginFilePath(name)) THEN
+            ignored = DisplayError("arcosh: plugins: no such installed plugin: " + name + " (see \"plugins install\")")
+            RETURN
+        END IF
+        enabledNames = LoadEnabledPluginNames()
+        IF !Array.Contains(enabledNames, name) THEN ignored = Array.Push(enabledNames, name)
+        ignored = SaveEnabledPluginNames(enabledNames)
+        outcome = LoadOnePlugin(name)
+        IF outcome.Ok THEN
+            ignored = DisplaySuccess("arcosh: plugins: enabled and loaded \"" + name + "\"")
+        ELSE
+            ignored = DisplayError("arcosh: plugins: enabled \"" + name + "\" but it failed to load: " + outcome.Error)
+        END IF
+        RETURN
+    END IF
+
+    IF subcommand == "DISABLE" THEN
+        IF LEN(arguments) < 2 THEN
+            ignored = DisplayError("arcosh: plugins: usage: plugins disable <name>")
+            RETURN
+        END IF
+        name = arguments[1]
+        enabledNames = LoadEnabledPluginNames()
+        updated = []
+        FOR existing IN enabledNames
+            IF existing <> name THEN ignored = Array.Push(updated, existing)
+        NEXT
+        ignored = SaveEnabledPluginNames(updated)
+        ignored = DisplaySuccess("arcosh: plugins: disabled \"" + name + "\" (takes effect on next start -- capabilities it already registered this session stay active until you restart)")
+        RETURN
+    END IF
+
+    ignored = DisplayError("arcosh: plugins: unknown subcommand: " + arguments[0] + " (see \"help plugins\")")
+END FUNCTION
+
+' A registered `command` capability, invoked as a shell built-in (see the main loop's own dispatch
+' below) -- a proof-of-concept integration, not deep pipeline/redirection support: a plugin command
+' never sees pipes/redirection/backgrounding, only its own parsed Arguments, the real, disclosed
+' scope AP-0052-012's own "provide at least one proof plugin" bar asks for. A plugin command that
+' throws is caught here and reported, never crashing the shell (section 19.3).
+FUNCTION RunPluginCommand(parsed AS OBJECT)
+    TRY
+        output = Shell.PluginInvoke("command", parsed.Executable, {"Arguments": parsed.Arguments})
+        IF output <> "" THEN PRINT output
+    CATCH err
+        ignored = DisplayError("arcosh: " + parsed.Executable + ": plugin command failed: " + err.Message)
+    END TRY
+END FUNCTION
+
+' Structural + real-plugin-load regression coverage, run against a real, temporary ARCOSH_HOME
+' (never the real user's own ~/.arcosh) so it can freely install/enable plugins -- includes a
+' deliberately BROKEN plugin (AP-0052-016's own explicit "plugin failure" required test area).
+FUNCTION RunPluginSelfTest()
+    failures = 0
+    ignored = Shell.PluginResetForTesting()
+    testHome = Path.Cwd() + "/wp_plugin_selftest_home"
+    ignored = Process.Execute("rm", ["-rf", testHome])
+    ignored = Directory.Create(testHome)
+
+    ' ParsePluginNameList / SerializePluginNameList round-trip, including comments/blanks/dupes.
+    parsedNames = ParsePluginNameList(String.Join(["gittools", "", "# a comment", "neon", "gittools"], "\n"))
+    namesMatch = LEN(parsedNames) == 2
+    IF namesMatch THEN namesMatch = parsedNames[0] == "gittools"
+    IF namesMatch THEN namesMatch = parsedNames[1] == "neon"
+    IF namesMatch THEN
+        PRINT "ok   ParsePluginNameList skips blanks/comments and de-duplicates"
+    ELSE
+        PRINT "FAIL ParsePluginNameList did not parse the name list correctly"
+        failures = failures + 1
+    END IF
+
+    ' A real plugin, installed to a real temporary plugins directory, registering all four
+    ' capability classes through the RFC's own literal Shell.RegisterX API.
+    pluginsDir = testHome + "/plugins"
+    ignored = Directory.Create(pluginsDir)
+    goodPlugin = String.Join([
+        "FUNCTION RenderGitBranch(context AS OBJECT)",
+        "    RETURN " + Chr(34) + "git:main" + Chr(34),
+        "END FUNCTION",
+        "FUNCTION RunGitStatus(args AS OBJECT)",
+        "    RETURN " + Chr(34) + "nothing to commit" + Chr(34),
+        "END FUNCTION",
+        "ignored1 = Shell.RegisterPromptSegment(" + Chr(34) + "git" + Chr(34) + ", ADDRESSOF RenderGitBranch)",
+        "ignored2 = Shell.RegisterCommand(" + Chr(34) + "gitstatus" + Chr(34) + ", ADDRESSOF RunGitStatus)",
+        "ignored3 = Shell.RegisterTheme(" + Chr(34) + "neon" + Chr(34) + ", {" + Chr(34) + "error" + Chr(34) + ": {" + Chr(34) + "TrueColor" + Chr(34) + ": " + Chr(34) + "38;2;255;0;255" + Chr(34) + "}})"
+    ], "\n")
+    ignored = File.WriteText(pluginsDir + "/gittools.abas", goodPlugin)
+
+    discovered = DiscoverPluginNames_TestOverride(pluginsDir)
+    IF LEN(discovered) == 1 ANDALSO discovered[0] == "gittools" THEN
+        PRINT "ok   DiscoverPluginNames finds an installed .abas plugin, sorted"
+    ELSE
+        PRINT "FAIL DiscoverPluginNames did not find the installed plugin"
+        failures = failures + 1
+    END IF
+
+    loadResult = LoadOnePlugin_TestOverride(pluginsDir, "gittools")
+    IF loadResult.Ok THEN
+        PRINT "ok   a real plugin file loads successfully through the persistent plugin interpreter"
+    ELSE
+        PRINT "FAIL gittools plugin failed to load: " + loadResult.Error
+        failures = failures + 1
+    END IF
+
+    segmentOutput = Shell.PluginInvoke("prompt.segment", "git", {})
+    IF segmentOutput == "git:main" THEN
+        PRINT "ok   the plugin's registered prompt.segment callback is invoked correctly"
+    ELSE
+        PRINT "FAIL prompt.segment invoke returned: [" + segmentOutput + "]"
+        failures = failures + 1
+    END IF
+
+    commandOutput = Shell.PluginInvoke("command", "gitstatus", {"Arguments": []})
+    IF commandOutput == "nothing to commit" THEN
+        PRINT "ok   the plugin's registered command callback is invoked correctly"
+    ELSE
+        PRINT "FAIL command invoke returned: [" + commandOutput + "]"
+        failures = failures + 1
+    END IF
+
+    themeValue = Shell.PluginCapabilityValue("theme", "neon")
+    IF TYPEOF(themeValue) == "Object" THEN
+        PRINT "ok   the plugin's registered theme capability is retrievable"
+    ELSE
+        PRINT "FAIL theme capability was not retrievable"
+        failures = failures + 1
+    END IF
+
+    grouped = GroupCapabilitiesByPlugin(Shell.PluginCapabilities())
+    gitToolsCaps = Object.Get(grouped, "gittools", [])
+    groupedOk = LEN(gitToolsCaps) == 3
+    IF groupedOk THEN groupedOk = Array.Contains(gitToolsCaps, "prompt.segment.git")
+    IF groupedOk THEN groupedOk = Array.Contains(gitToolsCaps, "command.gitstatus")
+    IF groupedOk THEN groupedOk = Array.Contains(gitToolsCaps, "theme.neon")
+    IF groupedOk THEN
+        PRINT "ok   GroupCapabilitiesByPlugin groups every capability under the registering plugin's name"
+    ELSE
+        PRINT "FAIL capabilities were not grouped correctly under \"gittools\""
+        failures = failures + 1
+    END IF
+
+    ' AP-0052-016's own explicit "plugin failure" required test area: a deliberately broken plugin
+    ' (a syntax error) must fail cleanly with a real error message, never crash the process, and
+    ' never prevent a DIFFERENT, valid plugin from loading.
+    brokenPlugin = "FUNCTION Broken(" + Chr(10) + "    this is not valid ArcoBASIC"
+    ignored = File.WriteText(pluginsDir + "/broken.abas", brokenPlugin)
+    brokenResult = LoadOnePlugin_TestOverride(pluginsDir, "broken")
+    IF !brokenResult.Ok ANDALSO brokenResult.Error <> "" THEN
+        PRINT "ok   a broken plugin fails to load with a real, non-empty error message"
+    ELSE
+        PRINT "FAIL a broken plugin did not report a clean failure"
+        failures = failures + 1
+    END IF
+
+    missingResult = LoadOnePlugin_TestOverride(pluginsDir, "not-a-real-plugin")
+    IF !missingResult.Ok THEN
+        PRINT "ok   loading a not-installed plugin name fails cleanly instead of crashing"
+    ELSE
+        PRINT "FAIL loading a missing plugin did not fail as expected"
+        failures = failures + 1
+    END IF
+
+    unknownOk = !Shell.PluginHasCapability("command", "not-a-real-command")
+    IF unknownOk THEN
+        PRINT "ok   an unregistered capability correctly reports as not present"
+    ELSE
+        PRINT "FAIL an unregistered capability was incorrectly reported as present"
+        failures = failures + 1
+    END IF
+
+    ignored = Process.Execute("rm", ["-rf", testHome])
+    ignored = Shell.PluginResetForTesting()
+    RETURN failures
+END FUNCTION
+
+' Test-only variants of DiscoverPluginNames/LoadOnePlugin that take an explicit plugins directory
+' rather than reading PluginsDir()/ProfileHome()/$ARCOSH_HOME -- keeps this self-test from ever
+' touching the real user's own ~/.arcosh regardless of what ARCOSH_HOME happens to be set to when
+' `--selftest-plugin` is run directly (unlike the profile/theme self-test, which can safely rely on
+' ARCOSH_HOME since it never LOADS anything through the process-lifetime plugin interpreter that
+' every OTHER selftest in this same process run would then also observe).
+FUNCTION DiscoverPluginNames_TestOverride(pluginsDir AS STRING)
+    names = []
+    listed = Directory.List(pluginsDir)
+    FOR entry IN listed.Entries
+        IF String.EndsWith(entry, ".abas") THEN
+            ignored = Array.Push(names, String.Slice(entry, 0, LEN(entry) - 5))
+        END IF
+    NEXT
+    RETURN Array.Sort(names)
+END FUNCTION
+
+FUNCTION LoadOnePlugin_TestOverride(pluginsDir AS STRING, name AS STRING)
+    path = pluginsDir + "/" + name + ".abas"
+    IF !File.Exists(path) THEN
+        RETURN {"Name": name, "Ok": FALSE, "Error": "plugin file not found: " + path}
+    END IF
+    fullSource = PluginPrelude() + "\n" + File.ReadText(path)
+    result = Shell.LoadPlugin(name, fullSource)
+    RETURN {"Name": name, "Ok": result.Ok, "Error": result.Error}
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
 ' Resident ArcoBASIC Program (RFC-0052 WP-006)
 ' ---------------------------------------------------------------------------------------------
 
@@ -3602,7 +4136,7 @@ FUNCTION RunPathLayerSelfTest()
     RETURN failures
 END FUNCTION
 
-version = "0.14.0-user-segment"
+version = "0.15.0-plugins"
 no_color_flag = HasFlag(Args, "--no-color")
 no_color_env = Process.Env("NO_COLOR") <> ""
 term = Process.Env("TERM")
@@ -3632,7 +4166,7 @@ color_tier = DetectColorTier(is_tty, effective_no_color_flag, no_color_env, term
 ignored = Runtime.SetGlobal("arcosh_color_tier", color_tier)
 
 IF HasFlag(Args, "--version") THEN
-    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008, HELP, Profiles, Editors, Prompt Color Tags, Date/Time Fields, User Segment)"
+    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008, WP-009, HELP, Profiles, Editors, Prompt Color Tags, Date/Time Fields, User Segment)"
     ExitTheProgram(0)
 END IF
 
@@ -3761,6 +4295,16 @@ IF HasFlag(Args, "--selftest-editor") THEN
     ExitTheProgram(0)
 END IF
 
+IF HasFlag(Args, "--selftest-plugin") THEN
+    failures = RunPluginSelfTest()
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " plugin test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all plugin tests passed"
+    ExitTheProgram(0)
+END IF
+
 ' Reduced terminal capability (piped stdin, dumb terminal, no color) must degrade gracefully
 ' rather than fail -- RFC-0052 section 17/18 (Display and Themes, WP-008): the banner uses the
 ' real `prompt` role through Display.Style/Reset like everything else in this file now does,
@@ -3786,6 +4330,19 @@ END IF
 ' comment in runtime.cpp. Safe to call even non-interactively (piped stdin, ctest): it detects that
 ' itself and is a no-op.
 ignored = Process.SetupShellJobControl()
+
+' RFC-0052 section 19.3's own required "recovery launch with optional plugins disabled" -- a
+' broken plugin found no other way is never a reason arcosh itself becomes unreachable. Plugins
+' are loaded AFTER color/theme startup config is already applied (not before): a persisted config
+' naming a plugin-contributed theme as the default therefore falls back to DefaultTheme() for THIS
+' one startup rather than resolving correctly -- a real, narrow, disclosed limitation (see "help
+' plugins") rather than reordering startup and risking the color/diagnostic/--selftest-* fast
+' exits above, none of which should ever depend on plugin loading having already happened.
+IF !HasFlag(Args, "--no-plugins") THEN
+    ignored = LoadEnabledPlugins()
+ELSE
+    ignored = DisplayMuted("arcosh: plugins disabled for this session (--no-plugins)")
+END IF
 
 running = TRUE
 history = []
@@ -3901,6 +4458,21 @@ WHILE running
 
     IF parsed.Executable == "profile" THEN
         ignored = RunProfileCommand(parsed.Arguments)
+        CONTINUE WHILE
+    END IF
+
+    IF parsed.Executable == "plugins" THEN
+        ignored = RunPluginsCommand(parsed.Arguments)
+        CONTINUE WHILE
+    END IF
+
+    ' RFC-0052 WP-009: a registered "command" plugin capability is checked as its own shell
+    ' built-in, BEFORE falling through to real Linux process execution below -- so a plugin command
+    ' takes precedence over a same-named real program on PATH, a disclosed, deliberate tradeoff
+    ' (see "help plugins") in exchange for never touching the pipeline/redirection/background
+    ' machinery at all for a plugin command (a real, disclosed scope limit, not an oversight).
+    IF Shell.PluginHasCapability("command", parsed.Executable) THEN
+        ignored = RunPluginCommand(parsed)
         CONTINUE WHILE
     END IF
 

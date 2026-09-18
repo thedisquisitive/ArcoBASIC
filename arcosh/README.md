@@ -8,10 +8,10 @@ standalone CMake project independent of the umbrella ArcoBASIC build (it is not
 Per RFC-0052 section 6, `arcosh` is authored **in ArcoBASIC itself** and compiled through
 ArcoFission, not hand-written in C++.
 
-## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes),
-a built-in HELP command, profile/theme/prompt customization (RFC-0052 sections 20/22), interactive
-theme/prompt editors on top of it, per-segment prompt color tags, broken-down date/time prompt
-fields, and a real-OS-identity `user` prompt segment
+## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes)
+and WP-009 (Plugin System), a built-in HELP command, profile/theme/prompt customization (RFC-0052
+sections 20/22), interactive theme/prompt editors on top of it, per-segment prompt color tags,
+broken-down date/time prompt fields, and a real-OS-identity `user` prompt segment
 
 `src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
 
@@ -345,14 +345,77 @@ object instead of growing the parameter list further — one pointer argument no
 fields it carries, and incidentally the natural one-argument shape for WP-009's eventual
 `Shell.RegisterPromptSegment` to hand a plugin's own render callback.
 
-It does not yet implement plugins or completion — later work packages (WP-009, WP-010). RFC-0052
-section 19 already earmarks `Shell.RegisterPromptSegment(...)` for WP-009 to let a plugin add its
-own prompt segments the same way `git`'s own prompt integrations do in other shells — today's
-segment dispatch (`KnownPromptSegments`/`DefaultSegmentRole`/`RenderPromptSegment`, now built
-around one context object, see above) is deliberately simple specifically so WP-009 has an
-obvious, minimal seam to extend later, but no plugin-loading machinery exists yet; building that is
-WP-009's own work, not something this pass tried to partially anticipate beyond leaving that seam
-clean.
+## WP-009: Plugin System
+
+Real, dynamically-loaded `.abas` plugin files, discovered under `~/.arcosh/plugins` (or
+`$ARCOSH_HOME/plugins`), that register genuine, repeatedly-invokable capabilities — not just
+static data — across the RFC's own four typed classes: `command`, `prompt.segment`, `theme`, and
+`completion` (RFC-0052 section 19, AP-0052-012).
+
+**This needed real research before implementation** (matching WP-012's own precedent) — see
+`.agents/reports/ARCO_SH_RFC0052_WP009_PLUGIN_SYSTEM_RESEARCH.md` for the full finding. In short:
+ArcoSH is natively compiled, so loading a plugin necessarily means running its text through the
+embedded interpreter (`Runtime.RunString`/`EvalImmediate`). Three things had to each be confirmed
+by direct testing, not assumed: (1) a plain value set via `Runtime.SetGlobal` *inside* such a
+script does **not** reach the native host's own `Runtime.GetGlobal` in either direction — they are
+two entirely separate storage mechanisms; (2) a **new**, purpose-built primitive with real
+process-wide static storage **does** cross that boundary correctly, once an actual bug in the
+first attempt (two lambdas each declaring their own independent `static` map, not a shared one)
+was found and fixed; (3) a genuine `CALLABLE` (`ADDRESSOF`) value does **not** survive being
+invoked from a different Runtime instance than the one that compiled it — `RunString`'s own
+disposable Runtime is destroyed the moment it returns, and invoking a callable from it afterward
+fails with a deliberate, explicit "value is not a live CALLABLE" (not a crash, not a silent wrong
+answer). The fix: plugins load through **one dedicated, process-lifetime Runtime** (mirroring
+`Runtime.EvalImmediate`'s own already-working `static Runtime session` pattern), and every later
+invocation of anything a plugin registered routes through that exact same instance. This is fully
+buildable within ArcoSH's existing architecture — no incompatible language change, no major
+compiler backend work (AP-0052-018 doesn't apply).
+
+Backed by six new `arco_runtime` primitives (`Shell.LoadPlugin`, `Shell.PluginRegister`,
+`Shell.PluginInvoke`, `Shell.PluginHasCapability`, `Shell.PluginCapabilities`,
+`Shell.PluginCapabilityValue`), each intentionally generic; the RFC's own literal conceptual API
+(`Shell.RegisterCommand`, `Shell.RegisterPromptSegment`, `Shell.RegisterTheme`,
+`Shell.RegisterCompleter`) is implemented as plain ArcoBASIC wrapper functions
+(`PluginPrelude()`) prepended to every plugin's own source, so a plugin author never needs to know
+the underlying primitive exists.
+
+* `plugins` — lists installed plugins (enabled/disabled), any load failures, and every currently
+  registered capability grouped by the plugin that registered it, matching section 19.2's own
+  worked example almost exactly (`GitTools` / `command.gitstatus`, `prompt.segment.git` / `Neon` /
+  `theme.neon`);
+* `plugins install <path> [name]` copies a `.abas` file in; `plugins enable <name>` persists it as
+  active (for every future start) **and** loads it into the current session immediately;
+  `plugins disable <name>` persists it as inactive for future starts (capabilities it already
+  registered this session stay active until restart — disclosed, not silently misleading);
+* a registered `command` becomes a real shell built-in, checked *before* falling through to real
+  process execution (so it takes precedence over a same-named real program on PATH — a disclosed
+  tradeoff) but never sees pipes/redirection/backgrounding, only its own parsed arguments — a real
+  proof-of-integration scope, not deep pipeline support;
+* a registered `prompt.segment` works exactly like a built-in one in `prompt set`/`prompt edit`
+  (`KnownPromptSegments` queries `Shell.PluginCapabilities()` dynamically) — a segment that throws
+  when rendered fails safe (renders as nothing) rather than breaking the whole prompt;
+* a registered `theme` can be selected with `theme use <name>` exactly like a saved one, filled in
+  with `DefaultTheme`'s own values for any role/tier it doesn't specify (`FillThemeDefaults`,
+  factored out of `ParseThemeText`'s own identical logic for a theme file);
+* `completion` is registered and enumerable today but genuinely **not consumed** — there is no
+  tab-completion system in ArcoSH at all yet (WP-010, a separate, later work package) — disclosed
+  in `help plugins` rather than pretending it does something;
+* `arcosh --no-plugins` skips loading entirely for the session — section 19.3's own required
+  "recovery launch with optional plugins disabled";
+* a broken plugin (fails to load, or throws when a registered command/segment actually runs) is
+  reported clearly and never crashes the shell or blocks any other plugin from loading (section
+  19.3's own "a broken optional plugin SHOULD NOT make the shell unrecoverable").
+
+A real proof plugin ships at `arcosh/tests/fixtures/wp009_gittools_plugin.abas` (a `gitstatus`
+command, a `git` prompt segment, and a `neon` theme — AP-0052-012's own explicit "provide at least
+one proof plugin" requirement). Verified via `--selftest-plugin` (name-list parsing, discovery and
+its deterministic sort order, a real plugin file loaded through the persistent plugin interpreter
+and all three of its capabilities actually invoked, capability grouping, and AP-0052-016's own
+explicitly required "plugin failure" coverage — a deliberately broken plugin file that must fail
+cleanly without crashing or blocking other plugins) plus a real pty run end to end: install, enable,
+run the plugin command, set the plugin prompt segment, switch to the plugin theme, list capabilities
+— and a separate run confirming a fresh process auto-loads the persisted-enabled plugin on startup,
+while `--no-plugins` correctly skips it.
 
 See `.agents/reports/ARCO_SH_RFC0052_WP000_REPOSITORY_AUDIT.md` (in the repo root's `.agents/`
 directory) for the mandatory pre-implementation audit this work was built against.

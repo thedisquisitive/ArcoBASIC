@@ -110,4 +110,13 @@ if(BUILD_TESTING)
     # manually against the compiled binary under a real pty instead -- see RunEditorSelfTest in
     # src/arcosh.abas.
     add_test(NAME arcosh_editor_selftest COMMAND ${ARCOSH_BINARY} --selftest-editor)
+    # RFC-0052 AP-0052-012 (WP-009): real plugin loading through a real, temporary plugins
+    # directory -- discovery, deterministic sort order, install/enable/disable persistence, all
+    # four capability classes (command/prompt.segment/theme/completion) registered through the
+    # RFC's own literal Shell.RegisterX API and actually invoked, capability enumeration grouped
+    # by plugin, and AP-0052-016's own explicitly required "plugin failure" coverage (a
+    # deliberately broken plugin file) -- see RunPluginSelfTest in src/arcosh.abas and
+    # .agents/reports/ARCO_SH_RFC0052_WP009_PLUGIN_SYSTEM_RESEARCH.md for the research this was
+    # built on.
+    add_test(NAME arcosh_plugin_selftest COMMAND ${ARCOSH_BINARY} --selftest-plugin)
 endif()
