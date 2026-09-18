@@ -95,4 +95,8 @@ if(BUILD_TESTING)
     # RFC-0052 AP-0052-011 (WP-008): semantic styling roles, TrueColor/256/16/None tier detection
     # and fallback, and the one bundled theme -- see RunDisplaySelfTest in src/arcosh.abas.
     add_test(NAME arcosh_display_selftest COMMAND ${ARCOSH_BINARY} --selftest-display)
+    # arcosh's own HELP command (not one of RFC-0052's own numbered work packages) -- topic-table
+    # integrity, lookup by name and alias, and a clean "not found" for an unknown topic -- see
+    # RunHelpSelfTest in src/arcosh.abas.
+    add_test(NAME arcosh_help_selftest COMMAND ${ARCOSH_BINARY} --selftest-help)
 endif()

@@ -9,6 +9,7 @@ Per RFC-0052 section 6, `arcosh` is authored **in ArcoBASIC itself** and compile
 ArcoFission, not hand-written in C++.
 
 ## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes)
+and a built-in HELP command
 
 `src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
 
@@ -197,6 +198,27 @@ for a separate, real 4-minute-plus native build this same pass found and fixed (
 memoization in the compiler's own static type-inference analysis, disclosed but left undone back
 in Entry 24 — now fixed, cutting the affected build down to well under a minute, though still
 slower than this project's single-digit-second norm and only partially root-caused).
+
+and a built-in `HELP` command (not one of RFC-0052's own numbered work packages — added directly
+on request):
+
+* `help` lists every topic with a one-line summary; `help <topic>` (case-insensitive, some topics
+  have short aliases — e.g. `help ?`/`help fg` both resolve to real topics) shows that topic's
+  full text. Topics: `help`, `overview`, `paths`, `commands`, `pipelines`, `jobs`, `oops`,
+  `history`, `program`, `immediate`, `run`, `themes`, `arcobasic` — covering every feature this
+  project has actually built so far, real and accurate, never describing planned functionality as
+  implemented (the same discipline RFC-0052 AP-0052-017 states for this project's external
+  documentation, applied here too);
+* the topic table (`HelpTopics` in `src/arcosh.abas`) is plain data — `{Name, Aliases, Summary,
+  Body}` — specifically so it can grow toward a fuller ArcoBASIC language reference, and
+  eventually interactive step-by-step tutorials, without `RunHelpCommand`/`FindHelpTopic` ever
+  needing to change shape; both of those are real, disclosed *future* work, not attempted in this
+  pass — `help arcobasic` is deliberately a short introduction, not the full language reference,
+  and says so;
+* styled through the same `Display.*` functions WP-008 established (topic names in the `prompt`
+  role, an unknown topic in `error`) rather than a raw `PRINT`;
+* verified via `--selftest-help` (topic-table integrity, lookup by name and by alias, a clean
+  "not found" for an unknown topic) plus manual verification of the real printed output.
 
 It does not yet implement plugins or completion — later work packages (WP-009, WP-010).
 

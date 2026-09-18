@@ -1,7 +1,9 @@
-#DESCRIPTION "The Arcology Shell -- WP-001..WP-012 + WP-008 (RFC-0052)"
+#DESCRIPTION "The Arcology Shell -- WP-001..WP-012 + WP-008 + HELP (RFC-0052)"
 
 ' RFC-0052 ("The Arcology Shell", see ../rfcs/RFC-0052_The_Arcology_Shell.md), WP-001 through
-' WP-012, plus WP-008 (Display and Themes), implemented out of numeric order alongside them.
+' WP-012, plus WP-008 (Display and Themes), implemented out of numeric order alongside them, plus
+' a built-in HELP command (see its own section below) added directly on request -- not one of
+' RFC-0052's own numbered work packages.
 '
 ' WP-001 (shell skeleton): interactive loop, prompt, clean exit, current directory, diagnostic
 ' output, terminal capability query, explicit no-color mode.
@@ -1331,6 +1333,375 @@ FUNCTION RunDisplaySelfTest()
 END FUNCTION
 
 ' ---------------------------------------------------------------------------------------------
+' Help (arcosh built-in -- not one of RFC-0052's own numbered work packages, added directly on
+' request rather than tracked against an AP packet). Deliberately scoped to what ArcoSH ITSELF
+' actually does today, real and accurate, never aspirational -- the same "never describe planned
+' functionality as implemented" discipline RFC-0052 AP-0052-017 states for this project's external
+' documentation, applied here too even though HELP isn't that AP's own subject. The topic table
+' below is plain DATA (Name/Aliases/Summary/Body), not code, specifically so it can grow -- toward
+' a fuller ArcoBASIC language reference, and eventually interactive step-by-step tutorials, both
+' explicitly out of scope for this pass -- without RunHelpCommand/FindHelpTopic ever needing to
+' change shape just because more topics get added later.
+' ---------------------------------------------------------------------------------------------
+
+FUNCTION HelpTopics()
+    RETURN [
+        {
+            "Name": "help",
+            "Aliases": ["?"],
+            "Summary": "how to use HELP itself",
+            "Body": String.Join([
+                "help                 lists every topic below with a one-line summary.",
+                "help <topic>         shows the full text for one topic.",
+                "",
+                "Topic names are case-insensitive, and some have a short alias shown in",
+                "parentheses in the topic list -- \"help ?\" and \"help help\" are the same thing."
+            ], "\n")
+        },
+        {
+            "Name": "overview",
+            "Aliases": [],
+            "Summary": "what ArcoSH is and how it differs from a POSIX shell",
+            "Body": String.Join([
+                "ArcoSH is a real Linux shell whose own scripting/automation language IS",
+                "ArcoBASIC -- there is no separate shell-scripting dialect (RFC-0052 section 2.2).",
+                "",
+                "A plain command line (ls -la, git status | grep modified) runs a real Linux",
+                "program, exactly like any other shell. A line that looks like ArcoBASIC instead",
+                "(PRINT \"hello\", x = 5) runs immediately as ArcoBASIC -- see \"help immediate\".",
+                "",
+                "Other topics: paths, commands, pipelines, jobs, oops, history, program,",
+                "immediate, run, themes, arcobasic."
+            ], "\n")
+        },
+        {
+            "Name": "paths",
+            "Aliases": [],
+            "Summary": "Arcology colon-paths and how they relate to ordinary Linux paths",
+            "Body": String.Join([
+                "Arcology paths use colons instead of slashes and are always absolute:",
+                "",
+                "    :               the root, equivalent to /",
+                "    :home:          equivalent to /home/",
+                "    :home:user:     equivalent to /home/user/",
+                "",
+                "cd accepts either kind of path (or no argument, which goes to your home",
+                "directory); the prompt always shows the current directory as an Arcology path.",
+                "Ordinary Linux paths (relative paths, or ones with no leading colon/slash) pass",
+                "through unchanged either direction -- you never have to translate anything",
+                "yourself, and real Linux commands still take ordinary Linux paths as arguments."
+            ], "\n")
+        },
+        {
+            "Name": "commands",
+            "Aliases": [],
+            "Summary": "running real Linux programs, arguments, and quoting",
+            "Body": String.Join([
+                "Anything that isn't classified as ArcoBASIC (see \"help immediate\") or one of",
+                "ArcoSH's own built-ins is parsed into a real command and executed for real --",
+                "fork/exec, not a text substitution. Single and double quotes and backslash",
+                "escapes work the way you'd expect from any other shell for splitting arguments.",
+                "",
+                "If a command isn't found, ArcoSH says so plainly (\"command not found: x\") and",
+                "records it in history so \"oops\" (see that topic) can retry it. There is no",
+                "$PATH-search ambiguity to worry about beyond the ordinary PATH environment",
+                "variable, exactly like any other shell."
+            ], "\n")
+        },
+        {
+            "Name": "pipelines",
+            "Aliases": ["redirection"],
+            "Summary": "real | pipes and </>/>> redirection",
+            "Body": String.Join([
+                "Pipelines and redirection are real, not simulated: cmd1 | cmd2 | cmd3 forks",
+                "every stage with its own pipe plumbing and one shared process group, so Ctrl-Z",
+                "and job control (see \"help jobs\") apply to the whole pipeline, not just one",
+                "stage of it.",
+                "",
+                "    program > file      write stdout to file, replacing its contents",
+                "    program >> file     write stdout to file, appending to it",
+                "    program < file      read stdin from file",
+                "",
+                "A pipeline's own exit status reflects its LAST stage, exactly like every other",
+                "shell -- an earlier stage failing to be found is reported on its own line but",
+                "doesn't change that overall status."
+            ], "\n")
+        },
+        {
+            "Name": "jobs",
+            "Aliases": ["job-control", "fg", "bg"],
+            "Summary": "background jobs, Ctrl-Z suspend/resume, fg and bg",
+            "Body": String.Join([
+                "Job control is real POSIX job control, not simulated: every job (a single",
+                "command or a whole pipeline) gets its own real process group.",
+                "",
+                "    command &     starts it in the background and returns to the prompt",
+                "                  right away, printing \"[N] pid\"",
+                "    jobs          lists every background/stopped job and its current state",
+                "    fg [%N]       brings a job to the foreground (the most recent one if no",
+                "                  %N is given) and waits for it, exactly like typing the",
+                "                  command directly",
+                "    bg [%N]       resumes a STOPPED job in the background",
+                "",
+                "Ctrl-Z suspends whatever is currently in the foreground -- including a command",
+                "typed directly, with no trailing & -- and prints \"[N]+  Stopped  ...\"; the",
+                "shell itself is never interrupted or stopped by Ctrl-C/Ctrl-Z, only the job you",
+                "are running."
+            ], "\n")
+        },
+        {
+            "Name": "oops",
+            "Aliases": [],
+            "Summary": "retry the last command-not-found with a corrected name",
+            "Body": String.Join([
+                "oops <command> replaces only the EXECUTABLE NAME of the immediately preceding",
+                "command, if (and only if) that command failed with \"command not found\" --",
+                "everything else about it (arguments, redirection, pipeline structure, quoting)",
+                "is preserved exactly, operating on the parsed command structure, never on its",
+                "raw text. A quoted argument that happens to contain the failed name is left",
+                "completely untouched.",
+                "",
+                "    gti status        (command not found: gti)",
+                "    oops git          arcosh: retrying: git status  -- and runs it for real",
+                "",
+                "In a pipeline, the stage that actually failed to run is always the one fixed --",
+                "never necessarily the first stage of the pipeline."
+            ], "\n")
+        },
+        {
+            "Name": "history",
+            "Aliases": [],
+            "Summary": "the history built-in",
+            "Body": String.Join([
+                "history lists every command you've run this session, in order, alongside how",
+                "it turned out (found and ran, command not found, etc.) -- the same structured",
+                "record oops itself reads from. Classic-BASIC program-line editing (LIST/RUN/NEW",
+                "-- see \"help program\") and ArcoBASIC immediate input are intentionally NOT",
+                "recorded here; they're a different category of input (RFC-0052 section 8)."
+            ], "\n")
+        },
+        {
+            "Name": "program",
+            "Aliases": ["resident", "list"],
+            "Summary": "the classic numbered-line BASIC program editor (LIST/RUN/NEW)",
+            "Body": String.Join([
+                "Typing a line that starts with a number edits an in-memory resident program",
+                "instead of running anything immediately -- classic BASIC line-editing rules:",
+                "",
+                "    10 PRINT \"ONE\"      inserts (or replaces) line 10",
+                "    20                   an existing line number with nothing after it",
+                "                         deletes that line",
+                "",
+                "Lines stay in numeric order regardless of the order you type them in.",
+                "",
+                "    LIST      prints the whole resident program back, in order",
+                "    RUN       runs it (GOTO and line-number control flow work exactly like",
+                "              classic BASIC); RUN <file> instead runs a script FILE on disk",
+                "              (see \"help run\") and leaves the resident program untouched",
+                "    NEW       clears the resident program"
+            ], "\n")
+        },
+        {
+            "Name": "immediate",
+            "Aliases": [],
+            "Summary": "typing plain ArcoBASIC statements directly at the prompt",
+            "Body": String.Join([
+                "A line typed at the prompt that looks like an ArcoBASIC statement -- one",
+                "starting with a keyword such as PRINT/IF/FOR/WHILE/FUNCTION/RETURN, or a plain",
+                "or compound assignment (x = 5, x += 1) -- runs immediately as ArcoBASIC instead",
+                "of being treated as a command line:",
+                "",
+                "    PRINT \"hello\"      -> hello",
+                "    x = 5",
+                "    PRINT x            -> 5",
+                "",
+                "Variables persist across separate lines within one session (a real REPL, not a",
+                "fresh interpreter every time) -- classic BASIC immediate-mode semantics. A",
+                "single line is always a complete statement; multi-line constructs (a whole FOR",
+                "loop, a FUNCTION body) belong in the resident program instead (\"help program\")."
+            ], "\n")
+        },
+        {
+            "Name": "run",
+            "Aliases": ["script"],
+            "Summary": "RUN <file> -- executing a .abas script file",
+            "Body": String.Join([
+                "RUN <file> reads a real file from disk and runs it through the exact same",
+                "compiler every other ArcoBASIC program goes through -- numbered lines,",
+                "unnumbered structured code, and a file mixing both all just work, with no",
+                "special-casing for classic line numbers. Accepts either a Linux path or an",
+                "Arcology colon-path (see \"help paths\"). A missing file produces a clean error",
+                "message rather than a crash.",
+                "",
+                "Bare RUN with no filename instead runs the resident numbered program you've",
+                "typed in at the prompt -- see \"help program\"."
+            ], "\n")
+        },
+        {
+            "Name": "themes",
+            "Aliases": ["color", "colour", "display"],
+            "Summary": "color output, themes, and how to disable it",
+            "Body": String.Join([
+                "ArcoSH styles its own prompt and messages (success/warning/error/etc.) using",
+                "real ANSI color, automatically detecting what your terminal actually supports:",
+                "24-bit truecolor, 256-color, plain 16-color, or no color at all. Detection uses",
+                "the COLORTERM and TERM environment variables, and disabling color entirely with",
+                "--no-color or the NO_COLOR environment variable is always respected first.",
+                "",
+                "Every message's own TEXT already carries its full meaning with color stripped",
+                "out entirely -- color is a visual enhancement layered on top, never load-bearing",
+                "for understanding what happened, so piping ArcoSH's output or using a plain",
+                "terminal never loses any information, just the color."
+            ], "\n")
+        },
+        {
+            "Name": "arcobasic",
+            "Aliases": ["basic", "syntax", "language"],
+            "Summary": "a short introduction to ArcoBASIC syntax for scripting",
+            "Body": String.Join([
+                "This is a short introduction, not the full ArcoBASIC language reference --",
+                "there's much more (classes, TRY/CATCH, tuples, bit vectors, comprehensions,",
+                "and more) that a fuller in-shell reference will eventually cover.",
+                "",
+                "    x = 5                       assignment (no LET required)",
+                "    PRINT \"x is \" + STRING(x)    string concatenation with +",
+                "    IF x > 3 THEN",
+                "        PRINT \"big\"",
+                "    ELSE",
+                "        PRINT \"small\"",
+                "    END IF",
+                "    FOR i = 1 TO 5",
+                "        PRINT i",
+                "    NEXT",
+                "    WHILE x > 0",
+                "        x = x - 1",
+                "    WEND",
+                "    FUNCTION Double(n)",
+                "        RETURN n * 2",
+                "    END FUNCTION",
+                "",
+                "Arrays: [1, 2, 3]  --  Objects: {\"Name\": \"Ada\"}  --  both support Foo.Bar-style",
+                "field access and indexing. See the project's own docs/ directory for the",
+                "complete language documentation until a fuller in-shell reference exists."
+            ], "\n")
+        }
+    ]
+END FUNCTION
+
+' Case-insensitive lookup by Name or any Aliases entry. Returns an object with an "IsNothing"
+' marker (an ordinary comparison via TYPEOF works fine on the real topic objects returned by
+' HelpTopics, but ArcoBASIC has no single canonical "not found" sentinel that's simpler than just
+' returning one explicitly here) rather than the language's own "nothing"/null, only because a
+' single explicit shape is easier for RunHelpCommand/the selftest to check without a special case.
+FUNCTION FindHelpTopic(topics AS ARRAY, query AS STRING)
+    needle = Upper(query)
+    FOR topic IN topics
+        IF Upper(topic.Name) == needle THEN RETURN topic
+        FOR alias IN topic.Aliases
+            IF Upper(alias) == needle THEN RETURN topic
+        NEXT
+    NEXT
+    RETURN {"IsNothing": TRUE}
+END FUNCTION
+
+' `help` / `?` [topic]. Bare form lists every topic with its summary and any alias; with an
+' argument, shows that one topic's full body. Styled (prompt role for topic names, error role for
+' an unknown topic) through the same Display.* functions everything else in this file uses --
+' never a raw PRINT with an ANSI code inline.
+FUNCTION RunHelpCommand(arguments AS ARRAY)
+    topics = HelpTopics()
+
+    IF LEN(arguments) == 0 THEN
+        ignored = Display.Style("prompt")
+        ignored = Display.Line("ArcoSH help topics (type: help <topic>)")
+        ignored = Display.Reset()
+        FOR topic IN topics
+            line = "  " + topic.Name
+            IF LEN(topic.Aliases) > 0 THEN line = line + " (" + String.Join(topic.Aliases, ", ") + ")"
+            ' At least one space always -- a name+alias list longer than targetColumn (e.g.
+            ' "pipelines (redirection)") must not run directly into the summary with no
+            ' separator at all.
+            padding = " "
+            targetColumn = 22
+            WHILE LEN(line) + LEN(padding) < targetColumn
+                padding = padding + " "
+            WEND
+            PRINT line + padding + topic.Summary
+        NEXT
+        RETURN
+    END IF
+
+    found = FindHelpTopic(topics, arguments[0])
+    IF Object.Has(found, "IsNothing") THEN
+        ignored = DisplayError("arcosh: help: no such topic: " + arguments[0] + " (try bare \"help\" for the topic list)")
+        RETURN
+    END IF
+
+    ignored = Display.Style("prompt")
+    ignored = Display.Line(found.Name)
+    ignored = Display.Reset()
+    PRINT found.Body
+END FUNCTION
+
+' Structural regression coverage -- topic-table integrity (every topic has real content, lookup
+' by name and by alias both work, an unknown topic is reported cleanly) rather than exact printed
+' formatting, which is cosmetic and not worth pinning down byte-for-byte.
+FUNCTION RunHelpSelfTest()
+    failures = 0
+    topics = HelpTopics()
+
+    IF LEN(topics) > 0 THEN
+        PRINT "ok   HelpTopics returns at least one topic (" + STRING(LEN(topics)) + ")"
+    ELSE
+        PRINT "FAIL HelpTopics returned no topics at all"
+        failures = failures + 1
+    END IF
+
+    FOR topic IN topics
+        hasContent = LEN(topic.Name) > 0
+        IF hasContent THEN hasContent = LEN(topic.Summary) > 0
+        IF hasContent THEN hasContent = LEN(topic.Body) > 0
+        IF hasContent THEN
+            PRINT "ok   topic " + topic.Name + " has a name, summary, and body"
+        ELSE
+            PRINT "FAIL topic " + topic.Name + " is missing content"
+            failures = failures + 1
+        END IF
+    NEXT
+
+    byName = FindHelpTopic(topics, "Jobs")
+    IF Object.Has(byName, "IsNothing") THEN
+        PRINT "FAIL lookup by name (case-insensitive) failed"
+        failures = failures + 1
+    ELSE
+        PRINT "ok   lookup by name (case-insensitive) found: " + byName.Name
+    END IF
+
+    byAlias = FindHelpTopic(topics, "fg")
+    IF Object.Has(byAlias, "IsNothing") THEN
+        PRINT "FAIL lookup by alias failed"
+        failures = failures + 1
+    ELSE
+        IF byAlias.Name == "jobs" THEN
+            PRINT "ok   lookup by alias resolved to the right topic: " + byAlias.Name
+        ELSE
+            PRINT "FAIL lookup by alias resolved to the wrong topic: " + byAlias.Name
+            failures = failures + 1
+        END IF
+    END IF
+
+    missing = FindHelpTopic(topics, "not-a-real-topic")
+    IF Object.Has(missing, "IsNothing") THEN
+        PRINT "ok   an unknown topic reports not found instead of crashing"
+    ELSE
+        PRINT "FAIL an unknown topic did not report not found"
+        failures = failures + 1
+    END IF
+
+    RETURN failures
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
 ' Resident ArcoBASIC Program (RFC-0052 WP-006)
 ' ---------------------------------------------------------------------------------------------
 
@@ -1705,7 +2076,7 @@ FUNCTION RunPathLayerSelfTest()
     RETURN failures
 END FUNCTION
 
-version = "0.9.0-wp008"
+version = "0.9.1-help"
 no_color_flag = HasFlag(Args, "--no-color")
 no_color_env = Process.Env("NO_COLOR") <> ""
 term = Process.Env("TERM")
@@ -1724,7 +2095,7 @@ color_tier = DetectColorTier(is_tty, no_color_flag, no_color_env, term, color_te
 ignored = Runtime.SetGlobal("arcosh_color_tier", color_tier)
 
 IF HasFlag(Args, "--version") THEN
-    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008)"
+    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008, HELP)"
     ExitTheProgram(0)
 END IF
 
@@ -1820,6 +2191,16 @@ IF HasFlag(Args, "--selftest-display") THEN
         ExitTheProgram(1)
     END IF
     PRINT "all display/theme tests passed"
+    ExitTheProgram(0)
+END IF
+
+IF HasFlag(Args, "--selftest-help") THEN
+    failures = RunHelpSelfTest()
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " help test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all help tests passed"
     ExitTheProgram(0)
 END IF
 
@@ -1942,6 +2323,11 @@ WHILE running
 
     IF parsed.Executable == "bg" THEN
         ignored = RunBackgroundResume(jobs_table, parsed.Arguments)
+        CONTINUE WHILE
+    END IF
+
+    IF parsed.Executable == "help" ORELSE parsed.Executable == "?" THEN
+        ignored = RunHelpCommand(parsed.Arguments)
         CONTINUE WHILE
     END IF
 
