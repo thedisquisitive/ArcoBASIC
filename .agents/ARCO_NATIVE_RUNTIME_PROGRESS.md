@@ -3428,3 +3428,107 @@ earlier stage's command-not-found, and per-command history-entry counting -- all
 `cat`/`grep`/`wc` processes and real files on disk, never mocked, per AP-0052-014's own explicit
 "parser-only tests are insufficient" rule) passes, as do all previously-passing arcosh selftests
 (paths/oops/resident/script-execution) and the full `arcosh/build` ctest suite (7/7).
+
+## Entry 31 — Memoizing the static type-inference analysis (Entry 24's own disclosed fix), found necessary by a real 4-minute-plus native build
+
+**Date:** 2026-09-17
+
+**Context:** implementing ArcoSH WP-008 (Display and Themes). Adding one new section to
+`arcosh.abas` (roughly a dozen new functions -- `Display.*`, a theme table, tier detection) made
+`ArcoFission build ... --target linux-x86_64` on the whole file take **4 minutes 19 seconds** --
+every other native build all session, including this same file one work package earlier, had
+compiled in single-digit seconds.
+
+**Root cause.** Exactly the gap Entry 24 already disclosed and left unfixed: `infer_hosted_value_kind`/
+`infer_local_kind`/`infer_function_return_kind` (`src/compiler/fission.cpp`) are pure functions of
+(function, name) with a depth cap (8) guarding against pathological recursion, but no memoization --
+"until this analysis is memoized per (function, name)... which would let the [depth] cap rise
+safely" (Entry 24's own words). Every Load/Store/Index/CallValue instruction `generate_x86_64_function`
+emits queries these functions fresh, at depth 0, for whichever local/function it touches; a local
+referenced by many instructions (or a function called from many sites) re-walked its own
+potentially-deep recursive analysis from scratch every single time. This cost was always there,
+just small enough not to matter until the file's own call graph grew dense enough -- confirmed by
+timing `arcosh.abas` as it stood after WP-011 (18.7s), WP-012 (38.1s -- a proportionally much
+larger jump than WP-012's own +355 lines alone would suggest, meaning the file had already crossed
+into visibly-quadratic-ish territory before WP-008 ever touched it), and after the oops fix
+(40.8s) -- this was a real, growing problem independent of WP-008's own additions, which added
+roughly another 15s on top of an already-degraded baseline.
+
+**Fix.** Split each of the three functions into an `_uncached` implementation (the original body,
+verbatim) plus a thin wrapper carrying the function's original name and signature: the wrapper
+checks/populates a `static std::unordered_map<const AmirFunction*, std::unordered_map<std::string,
+HostedValueKind>>` (or, for `infer_function_return_kind`, keyed on the callee pointer alone --
+no per-name dimension needed there) ONLY when `depth == 0`, falling straight through to the
+uncached implementation for any deeper, `depth > 0` recursive call. Safe specifically because every
+`depth == 0` query for the same (function, name) walks the identical, deterministic AMIR with the
+identical starting budget, so it always produces the answer a fresh recomputation would -- caching
+an interior, depth-limited answer could theoretically "starve" a later, more generously-budgeted
+query, but caching only ever-full-budget depth-0 answers cannot. No other call site anywhere in
+the file needed to change; the rename is entirely internal to these three functions.
+
+**Verification.** Full current `arcosh.abas` (through this WP-008 pass): 4m19s -> 57s (4.5x).
+Root project's full `ctest` suite unaffected (unchanged pass/fail set) -- this only changes when
+work is cached, never what any classification answers, so no behavioral regression is possible by
+construction of the fix itself; still confirmed empirically rather than assumed.
+
+**Disclosed, not fully solved:** 57s is still far slower than this project's established norm
+(single-digit seconds), and the WP-011-to-WP-012 jump (18.7s -> 38.1s for +355 lines, a much
+steeper per-line cost than WP-006's own +127 lines -> +0.7s) points at a SEPARATE scaling issue
+this memoization fix doesn't address -- plausibly something in `Kind::CallValue`'s own candidate
+resolution (a linear-or-worse scan over `module.functions` per call site) compounding as the
+number of functions in one file grows, but not confirmed by profiling (no `perf`/`valgrind`
+available in this environment) -- a real, disclosed gap for whoever next finds native build times
+creeping up again, not silently papered over by this entry stopping at "much better than before."
+
+## Entry 32 — A fourth real miscompilation: a Boxed argument passed into an explicitly `AS BOOL` parameter was never unboxed, just bit-loaded and masked
+
+**Date:** 2026-09-17
+
+**Context:** implementing ArcoSH WP-008 (Display and Themes). `DetectColorTier` takes `isTty AS
+BOOL` (a genuine Console.IsTTY() result, stored in a top-level variable first); called as
+`DetectColorTier(is_tty, ...)`, it returned `"TrueColor"` even when `is_tty` itself printed
+`FALSE` immediately before the call -- the value was correct right up until it crossed this one
+function call.
+
+**Minimized repro:**
+
+```basic
+FUNCTION TestBool(flag AS BOOL)
+    IF flag THEN PRINT "flag is TRUE" ELSE PRINT "flag is FALSE"
+END FUNCTION
+is_tty = Console.IsTTY()
+PRINT "top level: " + STRING(is_tty)   ' FALSE, correctly, under a piped/non-tty stdout
+ignored = TestBool(is_tty)             ' printed "flag is TRUE" -- wrong
+```
+
+**Root cause.** `Console.IsTTY()` (and any generic host-function call with no dedicated codegen)
+is classified `HostedValueKind::Boxed` by `infer_hosted_value_kind` -- the generic host-function
+bridge always returns a real `ArcoValue*`, never a raw bit pattern, regardless of what the
+underlying value conceptually is. Two separate call-argument-marshaling code paths in
+`generate_x86_64_function` (`src/compiler/fission.cpp`) already special-cased a `STRING`-typed
+parameter's argument (boxing it via `box_operand_into_rax` if it wasn't already, since a STRING
+parameter's callee-side representation is always Boxed) but had no equivalent case for `BOOL`:
+a `BOOL`-typed parameter's argument fell through to the generic `else` branch, which does a plain
+`load_value(arg, "BOOL", reg)` -- bit-load the slot, then mask to the low byte (`normalize`'s own
+BOOL-width behavior). For a Boxed argument, the slot holds a real heap POINTER; masking a pointer
+to its low byte reads an essentially arbitrary bit, having nothing to do with the value's actual
+truthiness -- coincidentally `1` (non-zero, hence "TRUE") for this exact repro's own heap layout,
+but not a guaranteed or stable answer, the same "silently wrong depending on allocator behavior"
+signature as Entries 25/26.
+
+**Fix.** Added a `BOOL`-typed-parameter special case, mirroring the existing STRING one, at BOTH
+call-argument-marshaling sites that have it (`call_resolved_method`'s own loop and the direct
+`Kind::CallValue` user-function-call loop -- two structurally similar but textually separate
+blocks, both needed the identical fix): when the declared parameter type is `"BOOL"` and the
+argument's inferred kind is `Boxed`, unbox it via the existing `arco_value_truthy` ABI function
+(added in Entry 26 for Unary `!`, reused here for the identical underlying need) instead of a raw
+bit-load-and-mask.
+
+**Verification.** The minimized repro now correctly prints `FALSE` in both places. `arcosh`'s own
+`--diagnostic` (which calls `DetectColorTier(is_tty, ...)` with a real, non-tty `is_tty` under
+ctest/piped execution) now correctly reports `color tier: None` instead of `TrueColor`; the full
+`--selftest-display`/`--selftest-pipeline`/`--selftest-jobcontrol` output was directly inspected
+byte-for-byte (`cat -v`) under piped/non-tty execution to confirm zero stray ANSI bytes leak, and
+separately confirmed styled output IS correctly emitted under a real pty with `TERM=xterm-256color`/
+`COLORTERM=truecolor` set. Full `arcosh/build` ctest: 10/10. Root project's full `ctest` suite
+unaffected (same pre-existing, unrelated `arcfsctl_smoke` baseline failure).

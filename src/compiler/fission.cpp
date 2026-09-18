@@ -4332,7 +4332,7 @@ HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunc
 // Kind::Call general-call branch (to know whether the callee's result comes back in XMM0 or RAX)
 // and by infer_hosted_value_kind's own Call handling just below (so a value that passed through a
 // function call chases the same rule a directly returned value would).
-HostedValueKind infer_function_return_kind(const AmirModule& module, const AmirFunction& callee, int depth = 0) {
+HostedValueKind infer_function_return_kind_uncached(const AmirModule& module, const AmirFunction& callee, int depth) {
     // A function with MULTIPLE return statements can genuinely disagree on physical
     // representation across them -- e.g. `IF token <> "" THEN RETURN token ... RETURN ""` (a real
     // shape, Arconaut's own NthToken/FirstToken helper): `token` is a genuinely Boxed pointer (an
@@ -4384,6 +4384,25 @@ HostedValueKind infer_function_return_kind(const AmirModule& module, const AmirF
     if (!found_any) return HostedValueKind::Unknown;
     if (disagreement) return HostedValueKind::Boxed;
     return agreed_kind;
+}
+
+// Per-callee memoization for infer_function_return_kind_uncached above, ONLY at depth == 0 -- the
+// same fix, for the same reason, as infer_hosted_value_kind/infer_local_kind's own wrappers
+// (see infer_hosted_value_kind's much larger comment). Keyed on the callee function pointer alone
+// (no "name" here -- this classifies a whole function's return, not one local): a function called
+// from many call sites (e.g. arcosh.abas's own DefaultTheme(), read by every Display.Style call)
+// previously re-walked its entire body -- every RETURN statement, each one a fresh
+// infer_hosted_value_kind_uncached call of its own -- from scratch at EVERY call site.
+HostedValueKind infer_function_return_kind(const AmirModule& module, const AmirFunction& callee, int depth = 0) {
+    if (depth != 0) {
+        return infer_function_return_kind_uncached(module, callee, depth);
+    }
+    static std::unordered_map<const AmirFunction*, HostedValueKind> cache;
+    const auto found = cache.find(&callee);
+    if (found != cache.end()) return found->second;
+    const HostedValueKind result = infer_function_return_kind_uncached(module, callee, depth);
+    cache.emplace(&callee, result);
+    return result;
 }
 
 // A polymorphic dispatch call site's own SET of resolvable candidates -- instance-method
@@ -4458,8 +4477,8 @@ std::optional<std::string> resolve_class_method(const AmirModule& module, std::s
 // `AS ARRAY`/`AS OBJECT`) is treated as Boxed: the only other parameters this backend's System V
 // path ever sees are pointers of one kind or another (arrays, objects, or a freestanding type that
 // never actually reaches this hosted analysis), never a second raw-double representation.
-HostedValueKind infer_local_kind(const AmirModule& module, const AmirFunction& function,
-                                  const std::string& local_name, int depth) {
+HostedValueKind infer_local_kind_uncached(const AmirModule& module, const AmirFunction& function,
+                                           const std::string& local_name, int depth) {
     // SELF (Phase 2 classes) is architecturally always a class instance (a Boxed Object), never a
     // hosted-number -- checked by name, same as param_is_hosted_number's own identical special
     // case in generate_x86_64_function, since SELF genuinely never carries a type annotation to
@@ -4547,8 +4566,28 @@ HostedValueKind infer_local_kind(const AmirModule& module, const AmirFunction& f
     return infer_hosted_value_kind(module, function, local_name, depth + 1);
 }
 
-HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunction& function,
-                                         const std::string& name, int depth = 0) {
+// Per-(function, local_name) memoization for infer_local_kind_uncached above, ONLY at depth == 0
+// -- the same fix, for the same reason, as infer_hosted_value_kind's own wrapper just below (see
+// its much larger comment): this function specifically is what SEVEN separate codegen call sites
+// throughout generate_x86_64_function call directly, always with depth==0, once per Load/Store/
+// StoreIndex/Index instruction referencing a given local -- the dominant cost in the real,
+// measured 4-minute-plus compile this fix was written to solve (ArcoSH WP-008).
+HostedValueKind infer_local_kind(const AmirModule& module, const AmirFunction& function,
+                                  const std::string& local_name, int depth) {
+    if (depth != 0) {
+        return infer_local_kind_uncached(module, function, local_name, depth);
+    }
+    static std::unordered_map<const AmirFunction*, std::unordered_map<std::string, HostedValueKind>> cache;
+    auto& function_cache = cache[&function];
+    const auto found = function_cache.find(local_name);
+    if (found != function_cache.end()) return found->second;
+    const HostedValueKind result = infer_local_kind_uncached(module, function, local_name, depth);
+    function_cache.emplace(local_name, result);
+    return result;
+}
+
+HostedValueKind infer_hosted_value_kind_uncached(const AmirModule& module, const AmirFunction& function,
+                                                  const std::string& name, int depth) {
     // Guards against a pathological reference cycle (e.g. a Store cycle this static analysis
     // would otherwise chase forever). Also, less obviously, bounds a genuine COMBINATORIAL blowup:
     // this function has more than one self-recursive call site (Binary "+"'s own two-operand
@@ -4820,6 +4859,46 @@ HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunc
         }
     }
     return HostedValueKind::Unknown;
+}
+
+// Per-(function, name) memoization for infer_hosted_value_kind_uncached above, ONLY at depth == 0
+// (a fresh, top-level query). This is the fix Entry 24 (.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md)
+// disclosed as not-yet-done: "until this analysis is memoized per (function, name)... which would
+// let the [depth] cap rise safely". Found genuinely necessary by ArcoSH WP-008 (a real,
+// measured 4-minute-plus native build -- previously every native build this whole project had
+// compiled in single-digit seconds), not a theoretical concern: EVERY Load/Store instruction
+// generate_x86_64_function ever emits queries this exact function, at depth 0, for the SAME
+// local's kind, over and over, once per instruction referencing it -- previously a completely
+// fresh, potentially deeply recursive re-walk EACH time. A function with many locals each
+// referenced by many instructions (arcosh.abas's own Display/theme functions, once the file grew
+// large enough) multiplies this badly enough to become the dominant cost of the entire compile.
+//
+// Caching is safe specifically because it is keyed on (function, name) alone, ignoring depth, and
+// ONLY populated from a depth==0 call: every depth==0 query for the same pair walks the
+// identical, deterministic AMIR with the identical starting depth budget (0, with the same cap
+// below), so it always produces the SAME answer a fresh recomputation would -- there is no way
+// for a cached depth==0 answer to be "starved" relative to a future depth==0 query the way caching
+// an interior, budget-limited (depth>0) answer could be if the budget available differed between
+// two calls. Interior recursive calls (depth>0) still walk fully uncached, preserving the existing
+// cycle-safety behavior exactly unchanged -- this removes only the REDUNDANT top-level
+// re-walking, never the recursion itself or its own depth cap.
+//
+// A function-local static, not a member of AmirModule/AmirFunction themselves: every real
+// ArcoFission invocation (the CLI's own `main()`) performs exactly one compile per process, so
+// this cache's lifetime naturally matches -- there is no cross-compile staleness to guard against
+// (a second, unrelated `build` invocation is a fresh process with a fresh, empty cache).
+HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunction& function,
+                                         const std::string& name, int depth = 0) {
+    if (depth != 0) {
+        return infer_hosted_value_kind_uncached(module, function, name, depth);
+    }
+    static std::unordered_map<const AmirFunction*, std::unordered_map<std::string, HostedValueKind>> cache;
+    auto& function_cache = cache[&function];
+    const auto found = function_cache.find(name);
+    if (found != function_cache.end()) return found->second;
+    const HostedValueKind result = infer_hosted_value_kind_uncached(module, function, name, depth);
+    function_cache.emplace(name, result);
+    return result;
 }
 
 // Distinguishes "this operand could genuinely be a hosted number, even though infer_hosted_value_
@@ -7459,6 +7538,31 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                             if (!box_operand_into_rax(args[i])) return false;
                             string_arg_freshly_boxed[i] = box_operand_freshly_boxed;
                             result.text.mov_store_disp32(Reg::RSP, spill_offset(i), Reg::RAX);
+                        } else if (declared_parameter_type(resolved.params[i]) == "BOOL" &&
+                                   infer_hosted_value_kind(module, *target, args[i]) == HostedValueKind::Boxed) {
+                            // A BOOL-typed parameter's argument can be genuinely Boxed at this call
+                            // site (a host-function-call result like Console.IsTTY(), or a local
+                            // whose OTHER assignment sites disagree with a plain-bool one -- see
+                            // infer_local_kind's own "disagreement -> Boxed" rule), in which case
+                            // its stack slot holds a real ArcoValueBox* POINTER, not a raw 0/1 --
+                            // the identical hazard the STRING branch just above this one already
+                            // guards against, just for Bool instead of String. A plain `load_value`
+                            // (below, the ordinary case) only bit-loads and BOOL-width-masks the
+                            // slot -- for a pointer, that keeps its low byte, an essentially
+                            // arbitrary value having nothing to do with the value's real
+                            // truthiness. Found by direct testing: `Console.IsTTY()` stored in a
+                            // variable and passed to a user function declaring `flag AS BOOL` read
+                            // back as an unpredictable, heap-layout-dependent TRUE/FALSE inside the
+                            // callee regardless of the real answer (RFC-0052 WP-008's own
+                            // DetectColorTier -- `is_tty` correct at the top level, wrong the moment
+                            // it crossed this exact call). Unboxed via arco_value_truthy (added
+                            // Entry 26 for Unary "!", reused here for the identical need) instead.
+                            if (!load_value(args[i], "U64", Reg::RDI)) return false;
+                            {
+                                const auto call_disp = result.text.call_rel32_placeholder();
+                                result.external_calls.push_back({call_disp, "arco_value_truthy"});
+                            }
+                            result.text.mov_store_disp32(Reg::RSP, spill_offset(i), Reg::RAX);
                         } else {
                             const std::string param_type = declared_parameter_type(resolved.params[i]);
                             const std::string load_type = param_type.empty() ? "U64" : param_type;
@@ -8492,6 +8596,22 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                             // genuine ArcoValueBox*, matching what the callee now assumes.
                             if (!box_operand_into_rax(instruction.operands[i])) return result;
                             string_arg_freshly_boxed[i] = box_operand_freshly_boxed;
+                            result.text.mov_store_disp32(Reg::RSP, slot_offset, Reg::RAX);
+                        } else if (param_type == "BOOL" &&
+                                   infer_hosted_value_kind(module, *target, instruction.operands[i]) == HostedValueKind::Boxed) {
+                            // Same hazard as call_resolved_method's own identical BOOL branch (see
+                            // its much larger comment) in this SEPARATE marshaling loop: a BOOL-typed
+                            // parameter's argument can be genuinely Boxed (a host-function-call
+                            // result, e.g. Console.IsTTY(), or a disagreement-classified local) --
+                            // a real ArcoValueBox* pointer, not a raw 0/1 -- and a plain BOOL-width
+                            // `load_value` only bit-loads and masks to the low byte, which for a
+                            // pointer is essentially arbitrary, not the real truthiness. Unboxed via
+                            // arco_value_truthy instead.
+                            if (!load_value(instruction.operands[i], "U64", Reg::RDI)) return result;
+                            {
+                                const auto call_disp = result.text.call_rel32_placeholder();
+                                result.external_calls.push_back({call_disp, "arco_value_truthy"});
+                            }
                             result.text.mov_store_disp32(Reg::RSP, slot_offset, Reg::RAX);
                         } else {
                             const std::string load_type = param_type.empty() ? "U64" : param_type;
