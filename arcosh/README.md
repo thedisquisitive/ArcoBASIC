@@ -8,8 +8,8 @@ standalone CMake project independent of the umbrella ArcoBASIC build (it is not
 Per RFC-0052 section 6, `arcosh` is authored **in ArcoBASIC itself** and compiled through
 ArcoFission, not hand-written in C++.
 
-## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes)
-and a built-in HELP command
+## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes),
+a built-in HELP command, and profile/theme/prompt customization (RFC-0052 sections 20/22)
 
 `src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
 
@@ -219,6 +219,41 @@ on request):
   role, an unknown topic in `error`) rather than a raw `PRINT`;
 * verified via `--selftest-help` (topic-table integrity, lookup by name and by alias, a clean
   "not found" for an unknown topic) plus manual verification of the real printed output.
+
+and profile/theme/prompt customization (RFC-0052 sections 20 "Prompt Architecture" and 22
+"Configuration" — not one of RFC-0052's own numbered work packages either):
+
+* the prompt is composed from named segments (`classic` — the original `arcosh:<path>` look, kept
+  as its own segment so the DEFAULT prompt is byte-for-byte unchanged — `path`, `hostname`,
+  `exitcode`, `jobs`) instead of one hardcoded format; `prompt` shows the active segments and a
+  live preview, `prompt set <seg1,seg2,...>` changes them for the session;
+* `theme` previews the active theme by printing every required role's own NAME in that role's own
+  live color (a real swatch, not a description); `theme list` lists built-in and saved themes;
+  `theme set <role> <tier> <code>` edits one role/tier of the active theme in memory; `theme save
+  <name>` / `theme use <name>` persist/switch themes, stored under `~/.arcosh/themes/<name>` as
+  plain `RoleName: TrueColor=..., Color256=..., Color16=...` text — a partial custom theme falls
+  back to `DefaultTheme`'s own values for anything it doesn't override;
+* `profile` shows the settings that would be saved right now; `profile save [name]` persists the
+  active theme name, prompt segments, and color policy to `~/.arcosh/config` (always) and,
+  if named, a separate snapshot under `~/.arcosh/profiles/<name>` `profile load <name>` can later
+  restore; `profile list` lists saved snapshots;
+* the on-disk format for both config and themes is deliberately a tiny, non-executable "Key:
+  value" line format (`ParseDeclarativeLines`), never ArcoBASIC source run through
+  `Runtime.RunString`/`EvalImmediate` — RFC section 22's own explicit rule ("Configuration and
+  arbitrary startup code MUST NOT be indistinguishable concepts") ruled that out; an executable
+  ArcoBASIC startup file for actual automation is real, disclosed, unattempted future work;
+* `~/.arcosh` (or `$ARCOSH_HOME` if set) is only ever created lazily, the first time something is
+  actually saved — a plain session that never touches these commands never creates it;
+* verified via `--selftest-profile` (config/theme round-tripping, a theme actually written to and
+  read back from disk, and prompt-segment rendering, including the two disclosed no-crash
+  guarantees: an unrecognized segment/role renders as nothing rather than failing) plus manual
+  verification against the real compiled binary under a real pty with `TERM=xterm-256color`/
+  `COLORTERM=truecolor` — every theme role previewed in its own distinct, correct color, and a
+  saved profile/theme correctly auto-loaded by a brand new session.
+
+Two new general-purpose `arco_runtime` primitives back this: `Directory.Create` (recursive `mkdir
+-p`-style creation) and `Directory.List` (enumerate a directory's entries by name), plus
+`Host.Hostname()` for the `hostname` prompt segment.
 
 It does not yet implement plugins or completion — later work packages (WP-009, WP-010).
 

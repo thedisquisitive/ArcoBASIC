@@ -99,4 +99,8 @@ if(BUILD_TESTING)
     # integrity, lookup by name and alias, and a clean "not found" for an unknown topic -- see
     # RunHelpSelfTest in src/arcosh.abas.
     add_test(NAME arcosh_help_selftest COMMAND ${ARCOSH_BINARY} --selftest-help)
+    # arcosh's own profile/theme/prompt-customization commands (not one of RFC-0052's own
+    # numbered work packages) -- config/theme file round-tripping and prompt segment rendering,
+    # against a real temporary profile directory -- see RunProfileSelfTest in src/arcosh.abas.
+    add_test(NAME arcosh_profile_selftest COMMAND ${ARCOSH_BINARY} --selftest-profile)
 endif()

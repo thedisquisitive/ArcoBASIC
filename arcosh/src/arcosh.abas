@@ -1,9 +1,10 @@
-#DESCRIPTION "The Arcology Shell -- WP-001..WP-012 + WP-008 + HELP (RFC-0052)"
+#DESCRIPTION "The Arcology Shell -- WP-001..WP-012 + WP-008 + HELP + Profiles (RFC-0052)"
 
 ' RFC-0052 ("The Arcology Shell", see ../rfcs/RFC-0052_The_Arcology_Shell.md), WP-001 through
 ' WP-012, plus WP-008 (Display and Themes), implemented out of numeric order alongside them, plus
-' a built-in HELP command (see its own section below) added directly on request -- not one of
-' RFC-0052's own numbered work packages.
+' a built-in HELP command and RFC-0052 sections 20/22 (Prompt Architecture / Configuration --
+' see the "Profiles" section below) added directly on request -- neither is one of RFC-0052's
+' own numbered work packages.
 '
 ' WP-001 (shell skeleton): interactive loop, prompt, clean exit, current directory, diagnostic
 ' output, terminal capability query, explicit no-color mode.
@@ -186,19 +187,32 @@ FUNCTION Path.ToArcology(rawPath AS STRING)
     RETURN result
 END FUNCTION
 
-' Styled per RFC-0052 section 17/18 (Display Abstraction/Themes, WP-008) -- "arcosh:" and the
-' trailing "> " in the `prompt` role, the colon-path itself in `path`, degrading to the exact
-' original plain text when the tier is None (piped stdin, --no-color, NO_COLOR, a dumb terminal,
-' or simply no color-capable tty at all). A pure string-builder (StyleCode calls, never
+' Styled per RFC-0052 section 17/18 (Display Abstraction/Themes, WP-008) -- degrading to the
+' exact original plain text when the tier is None (piped stdin, --no-color, NO_COLOR, a dumb
+' terminal, or simply no color-capable tty at all). A pure string-builder (StyleCode calls, never
 ' Console.Write) so the one caller still does a single write of the whole thing, matching how
 ' every other WP-002 Path.* function in this section stays a plain value-returning function.
-FUNCTION Prompt(cwd AS STRING)
+'
+' Composed from segments (RFC-0052 section 20, "Prompt Architecture" -- "The prompt SHOULD be
+' composed from segments") rather than a single hardcoded format -- see ActivePromptSegments/
+' RenderPromptSegment further down (in the "Profiles" section) for the actual segment list and
+' what each one renders as; this function only joins whatever they produce with spaces and wraps
+' the whole thing in the `prompt` role plus a trailing "> ". The DEFAULT segment list (["classic"])
+' reproduces this exact function's ORIGINAL, pre-customization text byte-for-byte, so nobody who
+' hasn't touched prompt customization ever sees their prompt change.
+FUNCTION Prompt(cwd AS STRING, lastExitCode AS NUMBER, jobsTable AS ARRAY)
     tier = CurrentColorTier()
     resetCode = ""
     IF tier <> "None" THEN resetCode = AnsiEscape("0m")
     promptStyle = StyleCode("prompt", tier)
-    pathStyle = StyleCode("path", tier)
-    RETURN promptStyle + "arcosh:" + resetCode + pathStyle + Path.ToArcology(cwd) + resetCode + promptStyle + "> " + resetCode
+
+    parts = []
+    FOR segmentName IN ActivePromptSegments()
+        rendered = RenderPromptSegment(segmentName, cwd, lastExitCode, jobsTable, tier, resetCode)
+        IF rendered <> "" THEN ignored = Array.Push(parts, rendered)
+    NEXT
+
+    RETURN promptStyle + String.Join(parts, " ") + resetCode + promptStyle + "> " + resetCode
 END FUNCTION
 
 ' ---------------------------------------------------------------------------------------------
@@ -1161,7 +1175,7 @@ END FUNCTION
 ' why that beats panicking over a styling call, of all things).
 FUNCTION StyleCode(role AS STRING, tier AS STRING)
     IF tier == "None" THEN RETURN ""
-    roleEntry = Object.Get(DefaultTheme(), role)
+    roleEntry = Object.Get(ActiveTheme(), role)
     IF TYPEOF(roleEntry) <> "Object" THEN RETURN ""
     code = Object.Get(roleEntry, tier)
     IF code == "" THEN RETURN ""
@@ -1551,7 +1565,69 @@ FUNCTION HelpTopics()
                 "Every message's own TEXT already carries its full meaning with color stripped",
                 "out entirely -- color is a visual enhancement layered on top, never load-bearing",
                 "for understanding what happened, so piping ArcoSH's output or using a plain",
-                "terminal never loses any information, just the color."
+                "terminal never loses any information, just the color.",
+                "",
+                "    theme                       shows the active theme and previews every role",
+                "    theme list                  lists built-in and saved themes",
+                "    theme set <role> <tier> <code>   edits one role/tier of the active theme",
+                "    theme save <name>           saves the active theme under a name",
+                "    theme use <name>            switches to a built-in or saved theme",
+                "",
+                "See \"help profiles\" for making a customized theme (and prompt) persist across",
+                "sessions."
+            ], "\n")
+        },
+        {
+            "Name": "prompt-customization",
+            "Aliases": ["prompt"],
+            "Summary": "composing the prompt from segments",
+            "Body": String.Join([
+                "The prompt is composed from named segments (RFC-0052 section 20), rendered in",
+                "order and joined with spaces. The default is just one segment, \"classic\" --",
+                "the original arcosh:<path> look -- so nobody who hasn't customized anything",
+                "sees any change.",
+                "",
+                "    prompt                      shows the active segments and a live preview",
+                "    prompt set <seg1,seg2,...>   changes the segment list for this session",
+                "",
+                "Known segments:",
+                "    classic     \"arcosh:\" followed by the current Arcology path (the default)",
+                "    path        just the current Arcology path, no \"arcosh:\" prefix",
+                "    hostname    this machine's hostname",
+                "    exitcode    the last command's exit status (styled success/error)",
+                "    jobs        the number of background/stopped jobs, hidden when there are",
+                "                none",
+                "",
+                "See \"help profiles\" to make a custom segment list persist across sessions."
+            ], "\n")
+        },
+        {
+            "Name": "profiles",
+            "Aliases": ["profile", "config", "configuration"],
+            "Summary": "saving your theme and prompt setup so it persists",
+            "Body": String.Join([
+                "Theme and prompt changes (\"help themes\", \"help prompt-customization\") only",
+                "last for the current session until saved. Settings live in ~/.arcosh (or",
+                "$ARCOSH_HOME if set) as plain, human-readable \"Key: value\" text -- never",
+                "executable ArcoBASIC code, by design (RFC-0052 section 22: configuration and",
+                "arbitrary startup code must never be indistinguishable concepts).",
+                "",
+                "    profile                 shows what would be saved right now",
+                "    profile save            saves the active theme/prompt/color policy as the",
+                "                            default for future sessions",
+                "    profile save <name>     does that AND keeps a separate named snapshot you",
+                "                            can return to later",
+                "    profile load <name>     restores a named snapshot and makes it the default",
+                "                            going forward",
+                "    profile list            lists your saved named snapshots",
+                "",
+                "\"profile save\" captures whatever color policy is ACTIVE right now, including a",
+                "one-off --no-color flag for this run -- running with --no-color once and then",
+                "saving really does make future sessions start in no-color too, the same way",
+                "saving current settings works in most tools.",
+                "",
+                "An executable ArcoBASIC startup file (for arbitrary automation, as opposed to",
+                "these plain settings) is planned but not implemented yet."
             ], "\n")
         },
         {
@@ -1698,6 +1774,583 @@ FUNCTION RunHelpSelfTest()
         failures = failures + 1
     END IF
 
+    RETURN failures
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Profiles: Configuration, Themes, and Prompt Customization (arcosh built-in -- not one of
+' RFC-0052's own numbered work packages; implements section 20, "Prompt Architecture" -- "The
+' prompt SHOULD be composed from segments" -- and section 22, "Configuration" -- "Configuration
+' SHOULD primarily be declarative... Configuration and arbitrary startup code MUST NOT be
+' indistinguishable concepts"). The on-disk format for both config and themes is deliberately a
+' tiny, hand-rollable "Key: value" line format (ParseDeclarativeLines below), not ArcoBASIC
+' source text run through Runtime.RunString/EvalImmediate -- running arbitrary ArcoBASIC to load
+' "configuration" would make config and startup code exactly the indistinguishable concept this
+' section explicitly forbids. An executable startup file (RFC section 22's own "explicitly
+' executable ArcoBASIC startup file") is real, disclosed, unattempted future work -- config here
+' only ever describes VALUES (active theme name, prompt segments, color policy), never behavior.
+' ---------------------------------------------------------------------------------------------
+
+' ~/.arcosh by default, or $ARCOSH_HOME if set -- the same convention the retired pre-RFC-0052
+' arco_shell already used (docs/arcosh.md), reused here rather than inventing a new one.
+FUNCTION ProfileHome()
+    override = Process.Env("ARCOSH_HOME")
+    IF override <> "" THEN RETURN override
+    RETURN Process.Env("HOME") + "/.arcosh"
+END FUNCTION
+
+FUNCTION ThemesDir()
+    RETURN ProfileHome() + "/themes"
+END FUNCTION
+
+FUNCTION ProfilesDir()
+    RETURN ProfileHome() + "/profiles"
+END FUNCTION
+
+FUNCTION ConfigPath()
+    RETURN ProfileHome() + "/config"
+END FUNCTION
+
+FUNCTION ThemePath(name AS STRING)
+    RETURN ThemesDir() + "/" + name
+END FUNCTION
+
+FUNCTION ProfilePath(name AS STRING)
+    RETURN ProfilesDir() + "/" + name
+END FUNCTION
+
+' Created lazily, only when something is actually about to be written -- a plain interactive
+' session that never touches theme/prompt/profile commands never creates ~/.arcosh at all,
+' matching how the rest of this file only ever does real filesystem work in response to a real
+' command, never speculatively at startup.
+FUNCTION EnsureProfileDirectories()
+    ignored = Directory.Create(ThemesDir())
+    ignored = Directory.Create(ProfilesDir())
+END FUNCTION
+
+' Shared by both config and theme files: trims each line, skips blank lines and "#" comments,
+' splits on the FIRST ":" (a color CODE's own value can itself contain ";" but never a bare ":",
+' so this never needs to worry about a value containing the delimiter). Genuinely just data --
+' no expression evaluation, no statements, nothing Runtime.RunString would need to run.
+FUNCTION ParseDeclarativeLines(text AS STRING)
+    result = []
+    FOR rawLine IN String.Split(text, "\n")
+        line = String.Trim(rawLine)
+        IF line == "" THEN CONTINUE FOR
+        IF String.Slice(line, 0, 1) == "#" THEN CONTINUE FOR
+        colonIndex = -1
+        i = 0
+        WHILE i < LEN(line)
+            IF String.Slice(line, i, 1) == ":" THEN
+                colonIndex = i
+                EXIT WHILE
+            END IF
+            i = i + 1
+        WEND
+        IF colonIndex < 0 THEN CONTINUE FOR
+        key = String.Trim(String.Slice(line, 0, colonIndex))
+        value = String.Trim(String.Slice(line, colonIndex + 1, LEN(line)))
+        ignored = Array.Push(result, {"Key": key, "Value": value})
+    NEXT
+    RETURN result
+END FUNCTION
+
+FUNCTION FindDeclarativeValue(pairs AS ARRAY, key AS STRING)
+    needle = Upper(key)
+    FOR pair IN pairs
+        IF Upper(pair.Key) == needle THEN RETURN pair.Value
+    NEXT
+    RETURN ""
+END FUNCTION
+
+' Fixed, stable order for serialization -- matches DefaultTheme's own field order, purely so a
+' saved theme file reads the same way twice in a row instead of shuffling by hash-map iteration
+' order.
+FUNCTION ThemeRoleOrder()
+    RETURN ["normal", "prompt", "path", "success", "warning", "error", "muted", "selection"]
+END FUNCTION
+
+FUNCTION ThemeTierOrder()
+    RETURN ["TrueColor", "Color256", "Color16"]
+END FUNCTION
+
+FUNCTION SerializeTheme(theme AS OBJECT)
+    lines = []
+    FOR roleName IN ThemeRoleOrder()
+        roleEntry = Object.Get(theme, roleName)
+        parts = []
+        FOR tierName IN ThemeTierOrder()
+            code = Object.Get(roleEntry, tierName)
+            ignored = Array.Push(parts, tierName + "=" + code)
+        NEXT
+        ignored = Array.Push(lines, roleName + ": " + String.Join(parts, ", "))
+    NEXT
+    RETURN String.Join(lines, "\n")
+END FUNCTION
+
+' A partial theme file (missing roles, or a role missing a tier) is filled in from DefaultTheme
+' for whatever it doesn't specify -- every role/tier this backend's StyleCode ever looks up is
+' always present in the result, so a hand-edited or half-finished theme file degrades to the
+' built-in color for anything it doesn't override rather than rendering with no style at all.
+FUNCTION ParseThemeText(text AS STRING)
+    base = DefaultTheme()
+    pairs = ParseDeclarativeLines(text)
+    result = {}
+    FOR roleName IN ThemeRoleOrder()
+        baseRole = Object.Get(base, roleName)
+        rawValue = FindDeclarativeValue(pairs, roleName)
+        roleResult = {"TrueColor": Object.Get(baseRole, "TrueColor"),
+            "Color256": Object.Get(baseRole, "Color256"), "Color16": Object.Get(baseRole, "Color16")}
+        IF rawValue <> "" THEN
+            FOR spec IN String.Split(rawValue, ",")
+                trimmedSpec = String.Trim(spec)
+                equalsIndex = -1
+                i = 0
+                WHILE i < LEN(trimmedSpec)
+                    IF String.Slice(trimmedSpec, i, 1) == "=" THEN
+                        equalsIndex = i
+                        EXIT WHILE
+                    END IF
+                    i = i + 1
+                WEND
+                IF equalsIndex >= 0 THEN
+                    tierName = String.Trim(String.Slice(trimmedSpec, 0, equalsIndex))
+                    tierValue = String.Trim(String.Slice(trimmedSpec, equalsIndex + 1, LEN(trimmedSpec)))
+                    ' Object.Set returns a MODIFIED COPY, unlike Array.Push -- it never mutates
+                    ' its first argument in place, so the result must always be reassigned.
+                    roleResult = Object.Set(roleResult, tierName, tierValue)
+                END IF
+            NEXT
+        END IF
+        result = Object.Set(result, roleName, roleResult)
+    NEXT
+    RETURN result
+END FUNCTION
+
+' "default" is always the built-in DefaultTheme(), never a file on disk -- a saved theme
+' literally named "default" would shadow nothing, since this checks the name before ever
+' touching the filesystem. A named theme that doesn't exist on disk gracefully falls back to
+' DefaultTheme() too (a typo in "theme use" is reported by RunThemeCommand itself, which checks
+' existence separately -- this loader's own job is just "give me a usable theme object no matter
+' what", never failing outright).
+FUNCTION LoadTheme(name AS STRING)
+    IF name == "default" THEN RETURN DefaultTheme()
+    path = ThemePath(name)
+    IF !File.Exists(path) THEN RETURN DefaultTheme()
+    RETURN ParseThemeText(File.ReadText(path))
+END FUNCTION
+
+FUNCTION SaveTheme(name AS STRING, theme AS OBJECT)
+    ignored = EnsureProfileDirectories()
+    ignored = File.WriteText(ThemePath(name), SerializeTheme(theme))
+END FUNCTION
+
+' Session-active theme CONTENT (an object) and NAME (a string, purely for display/config-saving
+' purposes -- "theme set" edits the content in place without renaming it; only "theme
+' save"/"theme use" change which name is considered active) -- both held via Runtime.GetGlobal/
+' SetGlobal for the same reason CurrentColorTier's own comment gives: a function far away from
+' the main script body (StyleCode, called from every Display.* call) needs to read this.
+FUNCTION ActiveTheme()
+    theme = Runtime.GetGlobal("arcosh_active_theme")
+    IF TYPEOF(theme) <> "Object" THEN RETURN DefaultTheme()
+    RETURN theme
+END FUNCTION
+
+FUNCTION ActiveThemeName()
+    name = Runtime.GetGlobal("arcosh_active_theme_name")
+    IF name == "" THEN RETURN "default"
+    RETURN name
+END FUNCTION
+
+FUNCTION SetActiveTheme(name AS STRING, theme AS OBJECT)
+    ignored = Runtime.SetGlobal("arcosh_active_theme_name", name)
+    ignored = Runtime.SetGlobal("arcosh_active_theme", theme)
+END FUNCTION
+
+' Known, renderable prompt segment names -- RFC section 20's own suggested built-ins (hostname,
+' current Arcology path, previous exit status, background job count) plus "classic", the
+' original hardcoded "arcosh:<path>" look kept as its own segment so the DEFAULT segment list can
+' reproduce it exactly (see Prompt's own comment) rather than every existing session's prompt
+' changing shape just because segments now exist as a concept.
+FUNCTION KnownPromptSegments()
+    RETURN ["classic", "path", "hostname", "exitcode", "jobs"]
+END FUNCTION
+
+FUNCTION DefaultPromptSegments()
+    RETURN ["classic"]
+END FUNCTION
+
+FUNCTION ActivePromptSegments()
+    segments = Runtime.GetGlobal("arcosh_prompt_segments")
+    IF TYPEOF(segments) <> "Array" THEN RETURN DefaultPromptSegments()
+    IF LEN(segments) == 0 THEN RETURN DefaultPromptSegments()
+    RETURN segments
+END FUNCTION
+
+FUNCTION SetActivePromptSegments(segments AS ARRAY)
+    ignored = Runtime.SetGlobal("arcosh_prompt_segments", segments)
+END FUNCTION
+
+' One self-contained styled fragment per segment (its own style AND reset), so segments render
+' correctly regardless of how many others are joined around them. "" for a segment that has
+' nothing to show right now (jobs, with none running) or an unrecognized name -- Prompt's own
+' caller already drops empty segments rather than leaving a stray extra space.
+FUNCTION RenderPromptSegment(name AS STRING, cwd AS STRING, lastExitCode AS NUMBER, jobsTable AS ARRAY, tier AS STRING, resetCode AS STRING)
+    IF name == "classic" THEN
+        pathStyle = StyleCode("path", tier)
+        RETURN "arcosh:" + resetCode + pathStyle + Path.ToArcology(cwd)
+    END IF
+    IF name == "path" THEN
+        RETURN StyleCode("path", tier) + Path.ToArcology(cwd) + resetCode
+    END IF
+    IF name == "hostname" THEN
+        RETURN StyleCode("prompt", tier) + Host.Hostname() + resetCode
+    END IF
+    IF name == "exitcode" THEN
+        role = "success"
+        IF lastExitCode <> 0 THEN role = "error"
+        RETURN StyleCode(role, tier) + STRING(lastExitCode) + resetCode
+    END IF
+    IF name == "jobs" THEN
+        count = LEN(jobsTable)
+        IF count == 0 THEN RETURN ""
+        RETURN StyleCode("warning", tier) + STRING(count) + "j" + resetCode
+    END IF
+    RETURN ""
+END FUNCTION
+
+FUNCTION SerializeConfig(config AS OBJECT)
+    lines = ["Theme: " + config.Theme]
+    ignored = Array.Push(lines, "PromptSegments: " + String.Join(config.PromptSegments, ", "))
+    ignored = Array.Push(lines, "NoColor: " + STRING(config.NoColor))
+    RETURN String.Join(lines, "\n")
+END FUNCTION
+
+FUNCTION ParseConfigText(text AS STRING)
+    pairs = ParseDeclarativeLines(text)
+    theme = FindDeclarativeValue(pairs, "Theme")
+    IF theme == "" THEN theme = "default"
+
+    segmentsRaw = FindDeclarativeValue(pairs, "PromptSegments")
+    segments = DefaultPromptSegments()
+    IF segmentsRaw <> "" THEN
+        segments = []
+        FOR seg IN String.Split(segmentsRaw, ",")
+            ignored = Array.Push(segments, String.Trim(seg))
+        NEXT
+    END IF
+
+    noColor = FALSE
+    IF Upper(FindDeclarativeValue(pairs, "NoColor")) == "TRUE" THEN noColor = TRUE
+
+    RETURN {"Theme": theme, "PromptSegments": segments, "NoColor": noColor}
+END FUNCTION
+
+' Never fails -- a missing config file (the ordinary first-run case) is just the defaults, not
+' an error condition worth reporting.
+FUNCTION LoadConfig()
+    path = ConfigPath()
+    IF !File.Exists(path) THEN RETURN {"Theme": "default", "PromptSegments": DefaultPromptSegments(), "NoColor": FALSE}
+    RETURN ParseConfigText(File.ReadText(path))
+END FUNCTION
+
+FUNCTION SaveConfig(config AS OBJECT)
+    ignored = EnsureProfileDirectories()
+    ignored = File.WriteText(ConfigPath(), SerializeConfig(config))
+END FUNCTION
+
+' Called once at startup (see the main script body below), after color-tier detection has already
+' run: loads ~/.arcosh/config if present and applies its theme/prompt-segments/no-color settings
+' to the session. --no-color and NO_COLOR are checked SEPARATELY at startup and always take
+' precedence over a persisted "NoColor: true" in config -- an explicit flag/environment override
+' beats a saved preference, the ordinary Unix convention -- so this only ever WIDENS the no-color
+' decision (config saying yes when the flag/env didn't), never narrows an explicit no-color back
+' to color.
+FUNCTION ApplyStartupConfig()
+    config = LoadConfig()
+    ignored = SetActiveTheme(config.Theme, LoadTheme(config.Theme))
+    ignored = SetActivePromptSegments(config.PromptSegments)
+    RETURN config.NoColor
+END FUNCTION
+
+' `theme` [list | set <role> <tier> <code> | save <name> | use <name>]. Bare form previews the
+' active theme by printing every required role's own name IN that role's own current color --
+' a real, live swatch, not a description of one.
+FUNCTION RunThemeCommand(arguments AS ARRAY)
+    IF LEN(arguments) == 0 THEN
+        ignored = Display.Style("prompt")
+        ignored = Display.Line("active theme: " + ActiveThemeName())
+        ignored = Display.Reset()
+        FOR roleName IN ThemeRoleOrder()
+            ignored = Display.Style(roleName)
+            ignored = Display.Line("  " + roleName)
+            ignored = Display.Reset()
+        NEXT
+        RETURN
+    END IF
+
+    subcommand = Upper(arguments[0])
+
+    IF subcommand == "LIST" THEN
+        names = ["default"]
+        listed = Directory.List(ThemesDir())
+        FOR entry IN listed.Entries
+            ignored = Array.Push(names, entry)
+        NEXT
+        activeName = ActiveThemeName()
+        FOR themeName IN names
+            marker = "  "
+            IF themeName == activeName THEN marker = "* "
+            PRINT marker + themeName
+        NEXT
+        RETURN
+    END IF
+
+    IF subcommand == "SET" THEN
+        IF LEN(arguments) < 4 THEN
+            ignored = DisplayError("arcosh: theme: usage: theme set <role> <tier> <code>")
+            RETURN
+        END IF
+        role = Lower(arguments[1])
+        tier = arguments[2]
+        code = arguments[3]
+        IF !Array.Contains(ThemeRoleOrder(), role) THEN
+            ignored = DisplayError("arcosh: theme: unknown role: " + role)
+            RETURN
+        END IF
+        IF !Array.Contains(ThemeTierOrder(), tier) THEN
+            ignored = DisplayError("arcosh: theme: unknown tier: " + tier + " (expected TrueColor, Color256, or Color16)")
+            RETURN
+        END IF
+        theme = ActiveTheme()
+        roleEntry = Object.Get(theme, role)
+        roleEntry = Object.Set(roleEntry, tier, code)
+        theme = Object.Set(theme, role, roleEntry)
+        ignored = SetActiveTheme(ActiveThemeName(), theme)
+        ignored = Display.Style(role)
+        ignored = Display.Line("updated " + role + " (" + tier + "): " + role)
+        ignored = Display.Reset()
+        RETURN
+    END IF
+
+    IF subcommand == "SAVE" THEN
+        IF LEN(arguments) < 2 THEN
+            ignored = DisplayError("arcosh: theme: usage: theme save <name>")
+            RETURN
+        END IF
+        name = arguments[1]
+        ignored = SaveTheme(name, ActiveTheme())
+        ignored = SetActiveTheme(name, ActiveTheme())
+        ignored = DisplaySuccess("arcosh: theme: saved " + name)
+        RETURN
+    END IF
+
+    IF subcommand == "USE" THEN
+        IF LEN(arguments) < 2 THEN
+            ignored = DisplayError("arcosh: theme: usage: theme use <name>")
+            RETURN
+        END IF
+        name = arguments[1]
+        IF name <> "default" ANDALSO !File.Exists(ThemePath(name)) THEN
+            ignored = DisplayError("arcosh: theme: no such theme: " + name)
+            RETURN
+        END IF
+        ignored = SetActiveTheme(name, LoadTheme(name))
+        ignored = DisplaySuccess("arcosh: theme: now using " + name)
+        RETURN
+    END IF
+
+    ignored = DisplayError("arcosh: theme: unknown subcommand: " + arguments[0] + " (see \"help themes\")")
+END FUNCTION
+
+' `prompt` [set <seg1,seg2,...>]. Bare form shows the active segment list and a live preview of
+' the resulting prompt text.
+FUNCTION RunPromptCommand(cwd AS STRING, arguments AS ARRAY)
+    IF LEN(arguments) == 0 THEN
+        PRINT "active segments: " + String.Join(ActivePromptSegments(), ", ")
+        PRINT "known segments:  " + String.Join(KnownPromptSegments(), ", ")
+        PRINT "preview:         " + Prompt(cwd, 0, [])
+        RETURN
+    END IF
+
+    subcommand = Upper(arguments[0])
+    IF subcommand == "SET" THEN
+        IF LEN(arguments) < 2 THEN
+            ignored = DisplayError("arcosh: prompt: usage: prompt set <seg1,seg2,...>")
+            RETURN
+        END IF
+        requested = []
+        FOR seg IN String.Split(arguments[1], ",")
+            ignored = Array.Push(requested, String.Trim(seg))
+        NEXT
+        FOR seg IN requested
+            IF !Array.Contains(KnownPromptSegments(), seg) THEN
+                ignored = DisplayError("arcosh: prompt: unknown segment: " + seg + " (known: " + String.Join(KnownPromptSegments(), ", ") + ")")
+                RETURN
+            END IF
+        NEXT
+        ignored = SetActivePromptSegments(requested)
+        PRINT "preview: " + Prompt(cwd, 0, [])
+        RETURN
+    END IF
+
+    ignored = DisplayError("arcosh: prompt: unknown subcommand: " + arguments[0] + " (see \"help prompt-customization\")")
+END FUNCTION
+
+' `profile` [show | save [name] | load <name> | list]. The MAIN config (ConfigPath) is always
+' what gets applied at the next startup; a NAMED profile is a separate saved snapshot under
+' ProfilesDir a later "profile load <name>" can bring back -- "profile save" with no name just
+' updates the main config, "profile save <name>" does that AND takes a named snapshot.
+'
+' NoColor here is CurrentColorTier() == "None" -- the session's CURRENT EFFECTIVE color state,
+' which also collapses to None from a one-off --no-color flag or a genuinely no-color-capable
+' terminal, not only from a previously-saved preference. This is disclosed, deliberate behavior,
+' not a bug: "profile save" always means "make what's active right now the default", the same way
+' saving current settings works in most tools -- running once with --no-color and then saving
+' really will make future sessions start in no-color too. Documented in "help profiles" rather
+' than adding a separate always-vs-just-now distinction nothing has asked for yet.
+FUNCTION CurrentConfigFromSession()
+    RETURN {"Theme": ActiveThemeName(), "PromptSegments": ActivePromptSegments(), "NoColor": CurrentColorTier() == "None"}
+END FUNCTION
+
+FUNCTION RunProfileCommand(arguments AS ARRAY)
+    IF LEN(arguments) == 0 THEN
+        config = CurrentConfigFromSession()
+        PRINT "theme:           " + config.Theme
+        PRINT "prompt segments: " + String.Join(config.PromptSegments, ", ")
+        PRINT "no-color:        " + STRING(config.NoColor)
+        RETURN
+    END IF
+
+    subcommand = Upper(arguments[0])
+
+    IF subcommand == "SAVE" THEN
+        config = CurrentConfigFromSession()
+        ignored = SaveConfig(config)
+        IF LEN(arguments) >= 2 THEN
+            name = arguments[1]
+            ignored = EnsureProfileDirectories()
+            ignored = File.WriteText(ProfilePath(name), SerializeConfig(config))
+            ignored = DisplaySuccess("arcosh: profile: saved as \"" + name + "\" and made active")
+        ELSE
+            ignored = DisplaySuccess("arcosh: profile: saved")
+        END IF
+        RETURN
+    END IF
+
+    IF subcommand == "LOAD" THEN
+        IF LEN(arguments) < 2 THEN
+            ignored = DisplayError("arcosh: profile: usage: profile load <name>")
+            RETURN
+        END IF
+        name = arguments[1]
+        path = ProfilePath(name)
+        IF !File.Exists(path) THEN
+            ignored = DisplayError("arcosh: profile: no such profile: " + name)
+            RETURN
+        END IF
+        config = ParseConfigText(File.ReadText(path))
+        ignored = SaveConfig(config)
+        ignored = SetActiveTheme(config.Theme, LoadTheme(config.Theme))
+        ignored = SetActivePromptSegments(config.PromptSegments)
+        ignored = DisplaySuccess("arcosh: profile: loaded \"" + name + "\" (color policy applies on next start)")
+        RETURN
+    END IF
+
+    IF subcommand == "LIST" THEN
+        listed = Directory.List(ProfilesDir())
+        IF LEN(listed.Entries) == 0 THEN
+            PRINT "(no saved profiles)"
+        END IF
+        FOR entry IN listed.Entries
+            PRINT "  " + entry
+        NEXT
+        RETURN
+    END IF
+
+    ignored = DisplayError("arcosh: profile: unknown subcommand: " + arguments[0] + " (see \"help profiles\")")
+END FUNCTION
+
+' Structural + real-file regression coverage -- runs against a real, temporary ARCOSH_HOME
+' (never the real user's own ~/.arcosh) so it can freely create/overwrite files.
+FUNCTION RunProfileSelfTest()
+    failures = 0
+    testHome = Path.Cwd() + "/wp_profile_selftest_home"
+    ignored = Process.Execute("rm", ["-rf", testHome])
+    ignored = Directory.Create(testHome)
+
+    ' ParseDeclarativeLines / config round-trip.
+    config = {"Theme": "mytheme", "PromptSegments": ["path", "hostname"], "NoColor": TRUE}
+    serialized = SerializeConfig(config)
+    reparsed = ParseConfigText(serialized)
+    configMatches = reparsed.Theme == "mytheme"
+    IF configMatches THEN configMatches = LEN(reparsed.PromptSegments) == 2
+    IF configMatches THEN configMatches = reparsed.PromptSegments[0] == "path"
+    IF configMatches THEN configMatches = reparsed.NoColor
+    IF configMatches THEN
+        PRINT "ok   config round-trips through Serialize/Parse correctly"
+    ELSE
+        PRINT "FAIL config did not round-trip correctly"
+        failures = failures + 1
+    END IF
+
+    ' Theme round-trip: a partial custom theme still has every role/tier from DefaultTheme.
+    customTheme = DefaultTheme()
+    errorRole = Object.Get(customTheme, "error")
+    errorRole = Object.Set(errorRole, "TrueColor", "1;38;2;255;0;0")
+    customTheme = Object.Set(customTheme, "error", errorRole)
+    themeText = SerializeTheme(customTheme)
+    reparsedTheme = ParseThemeText(themeText)
+    reparsedError = Object.Get(reparsedTheme, "error")
+    reparsedNormal = Object.Get(reparsedTheme, "normal")
+    themeMatches = Object.Get(reparsedError, "TrueColor") == "1;38;2;255;0;0"
+    IF themeMatches THEN themeMatches = Object.Get(reparsedNormal, "TrueColor") == Object.Get(Object.Get(DefaultTheme(), "normal"), "TrueColor")
+    IF themeMatches THEN
+        PRINT "ok   theme round-trips, preserving the edit and every other role's default"
+    ELSE
+        PRINT "FAIL theme did not round-trip correctly"
+        failures = failures + 1
+    END IF
+
+    ' Real file save/load, using a real temporary profile home (ProfileHome() itself just reads
+    ' $ARCOSH_HOME/$HOME, which ArcoBASIC has no way to override for THIS process's own
+    ' environment -- verified manually instead, launching a real arcosh with ARCOSH_HOME set).
+    themePath = testHome + "/themes/selftest-theme"
+    ignored = Directory.Create(testHome + "/themes")
+    ignored = File.WriteText(themePath, themeText)
+    loadedFromDisk = ParseThemeText(File.ReadText(themePath))
+    IF Object.Get(Object.Get(loadedFromDisk, "error"), "TrueColor") == "1;38;2;255;0;0" THEN
+        PRINT "ok   a theme written to disk reads back correctly"
+    ELSE
+        PRINT "FAIL a theme written to disk did not read back correctly"
+        failures = failures + 1
+    END IF
+
+    ' RenderPromptSegment: classic reproduces the exact pre-customization text; unknown segments
+    ' and an empty job table both produce "" rather than garbage.
+    classicRendered = RenderPromptSegment("classic", "/tmp", 0, [], "None", "")
+    IF classicRendered == "arcosh::tmp" THEN
+        PRINT "ok   the classic segment renders exactly like the pre-customization prompt"
+    ELSE
+        PRINT "FAIL classic segment rendered: [" + classicRendered + "] (expected \"arcosh::tmp\")"
+        failures = failures + 1
+    END IF
+
+    IF RenderPromptSegment("jobs", "/tmp", 0, [], "None", "") == "" THEN
+        PRINT "ok   the jobs segment is empty when there are no jobs"
+    ELSE
+        PRINT "FAIL jobs segment was not empty with zero jobs"
+        failures = failures + 1
+    END IF
+
+    IF RenderPromptSegment("not-a-real-segment", "/tmp", 0, [], "None", "") == "" THEN
+        PRINT "ok   an unrecognized segment renders as nothing instead of crashing"
+    ELSE
+        PRINT "FAIL an unrecognized segment did not render as nothing"
+        failures = failures + 1
+    END IF
+
+    ignored = Process.Execute("rm", ["-rf", testHome])
     RETURN failures
 END FUNCTION
 
@@ -2076,7 +2729,7 @@ FUNCTION RunPathLayerSelfTest()
     RETURN failures
 END FUNCTION
 
-version = "0.9.1-help"
+version = "0.10.0-profiles"
 no_color_flag = HasFlag(Args, "--no-color")
 no_color_env = Process.Env("NO_COLOR") <> ""
 term = Process.Env("TERM")
@@ -2091,11 +2744,22 @@ is_tty = Console.IsTTY()
 ' of ANDALSO wherever a host-returned bool (is_tty) is involved; comparison-expression results
 ' (term <> "dumb", String.Slice(...) == ":", etc.) combine via ANDALSO/ORELSE without issue
 ' throughout the rest of this file.
-color_tier = DetectColorTier(is_tty, no_color_flag, no_color_env, term, color_term)
+' RFC-0052 section 22 (Configuration): ~/.arcosh/config's "NoColor" setting is a persisted
+' fallback, checked here so it can WIDEN the no-color decision (a saved preference turning color
+' off) but never NARROW an explicit --no-color/NO_COLOR back on -- the ordinary Unix convention of
+' an explicit flag/environment override beating a saved one. ApplyStartupConfig's own return value
+' is a Boxed object-field read (config.NoColor -- Kind::Index always classifies Boxed, regardless
+' of the underlying value), so it's combined with nested IF here, never ANDALSO/ORELSE directly,
+' for the same disclosed reason is_tty's own detection above does the same.
+config_no_color = ApplyStartupConfig()
+effective_no_color_flag = no_color_flag
+IF config_no_color THEN effective_no_color_flag = TRUE
+
+color_tier = DetectColorTier(is_tty, effective_no_color_flag, no_color_env, term, color_term)
 ignored = Runtime.SetGlobal("arcosh_color_tier", color_tier)
 
 IF HasFlag(Args, "--version") THEN
-    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008, HELP)"
+    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008, HELP, Profiles)"
     ExitTheProgram(0)
 END IF
 
@@ -2204,6 +2868,16 @@ IF HasFlag(Args, "--selftest-help") THEN
     ExitTheProgram(0)
 END IF
 
+IF HasFlag(Args, "--selftest-profile") THEN
+    failures = RunProfileSelfTest()
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " profile/theme/prompt test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all profile/theme/prompt tests passed"
+    ExitTheProgram(0)
+END IF
+
 ' Reduced terminal capability (piped stdin, dumb terminal, no color) must degrade gracefully
 ' rather than fail -- RFC-0052 section 17/18 (Display and Themes, WP-008): the banner uses the
 ' real `prompt` role through Display.Style/Reset like everything else in this file now does,
@@ -2241,7 +2915,7 @@ WHILE running
     ignored = PollBackgroundJobs(jobs_table)
 
     cwd = Path.Cwd()
-    IF is_tty THEN Console.Write(Prompt(cwd))
+    IF is_tty THEN Console.Write(Prompt(cwd, last_exit_code, jobs_table))
 
     line = Console.ReadLine()
     IF !line.Ok THEN
@@ -2328,6 +3002,22 @@ WHILE running
 
     IF parsed.Executable == "help" ORELSE parsed.Executable == "?" THEN
         ignored = RunHelpCommand(parsed.Arguments)
+        CONTINUE WHILE
+    END IF
+
+    ' RFC-0052 sections 20/22 (Prompt Architecture / Configuration).
+    IF parsed.Executable == "theme" THEN
+        ignored = RunThemeCommand(parsed.Arguments)
+        CONTINUE WHILE
+    END IF
+
+    IF parsed.Executable == "prompt" THEN
+        ignored = RunPromptCommand(cwd, parsed.Arguments)
+        CONTINUE WHILE
+    END IF
+
+    IF parsed.Executable == "profile" THEN
+        ignored = RunProfileCommand(parsed.Arguments)
         CONTINUE WHILE
     END IF
 

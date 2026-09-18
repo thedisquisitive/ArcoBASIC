@@ -3723,6 +3723,59 @@ Runtime::Runtime()
         std::filesystem::current_path(args[0].to_string(), ec);
         return Value::Object{{"Ok", !ec}, {"Error", ec ? ec.message() : std::string()}};
     });
+    // Added for RFC-0052's own Configuration section (22): a profile directory (~/.arcosh/,
+    // plus themes/ and profiles/ subdirectories) needs real recursive creation, the same "mkdir
+    // -p" semantics shells always need for exactly this. std::filesystem::create_directories
+    // already succeeds (returns false, no error) if the directory already exists -- checked via
+    // the error_code, not the bool return, so "already existed" and "just created it" both
+    // report Ok here, only a genuine failure (e.g. a parent path component is a file, not a
+    // directory) sets Error.
+    register_function("Directory.Create", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Directory.Create", 1, 1);
+        std::error_code ec;
+        std::filesystem::create_directories(args[0].to_string(), ec);
+        return Value::Object{{"Ok", !ec}, {"Error", ec ? ec.message() : std::string()}};
+    });
+    // Added for RFC-0052 Configuration section (22): enumerating saved themes/profiles (e.g.
+    // "theme list") needs to see what's actually on disk. Bare entry NAMES only (matching every
+    // other cross-platform directory listing convention) -- a caller that needs full paths joins
+    // them with the directory itself. A missing directory is reported as Ok with zero entries,
+    // not an error: an ArcoSH profile directory that's never had a theme/profile saved into it
+    // yet is the normal, expected first-run state, not a fault.
+    register_function("Directory.List", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Directory.List", 1, 1);
+        const std::string path = args[0].to_string();
+        Value::Array entries;
+        if (!std::filesystem::exists(path)) {
+            return Value::Object{{"Ok", true}, {"Entries", Value(entries)}, {"Error", ""}};
+        }
+        std::error_code ec;
+        std::filesystem::directory_iterator it(path, ec);
+        if (ec) {
+            return Value::Object{{"Ok", false}, {"Entries", Value(entries)}, {"Error", ec.message()}};
+        }
+        for (const auto& entry : it) {
+            entries.push_back(Value(entry.path().filename().string()));
+        }
+        return Value::Object{{"Ok", true}, {"Entries", Value(entries)}, {"Error", ""}};
+    });
+    // Added for RFC-0052 section 20's own suggested prompt segment ("hostname"). POSIX
+    // gethostname() truncated/null-terminated defensively -- a real hostname is always far
+    // shorter than this buffer, but a misconfigured system returning something unexpectedly long
+    // must not overrun it.
+    register_function("Host.Hostname", [](const std::vector<Value>&) -> Value {
+#ifdef _WIN32
+        return Value(std::string("localhost"));
+#else
+        char buffer[256];
+        buffer[0] = '\0';
+        if (gethostname(buffer, sizeof(buffer)) != 0) {
+            return Value(std::string(""));
+        }
+        buffer[sizeof(buffer) - 1] = '\0';
+        return Value(std::string(buffer));
+#endif
+    });
     // Not meant to be called directly from ArcoBASIC source -- the AMIR builder emits a call to
     // this as Main's first instructions (see AstAmirBuilder::build in fission.cpp) so a bare
     // `Args` reference has a real local to read. Compiled functions treat every free identifier
