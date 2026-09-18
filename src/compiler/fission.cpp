@@ -5756,37 +5756,49 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
     // STRING` or a freestanding fixed-width type, arrives in the next *integer* register), rather
     // than by raw position the way the Microsoft x64/freestanding path below still does (which
     // never sees a hosted-number parameter at all -- is_hosted_number is unconditionally false
-    // under that convention). No stack-spilled parameters are attempted on this path yet (a
-    // real, disclosed scope reduction, matching the Kind::Call general-call branch's own limit):
-    // a function with more than 6 integer-class or 8 float-class parameters fails to compile with
-    // a clear error instead of silently misreading the caller's stack.
+    // under that convention). A parameter beyond the 6th integer-class or 8th float-class one is
+    // stack-spilled by the CALLER (see call_resolved_method's and Kind::CallValue's own PASS 2
+    // below, the mirror image of this) at entry-RSP+8, +16, ... in the same left-to-right order,
+    // restricted to whichever parameters overflowed their own class -- exactly the real System V
+    // ABI rule (Entry 34, .agents/ARCO_NATIVE_RUNTIME_PROGRESS.md): stack_arg_index only advances
+    // for an overflowing parameter, never for one that fit in a register, so the caller and callee
+    // always agree on stack position without needing to encode it anywhere explicit.
     if (convention == systems::CallingConvention::SystemV) {
         int int_arg_index = 0;
         int float_arg_index = 0;
+        int stack_arg_index = 0;
         const auto& int_regs = systems::sysv_integer_argument_registers();
         for (std::size_t i = 0; i < target->params.size(); ++i) {
             const std::string name = bare_parameter_name(target->params[i]);
             if (param_is_hosted_number(target->params[i])) {
-                if (float_arg_index >= 8) {
-                    result.ok = false;
-                    result.error = "function \"" + function_name + "\" has more hosted-number "
-                        "parameters than this backend's System V fast path supports (no "
-                        "stack-spilled parameters yet)";
-                    return result;
+                if (float_arg_index < 8) {
+                    if (!store_result_double(name, static_cast<Xmm>(float_arg_index++))) return result;
+                } else {
+                    // A stack-spilled double needs no XMM register at all -- it's a pure 8-byte
+                    // memory-to-memory bit copy (RAX, never a live SystemV argument register, is
+                    // always free here; every XMM0-7 real argument register, in contrast, may
+                    // still hold a value another later branch of THIS SAME loop hasn't spilled
+                    // to its own slot yet, so reusing one of those as scratch would be unsafe).
+                    const std::uint32_t incoming_offset = static_cast<std::uint32_t>(frame_size + 8 + 8 * stack_arg_index++);
+                    if (incoming_offset <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(incoming_offset));
+                    else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, incoming_offset);
+                    const int parameter_slot = slot_of(name);
+                    if (parameter_slot <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(parameter_slot), Reg::RAX);
+                    else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(parameter_slot), Reg::RAX);
                 }
-                if (!store_result_double(name, static_cast<Xmm>(float_arg_index++))) return result;
             } else {
-                if (int_arg_index >= static_cast<int>(int_regs.size())) {
-                    result.ok = false;
-                    result.error = "function \"" + function_name + "\" has more integer/pointer "
-                        "parameters than this backend's System V fast path supports (no "
-                        "stack-spilled parameters yet)";
-                    return result;
-                }
                 const int parameter_slot = slot_of(name);
-                const Reg src = kRegisterByName.at(int_regs[static_cast<std::size_t>(int_arg_index++)]);
-                if (parameter_slot <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(parameter_slot), src);
-                else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(parameter_slot), src);
+                if (int_arg_index < static_cast<int>(int_regs.size())) {
+                    const Reg src = kRegisterByName.at(int_regs[static_cast<std::size_t>(int_arg_index++)]);
+                    if (parameter_slot <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(parameter_slot), src);
+                    else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(parameter_slot), src);
+                } else {
+                    const std::uint32_t incoming_offset = static_cast<std::uint32_t>(frame_size + 8 + 8 * stack_arg_index++);
+                    if (incoming_offset <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(incoming_offset));
+                    else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, incoming_offset);
+                    if (parameter_slot <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(parameter_slot), Reg::RAX);
+                    else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(parameter_slot), Reg::RAX);
+                }
             }
         }
     } else {
@@ -7578,38 +7590,54 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                             result.text.mov_store_disp32(Reg::RSP, spill_offset(i), Reg::RAX);
                         }
                     }
-                    // PASS 2: reload every spilled value into its real calling-convention register,
-                    // in order -- no external calls happen in this pass (plain loads only), so
-                    // nothing already finalized can be clobbered by anything still to come.
+                    // PASS 2: reload every spilled value into its real calling-convention register
+                    // or, once a class's own registers are exhausted, write it into this frame's
+                    // pre-reserved outgoing-stack-argument area instead (outgoing_base..slot_base,
+                    // sized generously by max_outgoing_stack_args up in this function's own frame
+                    // layout -- see that computation's own comment) at a FIXED, never-moving offset
+                    // from RSP, matching exactly where the CALLEE's own prologue (see its "Spill
+                    // incoming arguments" comment) reads stack-spilled parameters from -- both sides
+                    // advance a stack_arg_index only for a parameter that overflowed ITS OWN class's
+                    // registers, in the same left-to-right order, so they always agree without
+                    // needing to encode the split anywhere explicit (Entry 34,
+                    // .agents/ARCO_NATIVE_RUNTIME_PROGRESS.md). No external calls happen in this
+                    // pass (plain loads/stores only), so nothing already finalized in a real argument
+                    // register can be clobbered by anything still to come.
                     int int_arg_index = 0;
                     int float_arg_index = 0;
+                    int stack_arg_index = 0;
                     for (std::size_t i = 0; i < args.size(); ++i) {
                         if (i == 0 && receiver_scratch_offset.has_value()) {
-                            if (int_arg_index >= static_cast<int>(int_regs.size())) {
-                                result.ok = false;
-                                result.error = "call to \"" + resolved.name + "\" passes more "
-                                    "integer/pointer arguments than this backend's System V fast path supports";
-                                return false;
+                            if (int_arg_index < static_cast<int>(int_regs.size())) {
+                                result.text.mov_load_disp32(kRegisterByName.at(int_regs[static_cast<std::size_t>(int_arg_index++)]),
+                                                             Reg::RSP, *receiver_scratch_offset);
+                            } else {
+                                result.text.mov_load_disp32(Reg::RAX, Reg::RSP, *receiver_scratch_offset);
+                                const std::uint32_t outgoing_offset = static_cast<std::uint32_t>(outgoing_base + 8 * stack_arg_index++);
+                                if (outgoing_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(outgoing_offset), Reg::RAX);
+                                else result.text.mov_store_disp32(Reg::RSP, outgoing_offset, Reg::RAX);
                             }
-                            result.text.mov_load_disp32(kRegisterByName.at(int_regs[static_cast<std::size_t>(int_arg_index++)]),
-                                                         Reg::RSP, *receiver_scratch_offset);
                             continue;
                         }
                         if (param_is_hosted_number(resolved.params[i])) {
-                            if (float_arg_index >= 8) {
-                                result.ok = false;
-                                result.error = "call to \"" + resolved.name + "\" passes more "
-                                    "hosted-number arguments than this backend's System V fast path supports";
-                                return false;
+                            if (float_arg_index < 8) {
+                                result.text.movsd_load_disp32(static_cast<Xmm>(float_arg_index++), Reg::RSP, spill_offset(i));
+                                continue;
                             }
-                            result.text.movsd_load_disp32(static_cast<Xmm>(float_arg_index++), Reg::RSP, spill_offset(i));
+                            // A stack-spilled double is a pure 8-byte bit copy via RAX -- see the
+                            // callee prologue's own identical reasoning for why no XMM register
+                            // (all real, still-live in registers XMM0-7) is safe to use as scratch
+                            // here instead.
+                            result.text.mov_load_disp32(Reg::RAX, Reg::RSP, spill_offset(i));
+                            const std::uint32_t outgoing_offset = static_cast<std::uint32_t>(outgoing_base + 8 * stack_arg_index++);
+                            if (outgoing_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(outgoing_offset), Reg::RAX);
+                            else result.text.mov_store_disp32(Reg::RSP, outgoing_offset, Reg::RAX);
+                        } else if (int_arg_index >= static_cast<int>(int_regs.size())) {
+                            result.text.mov_load_disp32(Reg::RAX, Reg::RSP, spill_offset(i));
+                            const std::uint32_t outgoing_offset = static_cast<std::uint32_t>(outgoing_base + 8 * stack_arg_index++);
+                            if (outgoing_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(outgoing_offset), Reg::RAX);
+                            else result.text.mov_store_disp32(Reg::RSP, outgoing_offset, Reg::RAX);
                         } else {
-                            if (int_arg_index >= static_cast<int>(int_regs.size())) {
-                                result.ok = false;
-                                result.error = "call to \"" + resolved.name + "\" passes more "
-                                    "integer/pointer arguments than this backend's System V fast path supports";
-                                return false;
-                            }
                             result.text.mov_load_disp32(kRegisterByName.at(int_regs[static_cast<std::size_t>(int_arg_index++)]),
                                                          Reg::RSP, spill_offset(i));
                         }
@@ -8627,25 +8655,31 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                             result.text.mov_store_disp32(Reg::RSP, slot_offset, Reg::RAX);
                         }
                     }
+                    // Reload every spilled argument into its real register or, once a class's own
+                    // registers are exhausted, into this frame's pre-reserved outgoing-stack-
+                    // argument area -- see call_resolved_method's own PASS 2 (identical reasoning,
+                    // and Entry 34 in .agents/ARCO_NATIVE_RUNTIME_PROGRESS.md) for why this is safe
+                    // and how it agrees with the callee's own prologue.
                     int int_arg_index = 0;
                     int float_arg_index = 0;
+                    int stack_arg_index = 0;
                     for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
                         const std::uint32_t slot_offset = static_cast<std::uint32_t>(host_args_base + 8 * static_cast<int>(i));
                         if (param_is_hosted_number(callee->params[i])) {
-                            if (float_arg_index >= 8) {
-                                result.ok = false;
-                                result.error = "call to \"" + instruction.target + "\" passes more "
-                                    "hosted-number arguments than this backend's System V fast path supports";
-                                return result;
+                            if (float_arg_index < 8) {
+                                result.text.movsd_load_disp32(static_cast<Xmm>(float_arg_index++), Reg::RSP, slot_offset);
+                                continue;
                             }
-                            result.text.movsd_load_disp32(static_cast<Xmm>(float_arg_index++), Reg::RSP, slot_offset);
+                            result.text.mov_load_disp32(Reg::RAX, Reg::RSP, slot_offset);
+                            const std::uint32_t outgoing_offset = static_cast<std::uint32_t>(outgoing_base + 8 * stack_arg_index++);
+                            if (outgoing_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(outgoing_offset), Reg::RAX);
+                            else result.text.mov_store_disp32(Reg::RSP, outgoing_offset, Reg::RAX);
+                        } else if (int_arg_index >= static_cast<int>(int_regs.size())) {
+                            result.text.mov_load_disp32(Reg::RAX, Reg::RSP, slot_offset);
+                            const std::uint32_t outgoing_offset = static_cast<std::uint32_t>(outgoing_base + 8 * stack_arg_index++);
+                            if (outgoing_offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(outgoing_offset), Reg::RAX);
+                            else result.text.mov_store_disp32(Reg::RSP, outgoing_offset, Reg::RAX);
                         } else {
-                            if (int_arg_index >= static_cast<int>(int_regs.size())) {
-                                result.ok = false;
-                                result.error = "call to \"" + instruction.target + "\" passes more "
-                                    "integer/pointer arguments than this backend's System V fast path supports";
-                                return result;
-                            }
                             result.text.mov_load_disp32(kRegisterByName.at(int_regs[static_cast<std::size_t>(int_arg_index++)]),
                                                          Reg::RSP, slot_offset);
                         }

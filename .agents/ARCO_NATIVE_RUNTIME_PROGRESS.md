@@ -3596,3 +3596,69 @@ the exact expected contents.
 suspicion around `Kind::CallValue`'s candidate resolution, `src/compiler/fission.cpp`) was not
 investigated further here -- this pass's regression had a fully-explained, now-fixed root cause of
 its own, so there was no signal pointing back at that older, still-unconfirmed suspicion.
+
+## Entry 34 — System V fast path: stack-spilled parameters/arguments beyond 6 integer/8 float registers, closing a real scope reduction found the hard way
+
+**Date:** 2026-09-18
+
+**Context:** ArcoSH's `RenderPromptSegment`/`ResolveSegmentRole` grew to 8 plain parameters while
+adding a "user" prompt segment, and the native (System V, Linux) build failed outright: "call to
+... passes more integer/pointer arguments than this backend's System V fast path supports". The
+immediate fix was a refactor (bundle everything into one `MakePromptContext(...)` object -- see
+arcosh's own README/commit), but the underlying limit was real and explicitly requested as a
+follow-up: "patch the language to allow far more params."
+
+**Root cause / scope.** This backend's "System V fast path" (`generate_x86_64_function`,
+`src/compiler/fission.cpp`) has always classified each parameter/argument as either integer/pointer
+class (the 6 System V registers RDI/RSI/RDX/RCX/R8/R9) or float class (the 8 XMM registers
+XMM0-7), but never implemented the ABI's own stack-spilling rule for whichever class overflows its
+own register budget -- three separate call/parameter-marshaling sites (the callee's own prologue
+reading its declared parameters; `call_resolved_method`'s PASS 2, shared by instance-method
+dispatch and ADDRESSOF/CALLABLE direct calls; and the plain `Kind::CallValue` direct-call PASS 2)
+all just returned a compile error the moment either counter hit its limit, a real, disclosed scope
+reduction (each error message said so directly: "no stack-spilled parameters yet").
+
+**Fix.** Implemented the real System V stack-spilling rule at all three sites: a parameter/argument
+that overflows its own class's register count is assigned the next slot in a single, shared
+`stack_arg_index` sequence -- incremented only for an overflowing value, in the original
+left-to-right parameter order, exactly matching the real ABI's own rule (stack arguments appear in
+left-to-right order restricted to whichever ones didn't fit in registers, interleaved regardless of
+class). Both sides of a call need to agree on this positioning without communicating it explicitly,
+and they do, because both independently replay the identical left-to-right classification.
+
+On the CALLEE side, a stack-spilled parameter is read from `frame_size + 8 + 8*stack_arg_index`
+(the same "entry-RSP is frame_size above current RSP, stack args start after the return address"
+formula the pre-existing Microsoft x64/freestanding path already used one branch below). On the
+CALLER side, this function's frame already reserves exactly this kind of space --
+`max_outgoing_stack_args`, computed once per function from its largest call site's own operand
+count, and already consumed by the Microsoft x64/freestanding general-call path -- so a
+stack-spilled OUTGOING argument is simply written to `outgoing_base + 8*stack_arg_index`, a fixed
+offset inside a region that never moves (this function's RSP is set once in the prologue and never
+adjusted again before a call), with no dynamic `sub rsp`/alignment juggling needed around the call
+itself. `max_outgoing_stack_args`'s own pre-existing sizing formula (`total_operand_count - 6`,
+ignoring the float/int class split entirely) turned out to already be a safe, if sometimes
+generous, over-approximation of the true mixed-class need -- confirmed by hand rather than assumed,
+since under-reserving here would silently corrupt an unrelated part of the frame.
+
+A stack-spilled value, whether conceptually a float (NUMBER) or a pointer/integer (STRING, OBJECT,
+ARRAY, BOOL, ...), is moved as a **raw 8-byte bit copy through RAX** rather than through an XMM
+register: RAX is never a live System V argument register, so it's always free as scratch, whereas
+every XMM0-7 register genuinely can still hold another argument's real, not-yet-spilled value at
+the exact moment a later argument needs a scratch register of its own. A `mov` and a `movsd` both
+just copy bytes for a memory-to-memory round trip (no conversion happens without an explicit
+`cvtsd2si`/`cvtsi2sd`), so this is exactly as correct as using an XMM register would have been, and
+removes any need to reason about which XMM registers are still "live" at a given point.
+
+**Verification.** Two standalone `.abas` test files (not checked into the repo -- ad hoc, run
+directly): a 10-`STRING`-parameter function (6 register + 4 stack-spilled), a 12-untyped-parameter
+(all NUMBER/float-class) function (8 register + 4 stack-spilled), an 18-parameter function
+interleaving 9 `STRING` and 9 NUMBER parameters (exercising `stack_arg_index` shared across both
+classes at once), a second call to the same functions immediately after the first (catching any
+frame-slot-reuse corruption), an 8-`BOOL`-parameter function (6 register + 2 stack-spilled,
+including a genuinely Boxed `Console.IsTTY()` result landing specifically in a stack-spilled slot
+-- the exact Entry 26/32 unboxing hazard, now also exercised past the register limit), and a
+7-`OBJECT`-parameter function (6 register + 1 stack-spilled). Every case built and ran correctly
+under BOTH the native x86-64 target and the default bytecode VM target, confirming the native
+answers are actually correct, not just self-consistent. `arcosh/build` ctest (rebuilt against the
+patched compiler): 13/13. Root project's full `ctest` suite: 121/122, same pre-existing unrelated
+`arcfsctl_smoke` failure.
