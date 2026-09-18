@@ -1,6 +1,7 @@
-#DESCRIPTION "The Arcology Shell -- WP-001..WP-012 (RFC-0052)"
+#DESCRIPTION "The Arcology Shell -- WP-001..WP-012 + WP-008 (RFC-0052)"
 
-' RFC-0052 ("The Arcology Shell", see ../rfcs/RFC-0052_The_Arcology_Shell.md), WP-001 through WP-012.
+' RFC-0052 ("The Arcology Shell", see ../rfcs/RFC-0052_The_Arcology_Shell.md), WP-001 through
+' WP-012, plus WP-008 (Display and Themes), implemented out of numeric order alongside them.
 '
 ' WP-001 (shell skeleton): interactive loop, prompt, clean exit, current directory, diagnostic
 ' output, terminal capability query, explicit no-color mode.
@@ -66,8 +67,18 @@
 ' finishing/stopping on its own schedule is reported without ever blocking the prompt), and the
 ' `jobs`/`fg`/`bg` built-ins below.
 '
-' Still not implemented: themes, plugins, completion -- later work packages (WP-008, WP-009,
-' WP-010).
+' WP-008 (display and themes): AnsiEscape/DetectColorTier/DefaultTheme/StyleCode below implement
+' RFC section 17's own literal API (Display.Style/Text/Line/Reset -- "Shell components SHOULD NOT
+' emit arbitrary ANSI sequences directly", so every raw escape byte in this whole file comes from
+' exactly these four functions, nowhere else) and section 18's themes (one bundled theme, the 8
+' required semantic roles, TrueColor/256/16 fallbacks per role, collapsing to zero styling bytes
+' at all for tier None -- AP-0052-011's own "all errors must remain understandable in monochrome
+' output" requirement, satisfied by every message's own text already carrying its full meaning
+' with color stripped out entirely). The prompt (`prompt`/`path` roles) and every `arcosh: ...`/
+' job-control notice throughout this file now go through Display.Style or the small
+' DisplayError/Warning/Success/Muted convenience wrappers instead of a bare PRINT.
+'
+' Still not implemented: plugins, completion -- later work packages (WP-009, WP-010).
 
 FUNCTION HasFlag(flagList AS ARRAY, flagName AS STRING)
     FOR flag IN flagList
@@ -173,8 +184,19 @@ FUNCTION Path.ToArcology(rawPath AS STRING)
     RETURN result
 END FUNCTION
 
+' Styled per RFC-0052 section 17/18 (Display Abstraction/Themes, WP-008) -- "arcosh:" and the
+' trailing "> " in the `prompt` role, the colon-path itself in `path`, degrading to the exact
+' original plain text when the tier is None (piped stdin, --no-color, NO_COLOR, a dumb terminal,
+' or simply no color-capable tty at all). A pure string-builder (StyleCode calls, never
+' Console.Write) so the one caller still does a single write of the whole thing, matching how
+' every other WP-002 Path.* function in this section stays a plain value-returning function.
 FUNCTION Prompt(cwd AS STRING)
-    RETURN "arcosh:" + Path.ToArcology(cwd) + "> "
+    tier = CurrentColorTier()
+    resetCode = ""
+    IF tier <> "None" THEN resetCode = AnsiEscape("0m")
+    promptStyle = StyleCode("prompt", tier)
+    pathStyle = StyleCode("path", tier)
+    RETURN promptStyle + "arcosh:" + resetCode + pathStyle + Path.ToArcology(cwd) + resetCode + promptStyle + "> " + resetCode
 END FUNCTION
 
 ' ---------------------------------------------------------------------------------------------
@@ -500,10 +522,10 @@ FUNCTION PollBackgroundJobs(jobsTable AS ARRAY)
         poll = Process.PollJob(job.Pgid)
         IF poll.Changed THEN
             IF poll.Done THEN
-                PRINT "[" + STRING(job.Number) + "]+  Done                    " + job.Command
+                ignored = DisplayMuted("[" + STRING(job.Number) + "]+  Done                    " + job.Command)
             END IF
             IF poll.Stopped THEN
-                PRINT "[" + STRING(job.Number) + "]+  Stopped                 " + job.Command
+                ignored = DisplayWarning("[" + STRING(job.Number) + "]+  Stopped                 " + job.Command)
                 job.State = "Stopped"
                 ignored = Array.Push(stillPending, job)
             END IF
@@ -544,7 +566,7 @@ FUNCTION RunForegroundJob(history AS ARRAY, jobsTable AS ARRAY, parsed AS OBJECT
 
     started = Process.StartJob(stages, stdinPath, stdoutPath, appendStdout, TRUE)
     IF !started.Ok THEN
-        PRINT "arcosh: " + started.Error
+        ignored = DisplayError("arcosh: " + started.Error)
         ignored = Array.Push(history, MakeHistoryEntry(parsed, "PROCESS_FAILED", -1))
         RETURN -1
     END IF
@@ -553,7 +575,7 @@ FUNCTION RunForegroundJob(history AS ARRAY, jobsTable AS ARRAY, parsed AS OBJECT
     lastStageFound = TRUE
     lastStageError = ""
     FOR failure IN started.NotFound
-        PRINT "arcosh: command not found: " + failure.Executable
+        ignored = DisplayError("arcosh: command not found: " + failure.Executable)
         IF failure.Executable == lastStageExecutable THEN
             lastStageFound = FALSE
             lastStageError = failure.Error
@@ -565,7 +587,7 @@ FUNCTION RunForegroundJob(history AS ARRAY, jobsTable AS ARRAY, parsed AS OBJECT
     IF waited.Stopped THEN
         jobNumber = NextJobNumber(jobsTable)
         ignored = Array.Push(jobsTable, {"Number": jobNumber, "Pgid": started.Pgid, "Command": parsed.Source, "State": "Stopped"})
-        PRINT "[" + STRING(jobNumber) + "]+  Stopped                 " + parsed.Source
+        ignored = DisplayWarning("[" + STRING(jobNumber) + "]+  Stopped                 " + parsed.Source)
         ' 148 == 128 + SIGTSTP(20), matching real shells' own $? convention for a foreground job
         ' that stopped rather than exiting -- there is no real "exit code" yet (the job is still
         ' alive), but a caller checking `last_exit_code == 0` must see this as non-success.
@@ -604,18 +626,18 @@ FUNCTION RunBackgroundJob(history AS ARRAY, jobsTable AS ARRAY, parsed AS OBJECT
 
     started = Process.StartJob(stages, stdinPath, stdoutPath, appendStdout, FALSE)
     IF !started.Ok THEN
-        PRINT "arcosh: " + started.Error
+        ignored = DisplayError("arcosh: " + started.Error)
         ignored = Array.Push(history, MakeHistoryEntry(parsed, "PROCESS_FAILED", -1))
         RETURN -1
     END IF
 
     FOR failure IN started.NotFound
-        PRINT "arcosh: command not found: " + failure.Executable
+        ignored = DisplayError("arcosh: command not found: " + failure.Executable)
     NEXT
 
     jobNumber = NextJobNumber(jobsTable)
     ignored = Array.Push(jobsTable, {"Number": jobNumber, "Pgid": started.Pgid, "Command": parsed.Source, "State": "Running"})
-    PRINT "[" + STRING(jobNumber) + "] " + STRING(started.Pgid)
+    ignored = DisplayMuted("[" + STRING(jobNumber) + "] " + STRING(started.Pgid))
 
     ' Real shells report `$?` as 0 immediately for `cmd &` regardless of what the job eventually
     ' does -- starting it successfully is the whole observable action of this statement.
@@ -627,7 +649,12 @@ END FUNCTION
 FUNCTION RunJobsCommand(jobsTable AS ARRAY)
     ignored = PollBackgroundJobs(jobsTable)
     FOR job IN jobsTable
-        PRINT "[" + STRING(job.Number) + "]+  " + job.State + "                 " + job.Command
+        line = "[" + STRING(job.Number) + "]+  " + job.State + "                 " + job.Command
+        IF job.State == "Stopped" THEN
+            ignored = DisplayWarning(line)
+        ELSE
+            ignored = DisplayMuted(line)
+        END IF
     NEXT
 END FUNCTION
 
@@ -637,22 +664,22 @@ END FUNCTION
 FUNCTION RunForegroundResume(history AS ARRAY, jobsTable AS ARRAY, arguments AS ARRAY)
     index = ResolveJobIndex(jobsTable, arguments)
     IF index < 0 THEN
-        PRINT "arcosh: fg: no such job"
+        ignored = DisplayError("arcosh: fg: no such job")
         RETURN -1
     END IF
     job = jobsTable[index]
-    PRINT job.Command
+    ignored = DisplayMuted(job.Command)
     ignored = Array.RemoveAt(jobsTable, index)
 
     resumed = Process.ContinueJob(job.Pgid, TRUE)
     IF !resumed.Ok THEN
-        PRINT "arcosh: fg: " + resumed.Error
+        ignored = DisplayError("arcosh: fg: " + resumed.Error)
         RETURN -1
     END IF
 
     waited = Process.WaitJob(job.Pgid, TRUE)
     IF waited.Stopped THEN
-        PRINT "[" + STRING(job.Number) + "]+  Stopped                 " + job.Command
+        ignored = DisplayWarning("[" + STRING(job.Number) + "]+  Stopped                 " + job.Command)
         ignored = Array.Push(jobsTable, {"Number": job.Number, "Pgid": job.Pgid, "Command": job.Command, "State": "Stopped"})
         RETURN 148
     END IF
@@ -670,24 +697,24 @@ END FUNCTION
 FUNCTION RunBackgroundResume(jobsTable AS ARRAY, arguments AS ARRAY)
     index = ResolveJobIndex(jobsTable, arguments)
     IF index < 0 THEN
-        PRINT "arcosh: bg: no such job"
+        ignored = DisplayError("arcosh: bg: no such job")
         RETURN
     END IF
     job = jobsTable[index]
     IF job.State <> "Stopped" THEN
-        PRINT "arcosh: bg: job " + STRING(job.Number) + " is already running"
+        ignored = DisplayWarning("arcosh: bg: job " + STRING(job.Number) + " is already running")
         RETURN
     END IF
 
     resumed = Process.ContinueJob(job.Pgid, FALSE)
     IF !resumed.Ok THEN
-        PRINT "arcosh: bg: " + resumed.Error
+        ignored = DisplayError("arcosh: bg: " + resumed.Error)
         RETURN
     END IF
 
     ignored = Array.RemoveAt(jobsTable, index)
     ignored = Array.Push(jobsTable, {"Number": job.Number, "Pgid": job.Pgid, "Command": job.Command, "State": "Running"})
-    PRINT "[" + STRING(job.Number) + "]+ " + job.Command + " &"
+    ignored = DisplayMuted("[" + STRING(job.Number) + "]+ " + job.Command + " &")
 END FUNCTION
 
 ' AP-0052-015's own "do not fake it" bar, same standard AP-0052-014 set for pipelines: real
@@ -914,20 +941,20 @@ END FUNCTION
 ' -- `cat file` is untouched, only `gerp -c o` gets fixed) passes through unchanged.
 FUNCTION RunOops(history AS ARRAY, jobsTable AS ARRAY, oopsCommand AS OBJECT)
     IF LEN(oopsCommand.Arguments) == 0 THEN
-        PRINT "arcosh: oops: usage: oops <command>"
+        ignored = DisplayError("arcosh: oops: usage: oops <command>")
         ignored = Array.Push(history, MakeHistoryEntry(oopsCommand, "INVALID_SYNTAX", -1))
         RETURN -1
     END IF
 
     IF LEN(history) == 0 THEN
-        PRINT "arcosh: oops: no previous command"
+        ignored = DisplayError("arcosh: oops: no previous command")
         ignored = Array.Push(history, MakeHistoryEntry(oopsCommand, "INVALID_SYNTAX", -1))
         RETURN -1
     END IF
 
     previous = history[LEN(history) - 1]
     IF previous.ResultKind <> "COMMAND_NOT_FOUND" THEN
-        PRINT "arcosh: oops: previous command did not fail with command not found"
+        ignored = DisplayError("arcosh: oops: previous command did not fail with command not found")
         ignored = Array.Push(history, MakeHistoryEntry(oopsCommand, "INVALID_SYNTAX", -1))
         RETURN -1
     END IF
@@ -959,7 +986,7 @@ FUNCTION RunOops(history AS ARRAY, jobsTable AS ARRAY, oopsCommand AS OBJECT)
         ignored = Array.Push(allStages, stage)
     NEXT
     displayText = FormatPipelineForDisplay(allStages)
-    PRINT "arcosh: retrying: " + displayText
+    ignored = DisplayMuted("arcosh: retrying: " + displayText)
     ignored = Array.Push(history, MakeHistoryEntry(oopsCommand, "SUCCESS", 0))
 
     retried = {
@@ -1077,6 +1104,233 @@ FUNCTION RunOopsSelfTest()
 END FUNCTION
 
 ' ---------------------------------------------------------------------------------------------
+' Display and Themes (RFC-0052 WP-008)
+' ---------------------------------------------------------------------------------------------
+
+' RFC section 17: "Shell components SHOULD NOT emit arbitrary ANSI sequences directly" -- every
+' raw escape sequence in this whole file is built and emitted from exactly the four Display.*
+' functions below, never inline elsewhere (arcosh's own prompt/error/job-notice call sites below
+' all go through Display.Style/Text/Line/Reset, per that same section's own example).
+FUNCTION AnsiEscape(code AS STRING)
+    RETURN Chr(27) + "[" + code
+END FUNCTION
+
+' RFC section 18: themes "SHOULD provide fallback mappings for: 24-bit / 256-color / 16-color /
+' no-color". Detected once at startup (arcosh has no runtime theme-switching command in this
+' pass -- RFC section 22, Configuration, is future work), not re-checked per Display.* call.
+' `COLORTERM=truecolor`/`24bit` is the real-world signal terminals set for 24-bit support; a
+' `TERM` containing "256color" (xterm-256color, screen-256color, ...) is the standard signal for
+' 256-color support; anything else that reaches here (a real tty, not explicitly disabled, not
+' "dumb") gets the universally-supported 16-color ANSI codes. `isTty`/`noColorFlag`/`noColorEnv`
+' are host-returned bools passed in as plain parameters and only ever used in bare `IF`/`IF !`
+' here -- never ANDALSO/ORELSE'd directly -- for the same disclosed reason the startup is_tty/no_color_flag/no_color_env
+' detection near the bottom of this file does the same.
+FUNCTION DetectColorTier(isTty AS BOOL, noColorFlag AS BOOL, noColorEnv AS BOOL, term AS STRING, colorTerm AS STRING)
+    IF !isTty THEN RETURN "None"
+    IF noColorFlag THEN RETURN "None"
+    IF noColorEnv THEN RETURN "None"
+    IF term == "dumb" ORELSE term == "" THEN RETURN "None"
+    IF colorTerm == "truecolor" ORELSE colorTerm == "24bit" THEN RETURN "TrueColor"
+    IF String.Contains(term, "256color") THEN RETURN "Color256"
+    RETURN "Color16"
+END FUNCTION
+
+' The one bundled theme AP-0052-011 requires ("create at least one bundled theme proving the
+' interface") -- the 8 required semantic roles, each mapped to a ready-to-use SGR parameter
+' string per RFC section 18's own three color-capable tiers (`None` needs no entry: StyleCode
+' below never looks one up for it). `normal` resets rather than picking a color, so
+' `Display.Style("normal")` doubles as "stop styling" without a separate call. `selection` is
+' reverse video (SGR 7) -- tier-independent, the same code in all three tiers, since it inverts
+' whatever the terminal's own default colors already are rather than picking new ones.
+FUNCTION DefaultTheme()
+    RETURN {
+        "normal":    {"TrueColor": "0", "Color256": "0", "Color16": "0"},
+        "prompt":    {"TrueColor": "1;38;2;97;175;239", "Color256": "1;38;5;75", "Color16": "1;34"},
+        "path":      {"TrueColor": "38;2;86;182;194", "Color256": "38;5;73", "Color16": "36"},
+        "success":   {"TrueColor": "38;2;98;209;150", "Color256": "38;5;71", "Color16": "32"},
+        "warning":   {"TrueColor": "38;2;229;192;123", "Color256": "38;5;179", "Color16": "33"},
+        "error":     {"TrueColor": "1;38;2;224;108;117", "Color256": "1;38;5;167", "Color16": "1;31"},
+        "muted":     {"TrueColor": "2;38;2;150;150;150", "Color256": "2;38;5;244", "Color16": "2"},
+        "selection": {"TrueColor": "7", "Color256": "7", "Color16": "7"}
+    }
+END FUNCTION
+
+' "" for an unrecognized role -- Display.Style silently no-ops for it (see its own comment on
+' why that beats panicking over a styling call, of all things).
+FUNCTION StyleCode(role AS STRING, tier AS STRING)
+    IF tier == "None" THEN RETURN ""
+    roleEntry = Object.Get(DefaultTheme(), role)
+    IF TYPEOF(roleEntry) <> "Object" THEN RETURN ""
+    code = Object.Get(roleEntry, tier)
+    IF code == "" THEN RETURN ""
+    RETURN AnsiEscape(code + "m")
+END FUNCTION
+
+' Session-wide color tier, set once at startup (see the main script body below) and read by every
+' Display.* call via Runtime.GetGlobal/SetGlobal -- the documented, host-provided mechanism for
+' exactly this "a function needs to read state a totally different part of the program set"
+' need (the same primitive AstAmirBuilder::apply_script_global_scoping itself is built on, per
+' Runtime.GetGlobal's own comment in runtime.cpp), rather than threading a tier parameter through
+' every single call site (and RFC section 17's own example -- `Display.Text(...)` then
+' `Display.Style(...)` then `Display.Line(...)` then `Display.Reset()` -- takes exactly one
+' argument each, not a tier parameter on top).
+FUNCTION CurrentColorTier()
+    tier = Runtime.GetGlobal("arcosh_color_tier")
+    IF tier == "" THEN RETURN "None"
+    RETURN tier
+END FUNCTION
+
+' Display.Style/Text/Line/Reset -- RFC section 17's own literal API. Deliberately never fails on
+' an unrecognized role (falls through StyleCode's own "" case to a no-op): a styling call is
+' cosmetic by construction, and AP-0052-011's own "all errors must remain understandable in
+' monochrome output" rule means the actual MEANING of any message these wrap must already be
+' carried entirely by its own text -- a missing/wrong color is a coloring bug, never a
+' comprehension one, so it should never be treated as an error condition capable of hiding or
+' replacing that text.
+FUNCTION Display.Style(role AS STRING)
+    ignored = Console.Write(StyleCode(role, CurrentColorTier()))
+END FUNCTION
+
+FUNCTION Display.Text(text AS STRING)
+    ignored = Console.Write(text)
+END FUNCTION
+
+FUNCTION Display.Line(text AS STRING)
+    PRINT text
+END FUNCTION
+
+FUNCTION Display.Reset()
+    tier = CurrentColorTier()
+    IF tier <> "None" THEN ignored = Console.Write(AnsiEscape("0m"))
+END FUNCTION
+
+' Small convenience wrappers used throughout the rest of this file wherever a single styled line
+' needs to be printed and immediately reset -- every one of these still reads as a plain,
+' complete, meaningful sentence with the color stripped out entirely (AP-0052-011's own
+' monochrome requirement), matching the existing "arcosh: ..." message text this project already
+' uses verbatim, just now optionally colored.
+FUNCTION DisplayStyledLine(role AS STRING, text AS STRING)
+    ignored = Display.Style(role)
+    ignored = Display.Line(text)
+    ignored = Display.Reset()
+END FUNCTION
+
+FUNCTION DisplayError(text AS STRING)
+    ignored = DisplayStyledLine("error", text)
+END FUNCTION
+
+FUNCTION DisplayWarning(text AS STRING)
+    ignored = DisplayStyledLine("warning", text)
+END FUNCTION
+
+FUNCTION DisplaySuccess(text AS STRING)
+    ignored = DisplayStyledLine("success", text)
+END FUNCTION
+
+FUNCTION DisplayMuted(text AS STRING)
+    ignored = DisplayStyledLine("muted", text)
+END FUNCTION
+
+' Structural + real-output regression coverage. `--no-color`/`NO_COLOR`/non-tty all collapsing to
+' tier "None" is already covered by the pre-existing is_tty/no_color_flag/no_color_env detection
+' this reuses the same signals as; what's new here is the theme/tier -> actual ANSI bytes mapping.
+FUNCTION RunDisplaySelfTest()
+    failures = 0
+
+    IF DetectColorTier(FALSE, FALSE, FALSE, "xterm-256color", "") == "None" THEN
+        PRINT "ok   no tty forces tier None regardless of TERM/COLORTERM"
+    ELSE
+        PRINT "FAIL no tty did not force tier None"
+        failures = failures + 1
+    END IF
+
+    IF DetectColorTier(TRUE, TRUE, FALSE, "xterm-256color", "truecolor") == "None" THEN
+        PRINT "ok   --no-color forces tier None even with COLORTERM=truecolor"
+    ELSE
+        PRINT "FAIL --no-color did not force tier None"
+        failures = failures + 1
+    END IF
+
+    IF DetectColorTier(TRUE, FALSE, FALSE, "dumb", "") == "None" THEN
+        PRINT "ok   TERM=dumb forces tier None"
+    ELSE
+        PRINT "FAIL TERM=dumb did not force tier None"
+        failures = failures + 1
+    END IF
+
+    IF DetectColorTier(TRUE, FALSE, FALSE, "xterm", "truecolor") == "TrueColor" THEN
+        PRINT "ok   COLORTERM=truecolor selects tier TrueColor"
+    ELSE
+        PRINT "FAIL COLORTERM=truecolor did not select tier TrueColor"
+        failures = failures + 1
+    END IF
+
+    IF DetectColorTier(TRUE, FALSE, FALSE, "xterm-256color", "") == "Color256" THEN
+        PRINT "ok   TERM containing 256color selects tier Color256"
+    ELSE
+        PRINT "FAIL TERM=xterm-256color did not select tier Color256"
+        failures = failures + 1
+    END IF
+
+    IF DetectColorTier(TRUE, FALSE, FALSE, "xterm", "") == "Color16" THEN
+        PRINT "ok   an ordinary tty with no other signal selects tier Color16"
+    ELSE
+        PRINT "FAIL a plain tty did not select tier Color16"
+        failures = failures + 1
+    END IF
+
+    requiredRoles = ["normal", "prompt", "path", "success", "warning", "error", "muted", "selection"]
+    theme = DefaultTheme()
+    FOR role IN requiredRoles
+        entry = Object.Get(theme, role)
+        IF TYPEOF(entry) == "Object" THEN
+            hasAllTiers = Object.Has(entry, "TrueColor")
+            IF hasAllTiers THEN hasAllTiers = Object.Has(entry, "Color256")
+            IF hasAllTiers THEN hasAllTiers = Object.Has(entry, "Color16")
+            IF hasAllTiers THEN
+                PRINT "ok   theme role " + role + " has TrueColor/Color256/Color16 fallbacks"
+            ELSE
+                PRINT "FAIL theme role " + role + " is missing a tier"
+                failures = failures + 1
+            END IF
+        ELSE
+            PRINT "FAIL theme is missing required role " + role
+            failures = failures + 1
+        END IF
+    NEXT
+
+    expectedError = AnsiEscape("1;38;2;224;108;117m") + "!" + AnsiEscape("0m")
+    actualError = StyleCode("error", "TrueColor") + "!" + AnsiEscape("0m")
+    IF actualError == expectedError THEN
+        PRINT "ok   StyleCode produces the real ANSI bytes for a known role/tier pair"
+    ELSE
+        PRINT "FAIL StyleCode produced unexpected bytes for error/TrueColor"
+        failures = failures + 1
+    END IF
+
+    IF StyleCode("not-a-real-role", "TrueColor") == "" THEN
+        PRINT "ok   an unrecognized role silently no-ops instead of failing"
+    ELSE
+        PRINT "FAIL an unrecognized role did not no-op"
+        failures = failures + 1
+    END IF
+
+    ' Real output, not just structure: Display.Reset must never emit anything when the tier is
+    ' None -- an actual monochrome terminal (or a pipe, as ctest itself is) must see byte-for-byte
+    ' plain text, never a stray escape code it can't render.
+    ignored = Runtime.SetGlobal("arcosh_color_tier", "None")
+    noneStyle = StyleCode("error", CurrentColorTier())
+    IF noneStyle == "" THEN
+        PRINT "ok   tier None produces zero style bytes for any role"
+    ELSE
+        PRINT "FAIL tier None still produced style bytes"
+        failures = failures + 1
+    END IF
+
+    RETURN failures
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
 ' Resident ArcoBASIC Program (RFC-0052 WP-006)
 ' ---------------------------------------------------------------------------------------------
 
@@ -1135,7 +1389,7 @@ END FUNCTION
 ' directly.
 FUNCTION RunImmediateInput(command AS STRING)
     result = Runtime.EvalImmediate(command)
-    IF !result.Ok THEN PRINT "arcosh: " + result.Error
+    IF !result.Ok THEN ignored = DisplayError("arcosh: " + result.Error)
 END FUNCTION
 
 ' RFC section 9's own rules: new numbered line -> insert; existing numbered line -> replace; bare
@@ -1295,7 +1549,7 @@ END FUNCTION
 ' needing to capture PRINT output or touch the filesystem from inside the nested Runtime. Nested
 ' IF rather than ANDALSO throughout -- Ok/Exited are Boxed booleans (object fields off
 ' Runtime.RunString's returned OBJECT), and this file avoids combining a Boxed bool with
-' ANDALSO/ORELSE everywhere else too (see the color_ok comment above for the disclosed reason).
+' ANDALSO/ORELSE everywhere else too (see the is_tty comment above for the disclosed reason).
 FUNCTION AssertScriptRanOk(label AS STRING, outcome AS OBJECT, expectedExitCode)
     IF !outcome.Ok THEN
         PRINT "FAIL " + label + ": " + outcome.Error
@@ -1451,10 +1705,11 @@ FUNCTION RunPathLayerSelfTest()
     RETURN failures
 END FUNCTION
 
-version = "0.8.0-wp012"
+version = "0.9.0-wp008"
 no_color_flag = HasFlag(Args, "--no-color")
 no_color_env = Process.Env("NO_COLOR") <> ""
 term = Process.Env("TERM")
+color_term = Process.Env("COLORTERM")
 is_tty = Console.IsTTY()
 
 ' NOTE: this backend's generic host-function bridge (src/native/host_bridge.cpp) has a real,
@@ -1465,19 +1720,11 @@ is_tty = Console.IsTTY()
 ' of ANDALSO wherever a host-returned bool (is_tty) is involved; comparison-expression results
 ' (term <> "dumb", String.Slice(...) == ":", etc.) combine via ANDALSO/ORELSE without issue
 ' throughout the rest of this file.
-color_ok = FALSE
-IF is_tty THEN
-    IF !no_color_flag THEN
-        IF !no_color_env THEN
-            IF term <> "dumb" ANDALSO term <> "" THEN
-                color_ok = TRUE
-            END IF
-        END IF
-    END IF
-END IF
+color_tier = DetectColorTier(is_tty, no_color_flag, no_color_env, term, color_term)
+ignored = Runtime.SetGlobal("arcosh_color_tier", color_tier)
 
 IF HasFlag(Args, "--version") THEN
-    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012)"
+    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008)"
     ExitTheProgram(0)
 END IF
 
@@ -1488,9 +1735,10 @@ IF HasFlag(Args, "--diagnostic") THEN
     PRINT "  cwd (arcology): " + Path.ToArcology(Path.Cwd())
     PRINT "  stdout is tty:  " + STRING(is_tty)
     PRINT "  TERM:           " + term
+    PRINT "  COLORTERM:      " + color_term
     PRINT "  NO_COLOR set:   " + STRING(no_color_env)
     PRINT "  --no-color:     " + STRING(no_color_flag)
-    PRINT "  color enabled:  " + STRING(color_ok)
+    PRINT "  color tier:     " + color_tier
     ExitTheProgram(0)
 END IF
 
@@ -1565,14 +1813,29 @@ IF HasFlag(Args, "--selftest-jobcontrol") THEN
     ExitTheProgram(0)
 END IF
 
+IF HasFlag(Args, "--selftest-display") THEN
+    failures = RunDisplaySelfTest()
+    IF failures > 0 THEN
+        PRINT STRING(failures) + " display/theme test(s) failed"
+        ExitTheProgram(1)
+    END IF
+    PRINT "all display/theme tests passed"
+    ExitTheProgram(0)
+END IF
+
 ' Reduced terminal capability (piped stdin, dumb terminal, no color) must degrade gracefully
-' rather than fail: no ANSI codes are ever emitted by this skeleton, so color_ok currently only
-' affects the banner line below. Real semantic styling (Display.*/Terminal.* per RFC-0052 section
-' 17) is WP-008, not this skeleton.
-IF color_ok THEN
-    PRINT "Arcology Shell (arcosh) " + version
+' rather than fail -- RFC-0052 section 17/18 (Display and Themes, WP-008): the banner uses the
+' real `prompt` role through Display.Style/Reset like everything else in this file now does,
+' which itself already degrades to plain text at tier None, so the explicit "[no-color]" suffix
+' below is purely an extra, redundant confirmation for the human reading it, not something the
+' styling itself depends on.
+ignored = Display.Style("prompt")
+ignored = Display.Text("Arcology Shell (arcosh) " + version)
+ignored = Display.Reset()
+IF color_tier == "None" THEN
+    PRINT " [no-color]"
 ELSE
-    PRINT "Arcology Shell (arcosh) " + version + " [no-color]"
+    PRINT ""
 END IF
 
 IF !is_tty THEN
@@ -1653,7 +1916,7 @@ WHILE running
         IF changeResult.Ok THEN
             ignored = Array.Push(history, MakeHistoryEntry(parsed, "SUCCESS", 0))
         ELSE
-            PRINT "arcosh: cd: " + target + ": " + changeResult.Error
+            ignored = DisplayError("arcosh: cd: " + target + ": " + changeResult.Error)
             ignored = Array.Push(history, MakeHistoryEntry(parsed, "PATH_NOT_FOUND", -1))
         END IF
         CONTINUE WHILE
@@ -1697,7 +1960,7 @@ WHILE running
         IF LEN(parsed.Arguments) > 0 THEN
             scriptResult = RunScriptFile(parsed.Arguments[0])
             IF !scriptResult.Ok THEN
-                PRINT "arcosh: run: " + scriptResult.Error
+                ignored = DisplayError("arcosh: run: " + scriptResult.Error)
             END IF
             CONTINUE WHILE
         END IF
@@ -1708,7 +1971,7 @@ WHILE running
             NEXT
             runResult = Runtime.RunString(String.Join(lines, "\n"))
             IF !runResult.Ok THEN
-                PRINT "arcosh: run: " + runResult.Error
+                ignored = DisplayError("arcosh: run: " + runResult.Error)
             END IF
         END IF
         CONTINUE WHILE

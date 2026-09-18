@@ -8,7 +8,7 @@ standalone CMake project independent of the umbrella ArcoBASIC build (it is not
 Per RFC-0052 section 6, `arcosh` is authored **in ArcoBASIC itself** and compiled through
 ArcoFission, not hand-written in C++.
 
-## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control)
+## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes)
 
 `src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
 
@@ -165,8 +165,40 @@ own explicit requirement):
   until the job actually finishes), and separately `bg` (resumes into the background, `jobs` shows
   `Running` until it completes on its own).
 
-It does not yet implement themes, plugins, or completion — later work packages (WP-008, WP-009,
-WP-010).
+and AP-0052-011 (WP-008 Display and Themes, implemented out of numeric order alongside WP-012):
+
+* RFC section 17's own literal API (`Display.Style`/`Text`/`Line`/`Reset`) — "Shell components
+  SHOULD NOT emit arbitrary ANSI sequences directly", so every raw escape byte anywhere in this
+  file comes from exactly these four functions;
+* the 8 required semantic roles (`normal`/`prompt`/`path`/`success`/`warning`/`error`/`muted`/
+  `selection`), each with `TrueColor`/`Color256`/`Color16` fallbacks in the one bundled default
+  theme (`DefaultTheme`), detected once at startup (`DetectColorTier`, using `COLORTERM`/`TERM`/
+  `NO_COLOR`/`--no-color`/tty-ness) and collapsing to zero styling bytes at all for tier `None` —
+  AP-0052-011's own "all errors must remain understandable in monochrome output" requirement,
+  satisfied by every message's own text already carrying its full meaning with color stripped out
+  entirely;
+* the prompt (`prompt`/`path` roles) and every `arcosh: ...`/job-control notice throughout this
+  file now go through `Display.Style` or the small `DisplayError`/`Warning`/`Success`/`Muted`
+  convenience wrappers instead of a bare `PRINT`;
+* verified structurally and by real output: `--selftest-display` (tier detection for all four
+  signal combinations, the theme's own role/tier completeness, the exact ANSI bytes `StyleCode`
+  produces, and zero bytes at tier `None`), plus manual verification against the real compiled
+  binary under a real pty with `TERM=xterm-256color`/`COLORTERM=truecolor` set — the styled prompt,
+  banner, and a real `command not found` error all confirmed byte-for-byte correct.
+
+A new general-purpose `Chr(code)` host function (classic BASIC `CHR$`) was added to `arco_runtime`
+for this — the lexer's own string-literal escapes have no way to embed a raw ESC (0x1B) byte to
+build an ANSI SGR sequence. Building this also required fixing a fourth real native-backend
+miscompilation, found the same way as the others this project: a `BOOL`-typed parameter's argument
+could be genuinely Boxed at the call site (any host-function-call result, e.g. `Console.IsTTY()`)
+but was never actually unboxed, just bit-loaded and masked to its low byte — a real heap pointer's
+low byte, not its truthiness. See `.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md` Entry 32, and Entry 31
+for a separate, real 4-minute-plus native build this same pass found and fixed (a missing
+memoization in the compiler's own static type-inference analysis, disclosed but left undone back
+in Entry 24 — now fixed, cutting the affected build down to well under a minute, though still
+slower than this project's single-digit-second norm and only partially root-caused).
+
+It does not yet implement plugins or completion — later work packages (WP-009, WP-010).
 
 See `.agents/reports/ARCO_SH_RFC0052_WP000_REPOSITORY_AUDIT.md` (in the repo root's `.agents/`
 directory) for the mandatory pre-implementation audit this work was built against.
@@ -220,6 +252,9 @@ small primitives were added there (colon-path translation itself is pure ArcoBAS
 * `Process.ContinueJob(pgid, foreground)` -> `{Ok, Error}` (WP-012; sends `SIGCONT` to a job's
   process group — harmless no-op if it wasn't actually stopped — and, if `foreground`, also
   reclaims the terminal for it; backs both `fg` and `bg`)
+* `Chr(code)` -> a one-character string (WP-008; classic BASIC `CHR$` — general-purpose, not
+  shell-specific, added because the lexer's own string-literal escapes have no way to embed a raw
+  ESC byte to build an ANSI SGR sequence)
 
 ## Relationship to the previous implementation
 

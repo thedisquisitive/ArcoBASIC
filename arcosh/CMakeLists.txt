@@ -92,4 +92,7 @@ if(BUILD_TESTING)
     # and .agents/reports/ARCO_SH_RFC0052_WP012_JOB_CONTROL_RESEARCH.md) -- see
     # RunJobControlSelfTest in src/arcosh.abas.
     add_test(NAME arcosh_job_control_selftest COMMAND ${ARCOSH_BINARY} --selftest-jobcontrol)
+    # RFC-0052 AP-0052-011 (WP-008): semantic styling roles, TrueColor/256/16/None tier detection
+    # and fallback, and the one bundled theme -- see RunDisplaySelfTest in src/arcosh.abas.
+    add_test(NAME arcosh_display_selftest COMMAND ${ARCOSH_BINARY} --selftest-display)
 endif()

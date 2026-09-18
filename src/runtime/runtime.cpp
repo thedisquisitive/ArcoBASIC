@@ -3264,6 +3264,37 @@ Runtime::Runtime()
         }
         return args[0].to_string();
     });
+    // Classic BASIC CHR$ -- returns the one-character string for a Unicode code point. Added for
+    // RFC-0052 WP-008 (Display and Themes): the lexer's own string-literal escapes are limited to
+    // \n/\r/\t/\"/\\/\0 (src/frontend/lexer.cpp), with no way to embed a raw ESC (0x1B) byte to
+    // build an ANSI SGR sequence -- CHR(27) is the general-purpose, not shell-specific, way to get
+    // one. Encodes to UTF-8 for any code point, not just ASCII, matching how every other string in
+    // this runtime is represented (to_string()/is_string() throughout is plain UTF-8 std::string).
+    register_function("Chr", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Chr", 1, 1);
+        const double raw = args[0].as_number();
+        if (!std::isfinite(raw) || std::floor(raw) != raw || raw < 0 || raw > 0x10FFFF) {
+            throw std::runtime_error("Chr argument must be a valid Unicode code point");
+        }
+        const unsigned int code_point = static_cast<unsigned int>(raw);
+        std::string encoded;
+        if (code_point < 0x80) {
+            encoded.push_back(static_cast<char>(code_point));
+        } else if (code_point < 0x800) {
+            encoded.push_back(static_cast<char>(0xC0 | (code_point >> 6)));
+            encoded.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+        } else if (code_point < 0x10000) {
+            encoded.push_back(static_cast<char>(0xE0 | (code_point >> 12)));
+            encoded.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
+            encoded.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+        } else {
+            encoded.push_back(static_cast<char>(0xF0 | (code_point >> 18)));
+            encoded.push_back(static_cast<char>(0x80 | ((code_point >> 12) & 0x3F)));
+            encoded.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
+            encoded.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+        }
+        return encoded;
+    });
     register_function("REF", [this](const std::vector<Value>& args) -> Value {
         if (args.size() < 1 || args.size() > 2) {
             throw std::runtime_error("REF expects 1 or 2 arguments");
