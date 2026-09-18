@@ -1609,6 +1609,12 @@ FUNCTION HelpTopics()
                 "                none",
                 "    date        today's date (YYYY-MM-DD)",
                 "    time        the current wall-clock time (HH:MM:SS)",
+                "    year        4-digit year, year2   2-digit year",
+                "    month       2-digit month (01-12), day     2-digit day of month (01-31)",
+                "    hour        2-digit 24h hour, minute   2-digit minute, second   2-digit second",
+                "    millisecond 3-digit millisecond (000-999) -- combine these individually",
+                "                instead of \"date\"/\"time\" for a custom layout, e.g. \"prompt set",
+                "                day,month,year2,hour,minute\" for a DD/MM/YY HH:MM style",
                 "",
                 "Color tags: every segment renders in its own default color (see \"help themes\"",
                 "for the role names), but any segment can be pinned to a specific role instead --",
@@ -1997,7 +2003,8 @@ END FUNCTION
 ' changing shape just because segments now exist as a concept, plus "date"/"time" (today's date,
 ' the current wall-clock time) built on Time.Now()'s own fixed "YYYY-MM-DD HH:MM:SS" format.
 FUNCTION KnownPromptSegments()
-    RETURN ["classic", "path", "hostname", "exitcode", "jobs", "date", "time"]
+    RETURN ["classic", "path", "hostname", "exitcode", "jobs", "date", "time",
+        "year", "year2", "month", "day", "hour", "minute", "second", "millisecond"]
 END FUNCTION
 
 FUNCTION DefaultPromptSegments()
@@ -2025,8 +2032,8 @@ FUNCTION DefaultSegmentRole(name AS STRING)
     IF name == "path" THEN RETURN "path"
     IF name == "hostname" THEN RETURN "prompt"
     IF name == "jobs" THEN RETURN "warning"
-    IF name == "date" THEN RETURN "muted"
-    IF name == "time" THEN RETURN "muted"
+    dateTimeSegments = ["date", "time", "year", "year2", "month", "day", "hour", "minute", "second", "millisecond"]
+    IF Array.Contains(dateTimeSegments, name) THEN RETURN "muted"
     RETURN "normal"
 END FUNCTION
 
@@ -2095,11 +2102,27 @@ FUNCTION RenderPromptSegment(name AS STRING, cwd AS STRING, lastExitCode AS NUMB
         IF count == 0 THEN RETURN ""
         RETURN style + STRING(count) + "j" + resetCode
     END IF
-    ' Time.Now()'s own fixed format is "YYYY-MM-DD HH:MM:SS" (19 characters) -- the date is the
-    ' first 10, the time the 8 after the single separating space, sliced directly rather than
-    ' adding a dedicated date-only/time-only host primitive for what's already one fixed layout.
+    ' Time.Now()'s own fixed format is "YYYY-MM-DD HH:MM:SS" (19 characters, every field already
+    ' zero-padded by std::put_time) -- date/time and each individual field below are all sliced
+    ' directly out of it rather than adding a dedicated primitive per field. Each segment fetches
+    ' its own fresh Time.Now() (matching a real, disclosed limitation "date"/"time" already had):
+    ' combining several of these in one prompt (e.g. "year,month,day") can, in the rarest possible
+    ' case, straddle a rollover between two calls (year 23:59:59.999 -> 00:00:00.000) and show a
+    ' date one instant apart from the time -- never wrong once printed, just not perfectly atomic.
     IF name == "date" THEN RETURN style + String.Slice(Time.Now(), 0, 10) + resetCode
     IF name == "time" THEN RETURN style + String.Slice(Time.Now(), 11, 8) + resetCode
+    IF name == "year" THEN RETURN style + String.Slice(Time.Now(), 0, 4) + resetCode
+    IF name == "year2" THEN RETURN style + String.Slice(Time.Now(), 2, 2) + resetCode
+    IF name == "month" THEN RETURN style + String.Slice(Time.Now(), 5, 2) + resetCode
+    IF name == "day" THEN RETURN style + String.Slice(Time.Now(), 8, 2) + resetCode
+    IF name == "hour" THEN RETURN style + String.Slice(Time.Now(), 11, 2) + resetCode
+    IF name == "minute" THEN RETURN style + String.Slice(Time.Now(), 14, 2) + resetCode
+    IF name == "second" THEN RETURN style + String.Slice(Time.Now(), 17, 2) + resetCode
+    ' The only field NOT available from Time.Now()'s own string -- std::time_t's resolution is
+    ' whole seconds, so this is Time.Milliseconds()'s own dedicated primitive instead, padded to
+    ' a fixed 3 digits (STRING(7) is "7", not "007") the same way every other field above already
+    ' is by std::put_time.
+    IF name == "millisecond" THEN RETURN style + PadNumber(Time.Milliseconds(), 3) + resetCode
     RETURN ""
 END FUNCTION
 
@@ -2205,6 +2228,17 @@ FUNCTION IsAllDigits(text AS STRING)
         i = i + 1
     WEND
     RETURN TRUE
+END FUNCTION
+
+' Zero-pads a non-negative whole number out to `width` digits (STRING(7) is "7", not "007") --
+' used by the "millisecond" prompt segment, the one date/time field not already zero-padded by
+' Time.Now()'s own std::put_time formatting.
+FUNCTION PadNumber(value AS NUMBER, width AS NUMBER)
+    text = STRING(value)
+    WHILE LEN(text) < width
+        text = "0" + text
+    WEND
+    RETURN text
 END FUNCTION
 
 ' A small curated palette of NAMED colors (not raw ANSI codes) so "design your look and feel" is
@@ -2882,6 +2916,54 @@ FUNCTION RunProfileSelfTest()
         failures = failures + 1
     END IF
 
+    ' Broken-down date/time fields: each checked for the right WIDTH and all-digits, not an exact
+    ' value (the real wall clock, not under this test's control). year/month/day/hour/minute/
+    ' second must also each be a SUBSTRING of the combined "date"/"time" segments rendered in the
+    ' same instant, proving they're sliced from the exact same fields, not independently wrong in
+    ' a way that happens to still be the right length.
+    combinedDate = String.Slice(RenderPromptSegment("date", "/tmp", 0, [], "None", "", {}), 0, 10)
+    combinedTime = String.Slice(RenderPromptSegment("time", "/tmp", 0, [], "None", "", {}), 0, 8)
+    fieldsOk = TRUE
+    FOR fieldSpec IN [{"Name": "year", "Width": 4}, {"Name": "month", "Width": 2}, {"Name": "day", "Width": 2},
+        {"Name": "hour", "Width": 2}, {"Name": "minute", "Width": 2}, {"Name": "second", "Width": 2}]
+        rendered = RenderPromptSegment(fieldSpec.Name, "/tmp", 0, [], "None", "", {})
+        IF LEN(rendered) <> fieldSpec.Width THEN fieldsOk = FALSE
+        IF !IsAllDigits(rendered) THEN fieldsOk = FALSE
+    NEXT
+    IF fieldsOk THEN
+        PRINT "ok   year/month/day/hour/minute/second each render as the right width, all digits"
+    ELSE
+        PRINT "FAIL a broken-down date/time field had the wrong width or non-digit content"
+        failures = failures + 1
+    END IF
+    year2Rendered = RenderPromptSegment("year2", "/tmp", 0, [], "None", "", {})
+    IF LEN(year2Rendered) == 2 ANDALSO IsAllDigits(year2Rendered) ANDALSO String.Slice(combinedDate, 2, 2) == year2Rendered THEN
+        PRINT "ok   year2 renders the last 2 digits of the 4-digit year"
+    ELSE
+        PRINT "FAIL year2 rendered: [" + year2Rendered + "]"
+        failures = failures + 1
+    END IF
+    IF String.Slice(combinedTime, 0, 2) == RenderPromptSegment("hour", "/tmp", 0, [], "None", "", {}) THEN
+        PRINT "ok   the hour field agrees with the combined time segment"
+    ELSE
+        PRINT "FAIL the hour field did not agree with the combined time segment"
+        failures = failures + 1
+    END IF
+
+    IF PadNumber(7, 3) == "007" ANDALSO PadNumber(42, 3) == "042" ANDALSO PadNumber(999, 3) == "999" THEN
+        PRINT "ok   PadNumber zero-pads to the requested width without truncating a wider number"
+    ELSE
+        PRINT "FAIL PadNumber did not pad correctly"
+        failures = failures + 1
+    END IF
+    millisRendered = RenderPromptSegment("millisecond", "/tmp", 0, [], "None", "", {})
+    IF LEN(millisRendered) == 3 ANDALSO IsAllDigits(millisRendered) THEN
+        PRINT "ok   the millisecond segment renders a zero-padded 3-digit value"
+    ELSE
+        PRINT "FAIL millisecond segment rendered: [" + millisRendered + "]"
+        failures = failures + 1
+    END IF
+
     ' Color tags: an explicit tag overrides a segment's own default role, "default" clears it back,
     ' and exitcode's own dynamic success/error behavior still applies when untagged.
     taggedTheme = ParseThemeText("")
@@ -3454,7 +3536,7 @@ FUNCTION RunPathLayerSelfTest()
     RETURN failures
 END FUNCTION
 
-version = "0.12.0-prompt-tags"
+version = "0.13.0-datetime-fields"
 no_color_flag = HasFlag(Args, "--no-color")
 no_color_env = Process.Env("NO_COLOR") <> ""
 term = Process.Env("TERM")
@@ -3484,7 +3566,7 @@ color_tier = DetectColorTier(is_tty, effective_no_color_flag, no_color_env, term
 ignored = Runtime.SetGlobal("arcosh_color_tier", color_tier)
 
 IF HasFlag(Args, "--version") THEN
-    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008, HELP, Profiles, Editors, Prompt Color Tags)"
+    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008, HELP, Profiles, Editors, Prompt Color Tags, Date/Time Fields)"
     ExitTheProgram(0)
 END IF
 

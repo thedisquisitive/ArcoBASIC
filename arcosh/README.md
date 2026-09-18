@@ -10,7 +10,8 @@ ArcoFission, not hand-written in C++.
 
 ## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes),
 a built-in HELP command, profile/theme/prompt customization (RFC-0052 sections 20/22), interactive
-theme/prompt editors on top of it, and date/time prompt segments with per-segment color tags
+theme/prompt editors on top of it, per-segment prompt color tags, and broken-down date/time
+prompt fields
 
 `src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
 
@@ -314,7 +315,25 @@ and make the parts that matter impossible to miss:
   switched to the tagged "error" red immediately and stayed that way, and an untagged `exitcode`
   still switched from green to red on its own after a real failing command.
 
-It does not yet implement plugins or completion — later work packages (WP-009, WP-010).
+and `date`/`time` broken down into individual fields, so a custom layout (`DD/MM/YY HH:MM:SS`,
+say) doesn't require the whole combined segment: `year` (4-digit), `year2` (2-digit), `month`,
+`day`, `hour`, `minute`, `second` (all sliced from `Time.Now()`'s own fixed, already zero-padded
+string, the same way `date`/`time` themselves are) and `millisecond` (3-digit, zero-padded by a
+new `PadNumber` helper) — the one field `Time.Now()`'s whole-second string genuinely can't provide,
+backed by a new `Time.Milliseconds()` `arco_runtime` primitive (`std::chrono`'s own millisecond-
+resolution clock, since `std::time_t` itself only has second resolution). E.g. `prompt set
+day,month,year2,hour,minute,second,millisecond` composes exactly that layout. Verified via
+`--selftest-profile` (every field checked for the right width and digit content, and cross-checked
+against the combined `date`/`time` segments rendered in the same instant to confirm they agree)
+plus a real pty run showing genuinely live, incrementing millisecond values between two prompts.
+
+It does not yet implement plugins or completion — later work packages (WP-009, WP-010). RFC-0052
+section 19 already earmarks `Shell.RegisterPromptSegment(...)` for WP-009 to let a plugin add its
+own prompt segments the same way `git`'s own prompt integrations do in other shells — today's
+segment dispatch (`KnownPromptSegments`/`DefaultSegmentRole`/`RenderPromptSegment`, all plain
+string-keyed) is deliberately simple specifically so WP-009 has an obvious, minimal seam to extend
+later, but no plugin-loading machinery exists yet; building that is WP-009's own work, not
+something this pass tried to partially anticipate beyond leaving that seam clean.
 
 See `.agents/reports/ARCO_SH_RFC0052_WP000_REPOSITORY_AUDIT.md` (in the repo root's `.agents/`
 directory) for the mandatory pre-implementation audit this work was built against.

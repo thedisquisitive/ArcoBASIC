@@ -2958,6 +2958,18 @@ Value time_now_function(const std::vector<Value>& args) {
     return output.str();
 }
 
+// The millisecond-of-second component (0-999) alone -- Time.Now()'s own fixed "YYYY-MM-DD
+// HH:MM:SS" format has no sub-second field to slice out (std::time_t's own resolution is whole
+// seconds), so a broken-down "millisecond" prompt segment (arcosh, RFC-0052 section 20) needs
+// this as its own primitive rather than reusing Time.Now()'s string.
+Value time_milliseconds_function(const std::vector<Value>& args) {
+    expect_arg_count(args, "Time.Milliseconds", 0, 0);
+    const auto now = std::chrono::system_clock::now();
+    const auto since_epoch = now.time_since_epoch();
+    const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(since_epoch).count() % 1000;
+    return static_cast<double>(millis);
+}
+
 Value sleep_function(const std::vector<Value>& args) {
     expect_arg_count(args, "Sleep", 1, 1);
     const auto milliseconds = static_cast<int>(args[0].as_number());
@@ -4274,6 +4286,7 @@ Runtime::Runtime()
     register_function("HexToBytes", hex_to_bytes_function);
     register_function("Time.Now", time_now_function);
     register_function("Time.Timestamp", time_timestamp_function);
+    register_function("Time.Milliseconds", time_milliseconds_function);
     register_function("DATE", time_now_function);
     register_function("Date", time_now_function);
     register_function("Sleep", sleep_function);
