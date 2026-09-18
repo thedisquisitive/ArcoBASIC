@@ -4393,15 +4393,26 @@ HostedValueKind infer_function_return_kind_uncached(const AmirModule& module, co
 // from many call sites (e.g. arcosh.abas's own DefaultTheme(), read by every Display.Style call)
 // previously re-walked its entire body -- every RETURN statement, each one a fresh
 // infer_hosted_value_kind_uncached call of its own -- from scratch at EVERY call site.
+// Keyed on (callee, depth) rather than depth==0 only (see Entry 33 in
+// .agents/ARCO_NATIVE_RUNTIME_PROGRESS.md): infer_*_uncached is a pure function of (module,
+// callee/function, name, depth) -- the module is fixed for the whole compile and depth is just a
+// recursion-budget counter, never mutated state -- so unlike sharing ONE bucket across different
+// depths (which really could "starve" a later, more-generously-budgeted query with a
+// budget-limited answer, the original concern that limited Entry 31's fix to depth==0), giving
+// EACH depth its own bucket has no such risk: a query at a given depth always sees the same
+// fixed budget and therefore always computes the same answer, so reusing it is always correct.
+// This matters because interior (depth>0) queries recur constantly with IDENTICAL (callee, depth)
+// pairs -- e.g. every call site anywhere that calls the same small helper function triggers an
+// infer_function_return_kind(callee, 1) for that helper, previously re-walking its entire body
+// from scratch EVERY TIME; a file with many small functions each called from many places (like
+// arcosh.abas's theme/prompt editors and their self-test) hits this constantly.
 HostedValueKind infer_function_return_kind(const AmirModule& module, const AmirFunction& callee, int depth = 0) {
-    if (depth != 0) {
-        return infer_function_return_kind_uncached(module, callee, depth);
-    }
-    static std::unordered_map<const AmirFunction*, HostedValueKind> cache;
-    const auto found = cache.find(&callee);
-    if (found != cache.end()) return found->second;
+    static std::unordered_map<const AmirFunction*, std::unordered_map<int, HostedValueKind>> cache;
+    auto& callee_cache = cache[&callee];
+    const auto found = callee_cache.find(depth);
+    if (found != callee_cache.end()) return found->second;
     const HostedValueKind result = infer_function_return_kind_uncached(module, callee, depth);
-    cache.emplace(&callee, result);
+    callee_cache.emplace(depth, result);
     return result;
 }
 
@@ -4572,17 +4583,18 @@ HostedValueKind infer_local_kind_uncached(const AmirModule& module, const AmirFu
 // throughout generate_x86_64_function call directly, always with depth==0, once per Load/Store/
 // StoreIndex/Index instruction referencing a given local -- the dominant cost in the real,
 // measured 4-minute-plus compile this fix was written to solve (ArcoSH WP-008).
+// Keyed on (function, local_name, depth) -- see infer_function_return_kind's own comment just
+// above for why extending the cache to every depth (not only depth==0) is safe: each depth is a
+// fixed, deterministic budget, so there is no cross-depth "starving" risk, only strictly more
+// cache hits.
 HostedValueKind infer_local_kind(const AmirModule& module, const AmirFunction& function,
                                   const std::string& local_name, int depth) {
-    if (depth != 0) {
-        return infer_local_kind_uncached(module, function, local_name, depth);
-    }
-    static std::unordered_map<const AmirFunction*, std::unordered_map<std::string, HostedValueKind>> cache;
-    auto& function_cache = cache[&function];
-    const auto found = function_cache.find(local_name);
-    if (found != function_cache.end()) return found->second;
+    static std::unordered_map<const AmirFunction*, std::unordered_map<std::string, std::unordered_map<int, HostedValueKind>>> cache;
+    auto& name_cache = cache[&function][local_name];
+    const auto found = name_cache.find(depth);
+    if (found != name_cache.end()) return found->second;
     const HostedValueKind result = infer_local_kind_uncached(module, function, local_name, depth);
-    function_cache.emplace(local_name, result);
+    name_cache.emplace(depth, result);
     return result;
 }
 
@@ -4861,27 +4873,26 @@ HostedValueKind infer_hosted_value_kind_uncached(const AmirModule& module, const
     return HostedValueKind::Unknown;
 }
 
-// Per-(function, name) memoization for infer_hosted_value_kind_uncached above, ONLY at depth == 0
-// (a fresh, top-level query). This is the fix Entry 24 (.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md)
-// disclosed as not-yet-done: "until this analysis is memoized per (function, name)... which would
-// let the [depth] cap rise safely". Found genuinely necessary by ArcoSH WP-008 (a real,
-// measured 4-minute-plus native build -- previously every native build this whole project had
-// compiled in single-digit seconds), not a theoretical concern: EVERY Load/Store instruction
-// generate_x86_64_function ever emits queries this exact function, at depth 0, for the SAME
-// local's kind, over and over, once per instruction referencing it -- previously a completely
-// fresh, potentially deeply recursive re-walk EACH time. A function with many locals each
-// referenced by many instructions (arcosh.abas's own Display/theme functions, once the file grew
-// large enough) multiplies this badly enough to become the dominant cost of the entire compile.
+// Per-(function, name, depth) memoization for infer_hosted_value_kind_uncached above. Entry 31
+// (.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md) originally memoized ONLY depth==0 queries -- found
+// genuinely necessary by ArcoSH WP-008 (a real, measured 4-minute-plus native build -- previously
+// every native build this whole project had compiled in single-digit seconds): EVERY Load/Store
+// instruction generate_x86_64_function ever emits queries this exact function, at depth 0, for
+// the SAME local's kind, over and over, once per instruction referencing it. That fix reasoned
+// caching was only PROVABLY safe at depth==0 because every depth==0 query for a given (function,
+// name) shares the identical starting budget (the depth cap below), so caching under a key that
+// dropped depth entirely couldn't mix answers computed under different budgets.
 //
-// Caching is safe specifically because it is keyed on (function, name) alone, ignoring depth, and
-// ONLY populated from a depth==0 call: every depth==0 query for the same pair walks the
-// identical, deterministic AMIR with the identical starting depth budget (0, with the same cap
-// below), so it always produces the SAME answer a fresh recomputation would -- there is no way
-// for a cached depth==0 answer to be "starved" relative to a future depth==0 query the way caching
-// an interior, budget-limited (depth>0) answer could be if the budget available differed between
-// two calls. Interior recursive calls (depth>0) still walk fully uncached, preserving the existing
-// cycle-safety behavior exactly unchanged -- this removes only the REDUNDANT top-level
-// re-walking, never the recursion itself or its own depth cap.
+// Entry 33 generalizes this to cache EVERY depth, each in its own bucket (depth is now part of
+// the key, never discarded) -- this sidesteps the exact "different budgets sharing one bucket"
+// risk the depth==0-only restriction existed to avoid, since a query at a given depth ALWAYS sees
+// the same fixed remaining budget and therefore always computes the same answer: there is no way
+// for two queries at the SAME depth to disagree, so nothing is ever starved. This mattered again
+// once arcosh.abas grew a set of small helper functions (its theme/prompt editors and their
+// self-test) each called from many sibling call sites: every such call site triggers an interior
+// (depth>0) query for the callee's own kind, previously re-walking the callee's ENTIRE body from
+// scratch at EVERY call site even though the (function/callee, name, depth) triple was identical
+// across all of them -- this is what pushed a single build from ~35s back up to 3m52s.
 //
 // A function-local static, not a member of AmirModule/AmirFunction themselves: every real
 // ArcoFission invocation (the CLI's own `main()`) performs exactly one compile per process, so
@@ -4889,15 +4900,12 @@ HostedValueKind infer_hosted_value_kind_uncached(const AmirModule& module, const
 // (a second, unrelated `build` invocation is a fresh process with a fresh, empty cache).
 HostedValueKind infer_hosted_value_kind(const AmirModule& module, const AmirFunction& function,
                                          const std::string& name, int depth = 0) {
-    if (depth != 0) {
-        return infer_hosted_value_kind_uncached(module, function, name, depth);
-    }
-    static std::unordered_map<const AmirFunction*, std::unordered_map<std::string, HostedValueKind>> cache;
-    auto& function_cache = cache[&function];
-    const auto found = function_cache.find(name);
-    if (found != function_cache.end()) return found->second;
+    static std::unordered_map<const AmirFunction*, std::unordered_map<std::string, std::unordered_map<int, HostedValueKind>>> cache;
+    auto& name_cache = cache[&function][name];
+    const auto found = name_cache.find(depth);
+    if (found != name_cache.end()) return found->second;
     const HostedValueKind result = infer_hosted_value_kind_uncached(module, function, name, depth);
-    function_cache.emplace(name, result);
+    name_cache.emplace(depth, result);
     return result;
 }
 

@@ -3532,3 +3532,67 @@ byte-for-byte (`cat -v`) under piped/non-tty execution to confirm zero stray ANS
 separately confirmed styled output IS correctly emitted under a real pty with `TERM=xterm-256color`/
 `COLORTERM=truecolor` set. Full `arcosh/build` ctest: 10/10. Root project's full `ctest` suite
 unaffected (same pre-existing, unrelated `arcfsctl_smoke` baseline failure).
+
+## Entry 33 — Entry 31's memoization fix was too narrow (depth==0 only); generalizing it to every depth fixed a second real 3-minute-plus native build regression
+
+**Date:** 2026-09-18
+
+**Context:** implementing interactive `theme edit`/`prompt edit` editors for ArcoSH, plus a new
+`RunEditorSelfTest` exercising their underlying pure helper functions directly (per this project's
+own "interactive loops verified manually, their pure logic verified by ctest" split -- see
+`RunJobControlSelfTest`'s own precedent for a real Ctrl-Z). Building the resulting `arcosh.abas`
+(now several new small functions -- `FindNamedColor`, `ApplyNamedColorToRole`,
+`ResolveRoleSelection`, `AddPromptSegment`, `RemovePromptSegmentAt`, `MovePromptSegment` -- each
+called from many sibling call sites, especially the new self-test's own several dozen assertions)
+took **3 minutes 52 seconds** -- up from the ~35-40s baseline Entry 31 had established, most of
+the way back to the exact magnitude of problem Entry 31 was written to fix.
+
+**Root cause.** Entry 31's fix memoized `infer_hosted_value_kind`/`infer_local_kind`/
+`infer_function_return_kind` (`src/compiler/fission.cpp`) ONLY for `depth == 0` (a fresh top-level
+query), falling through to a fully uncached, from-scratch walk for any interior (`depth > 0`)
+recursive call -- deliberately conservative at the time, reasoned safe only for depth-0 because
+every depth-0 query for the same (function, name) shares an identical starting recursion budget,
+so caching under a key that dropped depth entirely couldn't accidentally serve an answer computed
+under a smaller budget to a query that deserved a bigger one. What Entry 31 didn't yet fix: an
+interior query is exactly what happens whenever classifying ONE call site's result requires asking
+"what does the callee return" or "what kind is this local elsewhere" -- and that ALWAYS happens
+one level below a depth-0 entry point, so any (function/callee, name, depth) triple that recurs
+across MULTIPLE call sites still re-walked the entire callee body from scratch every time. A file
+with many small helper functions each called from many places -- exactly this pass's own shape,
+and its self-test in particular -- hits this constantly: every one of `RunEditorSelfTest`'s
+several dozen calls into the same handful of small functions re-triggered a full, uncached
+`infer_function_return_kind(callee, 1)` for that callee, even though the (callee, depth) pair was
+identical every single time.
+
+**Fix.** Extended all three caches to key on depth as well, rather than restricting the cache to
+`depth == 0` and falling through otherwise: `cache[&function][name][depth]` (or `cache[&callee]
+[depth]` for `infer_function_return_kind`, which has no per-name dimension). This is provably safe
+for the exact reason Entry 31's own comment already established for depth 0 specifically, just
+generalized: `infer_*_uncached` is a pure function of (module, function/callee, name, depth) --
+the module never changes mid-compile and depth is nothing but a fixed recursion-budget counter,
+never mutated state -- so a query at a GIVEN depth always computes the same answer no matter how
+many times or from where it's asked, and giving every depth its own cache bucket (rather than one
+shared bucket across all depths, which really would risk the "different budgets, same slot"
+starving Entry 31 was right to avoid) means there is no way for two same-depth queries to ever
+disagree. No caller anywhere needed to change; the fix is entirely internal to the three wrapper
+functions.
+
+**Verification.** `arcosh.abas` (through this pass, including the editors and their self-test):
+3m52s -> **9.87s** -- not only fixed but faster than Entry 31's own post-fix baseline (~35-40s for
+the pre-editor file), since the same generalization also speeds up every OTHER interior-recursion
+case anywhere in the codebase, not just this file's own new functions. `arcosh/build` ctest: 13/13
+(the new `arcosh_editor_selftest` included). Root project's full `ctest` suite: 121/122, same
+pre-existing unrelated `arcfsctl_smoke` failure -- unaffected, as expected: this only changes when
+work is cached, never what any classification answers, so no behavioral regression is possible by
+construction, still confirmed empirically rather than assumed. The interactive editor loops
+themselves (not covered by ctest, same reasoning as `RunJobControlSelfTest`'s own Ctrl-Z) were
+separately verified against the compiled binary under a real pty: a full `theme edit` session
+(select a role by name, pick a named color, toggle bold, go back, save under a new name) and a
+full `prompt edit` session (add/remove/reorder segments, save) both produced exactly the expected
+live-styled output and correctly wrote `~/.arcosh/themes/<name>` / `~/.arcosh/config` to disk with
+the exact expected contents.
+
+**Disclosed, still open:** Entry 31's own disclosed gap (a separate, unconfirmed scaling
+suspicion around `Kind::CallValue`'s candidate resolution, `src/compiler/fission.cpp`) was not
+investigated further here -- this pass's regression had a fully-explained, now-fixed root cause of
+its own, so there was no signal pointing back at that older, still-unconfirmed suspicion.
