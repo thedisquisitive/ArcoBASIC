@@ -206,11 +206,11 @@ FUNCTION Prompt(cwd AS STRING, lastExitCode AS NUMBER, jobsTable AS ARRAY)
     resetCode = ""
     IF tier <> "None" THEN resetCode = AnsiEscape("0m")
     promptStyle = StyleCode("prompt", tier)
-    tags = ActivePromptTags()
+    context = MakePromptContext(cwd, lastExitCode, jobsTable, tier, resetCode, ActivePromptTags(), Host.CurrentUser())
 
     parts = []
     FOR segmentName IN ActivePromptSegments()
-        rendered = RenderPromptSegment(segmentName, cwd, lastExitCode, jobsTable, tier, resetCode, tags)
+        rendered = RenderPromptSegment(segmentName, context)
         IF rendered <> "" THEN ignored = Array.Push(parts, rendered)
     NEXT
 
@@ -1604,6 +1604,10 @@ FUNCTION HelpTopics()
                 "    classic     \"arcosh:\" followed by the current Arcology path (the default)",
                 "    path        just the current Arcology path, no \"arcosh:\" prefix",
                 "    hostname    this machine's hostname",
+                "    user        the real OS username you're running as (styled \"error\" instead",
+                "                of the usual \"prompt\" role by default when that's root -- the",
+                "                classic red-prompt-as-root warning -- override with \"prompt tag",
+                "                user <role>\" like any other segment)",
                 "    exitcode    the last command's exit status (styled success/error)",
                 "    jobs        the number of background/stopped jobs, hidden when there are",
                 "                none",
@@ -2003,7 +2007,7 @@ END FUNCTION
 ' changing shape just because segments now exist as a concept, plus "date"/"time" (today's date,
 ' the current wall-clock time) built on Time.Now()'s own fixed "YYYY-MM-DD HH:MM:SS" format.
 FUNCTION KnownPromptSegments()
-    RETURN ["classic", "path", "hostname", "exitcode", "jobs", "date", "time",
+    RETURN ["classic", "path", "hostname", "user", "exitcode", "jobs", "date", "time",
         "year", "year2", "month", "day", "hour", "minute", "second", "millisecond"]
 END FUNCTION
 
@@ -2071,18 +2075,43 @@ FUNCTION TagPromptSegment(tags AS OBJECT, segment AS STRING, role AS STRING)
     RETURN {"Ok": TRUE, "Tags": tags, "Error": ""}
 END FUNCTION
 
+' Bundles everything a segment could possibly need to render itself into ONE object, rather than
+' growing RenderPromptSegment/ResolveSegmentRole's own parameter list every time a new segment
+' needs one more piece of state -- which is exactly what adding "user" just did: 8 plain
+' parameters (7 pointer-ish, 1 number) tipped RenderPromptSegment over this native backend's
+' System V fast path limit of 6 integer/pointer argument registers ("call ... passes more
+' integer/pointer arguments than this backend's System V fast path supports"), a real compile
+' failure caught immediately on rebuild. A single OBJECT parameter is one pointer no matter how
+' many fields it carries, so this both fixes that and gives WP-009's eventual
+' `Shell.RegisterPromptSegment` a natural one-argument shape to hand a plugin's own render
+' callback, rather than an ever-growing positional list.
+FUNCTION MakePromptContext(cwd AS STRING, lastExitCode AS NUMBER, jobsTable AS ARRAY, tier AS STRING, resetCode AS STRING, tags AS OBJECT, currentUser AS STRING)
+    RETURN {"Cwd": cwd, "LastExitCode": lastExitCode, "JobsTable": jobsTable, "Tier": tier,
+        "ResetCode": resetCode, "Tags": tags, "CurrentUser": currentUser}
+END FUNCTION
+
 ' The role a segment ACTUALLY renders in right now: an explicit tag always wins; "exitcode" with
 ' no tag keeps its own dynamic success/error behavior; anything else with no tag falls back to
 ' DefaultSegmentRole.
-FUNCTION ResolveSegmentRole(tags AS OBJECT, name AS STRING, lastExitCode AS NUMBER)
+FUNCTION ResolveSegmentRole(context AS OBJECT, name AS STRING)
     ' Object.Get's own 2-argument form returns a genuine NULL for a missing key, not "" -- the
     ' explicit 3-argument default form is required here so an untagged segment (the ordinary case)
     ' is correctly treated as "no tag" rather than as if it were tagged with a null value.
-    tag = Object.Get(tags, name, "")
+    tag = Object.Get(context.Tags, name, "")
     IF tag <> "" ANDALSO tag <> "default" THEN RETURN tag
     IF name == "exitcode" THEN
-        IF lastExitCode <> 0 THEN RETURN "error"
+        IF context.LastExitCode <> 0 THEN RETURN "error"
         RETURN "success"
+    END IF
+    ' "user" defaults to the alarming "error" color specifically when running as root -- the
+    ' classic "your prompt turns red as a warning you're root" convention many other shells use,
+    ' the exact "make certain parts easier to see on the fly for sysadmin roles" ask this whole
+    ' color-tag mechanism exists for, given for free as a sensible default rather than something
+    ' that has to be tagged manually. Still fully overridable with an explicit "prompt tag user
+    ' <role>" like any other segment.
+    IF name == "user" THEN
+        IF context.CurrentUser == "root" THEN RETURN "error"
+        RETURN "prompt"
     END IF
     RETURN DefaultSegmentRole(name)
 END FUNCTION
@@ -2091,14 +2120,17 @@ END FUNCTION
 ' correctly regardless of how many others are joined around them. "" for a segment that has
 ' nothing to show right now (jobs, with none running) or an unrecognized name -- Prompt's own
 ' caller already drops empty segments rather than leaving a stray extra space.
-FUNCTION RenderPromptSegment(name AS STRING, cwd AS STRING, lastExitCode AS NUMBER, jobsTable AS ARRAY, tier AS STRING, resetCode AS STRING, tags AS OBJECT)
-    style = StyleCode(ResolveSegmentRole(tags, name, lastExitCode), tier)
-    IF name == "classic" THEN RETURN "arcosh:" + resetCode + style + Path.ToArcology(cwd)
-    IF name == "path" THEN RETURN style + Path.ToArcology(cwd) + resetCode
+FUNCTION RenderPromptSegment(name AS STRING, context AS OBJECT)
+    tier = context.Tier
+    resetCode = context.ResetCode
+    style = StyleCode(ResolveSegmentRole(context, name), tier)
+    IF name == "classic" THEN RETURN "arcosh:" + resetCode + style + Path.ToArcology(context.Cwd)
+    IF name == "path" THEN RETURN style + Path.ToArcology(context.Cwd) + resetCode
     IF name == "hostname" THEN RETURN style + Host.Hostname() + resetCode
-    IF name == "exitcode" THEN RETURN style + STRING(lastExitCode) + resetCode
+    IF name == "user" THEN RETURN style + context.CurrentUser + resetCode
+    IF name == "exitcode" THEN RETURN style + STRING(context.LastExitCode) + resetCode
     IF name == "jobs" THEN
-        count = LEN(jobsTable)
+        count = LEN(context.JobsTable)
         IF count == 0 THEN RETURN ""
         RETURN style + STRING(count) + "j" + resetCode
     END IF
@@ -2876,7 +2908,8 @@ FUNCTION RunProfileSelfTest()
 
     ' RenderPromptSegment: classic reproduces the exact pre-customization text; unknown segments
     ' and an empty job table both produce "" rather than garbage.
-    classicRendered = RenderPromptSegment("classic", "/tmp", 0, [], "None", "", {})
+    plainContext = MakePromptContext("/tmp", 0, [], "None", "", {}, "testuser")
+    classicRendered = RenderPromptSegment("classic", plainContext)
     IF classicRendered == "arcosh::tmp" THEN
         PRINT "ok   the classic segment renders exactly like the pre-customization prompt"
     ELSE
@@ -2884,14 +2917,14 @@ FUNCTION RunProfileSelfTest()
         failures = failures + 1
     END IF
 
-    IF RenderPromptSegment("jobs", "/tmp", 0, [], "None", "", {}) == "" THEN
+    IF RenderPromptSegment("jobs", plainContext) == "" THEN
         PRINT "ok   the jobs segment is empty when there are no jobs"
     ELSE
         PRINT "FAIL jobs segment was not empty with zero jobs"
         failures = failures + 1
     END IF
 
-    IF RenderPromptSegment("not-a-real-segment", "/tmp", 0, [], "None", "", {}) == "" THEN
+    IF RenderPromptSegment("not-a-real-segment", plainContext) == "" THEN
         PRINT "ok   an unrecognized segment renders as nothing instead of crashing"
     ELSE
         PRINT "FAIL an unrecognized segment did not render as nothing"
@@ -2901,14 +2934,14 @@ FUNCTION RunProfileSelfTest()
     ' date/time segments -- Time.Now()'s fixed "YYYY-MM-DD HH:MM:SS" format sliced into its two
     ' halves; not asserting an exact VALUE (the real wall clock, not under this test's control),
     ' just the expected LENGTH and separator position, which is what a format regression would break.
-    dateRendered = RenderPromptSegment("date", "/tmp", 0, [], "None", "", {})
+    dateRendered = RenderPromptSegment("date", plainContext)
     IF LEN(dateRendered) == 10 ANDALSO String.Slice(dateRendered, 4, 1) == "-" THEN
         PRINT "ok   the date segment renders a 10-character YYYY-MM-DD date"
     ELSE
         PRINT "FAIL date segment rendered: [" + dateRendered + "]"
         failures = failures + 1
     END IF
-    timeRendered = RenderPromptSegment("time", "/tmp", 0, [], "None", "", {})
+    timeRendered = RenderPromptSegment("time", plainContext)
     IF LEN(timeRendered) == 8 ANDALSO String.Slice(timeRendered, 2, 1) == ":" THEN
         PRINT "ok   the time segment renders an 8-character HH:MM:SS time"
     ELSE
@@ -2921,12 +2954,12 @@ FUNCTION RunProfileSelfTest()
     ' second must also each be a SUBSTRING of the combined "date"/"time" segments rendered in the
     ' same instant, proving they're sliced from the exact same fields, not independently wrong in
     ' a way that happens to still be the right length.
-    combinedDate = String.Slice(RenderPromptSegment("date", "/tmp", 0, [], "None", "", {}), 0, 10)
-    combinedTime = String.Slice(RenderPromptSegment("time", "/tmp", 0, [], "None", "", {}), 0, 8)
+    combinedDate = String.Slice(RenderPromptSegment("date", plainContext), 0, 10)
+    combinedTime = String.Slice(RenderPromptSegment("time", plainContext), 0, 8)
     fieldsOk = TRUE
     FOR fieldSpec IN [{"Name": "year", "Width": 4}, {"Name": "month", "Width": 2}, {"Name": "day", "Width": 2},
         {"Name": "hour", "Width": 2}, {"Name": "minute", "Width": 2}, {"Name": "second", "Width": 2}]
-        rendered = RenderPromptSegment(fieldSpec.Name, "/tmp", 0, [], "None", "", {})
+        rendered = RenderPromptSegment(fieldSpec.Name, plainContext)
         IF LEN(rendered) <> fieldSpec.Width THEN fieldsOk = FALSE
         IF !IsAllDigits(rendered) THEN fieldsOk = FALSE
     NEXT
@@ -2936,14 +2969,14 @@ FUNCTION RunProfileSelfTest()
         PRINT "FAIL a broken-down date/time field had the wrong width or non-digit content"
         failures = failures + 1
     END IF
-    year2Rendered = RenderPromptSegment("year2", "/tmp", 0, [], "None", "", {})
+    year2Rendered = RenderPromptSegment("year2", plainContext)
     IF LEN(year2Rendered) == 2 ANDALSO IsAllDigits(year2Rendered) ANDALSO String.Slice(combinedDate, 2, 2) == year2Rendered THEN
         PRINT "ok   year2 renders the last 2 digits of the 4-digit year"
     ELSE
         PRINT "FAIL year2 rendered: [" + year2Rendered + "]"
         failures = failures + 1
     END IF
-    IF String.Slice(combinedTime, 0, 2) == RenderPromptSegment("hour", "/tmp", 0, [], "None", "", {}) THEN
+    IF String.Slice(combinedTime, 0, 2) == RenderPromptSegment("hour", plainContext) THEN
         PRINT "ok   the hour field agrees with the combined time segment"
     ELSE
         PRINT "FAIL the hour field did not agree with the combined time segment"
@@ -2956,7 +2989,7 @@ FUNCTION RunProfileSelfTest()
         PRINT "FAIL PadNumber did not pad correctly"
         failures = failures + 1
     END IF
-    millisRendered = RenderPromptSegment("millisecond", "/tmp", 0, [], "None", "", {})
+    millisRendered = RenderPromptSegment("millisecond", plainContext)
     IF LEN(millisRendered) == 3 ANDALSO IsAllDigits(millisRendered) THEN
         PRINT "ok   the millisecond segment renders a zero-padded 3-digit value"
     ELSE
@@ -2971,8 +3004,10 @@ FUNCTION RunProfileSelfTest()
     ignored = Runtime.SetGlobal("arcosh_color_tier", "TrueColor")
     tagResult = TagPromptSegment({}, "hostname", "error")
     IF tagResult.Ok THEN
-        taggedHostname = RenderPromptSegment("hostname", "/tmp", 0, [], "TrueColor", "", tagResult.Tags)
-        untaggedHostname = RenderPromptSegment("hostname", "/tmp", 0, [], "TrueColor", "", {})
+        taggedContext = MakePromptContext("/tmp", 0, [], "TrueColor", "", tagResult.Tags, "testuser")
+        untaggedContext = MakePromptContext("/tmp", 0, [], "TrueColor", "", {}, "testuser")
+        taggedHostname = RenderPromptSegment("hostname", taggedContext)
+        untaggedHostname = RenderPromptSegment("hostname", untaggedContext)
         IF taggedHostname == StyleCode("error", "TrueColor") + Host.Hostname() ANDALSO taggedHostname <> untaggedHostname THEN
             PRINT "ok   TagPromptSegment overrides a segment's rendered color role"
         ELSE
@@ -2995,8 +3030,10 @@ FUNCTION RunProfileSelfTest()
         PRINT "FAIL TagPromptSegment accepted an unknown role"
         failures = failures + 1
     END IF
-    exitOk = ResolveSegmentRole({}, "exitcode", 0) == "success"
-    IF exitOk THEN exitOk = ResolveSegmentRole({}, "exitcode", 1) == "error"
+    untaggedExitContext0 = MakePromptContext("/tmp", 0, [], "None", "", {}, "testuser")
+    untaggedExitContext1 = MakePromptContext("/tmp", 1, [], "None", "", {}, "testuser")
+    exitOk = ResolveSegmentRole(untaggedExitContext0, "exitcode") == "success"
+    IF exitOk THEN exitOk = ResolveSegmentRole(untaggedExitContext1, "exitcode") == "error"
     IF exitOk THEN
         PRINT "ok   an untagged exitcode segment keeps its own dynamic success/error role"
     ELSE
@@ -3004,10 +3041,39 @@ FUNCTION RunProfileSelfTest()
         failures = failures + 1
     END IF
     pinnedExit = TagPromptSegment({}, "exitcode", "muted")
-    IF pinnedExit.Ok ANDALSO ResolveSegmentRole(pinnedExit.Tags, "exitcode", 1) == "muted" THEN
+    pinnedExitContext = MakePromptContext("/tmp", 1, [], "None", "", pinnedExit.Tags, "testuser")
+    IF pinnedExit.Ok ANDALSO ResolveSegmentRole(pinnedExitContext, "exitcode") == "muted" THEN
         PRINT "ok   a tagged exitcode segment uses the fixed tagged role instead of dynamic coloring"
     ELSE
         PRINT "FAIL a tagged exitcode segment did not use its fixed tagged role"
+        failures = failures + 1
+    END IF
+
+    ' "user" segment: renders whatever username it's given (never re-deriving it -- Host.CurrentUser
+    ' itself isn't under this test's control), defaults to "error" for root and "prompt" otherwise,
+    ' and an explicit tag still overrides both.
+    sysadminContext = MakePromptContext("/tmp", 0, [], "TrueColor", "", {}, "sysadmin")
+    rootContext = MakePromptContext("/tmp", 0, [], "TrueColor", "", {}, "root")
+    userRendered = RenderPromptSegment("user", sysadminContext)
+    IF userRendered == StyleCode("prompt", "TrueColor") + "sysadmin" THEN
+        PRINT "ok   the user segment renders the given username in the prompt role by default"
+    ELSE
+        PRINT "FAIL user segment rendered: [" + userRendered + "] (expected prompt-styled \"sysadmin\")"
+        failures = failures + 1
+    END IF
+    rootRendered = RenderPromptSegment("user", rootContext)
+    IF rootRendered == StyleCode("error", "TrueColor") + "root" THEN
+        PRINT "ok   the user segment defaults to the error role when running as root"
+    ELSE
+        PRINT "FAIL root user segment rendered: [" + rootRendered + "] (expected error-styled \"root\")"
+        failures = failures + 1
+    END IF
+    userTag = TagPromptSegment({}, "user", "muted")
+    taggedRootContext = MakePromptContext("/tmp", 0, [], "TrueColor", "", userTag.Tags, "root")
+    IF userTag.Ok ANDALSO ResolveSegmentRole(taggedRootContext, "user") == "muted" THEN
+        PRINT "ok   an explicit user tag overrides even the root default"
+    ELSE
+        PRINT "FAIL tagging the user segment did not override the root default"
         failures = failures + 1
     END IF
 
@@ -3536,7 +3602,7 @@ FUNCTION RunPathLayerSelfTest()
     RETURN failures
 END FUNCTION
 
-version = "0.13.0-datetime-fields"
+version = "0.14.0-user-segment"
 no_color_flag = HasFlag(Args, "--no-color")
 no_color_env = Process.Env("NO_COLOR") <> ""
 term = Process.Env("TERM")
@@ -3566,7 +3632,7 @@ color_tier = DetectColorTier(is_tty, effective_no_color_flag, no_color_env, term
 ignored = Runtime.SetGlobal("arcosh_color_tier", color_tier)
 
 IF HasFlag(Args, "--version") THEN
-    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008, HELP, Profiles, Editors, Prompt Color Tags, Date/Time Fields)"
+    PRINT "arcosh " + version + " (RFC-0052 WP-001..WP-012, WP-008, HELP, Profiles, Editors, Prompt Color Tags, Date/Time Fields, User Segment)"
     ExitTheProgram(0)
 END IF
 

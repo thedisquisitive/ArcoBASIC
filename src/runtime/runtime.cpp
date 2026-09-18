@@ -39,6 +39,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <pwd.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -3786,6 +3787,27 @@ Runtime::Runtime()
         }
         buffer[sizeof(buffer) - 1] = '\0';
         return Value(std::string(buffer));
+#endif
+    });
+    // Added for RFC-0052 section 20's own suggested "user" prompt segment. Reads the REAL
+    // effective OS identity via geteuid()/getpwuid() rather than trusting $USER/$LOGNAME (which
+    // can be stale or absent -- e.g. under `su` without `-l`, cron, some containers) -- exactly
+    // the kind of "who is this actually running as" question a sysadmin's prompt segment exists
+    // to answer honestly. Falls back to the USER environment variable only if the OS lookup
+    // itself fails (getpwuid() returning null is rare but not impossible -- e.g. a uid with no
+    // /etc/passwd entry, common in some minimal containers), and to "" if that's unset too, the
+    // same "never fails, just returns less" contract Host.Hostname() above already has.
+    register_function("Host.CurrentUser", [](const std::vector<Value>&) -> Value {
+#ifdef _WIN32
+        const char* user = std::getenv("USERNAME");
+        return Value(std::string(user ? user : ""));
+#else
+        if (const struct passwd* entry = getpwuid(geteuid())) {
+            return Value(std::string(entry->pw_name));
+        }
+        const char* user = std::getenv("USER");
+        if (!user) user = std::getenv("LOGNAME");
+        return Value(std::string(user ? user : ""));
 #endif
     });
     // Not meant to be called directly from ArcoBASIC source -- the AMIR builder emits a call to

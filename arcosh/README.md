@@ -10,8 +10,8 @@ ArcoFission, not hand-written in C++.
 
 ## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes),
 a built-in HELP command, profile/theme/prompt customization (RFC-0052 sections 20/22), interactive
-theme/prompt editors on top of it, per-segment prompt color tags, and broken-down date/time
-prompt fields
+theme/prompt editors on top of it, per-segment prompt color tags, broken-down date/time prompt
+fields, and a real-OS-identity `user` prompt segment
 
 `src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
 
@@ -327,13 +327,32 @@ day,month,year2,hour,minute,second,millisecond` composes exactly that layout. Ve
 against the combined `date`/`time` segments rendered in the same instant to confirm they agree)
 plus a real pty run showing genuinely live, incrementing millisecond values between two prompts.
 
+and a `user` segment: the real OS username (`Host.CurrentUser()`, a new `arco_runtime` primitive
+reading `getpwuid(geteuid())` rather than trusting `$USER`/`$LOGNAME`, which can be stale or unset
+under `su`, cron, or some containers), styled in the alarming "error" role by default specifically
+when that's `root` — the classic "your prompt turns red as a warning you're root" convention,
+given for free rather than requiring a manual `prompt tag user error`, though `prompt tag user
+<role>` still overrides it like any other segment. Verified via `--selftest-profile` (given
+usernames directly, since the real OS identity isn't under a test's control) and a real pty run
+confirming the actual current user renders correctly in the default "prompt" color.
+
+Adding this segment needed one refactor: `RenderPromptSegment`/`ResolveSegmentRole` had grown to 7
+and then 8 plain parameters, and 8 tipped `RenderPromptSegment` over this native backend's System V
+fast path limit of 6 integer/pointer argument registers — a real compile failure caught immediately
+on rebuild ("call ... passes more integer/pointer arguments than this backend's System V fast path
+supports"). Fixed by bundling everything a segment needs to render into one `MakePromptContext(...)`
+object instead of growing the parameter list further — one pointer argument no matter how many
+fields it carries, and incidentally the natural one-argument shape for WP-009's eventual
+`Shell.RegisterPromptSegment` to hand a plugin's own render callback.
+
 It does not yet implement plugins or completion — later work packages (WP-009, WP-010). RFC-0052
 section 19 already earmarks `Shell.RegisterPromptSegment(...)` for WP-009 to let a plugin add its
 own prompt segments the same way `git`'s own prompt integrations do in other shells — today's
-segment dispatch (`KnownPromptSegments`/`DefaultSegmentRole`/`RenderPromptSegment`, all plain
-string-keyed) is deliberately simple specifically so WP-009 has an obvious, minimal seam to extend
-later, but no plugin-loading machinery exists yet; building that is WP-009's own work, not
-something this pass tried to partially anticipate beyond leaving that seam clean.
+segment dispatch (`KnownPromptSegments`/`DefaultSegmentRole`/`RenderPromptSegment`, now built
+around one context object, see above) is deliberately simple specifically so WP-009 has an
+obvious, minimal seam to extend later, but no plugin-loading machinery exists yet; building that is
+WP-009's own work, not something this pass tried to partially anticipate beyond leaving that seam
+clean.
 
 See `.agents/reports/ARCO_SH_RFC0052_WP000_REPOSITORY_AUDIT.md` (in the repo root's `.agents/`
 directory) for the mandatory pre-implementation audit this work was built against.
