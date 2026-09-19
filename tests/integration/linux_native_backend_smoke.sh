@@ -1866,3 +1866,40 @@ diff -u "$TMP_ROOT/addressof-ambiguous-return-expected.txt" "$TMP_ROOT/addressof
 # see infer_hosted_value_kind's own comment for the full reasoning; a proper fix needs memoizing
 # this analysis per (function, name), not just a bigger cap. No regression test added for the
 # gap itself (it's an intentionally-still-open limitation, not a fixed behavior to pin).
+
+# Entry 35: a local reassigned from ANOTHER LOCAL (`i = scrollOffset`, not a literal) and later
+# incremented in a loop (`i = i + 1`) is genuinely self-referential -- classifying one of `i`'s own
+# Store sites can require re-classifying `i` again, recursively, at a deeper depth. That recursion
+# terminates (infer_hosted_value_kind's own cycle-guard depth cap), but hitting the cap made an
+# INNER query return Unknown for `scrollOffset` (itself trivially just `= 0`, never actually
+# ambiguous) purely because it happened to bottom out deep in `i`'s own self-referential chain --
+# and infer_local_kind's own store-disagreement rule then treated that artificial Unknown as if it
+# genuinely disagreed with `i`'s other, definite Store (`i + 1`, Number), classifying `i` itself as
+# Boxed. `filtered[i]` (expects a raw double index, never a boxed pointer) then segfaulted the
+# instant `i` was no longer the all-zero-bits value 0.0 the first iteration happened to hold.
+# Fixed by having infer_local_kind treat Unknown as "no information" rather than a real,
+# disagreement-worthy kind of its own -- an Unknown answer from one Store site must never override
+# a DEFINITE answer from another. Found building a real ArcoBASIC stdlib module (stdlib/
+# curses.abas's own RunSearchList, a scrollable filtered-list widget) -- see
+# .agents/ARCO_NATIVE_RUNTIME_PROGRESS.md for the full writeup.
+cat > "$TMP_ROOT/self-referential-local.abas" <<'SCRIPT'
+FUNCTION Wrapped()
+    filtered = ["a", "b", "c", "d", "e"]
+    scrollOffset = 0
+    i = scrollOffset
+    WHILE i < LEN(filtered)
+        x = filtered[i]
+        PRINT x
+        i = i + 1
+    WEND
+END FUNCTION
+ignored = Wrapped()
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/self-referential-local.abas" -o "$TMP_ROOT/self-referential-local" --target linux-x86_64 --sanitize > /dev/null
+for i in 1 2 3 4 5; do
+    ASAN_OPTIONS=abort_on_error=1:halt_on_error=1 "$TMP_ROOT/self-referential-local" > "$TMP_ROOT/self-referential-local-native-run.txt"
+done
+"$ARCOFISSION" compile-run "$TMP_ROOT/self-referential-local.abas" > "$TMP_ROOT/self-referential-local-bytecode-run.txt"
+diff -u "$TMP_ROOT/self-referential-local-bytecode-run.txt" "$TMP_ROOT/self-referential-local-native-run.txt"
+printf 'a\nb\nc\nd\ne\n' > "$TMP_ROOT/self-referential-local-expected.txt"
+diff -u "$TMP_ROOT/self-referential-local-expected.txt" "$TMP_ROOT/self-referential-local-native-run.txt"

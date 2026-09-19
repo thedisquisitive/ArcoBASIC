@@ -3662,3 +3662,81 @@ under BOTH the native x86-64 target and the default bytecode VM target, confirmi
 answers are actually correct, not just self-consistent. `arcosh/build` ctest (rebuilt against the
 patched compiler): 13/13. Root project's full `ctest` suite: 121/122, same pre-existing unrelated
 `arcfsctl_smoke` failure.
+
+## Entry 35 — A fifth real miscompilation: a self-referential local (`i = someVar` then `i = i + 1`) could be misclassified Boxed, because an artificial depth-cap Unknown was treated as a real disagreement
+
+**Date:** 2026-09-18
+
+**Context:** building `stdlib/curses.abas`, a new platform-agnostic curses-style TUI toolkit for
+ArcoBASIC (raw terminal mode, key reading, and two real widgets: a menu and a search-as-you-type
+filtered list). `RunSearchList`'s own scrolling logic (`scrollOffset = 0; visible = []; i =
+scrollOffset; WHILE i < LEN(filtered) ANDALSO ...`) segfaulted on the SECOND loop iteration under
+the native backend, having printed the first item correctly. The bytecode VM ran the identical
+source correctly. Bisected (per this project's own established methodology: strip the repro down
+until it's minimal, checking after every cut, comparing native against bytecode at each step) down
+to a genuinely tiny, single-function, no-import repro:
+
+```basic
+FUNCTION Wrapped()
+    filtered = ["a", "b", "c", "d", "e"]
+    scrollOffset = 0
+    i = scrollOffset          ' NOT a literal -- this exact detail mattered
+    WHILE i < LEN(filtered)
+        x = filtered[i]
+        i = i + 1
+    WEND
+END FUNCTION
+```
+
+**Root cause.** `i` has two Store sites: `i = scrollOffset` and `i = i + 1`. Classifying the
+SECOND one (`infer_hosted_value_kind` on the Binary "+" result) requires classifying its own
+operand `i` -- a genuinely self-referential local, not a cycle in the usual "reference loop" sense
+but a real, legitimate loop-counter pattern. That recursion is bounded (the existing depth cap in
+`infer_hosted_value_kind_uncached`, `src/compiler/fission.cpp`), but hitting the cap deep inside
+this self-referential chain made an INNER query for `scrollOffset` (itself trivially just `= 0`,
+never actually ambiguous) return `Unknown` purely because that particular query happened to bottom
+out at depth 9, not because `scrollOffset` is ambiguous in any way. `infer_local_kind`'s own
+store-disagreement rule (Entry 23's fix, comparing every Store site's classification and falling
+back to `Boxed` on disagreement) then treated that artificial `Unknown` as if it genuinely
+DISAGREED with `i`'s other, definite classification (`Number`, from `i + 1`) -- classifying `i`
+itself as `Boxed`. Confirmed by direct instrumentation (a temporary `std::cerr` trace gated on an
+env var, added and removed during this investigation), not assumed: at `depth == 0` (the answer
+that actually matters), `i = scrollOffset`'s own operand classified `Number`, but `i = i + 1`'s own
+operand classified `Boxed` -- traced back through the recursion, this `Boxed` answer originated
+exactly at the depth where the cap forced `scrollOffset`'s own trivial classification to `Unknown`.
+Once `i` was `Boxed`, `filtered[i]` (the array-index codegen, which expects a raw double index,
+never a boxed pointer) misread `i`'s own bit pattern as a heap pointer -- coincidentally survivable
+for `i == 0.0` (an all-zero bit pattern), a real segfault the instant `i` became genuinely nonzero.
+
+**Fix.** `infer_local_kind_uncached`'s store-disagreement loop now treats `Unknown` as "no
+information available," never as a real, disagreement-worthy classification of its own: an
+`Unknown` answer from one Store site is skipped entirely rather than being compared against the
+running `agreed_store_kind`, so it can never override or falsely "disagree with" a DEFINITE answer
+(`Number`/`String`/`Bool`/`Boxed`) from another site. If every site is Unknown, the local itself is
+still reported `Unknown` (unchanged behavior for the case where there's genuinely no information at
+all); disagreement is only ever declared between two DEFINITE, non-Unknown answers, which is the
+only case the fallback was actually meant to catch (Entry 23's own motivating example -- a local
+truly holding two different representations depending on which branch ran).
+
+A second, smaller, complementary hardening fix went in alongside this while investigating (kept
+even though it turned out not to be what caused THIS particular crash): `infer_hosted_value_kind_
+uncached`'s final fallback, reached when `name` matches none of the instruction-RESULT shapes
+(Const/Binary/Load/Array/Object/Index/CallValue/...), now delegates to `infer_local_kind` instead
+of unconditionally returning `Unknown` -- closing a real, separate gap for a bare local-variable
+name that (in some AMIR shapes not exercised by this specific bug, since this one always went
+through an explicit `LOAD` temp) might be referenced directly as an operand rather than through a
+materializing Load.
+
+**Verification.** The minimized repro now runs correctly under the native backend (`a b c d e`,
+matching bytecode). A new permanent regression case, Entry 35, was added to
+`tests/integration/linux_native_backend_smoke.sh` following that file's own established per-entry
+convention exactly (`--sanitize` build, 5 repeated native runs to catch any nondeterministic
+corruption, diffed against both the bytecode VM's own output and an explicit expected-output file)
+-- the full script (all 35 entries) passes end to end. `stdlib/curses.abas`'s own `RunSearchList`
+now works correctly end to end, verified against the real compiled binary under a real pty: live
+search-as-you-type filtering down a 5-item list by typed prefix, arrow-key navigation, and Enter
+selection all behave correctly, chained together with `RunMenu` inside one `RunApp` session.
+`arcosh/build`'s own full ctest suite (14/14) and the root project's full `ctest` suite (121/122,
+same pre-existing unrelated `arcfsctl_smoke` failure) both unaffected -- this is a strictly more
+correct answer for a case that was previously silently wrong, not a behavior change for any
+already-passing case.

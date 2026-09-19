@@ -4510,7 +4510,25 @@ HostedValueKind infer_local_kind_uncached(const AmirModule& module, const AmirFu
     // common single-representation case); when they disagree, answer Boxed, and Kind::Store's own
     // codegen (see its comment) boxes whichever source actually stores at runtime so that answer
     // is always genuinely true.
+    // Entry 35 (.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md): a local reassigned from ITSELF (e.g. `i =
+    // i + 1`, an ordinary loop counter) is genuinely self-referential -- classifying one of ITS OWN
+    // stores can require re-classifying `local_name` again, recursively, at a deeper `depth`. That
+    // recursion isn't infinite (the depth cap in infer_hosted_value_kind_uncached bounds it), but
+    // hitting the cap makes some INNER call return Unknown for a value that, at any shallower depth
+    // (i.e. with a fairer budget), would have resolved to a real, definite answer -- confirmed by
+    // direct tracing: `scrollOffset = 0; i = scrollOffset; ...; i = i + 1` classified `i`'s own
+    // `i = scrollOffset` store as Unknown purely because that query happened to bottom out at
+    // depth 9, not because `scrollOffset` is actually ambiguous in any way. The two loops below
+    // therefore treat Unknown as "no information," never as a real, disagreement-worthy kind of its
+    // own -- an Unknown answer from one Store site must never override or "disagree with" a
+    // DEFINITE answer (Number/String/Bool/Boxed) from another, since disagreement is supposed to
+    // mean "this local really does hold two different representations depending on which branch
+    // ran," not "the static analysis ran out of recursion budget for one query." Without this fix,
+    // the artificial disagreement forced `i` to Boxed, and the array-index codegen for `filtered[i]`
+    // (which expects a raw double, never a boxed pointer) segfaulted on the second loop iteration,
+    // the instant `i` was no longer the all-zero-bits value 0.0 happened to coincide with.
     bool found_any_store = false;
+    bool found_any_definite_store = false;
     HostedValueKind agreed_store_kind = HostedValueKind::Unknown;
     bool store_disagreement = false;
     for (const auto& search_block : function.blocks) {
@@ -4519,16 +4537,21 @@ HostedValueKind infer_local_kind_uncached(const AmirModule& module, const AmirFu
                 candidate.operands.empty()) {
                 continue;
             }
+            found_any_store = true;
             const HostedValueKind this_store_kind = infer_hosted_value_kind(module, function, candidate.operands.front(), depth);
-            if (!found_any_store) {
+            if (this_store_kind == HostedValueKind::Unknown) continue;
+            if (!found_any_definite_store) {
                 agreed_store_kind = this_store_kind;
-                found_any_store = true;
+                found_any_definite_store = true;
             } else if (this_store_kind != agreed_store_kind) {
                 store_disagreement = true;
             }
         }
     }
-    if (found_any_store) return store_disagreement ? HostedValueKind::Boxed : agreed_store_kind;
+    if (found_any_store) {
+        if (!found_any_definite_store) return HostedValueKind::Unknown;
+        return store_disagreement ? HostedValueKind::Boxed : agreed_store_kind;
+    }
     for (const auto& param : function.params) {
         if (bare_parameter_name(param) != local_name) continue;
         const std::string param_type = declared_parameter_type(param);
@@ -4870,7 +4893,25 @@ HostedValueKind infer_hosted_value_kind_uncached(const AmirModule& module, const
             }
         }
     }
-    return HostedValueKind::Unknown;
+    // `name` matched none of the instruction-RESULT shapes above -- every case up to this point
+    // only recognizes a compiler-generated TEMP (a name that is literally the `result` of some
+    // Const/Binary/Load/Array/Object/... instruction). A NAMED LOCAL VARIABLE is never itself an
+    // instruction's own result in this AMIR model -- it's a Store TARGET -- so a bare reference to
+    // one (e.g. the plain identifier `scrollOffset` in `i = scrollOffset`, or `i` itself inside
+    // `i = i + 1`'s own Binary operand) fell through everything above and landed on `Unknown` by
+    // mistake, a real, found-by-running-it bug (Entry 35,
+    // .agents/ARCO_NATIVE_RUNTIME_PROGRESS.md): `i`'s own two Store sites (`i = scrollOffset`,
+    // classified Unknown; `i = i + 1`, classified Number) then DISAGREED, so infer_local_kind's own
+    // disagreement rule classified `i` as Boxed -- corrupting every later `filtered[i]` array
+    // index, which expects a raw double, not a boxed pointer, a real segfault on the second loop
+    // iteration once `i` no longer happened to be the all-zero bit pattern. Delegating to
+    // infer_local_kind here closes the gap the exact same way the Kind::Load case above already
+    // does for a TEMP that wraps one (`infer_local_kind(module, function, instruction.target, ...)`)
+    // -- infer_local_kind itself already knows how to classify a genuine local (scan its own Store
+    // sites) or a parameter, and safely bottoms out at the existing depth cap for a name that is
+    // neither (avoiding true infinite recursion for a pathological self-referential store like
+    // `x = x`, which would otherwise ping-pong between this function and infer_local_kind forever).
+    return infer_local_kind(module, function, name, depth + 1);
 }
 
 // Per-(function, name, depth) memoization for infer_hosted_value_kind_uncached above. Entry 31
