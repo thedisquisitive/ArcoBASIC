@@ -11,7 +11,8 @@ ArcoFission, not hand-written in C++.
 ## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes)
 and WP-009 (Plugin System), a built-in HELP command, profile/theme/prompt customization (RFC-0052
 sections 20/22), interactive theme/prompt editors on top of it, per-segment prompt color tags,
-broken-down date/time prompt fields, and a real-OS-identity `user` prompt segment
+broken-down date/time prompt fields, a real-OS-identity `user` prompt segment, and a bundled
+"learn" plugin (an interactive language reference and tutorial) shipped out of the box
 
 `src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
 
@@ -416,6 +417,58 @@ cleanly without crashing or blocking other plugins) plus a real pty run end to e
 run the plugin command, set the plugin prompt segment, switch to the plugin theme, list capabilities
 — and a separate run confirming a fresh process auto-loads the persisted-enabled plugin on startup,
 while `--no-plugins` correctly skips it.
+
+## Bundled "learn" plugin: an interactive language reference and tutorial
+
+ArcoSH ships with a real plugin out of the box — "ships with the terminal", not something a user
+has to separately discover and install: type `learn` and get an interactive ArcoBASIC language
+reference (searchable, live-filtered) and a real, quiz-based interactive tutorial, built entirely
+on `stdlib/curses.abas` (below) and the ordinary plugin system above. `arcosh/plugins/learn.abas`
+is the canonical, human-editable source; `~/.arcosh/plugins/learn.abas` gets written out and
+enabled automatically the FIRST time it's ever found missing (`EnsureBundledPluginsInstalled`,
+called from `LoadEnabledPlugins`) — but it is an ordinary plugin in every other respect from that
+point on: `plugins disable learn`, editing the file, or deleting it all work exactly like they
+would for any user-installed plugin, and none of them get silently reverted on a later start.
+
+Building this surfaced a real architectural gap: a plugin loaded through `Shell.LoadPlugin`/
+`Runtime.RunString` does **not** see `#IMPORT` — confirmed directly (`Curses.RunApp` failed with
+"unknown host function" the first time "learn" tried to use it) — `#IMPORT` is a compile-time-only
+mechanism ArcoFission's own frontend resolves when *building* a file, never something the embedded
+interpreter processes for an arbitrary in-memory string. Fixed by loading `stdlib/curses.abas`'s
+own full text into the one persistent plugin interpreter exactly ONCE, before any real plugin
+(bundled or user-installed) — function definitions persist across separate `Shell.LoadPlugin`
+calls on that same instance (confirmed directly), so every later plugin can call `Curses.*` with
+no import of its own, the same way `Shell.RegisterCommand`/etc. are already available to every
+plugin without one.
+
+Both `stdlib/curses.abas` and `arcosh/plugins/learn.abas` are embedded directly into
+`arcosh.abas` as string constants (`BundledCursesSource()`/`BundledLearnPluginSource()`), rather
+than read from a companion file at a fixed path relative to the arcosh binary — this way the
+bundled plugins work regardless of how the arcosh binary itself is copied, packaged, or invoked,
+with zero external file dependency at runtime. The embedded copies are generated, not
+hand-maintained (`scripts/arcosh/embed_plugin_source.py`, verified by round-tripping the generated
+function's own output back to a file and diffing it against the original — byte-for-byte
+identical except for one harmless trailing newline) — editing the canonical `.abas` files directly
+and forgetting to regenerate is a real, disclosed way to introduce drift.
+
+Also surfaced, and fixed by documentation (not by changing behavior): `Curses.RunSearchList`'s own
+`Index` result field is a position in whatever the live search had most recently filtered down to,
+not the caller's original items array — meaningless to index back into once any query has narrowed
+the list. The "learn" plugin's own reference browser hit this directly (looking up the wrong topic
+after a search); fixed there by looking the topic up by `Value` instead (unaffected by filtering),
+and `Curses.RunSearchList`'s own doc comment in `stdlib/curses.abas` now calls this trap out
+explicitly for the next caller.
+
+Verified via `tests/stdlib/curses_selftest.abas`'s own coverage (unaffected) plus new
+`--selftest-plugin` assertions (a real, temporary, empty plugins directory gets "learn" installed
+and enabled from nothing; a second run never overwrites an already-installed file or re-enables a
+disabled one; the bundled plugin's own embedded source actually loads and registers its command —
+catching a bad regeneration, not just proving the install/enable bookkeeping works) plus a full,
+real pty run of the whole interactive experience end to end: the main menu, searching the
+reference for "Classes" letter by letter and reading its real body text, and completing all three
+lessons of the "Getting Started" tutorial (including answering its quizzes correctly and
+confirming the "Correct!" feedback) — and a separate run against a completely fresh `$ARCOSH_HOME`
+confirming `learn` is installed, enabled, and immediately usable with zero manual setup.
 
 See `.agents/reports/ARCO_SH_RFC0052_WP000_REPOSITORY_AUDIT.md` (in the repo root's `.agents/`
 directory) for the mandatory pre-implementation audit this work was built against.

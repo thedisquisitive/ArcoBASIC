@@ -1,0 +1,257 @@
+' ArcoSH bundled "learn" plugin -- an interactive ArcoBASIC language reference and tutorial,
+' built entirely on stdlib/curses.abas's own RunMenu/RunSearchList/RunApp. Ships with arcosh
+' (auto-installed to ~/.arcosh/plugins/learn.abas and enabled the first time arcosh ever runs --
+' see EnsureBundledPluginsInstalled in arcosh.abas), but is an ordinary plugin in every other
+' respect: `plugins disable learn` turns it off exactly like any other.
+'
+' THIS FILE IS THE CANONICAL, HUMAN-EDITABLE SOURCE -- arcosh.abas's own BundledLearnPluginSource()
+' embeds an auto-generated, escaped copy of this exact content directly as a string constant (so
+' the bundled plugin has zero external file dependency at runtime; see that function's own header
+' comment for why). If you edit this file, you MUST regenerate that embedded copy from it -- it is
+' not hand-maintained and will silently drift out of sync otherwise. Regenerate with:
+'   python3 scripts/arcosh/embed_plugin_source.py arcosh/plugins/learn.abas BundledLearnPluginSource
+' then replace BundledLearnPluginSource()'s own body in arcosh/src/arcosh.abas with the result.
+
+FUNCTION LearnReferenceTopics()
+    topics = []
+    ignored = Array.Push(topics, {"Label": "Variables and Types", "Body": String.Join([
+        "Variables need no declaration -- the first assignment creates one:",
+        "",
+        "    name = " + Chr(34) + "Ada" + Chr(34),
+        "    age = 36",
+        "",
+        "A parameter or variable can be explicitly typed with AS:",
+        "",
+        "    FUNCTION Greet(who AS STRING)",
+        "",
+        "Common types: STRING, NUMBER, BOOL, ARRAY, OBJECT, CALLABLE. An untyped parameter",
+        "defaults to NUMBER."
+    ], Chr(10))})
+    ignored = Array.Push(topics, {"Label": "PRINT and Concatenation", "Body": String.Join([
+        "PRINT writes a line to the screen. + concatenates strings (converting numbers",
+        "automatically):",
+        "",
+        "    PRINT " + Chr(34) + "2 + 2 = " + Chr(34) + " + STRING(2 + 2)",
+        "",
+        "STRING(x) converts any value to text; NUMBER(x) parses text back into a number."
+    ], Chr(10))})
+    ignored = Array.Push(topics, {"Label": "Conditionals", "Body": String.Join([
+        "Single line:",
+        "",
+        "    IF age >= 18 THEN PRINT " + Chr(34) + "adult" + Chr(34),
+        "",
+        "Block form, with ELSE:",
+        "",
+        "    IF age >= 18 THEN",
+        "        PRINT " + Chr(34) + "adult" + Chr(34),
+        "    ELSE",
+        "        PRINT " + Chr(34) + "minor" + Chr(34),
+        "    END IF"
+    ], Chr(10))})
+    ignored = Array.Push(topics, {"Label": "Loops", "Body": String.Join([
+        "FOR EACH:",
+        "",
+        "    FOR item IN [1, 2, 3]",
+        "        PRINT item",
+        "    NEXT",
+        "",
+        "WHILE:",
+        "",
+        "    i = 0",
+        "    WHILE i < 3",
+        "        PRINT i",
+        "        i = i + 1",
+        "    WEND",
+        "",
+        "EXIT WHILE / EXIT FOR leave a loop early; CONTINUE WHILE / CONTINUE FOR skip to the",
+        "next iteration."
+    ], Chr(10))})
+    ignored = Array.Push(topics, {"Label": "Functions", "Body": String.Join([
+        "    FUNCTION Add(a, b)",
+        "        RETURN a + b",
+        "    END FUNCTION",
+        "",
+        "A function with no explicit RETURN returns " + Chr(34) + "nothing" + Chr(34) + " (ArcoBASIC's null).",
+        "Function names may contain a dot (Shell.RegisterCommand) -- a naming convention, not",
+        "real namespacing."
+    ], Chr(10))})
+    ignored = Array.Push(topics, {"Label": "Arrays", "Body": String.Join([
+        "    items = [10, 20, 30]",
+        "    PRINT items[0]",
+        "    ignored = Array.Push(items, 40)",
+        "    PRINT LEN(items)",
+        "",
+        "Array.Push/Pop/Insert/RemoveAt all mutate the array IN PLACE -- unlike Object.Set (see",
+        "the Objects topic), you never need to reassign the result."
+    ], Chr(10))})
+    ignored = Array.Push(topics, {"Label": "Objects", "Body": String.Join([
+        "    person = {" + Chr(34) + "Name" + Chr(34) + ": " + Chr(34) + "Ada" + Chr(34) + ", " + Chr(34) + "Age" + Chr(34) + ": 36}",
+        "    PRINT person.Name",
+        "",
+        "Object.Set returns a NEW, MODIFIED COPY -- it never changes the original object, unlike",
+        "Array.Push. Always reassign the result:",
+        "",
+        "    person = Object.Set(person, " + Chr(34) + "Age" + Chr(34) + ", 37)",
+        "",
+        "Object.Get(obj, key, default) reads a field that might not exist, safely."
+    ], Chr(10))})
+    ignored = Array.Push(topics, {"Label": "Classes", "Body": String.Join([
+        "    CLASS Animal",
+        "        FUNCTION Speak()",
+        "            RETURN " + Chr(34) + "..." + Chr(34),
+        "        END FUNCTION",
+        "    END CLASS",
+        "    CLASS Dog EXTENDS Animal",
+        "        FUNCTION Speak()",
+        "            RETURN " + Chr(34) + "Woof" + Chr(34),
+        "        END FUNCTION",
+        "    END CLASS",
+        "",
+        "SELF refers to the current instance inside a method; SUPER.Method(...) calls the",
+        "parent class's own version."
+    ], Chr(10))})
+    ignored = Array.Push(topics, {"Label": "Error Handling", "Body": String.Join([
+        "    TRY",
+        "        THROW " + Chr(34) + "something went wrong" + Chr(34),
+        "    CATCH err",
+        "        PRINT err.Message",
+        "    END TRY",
+        "",
+        "err.Type is " + Chr(34) + "UserError" + Chr(34) + " for a THROWn string, or " + Chr(34) + "RuntimeError" + Chr(34) + " for a",
+        "genuine runtime failure (like calling a method that doesn't exist)."
+    ], Chr(10))})
+    ignored = Array.Push(topics, {"Label": "Callables (ADDRESSOF)", "Body": String.Join([
+        "A named function can be passed around as a value:",
+        "",
+        "    FUNCTION Square(x)",
+        "        RETURN x * x",
+        "    END FUNCTION",
+        "    handler = ADDRESSOF Square",
+        "    PRINT handler(5)",
+        "",
+        "AS CALLABLE declares a parameter that accepts one of these. Array.SortBy/MinBy/MaxBy",
+        "all take a callable as their own key function."
+    ], Chr(10))})
+    RETURN topics
+END FUNCTION
+
+FUNCTION FindTopicByLabel(topics AS ARRAY, label AS STRING)
+    FOR t IN topics
+        IF t.Label == label THEN RETURN t
+    NEXT
+    RETURN {"Label": label, "Body": "(topic not found)"}
+END FUNCTION
+
+FUNCTION RunLearnReference()
+    topics = LearnReferenceTopics()
+    browsing = TRUE
+    WHILE browsing
+        ' RunSearchList's own Index is a position in whatever the search had most recently
+        ' filtered down to, not this array -- see its own doc comment in stdlib/curses.abas.
+        ' Value is unaffected by filtering (NormalizeMenuItems defaults it to each item's own
+        ' Label), so looking the topic back up by Value is the correct, robust way to do this.
+        choice = Curses.RunSearchList("ArcoBASIC Reference (Esc to go back)", topics, {"Height": 8})
+        IF choice.Cancelled THEN
+            browsing = FALSE
+        ELSE
+            topic = FindTopicByLabel(topics, choice.Value)
+            ignored = Curses.ClearScreen()
+            ignored = Curses.WriteAt(1, 1, topic.Label)
+            ignored = Curses.WriteAt(2, 1, RepeatChar("=", LEN(topic.Label)))
+            lineRow = 4
+            FOR bodyLine IN String.Split(topic.Body, Chr(10))
+                ignored = Curses.WriteAt(lineRow, 1, bodyLine)
+                lineRow = lineRow + 1
+            NEXT
+            ignored = Curses.WriteAt(lineRow + 1, 1, "-- press any key to go back --")
+            ignored = Curses.ReadKey()
+        END IF
+    WEND
+END FUNCTION
+
+FUNCTION ShowLessonText(lines AS ARRAY)
+    ignored = Curses.ClearScreen()
+    row = 1
+    FOR lessonLine IN lines
+        ignored = Curses.WriteAt(row, 1, lessonLine)
+        row = row + 1
+    NEXT
+    ignored = Curses.WriteAt(row + 1, 1, "-- press any key to continue --")
+    ignored = Curses.ReadKey()
+END FUNCTION
+
+FUNCTION AskQuiz(question AS STRING, choices AS ARRAY, correctIndex AS NUMBER)
+    answer = Curses.RunMenu(question, choices, {})
+    ignored = Curses.ClearScreen()
+    IF !answer.Cancelled ANDALSO answer.Index == correctIndex THEN
+        ignored = Curses.WriteAt(1, 1, "Correct!")
+    ELSE
+        ignored = Curses.WriteAt(1, 1, "Not quite -- the answer was: " + choices[correctIndex])
+    END IF
+    ignored = Curses.WriteAt(3, 1, "-- press any key to continue --")
+    ignored = Curses.ReadKey()
+END FUNCTION
+
+FUNCTION RunLearnTutorialGettingStarted()
+    ignored = ShowLessonText([
+        "Lesson 1: Getting Started",
+        "",
+        "ArcoSH's own scripting language is ArcoBASIC -- there is no separate shell dialect.",
+        "PRINT writes a line to the screen:",
+        "",
+        "    PRINT " + Chr(34) + "Hello, World!" + Chr(34)
+    ])
+    ignored = AskQuiz("What does PRINT " + Chr(34) + "Hello, World!" + Chr(34) + " print?",
+        ["Hello, World!", "PRINT Hello, World!", "Nothing", "An error"], 0)
+
+    ignored = ShowLessonText([
+        "Lesson 2: Variables",
+        "",
+        "Assigning a name creates a variable -- no declaration needed:",
+        "",
+        "    name = " + Chr(34) + "Ada" + Chr(34),
+        "    PRINT " + Chr(34) + "Hi, " + Chr(34) + " + name"
+    ])
+    ignored = AskQuiz("What does " + Chr(34) + "Hi, " + Chr(34) + " + name print, if name is " + Chr(34) + "Ada" + Chr(34) + "?",
+        ["Hi, Ada", "Hi, name", "Hi, " + Chr(34) + "Ada" + Chr(34), "An error"], 0)
+
+    ignored = ShowLessonText([
+        "Lesson 3: Loops",
+        "",
+        "FOR EACH walks every item in an array:",
+        "",
+        "    FOR n IN [1, 2, 3]",
+        "        PRINT n",
+        "    NEXT"
+    ])
+    ignored = AskQuiz("How many lines does that loop print?", ["1", "2", "3", "0"], 2)
+
+    ignored = ShowLessonText([
+        "That's the end of this lesson.",
+        "",
+        "Try the Language Reference from the main menu for more, or type real ArcoBASIC",
+        "directly at the arcosh prompt any time -- PRINT " + Chr(34) + "hello" + Chr(34) + " really works."
+    ])
+END FUNCTION
+
+FUNCTION RunLearnCommand(args AS OBJECT)
+    result = Curses.RunApp(ADDRESSOF LearnMainMenu)
+    RETURN ""
+END FUNCTION
+
+FUNCTION LearnMainMenu()
+    running = TRUE
+    WHILE running
+        choice = Curses.RunMenu("ArcoBASIC Learn", ["Language Reference", "Tutorial: Getting Started", "Quit"], {})
+        IF choice.Cancelled THEN
+            running = FALSE
+        ELSE
+            IF choice.Value == "Language Reference" THEN ignored = RunLearnReference()
+            IF choice.Value == "Tutorial: Getting Started" THEN ignored = RunLearnTutorialGettingStarted()
+            IF choice.Value == "Quit" THEN running = FALSE
+        END IF
+    WEND
+    RETURN ""
+END FUNCTION
+
+ignoredRegisterLearn = Shell.RegisterCommand("learn", ADDRESSOF RunLearnCommand)
