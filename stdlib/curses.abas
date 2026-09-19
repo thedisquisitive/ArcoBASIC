@@ -1,0 +1,369 @@
+' A platform-agnostic curses-style TUI toolkit for ArcoBASIC's own stdlib -- not part of ArcoSH
+' specifically (see arcosh/tests/fixtures/ for how arcosh's own tutorial/reference tooling uses
+' this), any ArcoBASIC program can use it.
+'
+' Layered in three pieces:
+'   1. Low-level primitives (Curses.EnableRawMode/DisableRawMode/ReadRawByteWithTimeout/
+'      TerminalSize) -- new arco_runtime host functions, src/runtime/runtime.cpp. Only the
+'      Linux/POSIX backend is implemented today (a real, disclosed gap -- Curses.EnableRawMode
+'      returns Ok: FALSE on any other platform); nothing about the API ITSELF assumes POSIX
+'      termios, so a Windows console backend can be added later with no API change here.
+'   2. Curses.ReadKey() and escape-sequence decoding -- built entirely in ArcoBASIC on top of (1),
+'      specifically so the decoding logic (DecodeEscapeSequence) is a PURE function, testable with
+'      synthetic byte strings, with no real terminal required.
+'   3. Drawing primitives (MoveCursor/ClearScreen/WriteAt/DrawBox/...) and two ready-to-use widgets
+'      (RunMenu, RunSearchList) built on top of (1) and (2).
+'
+' Usage pattern (mirrors real curses' own initscr()/endwin() bracketing -- RunMenu/RunSearchList
+' both ASSUME raw mode is already active, they never toggle it themselves, so several can be
+' chained inside one app without flicker or premature terminal restoration):
+'
+'   FUNCTION MyApp()
+'       choice = Curses.RunMenu("Pick one", ["Alpha", "Beta", "Gamma"], {})
+'       IF !choice.Cancelled THEN PRINT "you picked: " + choice.Value
+'   END FUNCTION
+'   ignored = Curses.RunApp(ADDRESSOF MyApp)
+'
+' Cbreak mode, not full raw() mode: Curses.EnableRawMode leaves ISIG on, so Ctrl-C still generates
+' a real SIGINT rather than arriving as a literal 0x03 byte a TUI app would otherwise have to
+' special-case. One real, disclosed cross-cutting interaction: running INSIDE arcosh specifically
+' (RFC-0052 WP-012's own shell-wide SIGINT-ignoring policy), that SIGINT is simply ignored by the
+' whole process, same as it already is for arcosh's own interactive loop -- Ctrl-C effectively does
+' nothing rather than interrupting the TUI app, exactly like it does nothing at arcosh's own
+' ordinary prompt. A standalone ArcoBASIC program (not hosted inside arcosh) sees ordinary
+' default SIGINT behavior instead.
+
+' ---------------------------------------------------------------------------------------------
+' Key reading
+' ---------------------------------------------------------------------------------------------
+
+' Pure -- no I/O, no globals -- so it can be tested directly with synthetic byte strings. `sequence`
+' is everything read AFTER the initial ESC byte (never including it). Covers the common xterm-family
+' arrow/navigation sequences; an unrecognized sequence returns "" and Curses.ReadKey reports it as
+' Kind "Unknown" rather than silently misinterpreting it as something else.
+FUNCTION DecodeEscapeSequence(sequence AS STRING)
+    IF sequence == "[A" THEN RETURN "Up"
+    IF sequence == "[B" THEN RETURN "Down"
+    IF sequence == "[C" THEN RETURN "Right"
+    IF sequence == "[D" THEN RETURN "Left"
+    IF sequence == "[H" THEN RETURN "Home"
+    IF sequence == "[F" THEN RETURN "End"
+    IF sequence == "[1~" THEN RETURN "Home"
+    IF sequence == "[4~" THEN RETURN "End"
+    IF sequence == "[3~" THEN RETURN "Delete"
+    IF sequence == "[5~" THEN RETURN "PageUp"
+    IF sequence == "[6~" THEN RETURN "PageDown"
+    RETURN ""
+END FUNCTION
+
+' A CSI sequence's own terminating byte -- a letter (the simple "\x1b[A" arrow-key shape) or "~"
+' (the numbered "\x1b[3~" shape) -- used by Curses.ReadKey to know when to stop accumulating bytes
+' without waiting for its own timeout to elapse on every single keypress.
+FUNCTION IsEscapeSequenceTerminator(byteText AS STRING)
+    IF byteText == "~" THEN RETURN TRUE
+    RETURN String.Contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", byteText)
+END FUNCTION
+
+' One keypress: {Kind: "Char" | "Key" | "Unknown" | "EOF", Value: "..."}. "Char" is one ordinary
+' printable byte (Value is that character); "Key" is a NAMED key (Enter/Backspace/Tab/Escape/Up/
+' Down/Left/Right/Home/End/Delete/PageUp/PageDown/CtrlC); "Unknown" is a real escape sequence this
+' function doesn't recognize (Value is the raw bytes, ESC included, so a caller can still inspect
+' it); "EOF" means stdin closed. Blocks waiting for the FIRST byte (Curses.ReadRawByteWithTimeout
+' -1); an ESC byte then gets up to a short 50ms window per subsequent byte to distinguish a real,
+' standalone Escape keypress (nothing else arrives) from the start of a longer sequence (arrow/
+' function keys all arrive as one fast burst from a real terminal, never one byte per 50ms) -- the
+' classic ambiguity every terminal-input reader has to resolve.
+FUNCTION Curses.ReadKey()
+    first = Curses.ReadRawByteWithTimeout(-1)
+    IF first == "" THEN RETURN {"Kind": "EOF", "Value": ""}
+    IF first == Chr(27) THEN
+        sequence = ""
+        collecting = TRUE
+        WHILE collecting
+            nextByte = Curses.ReadRawByteWithTimeout(50)
+            IF nextByte == "" THEN
+                collecting = FALSE
+            ELSE
+                sequence = sequence + nextByte
+                IF IsEscapeSequenceTerminator(nextByte) THEN collecting = FALSE
+                IF LEN(sequence) > 8 THEN collecting = FALSE
+            END IF
+        WEND
+        IF sequence == "" THEN RETURN {"Kind": "Key", "Value": "Escape"}
+        decoded = DecodeEscapeSequence(sequence)
+        IF decoded <> "" THEN RETURN {"Kind": "Key", "Value": decoded}
+        RETURN {"Kind": "Unknown", "Value": Chr(27) + sequence}
+    END IF
+    IF first == Chr(13) THEN RETURN {"Kind": "Key", "Value": "Enter"}
+    IF first == Chr(10) THEN RETURN {"Kind": "Key", "Value": "Enter"}
+    IF first == Chr(127) THEN RETURN {"Kind": "Key", "Value": "Backspace"}
+    IF first == Chr(8) THEN RETURN {"Kind": "Key", "Value": "Backspace"}
+    IF first == Chr(9) THEN RETURN {"Kind": "Key", "Value": "Tab"}
+    IF first == Chr(3) THEN RETURN {"Kind": "Key", "Value": "CtrlC"}
+    RETURN {"Kind": "Char", "Value": first}
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Drawing primitives -- every one of these just writes ordinary ANSI escapes via Console.Write,
+' the same "never emit a raw ANSI sequence except through one small set of named functions"
+' discipline arcosh's own Display.* functions already follow (RFC-0052 section 17), generalized
+' here for any ArcoBASIC program, not just arcosh.
+' ---------------------------------------------------------------------------------------------
+
+FUNCTION Curses.MoveCursor(row AS NUMBER, col AS NUMBER)
+    ignored = Console.Write(Chr(27) + "[" + STRING(row) + ";" + STRING(col) + "H")
+END FUNCTION
+
+FUNCTION Curses.ClearScreen()
+    ignored = Console.Write(Chr(27) + "[2J")
+    ignored = Curses.MoveCursor(1, 1)
+END FUNCTION
+
+FUNCTION Curses.ClearLine()
+    ignored = Console.Write(Chr(27) + "[2K")
+END FUNCTION
+
+FUNCTION Curses.HideCursor()
+    ignored = Console.Write(Chr(27) + "[?25l")
+END FUNCTION
+
+FUNCTION Curses.ShowCursor()
+    ignored = Console.Write(Chr(27) + "[?25h")
+END FUNCTION
+
+FUNCTION Curses.WriteAt(row AS NUMBER, col AS NUMBER, text AS STRING)
+    ignored = Curses.MoveCursor(row, col)
+    ignored = Console.Write(text)
+END FUNCTION
+
+FUNCTION RepeatChar(ch AS STRING, count AS NUMBER)
+    result = ""
+    i = 0
+    WHILE i < count
+        result = result + ch
+        i = i + 1
+    WEND
+    RETURN result
+END FUNCTION
+
+FUNCTION Curses.ClearRect(row AS NUMBER, col AS NUMBER, height AS NUMBER, width AS NUMBER)
+    blank = RepeatChar(" ", width)
+    i = 0
+    WHILE i < height
+        ignored = Curses.WriteAt(row + i, col, blank)
+        i = i + 1
+    WEND
+END FUNCTION
+
+' A plain single-line-bordered box (+/-/|), optionally with a title embedded in the top border --
+' deliberately plain ASCII, not Unicode box-drawing characters, so it renders correctly over an
+' actual serial/legacy terminal or a pty with no UTF-8 assumptions, matching this whole toolkit's
+' own "platform/terminal agnostic" brief.
+FUNCTION Curses.DrawBox(row AS NUMBER, col AS NUMBER, height AS NUMBER, width AS NUMBER, title AS STRING)
+    innerWidth = width - 2
+    topLine = "+" + RepeatChar("-", innerWidth) + "+"
+    IF title <> "" THEN
+        label = " " + title + " "
+        IF LEN(label) <= innerWidth THEN
+            topLine = "+" + label + RepeatChar("-", innerWidth - LEN(label)) + "+"
+        END IF
+    END IF
+    ignored = Curses.WriteAt(row, col, topLine)
+    i = 1
+    WHILE i < height - 1
+        ignored = Curses.WriteAt(row + i, col, "|" + RepeatChar(" ", innerWidth) + "|")
+        i = i + 1
+    WEND
+    ignored = Curses.WriteAt(row + height - 1, col, "+" + RepeatChar("-", innerWidth) + "+")
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Widgets. Both RunMenu and RunSearchList ASSUME raw mode is already active (see this file's own
+' header comment) -- neither ever calls Curses.EnableRawMode/DisableRawMode itself, so several can
+' be chained inside one Curses.RunApp session without flicker or premature restoration.
+' ---------------------------------------------------------------------------------------------
+
+' `items`: an array of plain strings, or {Label, Value} objects (Value defaults to Label when
+' omitted) -- normalized once, up front, so every widget/helper below works from one consistent
+' {Label, Value} shape regardless of what the caller passed in.
+FUNCTION NormalizeMenuItems(items AS ARRAY)
+    result = []
+    FOR item IN items
+        IF TYPEOF(item) == "Object" THEN
+            ignored = Array.Push(result, {"Label": item.Label, "Value": Object.Get(item, "Value", item.Label)})
+        ELSE
+            ignored = Array.Push(result, {"Label": STRING(item), "Value": STRING(item)})
+        END IF
+    NEXT
+    RETURN result
+END FUNCTION
+
+' Pure (no I/O) -- a case-insensitive substring match of `query` against each item's own Label.
+FUNCTION FilterMenuItems(normalized AS ARRAY, query AS STRING)
+    IF query == "" THEN RETURN normalized
+    needle = Lower(query)
+    result = []
+    FOR item IN normalized
+        IF String.Contains(Lower(item.Label), needle) THEN ignored = Array.Push(result, item)
+    NEXT
+    RETURN result
+END FUNCTION
+
+FUNCTION DrawMenuBody(row AS NUMBER, col AS NUMBER, innerWidth AS NUMBER, items AS ARRAY, selected AS NUMBER, firstLine AS NUMBER)
+    i = 0
+    FOR item IN items
+        label = item.Label
+        IF LEN(label) > innerWidth - 2 THEN label = String.Slice(label, 0, innerWidth - 2)
+        padded = " " + label + RepeatChar(" ", innerWidth - LEN(label) - 1)
+        lineRow = row + firstLine + i
+        IF i == selected THEN
+            ignored = Curses.WriteAt(lineRow, col + 1, Chr(27) + "[7m" + padded + Chr(27) + "[0m")
+        ELSE
+            ignored = Curses.WriteAt(lineRow, col + 1, padded)
+        END IF
+        i = i + 1
+    NEXT
+END FUNCTION
+
+' `options` (all optional): Row, Col (top-left corner; defaults to centered on the real terminal),
+' Width (defaults to fitting the longest item/title). Menus are NOT scrollable -- a real, disclosed
+' scope limit -- keep menus short; use Curses.RunSearchList instead for anything long enough to
+' need it. Up/Down wrap around; Enter selects; Escape or "q" cancels ({"Cancelled": TRUE}).
+FUNCTION Curses.RunMenu(title AS STRING, items AS ARRAY, options AS OBJECT)
+    normalized = NormalizeMenuItems(items)
+    width = LEN(title) + 4
+    FOR item IN normalized
+        IF LEN(item.Label) + 4 > width THEN width = LEN(item.Label) + 4
+    NEXT
+    width = width + Object.Get(options, "ExtraWidth", 0)
+    height = LEN(normalized) + 2
+    termSize = Curses.TerminalSize()
+    row = Object.Get(options, "Row", 0)
+    IF row == 0 THEN row = FLOOR((termSize.Rows - height) / 2)
+    IF row < 1 THEN row = 1
+    col = Object.Get(options, "Col", 0)
+    IF col == 0 THEN col = FLOOR((termSize.Cols - width) / 2)
+    IF col < 1 THEN col = 1
+
+    selected = 0
+    result = {"Cancelled": TRUE, "Value": "", "Index": -1}
+    running = TRUE
+    WHILE running
+        ignored = Curses.DrawBox(row, col, height, width, title)
+        ignored = DrawMenuBody(row, col, width - 2, normalized, selected, 1)
+        key = Curses.ReadKey()
+        IF key.Kind == "Key" THEN
+            IF key.Value == "Up" THEN
+                selected = selected - 1
+                IF selected < 0 THEN selected = LEN(normalized) - 1
+            END IF
+            IF key.Value == "Down" THEN
+                selected = selected + 1
+                IF selected >= LEN(normalized) THEN selected = 0
+            END IF
+            IF key.Value == "Enter" THEN
+                result = {"Cancelled": FALSE, "Value": normalized[selected].Value, "Index": selected}
+                running = FALSE
+            END IF
+            IF key.Value == "Escape" THEN running = FALSE
+        END IF
+        IF key.Kind == "Char" THEN
+            IF key.Value == "q" THEN running = FALSE
+        END IF
+        IF key.Kind == "EOF" THEN running = FALSE
+    WEND
+    RETURN result
+END FUNCTION
+
+' Same shape as Curses.RunMenu's own {Cancelled, Value, Index}, but with a live search-as-you-type
+' filter line under the title. Handles more items than fit on screen with simple scrolling (the
+' visible window always includes the current selection). `options`: same as RunMenu, plus Height
+' (visible item rows; defaults to a reasonable size capped to the real terminal).
+FUNCTION Curses.RunSearchList(title AS STRING, items AS ARRAY, options AS OBJECT)
+    normalized = NormalizeMenuItems(items)
+    width = LEN(title) + 4
+    FOR item IN normalized
+        IF LEN(item.Label) + 4 > width THEN width = LEN(item.Label) + 4
+    NEXT
+    width = width + Object.Get(options, "ExtraWidth", 0)
+    termSize = Curses.TerminalSize()
+    visibleRows = Object.Get(options, "Height", 10)
+    maxVisibleRows = termSize.Rows - 6
+    IF visibleRows > maxVisibleRows THEN visibleRows = maxVisibleRows
+    IF visibleRows < 1 THEN visibleRows = 1
+    height = visibleRows + 4
+    row = Object.Get(options, "Row", 0)
+    IF row == 0 THEN row = FLOOR((termSize.Rows - height) / 2)
+    IF row < 1 THEN row = 1
+    col = Object.Get(options, "Col", 0)
+    IF col == 0 THEN col = FLOOR((termSize.Cols - width) / 2)
+    IF col < 1 THEN col = 1
+
+    query = ""
+    selected = 0
+    result = {"Cancelled": TRUE, "Value": "", "Index": -1}
+    running = TRUE
+    WHILE running
+        filtered = FilterMenuItems(normalized, query)
+        IF selected >= LEN(filtered) THEN selected = LEN(filtered) - 1
+        IF selected < 0 THEN selected = 0
+        scrollOffset = 0
+        IF selected >= visibleRows THEN scrollOffset = selected - visibleRows + 1
+        visible = []
+        i = scrollOffset
+        WHILE i < LEN(filtered) ANDALSO LEN(visible) < visibleRows
+            ignored = Array.Push(visible, filtered[i])
+            i = i + 1
+        WEND
+
+        ignored = Curses.DrawBox(row, col, height, width, title)
+        ignored = Curses.WriteAt(row + 1, col + 1, "/" + query + RepeatChar(" ", width - 4 - LEN(query)))
+        ignored = DrawMenuBody(row, col, width - 2, visible, selected - scrollOffset, 2)
+        key = Curses.ReadKey()
+        IF key.Kind == "Key" THEN
+            IF key.Value == "Up" THEN
+                selected = selected - 1
+                IF selected < 0 THEN selected = 0
+            END IF
+            IF key.Value == "Down" THEN
+                selected = selected + 1
+                IF selected >= LEN(filtered) THEN selected = LEN(filtered) - 1
+            END IF
+            IF key.Value == "Enter" THEN
+                IF LEN(filtered) > 0 THEN result = {"Cancelled": FALSE, "Value": filtered[selected].Value, "Index": selected}
+                running = FALSE
+            END IF
+            IF key.Value == "Escape" THEN running = FALSE
+            IF key.Value == "Backspace" THEN
+                IF LEN(query) > 0 THEN query = String.Slice(query, 0, LEN(query) - 1)
+            END IF
+        END IF
+        IF key.Kind == "Char" THEN query = query + key.Value
+        IF key.Kind == "EOF" THEN running = FALSE
+    WEND
+    RETURN result
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Session bracketing -- the ONE place raw mode/cursor visibility get toggled for a whole
+' interactive session, mirroring real curses' own initscr()/endwin() pairing. Always restores the
+' terminal, even if `appFunction` throws -- a TUI app that dies mid-screen must never leave the
+' user's real terminal stuck without echo/line-editing.
+' ---------------------------------------------------------------------------------------------
+
+FUNCTION Curses.RunApp(appFunction AS CALLABLE)
+    enableResult = Curses.EnableRawMode()
+    IF !enableResult.Ok THEN THROW "Curses.RunApp: could not enable raw mode: " + enableResult.Error
+    ignored = Curses.HideCursor()
+    errorMessage = ""
+    appResult = NULL
+    TRY
+        appResult = appFunction()
+    CATCH err
+        errorMessage = err.Message
+    END TRY
+    ignored = Curses.ShowCursor()
+    ignored = Curses.DisableRawMode()
+    IF errorMessage <> "" THEN THROW errorMessage
+    RETURN appResult
+END FUNCTION

@@ -80,6 +80,13 @@ arco_add_script_test(
     $<TARGET_FILE:ArcoFission>
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+arco_add_script_test(
+    curses_stdlib_smoke
+    tests/integration/curses_stdlib_smoke.sh
+    $<TARGET_FILE:ArcoFission>
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
 if(TARGET ArcoNativeRuntimeCoreProbe)
     # ArcoNativeRuntimeCoreProbe is EXCLUDE_FROM_ALL (same reasoning as the pre-existing
     # ArcoFissionCapsuleCoreProbe: it exists purely so fission.cpp can read its link.txt, and

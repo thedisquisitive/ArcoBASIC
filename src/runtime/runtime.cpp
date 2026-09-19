@@ -39,8 +39,10 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <pwd.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -3092,6 +3094,36 @@ std::unordered_map<std::string, PluginCapabilityEntry>& plugin_capability_regist
     return registry;
 }
 
+#ifndef _WIN32
+// Backs Curses.EnableRawMode/DisableRawMode (the stdlib TUI toolkit's own low-level terminal-mode
+// primitive -- see stdlib/curses.abas): the ORIGINAL termios settings, saved once so they can be
+// restored exactly, and whether raw mode is currently active at all (so a second EnableRawMode
+// call is a safe no-op rather than clobbering the saved original with an already-raw state).
+// Process-wide, not per-Runtime-instance, for the same reason global_store()/plugin_runtime()
+// elsewhere in this file are: there is exactly one real controlling terminal for the whole
+// process, regardless of how many Runtime C++ objects exist.
+struct CursesRawModeState {
+    bool active = false;
+    termios original{};
+};
+CursesRawModeState& curses_raw_mode_state() {
+    static CursesRawModeState state;
+    return state;
+}
+// Registered with std::atexit the first time raw mode is ever enabled (see Curses.EnableRawMode)
+// so a program that enables raw mode and then crashes, throws uncaught, or simply forgets to call
+// Curses.DisableRawMode never leaves the user's real terminal stuck in cbreak/no-echo mode after
+// the process exits -- the single most user-hostile failure mode a terminal-mode-switching
+// program can have.
+void curses_restore_terminal_atexit() {
+    auto& state = curses_raw_mode_state();
+    if (state.active) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &state.original);
+        state.active = false;
+    }
+}
+#endif
+
 Runtime::Runtime()
     : output_(&std::cout),
       default_random_(std::make_shared<Pcg32>(automatic_random_seed(), Pcg32::default_sequence)) {
@@ -3768,6 +3800,78 @@ Runtime::Runtime()
         return _isatty(_fileno(stdout)) != 0;
 #else
         return isatty(fileno(stdout)) != 0;
+#endif
+    });
+    // Low-level primitives for the stdlib curses/TUI toolkit (stdlib/curses.abas): cbreak mode
+    // (ICANON+ECHO off, ISIG left ON so Ctrl-C still generates a real SIGINT rather than arriving
+    // as a literal 0x03 byte a TUI app would otherwise have to special-case itself -- deliberately
+    // NOT full raw() mode), a single-byte read with a caller-chosen timeout (the building block
+    // stdlib/curses.abas's own ArcoBASIC-level ReadKey/escape-sequence decoding is built from --
+    // decoding itself lives in ArcoBASIC specifically so it can be unit-tested with synthetic byte
+    // strings, no real terminal required), and a terminal-size query. Windows is a real, disclosed
+    // gap for now (Curses.EnableRawMode returns Ok: FALSE there rather than silently doing
+    // nothing) -- the ArcoBASIC-level API is designed platform-agnostic (nothing about it assumes
+    // POSIX termios), but only the Linux/POSIX backend is implemented in this pass.
+    register_function("Curses.EnableRawMode", [](const std::vector<Value>&) -> Value {
+#ifdef _WIN32
+        return Value::Object{{"Ok", false}, {"Error", std::string("raw mode is not implemented on this platform yet")}};
+#else
+        auto& state = curses_raw_mode_state();
+        if (state.active) return Value::Object{{"Ok", true}, {"Error", std::string()}};
+        termios original{};
+        if (tcgetattr(STDIN_FILENO, &original) != 0) {
+            return Value::Object{{"Ok", false}, {"Error", std::string("tcgetattr failed: ") + std::strerror(errno)}};
+        }
+        termios raw = original;
+        raw.c_lflag &= ~(ICANON | ECHO);
+        raw.c_cc[VMIN] = 1;
+        raw.c_cc[VTIME] = 0;
+        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) {
+            return Value::Object{{"Ok", false}, {"Error", std::string("tcsetattr failed: ") + std::strerror(errno)}};
+        }
+        const bool first_time = !state.active;
+        state.original = original;
+        state.active = true;
+        if (first_time) std::atexit(curses_restore_terminal_atexit);
+        return Value::Object{{"Ok", true}, {"Error", std::string()}};
+#endif
+    });
+    register_function("Curses.DisableRawMode", [](const std::vector<Value>&) -> Value {
+#ifndef _WIN32
+        curses_restore_terminal_atexit();
+#endif
+        return Value();
+    });
+    // `timeoutMs`: 0 polls without blocking, a positive value waits up to that many milliseconds,
+    // -1 blocks indefinitely (poll()'s own convention, passed straight through) -- stdlib/
+    // curses.abas's own ReadKey uses -1 for the FIRST byte of a keypress (genuinely waiting for
+    // the user) and a short positive timeout for any SUBSEQUENT bytes (deciding whether a lone ESC
+    // byte is a real standalone Escape keypress or the start of a longer arrow/function-key
+    // sequence -- the classic terminal-input ambiguity every curses-like reader has to resolve).
+    // Returns "" for a timeout, EOF, or any read error -- ReadKey treats empty the same way in
+    // every case, so this primitive doesn't need to distinguish them itself.
+    register_function("Curses.ReadRawByteWithTimeout", [](const std::vector<Value>& args) -> Value {
+        expect_arg_count(args, "Curses.ReadRawByteWithTimeout", 1, 1);
+#ifdef _WIN32
+        return Value(std::string());
+#else
+        const int timeout_ms = static_cast<int>(args[0].as_number());
+        pollfd poll_fd{STDIN_FILENO, POLLIN, 0};
+        if (poll(&poll_fd, 1, timeout_ms) <= 0) return Value(std::string());
+        char byte = 0;
+        if (::read(STDIN_FILENO, &byte, 1) != 1) return Value(std::string());
+        return Value(std::string(1, byte));
+#endif
+    });
+    register_function("Curses.TerminalSize", [](const std::vector<Value>&) -> Value {
+#ifdef _WIN32
+        return Value::Object{{"Rows", 24.0}, {"Cols", 80.0}};
+#else
+        winsize size{};
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) != 0 || size.ws_row == 0 || size.ws_col == 0) {
+            return Value::Object{{"Rows", 24.0}, {"Cols", 80.0}};
+        }
+        return Value::Object{{"Rows", static_cast<double>(size.ws_row)}, {"Cols", static_cast<double>(size.ws_col)}};
 #endif
     });
     register_function("Path.Cwd", [](const std::vector<Value>& args) -> Value {

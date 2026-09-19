@@ -1,0 +1,145 @@
+' Structural regression coverage for stdlib/curses.abas -- every function tested here is pure (no
+' terminal I/O, no globals), by design, specifically so it can be exercised with synthetic inputs
+' with no real terminal required. The interactive pieces (Curses.ReadKey's own real byte timing,
+' Curses.EnableRawMode, RunMenu/RunSearchList's own arrow-key navigation and live search) are
+' verified manually against the compiled binary under a real pty instead (see stdlib/curses.abas's
+' own header comment and arcosh's own established "interactive loops verified manually, their pure
+' logic verified here" split, e.g. RunJobControlSelfTest/RunEditorSelfTest in arcosh/src/arcosh.abas).
+#IMPORT "curses"
+
+failures = 0
+
+IF DecodeEscapeSequence("[A") == "Up" THEN
+    PRINT "ok   Up arrow decodes correctly"
+ELSE
+    PRINT "FAIL Up arrow did not decode"
+    failures = failures + 1
+END IF
+
+allArrows = TRUE
+IF DecodeEscapeSequence("[B") <> "Down" THEN allArrows = FALSE
+IF DecodeEscapeSequence("[C") <> "Right" THEN allArrows = FALSE
+IF DecodeEscapeSequence("[D") <> "Left" THEN allArrows = FALSE
+IF allArrows THEN
+    PRINT "ok   Down/Right/Left all decode correctly"
+ELSE
+    PRINT "FAIL one of Down/Right/Left did not decode correctly"
+    failures = failures + 1
+END IF
+
+numberedOk = TRUE
+IF DecodeEscapeSequence("[3~") <> "Delete" THEN numberedOk = FALSE
+IF DecodeEscapeSequence("[1~") <> "Home" THEN numberedOk = FALSE
+IF DecodeEscapeSequence("[4~") <> "End" THEN numberedOk = FALSE
+IF DecodeEscapeSequence("[5~") <> "PageUp" THEN numberedOk = FALSE
+IF DecodeEscapeSequence("[6~") <> "PageDown" THEN numberedOk = FALSE
+IF numberedOk THEN
+    PRINT "ok   numbered CSI sequences (Delete/Home/End/PageUp/PageDown) decode correctly"
+ELSE
+    PRINT "FAIL a numbered CSI sequence did not decode correctly"
+    failures = failures + 1
+END IF
+
+IF DecodeEscapeSequence("[Z") == "" THEN
+    PRINT "ok   an unrecognized sequence decodes to empty rather than guessing"
+ELSE
+    PRINT "FAIL unrecognized sequence did not decode to empty"
+    failures = failures + 1
+END IF
+
+terminatorOk = IsEscapeSequenceTerminator("A")
+IF terminatorOk THEN terminatorOk = IsEscapeSequenceTerminator("~")
+IF terminatorOk THEN terminatorOk = !IsEscapeSequenceTerminator("[")
+IF terminatorOk THEN terminatorOk = !IsEscapeSequenceTerminator("1")
+IF terminatorOk THEN
+    PRINT "ok   IsEscapeSequenceTerminator recognizes letters and ~, rejects [ and digits"
+ELSE
+    PRINT "FAIL IsEscapeSequenceTerminator misclassified a byte"
+    failures = failures + 1
+END IF
+
+normalized = NormalizeMenuItems(["Alpha", {"Label": "Beta", "Value": "B"}])
+normOk = LEN(normalized) == 2
+IF normOk THEN normOk = normalized[0].Label == "Alpha"
+IF normOk THEN normOk = normalized[0].Value == "Alpha"
+IF normOk THEN normOk = normalized[1].Label == "Beta"
+IF normOk THEN normOk = normalized[1].Value == "B"
+IF normOk THEN
+    PRINT "ok   NormalizeMenuItems handles plain strings and {Label,Value} objects"
+ELSE
+    PRINT "FAIL NormalizeMenuItems did not normalize correctly"
+    failures = failures + 1
+END IF
+
+filtered = FilterMenuItems(normalized, "alp")
+IF LEN(filtered) == 1 ANDALSO filtered[0].Label == "Alpha" THEN
+    PRINT "ok   FilterMenuItems matches case-insensitively"
+ELSE
+    PRINT "FAIL FilterMenuItems did not filter correctly"
+    failures = failures + 1
+END IF
+
+IF LEN(FilterMenuItems(normalized, "")) == 2 THEN
+    PRINT "ok   FilterMenuItems returns every item for an empty query"
+ELSE
+    PRINT "FAIL FilterMenuItems did not return every item for an empty query"
+    failures = failures + 1
+END IF
+
+IF LEN(FilterMenuItems(normalized, "zzz")) == 0 THEN
+    PRINT "ok   FilterMenuItems returns nothing for a query matching no item"
+ELSE
+    PRINT "FAIL FilterMenuItems returned items for a non-matching query"
+    failures = failures + 1
+END IF
+
+IF RepeatChar("x", 4) == "xxxx" THEN
+    PRINT "ok   RepeatChar repeats the given count"
+ELSE
+    PRINT "FAIL RepeatChar did not repeat correctly"
+    failures = failures + 1
+END IF
+
+IF RepeatChar("x", 0) == "" THEN
+    PRINT "ok   RepeatChar with count 0 produces an empty string"
+ELSE
+    PRINT "FAIL RepeatChar with count 0 did not produce an empty string"
+    failures = failures + 1
+END IF
+
+' Entry 35 (.agents/ARCO_NATIVE_RUNTIME_PROGRESS.md): the exact scrolling-loop shape RunSearchList
+' uses (a local reassigned from ANOTHER local, then incremented and used as an array index in a
+' loop) once segfaulted under the native backend. Exercised here directly, against a list larger
+' than one screen, so a regression in either the compiler fix or this loop's own logic would fail
+' loudly rather than only showing up interactively.
+manyItems = []
+i = 0
+WHILE i < 20
+    ignored = Array.Push(manyItems, "item" + STRING(i))
+    i = i + 1
+WEND
+manyNormalized = NormalizeMenuItems(manyItems)
+scrollTestOk = LEN(manyNormalized) == 20
+scrollOffset = 5
+visibleRows = 10
+visible = []
+j = scrollOffset
+WHILE j < LEN(manyNormalized) ANDALSO LEN(visible) < visibleRows
+    ignored = Array.Push(visible, manyNormalized[j])
+    j = j + 1
+WEND
+IF scrollTestOk THEN scrollTestOk = LEN(visible) == 10
+IF scrollTestOk THEN scrollTestOk = visible[0].Label == "item5"
+IF scrollTestOk THEN scrollTestOk = visible[9].Label == "item14"
+IF scrollTestOk THEN
+    PRINT "ok   a scrolled sub-window over a 20-item list produces the correct 10-item slice"
+ELSE
+    PRINT "FAIL the scrolled sub-window did not produce the expected slice"
+    failures = failures + 1
+END IF
+
+IF failures > 0 THEN
+    PRINT STRING(failures) + " curses stdlib test(s) failed"
+    ignored = Exit(1)
+END IF
+PRINT "all curses stdlib tests passed"
