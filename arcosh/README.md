@@ -11,8 +11,9 @@ ArcoFission, not hand-written in C++.
 ## Status: WP-001 (Shell Skeleton) through WP-012 (Job Control), plus WP-008 (Display and Themes)
 and WP-009 (Plugin System), a built-in HELP command, profile/theme/prompt customization (RFC-0052
 sections 20/22), interactive theme/prompt editors on top of it, per-segment prompt color tags,
-broken-down date/time prompt fields, a real-OS-identity `user` prompt segment, and a bundled
-"learn" plugin (an interactive language reference and tutorial) shipped out of the box
+broken-down date/time prompt fields, a real-OS-identity `user` prompt segment, a bundled
+"learn" plugin (an interactive language reference and tutorial) shipped out of the box, and a
+default-on home directory abbreviation (`:~:...`) for the `classic`/`path` prompt segments
 
 `src/arcosh.abas` implements RFC-0052's AP-0052-004 (WP-001):
 
@@ -472,6 +473,34 @@ confirming `learn` is installed, enabled, and immediately usable with zero manua
 
 See `.agents/reports/ARCO_SH_RFC0052_WP000_REPOSITORY_AUDIT.md` (in the repo root's `.agents/`
 directory) for the mandatory pre-implementation audit this work was built against.
+
+## Home directory abbreviation ("~")
+
+The `classic`/`path` prompt segments abbreviate the current user's home directory down to `~`, the
+same familiar bash/zsh convention, adapted to Arcology colon-paths: `:home:daedalus:projects:
+arcobasic` renders as `:~:projects:arcobasic`, and the home directory itself renders as bare `:~`.
+On by default; `prompt home off` / `prompt home on` toggle it for the session immediately (like
+`theme use`/`prompt set`), and `prompt`'s own bare display shows the current setting
+(`abbreviate home: TRUE`/`FALSE`). Persists like every other prompt setting: `profile save` writes
+an `AbbreviateHome: TRUE`/`FALSE` line to `~/.arcosh/config`, and an old config file with no such
+line at all still defaults to ON (`ParseConfigText` only turns it off on an explicit
+`AbbreviateHome: FALSE` line — the opposite convention from `NoColor`, which defaults to off).
+
+Implementation: `AbbreviateHomeInPath(arcologyPath, homePath)` is a small pure function (replaces
+the home directory's own PREFIX, leaves anything outside it, or an empty/unknown home path,
+completely untouched); `DisplayedPath(context)` calls it only when the context's own
+`AbbreviateHome` flag is set. The toggle itself is held the same way `ActivePromptTags` already is
+— a session-wide value via `Runtime.GetGlobal`/`SetGlobal`, read back with a `TYPEOF(stored) <>
+"Boolean"` check to detect "never set this session" and fall back to the ON default (a real bug
+caught while building this: `TYPEOF` returns the string `"Boolean"`, not `"Bool"` — a `--selftest-
+profile` run caught it immediately, since `SetActiveAbbreviateHome(FALSE)` silently failed to take
+effect until fixed).
+
+Verified via `--selftest-profile` (`AbbreviateHomeInPath`'s own prefix/exact-match/outside-home/
+empty-home cases, `ActiveAbbreviateHome`'s default-ON-when-unset and live-toggle behavior, and the
+config round-trip including the "old config, no line at all" default-ON case) plus a real pty run:
+`cd`-ing into the real home directory showed `:~:...` immediately, `prompt home off`/`on` toggled it
+live, and `profile save` followed by a fresh session confirmed the setting persists correctly.
 
 ### New runtime primitives added across these work packages
 
