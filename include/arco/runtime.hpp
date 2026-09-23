@@ -143,6 +143,10 @@ public:
 
     void register_function(const std::string& name, HostFunction function);
     bool has_function(const std::string& name) const;
+    // Removes every registered host function not explicitly listed.  Embedders use this
+    // to run untrusted documents with a capability-sized standard library instead of
+    // relying on the full desktop/runtime surface.
+    void set_function_allowlist(const std::vector<std::string>& names);
     void register_class(std::string name, std::string parent = "", std::vector<std::string> interfaces = {});
     void register_class_field(const std::string& class_name, const std::string& field_name, int access, const std::string& type_name = "");
     void register_class_method(const std::string& class_name, const std::string& method_name, int access);

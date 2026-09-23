@@ -30,6 +30,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(ARCO_NETWORK_CURL)
@@ -4075,6 +4076,16 @@ void Runtime::register_function(const std::string& name, HostFunction function) 
 
 bool Runtime::has_function(const std::string& name) const {
     return host_functions_.find(function_key(name)) != host_functions_.end();
+}
+
+void Runtime::set_function_allowlist(const std::vector<std::string>& names) {
+    std::unordered_set<std::string> allowed;
+    allowed.reserve(names.size());
+    for (const auto& name : names) allowed.insert(function_key(name));
+    for (auto iterator = host_functions_.begin(); iterator != host_functions_.end();) {
+        if (allowed.find(iterator->first) == allowed.end()) iterator = host_functions_.erase(iterator);
+        else ++iterator;
+    }
 }
 
 void Runtime::register_class(std::string name, std::string parent, std::vector<std::string> interfaces) {

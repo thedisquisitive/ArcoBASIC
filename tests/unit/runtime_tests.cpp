@@ -1299,6 +1299,13 @@ int main() {
     require(!ranges.run_string("PRINT Range(1.5)\n").ok, "rejects non-integral range bounds");
     require(!ranges.run_string("PRINT [x FOR x IN 3]\n").ok, "rejects non-iterable comprehensions");
 
+    arco::Runtime restricted;
+    restricted.set_function_allowlist({"LEN", "STRING"});
+    require(restricted.run_string("PRINT LEN([1, 2])\n").ok,
+            "allows explicitly retained runtime functions");
+    require(!restricted.run_string("File.WriteText(\"nope\", \"nope\")\n").ok,
+            "removes filesystem functions outside an embedder allowlist");
+
     arco::Runtime limited;
     limited.set_limits({2});
     const auto limit_result = limited.run_string("WHILE TRUE\nPRINT 1\nWEND\n");
