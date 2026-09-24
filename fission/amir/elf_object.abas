@@ -16,18 +16,28 @@
 ' itself never needs to know whether a given fragment came from this
 ' backend's own encoder or a genuine compiled `.o` file.
 '
-' Real, disclosed FIRST-SLICE scope: only a `.o` with ZERO relocations is
-' supported (a real, reported diagnostic otherwise, not a silent
-' mis-link) -- `fission/native_runtime/host_bridge.c`'s own functions are
-' deliberately written self-contained (no static/global data, no
-' cross-function calls) specifically so gcc never needs to emit one,
-' confirmed via a direct `readelf -r` probe. A real relocation whose own
-' target is a SECTION symbol with an addend (GCC's own usual convention
-' for referencing static/local data, rather than the specific object's
-' own name) is real, disclosed, unimplemented follow-on work -- to be
-' added once an actual host function needs static data or a genuine
-' cross-function call, not attempted here without a real function that
-' needs it to verify against.
+' Real relocation support: a `.rela.text` entry naming a real, named
+' FUNC/OBJECT symbol (R_X86_64_PC32/PLT32 for a cross-function `call`,
+' R_X86_64_32/32S for a plain absolute data reference) is parsed into the
+' exact same {Target, FieldOffset, Section, Type, Addend} shape
+' fission/amir/x86_64_assembler.abas's own encoder-produced relocations
+' already use, resolved later by Fission_FusionLink's own already-generic
+' relocation-patching loop at final link time -- confirmed against a real
+' need, not spec-read speculatively: `fission/native_runtime/
+' host_bridge.c`'s own Array.Contains/Array.Find/Array.Remove/Array.Join
+' functions already call each other, and this was found to be an ACTIVELY
+' BLOCKING gap (every real host-function call failed outright on this
+' project's own reference toolchain), not merely a theoretical one -- see
+' .agents/FISSION_SUBSTRATE_PROGRESS.md's own Known Failures history. Real,
+' disclosed remaining scope: a relocation against a SECTION symbol (gcc's
+' own usual convention for an ANONYMOUS string literal/static data
+' reference, e.g. a bare C string literal inside host_bridge.c, rather than
+' a named symbol) is still unimplemented -- resolving one needs this same
+' fragment's own section base at final link time, not a name Fusion's own
+' global symbol table can look up, a genuinely different resolution shape.
+' Every host function in this file is written to avoid ever needing one
+' (see e.g. arco_host_path_home's own comment on why), so this has never
+' actually blocked anything yet.
 FUNCTION Fission_ElfReadU16(bytes, offset)
     RETURN bytes[offset] BITOR (bytes[offset + 1] SHL 8)
 END FUNCTION
@@ -218,10 +228,18 @@ FUNCTION Fission_ElfObjectParse(bytes)
     NEXT
 
     symbols = []
+    ' Every real symtab entry, kept by ORIGINAL symbol table INDEX (unlike
+    ' `symbols` below, which only keeps the exportable subset) -- a real
+    ' relocation names its target by that raw index (ELF64_R_SYM), never by
+    ' name directly, so resolving one requires the FULL table, local
+    ' symbols included (a relocation could, in principle, target one, even
+    ' though nothing this parser has ever actually seen does).
+    allSymbols = []
     symbolCount = symtabSection.Size / symtabSection.EntSize
     symIndex = 0
     WHILE symIndex < symbolCount
         symbol = Fission_ElfReadSymbol(bytes, symtabSection.Offset + symIndex * symtabSection.EntSize, bytes, strtabSection.Offset)
+        ignored = Array.Push(allSymbols, symbol)
         symType = symbol.Info BITAND 15
         symBind = symbol.Info SHR 4
         ' Only real, globally-visible FUNC/OBJECT symbols (STT_FUNC=2,
@@ -243,11 +261,90 @@ FUNCTION Fission_ElfObjectParse(bytes)
         symIndex = symIndex + 1
     WEND
 
+    ' Real ELF64 relocation support -- confirmed ACTIVELY needed, not just
+    ' theoretical (see .agents/FISSION_SUBSTRATE_PROGRESS.md's own Known
+    ' Failures entry): fission/native_runtime/host_bridge.c already
+    ' contains real cross-function calls between its own host functions
+    ' (Array.Contains calling Array.Find, etc.) that are not inlined, and
+    ' gcc emits a genuine R_X86_64_PLT32 relocation for each one. Produces
+    ' the SAME {Target, FieldOffset, Section, Type, Addend} shape
+    ' fission/amir/x86_64_assembler.abas's own encoder-produced relocations
+    ' already use -- Fission_FusionLink's own relocation-patching loop
+    ' (fission/amir/fusion_linker.abas) already understands "PC32"/"ABS32"
+    ' fully generically (it was written expecting exactly this, see its
+    ' own comment), resolving each `Target` against its OWN whole-link
+    ' global symbol table at FINAL link time -- so nothing here needs to
+    ' resolve or patch anything itself, only translate real ELF relocation
+    ' records into that same shape.
     relocations = []
     IF relaTextSection != NULL THEN
         relaCount = relaTextSection.Size / relaTextSection.EntSize
-        ignored = diagnostics.ReportError("FISSION_ELF_UNSUPPORTED_RELOCATION", "The Arcology Fusion Linker's own ELF object support does not yet handle a real relocation in this object file (" + String(relaCount) + " found in .rela.text) -- real, disclosed follow-on work, not attempted without a real host function that needs it")
-        RETURN emptyResult
+        relaIndex = 0
+        WHILE relaIndex < relaCount
+            relaOffset = relaTextSection.Offset + relaIndex * relaTextSection.EntSize
+            ' Elf64_Rela is {r_offset: u64, r_info: u64, r_addend: i64}.
+            ' r_info's own low 32 bits are the TYPE and its high 32 bits are
+            ' the symbol table INDEX (the real ELF64_R_TYPE/ELF64_R_SYM
+            ' macros) -- reading each HALF directly as its own u32 (rather
+            ' than one u64 read plus a 64-bit BITAND mask/shift) sidesteps
+            ' any doubt about this backend's own large-constant 64-bit
+            ' bitwise-operator behavior, and is exactly as correct: on a
+            ' little-endian target the low 4 bytes of any 8-byte field ARE
+            ' its own low 32 bits, unconditionally.
+            rOffset = Fission_ElfReadU64(bytes, relaOffset)
+            relocType = Fission_ElfReadU32(bytes, relaOffset + 8)
+            relocSymIndex = Fission_ElfReadU32(bytes, relaOffset + 12)
+            ' A real signed 64-bit addend read would need a genuine
+            ' Fission_ElfReadI64 this parser doesn't have -- real, disclosed
+            ' scope narrowing: every addend this parser actually needs to
+            ' handle (a `call`'s own -4 PC-relative adjustment, or a small
+            ' non-negative offset into rodata) fits comfortably inside a
+            ' signed 32-bit range, so the low 32 bits alone (sign-extended
+            ' the same way Fission_ElfReadI32 already does everywhere else
+            ' in this file) are exact for every real case, never truncated.
+            rAddend = Fission_ElfReadI32(bytes, relaOffset + 16)
+            IF relocSymIndex < 0 ORELSE relocSymIndex >= LEN(allSymbols) THEN
+                ignored = diagnostics.ReportError("FISSION_ELF_UNSUPPORTED_RELOCATION", "The Arcology Fusion Linker found a relocation in .rela.text referencing an out-of-range symbol table index")
+                RETURN emptyResult
+            END IF
+            relocSymbol = allSymbols[relocSymIndex]
+            relocSymType = relocSymbol.Info BITAND 15
+            ' STT_OBJECT=1/STT_FUNC=2 only -- a relocation against a
+            ' SECTION symbol (STT_SECTION=3, gcc's own usual convention for
+            ' an anonymous string literal/static data reference, e.g. the
+            ' `.rodata.str1.1` case this whole feature's own investigation
+            ' found and worked around rather than needing) is real,
+            ' disclosed, deliberately still-unimplemented follow-on work --
+            ' resolving one needs this SAME fragment's own section base at
+            ' FINAL link time (not a named global symbol at all), a
+            ' genuinely different resolution shape Fusion's own
+            ' `globalSymbols` name->offset map has no way to express yet.
+            targetIsResolvable = relocSymType == 1 ORELSE relocSymType == 2
+            IF targetIsResolvable == FALSE THEN
+                ignored = diagnostics.ReportError("FISSION_ELF_UNSUPPORTED_RELOCATION", "The Arcology Fusion Linker does not yet support a relocation against a symbol of this kind (expected a real named FUNC/OBJECT symbol, e.g. not an anonymous SECTION-relative static-data reference): " + relocSymbol.Name)
+                RETURN emptyResult
+            END IF
+            ' R_X86_64_PC32=2 and R_X86_64_PLT32=4 both resolve identically
+            ' here (S + A - P either way) -- PLT32's own "through a real PLT
+            ' stub" distinction only matters for a genuinely external,
+            ' dynamically-linked symbol, never the case anywhere in this
+            ' whole ecosystem (every symbol ever linked against is a real
+            ' definition in one of Fusion's own input fragments, resolved
+            ' directly). R_X86_64_32=10/R_X86_64_32S=11 are both a plain
+            ' absolute reference (S + A, no P subtraction) -- signed vs.
+            ' unsigned only matters for gcc's own out-of-range diagnostics
+            ' at ITS compile time, never for how the 4 patched bytes
+            ' themselves are computed or stored.
+            relocTypeName = ""
+            IF relocType == 2 ORELSE relocType == 4 THEN relocTypeName = "PC32"
+            IF relocType == 10 ORELSE relocType == 11 THEN relocTypeName = "ABS32"
+            IF relocTypeName == "" THEN
+                ignored = diagnostics.ReportError("FISSION_ELF_UNSUPPORTED_RELOCATION", "The Arcology Fusion Linker does not yet handle ELF relocation type " + String(relocType) + " (found in .rela.text)")
+                RETURN emptyResult
+            END IF
+            ignored = Array.Push(relocations, {Target: relocSymbol.Name, FieldOffset: rOffset, Section: "text", Type: relocTypeName, Addend: rAddend})
+            relaIndex = relaIndex + 1
+        WEND
     END IF
 
     fragment = FissionX86_64Fragment(textBytes, rodataBytes, bssSize, symbols, relocations)

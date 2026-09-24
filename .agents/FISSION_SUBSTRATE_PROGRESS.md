@@ -3758,6 +3758,44 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   PROCESS.ENV destKind-infer as "String" (a fixed, single ABI signature,
   unlike Random.Choice/Array.First's own input-kind-dependent case) via the
   same one-line override STRING/TYPEOF already use.
+- Real ELF64 relocation support (`fission/amir/elf_object.abas`'s own
+  `Fission_ElfObjectParse`) -- fixes the gap recorded above under Known
+  Failures as actively blocking every real host-function call on this
+  machine's toolchain. `.rela.text` entries are now parsed for real: each
+  `Elf64_Rela`'s own type (`R_X86_64_PC32`=2/`PLT32`=4 for a cross-function
+  `call`, `R_X86_64_32`=10/`32S`=11 for a plain absolute reference) and
+  symbol-table index are read directly (each half of the 64-bit `r_info`
+  field as its own 32-bit read, sidestepping any question about this
+  backend's own large-constant 64-bit bitwise-operator behavior), resolved
+  against a NEW full-symtab-by-index array (`allSymbols`, kept alongside
+  the pre-existing exportable-only `symbols` list, since a relocation names
+  its target by raw index, not name), and turned into the exact
+  `{Target, FieldOffset, Section, Type, Addend}` shape `fission/amir/
+  x86_64_assembler.abas`'s own encoder-produced relocations already use. No
+  changes needed in `Fission_FusionLink` (`fission/amir/fusion_linker.abas`)
+  at all -- its own relocation-patching loop was ALREADY fully generic
+  (PC32/ABS32, resolved against its own whole-link `globalSymbols` table at
+  final link time), written anticipating exactly this before this object
+  file ever needed it. Real, disclosed remaining scope, unchanged from
+  before: a relocation against a SECTION symbol (STT_SECTION=3, gcc's own
+  usual convention for an anonymous string literal/static data reference)
+  is still unimplemented -- resolving one needs this fragment's own section
+  base at final link time, a genuinely different resolution shape Fusion's
+  name-keyed `globalSymbols` map has no way to express yet; nothing in this
+  file has ever needed one (see Path.Home's own comment above on why).
+  Verified two ways: (1) the full 38-file `fission/tests/native_programs/`
+  suite compiled, linked, and run through the real substrate pipeline
+  end-to-end (not the `as`/`ld` workaround Path.Home/Process.Env needed
+  before this fix), output diffed against legacy `ArcoFission compile-run`
+  -- 38/38 match (one apparent mismatch in `host_bridge_files.abas` was a
+  test-harness artifact, both runs sharing one real `/tmp` file back to
+  back rather than each getting a clean one -- confirmed by resetting that
+  file between runs and re-diffing, a clean match); (2) `Path.Home`/
+  `Process.Env` themselves, previously only verified via the `as`/`ld`
+  workaround, now also compile and run correctly through the real
+  substrate pipeline directly, alongside `Array.Contains`/`Remove`/`Join`
+  (whose own cross-calls were the actual relocations that motivated this
+  fix in the first place).
 
 ## In-Progress Components
 
@@ -3793,46 +3831,19 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 
 ## Known Failures
 
-- **CONFIRMED ACTIVELY BLOCKING (2026-09-23), not just theoretical**:
-  `Fission_ElfObjectParse` (`fission/amir/elf_object.abas`) rejects a `.o`
-  file OUTRIGHT the moment it has ANY `.rela.text` entries at all (see that
-  function's own `relaTextSection != NULL` check -- it reports
-  `FISSION_ELF_UNSUPPORTED_RELOCATION` and bails before even looking at what
-  relocation TYPE is present, let alone attempting to resolve one). This was
-  previously recorded elsewhere in this ledger as deferred, disclosed,
-  not-yet-needed follow-on work ("to be added once an actual host function
-  needs it") -- that assumption no longer holds: `fission/native_runtime/
-  host_bridge.c` ALREADY contains real cross-function calls between host
-  functions that are not inlined (`Array.Contains`/`Array.Find`/
-  `Array.Remove`/`Array.Join` at minimum), and on this machine's toolchain
-  (gcc 14.2.0 Debian) compiling the UNMODIFIED, currently-committed
-  `host_bridge.c` with the exact flags `Fission_RivetBuildHostBridge` uses
-  produces 8 real `R_X86_64_PLT32` relocations in `.rela.text` -- confirmed
-  directly with `objdump -r`, not assumed. Any ArcoBASIC program compiled
-  through `fission/cli/compile_to_x86_64.abas` that calls ANY real host
-  function on this machine currently fails outright at the HOST_BRIDGE stage
-  with exactly this error, regardless of which host function -- this is not
-  specific to the Path.Home/Process.Env work that surfaced it (see Completed
-  Components), which needed no relocation-handling of its own at all (both
-  new functions are fully inlined, zero outgoing calls). Whether this also
-  reproduces on whatever toolchain most recently exercised the Array.*
-  functions successfully (a different gcc/clang version could plausibly emit
-  `R_X86_64_PC32` instead, which -- if this parser handled ANY relocation
-  type at all, which it currently does not -- might already resolve
-  identically for a same-object, already-defined call target) is unconfirmed;
-  what IS confirmed is that this parser has zero relocation-handling code of
-  any kind today, so it fails identically either way. A real, moderately-
-  scoped fix: walk `.rela.text`'s own entries, resolve each referenced
-  symbol against this SAME object file's own symbol table (every relocation
-  actually needed so far is a same-object function call, never a truly
-  external/undefined symbol), and patch the 4-byte PC-relative displacement
-  at each call site into the copied `.text` bytes before this fragment is
-  handed to Fusion -- `R_X86_64_PLT32` and `R_X86_64_PC32` compute
-  identically (`S + A - P`) once the target resolves locally, so one code
-  path likely covers both. Verified as a real, working design independently
-  of this gap: see Completed Components' own Path.Home/Process.Env entry for
-  the alternate verification (plain `as`/`ld`, not this substrate's own
-  linker) used to confirm that work despite this blocker.
+- FIXED (see Completed Components): `Fission_ElfObjectParse`
+  (`fission/amir/elf_object.abas`) used to reject a `.o` file OUTRIGHT the
+  moment it had ANY `.rela.text` entries at all -- confirmed ACTIVELY
+  BLOCKING (2026-09-23), not just theoretical, before the fix: any ArcoBASIC
+  program compiled through `fission/cli/compile_to_x86_64.abas` that called
+  ANY real host function failed outright at the HOST_BRIDGE stage on this
+  machine's toolchain (gcc 14.2.0 Debian), since `fission/native_runtime/
+  host_bridge.c` already contained real cross-function calls (`Array.
+  Contains`/`Find`/`Remove`/`Join` at minimum) producing real
+  `R_X86_64_PLT32` relocations. Now parses `.rela.text` for real (PC32/
+  PLT32/32/32S against a named FUNC/OBJECT symbol) into the exact
+  relocation shape Fusion's own linker already understood generically --
+  see Completed Components for the fix and its full verification.
 - FIXED (see Completed Components): `FissionArcoBasicSemanticReport`/
   `FissionArcoBasicProgramReport` symbol lookup used to be a linear
   `FOR symbol IN SELF.Symbols` scan per call; now `Object`-keyed indexes.
