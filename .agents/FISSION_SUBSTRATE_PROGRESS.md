@@ -5,6 +5,20 @@ This ledger is required by
 the Fission Compiler Substrate must read this file before code changes and update
 it before completion.
 
+**Staleness notice (found 2026-09-23):** this ledger's own "Current Milestone"
+prose below was last updated at commit `08d8328`, but real work landed on top of
+it without a matching ledger update: `ea71d2f` ("Real G1-level self-hosting
+bootstrap: Fission compiles Fission" -- a genuinely major, unrecorded milestone),
+`9339241` (closing the self-hosted codegen gap 70/96 -> 96/96 real Fission source
+files), `d5376e0` (real `#IMPORT` expansion for the self-hosted path), plus
+several more recent host-function-bridge/language-feature commits (floating
+point, Math.* hardware functions, the Array.*/Bytes.*/growable-array grind,
+CALLABLE support, Array.SortBy/MinBy/MaxBy, host-function allowlists). None of
+that is reflected in the prose immediately below -- read `git log` directly for
+the real recent history rather than trusting this section's own words about
+"current" state. This notice, and the real gap recorded under Known Failures
+below (ELF relocation support), are current as of this note.
+
 ## Current Milestone
 
 WP-001/002/003 are substantially delivered (component system, ArcoBASIC
@@ -3706,6 +3720,45 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   semantic corpus symbol count grew again (4129 -> 4150, file count 98
   and import-edge count 157 both unchanged).
 
+- Real Path.Home/Process.Env (`fission/native_runtime/host_bridge.c`'s own new
+  "Batch 13" section, `fission/amir/lower_x86_64.abas`) -- closes the gap
+  `arco_host_path_join`'s own comment explicitly deferred ("needs the real
+  process ENVP block... this backend's own `_start` entry point does not
+  capture argv/envp from the stack at all yet"). `Fission_X86_64LowerFunction`'s
+  own `isMain` prologue now captures the real Linux x86-64 process-entry ENVP
+  pointer (computed from `[rsp]`=argc and the SysV argv/envp stack layout,
+  before anything -- including the ordinary `push %rbp` -- touches `%rsp`)
+  into a new unconditional `envp_base` `.bss` global; Path.Home/Process.Env are
+  real special-case dispatch (same shape as Random.Choice/Array.First -- see
+  Fission_X86_64HostFunctionTable's own comment) since both need that pointer
+  as an IMPLICIT argument no ArcoBASIC-level call site supplies, which the
+  uniform host-table's "args map 1:1 onto ABI registers" marshaling has no way
+  to express. A real, deliberately avoided landmine found and worked around
+  along the way: a bare C string literal in host_bridge.c (`"HOME"`, used for
+  the env-var-name comparison) compiles to a real `R_X86_64_32S` relocation
+  against a raw `.rodata.str1.1` SECTION symbol -- confirmed directly (built
+  the object file, read its own relocations with objdump) to be the exact,
+  previously-theoretical "SECTION symbol relocation... remains unimplemented"
+  gap this ledger already disclosed under WP-011 -- avoided entirely by
+  building the 4-byte name in a local stack array instead (compiles to plain
+  immediate byte stores, no data-section reference at all), matching how
+  every OTHER host function in this file already avoids ever emitting a bare
+  string literal. Verified two ways since the substrate's own linker could
+  not (see the real, now-CONFIRMED-blocking gap recorded under Known Failures
+  below, found while testing this): (1) a standalone libc test harness
+  compiled the exact same `arco_raw_getenv`/`arco_host_path_home`/
+  `arco_host_process_env` C logic against a real `main()`, confirming
+  `Path.Home()` matches the real `$HOME` and `Process.Env("PATH")` matches
+  libc's own `getenv("PATH")` exactly, byte for byte; (2) the EXACT `_start`
+  prologue instruction sequence added to `Fission_X86_64LowerFunction`,
+  hand-transcribed into a real `.s` file, assembled, and linked directly
+  against the real (unmodified) `host_bridge.c` via plain `as`/`ld` (bypassing
+  only the self-hosted Fusion linker, for this one verification), then
+  actually run: printed the real `$HOME` value exactly. Both PATH.HOME and
+  PROCESS.ENV destKind-infer as "String" (a fixed, single ABI signature,
+  unlike Random.Choice/Array.First's own input-kind-dependent case) via the
+  same one-line override STRING/TYPEOF already use.
+
 ## In-Progress Components
 
 - WP-001 needs expansion beyond skeleton route resolution:
@@ -3740,6 +3793,46 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 
 ## Known Failures
 
+- **CONFIRMED ACTIVELY BLOCKING (2026-09-23), not just theoretical**:
+  `Fission_ElfObjectParse` (`fission/amir/elf_object.abas`) rejects a `.o`
+  file OUTRIGHT the moment it has ANY `.rela.text` entries at all (see that
+  function's own `relaTextSection != NULL` check -- it reports
+  `FISSION_ELF_UNSUPPORTED_RELOCATION` and bails before even looking at what
+  relocation TYPE is present, let alone attempting to resolve one). This was
+  previously recorded elsewhere in this ledger as deferred, disclosed,
+  not-yet-needed follow-on work ("to be added once an actual host function
+  needs it") -- that assumption no longer holds: `fission/native_runtime/
+  host_bridge.c` ALREADY contains real cross-function calls between host
+  functions that are not inlined (`Array.Contains`/`Array.Find`/
+  `Array.Remove`/`Array.Join` at minimum), and on this machine's toolchain
+  (gcc 14.2.0 Debian) compiling the UNMODIFIED, currently-committed
+  `host_bridge.c` with the exact flags `Fission_RivetBuildHostBridge` uses
+  produces 8 real `R_X86_64_PLT32` relocations in `.rela.text` -- confirmed
+  directly with `objdump -r`, not assumed. Any ArcoBASIC program compiled
+  through `fission/cli/compile_to_x86_64.abas` that calls ANY real host
+  function on this machine currently fails outright at the HOST_BRIDGE stage
+  with exactly this error, regardless of which host function -- this is not
+  specific to the Path.Home/Process.Env work that surfaced it (see Completed
+  Components), which needed no relocation-handling of its own at all (both
+  new functions are fully inlined, zero outgoing calls). Whether this also
+  reproduces on whatever toolchain most recently exercised the Array.*
+  functions successfully (a different gcc/clang version could plausibly emit
+  `R_X86_64_PC32` instead, which -- if this parser handled ANY relocation
+  type at all, which it currently does not -- might already resolve
+  identically for a same-object, already-defined call target) is unconfirmed;
+  what IS confirmed is that this parser has zero relocation-handling code of
+  any kind today, so it fails identically either way. A real, moderately-
+  scoped fix: walk `.rela.text`'s own entries, resolve each referenced
+  symbol against this SAME object file's own symbol table (every relocation
+  actually needed so far is a same-object function call, never a truly
+  external/undefined symbol), and patch the 4-byte PC-relative displacement
+  at each call site into the copied `.text` bytes before this fragment is
+  handed to Fusion -- `R_X86_64_PLT32` and `R_X86_64_PC32` compute
+  identically (`S + A - P`) once the target resolves locally, so one code
+  path likely covers both. Verified as a real, working design independently
+  of this gap: see Completed Components' own Path.Home/Process.Env entry for
+  the alternate verification (plain `as`/`ld`, not this substrate's own
+  linker) used to confirm that work despite this blocker.
 - FIXED (see Completed Components): `FissionArcoBasicSemanticReport`/
   `FissionArcoBasicProgramReport` symbol lookup used to be a linear
   `FOR symbol IN SELF.Symbols` scan per call; now `Object`-keyed indexes.

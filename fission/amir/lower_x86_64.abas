@@ -1200,6 +1200,19 @@ FUNCTION Fission_X86_64CollectSlots(fn, functionNames, paramKindsIn, returnKinds
                 ' fixed ABI signature) always produce a real String result,
                 ' regardless of the argument's own kind.
                 IF Upper(callee) == "STRING" ORELSE Upper(callee) == "TYPEOF" THEN destKind = "String"
+                ' Path.Home/Process.Env (see Fission_X86_64LowerFunction's
+                ' own emission-time handling for why these need real
+                ' special-case dispatch rather than a uniform
+                ' Fission_X86_64HostFunctionTable entry: both need the
+                ' real process ENVP pointer as an IMPLICIT extra argument
+                ' no ArcoBASIC-level call site ever supplies, which the
+                ' table's own uniform "args map 1:1 onto ABI registers"
+                ' marshaling has no way to express). Both always produce a
+                ' real String result -- a fixed, single ABI signature, so
+                ' (unlike Random.Choice/Array.First) this needs no
+                ' input-kind-dependent logic, just the same one-line
+                ' override STRING/TYPEOF already use just above.
+                IF Upper(callee) == "PATH.HOME" ORELSE Upper(callee) == "PROCESS.ENV" THEN destKind = "String"
                 ' Real hardware-backed Math.* functions (see
                 ' Fission_X86_64LowerFunction's own emission-time handling
                 ' for why these get dedicated inline SSE dispatch instead
@@ -3298,6 +3311,29 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
     IF isMain THEN
         ignored = Array.Push(textLines, "    .globl _start")
         ignored = Array.Push(textLines, "_start:")
+        ' Real process ENVP capture -- unblocks Path.Home/Process.Env (see
+        ' arco_host_path_join's own comment in host_bridge.c, which
+        ' explicitly deferred this as "a real, separate, disclosed, larger
+        ' undertaking -- touches every program's own prologue, not a
+        ' one-function fix"). The real Linux x86-64 process-entry stack
+        ' layout, before anything (including the `push %rbp` just below)
+        ' touches %rsp: [rsp]=argc, [rsp+8..]=argv[0..argc-1],
+        ' [rsp+8+8*argc]=NULL (argv's own terminator), and envp starts
+        ' immediately after that NULL -- i.e. at rsp+16+8*argc. Captured
+        ' unconditionally (not gated behind a "does this program call
+        ' Path.Home/Process.Env" flag the way string_heap/UsesConcat are):
+        ' Main's own prologue is emitted before this pass has necessarily
+        ' seen every OTHER function's body, so a flag set while lowering
+        ' some later-processed function would arrive too late to affect a
+        ' prologue already emitted -- a few real, cheap instructions run
+        ' once at true process start is a simpler, unconditionally-correct
+        ' trade against that ordering hazard. envp_base itself (see the
+        ' `.bss` emission below) is reserved the same unconditional way,
+        ' for the identical reason.
+        ignored = Array.Push(textLines, "    mov (%rsp), %rax")
+        ignored = Array.Push(textLines, "    lea 16(%rsp,%rax,8), %rcx")
+        ignored = Array.Push(textLines, "    lea envp_base(%rip), %rdx")
+        ignored = Array.Push(textLines, "    mov %rcx, (%rdx)")
     ELSE
         ignored = Array.Push(textLines, fn.Name + ":")
     END IF
@@ -4426,6 +4462,46 @@ FUNCTION Fission_X86_64LowerFunction(diagnostics, fn, isMain, labelPrefix, funct
                     context.UsesHostBridge = TRUE
                     CONTINUE FOR
                 END IF
+                ' Path.Home/Process.Env -- see Fission_X86_64HostFunctionTable's
+                ' own destKind-inference comment (same wording) for why these
+                ' can't be uniform table entries: both need the real process
+                ' ENVP pointer as an IMPLICIT first argument, loaded here from
+                ' the `envp_base` .bss global _start's own new prologue
+                ' populates (see that prologue's own comment), which no
+                ' ArcoBASIC-level call site ever supplies and
+                ' Fission_X86_64EmitCall's own uniform "args map 1:1 onto ABI
+                ' registers" marshaling has no way to express -- so this
+                ' bypasses EmitCall entirely and marshals both the implicit
+                ' envp and (for Process.Env) the real ArcoBASIC-level `name`
+                ' argument by hand, same shape as the Math-constant loading
+                ' just above.
+                IF Upper(callee) == "PATH.HOME" THEN
+                    IF LEN(args) != 0 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected 0)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Array.Push(textLines, "    mov envp_base(%rip), %rdi")
+                    ignored = Array.Push(textLines, "    call arco_host_path_home")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
+                IF Upper(callee) == "PROCESS.ENV" THEN
+                    IF LEN(args) != 1 THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with " + String(LEN(args)) + " argument(s) is not supported by native x86-64 codegen (expected 1)")
+                        CONTINUE FOR
+                    END IF
+                    IF Fission_X86_64OperandIsResolvable(offsets, args[0]) == FALSE ORELSE Fission_X86_64OperandKind(kinds, args[0]) != "String" THEN
+                        ignored = diagnostics.ReportError("FISSION_X86_64_UNSUPPORTED", "Calling " + callee + " with an argument of the wrong kind is not supported by native x86-64 codegen (expected a String)")
+                        CONTINUE FOR
+                    END IF
+                    ignored = Array.Push(textLines, "    mov envp_base(%rip), %rdi")
+                    ignored = Array.Push(textLines, Fission_X86_64OperandLoadLine(offsets, args[0], "rsi"))
+                    ignored = Array.Push(textLines, "    call arco_host_process_env")
+                    IF isVoidCall == FALSE THEN ignored = Array.Push(textLines, Fission_X86_64StoreRaxLine(offsets, destOperand))
+                    context.UsesHostBridge = TRUE
+                    CONTINUE FOR
+                END IF
                 ' `Array.First`/`Array.Last`/`Array.Reverse` -- see
                 ' Fission_X86_64CollectSlots' own comment (same wording)
                 ' for why these can't be uniform host-table entries.
@@ -5338,6 +5414,14 @@ FUNCTION Fission_AmirToX86_64(amirModule)
         ignored = Array.Push(lines, "    .skip 1048576")
         ignored = Array.Push(lines, "")
     END IF
+    ' envp_base -- see _start's own prologue comment above for why this is
+    ' reserved unconditionally rather than gated behind a "does this
+    ' program actually call Path.Home/Process.Env" flag.
+    ignored = Array.Push(lines, "    .section .bss")
+    ignored = Array.Push(lines, "    .align 8")
+    ignored = Array.Push(lines, "envp_base:")
+    ignored = Array.Push(lines, "    .skip 8")
+    ignored = Array.Push(lines, "")
     ignored = Array.Push(lines, "    .section .text")
     FOR line IN allTextLines
         ignored = Array.Push(lines, line)

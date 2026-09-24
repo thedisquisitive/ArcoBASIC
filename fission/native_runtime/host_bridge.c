@@ -2280,3 +2280,75 @@ arco_i64 arco_host_array_argbest_string(const arco_i64* keys, arco_i64 count, ar
 arco_i64 arco_host_array_element_at(const arco_i64* arr, arco_i64 index) {
     return arco_array_data(arr)[index];
 }
+
+// --- Batch 13: real Path.Home/Process.Env -- unblocked by _start's own
+// new real ENVP capture (fission/amir/lower_x86_64.abas's own
+// Fission_X86_64LowerFunction, isMain prologue), closing the gap
+// Path.Join's own comment above explicitly deferred as "a real, separate,
+// disclosed, larger undertaking -- touches every program's own prologue,
+// not a one-function fix". `envp` (a NULL-terminated array of
+// "NAME=VALUE\0" C strings, the real Linux process ENVP contract) is
+// passed as a genuine explicit argument from the call site -- loaded
+// there from the new `envp_base` .bss global via the SAME `mov
+// label(%rip), %reg` pattern already proven throughout this whole
+// backend (e.g. the Math.* constant-loading in
+// Fission_X86_64LowerFunction) -- rather than having this file read
+// `envp_base` itself as its own extern data symbol, which would need a
+// real DATA relocation (a C object referencing a symbol DEFINED in the
+// generated assembly object) this backend's own linker
+// (fission/amir/elf_object.abas) has never been exercised against; every
+// relocation this whole bridge already relies on is the other direction
+// (generated code CALLING a symbol this file defines). Confirmed
+// directly against the oracle's own Process.Env (src/runtime/
+// runtime.cpp): a missing variable returns "" (its own
+// std::getenv-returned-nullptr fallback), never a crash/panic -- matched
+// here exactly rather than inventing different behavior; Path.Home
+// mirrors it (a plain "HOME" lookup) rather than the oracle's own
+// separate USERPROFILE Windows fallback, out of scope for a Linux-only
+// backend.
+static inline __attribute__((always_inline)) const char* arco_raw_getenv(char** envp, const char* name) {
+    arco_i64 nameLen = arco_raw_strlen(name);
+    while (*envp != 0) {
+        const char* entry = *envp;
+        arco_i64 i = 0;
+        while (i < nameLen && entry[i] == name[i]) { i = i + 1; }
+        if (i == nameLen && entry[i] == '=') return entry + i + 1;
+        envp = envp + 1;
+    }
+    return 0;
+}
+
+const char* arco_host_path_home(char** envp) {
+    // "HOME" as a real C string LITERAL here would land in gcc's own
+    // `.rodata.str1.1`, referenced via a real R_X86_64_32S relocation
+    // against a raw SECTION symbol -- exactly the one relocation shape
+    // this file's own linker (fission/amir/elf_object.abas) has never
+    // been exercised against (confirmed directly: it was the very first
+    // thing tried here, and Fusion's own object-file PARSER rejected the
+    // resulting .o outright, before linking ever even started). A local
+    // stack array initialized byte-by-byte compiles to plain immediate
+    // stores instead, no data-section reference or relocation at all --
+    // matching how every OTHER host function in this file already avoids
+    // ever emitting a bare C string literal, not a new pattern.
+    char home[5];
+    home[0] = 'H'; home[1] = 'O'; home[2] = 'M'; home[3] = 'E'; home[4] = 0;
+    const char* value = arco_raw_getenv(envp, home);
+    // A real, disclosed "not found" case (see arco_host_process_env's own
+    // identical comment for the reasoning: this is length-0, so `value`'s
+    // actual content -- even NULL -- is never read).
+    if (value == 0) return arco_raw_copy_substring(home, 0, 0);
+    return arco_raw_copy_substring(value, 0, arco_raw_strlen(value));
+}
+
+const char* arco_host_process_env(char** envp, const char* name) {
+    const char* value = arco_raw_getenv(envp, name);
+    // arco_raw_copy_substring's own copy loop is bounded by its `len`
+    // argument alone (0 here) -- `name` itself is passed as the "text" to
+    // copy from purely because it's already a real, valid, non-NULL
+    // pointer this function was handed (never actually dereferenced at
+    // length 0), sidestepping the need for any placeholder string
+    // literal at all (see arco_host_path_home's own comment on why a
+    // literal here would be a real problem, not just an unnecessary one).
+    if (value == 0) return arco_raw_copy_substring(name, 0, 0);
+    return arco_raw_copy_substring(value, 0, arco_raw_strlen(value));
+}
