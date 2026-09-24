@@ -17,9 +17,10 @@
 // generated code, not something this layer tries to recover from gracefully.
 
 #include "arco/native_runtime_abi.h"
+#include "arco/native_value_box.hpp"
 #include "arco/value.hpp"
 
-#include <atomic>
+#include <cstddef>
 #include <csetjmp>
 #include <cstdio>
 #include <cstdlib>
@@ -29,11 +30,6 @@
 #include <vector>
 
 namespace {
-
-struct ArcoValueBox {
-    arco::Value value;
-    std::atomic<int> refcount{1};
-};
 
 // Backs arco_runtime_capture_args/arco_runtime_args (RFC-0053, "full Linux support" pass). Raw
 // argc/argv, not a copied std::vector<std::string> -- the C runtime's own argv strings are valid
@@ -141,17 +137,40 @@ int arco_value_compare(const ArcoValue* left, const ArcoValue* right) {
     return 0; // unreachable -- arco_value_panic never returns (std::exit)
 }
 
+// Plain, non-atomic increment/decrement -- see native_value_box.hpp's own comment on why
+// `refcount` is a plain int, not std::atomic<int>: this runtime has no real shared-memory
+// multithreading to protect against, and paying for LOCK-prefixed atomics anyway measured as a
+// real, substantial (roughly 2x on refcount-heavy code), otherwise-unrecoverable cost for a
+// guarantee nothing here uses. generate_x86_64_function's own emit_inline_retain/
+// emit_inline_release emit the identical plain inc/dec this function's own fast path performs, so
+// generated code and this fallback implementation always agree.
 void arco_value_retain(ArcoValue* value) {
     if (value == nullptr) return;
-    box(value)->refcount.fetch_add(1, std::memory_order_relaxed);
+    ++box(value)->refcount;
 }
 
 void arco_value_release(ArcoValue* value) {
     if (value == nullptr) return;
-    if (box(value)->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    if (--box(value)->refcount == 0) {
         delete box(value);
     }
 }
+
+// The real, current ArcoValueBox layout's own refcount offset -- computed fresh, correctly, every
+// time this file is recompiled (see native_value_box.hpp's own comment on why this file is NOT a
+// stable prebuilt library fission.cpp links against, but is instead recompiled live from disk on
+// every `ArcoFission build` invocation). Called exactly once per generated program, in its own
+// Main prologue, so fission.cpp's OWN compile-time-baked-in copy of this same offset (frozen at
+// ArcoFission's own build time) can be checked against reality instead of trusted blindly -- see
+// generate_x86_64_function's own self-check comment in fission.cpp.
+std::size_t arco_value_refcount_offset() { return offsetof(ArcoValueBox, refcount); }
+
+// Unconditionally frees a box -- NO refcount check. Only ever safe to call after generated code's
+// own inlined fast path (a plain `dec` on the box's refcount followed by a `jnz` skip) has ALREADY
+// confirmed the count just hit zero; this function trusts that entirely, matching
+// arco_value_release's own "then delete" tail exactly, just without redoing the decrement
+// generated code already performed inline.
+void arco_value_free_now(ArcoValue* value) { delete box(value); }
 
 int arco_value_is_number(const ArcoValue* value) { return value != nullptr && box(value)->value.is_number(); }
 int arco_value_is_string(const ArcoValue* value) { return value != nullptr && box(value)->value.is_string(); }

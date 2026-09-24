@@ -2,6 +2,7 @@
 
 #include "arco/calling_convention.hpp"
 #include "arco/jit_x86_64.hpp"
+#include "arco/native_value_box.hpp"
 #include "arco/runtime.hpp"
 #include "arco/pe_image.hpp"
 #include "arco/uefi_bindings.hpp"
@@ -14,7 +15,9 @@
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstddef>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -43,6 +46,16 @@
 
 namespace arco::fission {
 namespace {
+
+// generate_x86_64_function's own compile-time-computed copy of ArcoValueBox's refcount offset --
+// baked into every inline reference-counting fast path this backend emits (emit_inline_retain/
+// emit_inline_release) as a literal displacement. Frozen at ArcoFission's OWN build time, which is
+// exactly why every generated program's own Main prologue calls the REAL runtime's
+// arco_value_refcount_offset() once at startup and panics loudly on any disagreement, rather than
+// trusting this constant blindly -- see native_value_box.hpp's own comment for the full reasoning
+// (src/native/runtime_abi.cpp, unlike this compiler, is recompiled fresh from disk on every single
+// `ArcoFission build` invocation, so the two copies are not guaranteed to agree by construction).
+constexpr std::size_t kRefcountOffset = offsetof(ArcoValueBox, refcount);
 
 std::string read_file(const std::string& path) {
     std::ifstream input(path);
@@ -4293,7 +4306,27 @@ std::string declared_parameter_type(const std::string& declared_parameter) {
     // " = " separator, including the padding spaces on both sides).
     const std::string type_part = declared_parameter.substr(as_pos + 4);
     const auto default_pos = type_part.find(" = ");
-    return default_pos == std::string::npos ? type_part : type_part.substr(0, default_pos);
+    std::string type_name = default_pos == std::string::npos ? type_part : type_part.substr(0, default_pos);
+    // Every caller of this function compares the result against an ALL-CAPS literal ("NUMBER",
+    // "STRING", "BOOL", ...) -- but `parameter_text` renders whatever case the ORIGINAL ArcoBASIC
+    // source used (param.type_name, straight from the parser), and this entire codebase's own
+    // established convention -- every single FUNCTION/CONSTRUCTOR signature in arcosh.abas,
+    // stdlib/gui.abas, stdlib/arcogui.abas, and aperture.abas -- writes "AS Number"/"AS String"/
+    // "AS Bool" (capitalized first letter only), never "AS NUMBER". A real, severe, confirmed bug
+    // found by direct testing, not hypothesized: `FUNCTION Foo(x AS Number): PRINT x: END
+    // FUNCTION` segfaults natively (Kind::Load's own tracks_lifetime check, gated on this
+    // function's result equaling the literal "NUMBER", silently fell through to the Boxed
+    // default and called arco_value_retain on x's own raw IEEE-754 bit pattern as if it were a
+    // live ArcoValueBox pointer) while the exact same function spelled `AS NUMBER` (all caps)
+    // worked correctly -- confirmed as the root cause by that exact minimal pair, not assumed.
+    // Since idiomatic ArcoBASIC in this entire codebase uses the mixed-case spelling, this bug
+    // was latent in essentially every typed parameter anyone has ever written natively. Fixed
+    // ONCE here, for every one of this function's 11 call sites (declared_parameter_type itself,
+    // is_hosted_number/param_is_hosted_number, and every direct `== "NUMBER"`/`"STRING"`/`"BOOL"`
+    // comparison throughout generate_x86_64_function), rather than patching each comparison site
+    // to be case-insensitive individually.
+    for (char& c : type_name) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return type_name;
 }
 
 // Bounded, best-effort static type inference for one AMIR value, used only by the System V
@@ -4812,19 +4845,76 @@ HostedValueKind infer_hosted_value_kind_uncached(const AmirModule& module, const
                 // crash this fixes -- an earlier version returned the FIRST match's own kind alone).
                 const auto dot = instruction.target.rfind('.');
                 if (dot != std::string::npos) {
-                    const std::string method_name = instruction.target.substr(dot + 1);
-                    std::vector<const AmirFunction*> method_candidates;
-                    for (const auto& entry : module.class_parents) {
-                        const auto resolved_name = resolve_class_method(module, entry.first, method_name);
-                        if (!resolved_name) continue;
-                        for (const auto& resolved_function : module.functions) {
-                            if (resolved_function.name == *resolved_name) {
-                                method_candidates.push_back(&resolved_function);
-                                break;
+                    // A dotted CallValue target is ambiguous by string shape alone: `GUI.
+                    // ShouldClose`/`WINDOW.Create`/etc. are host-function calls (their own "GUI"/
+                    // "WINDOW" prefix is not a receiver, just part of the function's own dotted
+                    // name), while `window.ShouldClose` is a genuine instance-method dispatch on a
+                    // real local variable named `window`. The actual codegen (this same file's own
+                    // Kind::CallValue case, "Instance method dispatch" comment) already resolves
+                    // this correctly by requiring the base name to be a real local/parameter
+                    // (`slot_of(base_name) >= 0`) before ever treating a dotted target as a method
+                    // call -- this analysis MUST replicate that same guard, or it will treat any
+                    // host-function name that happens to share its own bare suffix with some
+                    // unrelated class's own method name (e.g. a wrapper class that (reasonably)
+                    // names its own method `ShouldClose` to mirror `WINDOW.ShouldClose`) as a
+                    // candidate instance method. A real, confirmed bug found by direct testing, not
+                    // hypothesized: without this guard, inferring the return kind of such a wrapper
+                    // method recurses into itself via this exact fallback (its own return kind
+                    // depends on its own local `result`'s kind, which depends on this same
+                    // CallValue's kind, which -- absent this guard -- resolves back to the
+                    // WRAPPER's own return kind again), infinitely, crashing the compiler with a
+                    // stack overflow instead of compiling correctly or reporting a clear error. The
+                    // depth-limited recursion guards elsewhere in this file (the memoized `_cached`
+                    // wrappers around each `_uncached` helper) do not catch this because each step
+                    // of the cycle is a DIFFERENT (module, function, name) key from that cache's own
+                    // point of view -- caching cannot short-circuit a cycle it cannot recognize as a
+                    // cycle at all, so this must be prevented at the source: never even consider a
+                    // dotted target's base name a receiver unless it plausibly could be one.
+                    const std::string receiver_path = instruction.target.substr(0, dot);
+                    const std::string base_name = receiver_path.substr(0, receiver_path.find('.'));
+                    bool base_is_known_local_or_param = false;
+                    for (const auto& param : function.params) {
+                        if (bare_parameter_name(param) == base_name) { base_is_known_local_or_param = true; break; }
+                    }
+                    if (!base_is_known_local_or_param) {
+                        // A named local variable (`x = SomeClass(...)`) is assigned via Kind::Store,
+                        // which carries the variable's name in `.target`, NOT `.result` -- confirmed
+                        // against infer_local_kind_uncached's own identical `candidate.kind ==
+                        // Kind::Store && candidate.target == local_name` check just above in this
+                        // file. A first version of this guard checked `.result` only (correct for a
+                        // compiler-generated temporary like `%t9`, e.g. an inline `Foo().Bar()`
+                        // chain, but not for an ordinary named local) and broke real, existing method
+                        // calls on a plain named receiver -- caught by this project's own full
+                        // `ctest` suite (linux_native_backend_smoke's "classes" section: "value is
+                        // not an object") before being treated as done. Both forms are checked here.
+                        for (const auto& block : function.blocks) {
+                            bool found = false;
+                            for (const auto& candidate_instruction : block.instructions) {
+                                if (candidate_instruction.result == base_name ||
+                                    (candidate_instruction.kind == AmirInstruction::Kind::Store &&
+                                     candidate_instruction.target == base_name)) {
+                                    found = true;
+                                    break;
+                                }
                             }
+                            if (found) { base_is_known_local_or_param = true; break; }
                         }
                     }
-                    if (!method_candidates.empty()) return candidate_set_return_kind(module, method_candidates);
+                    if (base_is_known_local_or_param) {
+                        const std::string method_name = instruction.target.substr(dot + 1);
+                        std::vector<const AmirFunction*> method_candidates;
+                        for (const auto& entry : module.class_parents) {
+                            const auto resolved_name = resolve_class_method(module, entry.first, method_name);
+                            if (!resolved_name) continue;
+                            for (const auto& resolved_function : module.functions) {
+                                if (resolved_function.name == *resolved_name) {
+                                    method_candidates.push_back(&resolved_function);
+                                    break;
+                                }
+                            }
+                        }
+                        if (!method_candidates.empty()) return candidate_set_return_kind(module, method_candidates);
+                    }
                 }
                 // ADDRESSOF/CALLABLE dispatch (see the Kind::CallValue case's own much larger
                 // comment on this exact pattern): `instruction.target` is a plain (non-dotted)
@@ -5431,7 +5521,14 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
     const int scratch_base = slot_base + 8 * static_cast<int>(slot_names.size());
     const int host_args_base = scratch_base + 32;
     const int try_jmpbuf_base = host_args_base + 8 * max_host_call_args;
-    int frame_size = try_jmpbuf_base + kJmpBufSlotSize * try_block_count;
+    // 24 bytes to save the CALLER's own RBX/R15/RBP across this function's body (System V only) --
+    // see the NumberCacheEntry/BoxedCacheEntry comments near slot_of below for why this function
+    // repurposes those three specific registers as persistent caches for hosted Number values and
+    // Boxed pointers, and therefore must give them back unchanged to whoever called it, exactly
+    // like any other real callee-saved-register use. Not needed (and not sized in) under
+    // Microsoft x64, which neither cache ever applies to in this first phase.
+    const int saved_regs_base = try_jmpbuf_base + kJmpBufSlotSize * try_block_count;
+    int frame_size = convention == systems::CallingConvention::SystemV ? saved_regs_base + 24 : saved_regs_base;
     // RSP is kEntryRspMod16 (8) mod 16 at function entry; after `sub rsp, frame_size`, RSP must
     // be 0 mod 16 immediately before any CALL this function makes, which requires
     // frame_size % 16 == kEntryRspMod16.
@@ -5462,6 +5559,358 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
         return found == slot_offsets.end() ? -1 : found->second;
     };
 
+    // Loop-carried Number register pinning (System V only): extends the persistent Number-value
+    // register cache below (see NumberCacheEntry) to survive a loop's OWN back edge, not just
+    // straight-line code within one block -- the "real, disclosed... deferred future work" that
+    // comment used to name. Requires knowing which blocks actually form a genuine loop, which is
+    // NOT the same question as "does some Jump/Branch target a block with a lower index in
+    // target->blocks" -- confirmed directly with `ArcoFission reveal --stage AMIR` on a FOR loop
+    // containing CONTINUE FOR/EXIT FOR: the CONTINUE FOR block is emitted well AFTER the increment
+    // block it jumps to (AMIR emits an IF's own child blocks only after every block the IF's
+    // surrounding statement already reserved), so it targets a block with a LOWER vector index
+    // than its own even though that target is not a real loop header at all -- an index-based
+    // "back edge" heuristic would misidentify it and corrupt this optimization's own bookkeeping.
+    // A real CFG walk is used instead: a DFS from the entry block (the standard "is this successor
+    // still on my own DFS stack" test) to find genuine back edges, then the classic natural-loop
+    // construction (walk the predecessor graph backward from each back edge's own source, stopping
+    // at the header) to find every block the loop actually contains -- built from the same two AMIR
+    // shapes (Jump, Branch) the reachable_blocks scan further below also follows for its own,
+    // separate purpose (this pre-pass runs first and computes its own DFS visitation directly,
+    // rather than depending on that scan's own output). TryBegin's own catch-handler edge is
+    // deliberately excluded from this graph: any loop touching a TRY block at all is rejected
+    // outright further down (see touches_try), rather than trying to model a real longjmp as a
+    // graph edge here.
+    struct LoopCacheInfo {
+        // Every block name that is part of this loop's own natural body (the header plus
+        // everything that can reach the back edge without passing back through the header) --
+        // used both to decide "is the block currently being emitted inside this loop" (for
+        // STORE's own pinned-slot repopulation, see Kind::Store below) and "is this jump/branch
+        // TARGET inside this loop" (for the priming performed at every edge into it, see
+        // prime_for_jump_target below).
+        std::unordered_set<std::string> blocks;
+        // Up to two real (non-"%") Number-kind local names, one per physical cache slot (RBX/
+        // R15) -- "" means that slot is not reserved for this loop at all. Chosen once, below, by
+        // counting how often each candidate name is read/written inside this loop's own body:
+        // the two most frequently touched names are exactly the ones a real iteration of the loop
+        // most benefits from keeping resident in a register for its whole lifetime.
+        std::array<std::string, 2> pinned_names;
+    };
+    std::vector<LoopCacheInfo> pinned_loops;
+    std::unordered_map<std::string, const LoopCacheInfo*> block_loop_info;
+    if (convention == systems::CallingConvention::SystemV && !target->blocks.empty()) {
+        std::unordered_map<std::string, std::vector<std::string>> successors;
+        std::unordered_set<std::string> try_touched_blocks;
+        for (const auto& block : target->blocks) {
+            if (block.instructions.empty()) continue;
+            for (const auto& instruction : block.instructions) {
+                if (instruction.kind == AmirInstruction::Kind::TryBegin) {
+                    try_touched_blocks.insert(block.name);
+                    if (!instruction.target.empty()) try_touched_blocks.insert(instruction.target);
+                }
+            }
+            const auto& terminator = block.instructions.back();
+            if (terminator.kind == AmirInstruction::Kind::Jump && !terminator.target.empty()) {
+                successors[block.name].push_back(terminator.target);
+            } else if (terminator.kind == AmirInstruction::Kind::Branch && terminator.operands.size() >= 3) {
+                successors[block.name].push_back(terminator.operands[1]);
+                successors[block.name].push_back(terminator.operands[2]);
+            }
+        }
+        // header -> every back-edge source that targets it (there can be more than one, e.g. a
+        // FOR loop's own CONTINUE reaching its increment block, which itself loops back to the
+        // real header -- see this whole section's own opening example). Blocks never actually
+        // reached from the entry block (dead code) simply never get visited below, so they can
+        // never contribute a back edge -- equivalent, for this pass's own purposes, to filtering
+        // by the reachable_blocks scan further below without needing to run it first.
+        std::unordered_map<std::string, std::vector<std::string>> back_edges;
+        {
+            std::unordered_set<std::string> visited;
+            std::unordered_set<std::string> on_stack;
+            // {block name, next successor index to explore} -- an explicit work stack standing in
+            // for real DFS recursion, so a pathologically large function can't blow the C++ stack.
+            std::vector<std::pair<std::string, std::size_t>> stack;
+            const std::string entry_name = target->blocks.front().name;
+            stack.push_back({entry_name, 0});
+            visited.insert(entry_name);
+            on_stack.insert(entry_name);
+            const std::vector<std::string> no_successors;
+            while (!stack.empty()) {
+                auto& frame = stack.back();
+                const auto succ_it = successors.find(frame.first);
+                const auto& succs = succ_it == successors.end() ? no_successors : succ_it->second;
+                if (frame.second >= succs.size()) {
+                    on_stack.erase(frame.first);
+                    stack.pop_back();
+                    continue;
+                }
+                const std::string successor = succs[frame.second];
+                ++frame.second;
+                if (on_stack.count(successor) != 0) {
+                    back_edges[successor].push_back(frame.first);
+                } else if (visited.insert(successor).second) {
+                    on_stack.insert(successor);
+                    stack.push_back({successor, 0});
+                }
+            }
+        }
+        // Predecessor graph (successors, inverted) -- walking it backward from each back edge's
+        // own source is how the loop's natural body is found: every block that can reach the back
+        // edge without first passing through the header belongs to it (the standard natural-loop
+        // construction), which correctly pulls in nested IF/CONTINUE/EXIT blocks (like the
+        // CONTINUE FOR block from this section's own opening example) without needing to
+        // special-case any of those shapes individually.
+        std::unordered_map<std::string, std::vector<std::string>> predecessors;
+        for (const auto& entry : successors) {
+            for (const auto& succ : entry.second) predecessors[succ].push_back(entry.first);
+        }
+        struct LoopCandidate { std::string header; std::unordered_set<std::string> body; };
+        std::vector<LoopCandidate> candidates;
+        for (const auto& entry : back_edges) {
+            LoopCandidate candidate;
+            candidate.header = entry.first;
+            candidate.body.insert(entry.first);
+            std::vector<std::string> worklist;
+            for (const auto& source : entry.second) {
+                if (candidate.body.insert(source).second) worklist.push_back(source);
+            }
+            while (!worklist.empty()) {
+                const std::string node = worklist.back();
+                worklist.pop_back();
+                const auto pred_it = predecessors.find(node);
+                if (pred_it == predecessors.end()) continue;
+                for (const auto& pred : pred_it->second) {
+                    if (pred == candidate.header) continue;
+                    if (candidate.body.insert(pred).second) worklist.push_back(pred);
+                }
+            }
+            candidates.push_back(std::move(candidate));
+        }
+        // Innermost-first, so a nested loop wins its own pinned slots over an outer loop that
+        // merely contains it (see the overlap check below) -- only ONE loop's pinned names can
+        // ever be trusted for a given block, since only 2 physical slots exist for the whole
+        // function, so nesting/overlap always means picking exactly one winner, never both.
+        std::sort(candidates.begin(), candidates.end(), [](const LoopCandidate& a, const LoopCandidate& b) {
+            return a.body.size() < b.body.size();
+        });
+        std::unordered_set<std::string> claimed_blocks;
+        for (const auto& candidate : candidates) {
+            // Function entry can never legitimately be a loop header (nothing runs before it to
+            // prime anything) -- defensive; should be unreachable given a real loop is always
+            // formed from a genuine back edge somewhere after real setup code, but cheap to rule
+            // out outright rather than assume.
+            if (candidate.header == target->blocks.front().name) continue;
+            bool touches_try = false;
+            for (const auto& name : candidate.body) {
+                if (try_touched_blocks.count(name) != 0) { touches_try = true; break; }
+            }
+            if (touches_try) continue;
+            bool overlaps = false;
+            for (const auto& name : candidate.body) {
+                if (claimed_blocks.count(name) != 0) { overlaps = true; break; }
+            }
+            if (overlaps) continue;
+            // Rank every real (non-"%") Number-kind local touched anywhere in the loop body by how
+            // often it's read or written there -- the two most frequently touched names are
+            // exactly the ones worth permanently reserving a physical register for over the
+            // loop's own lifetime, matching the shape of the register-cache-call.abas smoke test
+            // (a loop-invariant read and a loop-carried induction variable, both hot).
+            std::unordered_map<std::string, int> frequency;
+            for (const auto& block : target->blocks) {
+                if (candidate.body.count(block.name) == 0) continue;
+                for (const auto& instruction : block.instructions) {
+                    std::string name;
+                    if (instruction.kind == AmirInstruction::Kind::Load) name = instruction.target;
+                    else if (instruction.kind == AmirInstruction::Kind::Store) name = instruction.target;
+                    else continue;
+                    if (name.empty() || name[0] == '%') continue;
+                    if (infer_hosted_value_kind(module, *target, name) != HostedValueKind::Number) continue;
+                    ++frequency[name];
+                }
+            }
+            if (frequency.empty()) continue; // nothing in this loop is worth pinning at all
+            std::vector<std::pair<std::string, int>> ranked(frequency.begin(), frequency.end());
+            std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+                if (a.second != b.second) return a.second > b.second;
+                return a.first < b.first;
+            });
+            for (const auto& name : candidate.body) claimed_blocks.insert(name);
+            LoopCacheInfo info;
+            info.blocks = candidate.body;
+            for (std::size_t i = 0; i < 2 && i < ranked.size(); ++i) info.pinned_names[i] = ranked[i].first;
+            pinned_loops.push_back(std::move(info));
+        }
+        // Pointers into pinned_loops are taken only now, after every push_back above has already
+        // happened -- vector growth would otherwise invalidate any pointer captured mid-loop.
+        for (const auto& info : pinned_loops) {
+            for (const auto& name : info.blocks) block_loop_info[name] = &info;
+        }
+    }
+
+    // `y = y` (a self-assignment: STORE's own target names the exact same slot its own source
+    // value came from) always lowers to two SEPARATE AMIR instructions, never a single
+    // self-referencing STORE -- confirmed directly with `ArcoFission reveal --stage AMIR` on
+    // `x = x`: `%t3 := LOAD x` followed by `STORE x, %t3`, exactly like any other assignment,
+    // never `STORE x, x`. Both instructions together are a provable, unconditional no-op: they
+    // read a slot's current value into a temp and write that SAME value straight back to the
+    // SAME slot, so memory ends up byte-for-byte identical to before either ran, whatever that
+    // value's real kind is. For a Boxed value this is more than a wasted memory round-trip: LOAD's
+    // own aliasing-retain (see its case's own much larger comment) followed by STORE's own
+    // retain-of-the-new-value-then-release-of-the-old-value would all operate on the exact SAME
+    // underlying ArcoValueBox* here, and that whole sequence provably nets to zero regardless of
+    // the box's current refcount (each retain takes rc -> rc+1; each matching release decrements
+    // back down, and can only ever hit its own "just reached zero, actually free it" path when the
+    // DECREMENTED value is exactly 0 -- impossible for rc+1, which is never zero for any rc >= 0)
+    // -- see the general STORE case's own retain comment further down ("if source and target
+    // happen to be the SAME underlying box... retaining before releasing is what keeps its
+    // refcount from ever transiently reaching zero", already documenting this exact case as safe,
+    // just not, before now, skipped. A compiler-generated temp ("%tN") is single-use by
+    // construction (produced by exactly one instruction, consumed by exactly one other -- an
+    // invariant this whole file already relies on elsewhere, see number_cache_worth_caching's own
+    // comment), so a LOAD whose own temp result is consumed by EXACTLY this one immediately
+    // following STORE, and by nothing else, has no other observer to break by disappearing
+    // entirely. Detected once, up front, as a set of instruction addresses to skip outright
+    // (elided_self_copy, checked at the very top of the main per-block instruction loop below) --
+    // stable across this whole single-pass emission, since neither of these two vectors
+    // (target->blocks or any individual block's own instructions) is ever mutated once codegen
+    // starts. Convention-agnostic (checked before any SystemV-only lambda even exists): the "this
+    // does nothing" property holds for any value representation this backend has, boxed or not.
+    std::unordered_set<const AmirInstruction*> elided_self_copy;
+    for (const auto& block : target->blocks) {
+        for (std::size_t i = 0; i + 1 < block.instructions.size(); ++i) {
+            const auto& load_instruction = block.instructions[i];
+            const auto& next_instruction = block.instructions[i + 1];
+            if (load_instruction.kind != AmirInstruction::Kind::Load) continue;
+            if (next_instruction.kind != AmirInstruction::Kind::Store) continue;
+            if (next_instruction.operands.size() != 1) continue;
+            if (next_instruction.target != load_instruction.target) continue;
+            if (next_instruction.operands.front() != load_instruction.result) continue;
+            elided_self_copy.insert(&load_instruction);
+            elided_self_copy.insert(&next_instruction);
+        }
+    }
+
+    // A persistent, function-scoped register cache for hosted Number values (System V only --
+    // Numbers have no retain/release semantics at all under is_hosted_number below, so this never
+    // has to interact with the Boxed reference-counting machinery, which is bound to stack-slot
+    // MEMORY as its single source of truth and must never be bypassed). Reg::RBX and Reg::R15 were
+    // chosen because they are the only two GPRs never referenced anywhere else in this function
+    // (confirmed directly: grep the whole file -- R12/R13/R14 are already used as raw scratch by
+    // the hand-rolled MID$ builtin further down, and every other GPR is a live argument/scratch
+    // register somewhere). Both are genuine System V AMD64 callee-saved registers -- NOT
+    // calling_convention.hpp's own callee_saved_registers()/caller_saved_registers(), which
+    // unconditionally hardcode the Microsoft x64 classification (e.g. claim RDI/RSI and XMM6-15
+    // are callee-saved) and are simply wrong for System V, where RDI/RSI are volatile argument
+    // registers and EVERY XMM register is caller-saved -- verified directly against the real ABI,
+    // not assumed, and confirmed unused (zero references) anywhere in this file's own SystemV
+    // codegen. Because they are real callee-saved GPRs, this cache survives ordinary calls
+    // (arco_value_retain/_release, host functions, other compiled ArcoBASIC functions) with no
+    // invalidation needed there -- any ABI-compliant callee must preserve them. It does NOT
+    // survive an ORDINARY basic-block boundary: invalidated wholesale at every block entry and at
+    // every Jump/Branch, since this is a single-pass emitter with no general liveness/dataflow
+    // analysis, so a label reached from multiple predecessors has no way to know which
+    // predecessor's cache state would actually be true at runtime. A block that's part of a
+    // pinned loop (see the LoopCacheInfo pre-pass just above, and block_loop_info/
+    // current_block_loop/prime_for_jump_target below) is the one deliberate exception: those
+    // specific names ARE carried across that specific loop's own back edge, by construction
+    // (every edge into such a block primes its two pinned names before transferring control there,
+    // so the target's own entry can simply trust them, exactly as if it were still straight-line
+    // code within one block) -- this function must give the CALLER's own original RBX/R15 back
+    // unchanged before returning (saved_regs_base above, restored in Kind::Return below), exactly
+    // like any other legitimate callee-saved-register use, regardless of which of this loop's own
+    // values (if any) happen to be pinned there at the moment of return.
+    struct NumberCacheEntry { std::string slot_name; bool valid = false; };
+    std::array<NumberCacheEntry, 2> number_cache;
+    // A single-slot sibling to the Number-value cache above, for a Boxed local's own raw POINTER
+    // value (System V only, same reasoning throughout). Reg::RBP was chosen because this backend
+    // never uses it as a frame pointer anywhere in generate_x86_64_function (every stack access
+    // throughout this whole function is RSP-relative, confirmed by grepping this function for
+    // every Reg::RBP reference before choosing it -- the only other RBP reference anywhere in this
+    // file is a completely unrelated function's own interrupt-vector-stub generator, which has no
+    // interaction with this one at all) and there is no eh_frame/CFI/unwind-table generation
+    // anywhere in this backend that would expect RBP to mean anything in particular (real
+    // TRY/CATCH uses setjmp/longjmp instead -- see Kind::TryBegin's own comment), so repurposing
+    // it here breaks nothing that worked before. Only ONE slot, not two like the Number cache:
+    // R12/R13/R14 (the other System V callee-saved GPRs RBX/R15 weren't already claimed from) are
+    // already used as raw scratch by the hand-rolled MID$ builtin further down in this same
+    // function, so claiming a second one here would require either avoiding MID$'s own registers
+    // (none of the three are free) or invalidating this cache specifically around that one
+    // builtin -- not worth the complexity for what's explicitly a smaller, cheaper win than the
+    // Number cache's own two slots. No loop-back-edge pinning extension for this cache (unlike
+    // the Number cache's own LoopCacheInfo, see slot_of's own much larger comment) -- invalidated
+    // wholesale at every block entry, exactly like the Number cache was before that extension.
+    struct BoxedCacheEntry { std::string slot_name; bool valid = false; };
+    BoxedCacheEntry boxed_cache;
+    // Which slot was touched (hit OR populated) most recently -- real LRU, not "always evict slot
+    // 0", which a real measured bug found: without it, a compile-time TEMP that's read exactly
+    // once (e.g. a CONST literal immediately consumed by the one STORE that uses it, then never
+    // referenced again) permanently squats in whichever slot it landed in, since nothing ever
+    // explicitly evicts a "dead" temp -- with only 2 slots and an "always evict slot 0" rule, that
+    // leaves effectively LESS than one slot of real, useful capacity: two genuinely-still-useful
+    // names (e.g. two variables actually being reused) end up fighting over the one remaining
+    // slot while a long-dead temp occupies the other forever. With only 2 slots, LRU is trivial:
+    // track which one was touched last and evict the OTHER one.
+    std::size_t number_cache_mru = 0;
+    const auto number_cache_reg = [](std::size_t i) { return i == 0 ? Reg::RBX : Reg::R15; };
+    const auto invalidate_number_cache_all = [&]() {
+        number_cache[0].valid = false;
+        number_cache[1].valid = false;
+    };
+    const auto invalidate_number_cache_name = [&](const std::string& name) {
+        for (auto& entry : number_cache) {
+            if (entry.valid && entry.slot_name == name) entry.valid = false;
+        }
+    };
+    const auto invalidate_boxed_cache_name = [&](const std::string& name) {
+        if (boxed_cache.valid && boxed_cache.slot_name == name) boxed_cache.valid = false;
+    };
+    // Set once per block by the main per-block loop below, from block_loop_info -- Kind::Store's
+    // own pinned-slot repopulation (see below) needs to know "is the STORE being compiled right
+    // now inside a pinned loop's own body", a question number_cache's own name-keyed bookkeeping
+    // alone can't answer (it only knows what's CURRENTLY cached, not which loop, if any, the
+    // instruction generating this code belongs to). nullptr outside any pinned loop -- the
+    // overwhelmingly common case, and the only one Microsoft x64 ever sees (pinned_loops is always
+    // empty there; see the LoopCacheInfo pre-pass's own convention gate).
+    const LoopCacheInfo* current_block_loop = nullptr;
+    // Returned by number_cache_claim_slot below when neither physical slot is available for a
+    // NEW name: both are already permanently reserved for the active loop's own two pinned names,
+    // and evicting one to make room for something else would silently break the very "prime once,
+    // trust forever across the back edge" contract prime_for_jump_target below relies on. Every
+    // caller of number_cache_claim_slot (store_result_double, load_value_double, Kind::Load's own
+    // miss-populate) already treats a real slot index as "go ahead and cache this" -- this
+    // sentinel just makes "there's nowhere to put it, fall back to memory-only" an explicit,
+    // checked case at each of those three call sites instead.
+    constexpr std::size_t kNoNumberCacheSlot = static_cast<std::size_t>(-1);
+    // The other half of the loop-pinning contract (see the LoopCacheInfo pre-pass's own comment
+    // near slot_of for the "why" -- this is the "make it true" half): called with the name of
+    // whatever block a Jump/Branch is about to transfer control to, right before the actual jmp/
+    // jcc instruction is emitted. If that block belongs to a pinned loop, ensures -- using
+    // whatever number_cache state is ACTUALLY true right here (accurate for this specific edge,
+    // since a basic block's own instructions are straight-line code, emitted in the same order
+    // they will execute) -- that each of the loop's pinned names is loaded into its designated
+    // physical register, emitting a real load only when it isn't already there. Every single
+    // Jump/Branch instruction in the function that targets such a block calls this before
+    // transferring control (Kind::Jump once, Kind::Branch once per target) -- that totality is
+    // what lets the target block's own entry (see the main per-block loop below) trust its two
+    // pinned slots UNCONDITIONALLY rather than re-checking them, the same way it's always been
+    // sound to trust number_cache from one instruction to the next within a single block. A
+    // no-op for any target outside every pinned loop -- ordinary blocks keep relying on the
+    // existing wholesale invalidate-at-entry below, unaffected by any of this.
+    const auto prime_for_jump_target = [&](const std::string& target_name) {
+        const auto found = block_loop_info.find(target_name);
+        if (found == block_loop_info.end()) return;
+        const LoopCacheInfo& loop = *found->second;
+        for (std::size_t slot = 0; slot < loop.pinned_names.size(); ++slot) {
+            const std::string& pinned = loop.pinned_names[slot];
+            if (pinned.empty()) continue;
+            if (number_cache[slot].valid && number_cache[slot].slot_name == pinned) continue;
+            const int offset = slot_of(pinned);
+            if (offset < 0) continue; // defensive; every pinned name was a real local by construction
+            if (offset <= 127) result.text.mov_load_disp8(number_cache_reg(slot), Reg::RSP, static_cast<std::uint8_t>(offset));
+            else result.text.mov_load_disp32(number_cache_reg(slot), Reg::RSP, static_cast<std::uint32_t>(offset));
+            number_cache[slot] = NumberCacheEntry{pinned, true};
+        }
+    };
+
     const auto width_bits = [](const std::string& type) -> int {
         if (type == "U8" || type == "I8" || type == "BOOL") return 8;
         if (type == "IOPORT") return 16;
@@ -5485,6 +5934,45 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 result.text.sar_reg_imm8(reg, static_cast<std::uint8_t>(64 - bits));
             }
         }
+    };
+    // Inline reference-counting fast path (System V only -- confirmed every real call site in this
+    // function is already gated to this convention one way or another, so this never needs a
+    // Microsoft x64 path of its own): a null check plus one plain (NOT LOCK-prefixed -- see
+    // ArcoValueBox's own comment on why this runtime's reference counting isn't thread-safe, by
+    // deliberate design) increment/decrement instruction, replacing a full out-of-line function
+    // call for the overwhelmingly common case (a live, still-referenced object). See
+    // kRefcountOffset's own comment for why this offset must be verified at runtime (the Main
+    // prologue's own self-check below), not simply trusted. Operates directly on whatever register
+    // already holds the ArcoValue* pointer -- no real call happens on retain's path at all, and
+    // release only calls out on the genuinely rare "this was the last reference" path, so unlike
+    // the old call-based design, nothing else needs to be spilled or reloaded purely to survive an
+    // ABI-mandated call.
+    const auto emit_inline_retain = [&](Reg reg) {
+        result.text.test_reg_reg(reg, reg);
+        const auto skip_disp = result.text.jcc_rel32_placeholder(0x4); // JE -> skip (null)
+        result.text.inc_dword_disp32(reg, static_cast<std::uint32_t>(kRefcountOffset));
+        const std::size_t skip_start = result.text.size();
+        const std::int64_t next_instruction = static_cast<std::int64_t>(skip_disp + 4);
+        result.text.patch_i32(skip_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(skip_start) - next_instruction));
+    };
+    // Same shape, but the decrement can reveal the refcount just hit zero (ZF set -- INC/DEC set
+    // flags from the RESULT, unlike ADD/SUB, matching arco_value_release's own "was 1 before
+    // decrementing" check exactly), in which case the object genuinely needs freeing -- the one
+    // case that still needs a real call (arco_value_free_now), since generated code has no inline
+    // equivalent for "run ArcoValueBox's C++ destructor and deallocate."
+    const auto emit_inline_release = [&](Reg reg) {
+        result.text.test_reg_reg(reg, reg);
+        const auto skip_disp1 = result.text.jcc_rel32_placeholder(0x4); // JE -> skip (null)
+        result.text.dec_dword_disp32(reg, static_cast<std::uint32_t>(kRefcountOffset));
+        const auto skip_disp2 = result.text.jcc_rel32_placeholder(0x5); // JNE -> skip (still referenced)
+        if (reg != Reg::RDI) result.text.mov_reg_reg(Reg::RDI, reg);
+        const auto call_disp = result.text.call_rel32_placeholder();
+        result.external_calls.push_back({call_disp, "arco_value_free_now"});
+        const std::size_t skip_start = result.text.size();
+        const std::int64_t next_instruction1 = static_cast<std::int64_t>(skip_disp1 + 4);
+        result.text.patch_i32(skip_disp1, static_cast<std::int32_t>(static_cast<std::int64_t>(skip_start) - next_instruction1));
+        const std::int64_t next_instruction2 = static_cast<std::int64_t>(skip_disp2 + 4);
+        result.text.patch_i32(skip_disp2, static_cast<std::int32_t>(static_cast<std::int64_t>(skip_start) - next_instruction2));
     };
     const auto store_result = [&](const std::string& name, const std::string& type, Reg reg = Reg::RAX) -> bool {
         const int offset = slot_of(name);
@@ -5521,9 +6009,7 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
         if (offset <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(offset), reg);
         else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(offset), reg);
         if (tracks_lifetime) {
-            result.text.mov_reg_reg(Reg::RDI, Reg::R10);
-            const auto release_disp = result.text.call_rel32_placeholder();
-            result.external_calls.push_back({release_disp, "arco_value_release"});
+            emit_inline_release(Reg::R10);
         }
         return true;
     };
@@ -5578,6 +6064,61 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
     const auto param_is_hosted_number = [&](const std::string& declared_parameter) {
         return bare_parameter_name(declared_parameter) != "SELF" && is_hosted_number(declared_parameter_type(declared_parameter));
     };
+    // Compiler-generated temps (AMIR's own "%tN" names) are single-use by construction -- each one
+    // is produced by exactly one instruction and consumed by exactly one other, so caching one
+    // costs a slot and an instruction for a value that will NEVER be read again. With only 2
+    // slots, a real, measured effect of caching them anyway: a Binary instruction's own two operand
+    // temps (loaded via load_value_double) immediately evict whichever REAL, actually-reused named
+    // variables Kind::Load just populated moments earlier, every single time a value is used in a
+    // compound expression -- confirmed directly by disassembling a minimal repro (`total = total +
+    // a` repeated) and watching `total`/`a` get evicted by their own consuming Binary's temps
+    // before the NEXT statement ever gets a chance to reuse them. Restricting populate-on-miss to
+    // real names (never "%"-prefixed) keeps the 2 slots for values that can actually be reused --
+    // Kind::Load already only ever calls this with a real declared name (instruction.target is
+    // never a temp for a LOAD), so this only changes behavior for load_value_double/
+    // store_result_double's own temp-heavy call sites (Binary/CallValue/PRINT's operand loading).
+    // A cache-HIT check is harmless to leave unconditional (a "%tN" name will simply never be
+    // found, a clean miss) -- only the POPULATE side needs this gate.
+    const auto number_cache_worth_caching = [](const std::string& name) {
+        return !name.empty() && name[0] != '%';
+    };
+    // `name` might already occupy a cache slot from an earlier store/load -- drop that first so
+    // exactly one entry ever claims to represent a given name -- then pick a target slot: any
+    // currently-invalid one, else the LRU slot (see number_cache_mru's own comment for why "always
+    // evict slot 0" was a real, measured bug, not a harmless simplification). Marks the returned
+    // slot as the new MRU -- callers still own updating number_cache[use] itself with the actual
+    // new entry. Inside a pinned loop's own body (current_block_loop != nullptr), its two
+    // designated slots are permanently reserved for its own pinned names for the loop's whole
+    // lifetime -- this is `name` itself for one of them (handled the same as any other slot,
+    // since invalidate_number_cache_name+LRU already picks the right one), but for anything ELSE
+    // touched inside that same loop, evicting a pinned slot to make room would silently break the
+    // "prime once at every edge into this loop, then trust forever" contract prime_for_jump_target
+    // and the main per-block loop's own entry logic below both depend on -- returns
+    // kNoNumberCacheSlot instead when there is truly no room, so the caller just leaves that OTHER
+    // value in memory only, exactly as if this whole cache didn't exist for it.
+    const auto number_cache_claim_slot = [&](const std::string& name) -> std::size_t {
+        invalidate_number_cache_name(name);
+        if (current_block_loop != nullptr) {
+            for (std::size_t slot = 0; slot < current_block_loop->pinned_names.size(); ++slot) {
+                if (current_block_loop->pinned_names[slot] == name) {
+                    number_cache_mru = slot;
+                    return slot;
+                }
+            }
+            const bool slot0_reserved = !current_block_loop->pinned_names[0].empty();
+            const bool slot1_reserved = !current_block_loop->pinned_names[1].empty();
+            if (slot0_reserved && slot1_reserved) return kNoNumberCacheSlot;
+            const std::size_t free_slot = slot0_reserved ? 1 : 0;
+            number_cache_mru = free_slot;
+            return free_slot;
+        }
+        std::size_t use;
+        if (!number_cache[0].valid) use = 0;
+        else if (!number_cache[1].valid) use = 1;
+        else use = 1 - number_cache_mru;
+        number_cache_mru = use;
+        return use;
+    };
     const auto store_result_double = [&](const std::string& name, Xmm src) -> bool {
         const int offset = slot_of(name);
         if (offset < 0) {
@@ -5586,9 +6127,28 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
             return false;
         }
         result.text.movsd_store_disp32(Reg::RSP, static_cast<std::uint32_t>(offset), src);
+        // Memory (just written above) is always authoritative; this only refreshes the cache so a
+        // LATER load_value_double for the same name can skip re-reading memory it already knows
+        // the answer to.
+        if (convention == systems::CallingConvention::SystemV && number_cache_worth_caching(name)) {
+            const std::size_t use = number_cache_claim_slot(name);
+            if (use != kNoNumberCacheSlot) {
+                result.text.movq_reg_xmm(number_cache_reg(use), src);
+                number_cache[use] = NumberCacheEntry{name, true};
+            }
+        }
         return true;
     };
     const auto load_value_double = [&](const std::string& name, Xmm dst) -> bool {
+        if (convention == systems::CallingConvention::SystemV) {
+            for (std::size_t i = 0; i < number_cache.size(); ++i) {
+                if (number_cache[i].valid && number_cache[i].slot_name == name) {
+                    result.text.movq_xmm_reg(dst, number_cache_reg(i));
+                    number_cache_mru = i;
+                    return true;
+                }
+            }
+        }
         const int offset = slot_of(name);
         if (offset < 0) {
             result.ok = false;
@@ -5596,6 +6156,13 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
             return false;
         }
         result.text.movsd_load_disp32(dst, Reg::RSP, static_cast<std::uint32_t>(offset));
+        if (convention == systems::CallingConvention::SystemV && number_cache_worth_caching(name)) {
+            const std::size_t use = number_cache_claim_slot(name);
+            if (use != kNoNumberCacheSlot) {
+                result.text.movq_reg_xmm(number_cache_reg(use), dst);
+                number_cache[use] = NumberCacheEntry{name, true};
+            }
+        }
         return true;
     };
 
@@ -5649,16 +6216,15 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
             "string/number/bool/array/object (this backend's static analysis limit)";
         return false;
     };
-    // Emits `call arco_value_release` on the ArcoValue* currently at [RSP+scratch_offset] -- shared
-    // by every box_operand_into_rax call site below that copies a freshly-boxed temporary into
-    // something else BY VALUE (see box_operand_freshly_boxed's own comment for the full list and
-    // reasoning). Never called for an already-Boxed operand (box_operand_freshly_boxed is false
-    // then), since that pointer is an existing local's own live reference, not a temp this call site
-    // owns.
+    // Emits the inline release fast path on the ArcoValue* currently at [RSP+scratch_offset] --
+    // shared by every box_operand_into_rax call site below that copies a freshly-boxed temporary
+    // into something else BY VALUE (see box_operand_freshly_boxed's own comment for the full list
+    // and reasoning). Never called for an already-Boxed operand (box_operand_freshly_boxed is
+    // false then), since that pointer is an existing local's own live reference, not a temp this
+    // call site owns.
     const auto release_scratch_temp = [&](std::uint32_t scratch_offset) {
         result.text.mov_load_disp32(Reg::RDI, Reg::RSP, scratch_offset);
-        const auto release_disp = result.text.call_rel32_placeholder();
-        result.external_calls.push_back({release_disp, "arco_value_release"});
+        emit_inline_release(Reg::RDI);
     };
 
     // Loads `operand` as a raw double into `dest`, unboxing it first (via arco_value_as_number,
@@ -5743,6 +6309,17 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
     if (frame_size <= 127) result.text.sub_rsp_imm8(static_cast<std::uint8_t>(frame_size));
     else result.text.sub_rsp_imm32(static_cast<std::uint32_t>(frame_size));
 
+    // Save the CALLER's own RBX/R15/RBP before this function repurposes them as its own
+    // persistent Number-value and Boxed-pointer register caches (see the NumberCacheEntry/
+    // BoxedCacheEntry comments near slot_of above) -- must happen before anything else touches
+    // any of the three registers, and does, since nothing before this point in the prologue ever
+    // does. Restored in Kind::Return below, on every return path.
+    if (convention == systems::CallingConvention::SystemV) {
+        result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(saved_regs_base), Reg::RBX);
+        result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(saved_regs_base + 8), Reg::R15);
+        result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(saved_regs_base + 16), Reg::RBP);
+    }
+
     // Runtime.Args real support (RFC-0053, "full Linux support" pass -- found genuinely blocking a
     // real program, Arconaut, from compiling at all): the C runtime's own startup convention hands
     // this process's real argc/argv to `main` in EDI/ESI, exactly the same registers System V's own
@@ -5760,6 +6337,51 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
     if (convention == systems::CallingConvention::SystemV && function_name == "Main") {
         const auto call_disp = result.text.call_rel32_placeholder();
         result.external_calls.push_back({call_disp, "arco_runtime_capture_args"});
+
+        // Reference-counting offset self-check (see kRefcountOffset's own comment): runs exactly
+        // once, here in Main's own prologue, before any user code -- including any real inline
+        // retain/release -- ever executes. src/native/runtime_abi.cpp is recompiled fresh from
+        // disk on every single `ArcoFission build` invocation, so its own arco_value_refcount_
+        // offset() always reflects the REAL, current ArcoValueBox layout, while kRefcountOffset is
+        // frozen at ArcoFission's own build time -- if the two ever disagree (someone edited
+        // ArcoValueBox's layout without rebuilding ArcoFission itself), every emit_inline_retain/
+        // emit_inline_release call elsewhere in this program would otherwise read/write the wrong
+        // memory offset, silently. Panicking here instead trades that silent corruption for a
+        // clear, immediate, loud failure.
+        {
+            const std::uint32_t self_check_expected =
+                std::getenv("ARCO_TEST_FORCE_BAD_REFCOUNT_SELFCHECK")
+                    // Test-only escape hatch (see linux_native_backend_smoke.sh's own
+                    // refcount-offset-mismatch case): perturbs ONLY this comparison's own
+                    // expected value, never kRefcountOffset itself -- every real
+                    // emit_inline_retain/emit_inline_release call elsewhere in this program still
+                    // uses the real, correct offset, so this can never actually corrupt memory,
+                    // even though the mechanism it exercises (the real call, the real comparison,
+                    // the real panic) is entirely genuine.
+                    ? static_cast<std::uint32_t>(kRefcountOffset) + 8
+                    : static_cast<std::uint32_t>(kRefcountOffset);
+            const auto offset_call_disp = result.text.call_rel32_placeholder();
+            result.external_calls.push_back({offset_call_disp, "arco_value_refcount_offset"});
+            result.text.cmp_reg_imm32(Reg::RAX, self_check_expected);
+            const auto ok_disp = result.text.jcc_rel32_placeholder(0x4); // JE -> ok
+            {
+                static const char kMessage[] =
+                    "ArcoFission's own compile-time reference-counting offset disagrees with this "
+                    "build's real ArcoValueBox layout -- rebuild ArcoFission";
+                const std::size_t data_offset = result.rdata.size();
+                for (char c : std::string(kMessage)) result.rdata.push_back(static_cast<std::uint8_t>(c));
+                result.rdata.push_back(0);
+                const std::size_t disp_offset = result.text.lea_rip_relative(Reg::RDI);
+                result.relocations.push_back({disp_offset, result.text.size(), data_offset});
+            }
+            {
+                const auto panic_call_disp = result.text.call_rel32_placeholder();
+                result.external_calls.push_back({panic_call_disp, "arco_value_panic"});
+            }
+            const std::size_t ok_start = result.text.size();
+            const std::int64_t next_instruction = static_cast<std::int64_t>(ok_disp + 4);
+            result.text.patch_i32(ok_disp, static_cast<std::int32_t>(static_cast<std::int64_t>(ok_start) - next_instruction));
+        }
     }
 
     // Reference-counted lifetime tracking (RFC-0053, "full Linux support" pass): every Boxed-kind
@@ -5868,7 +6490,41 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
     for (const auto& current_block : target->blocks) {
         if (reachable_blocks.count(current_block.name) == 0) continue;
         block_offsets[current_block.name] = result.text.size();
+        // A block may be reached from multiple predecessors (a loop back-edge, a join after an
+        // IF/ELSE) whose own NumberCacheEntry state this single-pass emitter has no way to
+        // reconcile in general -- invalidating wholesale at every ordinary block entry is what
+        // makes skipping real liveness/dataflow analysis sound there. A cache miss only costs a
+        // reload, never correctness; see the NumberCacheEntry comment near slot_of for the full
+        // reasoning. The one deliberate exception is a block that's part of a pinned loop's own
+        // body (block_loop_info, populated by the LoopCacheInfo pre-pass near slot_of): its two
+        // pinned slots are trusted UNCONDITIONALLY here, never re-verified, because
+        // prime_for_jump_target already guarantees -- at every single edge into this block,
+        // wherever in the function that edge is emitted -- that both physical registers hold the
+        // loop's own pinned values by the time control actually reaches here. Any slot NOT
+        // reserved by the active loop (0, 1, or both pinned names, see LoopCacheInfo's own
+        // comment) is still invalidated exactly as before; a block outside every pinned loop is
+        // entirely unaffected, and takes the exact same wholesale-invalidate path it always has.
+        const auto loop_for_block = block_loop_info.find(current_block.name);
+        current_block_loop = loop_for_block == block_loop_info.end() ? nullptr : loop_for_block->second;
+        if (current_block_loop != nullptr) {
+            for (std::size_t slot = 0; slot < current_block_loop->pinned_names.size(); ++slot) {
+                const std::string& pinned = current_block_loop->pinned_names[slot];
+                number_cache[slot] = pinned.empty() ? NumberCacheEntry{} : NumberCacheEntry{pinned, true};
+            }
+        } else {
+            invalidate_number_cache_all();
+        }
+        // The Boxed pointer-value cache (boxed_cache, see its own comment near slot_of) has no
+        // loop-pinning extension -- always invalidated wholesale at every block entry, regardless
+        // of current_block_loop, exactly like the Number cache was before that extension existed.
+        boxed_cache.valid = false;
         for (const auto& instruction : current_block.instructions) {
+        // See elided_self_copy's own comment near slot_of: a LOAD/STORE pair identified there as a
+        // provable no-op (`y = y`, always two instructions in AMIR, never one self-referencing
+        // STORE) emits nothing at all for either instruction -- no annotation either, so debug
+        // tooling never sees a phantom zero-byte instruction sharing an offset with whatever comes
+        // right after it.
+        if (elided_self_copy.count(&instruction) != 0) continue;
         // Arco native debugger tooling (see X86_64CodegenResult::InstructionAnnotation's own
         // comment) -- records where THIS instruction's own codegen starts, before any of it runs,
         // so the annotation always points at the first byte actually attributable to it (matches
@@ -5910,12 +6566,31 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 break;
 
             case AmirInstruction::Kind::Jump: {
+                // If the target is an ordinary block, this is a no-op and the target's own
+                // wholesale invalidate-at-entry (see the main per-block loop above) is what makes
+                // jumping there safe regardless of whatever's currently cached here. If the
+                // target is part of a pinned loop, this is instead the "prime" half of that
+                // loop's own trust contract -- see prime_for_jump_target's own comment near
+                // slot_of for the full reasoning, including why this is sound to call with
+                // whatever number_cache state is true right at this exact point in this block's
+                // own straight-line code.
+                prime_for_jump_target(instruction.target);
                 const std::size_t displacement = result.text.jmp_rel32_placeholder();
                 branch_fixups.push_back({displacement, instruction.target});
                 break;
             }
 
             case AmirInstruction::Kind::Branch: {
+                // Unlike Jump, priming for BRANCH's own two targets (see prime_for_jump_target
+                // near slot_of) can't happen in one place here at the top of this case: it has to
+                // straddle the actual jcc/jmp pair emitted below (once per condition-kind
+                // sub-path), since the "true" target is only reached via the jcc actually taken
+                // and the "false" target only via falling through it to the jmp -- priming for
+                // BOTH before either instruction would be just as correct (nothing here touches
+                // memory, only bookkeeping-then-maybe-a-register-load) but wastes a load on
+                // whichever path isn't actually taken. Each sub-path below primes operands[1]
+                // (the true target) immediately before its own jcc, and operands[2] (the false
+                // target) immediately after, in the fallthrough-only zone before its own jmp.
                 if (instruction.operands.size() < 3) {
                     result.ok = false;
                     result.error = "malformed BRANCH instruction";
@@ -5972,16 +6647,20 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     // exactly 0.0 or 1.0 for the former, never NaN), so ucomisd's own
                     // unordered-case quirk (ZF=1 for NaN, same as equal-to-zero, which would make a
                     // genuine NaN condition read as false here) never actually arises for either.
+                    prime_for_jump_target(instruction.operands[1]);
                     const std::size_t true_displacement = result.text.jcc_rel32_placeholder(0x5); // JNE
                     branch_fixups.push_back({true_displacement, instruction.operands[1]});
+                    prime_for_jump_target(instruction.operands[2]);
                     const std::size_t false_displacement = result.text.jmp_rel32_placeholder();
                     branch_fixups.push_back({false_displacement, instruction.operands[2]});
                     break;
                 }
                 if (!load_value(instruction.operands[0], condition_type, Reg::RAX)) return result;
                 result.text.cmp_reg_imm32(Reg::RAX, 0);
+                prime_for_jump_target(instruction.operands[1]);
                 const std::size_t true_displacement = result.text.jcc_rel32_placeholder(0x5); // JNE
                 branch_fixups.push_back({true_displacement, instruction.operands[1]});
+                prime_for_jump_target(instruction.operands[2]);
                 const std::size_t false_displacement = result.text.jmp_rel32_placeholder();
                 branch_fixups.push_back({false_displacement, instruction.operands[2]});
                 break;
@@ -6106,6 +6785,51 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     result.error = "LOAD of \"" + instruction.target + "\" has no assigned stack slot";
                     return result;
                 }
+                // Hoisted from this case's own later use (load_result_type, near store_result below)
+                // so the Number-cache check just below can share it: LOAD's own result kind IS the
+                // source's kind, always, by construction (a plain copy can't change representation;
+                // a given name's classification is fixed for its whole life -- see box_operand_into_
+                // rax's own comment), so this one classification correctly answers "is
+                // instruction.target a cached Number?" too.
+                const HostedValueKind load_result_kind = convention == systems::CallingConvention::SystemV
+                    ? infer_hosted_value_kind(module, *target, instruction.result)
+                    : HostedValueKind::Unknown;
+                // Ordinary variable reads (`PRINT y`, `y + 0`, an operand of any Binary/CallValue)
+                // ALWAYS lower through a LOAD instruction first -- confirmed directly via
+                // `ArcoFission reveal ... --stage AMIR` -- so THIS is where the Number-value register
+                // cache (NumberCacheEntry, near slot_of above) actually has to hook in for reusing a
+                // NAMED variable's value to benefit at all; load_value_double/store_result_double
+                // alone only ever see compile-time TEMPS (Binary/CallValue's own operands), never a
+                // bare variable name directly -- a real gap found and closed before this ever shipped,
+                // not an oversight left in. Plain GPR-to-GPR moves here, not movq_xmm_reg/
+                // movq_reg_xmm: Kind::Load already treats every value as an opaque 8-byte payload in
+                // RAX regardless of its real representation (a double's raw bits fit a GPR exactly as
+                // well as a pointer's do), so no XMM round-trip is needed to interoperate with the
+                // SAME cache load_value_double/store_result_double populate elsewhere.
+                bool number_loaded_from_cache = false;
+                if (load_result_kind == HostedValueKind::Number) {
+                    for (std::size_t i = 0; i < number_cache.size(); ++i) {
+                        if (number_cache[i].valid && number_cache[i].slot_name == instruction.target) {
+                            result.text.mov_reg_reg(Reg::RAX, number_cache_reg(i));
+                            number_cache_mru = i;
+                            number_loaded_from_cache = true;
+                            break;
+                        }
+                    }
+                }
+                // Same idea as the Number-value cache just above, one dedicated slot (RBP --
+                // see boxed_cache's own comment near slot_of for why that register specifically),
+                // for a Boxed local's own POINTER value: reading `obj.field` or `arr[i]` twice in
+                // the same block skips re-reading the plain 8-byte pointer from memory the second
+                // time. This is purely a value cache, orthogonal to the real refcount tracking
+                // just below (tracks_lifetime/emit_inline_retain still always run exactly as
+                // before, using the actual pointer value -- whichever register it came from makes
+                // no difference to a retain/release, which only ever needs the value itself).
+                bool boxed_loaded_from_cache = false;
+                if (load_result_kind == HostedValueKind::Boxed && boxed_cache.valid && boxed_cache.slot_name == instruction.target) {
+                    result.text.mov_reg_reg(Reg::RAX, Reg::RBP);
+                    boxed_loaded_from_cache = true;
+                }
                 // Reference-counted lifetime tracking (RFC-0053, "full Linux support" pass): LOAD is
                 // a plain slot-to-slot COPY exactly like Kind::Store (just named the other way --
                 // `.target` is the SOURCE here, `.result` is the destination), so it has the exact
@@ -6127,8 +6851,22 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 const bool tracks_lifetime = convention == systems::CallingConvention::SystemV &&
                     parameter_names.count(instruction.result) == 0 &&
                     infer_local_kind(module, *target, instruction.result, 0) == HostedValueKind::Boxed;
-                if (source_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(source_slot));
-                else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(source_slot));
+                if (!number_loaded_from_cache && !boxed_loaded_from_cache) {
+                    if (source_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(source_slot));
+                    else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(source_slot));
+                    // Populate the cache on a miss so the NEXT read of this same name (in this same
+                    // block) can skip the memory read entirely, the way the hit branch above just did.
+                    if (load_result_kind == HostedValueKind::Number) {
+                        const std::size_t use = number_cache_claim_slot(instruction.target);
+                        if (use != kNoNumberCacheSlot) {
+                            result.text.mov_reg_reg(number_cache_reg(use), Reg::RAX);
+                            number_cache[use] = NumberCacheEntry{instruction.target, true};
+                        }
+                    } else if (load_result_kind == HostedValueKind::Boxed && number_cache_worth_caching(instruction.target)) {
+                        result.text.mov_reg_reg(Reg::RBP, Reg::RAX);
+                        boxed_cache = BoxedCacheEntry{instruction.target, true};
+                    }
+                }
                 if (tracks_lifetime) {
                     const int dest_slot = slot_of(instruction.result);
                     if (dest_slot >= 0) {
@@ -6137,11 +6875,10 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                         if (dest_slot <= 127) result.text.mov_load_disp8(Reg::R10, Reg::RSP, static_cast<std::uint8_t>(dest_slot));
                         else result.text.mov_load_disp32(Reg::R10, Reg::RSP, static_cast<std::uint32_t>(dest_slot));
                     }
-                    result.text.mov_reg_reg(Reg::RDI, Reg::RAX);
-                    const auto retain_disp = result.text.call_rel32_placeholder();
-                    result.external_calls.push_back({retain_disp, "arco_value_retain"});
-                    // arco_value_retain doesn't return the pointer it was given -- reload the
-                    // source value fresh rather than assume RAX survived the call.
+                    emit_inline_retain(Reg::RAX);
+                    // The inline fast path never clobbers RAX (unlike the old call-based
+                    // arco_value_retain, which needed this reload) -- kept anyway, out of scope
+                    // for this pass, to keep the blast radius of this change narrow.
                     if (source_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(source_slot));
                     else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(source_slot));
                 }
@@ -6176,9 +6913,8 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 // "pointer" (0x00/0x01) as if it were the real ArcoValueBox. Fixed by widening this
                 // preference to Boxed as well as Number -- both share the same "instruction.result_
                 // type cannot be trusted over the real, disagreement-aware runtime kind" fix.
-                const HostedValueKind load_result_kind = convention == systems::CallingConvention::SystemV
-                    ? infer_hosted_value_kind(module, *target, instruction.result)
-                    : HostedValueKind::Unknown;
+                // (load_result_kind itself is computed once, earlier in this case -- see the
+                // Number-cache comment near the top -- and reused here unchanged.)
                 const std::string load_result_type =
                     (load_result_kind == HostedValueKind::Number || load_result_kind == HostedValueKind::Boxed)
                     ? "U64" : (instruction.result_type.empty() ? "U64" : instruction.result_type);
@@ -6205,9 +6941,7 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                 // class-constructor `__instance` case this block's own comment documents, where load_
                 // result_type normalizes to "U64" and store_result never touches lifetime at all.
                 if (tracks_lifetime && load_result_type != "STRING") {
-                    result.text.mov_reg_reg(Reg::RDI, Reg::R10);
-                    const auto release_disp = result.text.call_rel32_placeholder();
-                    result.external_calls.push_back({release_disp, "arco_value_release"});
+                    emit_inline_release(Reg::R10);
                 }
                 break;
             }
@@ -7005,6 +7739,16 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     result.error = "STORE references an unknown value";
                     return result;
                 }
+                // A plain STORE writes the target's slot via a raw memory-to-memory GPR copy below
+                // (both the Boxed and the ordinary-Number path), never through store_result_double
+                // -- so it's the one place that can otherwise leave a STALE NumberCacheEntry
+                // pointing at this target's old value after its memory has already changed underneath
+                // it. A real bug caught during design review, not by testing: `y = x` for two cached
+                // Number locals would silently print the OLD value of `y` from before this store. No
+                // convention check needed -- invalidate_number_cache_name is already a safe no-op for
+                // a name the cache never held (e.g. every Boxed target, and Microsoft x64 builds).
+                invalidate_number_cache_name(instruction.target);
+                invalidate_boxed_cache_name(instruction.target);
                 // Reference-counted lifetime tracking (RFC-0053, "full Linux support" pass): unlike
                 // store_result (which always stores a FRESH reference this instruction itself just
                 // produced), a plain STORE is a raw slot-to-slot COPY -- `y = x` for two Boxed
@@ -7055,37 +7799,65 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     // exactly this branch's own gate).
                     if (target_slot <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(target_slot), Reg::RAX);
                     else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(target_slot), Reg::RAX);
+                    // Refresh the Boxed pointer cache with the freshly boxed value while it's
+                    // still sitting in RAX -- the RDI load just below (for the release call) never
+                    // touches RAX, so this is always the exact value that just landed in the
+                    // target's own slot.
+                    result.text.mov_reg_reg(Reg::RBP, Reg::RAX);
+                    boxed_cache = BoxedCacheEntry{instruction.target, true};
                     result.text.mov_load_disp32(Reg::RDI, Reg::RSP, static_cast<std::uint32_t>(scratch_base));
-                    const auto release_disp = result.text.call_rel32_placeholder();
-                    result.external_calls.push_back({release_disp, "arco_value_release"});
+                    emit_inline_release(Reg::RDI);
                     break;
                 }
                 if (value_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(value_slot));
                 else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(value_slot));
                 if (tracks_lifetime) {
-                    // Old target value survives in R10 across the retain call below (a plain
-                    // ArcoValue* argument call never touches R10, see store_result's own identical
-                    // scratch-register reasoning) so it can be released only after the new value is
+                    // Old target value survives in R10 across the retain below (the inline fast
+                    // path never clobbers it, and even the rare real-call fallback inside
+                    // emit_inline_retain -- there is none, retain never frees anything -- would be
+                    // fine here either way) so it can be released only after the new value is
                     // safely retained and stored -- if source and target happen to be the SAME
                     // underlying box (`x = x`), retaining before releasing is what keeps its
                     // refcount from ever transiently reaching zero.
                     if (target_slot <= 127) result.text.mov_load_disp8(Reg::R10, Reg::RSP, static_cast<std::uint8_t>(target_slot));
                     else result.text.mov_load_disp32(Reg::R10, Reg::RSP, static_cast<std::uint32_t>(target_slot));
-                    result.text.mov_reg_reg(Reg::RDI, Reg::RAX);
-                    const auto retain_disp = result.text.call_rel32_placeholder();
-                    result.external_calls.push_back({retain_disp, "arco_value_retain"});
-                    // arco_value_retain doesn't return the pointer it was given, so RAX (the value
-                    // being stored) must be reloaded from its own source slot rather than assumed
-                    // to have survived the call.
+                    emit_inline_retain(Reg::RAX);
+                    // The inline fast path never clobbers RAX (unlike the old call-based
+                    // arco_value_retain, which needed this reload) -- kept anyway, out of scope
+                    // for this pass, to keep the blast radius of this change narrow.
                     if (value_slot <= 127) result.text.mov_load_disp8(Reg::RAX, Reg::RSP, static_cast<std::uint8_t>(value_slot));
                     else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(value_slot));
                 }
                 if (target_slot <= 127) result.text.mov_store_disp8(Reg::RSP, static_cast<std::uint8_t>(target_slot), Reg::RAX);
                 else result.text.mov_store_disp32(Reg::RSP, static_cast<std::uint32_t>(target_slot), Reg::RAX);
+                // Immediately re-cache the freshly written value if this STORE's own target is one
+                // of the active loop's two pinned names (current_block_loop, set once per block by
+                // the main per-block loop above) -- without this, invalidate_number_cache_name just
+                // above would leave the pinned slot marked invalid for the rest of this block, and
+                // the very next prime_for_jump_target/block-entry trust for this same loop would
+                // see "not valid" and fall back to a real memory reload every single iteration,
+                // silently losing the whole point of pinning an induction variable like a FOR
+                // loop's own counter in the first place. RAX still holds exactly the value just
+                // written (the plain register-to-memory store above touches no other register), so
+                // this is a pure register-to-register copy, no second memory read.
+                if (convention == systems::CallingConvention::SystemV && current_block_loop != nullptr) {
+                    for (std::size_t slot = 0; slot < current_block_loop->pinned_names.size(); ++slot) {
+                        if (current_block_loop->pinned_names[slot] == instruction.target) {
+                            result.text.mov_reg_reg(number_cache_reg(slot), Reg::RAX);
+                            number_cache[slot] = NumberCacheEntry{instruction.target, true};
+                            break;
+                        }
+                    }
+                }
                 if (tracks_lifetime) {
-                    result.text.mov_reg_reg(Reg::RDI, Reg::R10);
-                    const auto release_disp = result.text.call_rel32_placeholder();
-                    result.external_calls.push_back({release_disp, "arco_value_release"});
+                    // Same idea as the pinned-Number repopulation just above, for the Boxed
+                    // pointer cache -- tracks_lifetime here means the TARGET is Boxed-kind (its
+                    // own gate, above), so this and that branch are always mutually exclusive for
+                    // a given STORE. RAX still holds the pointer just written (retain, if it ran,
+                    // never clobbers RAX -- see its own comment a few lines up).
+                    result.text.mov_reg_reg(Reg::RBP, Reg::RAX);
+                    boxed_cache = BoxedCacheEntry{instruction.target, true};
+                    emit_inline_release(Reg::R10);
                 }
                 break;
             }
@@ -8028,10 +8800,7 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                         }
                         result.text.movsd_store_disp32(Reg::RSP, static_cast<std::uint32_t>(scratch_base + 8), Xmm::XMM0);
                         result.text.mov_load_disp32(Reg::RDI, Reg::RSP, static_cast<std::uint32_t>(scratch_base));
-                        {
-                            const auto release_disp = result.text.call_rel32_placeholder();
-                            result.external_calls.push_back({release_disp, "arco_value_release"});
-                        }
+                        emit_inline_release(Reg::RDI);
                         result.text.movsd_load_disp32(Xmm::XMM0, Reg::RSP, static_cast<std::uint32_t>(scratch_base + 8));
                         if (!store_result_double(instruction.result, Xmm::XMM0)) return result;
                         break;
@@ -8992,10 +9761,7 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     result.external_calls.push_back({print_disp, "arco_value_print"});
                 }
                 result.text.mov_load_disp32(Reg::RDI, Reg::RSP, static_cast<std::uint32_t>(scratch_base));
-                {
-                    const auto release_disp = result.text.call_rel32_placeholder();
-                    result.external_calls.push_back({release_disp, "arco_value_release"});
-                }
+                emit_inline_release(Reg::RDI);
                 break;
             }
 
@@ -9095,13 +9861,25 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                         const int offset = slot_of(name);
                         if (offset <= 127) result.text.mov_load_disp8(Reg::RDI, Reg::RSP, static_cast<std::uint8_t>(offset));
                         else result.text.mov_load_disp32(Reg::RDI, Reg::RSP, static_cast<std::uint32_t>(offset));
-                        const auto release_disp = result.text.call_rel32_placeholder();
-                        result.external_calls.push_back({release_disp, "arco_value_release"});
+                        emit_inline_release(Reg::RDI);
                     }
                     if (swept_any) {
                         if (returns_via_xmm0) result.text.movsd_load_disp32(Xmm::XMM0, Reg::RSP, static_cast<std::uint32_t>(scratch_base));
                         else result.text.mov_load_disp32(Reg::RAX, Reg::RSP, static_cast<std::uint32_t>(scratch_base));
                     }
+                }
+                // Restore the CALLER's own RBX/R15/RBP (saved in the prologue -- see the
+                // NumberCacheEntry/BoxedCacheEntry comments near slot_of) before actually
+                // returning to it. Must run on every return path, which is exactly what putting
+                // it here achieves: this is the one and only Kind::Return case body, and every
+                // reachable RETURN in this function compiles through it (confirmed no other
+                // .ret()/frame-teardown exists anywhere else in this function). Neither the return
+                // value itself (always marshaled through RAX/XMM0 above) nor the sweep just above
+                // ever reads from RBP, so restoring it here can't clobber anything still needed.
+                if (convention == systems::CallingConvention::SystemV) {
+                    result.text.mov_load_disp32(Reg::RBX, Reg::RSP, static_cast<std::uint32_t>(saved_regs_base));
+                    result.text.mov_load_disp32(Reg::R15, Reg::RSP, static_cast<std::uint32_t>(saved_regs_base + 8));
+                    result.text.mov_load_disp32(Reg::RBP, Reg::RSP, static_cast<std::uint32_t>(saved_regs_base + 16));
                 }
                 // Same sign-extension hazard as the prologue's sub rsp, imm8 above.
                 if (frame_size <= 127) result.text.add_rsp_imm8(static_cast<std::uint8_t>(frame_size));
@@ -9310,12 +10088,9 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                         const auto call_disp = result.text.call_rel32_placeholder();
                         result.external_calls.push_back({call_disp, "arco_value_index_get"});
                     }
-                    result.text.mov_reg_reg(Reg::R10, Reg::RAX); // survive the release call below
+                    result.text.mov_reg_reg(Reg::R10, Reg::RAX); // survive the release below
                     result.text.mov_load_disp32(Reg::RDI, Reg::RSP, static_cast<std::uint32_t>(scratch_base));
-                    {
-                        const auto release_disp = result.text.call_rel32_placeholder();
-                        result.external_calls.push_back({release_disp, "arco_value_release"});
-                    }
+                    emit_inline_release(Reg::RDI);
                     result.text.mov_reg_reg(Reg::RAX, Reg::R10);
                 } else if (index_kind == HostedValueKind::String) {
                     // Dotted property access (obj.field) lowers to exactly this shape -- a
@@ -9559,6 +10334,12 @@ X86_64CodegenResult generate_x86_64_function(const AmirModule& module, const std
                     result.error = "this milestone's code generator does not support this A-MIR instruction kind";
                     return result;
                 }
+                // Technically already covered by the per-block invalidation above (the catch
+                // handler instruction.target is its own separate block, entered fresh), since RBX/
+                // R15 are genuine callee-saved GPRs that setjmp/longjmp correctly preserve either
+                // way -- kept anyway as free, easily-justified defense in depth against any future
+                // refactor of how the catch handler is reached.
+                invalidate_number_cache_all();
                 const std::uint32_t jmpbuf_offset = static_cast<std::uint32_t>(try_jmpbuf_base + kJmpBufSlotSize * try_block_ordinal);
                 ++try_block_ordinal;
                 result.text.lea_rsp_disp32(Reg::RDI, jmpbuf_offset);
@@ -12063,22 +12844,39 @@ std::vector<std::string> native_gui_runtime_link_dependencies(const std::filesys
         std::filesystem::path("CMakeFiles") / "arco_cli.dir" / "link.txt", {"libarco_runtime.a"});
 }
 
-// True if `module` calls a `GUI.*` host function anywhere (a plain `Kind::CallValue` whose target
-// starts with the literal prefix "GUI." -- GUI.Window, GUI.Clear, GUI.WaitEvent, and so on all
-// reach here identically, since none of them have dedicated native codegen of their own; every one
-// falls through to the generic host-function bridge the same way any other unrecognized host call
+// True if `module` calls a `GUI.*` host function, OR a RFC-0056 ("The Arcology GUI Library")
+// Host Platform Interface function (WINDOW./SURFACE./POINTER./KEYBOARD./CLIPBOARD./CURSOR. --
+// include/arco/arcogui_host.hpp, a NEW primitive surface deliberately independent of GUI.*, RFC-
+// 0056 S35.1), anywhere in the module (a plain `Kind::CallValue` whose target starts with one of
+// these literal prefixes -- GUI.Window, WINDOW.Create, SURFACE.Present, and so on all reach here
+// identically, since none of them have dedicated native codegen of their own; every one falls
+// through to the generic host-function bridge the same way any other unrecognized host call
 // does). Used to decide which prebuilt runtime library build_linux_native_image's own host-function
 // bridge should link against: this walks the WHOLE module (every function, not just Main) because a
 // GUI call inside a user-declared FUNCTION/CLASS method is exactly as real a GUI program as one
 // written directly at script scope -- Arconaut itself calls GUI.* exclusively from inside its own
 // Draw*/event-handling functions, never from Main directly.
+//
+// Both families need the SAME full runtime library (native_gui_runtime_link_dependencies,
+// arco_cli's own libarco_runtime.a) despite being gated by two entirely independent CMake
+// booleans (ARCO_GUI_BACKEND_AVAILABLE vs. ARCO_ARCOGUI_BACKEND_AVAILABLE) -- arco_cli links
+// whichever of each was actually available at configure time, so "the full runtime" already means
+// "whichever GUI backends this build tree actually has", not specifically the legacy one. A
+// program calling ONLY WINDOW.*/SURFACE.*/etc., built where ARCO_ARCOGUI_BACKEND_AVAILABLE is
+// TRUE but ARCO_GUI_BACKEND_AVAILABLE is FALSE (the exact configuration RFC-0056 S35.2's own audit
+// found on this development machine), still needs this same full-runtime link -- it is the only
+// prebuilt library that contains the real src/gui/arcogui_glfw.cpp implementation instead of
+// src/gui/arcogui_stub.cpp's own unconditional panic.
 bool program_calls_gui_function(const AmirModule& module) {
+    static const char* const kGuiHostPrefixes[] = {
+        "GUI.", "WINDOW.", "SURFACE.", "POINTER.", "KEYBOARD.", "CLIPBOARD.", "CURSOR.",
+    };
     for (const auto& function : module.functions) {
         for (const auto& block : function.blocks) {
             for (const auto& instruction : block.instructions) {
-                if (instruction.kind == AmirInstruction::Kind::CallValue &&
-                    instruction.target.rfind("GUI.", 0) == 0) {
-                    return true;
+                if (instruction.kind != AmirInstruction::Kind::CallValue) continue;
+                for (const char* prefix : kGuiHostPrefixes) {
+                    if (instruction.target.rfind(prefix, 0) == 0) return true;
                 }
             }
         }
@@ -12450,29 +13248,37 @@ Result build_web_bytecode(const std::string& bytecode_binary, const std::string&
 }
 #endif
 
-// True if a program calls a real GUI.* function -- one that would actually reach the stub
-// backend's `unsupported()` (see src/gui/stub_backend.cpp) if linked without the GTK/GLFW
-// backend. GUI.Available and GUI.Backend are excluded since the stub answers those directly
-// (false / "none") rather than throwing, which is exactly how well-behaved ArcoBASIC programs are
-// meant to probe for a GUI backend before using one (see examples/gui_cube.abas). Network.* needs
-// no such carve-out: every Network.* function already degrades gracefully without libcurl (see
-// the #else branch of http_request in runtime.cpp), so it's never a reason to prefer the full
-// runtime. Scans every instruction operand rather than only call-name positions, which is
-// simpler and only risks an occasional unnecessary "full" link (e.g. a string literal that
-// happens to start with "gui." for unrelated reasons), never an incorrect "lean" one.
+// True if a program calls a real GUI.* function, OR a RFC-0056 ("The Arcology GUI Library") Host
+// Platform Interface function (WINDOW./SURFACE./POINTER./KEYBOARD./CLIPBOARD./CURSOR. --
+// include/arco/arcogui_host.hpp) -- either family would actually reach its own stub backend's
+// `unsupported()` (see src/gui/stub_backend.cpp / src/gui/arcogui_stub.cpp) if linked without the
+// real GLFW-backed implementation. Each family's own `Available`/`Backend` pair is excluded since
+// both stubs answer those directly (false / "none") rather than throwing, which is exactly how a
+// well-behaved ArcoBASIC program is meant to probe for a GUI backend before using one (see
+// examples/gui_cube.abas, and RFC-0054's own Aperture, which checks WINDOW.Available()) --
+// see program_calls_gui_function's own identical carve-out and reasoning for the sibling
+// --target linux-x86_64 code path this mirrors. Network.* needs no such carve-out: every
+// Network.* function already degrades gracefully without libcurl (see the #else branch of
+// http_request in runtime.cpp), so it's never a reason to prefer the full runtime. Scans every
+// instruction operand rather than only call-name positions, which is simpler and only risks an
+// occasional unnecessary "full" link (e.g. a string literal that happens to start with one of
+// these prefixes for unrelated reasons), never an incorrect "lean" one.
 bool bytecode_needs_full_runtime(const BytecodeModule& module) {
+    static const char* const kGuiHostPrefixes[] = {
+        "gui.", "window.", "surface.", "pointer.", "keyboard.", "clipboard.", "cursor.",
+    };
     for (const auto& function : module.functions) {
         for (const auto& block : function.blocks) {
             for (const auto& instruction : block.instructions) {
                 for (const auto& operand : instruction.operands) {
-                    if (operand.size() < 4) continue;
-                    if (std::tolower(static_cast<unsigned char>(operand[0])) != 'g' ||
-                        std::tolower(static_cast<unsigned char>(operand[1])) != 'u' ||
-                        std::tolower(static_cast<unsigned char>(operand[2])) != 'i' || operand[3] != '.') {
-                        continue;
-                    }
+                    if (operand.size() < 4) continue; // shorter than "gui.", the shortest prefix
                     const std::string key = lowered_call_key(operand);
-                    if (key != "gui.available" && key != "gui.backend") {
+                    for (const char* prefix : kGuiHostPrefixes) {
+                        if (key.rfind(prefix, 0) != 0) continue;
+                        if (key == "gui.available" || key == "gui.backend" ||
+                            key == "window.available" || key == "window.backend") {
+                            continue;
+                        }
                         return true;
                     }
                 }
