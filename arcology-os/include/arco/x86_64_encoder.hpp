@@ -77,6 +77,29 @@ public:
     void mov_load_disp32(Reg dst, Reg base, std::uint32_t disp32) { emit_modrm_disp32(0x8B, dst, base, disp32); }
     void mov_load32_disp32(Reg dst, Reg base, std::uint32_t disp32) { emit_modrm32_disp32(0x8B, dst, base, disp32); }
 
+    // inc dword ptr [base+disp32] -- FF /0. Plain (NOT LOCK-prefixed) increment of a 4-byte value
+    // in memory (ArcoValueBox::refcount's own width, native_value_box.hpp) -- see that struct's
+    // own comment for why refcount is a plain int, not std::atomic<int>: this runtime has no real
+    // shared-memory multithreading to protect against, and a LOCK-prefixed instruction measured as
+    // costing roughly 2x a plain one on real hardware for this exact access pattern, a real cost
+    // for a guarantee nothing here uses. Reuses emit_modrm32_disp32 (32-bit width, no REX.W)
+    // exactly like mov_load32_disp32 above -- Reg::RAX's own low 3 bits (000) select the `/0`
+    // opcode extension that makes 0xFF mean INC rather than some other group-5 operation; it is
+    // never actually used as a real register operand here.
+    void inc_dword_disp32(Reg base, std::uint32_t disp32) {
+        emit_modrm32_disp32(0xFF, Reg::RAX, base, disp32);
+    }
+
+    // dec dword ptr [base+disp32] -- FF /1, same shape as inc_dword_disp32 above (Reg::RCX's own
+    // low 3 bits, 001, select the `/1` = DEC extension instead). INC/DEC set ZF/SF/PF from the
+    // RESULT (unlike ADD/SUB, they never touch CF), so ZF is set here exactly when the decremented
+    // value is zero -- the same condition arco_value_release's own "was 1 before decrementing"
+    // check needs, making a plain `jz`/`je` immediately after this instruction the correct "the
+    // refcount just hit zero, really free the object now" test (see emit_inline_release).
+    void dec_dword_disp32(Reg base, std::uint32_t disp32) {
+        emit_modrm32_disp32(0xFF, Reg::RCX, base, disp32);
+    }
+
     void lea_rsp_disp8(Reg dst, std::uint8_t disp8) { emit_modrm_disp8(0x8D, dst, Reg::RSP, disp8); }
     void lea_rsp_disp32(Reg dst, std::uint32_t disp32) { emit_modrm_disp32(0x8D, dst, Reg::RSP, disp32); }
 
@@ -113,6 +136,12 @@ public:
 
     void cmp_reg_reg(Reg left, Reg right) { emit_binary_reg(0x39, left, right); }
     void cmp_reg_imm32(Reg reg, std::uint32_t value) { emit_imm_reg(0x81, 7, reg, value); }
+
+    // test r/m64, r64 -- REX.W 85 /r. Sets ZF/SF/PF from `a AND b` without modifying either
+    // register, same operand-encoding shape as cmp_reg_reg above -- reused here for a null-pointer
+    // check (`test_reg_reg(reg, reg)` then `jz`) ahead of the inline reference-counting fast path
+    // (see generate_x86_64_function's own emit_inline_retain/emit_inline_release).
+    void test_reg_reg(Reg a, Reg b) { emit_binary_reg(0x85, a, b); }
 
     void shl_reg_imm8(Reg reg, std::uint8_t count) { emit_shift_imm(reg, 4, count); }
     void shr_reg_imm8(Reg reg, std::uint8_t count) { emit_shift_imm(reg, 5, count); }
@@ -205,6 +234,21 @@ public:
         emit(0x0F);
         emit(0x6E);
         emit(static_cast<std::uint8_t>(0xC0 | (xmm_low3(dst) << 3) | reg_low3(src)));
+    }
+
+    // movq r/m64, xmm -- 66 REX.W 0F 7E /r. The reverse of movq_xmm_reg above: reinterprets an XMM
+    // register's low 64 bits as a GPR's raw bit pattern, with no conversion -- the standard way to
+    // get an already-computed double's exact bits into a GPR (e.g. to stash it in a register-cached
+    // local across other codegen that doesn't touch that GPR, see generate_x86_64_function's own
+    // NumberCacheEntry). ModRM.reg selects the source XMM register here and ModRM.rm selects the
+    // destination GPR -- opposite of movq_xmm_reg's own operand encoding -- so REX.B (not REX.R) is
+    // the extension bit that matters, since only the r/m-side GPR can be R8-R15.
+    void movq_reg_xmm(Reg dst, Xmm src) {
+        emit(0x66);
+        emit(static_cast<std::uint8_t>(0x48 | (reg_needs_rex_extension(dst) ? 0x01 : 0)));
+        emit(0x0F);
+        emit(0x7E);
+        emit(static_cast<std::uint8_t>(0xC0 | (xmm_low3(src) << 3) | reg_low3(dst)));
     }
 
     // cvttsd2si r64, xmm -- F2 REX.W 0F 2C /r. TRUNCATING double->int64 conversion (toward zero) --

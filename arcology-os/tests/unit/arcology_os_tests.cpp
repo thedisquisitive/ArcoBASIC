@@ -382,6 +382,64 @@ int main() {
             require(bytes_equal(asm_.bytes(), {0x66, 0x49, 0x0F, 0x6E, 0xC0}), "movq xmm0, r8 matches nasm");
         }
         {
+            // movq_reg_xmm -- the reverse direction of movq_xmm_reg, added for
+            // generate_x86_64_function's own NumberCacheEntry (a persistent register cache for
+            // hosted Number values under System V). RBX/R15 are the two registers this cache
+            // actually uses.
+            Assembler asm_;
+            asm_.movq_reg_xmm(Reg::RBX, Xmm::XMM0);
+            require(bytes_equal(asm_.bytes(), {0x66, 0x48, 0x0F, 0x7E, 0xC3}), "movq rbx, xmm0 matches nasm");
+        }
+        {
+            // The one case that actually needs REX.B (a dst GPR from R8-R15) -- R15 is the
+            // cache's own second register.
+            Assembler asm_;
+            asm_.movq_reg_xmm(Reg::R15, Xmm::XMM1);
+            require(bytes_equal(asm_.bytes(), {0x66, 0x49, 0x0F, 0x7E, 0xCF}), "movq r15, xmm1 matches nasm");
+        }
+        {
+            // Round-trip: a bit pattern loaded into a GPR, moved into an XMM register via
+            // movq_xmm_reg, then back out via movq_reg_xmm, must be bit-for-bit identical -- the
+            // whole cache design depends on this being a lossless reinterpretation, never a
+            // numeric conversion.
+            Assembler asm_;
+            asm_.movq_xmm_reg(Xmm::XMM2, Reg::RAX);
+            asm_.movq_reg_xmm(Reg::RCX, Xmm::XMM2);
+            require(bytes_equal(asm_.bytes(), {0x66, 0x48, 0x0F, 0x6E, 0xD0, 0x66, 0x48, 0x0F, 0x7E, 0xD1}),
+                    "movq xmm2, rax; movq rcx, xmm2 round-trip matches nasm");
+        }
+        {
+            // test_reg_reg -- the null-pointer check ahead of the inline reference-counting fast
+            // path (generate_x86_64_function's own emit_inline_retain/emit_inline_release).
+            Assembler asm_;
+            asm_.test_reg_reg(Reg::RAX, Reg::RAX);
+            require(bytes_equal(asm_.bytes(), {0x48, 0x85, 0xC0}), "test rax, rax matches nasm");
+        }
+        {
+            // The extended-register case (both operands need REX.R and REX.B, being the same R8-15
+            // register on both sides of the ModRM byte).
+            Assembler asm_;
+            asm_.test_reg_reg(Reg::R10, Reg::R10);
+            require(bytes_equal(asm_.bytes(), {0x4D, 0x85, 0xD2}), "test r10, r10 matches nasm");
+        }
+        {
+            // inc_dword_disp32 / dec_dword_disp32 -- the actual reference-counting fast path's own
+            // plain (deliberately NOT LOCK-prefixed -- see ArcoValueBox's own comment on why this
+            // runtime's reference counting isn't thread-safe) increment/decrement, verified
+            // against a displacement large enough to force the disp32 (not disp8) ModRM encoding,
+            // and against both a non-extended (RDI) and an extended (R10) base register.
+            Assembler asm_;
+            asm_.inc_dword_disp32(Reg::RDI, 0x300);
+            require(bytes_equal(asm_.bytes(), {0xFF, 0x87, 0x00, 0x03, 0x00, 0x00}),
+                    "inc dword [rdi+0x300] matches nasm");
+        }
+        {
+            Assembler asm_;
+            asm_.dec_dword_disp32(Reg::R10, 0x300);
+            require(bytes_equal(asm_.bytes(), {0x41, 0xFF, 0x8A, 0x00, 0x03, 0x00, 0x00}),
+                    "dec dword [r10+0x300] matches nasm");
+        }
+        {
             // R12 as a memory-operand base needs an explicit SIB byte (its low 3 bits, 100,
             // collide with the "SIB follows" ModRM.rm encoding), same as RSP -- and, being an
             // extended register, also needs REX.B, unlike RSP.

@@ -1866,3 +1866,380 @@ diff -u "$TMP_ROOT/addressof-ambiguous-return-expected.txt" "$TMP_ROOT/addressof
 # see infer_hosted_value_kind's own comment for the full reasoning; a proper fix needs memoizing
 # this analysis per (function, name), not just a bigger cap. No regression test added for the
 # gap itself (it's an intentionally-still-open limitation, not a fixed behavior to pin).
+# Number-value register cache (generate_x86_64_function's own NumberCacheEntry, System V only): a
+# small, function-scoped 2-entry cache (Reg::RBX/Reg::R15, real System V callee-saved GPRs) that
+# lets load_value_double skip re-reading a slot from memory when it already knows the answer from
+# a recent load/store of the SAME name. Real callee-saved registers survive an ordinary function
+# call (any ABI-compliant callee must preserve them) -- the whole point of choosing them over the
+# caller-saved registers already in heavy use throughout this backend. `a`/`b` are read, cached,
+# a genuine System V call happens in between (AddOne, a completely separate compiled function with
+# its own save/restore prologue/epilogue), then `a`/`b` are read again in the SAME block -- if
+# AddOne's own internal use of RBX/R15 as ITS OWN cache ever leaked past its own restore, this
+# would silently read garbage instead of 3/4. Run for several loop iterations (a WHILE loop's own
+# header is a Label -- a block boundary -- so the cache is deliberately invalidated at the top of
+# every iteration, a real disclosed scope limit of this first phase; this test simply exercises
+# the store-across-a-call reuse WITHIN one iteration's own straight-line body, repeated several
+# times for extra confidence that eviction/reuse across iterations never accumulates corruption).
+cat > "$TMP_ROOT/register-cache-call.abas" <<'SCRIPT'
+FUNCTION AddOne(n)
+    RETURN n + 1
+END FUNCTION
+
+a = 3
+b = 4
+total = 0
+i = 0
+WHILE i < 5
+    x = a + b
+    y = AddOne(i)
+    z = a + b
+    total = total + x + y + z
+    i = i + 1
+WEND
+PRINT total
+PRINT a
+PRINT b
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/register-cache-call.abas" -o "$TMP_ROOT/register-cache-call" --target linux-x86_64 > /dev/null
+"$TMP_ROOT/register-cache-call" > "$TMP_ROOT/register-cache-call-native-run.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/register-cache-call.abas" > "$TMP_ROOT/register-cache-call-bytecode-run.txt"
+diff -u "$TMP_ROOT/register-cache-call-bytecode-run.txt" "$TMP_ROOT/register-cache-call-native-run.txt"
+printf '85\n3\n4\n' > "$TMP_ROOT/register-cache-call-expected.txt"
+diff -u "$TMP_ROOT/register-cache-call-expected.txt" "$TMP_ROOT/register-cache-call-native-run.txt"
+
+# Kind::Store regression: a real bug caught during implementation (not just design review) of the
+# register cache above, before it ever shipped -- and only reproducible once Kind::Load ALSO
+# started consulting/populating the cache (see that case's own much larger comment on why ordinary
+# variable reads need to hook in there, not just load_value_double/store_result_double, which only
+# ever see compile-time temps). Kind::Store (a plain `y = 9` local-to-local/literal assignment)
+# writes the target's slot via a raw memory-to-memory copy that bypasses store_result_double
+# entirely -- so it's the one place that could otherwise leave a STALE Kind::Load-populated cache
+# entry pointing at a name's OLD value after Kind::Store already changed its memory underneath it.
+# `y = 1; PRINT y; y = 9; PRINT y` is the minimal shape that actually exercises this: PRINT's own
+# operand loading (a different temp each time) never evicts `y`'s own cache slot in between, so
+# without invalidate_number_cache_name(instruction.target) in Kind::Store, the second PRINT
+# silently repeats the first PRINT's value -- confirmed directly by temporarily disabling that one
+# line and observing this exact script print "1\n1\n" instead of "1\n9\n" before re-enabling it.
+cat > "$TMP_ROOT/register-cache-store.abas" <<'SCRIPT'
+y = 1
+PRINT y
+y = 9
+PRINT y
+
+x = 42
+w = y + 0
+y = x
+PRINT y
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/register-cache-store.abas" -o "$TMP_ROOT/register-cache-store" --target linux-x86_64 > /dev/null
+"$TMP_ROOT/register-cache-store" > "$TMP_ROOT/register-cache-store-native-run.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/register-cache-store.abas" > "$TMP_ROOT/register-cache-store-bytecode-run.txt"
+diff -u "$TMP_ROOT/register-cache-store-bytecode-run.txt" "$TMP_ROOT/register-cache-store-native-run.txt"
+printf '1\n9\n42\n' > "$TMP_ROOT/register-cache-store-expected.txt"
+diff -u "$TMP_ROOT/register-cache-store-expected.txt" "$TMP_ROOT/register-cache-store-native-run.txt"
+
+# Register cache across a real setjmp/longjmp round trip: `a`/`b` are cached before a TRY block,
+# a nested function call inside the guarded block raises an out-of-range array access (caught,
+# unwinding through Boom's own real native call frame via longjmp -- see the try-catch.abas
+# coverage above for that mechanism itself), and `a`/`b` are read again afterward. This mainly
+# proves the RBX/R15 save/restore discipline survives a longjmp cleanly -- both the per-block and
+# the explicit TryBegin cache invalidation mean nothing here is actually relying on stale cache
+# state surviving the jump, but a corrupted RBX/R15 (e.g. an unbalanced save/restore somewhere)
+# would still show up here as a wrong `post` value or a crash.
+cat > "$TMP_ROOT/register-cache-trycatch.abas" <<'SCRIPT'
+FUNCTION Boom()
+    arr = [1, 2, 3]
+    PRINT arr[99]
+END FUNCTION
+
+a = 11
+b = 22
+pre = a + b
+TRY
+    inner = a + b
+    Boom()
+CATCH e
+    PRINT "caught"
+END TRY
+post = a + b
+PRINT pre
+PRINT post
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/register-cache-trycatch.abas" -o "$TMP_ROOT/register-cache-trycatch" --target linux-x86_64 > /dev/null
+"$TMP_ROOT/register-cache-trycatch" > "$TMP_ROOT/register-cache-trycatch-native-run.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/register-cache-trycatch.abas" > "$TMP_ROOT/register-cache-trycatch-bytecode-run.txt"
+diff -u "$TMP_ROOT/register-cache-trycatch-bytecode-run.txt" "$TMP_ROOT/register-cache-trycatch-native-run.txt"
+printf 'caught\n33\n33\n' > "$TMP_ROOT/register-cache-trycatch-expected.txt"
+diff -u "$TMP_ROOT/register-cache-trycatch-expected.txt" "$TMP_ROOT/register-cache-trycatch-native-run.txt"
+
+# Inline reference-counting fast path (generate_x86_64_function's own emit_inline_retain/
+# emit_inline_release, src/compiler/fission.cpp): a null check plus one plain (deliberately NOT
+# LOCK-prefixed -- see ArcoValueBox's own comment in native_value_box.hpp on why this runtime's
+# reference counting isn't thread-safe by design) inc/dec instruction, replacing a real
+# out-of-line call to arco_value_retain/arco_value_release for the common case; a real call
+# (arco_value_free_now) only happens on the rare "this was the last reference" path. Real
+# array/object construction, cross-references (`y = x` aliasing the same box), field mutation, and
+# a function returning a freshly built array -- covers retain, release, AND the actually-free path
+# (every temporary and intermediate array/object here does eventually hit refcount zero). Checked
+# under --sanitize specifically: this is exactly the kind of change (raw memory offset arithmetic,
+# a hand-rolled "free when it hits zero" test) ASan is best at catching if the offset or the ZF
+# polarity were ever wrong.
+cat > "$TMP_ROOT/inline-refcount.abas" <<'SCRIPT'
+arr = [1, 2, 3]
+PRINT arr
+PRINT arr[0]
+arr[1] = 99
+PRINT arr
+
+obj = {name: "Zach", age: 5}
+PRINT obj.name
+obj.age = 6
+PRINT obj.age
+
+x = arr
+y = x
+PRINT y[0]
+
+FUNCTION MakeArr(n)
+    RETURN [n, n + 1, n + 2]
+END FUNCTION
+z = MakeArr(10)
+PRINT z
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/inline-refcount.abas" -o "$TMP_ROOT/inline-refcount" --target linux-x86_64 --sanitize > /dev/null
+ASAN_OPTIONS=abort_on_error=1:halt_on_error=1 "$TMP_ROOT/inline-refcount" > "$TMP_ROOT/inline-refcount-native-run.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/inline-refcount.abas" > "$TMP_ROOT/inline-refcount-bytecode-run.txt"
+diff -u "$TMP_ROOT/inline-refcount-bytecode-run.txt" "$TMP_ROOT/inline-refcount-native-run.txt"
+cat > "$TMP_ROOT/inline-refcount-expected.txt" <<'EXPECTED'
+[1, 2, 3]
+1
+[1, 99, 3]
+Zach
+6
+1
+[10, 11, 12]
+EXPECTED
+diff -u "$TMP_ROOT/inline-refcount-expected.txt" "$TMP_ROOT/inline-refcount-native-run.txt"
+
+# The reference-counting offset self-check (generate_x86_64_function's own Main-prologue block,
+# right after arco_runtime_capture_args): ArcoFission's own compile-time-baked-in
+# offsetof(ArcoValueBox, refcount) is verified, once per program run, against the REAL value
+# src/native/runtime_abi.cpp's own arco_value_refcount_offset() computes fresh every time that
+# file is recompiled (which happens on every single native build -- see that file's own comment on
+# why it is NOT a stable prebuilt library). ARCO_TEST_FORCE_BAD_REFCOUNT_SELFCHECK is a build-time
+# (not run-time) escape hatch that perturbs ONLY the self-check's own expected comparison value,
+# never the real kRefcountOffset every actual emit_inline_retain/emit_inline_release call site
+# uses -- so this can never actually corrupt memory, even though the mechanism it exercises (the
+# real call, the real comparison, the real panic) is entirely genuine. Confirms the panic fires
+# with a clear message and a nonzero exit rather than silently proceeding with a wrong offset.
+ARCO_TEST_FORCE_BAD_REFCOUNT_SELFCHECK=1 "$ARCOFISSION" build "$TMP_ROOT/inline-refcount.abas" \
+    -o "$TMP_ROOT/inline-refcount-bad-selfcheck" --target linux-x86_64 > /dev/null
+if "$TMP_ROOT/inline-refcount-bad-selfcheck" > "$TMP_ROOT/bad-selfcheck-run.txt" 2>"$TMP_ROOT/bad-selfcheck-stderr.txt"; then
+    echo "linux-x86_64 backend unexpectedly succeeded with a deliberately-forced refcount offset mismatch" >&2
+    exit 1
+fi
+grep -q "reference-counting offset disagrees" "$TMP_ROOT/bad-selfcheck-stderr.txt"
+
+# Loop-carried Number register pinning (generate_x86_64_function's own LoopCacheInfo pre-pass and
+# prime_for_jump_target, src/compiler/fission.cpp): extends the Number-value register cache above
+# to survive a loop's own back edge, not just straight-line code within one block. A FOR loop
+# whose body contains BOTH a CONTINUE FOR and an EXIT FOR (the exact shape that made an
+# index-based "does the jump target a lower vector-index block" back-edge heuristic misidentify
+# the CONTINUE FOR block itself as a bogus loop header during development -- caught before this
+# ever shipped by comparing `ArcoFission reveal --stage AMIR` output against the real CFG by hand,
+# not by a test failing) -- CONTINUE skips the accumulation on i=3, EXIT stops the loop entirely
+# at i=7, so the real loop header (ForCond0, reached via the genuine back edge from the increment
+# block) must be the only thing treated as pinned.
+cat > "$TMP_ROOT/loop-pin-for.abas" <<'SCRIPT'
+total = 0
+FOR i = 0 TO 10
+    IF i = 3 THEN
+        CONTINUE FOR
+    END IF
+    IF i = 7 THEN
+        EXIT FOR
+    END IF
+    total = total + i
+NEXT
+PRINT total
+PRINT i
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/loop-pin-for.abas" -o "$TMP_ROOT/loop-pin-for" --target linux-x86_64 > /dev/null
+"$TMP_ROOT/loop-pin-for" > "$TMP_ROOT/loop-pin-for-native-run.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/loop-pin-for.abas" > "$TMP_ROOT/loop-pin-for-bytecode-run.txt"
+diff -u "$TMP_ROOT/loop-pin-for-bytecode-run.txt" "$TMP_ROOT/loop-pin-for-native-run.txt"
+printf '18\n7\n' > "$TMP_ROOT/loop-pin-for-expected.txt"
+diff -u "$TMP_ROOT/loop-pin-for-expected.txt" "$TMP_ROOT/loop-pin-for-native-run.txt"
+
+# Nested loops: only the INNERMOST loop's own two names ever get pinned (LoopCacheInfo's own
+# innermost-first, reject-on-overlap selection) -- the outer loop's own accumulator
+# (grandTotal) is deliberately left unpinned here (3 real Number locals are read/written across
+# the two loops combined, one more than the 2 physical slots have room for), so this also
+# exercises the ordinary, non-pinned STORE/LOAD path continuing to work correctly right alongside
+# a pinned inner loop in the very same function.
+cat > "$TMP_ROOT/loop-pin-nested.abas" <<'SCRIPT'
+grandTotal = 0
+FOR i = 1 TO 3
+    innerSum = 0
+    FOR j = 1 TO 4
+        innerSum = innerSum + j
+    NEXT
+    grandTotal = grandTotal + innerSum
+NEXT
+PRINT grandTotal
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/loop-pin-nested.abas" -o "$TMP_ROOT/loop-pin-nested" --target linux-x86_64 > /dev/null
+"$TMP_ROOT/loop-pin-nested" > "$TMP_ROOT/loop-pin-nested-native-run.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/loop-pin-nested.abas" > "$TMP_ROOT/loop-pin-nested-bytecode-run.txt"
+diff -u "$TMP_ROOT/loop-pin-nested-bytecode-run.txt" "$TMP_ROOT/loop-pin-nested-native-run.txt"
+printf '30\n' > "$TMP_ROOT/loop-pin-nested-expected.txt"
+diff -u "$TMP_ROOT/loop-pin-nested-expected.txt" "$TMP_ROOT/loop-pin-nested-native-run.txt"
+
+# A TRY/CATCH inside a loop body is deliberately EXCLUDED from pinning altogether (LoopCacheInfo's
+# own touches_try rejection): the catch handler is reached via a real longjmp, never via any
+# Jump/Branch instruction this function emits, so nothing at that transfer would ever run
+# prime_for_jump_target -- trusting a pinned register there would be unsound. Run for several
+# iterations, some raising (out-of-range index) and some not, to exercise the un-pinned fallback
+# path (full invalidate at every block entry, exactly as before this whole feature existed)
+# repeatedly rather than just once.
+cat > "$TMP_ROOT/loop-pin-trycatch.abas" <<'SCRIPT'
+FUNCTION Pick(arr AS ARRAY, n)
+    RETURN arr[n]
+END FUNCTION
+
+total = 0
+caught = 0
+FOR i = 0 TO 5
+    TRY
+        v = Pick([10, 20, 30], i)
+        total = total + v
+    CATCH e
+        caught = caught + 1
+    END TRY
+NEXT
+PRINT total
+PRINT caught
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/loop-pin-trycatch.abas" -o "$TMP_ROOT/loop-pin-trycatch" --target linux-x86_64 > /dev/null
+"$TMP_ROOT/loop-pin-trycatch" > "$TMP_ROOT/loop-pin-trycatch-native-run.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/loop-pin-trycatch.abas" > "$TMP_ROOT/loop-pin-trycatch-bytecode-run.txt"
+diff -u "$TMP_ROOT/loop-pin-trycatch-bytecode-run.txt" "$TMP_ROOT/loop-pin-trycatch-native-run.txt"
+printf '60\n3\n' > "$TMP_ROOT/loop-pin-trycatch-expected.txt"
+diff -u "$TMP_ROOT/loop-pin-trycatch-expected.txt" "$TMP_ROOT/loop-pin-trycatch-native-run.txt"
+
+# Boxed pointer-value register cache (generate_x86_64_function's own boxed_cache, a one-slot
+# sibling to the Number-value cache above, using Reg::RBP -- see boxed_cache's own comment near
+# slot_of for why RBP specifically and why only one slot, not two): reading the SAME Boxed local
+# (an object, array, or string) twice in a row skips re-reading its plain 8-byte pointer from
+# memory the second time. Checked under --sanitize specifically, same reasoning as the inline
+# reference-counting coverage above: a wrong register or a stale cache entry here would show up as
+# a genuinely different pointer value (a real semantic bug), not just a crash, so this also diffs
+# every value against the bytecode interpreter's own ground truth, not only against ASan.
+cat > "$TMP_ROOT/boxed-cache.abas" <<'SCRIPT'
+obj = {name: "Zach", age: 5}
+PRINT obj.name
+PRINT obj.name
+obj.age = obj.age + 1
+PRINT obj.age
+PRINT obj.age
+
+arr = [1, 2, 3]
+PRINT arr[0]
+PRINT arr[0]
+arr[1] = 99
+PRINT arr
+PRINT arr
+
+x = arr
+y = x
+PRINT y[0]
+PRINT x[0]
+
+s = "hello"
+PRINT s
+PRINT s
+s = s + " world"
+PRINT s
+PRINT s
+
+FUNCTION Make(n)
+    RETURN {value: n}
+END FUNCTION
+z = Make(10)
+PRINT z.value
+PRINT z.value
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/boxed-cache.abas" -o "$TMP_ROOT/boxed-cache" --target linux-x86_64 --sanitize > /dev/null
+ASAN_OPTIONS=abort_on_error=1:halt_on_error=1 "$TMP_ROOT/boxed-cache" > "$TMP_ROOT/boxed-cache-native-run.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/boxed-cache.abas" > "$TMP_ROOT/boxed-cache-bytecode-run.txt"
+diff -u "$TMP_ROOT/boxed-cache-bytecode-run.txt" "$TMP_ROOT/boxed-cache-native-run.txt"
+cat > "$TMP_ROOT/boxed-cache-expected.txt" <<'EXPECTED'
+Zach
+Zach
+6
+6
+1
+1
+[1, 99, 3]
+[1, 99, 3]
+1
+1
+hello
+hello
+hello world
+hello world
+10
+10
+EXPECTED
+diff -u "$TMP_ROOT/boxed-cache-expected.txt" "$TMP_ROOT/boxed-cache-native-run.txt"
+
+# Self-assignment no-op elision (elided_self_copy, generate_x86_64_function's own pre-pass near
+# slot_of): `y = y` always lowers to a real LOAD followed by a real STORE of the same name in
+# AMIR, never a single self-referencing STORE (confirmed with `ArcoFission reveal --stage AMIR`)
+# -- both are detected as a provable no-op (reads a slot, writes the exact same value straight
+# back to it) and emit zero bytes for either instruction, including skipping what would otherwise
+# be a real, wasted retain+release pair for a Boxed value. Checked under --sanitize: eliding an
+# instruction pair that includes a real retain/release is exactly the kind of change ASan is best
+# at catching if the "these always cancel out" reasoning were ever wrong.
+cat > "$TMP_ROOT/self-copy-elision.abas" <<'SCRIPT'
+obj = {name: "Zach"}
+obj = obj
+PRINT obj.name
+
+x = 5
+x = x
+PRINT x
+
+arr = [1, 2, 3]
+arr = arr
+PRINT arr
+
+s = "hi"
+s = s
+PRINT s
+SCRIPT
+"$ARCOFISSION" build "$TMP_ROOT/self-copy-elision.abas" -o "$TMP_ROOT/self-copy-elision" --target linux-x86_64 --sanitize > /dev/null
+ASAN_OPTIONS=abort_on_error=1:halt_on_error=1 "$TMP_ROOT/self-copy-elision" > "$TMP_ROOT/self-copy-elision-native-run.txt"
+"$ARCOFISSION" compile-run "$TMP_ROOT/self-copy-elision.abas" > "$TMP_ROOT/self-copy-elision-bytecode-run.txt"
+diff -u "$TMP_ROOT/self-copy-elision-bytecode-run.txt" "$TMP_ROOT/self-copy-elision-native-run.txt"
+cat > "$TMP_ROOT/self-copy-elision-expected.txt" <<'EXPECTED'
+Zach
+5
+[1, 2, 3]
+hi
+EXPECTED
+diff -u "$TMP_ROOT/self-copy-elision-expected.txt" "$TMP_ROOT/self-copy-elision-native-run.txt"
+
+# Confirms the elision actually fires (not just "is correct if it never triggers"): the annotated
+# debug assembly (--debug) must have NO instruction at all for `obj = obj`'s own LOAD/STORE pair
+# between the object literal's own construction and the very next real statement's own first
+# instruction.
+"$ARCOFISSION" build "$TMP_ROOT/self-copy-elision.abas" -o "$TMP_ROOT/self-copy-elision-debug" \
+    --target linux-x86_64 --debug > /dev/null
+# `obj` is read via a real LOAD exactly once in this whole script (PRINT obj.name) --
+# `obj = obj` itself would be a SECOND "LOAD obj" annotation if the elision failed to fire.
+load_obj_count=$(grep -c 'LOAD obj$' "$TMP_ROOT/self-copy-elision-debug.s")
+if [ "$load_obj_count" -ne 1 ]; then
+    echo "self-assignment elision did not fire: expected exactly 1 real \"LOAD obj\" instruction in the generated assembly, found $load_obj_count" >&2
+    exit 1
+fi

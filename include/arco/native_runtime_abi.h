@@ -23,6 +23,7 @@
 // hosted-number fast path already does, with zero ArcoValue overhead. Boxing is the fallback for the
 // general case, not the default for everything.
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -65,6 +66,16 @@ int arco_value_equals(const ArcoValue* left, const ArcoValue* right);
 // --- Reference counting. ---
 void arco_value_retain(ArcoValue* value);
 void arco_value_release(ArcoValue* value);
+// The real ArcoValueBox layout's own refcount offset, computed fresh every time this ABI's own
+// implementation (src/native/runtime_abi.cpp) is recompiled -- see include/arco/native_value_box.hpp's
+// own comment for why generated code calls this once, at program startup, to verify against the
+// compile-time-baked-in offset the code generator assumed, rather than trusting it blindly.
+size_t arco_value_refcount_offset(void);
+// Unconditionally frees a box, no refcount check -- only ever safe to call after generated code's
+// own inlined fast path has ALREADY confirmed (via a locked decrement) that the refcount just hit
+// zero. Never call this directly on a value whose refcount hasn't just been atomically decremented
+// to zero by the caller.
+void arco_value_free_now(ArcoValue* value);
 
 // --- Introspection. ---
 int arco_value_is_number(const ArcoValue* value);
