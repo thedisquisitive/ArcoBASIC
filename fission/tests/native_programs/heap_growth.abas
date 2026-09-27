@@ -1,0 +1,13 @@
+' Allocates far more than the old fixed 1 MiB .bss arena could hold (about
+' 150 MB of short-lived strings and arrays): every allocation now comes from
+' the ArcoBASIC runtime heap (fission/runtime/heap.abas), which grows in
+' mmap'd chunks.
+total = 0
+i = 0
+WHILE i < 30000
+    s = "chunk-" + "abcdefghijklmnopqrstuvwxyz" + "-" + "0123456789"
+    arr = [i, i + 1, i + 2, i + 3, i + 4, i + 5, i + 6, i + 7]
+    total = total + arr[7] + LEN(s)
+    i = i + 1
+WEND
+PRINT total

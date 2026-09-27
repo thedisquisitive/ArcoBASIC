@@ -1,0 +1,22 @@
+# A character's attack
+strength = 7
+weaponBonus = 3
+damage = strength * 2 + weaponBonus
+show "damage"
+show damage
+
+repeat 2
+  show "swing"
+  repeat 2
+    show -damage + damage % 5 * 10
+  end
+end
+
+if damage > 15
+  show "critical"
+otherwise
+  show "normal"
+end
+if (damage - 17) * 3 = 0
+  show "exactly 17"
+end

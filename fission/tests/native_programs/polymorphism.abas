@@ -90,3 +90,28 @@ MakePet(2)
 pup = Puppy(4)
 PRINT pup.Speak()
 PRINT pup.GetLegs()
+
+' A method only some of the possible classes have: dispatched at run time.
+CLASS Plain
+    CONSTRUCTOR()
+        SELF.Tag = "plain"
+    END CONSTRUCTOR
+END CLASS
+
+CLASS Fancy
+    CONSTRUCTOR()
+        SELF.Tag = "fancy"
+    END CONSTRUCTOR
+    FUNCTION Decorate(text)
+        RETURN "*" + text + "*"
+    END FUNCTION
+END CLASS
+
+FUNCTION Pick(fancy)
+    IF fancy THEN RETURN Fancy()
+    RETURN Plain()
+END FUNCTION
+
+chosen = Pick(TRUE)
+PRINT chosen.Decorate("hi")
+PRINT Pick(FALSE).Tag

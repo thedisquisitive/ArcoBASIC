@@ -1,0 +1,32 @@
+' Array.Join on non-Number/String element kinds, bitwise operators on
+' dynamic values, and Object.Get with no default.
+CLASS Item
+    Name = ""
+END CLASS
+
+FUNCTION Describe(value)
+    RETURN value
+END FUNCTION
+
+switches = [TRUE, FALSE, TRUE]
+PRINT Array.Join(switches, ",")
+ignored = Array.Push(switches, FALSE)
+PRINT switches
+PRINT switches[3] == FALSE
+ratios = [1.5, 2.25]
+PRINT Array.Join(ratios, " | ")
+mixed = [1, "two", 3.5, TRUE]
+PRINT Array.Join(mixed, "/")
+
+left = Describe(12)
+right = Describe(10)
+PRINT left BITAND right
+PRINT left BITOR right
+PRINT left BITXOR right
+PRINT Describe(TRUE) AND Describe(FALSE)
+
+settings = {Mode: "fast"}
+PRINT Object.Get(settings, "Mode")
+missing = Object.Get(settings, "Absent")
+IF missing == NULL THEN PRINT "ABSENT-IS-NULL"
+PRINT String.Slice("fission", 3)

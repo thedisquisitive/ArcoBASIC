@@ -1,0 +1,23 @@
+' A function with early RETURNs that ends without one returns NULL; it must
+' never run on into the next function.
+FUNCTION Classify(n)
+    IF n < 0 THEN
+        PRINT "negative"
+        RETURN
+    END IF
+    IF n == 0 THEN
+        PRINT "zero"
+    ELSE
+        PRINT "positive"
+    END IF
+END FUNCTION
+
+FUNCTION Following(n)
+    PRINT "Next must not run"
+    RETURN n + 1
+END FUNCTION
+
+ignored = Classify(-1)
+ignored = Classify(0)
+ignored = Classify(5)
+PRINT "done"

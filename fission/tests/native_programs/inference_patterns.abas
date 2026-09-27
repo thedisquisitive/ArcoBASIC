@@ -1,0 +1,60 @@
+' Kind-inference shapes taken from the compiler's own source: an empty
+' array filled by a callee, a map field replaced through Object.Set, and
+' lookups keyed by the collected names.
+CLASS Scope
+    CONSTRUCTOR()
+        SELF.Types = {}
+    END CONSTRUCTOR
+
+    FUNCTION Declare(name, typeName)
+        IF typeName != "" THEN SELF.Types = Object.Set(SELF.Types, name, typeName)
+        RETURN SELF
+    END FUNCTION
+
+    FUNCTION TypeOf(name)
+        RETURN Object.Get(SELF.Types, name, "")
+    END FUNCTION
+END CLASS
+
+CLASS Holder
+    CONSTRUCTOR()
+        SELF.Scope = Scope()
+    END CONSTRUCTOR
+END CLASS
+
+FUNCTION DeclareThrough(holder)
+    ' Only ever reached through a field chain (a dynamic method call).
+    ignored = holder.Scope.Declare("via", "Chain")
+    RETURN holder.Scope.TypeOf("via")
+END FUNCTION
+
+FUNCTION CollectNames(words, names, seen)
+    FOR word IN words
+        IF Object.Has(seen, word) == FALSE THEN
+            seen[word] = TRUE
+            ignored = Array.Push(names, word)
+        END IF
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
+FUNCTION Referenced(names, wanted)
+    result = []
+    FOR name IN names
+        IF Object.Has(wanted, name) THEN ignored = Array.Push(result, name)
+    NEXT
+    RETURN result
+END FUNCTION
+
+scope = Scope()
+ignored = scope.Declare("count", "Number")
+ignored = scope.Declare("label", "")
+PRINT scope.TypeOf("count")
+PRINT "[" + scope.TypeOf("label") + "]"
+
+collected = []
+seenWords = {}
+ignored = CollectNames(["b", "a", "b", "c"], collected, seenWords)
+PRINT collected
+PRINT Referenced(collected, {a: TRUE, c: TRUE})
+PRINT DeclareThrough(Holder())

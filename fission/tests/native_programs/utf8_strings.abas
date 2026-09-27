@@ -1,0 +1,12 @@
+' Character-based String.Length/LEN/Slice and byte-based IndexOf/Insert/Delete, as the language does.
+s = "héllo"
+PRINT String.Length(s)
+PRINT LEN(s)
+PRINT String.Slice(s, 1, 2)
+PRINT String.IndexOf(s, "l")
+PRINT String.Contains(s, "é")
+PRINT Upper(s)
+PRINT String.Trim("  é  ") + "|"
+PRINT String.Insert(s, 2, "X")
+PRINT String.Delete(s, 1, 1)
+PRINT LEN(String.ToChars(s))

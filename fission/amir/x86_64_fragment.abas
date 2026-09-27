@@ -87,9 +87,8 @@ CLASS FissionX86_64Buffer
     ' to the full 10-byte REX.W B8+rd io form instead of silently
     ' truncating it.
     FUNCTION EmitU64Full(value)
-        v = value
-        IF v < 0 THEN v = v + 18446744073709551616
-        remaining = v
+        ' A negative value's low bytes already are its two's-complement bytes.
+        remaining = value
         index = 0
         WHILE index < 8
             ignored = SELF.EmitByte(remaining BITAND 255)

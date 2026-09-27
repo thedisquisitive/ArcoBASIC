@@ -1,0 +1,20 @@
+' Script-scope globals: a top-level name referenced inside a FUNCTION is
+' copied in at call time (Runtime.GetGlobal); a write inside the function
+' stays local, and later top-level stores are visible to later calls --
+' the legacy oracle's own semantics.
+counter = 5
+label = "n"
+scale = 1.5
+FUNCTION Bump(by)
+    counter = counter + by
+    RETURN label + String(counter)
+END FUNCTION
+FUNCTION Scaled(x)
+    RETURN x * scale
+END FUNCTION
+PRINT Bump(2)
+PRINT counter
+counter = 40
+label = "m"
+PRINT Bump(2)
+PRINT Scaled(4)

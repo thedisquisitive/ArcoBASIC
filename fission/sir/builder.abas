@@ -332,6 +332,12 @@ CLASS FissionSirBuilder
         RETURN FissionSirNode("Modifier").WithField("Name", name)
     END FUNCTION
 
+    ' Reports a problem in the program being compiled (stops the build).
+    FUNCTION Error(message)
+        ignored = SELF.Module.Diagnostics.ReportError("FISSION_LANGUAGE_ERROR", message)
+        RETURN SELF
+    END FUNCTION
+
     FUNCTION Append(statement)
         ignored = SELF.Module.AppendStatement(statement)
         RETURN statement

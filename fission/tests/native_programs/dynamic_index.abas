@@ -1,0 +1,45 @@
+' An array index whose kind is only known at run time (the lexer's own
+' `index`, sometimes assigned from a map field) must be unboxed before use.
+FUNCTION Skip(position)
+    RETURN {Ahead: position + 2}
+END FUNCTION
+
+chars = String.ToChars("native!")
+index = 0
+out = ""
+WHILE index < LEN(chars)
+    out = out + chars[index]
+    IF chars[index] == "t" THEN
+        index = Skip(index).Ahead
+    ELSE
+        index = index + 1
+    END IF
+WEND
+PRINT out
+slots = [0, 0, 0]
+at = Skip(-1).Ahead
+slots[at] = 7
+PRINT slots
+
+' A parameter receiving arrays of different element kinds is dynamic:
+' FOR EACH, reads and writes index it at run time.
+FUNCTION Describe(items)
+    text = ""
+    FOR item IN items
+        text = text + String(item) + ";"
+    NEXT
+    items[0] = items[LEN(items) - 1]
+    RETURN text + String(items[0])
+END FUNCTION
+
+PRINT Describe(["x", "y"])
+PRINT Describe([1, 2, 3])
+missing = NULL
+names = ["a"]
+names[0] = missing
+PRINT names
+
+' A dynamic value stored into an array of dynamic values stays boxed.
+boxes = [1, "two"]
+boxes[0] = Describe([5])
+PRINT boxes

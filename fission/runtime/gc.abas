@@ -1,0 +1,309 @@
+' The Fission native runtime's heap: allocation plus a conservative
+' mark-and-sweep garbage collector, written with MEMORY.* and integer
+' arithmetic only (nothing here may allocate from the heap itself).
+'
+' Layout. One contiguous address range (16 GiB, reserved without committing
+' memory) split into 64 KiB pages. A small-object page holds slots of one size
+' class (16 bytes .. 32 KiB); a larger object gets a run of whole pages. Side
+' tables (outside the heap) record each page's kind, and a mark bitmap has one
+' bit per 16-byte granule.
+'
+' Collection. Roots are the machine stack, the program's .bss globals (both
+' passed in by FissionRt_GcEnter, a stub every program carries that first
+' pushes the callee-saved registers -- C host-bridge code may hold pointers
+' there) and the class registry. Any word that points into a live object --
+' at its start or anywhere inside, e.g. a string's bytes or an array's data --
+' keeps it alive. Unmarked slots are rebuilt into per-class free lists; empty
+' pages go back to the operating system (madvise). A collection runs once the
+' bytes allocated since the last one exceed max(64 MiB, 2 x live bytes).
+'
+' State page (FissionRt_HeapState) offsets:
+'   16 class registry (classes.abas)      64 region base      72 pages in use
+'   80 page kind table   88 page aux table   96 mark bitmap
+'  104 free page stack  112 free page count  120 bytes since GC  128 threshold
+'  136 mark stack  144 in-GC flag  152 class size table  160 class-of table
+'  168 mark stack depth
+'  256 + 24 * class: free list head, bump cursor, bump limit (40 classes)
+'  2048..2303: FissionRt_ClassOf's cache (classes.abas)
+'  2304: the callable registry array (classes.abas)
+'  2312: the TRY handler chain (dynamic.abas)
+' Page kinds: 0 unused, 1 small (aux = class), 2 large head (aux = pages),
+' 3 large continuation (aux = head page).
+' Requires fission/runtime/heap.abas (imported once by dynamic.abas).
+
+FUNCTION FissionRt_MapNoReserve(rtBytes)
+    ' mmap(..., PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)
+    rtAddress = LINUX.Syscall(9, 0, rtBytes, 3, 16418, -1, 0)
+    IF rtAddress < 0 THEN rtIgnored = FissionRt_OutOfMemory()
+    RETURN rtAddress
+END FUNCTION
+
+FUNCTION FissionRt_OutOfMemory()
+    PRINT "Fission runtime: out of memory"
+    rtIgnored = LINUX.Syscall(231, 70)
+    RETURN 0
+END FUNCTION
+
+FUNCTION FissionRt_GcSetup(rtState)
+    rtIgnored = MEMORY.Write64(rtState + 64, FissionRt_MapNoReserve(17179869184))
+    rtIgnored = MEMORY.Write64(rtState + 72, 0)
+    rtIgnored = MEMORY.Write64(rtState + 80, FissionRt_MapNoReserve(2097152))
+    rtIgnored = MEMORY.Write64(rtState + 88, FissionRt_MapNoReserve(2097152))
+    rtIgnored = MEMORY.Write64(rtState + 96, FissionRt_MapNoReserve(134217728))
+    rtIgnored = MEMORY.Write64(rtState + 104, FissionRt_MapNoReserve(2097152))
+    rtIgnored = MEMORY.Write64(rtState + 112, 0)
+    rtIgnored = MEMORY.Write64(rtState + 120, 0)
+    rtIgnored = MEMORY.Write64(rtState + 128, 67108864)
+    rtIgnored = MEMORY.Write64(rtState + 136, FissionRt_MapNoReserve(2147483648))
+    rtIgnored = MEMORY.Write64(rtState + 144, 0)
+    rtIgnored = MEMORY.Write64(rtState + 168, 0)
+    ' Size classes: 16..128 by 16, then four steps per doubling up to 32 KiB.
+    rtSizes = FissionRt_MapAnonymous(4096)
+    rtIgnored = MEMORY.Write64(rtState + 152, rtSizes)
+    rtCount = 0
+    rtSize = 16
+    WHILE rtSize <= 128
+        rtIgnored = MEMORY.Write64(rtSizes + rtCount * 8, rtSize)
+        rtCount = rtCount + 1
+        rtSize = rtSize + 16
+    WEND
+    rtPower = 128
+    WHILE rtPower < 32768
+        rtQuarter = rtPower SHR 2
+        rtStep = 1
+        WHILE rtStep <= 4
+            rtIgnored = MEMORY.Write64(rtSizes + rtCount * 8, rtPower + rtQuarter * rtStep)
+            rtCount = rtCount + 1
+            rtStep = rtStep + 1
+        WEND
+        rtPower = rtPower * 2
+    WEND
+    ' Class for each size in 16-byte granules (1..2048).
+    rtClassOf = FissionRt_MapAnonymous(20480)
+    rtIgnored = MEMORY.Write64(rtState + 160, rtClassOf)
+    rtClass = 0
+    rtGranules = 1
+    WHILE rtGranules <= 2048
+        WHILE MEMORY.Read64(rtSizes + rtClass * 8) < rtGranules * 16
+            rtClass = rtClass + 1
+        WEND
+        rtIgnored = MEMORY.Write64(rtClassOf + rtGranules * 8, rtClass)
+        rtGranules = rtGranules + 1
+    WEND
+    RETURN 0
+END FUNCTION
+
+' A page index to use: a released one if any, else a fresh one.
+FUNCTION FissionRt_GcTakePage(rtState)
+    rtFreeCount = MEMORY.Read64(rtState + 112)
+    IF rtFreeCount > 0 THEN
+        rtIgnored = MEMORY.Write64(rtState + 112, rtFreeCount - 1)
+        RETURN MEMORY.Read64(MEMORY.Read64(rtState + 104) + (rtFreeCount - 1) * 8)
+    END IF
+    rtPage = MEMORY.Read64(rtState + 72)
+    IF rtPage >= 67108864 THEN rtIgnored = FissionRt_OutOfMemory()
+    rtIgnored = MEMORY.Write64(rtState + 72, rtPage + 1)
+    RETURN rtPage
+END FUNCTION
+
+' Zeroed memory for `rtBytes` bytes, 16-byte aligned.
+FUNCTION FissionRt_Alloc(rtBytes)
+    rtState = FissionRt_HeapState
+    IF MEMORY.Read64(rtState + 64) == 0 THEN rtIgnored = FissionRt_GcSetup(rtState)
+    rtSize = rtBytes
+    IF rtSize < 16 THEN rtSize = 16
+    rtSize = rtSize + (16 - rtSize MOD 16) MOD 16
+    rtSince = MEMORY.Read64(rtState + 120) + rtSize
+    rtIgnored = MEMORY.Write64(rtState + 120, rtSince)
+    IF rtSince > MEMORY.Read64(rtState + 128) ANDALSO MEMORY.Read64(rtState + 144) == 0 THEN rtIgnored = FissionRt_GcEnter()
+    rtBase = MEMORY.Read64(rtState + 64)
+    IF rtSize <= 32768 THEN
+        rtClass = MEMORY.Read64(MEMORY.Read64(rtState + 160) + (rtSize SHR 4) * 8)
+        rtSize = MEMORY.Read64(MEMORY.Read64(rtState + 152) + rtClass * 8)
+        rtSlot = rtState + 256 + rtClass * 24
+        rtHead = MEMORY.Read64(rtSlot)
+        IF rtHead != 0 THEN
+            rtIgnored = MEMORY.Write64(rtSlot, MEMORY.Read64(rtHead))
+            rtWord = 0
+            WHILE rtWord < rtSize
+                rtIgnored = MEMORY.Write64(rtHead + rtWord, 0)
+                rtWord = rtWord + 8
+            WEND
+            RETURN rtHead
+        END IF
+        rtCursor = MEMORY.Read64(rtSlot + 8)
+        IF rtCursor + rtSize > MEMORY.Read64(rtSlot + 16) THEN
+            rtPage = FissionRt_GcTakePage(rtState)
+            rtIgnored = MEMORY.Write64(MEMORY.Read64(rtState + 80) + rtPage * 8, 1)
+            rtIgnored = MEMORY.Write64(MEMORY.Read64(rtState + 88) + rtPage * 8, rtClass)
+            rtCursor = rtBase + (rtPage SHL 16)
+            rtIgnored = MEMORY.Write64(rtSlot + 16, rtCursor + 65536 - 65536 MOD rtSize)
+        END IF
+        rtIgnored = MEMORY.Write64(rtSlot + 8, rtCursor + rtSize)
+        RETURN rtCursor
+    END IF
+    ' A large object: a run of fresh pages.
+    rtPages = (rtSize + 65535) SHR 16
+    rtFirst = MEMORY.Read64(rtState + 72)
+    IF rtFirst + rtPages > 67108864 THEN rtIgnored = FissionRt_OutOfMemory()
+    rtIgnored = MEMORY.Write64(rtState + 72, rtFirst + rtPages)
+    rtIgnored = MEMORY.Write64(MEMORY.Read64(rtState + 80) + rtFirst * 8, 2)
+    rtIgnored = MEMORY.Write64(MEMORY.Read64(rtState + 88) + rtFirst * 8, rtPages)
+    rtIndex = 1
+    WHILE rtIndex < rtPages
+        rtIgnored = MEMORY.Write64(MEMORY.Read64(rtState + 80) + (rtFirst + rtIndex) * 8, 3)
+        rtIgnored = MEMORY.Write64(MEMORY.Read64(rtState + 88) + (rtFirst + rtIndex) * 8, rtFirst)
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtBase + (rtFirst SHL 16)
+END FUNCTION
+
+' Marks the object `rtWord` points into (if any) and queues it for scanning.
+FUNCTION FissionRt_GcMark(rtState, rtWord)
+    rtBase = MEMORY.Read64(rtState + 64)
+    IF rtWord < rtBase THEN RETURN 0
+    rtPage = (rtWord - rtBase) SHR 16
+    IF rtPage >= MEMORY.Read64(rtState + 72) THEN RETURN 0
+    rtKind = MEMORY.Read64(MEMORY.Read64(rtState + 80) + rtPage * 8)
+    IF rtKind == 0 THEN RETURN 0
+    IF rtKind == 3 THEN
+        rtPage = MEMORY.Read64(MEMORY.Read64(rtState + 88) + rtPage * 8)
+        rtKind = 2
+    END IF
+    rtPageAddress = rtBase + (rtPage SHL 16)
+    rtStart = rtPageAddress
+    IF rtKind == 1 THEN
+        rtSize = MEMORY.Read64(MEMORY.Read64(rtState + 152) + MEMORY.Read64(MEMORY.Read64(rtState + 88) + rtPage * 8) * 8)
+        rtOffset = rtWord - rtPageAddress
+        IF rtOffset >= 65536 - 65536 MOD rtSize THEN RETURN 0
+        rtStart = rtPageAddress + rtOffset - rtOffset MOD rtSize
+    END IF
+    rtGranule = (rtStart - rtPageAddress) SHR 4
+    rtMarkByte = MEMORY.Read64(rtState + 96) + rtPage * 512 + (rtGranule SHR 3)
+    rtBit = 1 SHL (rtGranule BITAND 7)
+    rtByte = MEMORY.Read8(rtMarkByte)
+    IF (rtByte BITAND rtBit) != 0 THEN RETURN 0
+    rtIgnored = MEMORY.Write8(rtMarkByte, rtByte BITOR rtBit)
+    rtDepth = MEMORY.Read64(rtState + 168)
+    IF rtDepth >= 268435456 THEN rtIgnored = FissionRt_OutOfMemory()
+    rtIgnored = MEMORY.Write64(MEMORY.Read64(rtState + 136) + rtDepth * 8, rtStart)
+    rtIgnored = MEMORY.Write64(rtState + 168, rtDepth + 1)
+    RETURN 1
+END FUNCTION
+
+FUNCTION FissionRt_GcScanRange(rtState, rtLow, rtHigh)
+    rtAddress = rtLow - rtLow MOD 8
+    rtHeapLow = MEMORY.Read64(rtState + 64)
+    rtHeapHigh = rtHeapLow + (MEMORY.Read64(rtState + 72) SHL 16)
+    WHILE rtAddress + 8 <= rtHigh
+        rtWord = MEMORY.Read64(rtAddress)
+        IF rtWord >= rtHeapLow ANDALSO rtWord < rtHeapHigh THEN rtIgnored = FissionRt_GcMark(rtState, rtWord)
+        rtAddress = rtAddress + 8
+    WEND
+    RETURN 0
+END FUNCTION
+
+' Size in bytes of the object starting at `rtStart`.
+FUNCTION FissionRt_GcObjectSize(rtState, rtStart)
+    rtPage = (rtStart - MEMORY.Read64(rtState + 64)) SHR 16
+    IF MEMORY.Read64(MEMORY.Read64(rtState + 80) + rtPage * 8) == 1 THEN RETURN MEMORY.Read64(MEMORY.Read64(rtState + 152) + MEMORY.Read64(MEMORY.Read64(rtState + 88) + rtPage * 8) * 8)
+    RETURN MEMORY.Read64(MEMORY.Read64(rtState + 88) + rtPage * 8) SHL 16
+END FUNCTION
+
+FUNCTION FissionRt_GcReleasePage(rtState, rtPage)
+    rtIgnored = LINUX.Syscall(28, MEMORY.Read64(rtState + 64) + (rtPage SHL 16), 65536, 4)
+    rtIgnored = MEMORY.Write64(MEMORY.Read64(rtState + 80) + rtPage * 8, 0)
+    rtFreeCount = MEMORY.Read64(rtState + 112)
+    rtIgnored = MEMORY.Write64(MEMORY.Read64(rtState + 104) + rtFreeCount * 8, rtPage)
+    rtIgnored = MEMORY.Write64(rtState + 112, rtFreeCount + 1)
+    RETURN 0
+END FUNCTION
+
+' Called (through FissionRt_GcEnter) with the machine stack range and the
+' program's .bss range.
+FUNCTION FissionRt_GcCollect(rtStackLow, rtStackHigh, rtBssStart, rtBssEnd)
+    rtState = FissionRt_HeapState
+    rtIgnored = MEMORY.Write64(rtState + 144, 1)
+    rtPages = MEMORY.Read64(rtState + 72)
+    rtMarks = MEMORY.Read64(rtState + 96)
+    ' Fresh (zeroed) mark bits.
+    rtIgnored = LINUX.Syscall(28, rtMarks, ((rtPages * 512 + 4095) SHR 12) SHL 12, 4)
+    rtIgnored = MEMORY.Write64(rtState + 168, 0)
+    ' Roots.
+    rtIgnored = FissionRt_GcScanRange(rtState, rtStackLow, rtStackHigh)
+    rtIgnored = FissionRt_GcScanRange(rtState, rtBssStart, rtBssEnd)
+    rtIgnored = FissionRt_GcMark(rtState, MEMORY.Read64(rtState + 16))
+    rtIgnored = FissionRt_GcMark(rtState, MEMORY.Read64(rtState + 2304))
+    rtIgnored = FissionRt_GcMark(rtState, MEMORY.Read64(rtState + 2312))
+    ' Transitive marking.
+    WHILE MEMORY.Read64(rtState + 168) > 0
+        rtDepth = MEMORY.Read64(rtState + 168) - 1
+        rtIgnored = MEMORY.Write64(rtState + 168, rtDepth)
+        rtObject = MEMORY.Read64(MEMORY.Read64(rtState + 136) + rtDepth * 8)
+        rtIgnored = FissionRt_GcScanRange(rtState, rtObject, rtObject + FissionRt_GcObjectSize(rtState, rtObject))
+    WEND
+    ' Sweep: free lists are rebuilt from scratch; bump pages are retired.
+    rtClass = 0
+    WHILE rtClass < 40
+        rtIgnored = MEMORY.Write64(rtState + 256 + rtClass * 24, 0)
+        rtIgnored = MEMORY.Write64(rtState + 256 + rtClass * 24 + 8, 0)
+        rtIgnored = MEMORY.Write64(rtState + 256 + rtClass * 24 + 16, 0)
+        rtClass = rtClass + 1
+    WEND
+    rtBase = MEMORY.Read64(rtState + 64)
+    rtKinds = MEMORY.Read64(rtState + 80)
+    rtAux = MEMORY.Read64(rtState + 88)
+    rtSizes = MEMORY.Read64(rtState + 152)
+    rtLive = 0
+    rtPage = 0
+    WHILE rtPage < rtPages
+        rtKind = MEMORY.Read64(rtKinds + rtPage * 8)
+        rtPageMarks = rtMarks + rtPage * 512
+        IF rtKind == 1 THEN
+            rtAnyMarked = 0
+            rtWord = 0
+            WHILE rtWord < 512 ANDALSO rtAnyMarked == 0
+                IF MEMORY.Read64(rtPageMarks + rtWord) != 0 THEN rtAnyMarked = 1
+                rtWord = rtWord + 8
+            WEND
+            IF rtAnyMarked == 0 THEN
+                rtIgnored = FissionRt_GcReleasePage(rtState, rtPage)
+            ELSE
+                rtClass = MEMORY.Read64(rtAux + rtPage * 8)
+                rtSize = MEMORY.Read64(rtSizes + rtClass * 8)
+                rtHeadSlot = rtState + 256 + rtClass * 24
+                rtPageAddress = rtBase + (rtPage SHL 16)
+                rtOffset = 0
+                WHILE rtOffset + rtSize <= 65536
+                    rtGranule = rtOffset SHR 4
+                    IF (MEMORY.Read8(rtPageMarks + (rtGranule SHR 3)) BITAND (1 SHL (rtGranule BITAND 7))) != 0 THEN
+                        rtLive = rtLive + rtSize
+                    ELSE
+                        rtIgnored = MEMORY.Write64(rtPageAddress + rtOffset, MEMORY.Read64(rtHeadSlot))
+                        rtIgnored = MEMORY.Write64(rtHeadSlot, rtPageAddress + rtOffset)
+                    END IF
+                    rtOffset = rtOffset + rtSize
+                WEND
+            END IF
+        END IF
+        IF rtKind == 2 THEN
+            rtRun = MEMORY.Read64(rtAux + rtPage * 8)
+            IF (MEMORY.Read8(rtPageMarks) BITAND 1) != 0 THEN
+                rtLive = rtLive + (rtRun SHL 16)
+            ELSE
+                rtIndex = 0
+                WHILE rtIndex < rtRun
+                    rtIgnored = FissionRt_GcReleasePage(rtState, rtPage + rtIndex)
+                    rtIndex = rtIndex + 1
+                WEND
+            END IF
+        END IF
+        rtPage = rtPage + 1
+    WEND
+    rtThreshold = rtLive * 2
+    IF rtThreshold < 67108864 THEN rtThreshold = 67108864
+    rtIgnored = MEMORY.Write64(rtState + 128, rtThreshold)
+    rtIgnored = MEMORY.Write64(rtState + 120, 0)
+    rtIgnored = MEMORY.Write64(rtState + 144, 0)
+    RETURN 0
+END FUNCTION

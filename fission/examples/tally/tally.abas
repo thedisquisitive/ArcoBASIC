@@ -1,0 +1,196 @@
+' Tally: a small example language, written the way any Fission language is --
+' ordinary ArcoBASIC that turns program text into SIR with the builder. It
+' contains nothing about bytecode, x86-64, ELF or any other target: every
+' installed Fission target works for it unchanged.
+'
+'   say EXPRESSION          print a value
+'   let NAME = EXPRESSION   set a variable
+'   repeat EXPRESSION       run the lines up to `end` that many times
+'   if EXPRESSION           run the lines up to `else`/`end` when true
+'   # ...                   a comment
+'
+' Expressions: numbers, "text", names, + - * / %, = <> < <= > >=, ( ).
+#IMPORT "fission/core/fission.abas"
+
+' Splits a line into tokens: numbers, names, "strings", and symbols.
+FUNCTION Tally_Tokens(line)
+    chars = String.ToChars(line)
+    tokens = []
+    index = 0
+    WHILE index < LEN(chars)
+        ch = chars[index]
+        IF ch == " " ORELSE ch == "\t" THEN
+            index = index + 1
+            CONTINUE WHILE
+        END IF
+        IF ch == "\"" THEN
+            text = ""
+            index = index + 1
+            WHILE index < LEN(chars) ANDALSO chars[index] != "\""
+                text = text + chars[index]
+                index = index + 1
+            WEND
+            ignored = Array.Push(tokens, {Kind: "String", Text: text})
+            index = index + 1
+            CONTINUE WHILE
+        END IF
+        IF String.Contains("0123456789", ch) THEN
+            text = ""
+            WHILE index < LEN(chars) ANDALSO String.Contains("0123456789", chars[index])
+                text = text + chars[index]
+                index = index + 1
+            WEND
+            ignored = Array.Push(tokens, {Kind: "Number", Text: text})
+            CONTINUE WHILE
+        END IF
+        IF String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_", ch) THEN
+            text = ""
+            WHILE index < LEN(chars) ANDALSO String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789", chars[index])
+                text = text + chars[index]
+                index = index + 1
+            WEND
+            ignored = Array.Push(tokens, {Kind: "Name", Text: text})
+            CONTINUE WHILE
+        END IF
+        IF index + 1 < LEN(chars) ANDALSO (ch + chars[index + 1] == "<=" ORELSE ch + chars[index + 1] == ">=" ORELSE ch + chars[index + 1] == "<>") THEN
+            ignored = Array.Push(tokens, {Kind: "Symbol", Text: ch + chars[index + 1]})
+            index = index + 2
+            CONTINUE WHILE
+        END IF
+        ignored = Array.Push(tokens, {Kind: "Symbol", Text: ch})
+        index = index + 1
+    WEND
+    RETURN tokens
+END FUNCTION
+
+' Expression parsing over a line's tokens, lowest precedence first.
+CLASS TallyExpression
+    CONSTRUCTOR(tokens, start, builder)
+        SELF.Tokens = tokens
+        SELF.Position = start
+        SELF.Builder = builder
+    END CONSTRUCTOR
+
+    FUNCTION Peek()
+        IF SELF.Position >= LEN(SELF.Tokens) THEN RETURN ""
+        RETURN SELF.Tokens[SELF.Position].Text
+    END FUNCTION
+
+    FUNCTION Comparison()
+        left = SELF.Sum()
+        op = SELF.Peek()
+        IF op == "=" ORELSE op == "<>" ORELSE op == "<" ORELSE op == "<=" ORELSE op == ">" ORELSE op == ">=" THEN
+            SELF.Position = SELF.Position + 1
+            IF op == "=" THEN op = "=="
+            IF op == "<>" THEN op = "!="
+            RETURN SELF.Builder.Binary(op, left, SELF.Sum())
+        END IF
+        RETURN left
+    END FUNCTION
+
+    FUNCTION Sum()
+        left = SELF.Product()
+        WHILE SELF.Peek() == "+" ORELSE SELF.Peek() == "-"
+            op = SELF.Peek()
+            SELF.Position = SELF.Position + 1
+            left = SELF.Builder.Binary(op, left, SELF.Product())
+        WEND
+        RETURN left
+    END FUNCTION
+
+    FUNCTION Product()
+        left = SELF.Atom()
+        WHILE SELF.Peek() == "*" ORELSE SELF.Peek() == "/" ORELSE SELF.Peek() == "%"
+            op = SELF.Peek()
+            SELF.Position = SELF.Position + 1
+            IF op == "%" THEN op = "MOD"
+            left = SELF.Builder.Binary(op, left, SELF.Atom())
+        WEND
+        RETURN left
+    END FUNCTION
+
+    FUNCTION Atom()
+        IF SELF.Position >= LEN(SELF.Tokens) THEN
+            ignored = SELF.Builder.Error("expected a value")
+            RETURN SELF.Builder.Literal("0")
+        END IF
+        token = SELF.Tokens[SELF.Position]
+        SELF.Position = SELF.Position + 1
+        IF token.Kind == "Number" THEN RETURN SELF.Builder.Literal(token.Text)
+        IF token.Kind == "String" THEN RETURN SELF.Builder.LiteralTyped(token.Text, "String")
+        IF token.Kind == "Name" THEN RETURN SELF.Builder.Variable(token.Text)
+        IF token.Text == "(" THEN
+            inner = SELF.Comparison()
+            IF SELF.Peek() == ")" THEN SELF.Position = SELF.Position + 1
+            RETURN inner
+        END IF
+        ignored = SELF.Builder.Error("unexpected " + token.Text)
+        RETURN SELF.Builder.Literal("0")
+    END FUNCTION
+END CLASS
+
+FUNCTION Tally_Expression(tokens, start, builder)
+    RETURN TallyExpression(tokens, start, builder).Comparison()
+END FUNCTION
+
+' The statements from `lines[state.Line]` up to (not including) an `end` or
+' `else`; state.Line is left on that line.
+FUNCTION Tally_Block(lines, state, builder)
+    statements = []
+    WHILE state.Line < LEN(lines)
+        tokens = Tally_Tokens(lines[state.Line])
+        IF LEN(tokens) == 0 ORELSE tokens[0].Text == "#" THEN
+            state.Line = state.Line + 1
+            CONTINUE WHILE
+        END IF
+        word = tokens[0].Text
+        IF word == "end" ORELSE word == "else" THEN RETURN statements
+        state.Line = state.Line + 1
+        IF word == "say" THEN
+            ignored = Array.Push(statements, builder.PrintValue(Tally_Expression(tokens, 1, builder)))
+        ELSE
+            IF word == "let" ANDALSO LEN(tokens) >= 3 ANDALSO tokens[2].Text == "=" THEN
+                ignored = Array.Push(statements, builder.AssignValue(tokens[1].Text, Tally_Expression(tokens, 3, builder)))
+            ELSE
+                IF word == "repeat" THEN
+                    state.Count = state.Count + 1
+                    counter = "__tally_repeat" + String(state.Count)
+                    body = Tally_Block(lines, state, builder)
+                    state.Line = state.Line + 1
+                    ignored = Array.Push(statements, builder.ForRangeLoop(counter, builder.Literal("1"), Tally_Expression(tokens, 1, builder), builder.Literal("1"), body))
+                ELSE
+                    IF word == "if" THEN
+                        condition = Tally_Expression(tokens, 1, builder)
+                        thenBody = Tally_Block(lines, state, builder)
+                        elseBody = []
+                        IF state.Line < LEN(lines) ANDALSO Tally_Tokens(lines[state.Line])[0].Text == "else" THEN
+                            state.Line = state.Line + 1
+                            elseBody = Tally_Block(lines, state, builder)
+                        END IF
+                        state.Line = state.Line + 1
+                        ignored = Array.Push(statements, builder.Conditional(condition, thenBody, elseBody))
+                    ELSE
+                        ignored = builder.Error("line " + String(state.Line) + ": unknown statement " + word)
+                    END IF
+                END IF
+            END IF
+        END IF
+    WEND
+    RETURN statements
+END FUNCTION
+
+' The language's compile function: program text in, SIR out.
+FUNCTION Tally_Compile(source, builder)
+    state = {Line: 0, Count: 0}
+    FOR statement IN Tally_Block(String.Split(source, "\n"), state, builder)
+        ignored = builder.Append(statement)
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
+' Registers Tally (files ending in .tally) with a Fission host.
+FUNCTION Tally_Register(host)
+    tally = host.LanguageKit().BeginnerCompiledLanguage("tally", ".tally")
+    ignored = tally.SourceToSir(ADDRESSOF Tally_Compile)
+    RETURN host.Register(tally)
+END FUNCTION

@@ -1,0 +1,14 @@
+# A Tally program.
+say "Counting down"
+let n = 5
+repeat n
+  say n
+  let n = n - 1
+end
+let total = (3 + 4) * 2
+if total > 10
+  say "big: " + total
+else
+  say "small"
+end
+say 17 % 5

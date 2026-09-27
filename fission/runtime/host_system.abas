@@ -1,0 +1,496 @@
+' Host functions for files, directories, time, the environment, random
+' numbers (PCG32) and number formatting, in ArcoBASIC (formerly C in
+' fission/native_runtime/host_bridge.c). Linux system calls go through
+' LINUX.Syscall; strings are NUL-terminated so they can be passed as paths.
+' Functions taking or returning a double (format, fmod, Random.Float) work on
+' its raw bits: every program carries arco_host_format_double/arco_host_fmod/
+' arco_host_random_float shims that move the value between %xmm registers
+' and these functions.
+
+' --- Files and directories
+FUNCTION arco_host_file_exists(rtPath)
+    IF LINUX.Syscall(21, rtPath, 0) == 0 THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+' st_mode of the path, or -1 when it cannot be stat'ed.
+FUNCTION FissionRt_StatMode(rtPath)
+    rtBuffer = FissionRt_Alloc(144)
+    IF LINUX.Syscall(4, rtPath, rtBuffer) != 0 THEN RETURN -1
+    RETURN MEMORY.Read32(rtBuffer + 24)
+END FUNCTION
+
+FUNCTION arco_host_directory_exists(rtPath)
+    rtMode = FissionRt_StatMode(rtPath)
+    IF rtMode >= 0 ANDALSO (rtMode BITAND 61440) == 16384 THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+' Reads up to `rtSize` bytes from `rtFd` into `rtBuffer`; returns the count.
+FUNCTION FissionRt_ReadAll(rtFd, rtBuffer, rtSize)
+    rtTotal = 0
+    WHILE rtTotal < rtSize
+        rtRead = LINUX.Syscall(0, rtFd, rtBuffer + rtTotal, rtSize - rtTotal)
+        IF rtRead <= 0 THEN RETURN rtTotal
+        rtTotal = rtTotal + rtRead
+    WEND
+    RETURN rtTotal
+END FUNCTION
+
+' The file's size (and position back at its start), or -1.
+FUNCTION FissionRt_FileSize(rtFd)
+    rtSize = LINUX.Syscall(8, rtFd, 0, 2)
+    rtIgnored = LINUX.Syscall(8, rtFd, 0, 0)
+    IF rtSize < 0 THEN RETURN 0
+    RETURN rtSize
+END FUNCTION
+
+FUNCTION arco_host_file_read_text(rtPath)
+    rtFd = LINUX.Syscall(2, rtPath, 0, 0)
+    IF rtFd < 0 THEN RETURN FissionRt_StrNew(0)
+    rtSize = FissionRt_FileSize(rtFd)
+    rtResult = FissionRt_StrNew(rtSize)
+    rtRead = FissionRt_ReadAll(rtFd, rtResult, rtSize)
+    IF rtRead < rtSize THEN
+        rtIgnored = MEMORY.Write64(rtResult - 8, rtRead)
+        rtIgnored = MEMORY.Write8(rtResult + rtRead, 0)
+    END IF
+    rtIgnored = LINUX.Syscall(3, rtFd)
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION FissionRt_WriteAll(rtPath, rtBuffer, rtLength, rtFlags)
+    rtFd = LINUX.Syscall(2, rtPath, rtFlags, 420)
+    IF rtFd < 0 THEN RETURN 0
+    rtWritten = 0
+    WHILE rtWritten < rtLength
+        rtCount = LINUX.Syscall(1, rtFd, rtBuffer + rtWritten, rtLength - rtWritten)
+        IF rtCount <= 0 THEN
+            rtIgnored = LINUX.Syscall(3, rtFd)
+            RETURN 0
+        END IF
+        rtWritten = rtWritten + rtCount
+    WEND
+    rtIgnored = LINUX.Syscall(3, rtFd)
+    RETURN 1
+END FUNCTION
+
+' O_WRONLY|O_CREAT|O_TRUNC = 577, O_WRONLY|O_CREAT|O_APPEND = 1089; mode 0644.
+FUNCTION arco_host_file_write_text(rtPath, rtText)
+    RETURN FissionRt_WriteAll(rtPath, rtText, FissionRt_StrLen(rtText), 577)
+END FUNCTION
+
+FUNCTION arco_host_file_append_text(rtPath, rtText)
+    RETURN FissionRt_WriteAll(rtPath, rtText, FissionRt_StrLen(rtText), 1089)
+END FUNCTION
+
+FUNCTION arco_host_file_read_bytes(rtPath)
+    rtFd = LINUX.Syscall(2, rtPath, 0, 0)
+    IF rtFd < 0 THEN RETURN FissionRt_NewArray(0)
+    rtSize = FissionRt_FileSize(rtFd)
+    rtBuffer = FissionRt_StrNew(rtSize)
+    rtIgnored = FissionRt_ReadAll(rtFd, rtBuffer, rtSize)
+    rtIgnored = LINUX.Syscall(3, rtFd)
+    rtResult = FissionRt_NewArray(rtSize)
+    rtData = FissionRt_ArrayData(rtResult)
+    rtIndex = 0
+    WHILE rtIndex < rtSize
+        rtIgnored = MEMORY.Write64(rtData + rtIndex * 8, MEMORY.Read8(rtBuffer + rtIndex))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_file_write_bytes(rtPath, rtArray)
+    rtCount = MEMORY.Read64(rtArray)
+    rtData = FissionRt_ArrayData(rtArray)
+    rtBuffer = FissionRt_StrNew(rtCount)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write8(rtBuffer + rtIndex, MEMORY.Read64(rtData + rtIndex * 8) BITAND 255)
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN FissionRt_WriteAll(rtPath, rtBuffer, rtCount, 577)
+END FUNCTION
+
+FUNCTION arco_host_file_set_executable(rtPath)
+    rtMode = FissionRt_StatMode(rtPath)
+    IF rtMode < 0 THEN RETURN 0
+    IF LINUX.Syscall(90, rtPath, rtMode BITOR 73) == 0 THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+' Creates each missing directory along the path (mode 0755).
+FUNCTION arco_host_directory_create(rtPath)
+    rtLength = FissionRt_StrLen(rtPath)
+    IF rtLength == 0 THEN RETURN 0
+    rtBuffer = FissionRt_SubString(rtPath, 0, rtLength)
+    rtIndex = 1
+    WHILE rtIndex <= rtLength
+        IF rtIndex == rtLength ORELSE MEMORY.Read8(rtBuffer + rtIndex) == 47 THEN
+            rtSaved = MEMORY.Read8(rtBuffer + rtIndex)
+            rtIgnored = MEMORY.Write8(rtBuffer + rtIndex, 0)
+            rtIgnored = LINUX.Syscall(83, rtBuffer, 493)
+            rtIgnored = MEMORY.Write8(rtBuffer + rtIndex, rtSaved)
+        END IF
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN arco_host_directory_exists(rtPath)
+END FUNCTION
+
+' --- Time
+FUNCTION arco_host_time_timestamp()
+    rtBuffer = FissionRt_Alloc(16)
+    rtIgnored = LINUX.Syscall(228, 0, rtBuffer)
+    RETURN MEMORY.Read64(rtBuffer)
+END FUNCTION
+
+FUNCTION arco_host_sleep(rtMilliseconds)
+    IF rtMilliseconds > 0 THEN
+        rtBuffer = FissionRt_Alloc(16)
+        rtIgnored = MEMORY.Write64(rtBuffer, FISSION.Quotient(rtMilliseconds, 1000))
+        rtIgnored = MEMORY.Write64(rtBuffer + 8, (rtMilliseconds MOD 1000) * 1000000)
+        rtIgnored = LINUX.Syscall(35, rtBuffer, 0)
+    END IF
+    RETURN 1
+END FUNCTION
+
+' --- Environment (envp: the process's NULL-terminated array of "NAME=value")
+FUNCTION FissionRt_GetEnv(rtEnvp, rtName)
+    rtNameLength = FissionRt_StrLen(rtName)
+    rtCursor = rtEnvp
+    WHILE MEMORY.Read64(rtCursor) != 0
+        rtEntry = MEMORY.Read64(rtCursor)
+        rtIndex = 0
+        WHILE rtIndex < rtNameLength ANDALSO MEMORY.Read8(rtEntry + rtIndex) == MEMORY.Read8(rtName + rtIndex)
+            rtIndex = rtIndex + 1
+        WEND
+        IF rtIndex == rtNameLength ANDALSO MEMORY.Read8(rtEntry + rtIndex) == 61 THEN RETURN FissionRt_StrFromC(rtEntry + rtIndex + 1)
+        rtCursor = rtCursor + 8
+    WEND
+    RETURN FissionRt_StrNew(0)
+END FUNCTION
+
+FUNCTION arco_host_path_home(rtEnvp)
+    RETURN FissionRt_GetEnv(rtEnvp, FISSION.Bits("HOME"))
+END FUNCTION
+
+FUNCTION arco_host_process_env(rtEnvp, rtName)
+    RETURN FissionRt_GetEnv(rtEnvp, rtName)
+END FUNCTION
+
+' --- Random numbers: PCG32 (O'Neill), state record {state, increment}.
+FUNCTION FissionRt_Pcg32Next(rtHandle)
+    rtOld = MEMORY.Read64(rtHandle)
+    ' The multiplier 6364136223846793005 is assembled from 32-bit halves: a
+    ' literal above 2^53 would lose bits in a compiler hosted on doubles.
+    rtMultiplier = (1481765933 SHL 32) BITOR 1284865837
+    rtIgnored = MEMORY.Write64(rtHandle, rtOld * rtMultiplier + MEMORY.Read64(rtHandle + 8))
+    rtXorShifted = FissionRt_ShiftRightLogical(FissionRt_ShiftRightLogical(rtOld, 18) BITXOR rtOld, 27) BITAND 4294967295
+    rtRotation = FissionRt_ShiftRightLogical(rtOld, 59)
+    RETURN ((rtXorShifted SHR rtRotation) BITOR (rtXorShifted SHL ((32 - rtRotation) BITAND 31))) BITAND 4294967295
+END FUNCTION
+
+FUNCTION FissionRt_Pcg32Reseed(rtHandle, rtSeed)
+    rtIgnored = MEMORY.Write64(rtHandle, 0)
+    rtIgnored = MEMORY.Write64(rtHandle + 8, (54 SHL 1) BITOR 1)
+    rtIgnored = FissionRt_Pcg32Next(rtHandle)
+    rtIgnored = MEMORY.Write64(rtHandle, MEMORY.Read64(rtHandle) + rtSeed)
+    rtIgnored = FissionRt_Pcg32Next(rtHandle)
+    RETURN 0
+END FUNCTION
+
+' Uniform in [0, bound) without bias (bound up to 2^32).
+FUNCTION FissionRt_Pcg32Bounded(rtHandle, rtBound)
+    IF rtBound == 4294967296 THEN RETURN FissionRt_Pcg32Next(rtHandle)
+    rtWidth = rtBound BITAND 4294967295
+    rtThreshold = (4294967296 - rtWidth) MOD rtWidth
+    WHILE TRUE
+        rtValue = FissionRt_Pcg32Next(rtHandle)
+        IF rtValue >= rtThreshold THEN RETURN rtValue MOD rtWidth
+    WEND
+    RETURN 0
+END FUNCTION
+
+FUNCTION arco_host_random_create(rtSeed)
+    rtHandle = FissionRt_Alloc(16)
+    rtIgnored = FissionRt_Pcg32Reseed(rtHandle, rtSeed)
+    RETURN rtHandle
+END FUNCTION
+
+FUNCTION arco_host_random_clone(rtHandle)
+    rtCopy = FissionRt_Alloc(16)
+    rtIgnored = MEMORY.Write64(rtCopy, MEMORY.Read64(rtHandle))
+    rtIgnored = MEMORY.Write64(rtCopy + 8, MEMORY.Read64(rtHandle + 8))
+    RETURN rtCopy
+END FUNCTION
+
+FUNCTION arco_host_random_destroy(rtHandle)
+    RETURN 1
+END FUNCTION
+
+FUNCTION arco_host_random_reseed(rtHandle, rtSeed)
+    rtIgnored = FissionRt_Pcg32Reseed(rtHandle, rtSeed)
+    RETURN 1
+END FUNCTION
+
+FUNCTION arco_host_random_integer(rtMinimum, rtMaximum, rtHandle)
+    RETURN rtMinimum + FissionRt_Pcg32Bounded(rtHandle, rtMaximum - rtMinimum + 1)
+END FUNCTION
+
+FUNCTION arco_host_random_choice(rtArray, rtHandle)
+    RETURN MEMORY.Read64(FissionRt_ArrayData(rtArray) + FissionRt_Pcg32Bounded(rtHandle, MEMORY.Read64(rtArray)) * 8)
+END FUNCTION
+
+FUNCTION arco_host_random_shuffle(rtArray, rtHandle)
+    rtCount = MEMORY.Read64(rtArray)
+    rtResult = FissionRt_NewArray(rtCount)
+    rtData = FissionRt_ArrayData(rtResult)
+    rtIgnored = FissionRt_CopyBytes(rtData, FissionRt_ArrayData(rtArray), rtCount * 8)
+    rtRemaining = rtCount
+    WHILE rtRemaining > 1
+        rtSelected = FissionRt_Pcg32Bounded(rtHandle, rtRemaining)
+        rtSwap = MEMORY.Read64(rtData + (rtRemaining - 1) * 8)
+        rtIgnored = MEMORY.Write64(rtData + (rtRemaining - 1) * 8, MEMORY.Read64(rtData + rtSelected * 8))
+        rtIgnored = MEMORY.Write64(rtData + rtSelected * 8, rtSwap)
+        rtRemaining = rtRemaining - 1
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_random_sample(rtArray, rtCount, rtHandle)
+    rtTotal = MEMORY.Read64(rtArray)
+    rtWork = FissionRt_Alloc(rtTotal * 8 + 8)
+    rtIgnored = FissionRt_CopyBytes(rtWork, FissionRt_ArrayData(rtArray), rtTotal * 8)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtSelected = rtIndex + FissionRt_Pcg32Bounded(rtHandle, rtTotal - rtIndex)
+        rtSwap = MEMORY.Read64(rtWork + rtIndex * 8)
+        rtIgnored = MEMORY.Write64(rtWork + rtIndex * 8, MEMORY.Read64(rtWork + rtSelected * 8))
+        rtIgnored = MEMORY.Write64(rtWork + rtSelected * 8, rtSwap)
+        rtIndex = rtIndex + 1
+    WEND
+    rtResult = FissionRt_NewArray(rtCount)
+    rtIgnored = FissionRt_CopyBytes(FissionRt_ArrayData(rtResult), rtWork, rtCount * 8)
+    RETURN rtResult
+END FUNCTION
+
+' Uniform in [0, 1) with 53 random bits; returns the double's bits.
+FUNCTION FissionRt_RandomFloat(rtHandle)
+    rtHigh = FissionRt_Pcg32Next(rtHandle) SHR 5
+    rtLow = FissionRt_Pcg32Next(rtHandle) SHR 6
+    rtValue = (rtHigh * 67108864.0 + rtLow * 1.0) / 9007199254740992.0
+    RETURN FISSION.Bits(rtValue)
+END FUNCTION
+
+' --- Doubles (raw bits in and out)
+' x with its fraction dropped (x already whole beyond 2^52).
+FUNCTION FissionRt_TruncFloat(rtBits)
+    rtValue = FISSION.AsFloat(rtBits)
+    IF rtValue >= 4503599627370496.0 ORELSE rtValue <= -4503599627370496.0 THEN RETURN rtBits
+    RETURN FISSION.Bits((rtValue BITOR 0) * 1.0)
+END FUNCTION
+
+' a - trunc(a / b) * b, like C's fmod for finite values.
+FUNCTION FissionRt_FMod(rtABits, rtBBits)
+    rtA = FISSION.AsFloat(rtABits)
+    rtB = FISSION.AsFloat(rtBBits)
+    rtQuotient = FISSION.AsFloat(FissionRt_TruncFloat(FISSION.Bits(rtA / rtB)))
+    RETURN FISSION.Bits(rtA - rtQuotient * rtB)
+END FUNCTION
+
+' The language's rendering of a double: integral values below 2^63 as
+' integers, otherwise six significant digits (trailing zeros dropped), in
+' scientific form ("1.5e+07") when the exponent is below -4 or at least 6.
+FUNCTION FissionRt_FormatDouble(rtBits)
+    rtValue = FISSION.AsFloat(rtBits)
+    rtNegative = 0
+    IF rtValue < 0.0 THEN rtNegative = 1
+    rtV = rtValue
+    IF rtNegative == 1 THEN rtV = 0.0 - rtValue
+    rtOut = FissionRt_StrNew(64)
+    rtPosition = 0
+    IF rtV < 9223372036854775808.0 ANDALSO (rtV BITOR 0) * 1.0 == rtV THEN
+        IF rtNegative == 1 THEN
+            rtIgnored = MEMORY.Write8(rtOut, 45)
+            rtPosition = 1
+        END IF
+        rtDigits = arco_host_number_to_string(rtV BITOR 0)
+        rtIgnored = FissionRt_CopyBytes(rtOut + rtPosition, rtDigits, FissionRt_StrLen(rtDigits))
+        RETURN FissionRt_SubString(rtOut, 0, rtPosition + FissionRt_StrLen(rtDigits))
+    END IF
+    ' Powers 10^(2^i), i = 0..8, by repeated squaring.
+    rtPowers = FissionRt_Alloc(72)
+    rtIgnored = MEMORY.Write64(rtPowers, FISSION.Bits(10.0))
+    rtIndex = 1
+    WHILE rtIndex < 9
+        rtPrevious = FISSION.AsFloat(MEMORY.Read64(rtPowers + (rtIndex - 1) * 8))
+        rtIgnored = MEMORY.Write64(rtPowers + rtIndex * 8, FISSION.Bits(rtPrevious * rtPrevious))
+        rtIndex = rtIndex + 1
+    WEND
+    rtExponent = 0
+    rtIndex = 8
+    WHILE rtIndex >= 0
+        rtPower = FISSION.AsFloat(MEMORY.Read64(rtPowers + rtIndex * 8))
+        WHILE rtV >= rtPower
+            rtV = rtV / rtPower
+            rtExponent = rtExponent + (1 SHL rtIndex)
+        WEND
+        rtIndex = rtIndex - 1
+    WEND
+    rtIndex = 8
+    WHILE rtIndex >= 0 ANDALSO rtV > 0.0
+        rtPower = FISSION.AsFloat(MEMORY.Read64(rtPowers + rtIndex * 8))
+        WHILE rtV < 1.0 ANDALSO rtV * rtPower < 10.0
+            rtV = rtV * rtPower
+            rtExponent = rtExponent - (1 SHL rtIndex)
+        WEND
+        rtIndex = rtIndex - 1
+    WEND
+    ' Six significant digits, rounded half to even.
+    rtScaled = rtV * (FISSION.AsFloat(MEMORY.Read64(rtPowers + 16)) * 10.0)
+    rtWhole = rtScaled BITOR 0
+    rtFraction = rtScaled - rtWhole * 1.0
+    IF rtFraction > 0.5 ORELSE (rtFraction == 0.5 ANDALSO (rtWhole MOD 2) == 1) THEN rtWhole = rtWhole + 1
+    IF rtWhole >= 1000000 THEN
+        rtWhole = FISSION.Quotient(rtWhole, 10)
+        rtExponent = rtExponent + 1
+    END IF
+    IF rtWhole < 100000 THEN
+        rtWhole = rtWhole * 10
+        rtExponent = rtExponent - 1
+    END IF
+    rtDigitText = arco_host_number_to_string(rtWhole)
+    IF rtNegative == 1 THEN
+        rtIgnored = MEMORY.Write8(rtOut, 45)
+        rtPosition = 1
+    END IF
+    IF rtExponent < -4 ORELSE rtExponent >= 6 THEN
+        rtIgnored = MEMORY.Write8(rtOut + rtPosition, MEMORY.Read8(rtDigitText))
+        rtPosition = rtPosition + 1
+        rtEnd = FissionRt_DigitsEnd(rtDigitText, 1)
+        IF rtEnd > 1 THEN
+            rtIgnored = MEMORY.Write8(rtOut + rtPosition, 46)
+            rtIgnored = FissionRt_CopyBytes(rtOut + rtPosition + 1, rtDigitText + 1, rtEnd - 1)
+            rtPosition = rtPosition + rtEnd
+        END IF
+        rtIgnored = MEMORY.Write8(rtOut + rtPosition, 101)
+        rtE = rtExponent
+        IF rtE < 0 THEN
+            rtIgnored = MEMORY.Write8(rtOut + rtPosition + 1, 45)
+            rtE = 0 - rtE
+        ELSE
+            rtIgnored = MEMORY.Write8(rtOut + rtPosition + 1, 43)
+        END IF
+        rtPosition = rtPosition + 2
+        IF rtE < 10 THEN
+            rtIgnored = MEMORY.Write8(rtOut + rtPosition, 48)
+            rtPosition = rtPosition + 1
+        END IF
+        rtExponentText = arco_host_number_to_string(rtE)
+        rtIgnored = FissionRt_CopyBytes(rtOut + rtPosition, rtExponentText, FissionRt_StrLen(rtExponentText))
+        rtPosition = rtPosition + FissionRt_StrLen(rtExponentText)
+        RETURN FissionRt_SubString(rtOut, 0, rtPosition)
+    END IF
+    IF rtExponent >= 0 THEN
+        rtIntDigits = rtExponent + 1
+        rtIgnored = FissionRt_CopyBytes(rtOut + rtPosition, rtDigitText, rtIntDigits)
+        rtPosition = rtPosition + rtIntDigits
+        rtEnd = FissionRt_DigitsEnd(rtDigitText, rtIntDigits)
+        IF rtEnd > rtIntDigits THEN
+            rtIgnored = MEMORY.Write8(rtOut + rtPosition, 46)
+            rtIgnored = FissionRt_CopyBytes(rtOut + rtPosition + 1, rtDigitText + rtIntDigits, rtEnd - rtIntDigits)
+            rtPosition = rtPosition + 1 + rtEnd - rtIntDigits
+        END IF
+        RETURN FissionRt_SubString(rtOut, 0, rtPosition)
+    END IF
+    rtIgnored = MEMORY.Write8(rtOut + rtPosition, 48)
+    rtPosition = rtPosition + 1
+    rtEnd = FissionRt_DigitsEnd(rtDigitText, 0)
+    IF rtEnd > 0 THEN
+        rtIgnored = MEMORY.Write8(rtOut + rtPosition, 46)
+        rtPosition = rtPosition + 1
+        rtZeros = 0 - rtExponent - 1
+        WHILE rtZeros > 0
+            rtIgnored = MEMORY.Write8(rtOut + rtPosition, 48)
+            rtPosition = rtPosition + 1
+            rtZeros = rtZeros - 1
+        WEND
+        rtIgnored = FissionRt_CopyBytes(rtOut + rtPosition, rtDigitText, rtEnd)
+        rtPosition = rtPosition + rtEnd
+    END IF
+    RETURN FissionRt_SubString(rtOut, 0, rtPosition)
+END FUNCTION
+
+' Length of the six-digit text once trailing zeros past `rtKeep` are dropped.
+FUNCTION FissionRt_DigitsEnd(rtDigitText, rtKeep)
+    rtEnd = 6
+    WHILE rtEnd > rtKeep ANDALSO MEMORY.Read8(rtDigitText + rtEnd - 1) == 48
+        rtEnd = rtEnd - 1
+    WEND
+    RETURN rtEnd
+END FUNCTION
+
+' --- Processes
+' Process.Run(command): runs `/bin/sh -c command` with stdout and stderr
+' captured together; the result map is {Ok, Output (one trailing newline
+' dropped), ExitCode (-1 when not a normal exit), Error}.
+FUNCTION FissionRt_ProcessRun(rtEnvp, rtCommand)
+    rtPipe = FissionRt_Alloc(16)
+    IF LINUX.Syscall(22, rtPipe) != 0 THEN RETURN FissionRt_ProcessResult(0, FissionRt_StrNew(0), -1, FISSION.Bits("could not start command"))
+    rtReadFd = MEMORY.Read32(rtPipe)
+    rtWriteFd = MEMORY.Read32(rtPipe + 4)
+    rtArgv = FissionRt_Alloc(32)
+    rtIgnored = MEMORY.Write64(rtArgv, FISSION.Bits("/bin/sh"))
+    rtIgnored = MEMORY.Write64(rtArgv + 8, FISSION.Bits("-c"))
+    rtIgnored = MEMORY.Write64(rtArgv + 16, rtCommand)
+    rtIgnored = MEMORY.Write64(rtArgv + 24, 0)
+    rtPid = LINUX.Syscall(57)
+    IF rtPid == 0 THEN
+        ' The child: output into the pipe, then become the shell.
+        rtIgnored = LINUX.Syscall(33, rtWriteFd, 1)
+        rtIgnored = LINUX.Syscall(33, rtWriteFd, 2)
+        rtIgnored = LINUX.Syscall(3, rtReadFd)
+        rtIgnored = LINUX.Syscall(3, rtWriteFd)
+        rtIgnored = LINUX.Syscall(59, FISSION.Bits("/bin/sh"), rtArgv, rtEnvp)
+        rtIgnored = LINUX.Syscall(231, 127)
+    END IF
+    rtIgnored = LINUX.Syscall(3, rtWriteFd)
+    IF rtPid < 0 THEN
+        rtIgnored = LINUX.Syscall(3, rtReadFd)
+        RETURN FissionRt_ProcessResult(0, FissionRt_StrNew(0), -1, FISSION.Bits("could not start command"))
+    END IF
+    rtCapacity = 4096
+    rtBuffer = FissionRt_StrNew(rtCapacity)
+    rtLength = 0
+    WHILE TRUE
+        IF rtLength == rtCapacity THEN
+            rtBigger = FissionRt_StrNew(rtCapacity * 2)
+            rtIgnored = FissionRt_CopyBytes(rtBigger, rtBuffer, rtLength)
+            rtBuffer = rtBigger
+            rtCapacity = rtCapacity * 2
+        END IF
+        rtRead = LINUX.Syscall(0, rtReadFd, rtBuffer + rtLength, rtCapacity - rtLength)
+        IF rtRead <= 0 THEN EXIT WHILE
+        rtLength = rtLength + rtRead
+    WEND
+    rtIgnored = LINUX.Syscall(3, rtReadFd)
+    rtStatus = FissionRt_Alloc(16)
+    rtIgnored = LINUX.Syscall(61, rtPid, rtStatus, 0, 0)
+    rtRaw = MEMORY.Read32(rtStatus)
+    rtCode = -1
+    IF (rtRaw BITAND 127) == 0 THEN rtCode = (rtRaw SHR 8) BITAND 255
+    IF rtLength > 0 ANDALSO MEMORY.Read8(rtBuffer + rtLength - 1) == 10 THEN rtLength = rtLength - 1
+    rtOk = 0
+    IF rtCode == 0 THEN rtOk = 1
+    RETURN FissionRt_ProcessResult(rtOk, FissionRt_SubString(rtBuffer, 0, rtLength), rtCode, FissionRt_StrNew(0))
+END FUNCTION
+
+FUNCTION FissionRt_ProcessResult(rtOk, rtOutput, rtCode, rtError)
+    rtResult = FissionRt_MapNew()
+    rtIgnored = FissionRt_MapSet(rtResult, FISSION.Bits("Ok"), FissionRt_Box(3, rtOk, 0))
+    rtIgnored = FissionRt_MapSet(rtResult, FISSION.Bits("Output"), FissionRt_Box(4, rtOutput, 0))
+    rtIgnored = FissionRt_MapSet(rtResult, FISSION.Bits("ExitCode"), FissionRt_Box(1, rtCode, 0))
+    rtIgnored = FissionRt_MapSet(rtResult, FISSION.Bits("Error"), FissionRt_Box(4, rtError, 0))
+    RETURN rtResult
+END FUNCTION

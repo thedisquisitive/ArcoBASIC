@@ -1,0 +1,55 @@
+' An array filled by a callee (an "out" parameter) whose element values
+' arrive dynamically -- the caller must read back what the callee stored.
+CLASS Thing
+    CONSTRUCTOR(n)
+        SELF.N = n
+    END CONSTRUCTOR
+
+    FUNCTION Show()
+        RETURN "thing " + String(SELF.N)
+    END FUNCTION
+END CLASS
+
+FUNCTION Collect(body, result)
+    IF result == NULL THEN RETURN body
+    IF TYPEOF(result) == "Array" THEN
+        FOR item IN result
+            ignored = Array.Push(body, item)
+        NEXT
+        RETURN body
+    END IF
+    ignored = Array.Push(body, result)
+    RETURN body
+END FUNCTION
+
+FUNCTION Make(n)
+    RETURN Thing(n)
+END FUNCTION
+
+maker = ADDRESSOF Make
+body = []
+ignored = Collect(body, maker(1))
+ignored = Collect(body, [Thing(2), Thing(3)])
+ignored = Collect(body, NULL)
+PRINT LEN(body)
+PRINT body[0].Show()
+PRINT body[2].Show()
+FOR item IN body
+    PRINT item.N
+NEXT
+
+' The same through a dynamic handler, with the array built in a function.
+FUNCTION Gather(handler)
+    statements = []
+    ignored = Collect(statements, handler(4))
+    ignored = Collect(statements, handler(5))
+    RETURN statements
+END FUNCTION
+
+holder = {Body: []}
+ignored = Collect(holder.Body, maker(6))
+PRINT LEN(holder.Body)
+
+FOR item IN Gather(maker)
+    PRINT item.Show()
+NEXT

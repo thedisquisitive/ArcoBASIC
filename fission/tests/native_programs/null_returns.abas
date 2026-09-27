@@ -1,0 +1,49 @@
+' A function whose last RETURN is NULL still returns objects from its other
+' RETURNs; callers must see (and pass on) the object, not NULL.
+CLASS Node
+    CONSTRUCTOR(label)
+        SELF.Label = label
+    END CONSTRUCTOR
+END CLASS
+
+CLASS Holder
+    CONSTRUCTOR()
+        SELF.Items = []
+    END CONSTRUCTOR
+    FUNCTION Keep(item)
+        ignored = Array.Push(SELF.Items, item)
+        RETURN SELF
+    END FUNCTION
+END CLASS
+
+CLASS Wrapper
+    CONSTRUCTOR()
+        SELF.Inner = Holder()
+    END CONSTRUCTOR
+END CLASS
+
+FUNCTION MakeNode(text)
+    IF text == "a" THEN RETURN Node("first")
+    IF text == "b" THEN RETURN Node("second")
+    RETURN NULL
+END FUNCTION
+
+w = Wrapper()
+FOR t IN ["a", "x", "b"]
+    n = MakeNode(t)
+    IF n != NULL THEN ignored = w.Inner.Keep(n)
+NEXT
+FOR item IN w.Inner.Items
+    PRINT item.Label
+NEXT
+
+' A NULL held in an object-typed variable passed to a dynamic parameter is
+' still NULL there.
+FUNCTION Describe(value)
+    IF value != NULL THEN RETURN "value"
+    RETURN "null"
+END FUNCTION
+
+maybe = MakeNode("zzz")
+PRINT Describe(maybe)
+PRINT Describe(1)

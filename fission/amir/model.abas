@@ -141,6 +141,7 @@ CLASS FissionAmirInstruction
         IF SELF.Kind == "DeclareFunction" THEN RETURN "DECLARE_FUNCTION " + SELF.Field("Name") + " params=" + SELF.Field("Params") + " returns=" + SELF.Field("Returns")
         IF SELF.Kind == "DeclareClass" THEN RETURN "DECLARE_CLASS " + SELF.Field("Name")
         IF SELF.Kind == "Array" THEN RETURN destPart + "ARRAY" + Fission_AmirCallArgsSuffix(SELF.Field("Items"))
+        IF SELF.Kind == "Copy" THEN RETURN destPart + "COPY " + SELF.Field("Value")
         IF SELF.Kind == "Index" THEN RETURN destPart + "INDEX " + SELF.Field("Base") + ", " + SELF.Field("Index")
         IF SELF.Kind == "StoreIndex" THEN RETURN "STORE_INDEX " + SELF.Field("Name") + " " + SELF.Field("Index") + " " + SELF.Field("Value")
         IF SELF.Kind == "Object" THEN RETURN destPart + "OBJECT" + Fission_AmirCallArgsSuffix(SELF.Field("Fields"))

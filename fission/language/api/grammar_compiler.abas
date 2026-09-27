@@ -1,0 +1,326 @@
+' The Level 1 language construction API for languages with real syntax: a
+' language declared with Language.Statement / Language.Block / Language.On
+' (fission/language/api/language.abas) needs no lexer and no parser of its
+' own. Statements are one per line and are described by patterns:
+'
+'   Statement("Set", "{Target:name} = {Value}")
+'   Statement("Show", "show {Value}")
+'   Block("Repeat", "repeat {Count}", "end")      lines up to `end` are the body
+'   Alternative("When", "otherwise")              an else part for a block
+'
+' In a pattern, {Field} is an expression and {Field:name} a plain name;
+' everything else must appear literally. Patterns are tried in the order they
+' were declared, and the first that matches the whole line wins.
+'
+' Fission tokenizes the line (numbers, "text", names, symbols), parses the
+' expressions -- numbers, text, names, ( ), unary minus, and the declared
+' Infix operators (by default + - * / %, = <> < <= > >=) -- and calls the
+' statement's handler:
+'
+'   handler(node, builder)
+'
+' node.<Field> holds each captured part (a SIR value for an expression, a
+' String for a name), node.Body and node.ElseBody the SIR statements of a
+' block, node.Line the line number, and node.Id a number unique in the
+' program (handy for naming hidden variables). The handler returns one SIR
+' statement, an array of them, or NULL.
+#IMPORT "fission/sir/builder.abas"
+#IMPORT "fission/language/api/symbol_compiler.abas"
+
+FUNCTION Fission_GrammarDefaultOperators()
+    operators = []
+    ignored = Array.Push(operators, {Symbol: "=", Precedence: 1, Operator: "=="})
+    ignored = Array.Push(operators, {Symbol: "==", Precedence: 1, Operator: "=="})
+    ignored = Array.Push(operators, {Symbol: "<>", Precedence: 1, Operator: "!="})
+    ignored = Array.Push(operators, {Symbol: "!=", Precedence: 1, Operator: "!="})
+    ignored = Array.Push(operators, {Symbol: "<", Precedence: 1, Operator: "<"})
+    ignored = Array.Push(operators, {Symbol: "<=", Precedence: 1, Operator: "<="})
+    ignored = Array.Push(operators, {Symbol: ">", Precedence: 1, Operator: ">"})
+    ignored = Array.Push(operators, {Symbol: ">=", Precedence: 1, Operator: ">="})
+    ignored = Array.Push(operators, {Symbol: "+", Precedence: 2, Operator: "+"})
+    ignored = Array.Push(operators, {Symbol: "-", Precedence: 2, Operator: "-"})
+    ignored = Array.Push(operators, {Symbol: "*", Precedence: 3, Operator: "*"})
+    ignored = Array.Push(operators, {Symbol: "/", Precedence: 3, Operator: "/"})
+    ignored = Array.Push(operators, {Symbol: "%", Precedence: 3, Operator: "MOD"})
+    RETURN operators
+END FUNCTION
+
+FUNCTION Fission_GrammarIsDigit(ch)
+    RETURN String.Contains("0123456789", ch)
+END FUNCTION
+
+FUNCTION Fission_GrammarIsNameStart(ch)
+    RETURN String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_", ch)
+END FUNCTION
+
+FUNCTION Fission_GrammarIsNamePart(ch)
+    RETURN Fission_GrammarIsNameStart(ch) ORELSE Fission_GrammarIsDigit(ch)
+END FUNCTION
+
+' True when the text `word` starts at chars[index].
+FUNCTION Fission_GrammarStartsAt(chars, index, word)
+    IF word == "" ORELSE index + LEN(word) > LEN(chars) THEN RETURN FALSE
+    offset = 0
+    WHILE offset < LEN(word)
+        IF chars[index + offset] != String.Slice(word, offset, 1) THEN RETURN FALSE
+        offset = offset + 1
+    WEND
+    RETURN TRUE
+END FUNCTION
+
+' Splits one line into tokens {Kind: Number|String|Name|Symbol|Field, Text}.
+' `symbols` are the multi-character symbols to keep whole (longest first
+' wins); a comment prefix ends the line. With `placeholders`, {Field} and
+' {Field:name} become Field tokens (Text = field, Name = TRUE for :name).
+FUNCTION Fission_GrammarTokens(line, symbols, comments, placeholders)
+    chars = String.ToChars(line)
+    tokens = []
+    index = 0
+    WHILE index < LEN(chars)
+        ch = chars[index]
+        IF ch == " " ORELSE ch == "\t" ORELSE ch == "\r" THEN
+            index = index + 1
+            CONTINUE WHILE
+        END IF
+        commented = FALSE
+        FOR prefix IN comments
+            IF Fission_GrammarStartsAt(chars, index, prefix) THEN commented = TRUE
+        NEXT
+        IF commented THEN RETURN tokens
+        IF placeholders ANDALSO ch == "{" THEN
+            text = ""
+            index = index + 1
+            WHILE index < LEN(chars) ANDALSO chars[index] != "}"
+                text = text + chars[index]
+                index = index + 1
+            WEND
+            index = index + 1
+            isName = FALSE
+            IF String.EndsWith(text, ":name") THEN
+                isName = TRUE
+                text = String.Slice(text, 0, LEN(text) - 5)
+            END IF
+            ignored = Array.Push(tokens, {Kind: "Field", Text: text, Name: isName})
+            CONTINUE WHILE
+        END IF
+        IF ch == "\"" THEN
+            text = ""
+            index = index + 1
+            WHILE index < LEN(chars) ANDALSO chars[index] != "\""
+                text = text + chars[index]
+                index = index + 1
+            WEND
+            index = index + 1
+            ignored = Array.Push(tokens, {Kind: "String", Text: text, Name: FALSE})
+            CONTINUE WHILE
+        END IF
+        IF Fission_GrammarIsDigit(ch) THEN
+            text = ""
+            WHILE index < LEN(chars) ANDALSO (Fission_GrammarIsDigit(chars[index]) ORELSE chars[index] == ".")
+                text = text + chars[index]
+                index = index + 1
+            WEND
+            ignored = Array.Push(tokens, {Kind: "Number", Text: text, Name: FALSE})
+            CONTINUE WHILE
+        END IF
+        IF Fission_GrammarIsNameStart(ch) THEN
+            text = ""
+            WHILE index < LEN(chars) ANDALSO Fission_GrammarIsNamePart(chars[index])
+                text = text + chars[index]
+                index = index + 1
+            WEND
+            ignored = Array.Push(tokens, {Kind: "Name", Text: text, Name: FALSE})
+            CONTINUE WHILE
+        END IF
+        best = ch
+        FOR symbol IN symbols
+            IF LEN(symbol) > LEN(best) ANDALSO Fission_GrammarStartsAt(chars, index, symbol) THEN best = symbol
+        NEXT
+        ignored = Array.Push(tokens, {Kind: "Symbol", Text: best, Name: FALSE})
+        index = index + LEN(best)
+    WEND
+    RETURN tokens
+END FUNCTION
+
+' Expression parsing over one line's tokens. A failed parse returns NULL
+' (the caller then tries the next pattern) instead of reporting an error.
+CLASS FissionGrammarExpression
+    CONSTRUCTOR(tokens, position, operators, builder)
+        SELF.Tokens = tokens
+        SELF.Position = position
+        SELF.Operators = operators
+        SELF.Builder = builder
+    END CONSTRUCTOR
+
+    FUNCTION Peek()
+        IF SELF.Position >= LEN(SELF.Tokens) THEN RETURN NULL
+        RETURN SELF.Tokens[SELF.Position]
+    END FUNCTION
+
+    FUNCTION InfixAt()
+        token = SELF.Peek()
+        IF token == NULL THEN RETURN NULL
+        IF token.Kind != "Symbol" ANDALSO token.Kind != "Name" THEN RETURN NULL
+        FOR operator IN SELF.Operators
+            IF operator.Symbol == token.Text THEN RETURN operator
+        NEXT
+        RETURN NULL
+    END FUNCTION
+
+    FUNCTION Parse(minimum)
+        left = SELF.Atom()
+        IF left == NULL THEN RETURN NULL
+        WHILE TRUE
+            operator = SELF.InfixAt()
+            IF operator == NULL THEN RETURN left
+            IF operator.Precedence < minimum THEN RETURN left
+            SELF.Position = SELF.Position + 1
+            right = SELF.Parse(operator.Precedence + 1)
+            IF right == NULL THEN RETURN NULL
+            left = SELF.Builder.Binary(operator.Operator, left, right)
+        WEND
+        RETURN left
+    END FUNCTION
+
+    FUNCTION Atom()
+        token = SELF.Peek()
+        IF token == NULL THEN RETURN NULL
+        SELF.Position = SELF.Position + 1
+        IF token.Kind == "Number" THEN RETURN SELF.Builder.Literal(token.Text)
+        IF token.Kind == "String" THEN RETURN SELF.Builder.LiteralTyped(token.Text, "String")
+        IF token.Kind == "Name" THEN RETURN SELF.Builder.Variable(token.Text)
+        IF token.Text == "-" THEN
+            inner = SELF.Atom()
+            IF inner == NULL THEN RETURN NULL
+            RETURN SELF.Builder.Binary("-", SELF.Builder.Literal("0"), inner)
+        END IF
+        IF token.Text == "(" THEN
+            inner = SELF.Parse(0)
+            IF inner == NULL THEN RETURN NULL
+            closing = SELF.Peek()
+            IF closing == NULL THEN RETURN NULL
+            IF closing.Text != ")" THEN RETURN NULL
+            SELF.Position = SELF.Position + 1
+            RETURN inner
+        END IF
+        RETURN NULL
+    END FUNCTION
+END CLASS
+
+' Matches a line against one compiled pattern; returns the node with the
+' captured fields, or NULL.
+FUNCTION Fission_GrammarMatch(pattern, tokens, operators, builder)
+    node = {Semantic: pattern.Name}
+    position = 0
+    FOR part IN pattern.Parts
+        IF position >= LEN(tokens) THEN RETURN NULL
+        IF part.Kind == "Field" THEN
+            IF part.Name THEN
+                IF tokens[position].Kind != "Name" THEN RETURN NULL
+                node = Object.Set(node, part.Text, tokens[position].Text)
+                position = position + 1
+            ELSE
+                parser = FissionGrammarExpression(tokens, position, operators, builder)
+                value = parser.Parse(0)
+                IF value == NULL THEN RETURN NULL
+                node = Object.Set(node, part.Text, value)
+                position = parser.Position
+            END IF
+        ELSE
+            IF tokens[position].Text != part.Text THEN RETURN NULL
+            position = position + 1
+        END IF
+    NEXT
+    IF position != LEN(tokens) THEN RETURN NULL
+    RETURN node
+END FUNCTION
+
+' True when the line is exactly one of the given words.
+FUNCTION Fission_GrammarIsWord(tokens, words)
+    IF LEN(tokens) != 1 THEN RETURN FALSE
+    RETURN Fission_ListContains(words, tokens[0].Text)
+END FUNCTION
+
+' The statements from state.Line up to a line that is one of `stops`; leaves
+' state.Line on that line and state.Stop set to it ("" at the end of input).
+FUNCTION Fission_GrammarBlock(grammar, lines, state, builder, stops)
+    statements = []
+    state.Stop = ""
+    WHILE state.Line < LEN(lines)
+        tokens = Fission_GrammarTokens(lines[state.Line], grammar.Symbols, grammar.Comments, FALSE)
+        IF LEN(tokens) == 0 THEN
+            state.Line = state.Line + 1
+            CONTINUE WHILE
+        END IF
+        IF Fission_GrammarIsWord(tokens, stops) THEN
+            state.Stop = tokens[0].Text
+            RETURN statements
+        END IF
+        lineNumber = state.Line + 1
+        state.Line = state.Line + 1
+        matched = NULL
+        FOR pattern IN grammar.Patterns
+            IF matched == NULL THEN
+                node = Fission_GrammarMatch(pattern, tokens, grammar.Operators, builder)
+                IF node != NULL THEN
+                    matched = pattern
+                    state.Count = state.Count + 1
+                    node = Object.Set(node, "Line", lineNumber)
+                    node = Object.Set(node, "Id", state.Count)
+                    node = Object.Set(node, "Body", [])
+                    node = Object.Set(node, "ElseBody", [])
+                    IF pattern.End != "" THEN
+                        inner = [pattern.End]
+                        IF pattern.Else != "" THEN ignored = Array.Push(inner, pattern.Else)
+                        node = Object.Set(node, "Body", Fission_GrammarBlock(grammar, lines, state, builder, inner))
+                        IF state.Stop == pattern.Else ANDALSO pattern.Else != "" THEN
+                            state.Line = state.Line + 1
+                            node = Object.Set(node, "ElseBody", Fission_GrammarBlock(grammar, lines, state, builder, [pattern.End]))
+                        END IF
+                        IF state.Stop != pattern.End THEN
+                            ignored = builder.Error("line " + String(lineNumber) + ": " + pattern.Name + " is never closed with " + pattern.End)
+                            RETURN statements
+                        END IF
+                        state.Line = state.Line + 1
+                    END IF
+                    ignored = Fission_SymbolApply(grammar, node, builder, statements)
+                END IF
+            END IF
+        NEXT
+        IF matched == NULL THEN ignored = builder.Error("line " + String(lineNumber) + ": not a statement of this language: " + String.Trim(lines[lineNumber - 1]))
+    WEND
+    RETURN statements
+END FUNCTION
+
+' Compiles a pattern text into {Name, Parts, End, Else}.
+FUNCTION Fission_GrammarPattern(name, text, endWord, elseWord, symbols)
+    RETURN {Name: name, Parts: Fission_GrammarTokens(text, symbols, [], TRUE), End: endWord, Else: elseWord}
+END FUNCTION
+
+FUNCTION Fission_RunGrammarLanguage(language, artifact)
+    builder = FissionSirBuilder(artifact.Name)
+    operators = language.Operators
+    IF LEN(operators) == 0 THEN operators = Fission_GrammarDefaultOperators()
+    symbols = []
+    FOR operator IN operators
+        ignored = Array.Push(symbols, operator.Symbol)
+    NEXT
+    FOR statement IN language.Statements
+        FOR part IN Fission_GrammarTokens(statement.Pattern, [], [], TRUE)
+            IF part.Kind == "Symbol" THEN ignored = Array.Push(symbols, part.Text)
+        NEXT
+    NEXT
+    patterns = []
+    FOR statement IN language.Statements
+        ignored = Array.Push(patterns, Fission_GrammarPattern(statement.Name, statement.Pattern, statement.End, statement.Else, symbols))
+    NEXT
+    grammar = {Symbols: symbols, Comments: language.Comments, Operators: operators, Patterns: patterns, SemanticHandlers: language.SemanticHandlers}
+    state = {Line: 0, Count: 0, Stop: ""}
+    lines = String.Split(artifact.Value, "\n")
+    body = Fission_GrammarBlock(grammar, lines, state, builder, [])
+    IF state.Line < LEN(lines) THEN ignored = builder.Error("line " + String(state.Line + 1) + ": " + state.Stop + " without a block to close")
+    FOR statement IN body
+        ignored = builder.Append(statement)
+    NEXT
+    RETURN FissionArtifact("SIR", artifact.Name, builder.Build())
+END FUNCTION

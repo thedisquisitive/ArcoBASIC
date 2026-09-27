@@ -1,0 +1,28 @@
+' Array element kinds learned from what arrays receive: an empty array filled
+' with objects by Array.Push, a mixed literal (Any elements, boxed), an array
+' pushed values of two kinds, and index writes -- must match the oracle.
+CLASS Item
+    CONSTRUCTOR(name)
+        SELF.Name = name
+    END CONSTRUCTOR
+END CLASS
+items = []
+ignored = Array.Push(items, Item("a"))
+ignored = Array.Push(items, Item("b"))
+PRINT LEN(items)
+FOR it IN items
+    PRINT it.Name
+NEXT
+mixed = [1, "two", 3.5, TRUE]
+PRINT mixed
+PRINT mixed[1]
+mixed[0] = "one"
+PRINT mixed
+bag = []
+ignored = Array.Push(bag, 5)
+ignored = Array.Push(bag, "five")
+PRINT bag
+PRINT LEN(bag)
+names = []
+ignored = Array.Push(names, "x")
+PRINT names

@@ -1,0 +1,20 @@
+' String(...) and PRINT on class instances, arrays, maps and NULL render the
+' way the language renders them.
+CLASS Point
+    X = 1
+    Label = "origin"
+END CLASS
+
+CLASS Point3 EXTENDS Point
+    Z = 3
+END CLASS
+
+p = Point()
+PRINT String(p)
+PRINT p
+q = Point3()
+PRINT q
+PRINT String(NULL)
+PRINT String([1, 2])
+PRINT String(["a", "b"])
+PRINT String({A: 1, B: "two"})

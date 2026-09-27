@@ -96,7 +96,28 @@ FUNCTION Fission_ArcoBasicRecordDirective(metadata, diagnostics, name, args)
     RETURN metadata
 END FUNCTION
 
+' Where Fission's own sources (fission/...) are when a compiler runs outside
+' the Fission tree: $FISSION_HOME, else the nearest directory at or above the
+' working directory that holds fission/runtime ("" when there is none).
+FUNCTION Fission_SourceRoot()
+    home = Process.Env("FISSION_HOME")
+    IF home != "" THEN RETURN home
+    directory = Process.Env("PWD")
+    WHILE directory != "" ANDALSO directory != "/"
+        IF File.Exists(directory + "/fission/runtime/dynamic.abas") THEN RETURN directory
+        directory = Path.Dirname(directory)
+    WEND
+    RETURN ""
+END FUNCTION
+
 FUNCTION Fission_ArcoBasicPreprocess(source, initialDefines)
+    RETURN Fission_ArcoBasicPreprocessOnce(source, initialDefines, {})
+END FUNCTION
+
+' `importedFiles` is shared by the whole compilation: each file is expanded
+' at its FIRST #IMPORT only (a module imported by several others is compiled
+' once, so its functions and classes are defined once).
+FUNCTION Fission_ArcoBasicPreprocessOnce(source, initialDefines, importedFiles)
     diagnostics = FissionDiagnosticBag()
     defines = Fission_ListCopy(initialDefines)
     frames = []
@@ -258,16 +279,27 @@ FUNCTION Fission_ArcoBasicPreprocess(source, initialDefines)
         IF name == "IMPORT" THEN
             ignored = Array.Push(metadata.Imports, args)
             importPath = Fission_ArcoBasicUnquote(args)
-            IF File.Exists(importPath) THEN
-                imported = Fission_ArcoBasicPreprocess(File.ReadText(importPath), defines)
-                ignored = diagnostics.AppendMany(imported.Diagnostics)
-                FOR importedDefine IN imported.Defines
-                    IF Fission_ListContains(defines, importedDefine) == FALSE THEN ignored = Array.Push(defines, importedDefine)
-                NEXT
-                ignored = Array.Push(output, imported.Source)
-            ELSE
-                ignored = diagnostics.ReportError("FISSION_ARCOBASIC_IMPORT_NOT_FOUND", "#IMPORT file not found: " + importPath)
+            IF String.StartsWith(importPath, "./") THEN importPath = String.Slice(importPath, 2, String.Length(importPath) - 2)
+            IF File.Exists(importPath) == FALSE ANDALSO String.StartsWith(importPath, "fission/") THEN
+                sourceRoot = Fission_SourceRoot()
+                IF sourceRoot != "" THEN importPath = sourceRoot + "/" + importPath
+            END IF
+            IF Object.Has(importedFiles, importPath) THEN
+                ' Already expanded earlier in this compilation.
                 ignored = Array.Push(output, "")
+            ELSE
+                IF File.Exists(importPath) THEN
+                    importedFiles[importPath] = TRUE
+                    imported = Fission_ArcoBasicPreprocessOnce(File.ReadText(importPath), defines, importedFiles)
+                    ignored = diagnostics.AppendMany(imported.Diagnostics)
+                    FOR importedDefine IN imported.Defines
+                        IF Fission_ListContains(defines, importedDefine) == FALSE THEN ignored = Array.Push(defines, importedDefine)
+                    NEXT
+                    ignored = Array.Push(output, imported.Source)
+                ELSE
+                    ignored = diagnostics.ReportError("FISSION_ARCOBASIC_IMPORT_NOT_FOUND", "#IMPORT file not found: " + importPath)
+                    ignored = Array.Push(output, "")
+                END IF
             END IF
             lineNumber = lineNumber + 1
             CONTINUE FOR

@@ -1,0 +1,23 @@
+' A script global and a function's local of the same name: the function
+' starts from the global (copy-in) and may then hold other kinds of arrays.
+CLASS Node
+    CONSTRUCTOR(label)
+        SELF.Label = label
+    END CONSTRUCTOR
+END CLASS
+
+FUNCTION Build(count)
+    args = []
+    index = 0
+    WHILE index < count
+        ignored = Array.Push(args, Node("n" + String(index)))
+        index = index + 1
+    WEND
+    RETURN args
+END FUNCTION
+
+args = ["a", "b"]
+FOR n IN Build(3)
+    PRINT n.Label
+NEXT
+PRINT args

@@ -15,7 +15,7 @@
 ' mechanism, matching this whole project's own "verify in isolation
 ' first, then pin it down as a permanent regression fixture" discipline.
 
-' 1. NULL literal -- lowers as a plain `CONST 0`.
+' 1. NULL literal -- lowers as a dedicated `CONST null` (see case 7 below).
 NullSource = "x = NULL\nIF x == NULL THEN\n    PRINT \"yes\"\nEND IF"
 NullAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(NullSource), "gap-null-smoke.abas")))
 NullBc = Fission_AmirToBytecode(NullAmir)
@@ -117,3 +117,18 @@ SarBc = Fission_AmirToBytecode(SarAmir)
 PRINT SarAmir.Diagnostics.HasErrors()
 PRINT SarBc.Diagnostics.HasErrors()
 PRINT String.Contains(SarBc.Render(), "BINARY %t3 SAR %t1 %t2")
+
+' 7. G1->G2 self-hosting bootstrap fixes. NULL lowers to a real `null`
+' constant, distinct from the number 0 -- it used to lower to `CONST 0`, so
+' `0 != NULL` was FALSE in the bytecode target and
+' FissionBytecodeFunction.SlotFor never found slot 0 (SELF), which broke
+' every CLASS a Fission-compiled Fission compiled ("undefined bytecode
+' local: __instance"). And a STRING literal spelled "TRUE"/"FALSE"/"NULL"
+' stays a string, where it used to be lowered as the keyword (`value ==
+' "FALSE"` compared against the boolean 0). Output markers are checked by
+' tests/integration/fission_substrate_core_smoke.sh.
+KeywordSource = "x = 0\nd = {\"a\": 0}\ne = Object.Get(d, \"a\", NULL)\ns = \"FALSE\"\nt = \"NULL\""
+KeywordBc = Fission_AmirToBytecode(Fission_SirToAmir(Fission_ArcoBasicAstToSir(Fission_ArcoBasicParse(Fission_ArcoBasicLex(KeywordSource), "gap-keyword-literal-smoke.abas"))))
+KeywordText = KeywordBc.Render()
+IF KeywordBc.Diagnostics.HasErrors() == FALSE ANDALSO String.Contains(KeywordText, " null\n") ANDALSO String.Contains(KeywordText, " 0\n") THEN PRINT "NULL-LITERAL-OK"
+IF String.Contains(KeywordText, " \"FALSE\"\n") ANDALSO String.Contains(KeywordText, " \"NULL\"\n") THEN PRINT "STRING-KEYWORD-LITERAL-OK"

@@ -1,0 +1,716 @@
+' Dynamic ("Any") values for programs compiled by the Fission native x86-64
+' backend. The backend gives a value the Any kind when its kind is only known
+' at run time (a variable or parameter that receives different kinds); such a
+' value is a pointer to a 24-byte box on the runtime heap:
+'
+'   offset 0   tag      0 null, 1 Number (integer), 2 Float, 3 Bool,
+'                       4 String, 5 Array, 6 Object, 7 Map, 8 Callable
+'   offset 8   payload  the value's own 64 bits in its native representation
+'   offset 16  aux      Array: element tag (9 = elements are Any boxes);
+'                       Object: class name (String)
+'
+' A null pointer is ArcoBASIC's NULL. Operators follow the language's
+' semantics (the legacy oracle's eval_binary): "+" concatenates when either
+' side is a String, arithmetic promotes to Float when either side is a Float,
+' "/" always produces a Float. A value of the wrong kind where a specific
+' kind is required stops the program with a message, never a silent guess.
+'
+' FISSION.Bits/AsString/AsFloat/AsBool are compiler-internal: they
+' reinterpret 64 bits as another kind without generating code.
+' Runtime locals are rt-prefixed so they never alias user globals.
+#IMPORT "fission/runtime/heap.abas"
+#IMPORT "fission/runtime/gc.abas"
+#IMPORT "fission/runtime/strings.abas"
+#IMPORT "fission/runtime/host_strings.abas"
+#IMPORT "fission/runtime/host_arrays.abas"
+#IMPORT "fission/runtime/host_system.abas"
+#IMPORT "fission/runtime/map.abas"
+#IMPORT "fission/runtime/classes.abas"
+
+FUNCTION FissionRt_Box(rtTag, rtPayload, rtAux)
+    ' A null reference (string, array, object, map, callable) is NULL itself,
+    ' never a box around a zero pointer (`x != NULL` must stay false).
+    IF rtPayload == 0 ANDALSO rtTag >= 4 ANDALSO rtTag <= 8 THEN RETURN 0
+    rtCell = FissionRt_Alloc(24)
+    rtIgnored = MEMORY.Write64(rtCell, rtTag)
+    rtIgnored = MEMORY.Write64(rtCell + 8, rtPayload)
+    rtIgnored = MEMORY.Write64(rtCell + 16, rtAux)
+    RETURN rtCell
+END FUNCTION
+
+FUNCTION FissionRt_Tag(rtBox)
+    IF rtBox == 0 THEN RETURN 0
+    RETURN MEMORY.Read64(rtBox)
+END FUNCTION
+
+FUNCTION FissionRt_Payload(rtBox)
+    IF rtBox == 0 THEN RETURN 0
+    RETURN MEMORY.Read64(rtBox + 8)
+END FUNCTION
+
+FUNCTION FissionRt_Aux(rtBox)
+    IF rtBox == 0 THEN RETURN 0
+    RETURN MEMORY.Read64(rtBox + 16)
+END FUNCTION
+
+FUNCTION FissionRt_KindName(rtTag)
+    IF rtTag == 0 THEN RETURN "NULL"
+    IF rtTag == 1 ORELSE rtTag == 2 THEN RETURN "Number"
+    IF rtTag == 3 THEN RETURN "Bool"
+    IF rtTag == 4 THEN RETURN "String"
+    IF rtTag == 5 THEN RETURN "Array"
+    IF rtTag == 8 THEN RETURN "Callable"
+    RETURN "Object"
+END FUNCTION
+
+' A runtime error: caught by the innermost TRY as {Message, Type:
+' "RuntimeError"}, otherwise fatal.
+FUNCTION FissionRt_Fail(rtMessage)
+    IF MEMORY.Read64(FissionRt_HeapState + 2312) != 0 THEN rtIgnored = FissionRt_Raise(FissionRt_ErrorValue(FISSION.Bits(rtMessage), FISSION.Bits("RuntimeError")))
+    rtIgnored = FissionRt_ExitWithError(FISSION.Bits(rtMessage))
+    RETURN 0
+END FUNCTION
+
+' An uncaught error, the way the language's own runtime reports it: the
+' message on stderr, exit status 1.
+FUNCTION FissionRt_ExitWithError(rtMessage)
+    rtIgnored = LINUX.Syscall(1, 2, rtMessage, FissionRt_StrLen(rtMessage))
+    rtIgnored = LINUX.Syscall(1, 2, FISSION.Bits("\n"), 1)
+    rtIgnored = LINUX.Syscall(231, 1)
+    RETURN 0
+END FUNCTION
+
+' --- Exceptions. TRY handlers form a chain at state page offset 2312 (a
+' garbage-collection root): {previous, CATCH address, %rsp, %rbp}.
+FUNCTION FissionRt_TryPush(rtCatch, rtStack, rtFrame)
+    rtHandler = FissionRt_Alloc(32)
+    rtIgnored = MEMORY.Write64(rtHandler, MEMORY.Read64(FissionRt_HeapState + 2312))
+    rtIgnored = MEMORY.Write64(rtHandler + 8, rtCatch)
+    rtIgnored = MEMORY.Write64(rtHandler + 16, rtStack)
+    rtIgnored = MEMORY.Write64(rtHandler + 24, rtFrame)
+    rtIgnored = MEMORY.Write64(FissionRt_HeapState + 2312, rtHandler)
+    RETURN 0
+END FUNCTION
+
+FUNCTION FissionRt_TryPop()
+    rtTop = MEMORY.Read64(FissionRt_HeapState + 2312)
+    IF rtTop != 0 THEN rtIgnored = MEMORY.Write64(FissionRt_HeapState + 2312, MEMORY.Read64(rtTop))
+    RETURN 0
+END FUNCTION
+
+' Drops the handlers of a returning function (its frame pointer).
+FUNCTION FissionRt_TryPopFrame(rtFrame)
+    rtTop = MEMORY.Read64(FissionRt_HeapState + 2312)
+    WHILE rtTop != 0 ANDALSO MEMORY.Read64(rtTop + 24) == rtFrame
+        rtTop = MEMORY.Read64(rtTop)
+    WEND
+    rtIgnored = MEMORY.Write64(FissionRt_HeapState + 2312, rtTop)
+    RETURN 0
+END FUNCTION
+
+' The error value a CATCH receives: {Message, Type} (a dynamic map).
+FUNCTION FissionRt_ErrorValue(rtMessage, rtType)
+    rtError = FissionRt_MapNew()
+    rtIgnored = FissionRt_MapSet(rtError, FISSION.Bits("Message"), FissionRt_Box(4, rtMessage, 0))
+    rtIgnored = FissionRt_MapSet(rtError, FISSION.Bits("Type"), FissionRt_Box(4, rtType, 0))
+    RETURN FissionRt_Box(7, rtError, 0)
+END FUNCTION
+
+' THROW value: {Message: the value as text, Type: "UserError"}.
+FUNCTION FissionRt_Throw(rtValue)
+    rtIgnored = FissionRt_Raise(FissionRt_ErrorValue(FISSION.Bits(FissionRt_ToString(rtValue)), FISSION.Bits("UserError")))
+    RETURN 0
+END FUNCTION
+
+' Resumes the innermost CATCH with `rtError`; with no TRY active it is fatal.
+FUNCTION FissionRt_Raise(rtError)
+    rtTop = MEMORY.Read64(FissionRt_HeapState + 2312)
+    IF rtTop == 0 THEN rtIgnored = FissionRt_ExitWithError(FISSION.Bits(FissionRt_ToString(FissionRt_MapGetOr(FissionRt_Payload(rtError), FISSION.Bits("Message"), 0))))
+    rtIgnored = MEMORY.Write64(FissionRt_HeapState + 2312, MEMORY.Read64(rtTop))
+    rtIgnored = FissionRt_Unwind(MEMORY.Read64(rtTop + 8), MEMORY.Read64(rtTop + 16), MEMORY.Read64(rtTop + 24), rtError)
+    RETURN 0
+END FUNCTION
+
+' The payload of `rtBox` as the representation for `rtWantTag` (1 Number,
+' 2 Float, 3 Bool, 4 String, ...). An integer is accepted where a Float is
+' wanted (converted); anything else of the wrong kind is a runtime error.
+FUNCTION FissionRt_Unbox(rtBox, rtWantTag)
+    rtTag = FissionRt_Tag(rtBox)
+    IF rtTag == rtWantTag THEN RETURN FissionRt_Payload(rtBox)
+    IF rtWantTag == 2 ANDALSO rtTag == 1 THEN
+        rtAsFloat = FissionRt_Payload(rtBox) * 1.0
+        RETURN FISSION.Bits(rtAsFloat)
+    END IF
+    IF rtWantTag == 3 THEN RETURN FissionRt_Truthy(rtBox)
+    ' A Bool is the number 0/1 (the code generator treats them alike).
+    IF rtWantTag == 1 ANDALSO rtTag == 3 THEN RETURN FissionRt_Payload(rtBox)
+    ' One Number type in the language: a double into an integer slot truncates.
+    IF rtWantTag == 1 ANDALSO rtTag == 2 THEN RETURN FISSION.AsFloat(FissionRt_Payload(rtBox)) BITOR 0
+    ' NULL fits any reference kind (string, array, object, map, callable).
+    IF rtTag == 0 ANDALSO rtWantTag >= 4 ANDALSO rtWantTag <= 8 THEN RETURN 0
+    rtIgnored = FissionRt_Fail("expected " + FissionRt_KindName(rtWantTag) + ", got " + FissionRt_KindName(rtTag))
+    RETURN 0
+END FUNCTION
+
+FUNCTION FissionRt_Truthy(rtBox)
+    rtTag = FissionRt_Tag(rtBox)
+    IF rtTag == 0 THEN RETURN 0
+    rtPayload = FissionRt_Payload(rtBox)
+    IF rtTag == 1 ORELSE rtTag == 3 THEN
+        IF rtPayload != 0 THEN RETURN 1
+        RETURN 0
+    END IF
+    IF rtTag == 2 THEN
+        IF FISSION.AsFloat(rtPayload) != 0.0 THEN RETURN 1
+        RETURN 0
+    END IF
+    IF rtTag == 4 THEN
+        IF FissionRt_StrLen(rtPayload) != 0 THEN RETURN 1
+        RETURN 0
+    END IF
+    RETURN 1
+END FUNCTION
+
+FUNCTION FissionRt_ToString(rtBox)
+    rtTag = FissionRt_Tag(rtBox)
+    rtPayload = FissionRt_Payload(rtBox)
+    IF rtTag == 0 THEN RETURN "NULL"
+    IF rtTag == 1 THEN RETURN String(rtPayload)
+    IF rtTag == 2 THEN RETURN String(FISSION.AsFloat(rtPayload))
+    IF rtTag == 3 THEN
+        IF rtPayload != 0 THEN RETURN "TRUE"
+        RETURN "FALSE"
+    END IF
+    IF rtTag == 4 THEN RETURN FISSION.AsString(rtPayload)
+    IF rtTag == 5 THEN RETURN FissionRt_ArrayToString(rtPayload, FissionRt_Aux(rtBox))
+    IF rtTag == 7 THEN RETURN FissionRt_MapToString(rtPayload)
+    IF rtTag == 6 THEN RETURN FissionRt_ObjectToString(rtPayload)
+    IF rtTag == 10 THEN RETURN FISSION.AsString(rtPayload)
+    RETURN "[" + FissionRt_KindName(rtTag) + "]"
+END FUNCTION
+
+' One raw array element / map value of runtime tag `rtTag` as a box (an
+' Any-element array, tag 9, already holds boxes).
+' (Class metadata packs an array's element tag into the upper bits: the tag
+' is `rtTag MOD 16`, the aux `rtTag SHR 4`.)
+FUNCTION FissionRt_BoxElement(rtTag, rtRaw)
+    IF rtTag == 9 THEN RETURN rtRaw
+    RETURN FissionRt_Box(rtTag MOD 16, rtRaw, rtTag SHR 4)
+END FUNCTION
+
+' The language's own rendering: [1, two, [3]] (strings unquoted).
+FUNCTION FissionRt_ArrayToString(rtArray, rtElementTag)
+    rtInner = FissionRt_JoinElements(rtArray, rtElementTag, FISSION.Bits(", "))
+    RETURN "[" + FISSION.AsString(rtInner) + "]"
+END FUNCTION
+
+' {key: value, ...} in key order.
+FUNCTION FissionRt_MapToString(rtMap)
+    rtCount = MEMORY.Read64(rtMap)
+    rtText = "{"
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        IF rtIndex > 0 THEN rtText = rtText + ", "
+        rtText = rtText + FISSION.AsString(MEMORY.Read64(MEMORY.Read64(rtMap + 16) + rtIndex * 8)) + ": " + FissionRt_ToString(MEMORY.Read64(MEMORY.Read64(rtMap + 24) + rtIndex * 8))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtText + "}"
+END FUNCTION
+
+' A class instance rendered the way the language renders it: its fields
+' (own and inherited) plus `__class`, as a map sorted by name.
+FUNCTION FissionRt_ObjectAsMap(rtInstance)
+    rtView = FissionRt_MapNew()
+    rtClassName = MEMORY.Read64(rtInstance)
+    rtIgnored = FissionRt_MapSet(rtView, FISSION.Bits("__class"), FissionRt_Box(4, rtClassName, 0))
+    rtCurrent = FissionRt_ClassOf(rtInstance)
+    WHILE rtCurrent != 0
+        rtFields = MEMORY.Read64(rtCurrent + 16)
+        rtIndex = 0
+        WHILE rtIndex < MEMORY.Read64(rtFields)
+            rtName = MEMORY.Read64(MEMORY.Read64(rtFields + 16) + rtIndex * 8)
+            IF FissionRt_MapFind(rtView, rtName) < 0 THEN
+                rtField = MEMORY.Read64(MEMORY.Read64(rtFields + 24) + rtIndex * 8)
+                rtIgnored = FissionRt_MapSet(rtView, rtName, FissionRt_BoxElement(MEMORY.Read64(rtField + 8), MEMORY.Read64(rtInstance + MEMORY.Read64(rtField))))
+            END IF
+            rtIndex = rtIndex + 1
+        WEND
+        rtParent = MEMORY.Read64(rtCurrent + 8)
+        rtCurrent = 0
+        IF rtParent != 0 THEN rtCurrent = FissionRt_MapGetOr(FissionRt_ClassRegistry(), rtParent, 0)
+    WEND
+    RETURN FissionRt_Box(7, rtView, 0)
+END FUNCTION
+
+FUNCTION FissionRt_ObjectToString(rtInstance)
+    RETURN FissionRt_MapToString(FissionRt_Payload(FissionRt_ObjectAsMap(rtInstance)))
+END FUNCTION
+
+' `value.Key` / `value["Key"]` on a dynamic value.
+FUNCTION FissionRt_DynGetField(rtBox, rtKey)
+    rtTag = FissionRt_Tag(rtBox)
+    IF rtTag == 7 THEN
+        rtMap = FissionRt_Payload(rtBox)
+        IF FissionRt_MapFind(rtMap, rtKey) < 0 THEN rtIgnored = FissionRt_Fail("undefined property: " + FISSION.AsString(rtKey))
+        RETURN FissionRt_MapGetOr(rtMap, rtKey, 0)
+    END IF
+    IF rtTag == 6 THEN
+        rtInstance = FissionRt_Payload(rtBox)
+        rtField = FissionRt_FindField(FissionRt_ClassOf(rtInstance), rtKey)
+        IF rtField == 0 THEN rtIgnored = FissionRt_Fail("undefined property: " + FISSION.AsString(rtKey))
+        RETURN FissionRt_BoxElement(MEMORY.Read64(rtField + 8), MEMORY.Read64(rtInstance + MEMORY.Read64(rtField)))
+    END IF
+    rtIgnored = FissionRt_Fail("value is not an object")
+    RETURN 0
+END FUNCTION
+
+' `value.Key = v` / `value["Key"] = v` on a dynamic value (in place).
+' A new array holding each element of `rtArray` (runtime tag `rtTag`,
+' class-metadata encoding) as a box.
+FUNCTION FissionRt_ArrayBoxed(rtArray, rtTag)
+    IF rtArray == 0 THEN RETURN 0
+    rtCount = MEMORY.Read64(rtArray)
+    rtHeader = FissionRt_Alloc(24 + rtCount * 8)
+    rtIgnored = MEMORY.Write64(rtHeader, rtCount)
+    rtIgnored = MEMORY.Write64(rtHeader + 8, rtHeader + 24)
+    rtIgnored = MEMORY.Write64(rtHeader + 16, rtCount)
+    rtData = MEMORY.Read64(rtArray + 8)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write64(rtHeader + 24 + rtIndex * 8, FissionRt_BoxElement(rtTag, MEMORY.Read64(rtData + rtIndex * 8)))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtHeader
+END FUNCTION
+
+' The raw array a dynamic value holds, with elements of runtime tag `rtTag`:
+' as-is when already stored that way, converted from boxed elements otherwise.
+FUNCTION FissionRt_UnboxArray(rtBox, rtTag)
+    rtArray = FissionRt_Unbox(rtBox, 5)
+    IF rtArray == 0 ORELSE FissionRt_Aux(rtBox) != 9 THEN RETURN rtArray
+    RETURN FissionRt_ArrayUnboxed(rtArray, rtTag)
+END FUNCTION
+
+' A raw array of `rtTag` elements (checked) from an array of boxes.
+FUNCTION FissionRt_ArrayUnboxed(rtArray, rtTag)
+    rtCount = MEMORY.Read64(rtArray)
+    rtHeader = FissionRt_Alloc(24 + rtCount * 8)
+    rtIgnored = MEMORY.Write64(rtHeader, rtCount)
+    rtIgnored = MEMORY.Write64(rtHeader + 8, rtHeader + 24)
+    rtIgnored = MEMORY.Write64(rtHeader + 16, rtCount)
+    rtData = MEMORY.Read64(rtArray + 8)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write64(rtHeader + 24 + rtIndex * 8, FissionRt_UnboxTo(MEMORY.Read64(rtData + rtIndex * 8), rtTag))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtHeader
+END FUNCTION
+
+' Bit vectors (tag 10) hold their "0"/"1" text.
+FUNCTION FissionRt_BitsFromString(rtText)
+    rtLength = FissionRt_StrLen(rtText)
+    rtIndex = 0
+    WHILE rtIndex < rtLength
+        rtByte = MEMORY.Read8(rtText + rtIndex)
+        IF rtByte != 48 ANDALSO rtByte != 49 THEN rtIgnored = FissionRt_Fail("bit vector text must contain only 0 or 1")
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN FissionRt_Box(10, FissionRt_SubString(rtText, 0, rtLength), 0)
+END FUNCTION
+
+FUNCTION FissionRt_BitsToString(rtBox)
+    IF FissionRt_Tag(rtBox) != 10 THEN rtIgnored = FissionRt_Fail("Bits.ToString expects a bit vector")
+    RETURN FissionRt_SubString(FissionRt_Payload(rtBox), 0, FissionRt_StrLen(FissionRt_Payload(rtBox)))
+END FUNCTION
+
+' Object.Has/Get/Keys on a map or a class instance (its fields and __class).
+FUNCTION FissionRt_ObjectHas(rtBox, rtKey)
+    rtTag = FissionRt_Tag(rtBox)
+    IF rtTag == 7 THEN RETURN FissionRt_MapHas(FissionRt_Payload(rtBox), rtKey)
+    IF rtTag == 6 THEN
+        IF FissionRt_StrEquals(rtKey, FISSION.Bits("__class")) == 1 THEN RETURN 1
+        IF FissionRt_FindField(FissionRt_ClassOf(FissionRt_Payload(rtBox)), rtKey) != 0 THEN RETURN 1
+    END IF
+    RETURN 0
+END FUNCTION
+
+FUNCTION FissionRt_ObjectGet(rtBox, rtKey, rtDefault)
+    IF FissionRt_ObjectHas(rtBox, rtKey) == 0 THEN RETURN rtDefault
+    IF FissionRt_Tag(rtBox) == 7 THEN RETURN FissionRt_MapGetOr(FissionRt_Payload(rtBox), rtKey, rtDefault)
+    IF FissionRt_StrEquals(rtKey, FISSION.Bits("__class")) == 1 THEN RETURN FissionRt_Box(4, MEMORY.Read64(FissionRt_Payload(rtBox)), 0)
+    RETURN FissionRt_DynGetField(rtBox, rtKey)
+END FUNCTION
+
+' Keys in order: a map's, or an instance's field names plus __class.
+FUNCTION FissionRt_ObjectKeys(rtBox)
+    rtTag = FissionRt_Tag(rtBox)
+    IF rtTag == 7 THEN RETURN FissionRt_MapKeys(FissionRt_Payload(rtBox))
+    IF rtTag != 6 THEN RETURN FissionRt_NewArray(0)
+    rtView = FissionRt_Payload(FissionRt_ObjectAsMap(FissionRt_Payload(rtBox)))
+    RETURN FissionRt_MapKeys(rtView)
+END FUNCTION
+
+' TYPEOF(value) of a dynamic value, as the language names kinds.
+FUNCTION FissionRt_TypeOf(rtBox)
+    rtTag = FissionRt_Tag(rtBox)
+    IF rtTag == 0 THEN RETURN "Null"
+    IF rtTag == 1 ORELSE rtTag == 2 THEN RETURN "Number"
+    IF rtTag == 3 THEN RETURN "Boolean"
+    IF rtTag == 4 THEN RETURN "String"
+    IF rtTag == 5 THEN RETURN "Array"
+    IF rtTag == 8 THEN RETURN "Callable"
+    IF rtTag == 10 THEN RETURN "BitVector"
+    RETURN "Object"
+END FUNCTION
+
+' Copy(value): a shallow copy (a new array, map or instance holding the same
+' elements), matching the bytecode VM's COPY. Other values are themselves.
+FUNCTION FissionRt_ShallowCopy(rtBox)
+    rtTag = FissionRt_Tag(rtBox)
+    rtPayload = FissionRt_Payload(rtBox)
+    IF rtPayload == 0 THEN RETURN rtBox
+    IF rtTag == 5 THEN
+        rtCount = MEMORY.Read64(rtPayload)
+        rtCapacity = rtCount
+        IF rtCapacity < 1 THEN rtCapacity = 1
+        rtHeader = FissionRt_Alloc(24)
+        rtData = FissionRt_Alloc(rtCapacity * 8)
+        rtIgnored = FissionRt_CopyBytes(rtData, MEMORY.Read64(rtPayload + 8), rtCount * 8)
+        rtIgnored = MEMORY.Write64(rtHeader, rtCount)
+        rtIgnored = MEMORY.Write64(rtHeader + 8, rtData)
+        rtIgnored = MEMORY.Write64(rtHeader + 16, rtCapacity)
+        RETURN FissionRt_Box(5, rtHeader, FissionRt_Aux(rtBox))
+    END IF
+    IF rtTag == 7 THEN RETURN FissionRt_Box(7, FissionRt_MapCopy(rtPayload), 0)
+    IF rtTag == 6 THEN
+        rtSize = FissionRt_InstanceSize(FissionRt_ClassOf(rtPayload))
+        rtCopy = FissionRt_Alloc(rtSize)
+        rtIgnored = FissionRt_CopyBytes(rtCopy, rtPayload, rtSize)
+        RETURN FissionRt_Box(6, rtCopy, 0)
+    END IF
+    RETURN rtBox
+END FUNCTION
+
+' Bytes in an instance of a class record: its last field (own or
+' inherited) plus one word; the class-name word alone otherwise.
+FUNCTION FissionRt_InstanceSize(rtClass)
+    rtSize = 8
+    rtCurrent = rtClass
+    WHILE rtCurrent != 0
+        rtFields = MEMORY.Read64(rtCurrent + 16)
+        rtIndex = 0
+        WHILE rtIndex < MEMORY.Read64(rtFields)
+            rtEnd = MEMORY.Read64(MEMORY.Read64(MEMORY.Read64(rtFields + 24) + rtIndex * 8)) + 8
+            IF rtEnd > rtSize THEN rtSize = rtEnd
+            rtIndex = rtIndex + 1
+        WEND
+        rtParent = MEMORY.Read64(rtCurrent + 8)
+        rtCurrent = 0
+        IF rtParent != 0 THEN rtCurrent = FissionRt_MapGetOr(FissionRt_ClassRegistry(), rtParent, 0)
+    WEND
+    RETURN rtSize
+END FUNCTION
+
+' `value[key]` on a dynamic value, with a boxed key: an array by number
+' (bounds-checked), a map or instance by string key.
+FUNCTION FissionRt_DynIndex(rtBox, rtKey)
+    IF FissionRt_Tag(rtBox) == 5 THEN
+        rtArray = FissionRt_Payload(rtBox)
+        rtIndex = FissionRt_ArrayIndexOf(rtArray, rtKey)
+        RETURN FissionRt_BoxElement(FissionRt_Aux(rtBox), MEMORY.Read64(MEMORY.Read64(rtArray + 8) + rtIndex * 8))
+    END IF
+    IF FissionRt_Tag(rtKey) == 4 THEN RETURN FissionRt_DynGetField(rtBox, FissionRt_Payload(rtKey))
+    rtIgnored = FissionRt_Fail("cannot index a " + FissionRt_KindName(FissionRt_Tag(rtBox)) + " by " + FissionRt_KindName(FissionRt_Tag(rtKey)))
+    RETURN 0
+END FUNCTION
+
+' `value[key] = item` on a dynamic value (boxed key and item).
+FUNCTION FissionRt_DynSetIndex(rtBox, rtKey, rtValue)
+    IF FissionRt_Tag(rtBox) == 5 THEN
+        rtArray = FissionRt_Payload(rtBox)
+        rtIndex = FissionRt_ArrayIndexOf(rtArray, rtKey)
+        rtIgnored = MEMORY.Write64(MEMORY.Read64(rtArray + 8) + rtIndex * 8, FissionRt_UnboxTo(rtValue, FissionRt_Aux(rtBox)))
+        RETURN rtBox
+    END IF
+    IF FissionRt_Tag(rtKey) == 4 THEN RETURN FissionRt_DynSetField(rtBox, FissionRt_Payload(rtKey), rtValue)
+    rtIgnored = FissionRt_Fail("cannot index a " + FissionRt_KindName(FissionRt_Tag(rtBox)) + " by " + FissionRt_KindName(FissionRt_Tag(rtKey)))
+    RETURN 0
+END FUNCTION
+
+' A typed array index out of range (the code generator's bounds checks).
+FUNCTION FissionRt_IndexError()
+    rtIgnored = FissionRt_Fail("array index out of range")
+    RETURN 0
+END FUNCTION
+
+' A boxed numeric index checked against the array's length.
+FUNCTION FissionRt_ArrayIndexOf(rtArray, rtKey)
+    rtIndex = FissionRt_Unbox(rtKey, 1)
+    IF rtIndex < 0 ORELSE rtIndex >= MEMORY.Read64(rtArray) THEN rtIgnored = FissionRt_Fail("array index out of range")
+    RETURN rtIndex
+END FUNCTION
+
+FUNCTION FissionRt_DynSetField(rtBox, rtKey, rtValue)
+    IF FissionRt_Tag(rtBox) == 7 THEN RETURN FissionRt_MapSet(FissionRt_Payload(rtBox), rtKey, rtValue)
+    IF FissionRt_Tag(rtBox) == 6 THEN
+        rtInstance = FissionRt_Payload(rtBox)
+        rtField = FissionRt_FindField(FissionRt_ClassOf(rtInstance), rtKey)
+        IF rtField == 0 THEN rtIgnored = FissionRt_Fail("undefined property: " + FISSION.AsString(rtKey))
+        rtIgnored = MEMORY.Write64(rtInstance + MEMORY.Read64(rtField), FissionRt_UnboxTo(rtValue, MEMORY.Read64(rtField + 8)))
+        RETURN rtBox
+    END IF
+    rtIgnored = FissionRt_Fail("value is not an object")
+    RETURN 0
+END FUNCTION
+
+FUNCTION FissionRt_PrintAny(rtBox)
+    PRINT FissionRt_ToString(rtBox)
+    RETURN 0
+END FUNCTION
+
+FUNCTION FissionRt_AsFloat(rtBox)
+    IF FissionRt_Tag(rtBox) == 2 THEN RETURN FISSION.AsFloat(FissionRt_Payload(rtBox))
+    RETURN FissionRt_Unbox(rtBox, 1) * 1.0
+END FUNCTION
+
+' Operator codes: 1 +, 2 -, 3 *, 4 /, 5 MOD, 6 &, 7 |, 8 ^, 9 <<, 10 >>. Result is a new box.
+FUNCTION FissionRt_Arith(rtOp, rtLeft, rtRight)
+    rtLeftTag = FissionRt_Tag(rtLeft)
+    rtRightTag = FissionRt_Tag(rtRight)
+    IF rtOp == 1 ANDALSO (rtLeftTag == 4 ORELSE rtRightTag == 4) THEN
+        rtText = FissionRt_ToString(rtLeft) + FissionRt_ToString(rtRight)
+        RETURN FissionRt_Box(4, FISSION.Bits(rtText), 0)
+    END IF
+    ' Bitwise AND/OR/XOR (the language's bare AND/OR/XOR) on integers and
+    ' booleans.
+    IF rtOp >= 6 THEN
+        ' A double operand is truncated to an integer (BITOR 0 on a Float
+        ' compiles to a truncating conversion).
+        IF rtLeftTag == 3 THEN
+            rtA = FissionRt_Payload(rtLeft)
+        ELSE
+            IF rtLeftTag == 2 THEN
+                rtA = FISSION.AsFloat(FissionRt_Payload(rtLeft)) BITOR 0
+            ELSE
+                rtA = FissionRt_Unbox(rtLeft, 1)
+            END IF
+        END IF
+        IF rtRightTag == 3 THEN
+            rtB = FissionRt_Payload(rtRight)
+        ELSE
+            IF rtRightTag == 2 THEN
+                rtB = FISSION.AsFloat(FissionRt_Payload(rtRight)) BITOR 0
+            ELSE
+                rtB = FissionRt_Unbox(rtRight, 1)
+            END IF
+        END IF
+        rtBits = 0
+        IF rtOp == 6 THEN rtBits = rtA BITAND rtB
+        IF rtOp == 7 THEN rtBits = rtA BITOR rtB
+        IF rtOp == 8 THEN rtBits = rtA BITXOR rtB
+        IF rtOp == 9 THEN rtBits = rtA SHL rtB
+        IF rtOp == 10 THEN rtBits = rtA SHR rtB
+        RETURN FissionRt_Box(1, rtBits, 0)
+    END IF
+    IF rtLeftTag == 1 ANDALSO rtRightTag == 1 ANDALSO rtOp != 4 THEN
+        rtA = FissionRt_Payload(rtLeft)
+        rtB = FissionRt_Payload(rtRight)
+        rtResult = 0
+        IF rtOp == 1 THEN rtResult = rtA + rtB
+        IF rtOp == 2 THEN rtResult = rtA - rtB
+        IF rtOp == 3 THEN rtResult = rtA * rtB
+        IF rtOp == 5 THEN
+            IF rtB == 0 THEN rtIgnored = FissionRt_Fail("MOD divisor cannot be zero")
+            rtResult = rtA MOD rtB
+        END IF
+        RETURN FissionRt_Box(1, rtResult, 0)
+    END IF
+    rtFa = FissionRt_AsFloat(rtLeft)
+    rtFb = FissionRt_AsFloat(rtRight)
+    rtFResult = 0.0
+    IF rtOp == 1 THEN rtFResult = rtFa + rtFb
+    IF rtOp == 2 THEN rtFResult = rtFa - rtFb
+    IF rtOp == 3 THEN rtFResult = rtFa * rtFb
+    IF rtOp == 4 THEN rtFResult = rtFa / rtFb
+    IF rtOp == 5 THEN rtFResult = rtFa MOD rtFb
+    RETURN FissionRt_Box(2, FISSION.Bits(rtFResult), 0)
+END FUNCTION
+
+' -1 / 0 / 1 ordering, or 0/1 equality for "==" (rtEquality = 1).
+FUNCTION FissionRt_Equal(rtLeft, rtRight)
+    rtLeftTag = FissionRt_Tag(rtLeft)
+    rtRightTag = FissionRt_Tag(rtRight)
+    IF (rtLeftTag == 1 ORELSE rtLeftTag == 2) ANDALSO (rtRightTag == 1 ORELSE rtRightTag == 2) THEN
+        IF FissionRt_AsFloat(rtLeft) == FissionRt_AsFloat(rtRight) THEN RETURN 1
+        RETURN 0
+    END IF
+    IF rtLeftTag == 0 ORELSE rtRightTag == 0 THEN
+        IF rtLeftTag == rtRightTag THEN RETURN 1
+        RETURN 0
+    END IF
+    IF rtLeftTag == 4 ORELSE rtRightTag == 4 ORELSE rtLeftTag == 3 ORELSE rtRightTag == 3 THEN
+        IF FissionRt_ToString(rtLeft) == FissionRt_ToString(rtRight) THEN RETURN 1
+        RETURN 0
+    END IF
+    IF FissionRt_Payload(rtLeft) == FissionRt_Payload(rtRight) THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+FUNCTION FissionRt_Compare(rtLeft, rtRight)
+    rtLeftTag = FissionRt_Tag(rtLeft)
+    rtRightTag = FissionRt_Tag(rtRight)
+    IF rtLeftTag == 4 ORELSE rtRightTag == 4 THEN
+        rtA = FissionRt_ToString(rtLeft)
+        rtB = FissionRt_ToString(rtRight)
+        RETURN FissionRt_StrCmp(FISSION.Bits(rtA), FISSION.Bits(rtB))
+    END IF
+    rtFa = FissionRt_AsFloat(rtLeft)
+    rtFb = FissionRt_AsFloat(rtRight)
+    IF rtFa < rtFb THEN RETURN -1
+    IF rtFa > rtFb THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+' Runtime.Args: argv[1..argc-1] as an Array:String in the native array
+' layout -- a 24-byte header {length, dataPointer, capacity} then the elements
+' (NUL-terminated string pointers, straight from argv).
+FUNCTION FissionRt_ArgsFrom(rtArgc, rtArgv)
+    rtCount = rtArgc - 1
+    IF rtCount < 0 THEN rtCount = 0
+    rtHeader = FissionRt_Alloc(24 + rtCount * 8)
+    rtIgnored = MEMORY.Write64(rtHeader, rtCount)
+    rtIgnored = MEMORY.Write64(rtHeader + 8, rtHeader + 24)
+    rtIgnored = MEMORY.Write64(rtHeader + 16, rtCount)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write64(rtHeader + 24 + rtIndex * 8, FissionRt_StrFromC(MEMORY.Read64(rtArgv + (rtIndex + 1) * 8)))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtHeader
+END FUNCTION
+
+' `map.Key` on a statically-known map: a missing key is an error.
+FUNCTION FissionRt_MapGetField(rtMap, rtKey)
+    IF FissionRt_MapFind(rtMap, rtKey) < 0 THEN rtIgnored = FissionRt_Fail("undefined property: " + FISSION.AsString(rtKey))
+    RETURN FissionRt_MapGetOr(rtMap, rtKey, 0)
+END FUNCTION
+
+' LEN of a dynamic value: string length (bytes), array length, map size.
+FUNCTION FissionRt_DynLen(rtBox)
+    rtTag = FissionRt_Tag(rtBox)
+    rtPayload = FissionRt_Payload(rtBox)
+    IF rtTag == 4 THEN RETURN FissionRt_CharCount(rtPayload)
+    IF rtTag == 10 THEN RETURN FissionRt_StrLen(rtPayload)
+    IF rtTag == 5 ORELSE rtTag == 7 THEN RETURN MEMORY.Read64(rtPayload)
+    rtIgnored = FissionRt_Fail("LEN needs a string, array or object, got " + FissionRt_KindName(rtTag))
+    RETURN 0
+END FUNCTION
+
+' The raw representation of the box `rtValue` for a slot of runtime kind tag
+' `rtTag` (9 = the slot itself holds a box).
+FUNCTION FissionRt_UnboxTo(rtValue, rtTag)
+    IF rtTag == 9 THEN RETURN rtValue
+    RETURN FissionRt_Unbox(rtValue, rtTag MOD 16)
+END FUNCTION
+
+' `receiver.Method(args...)` on a dynamic receiver: finds the method on the
+' instance's class (or an ancestor), converts each boxed argument to the
+' parameter's own representation, calls it with SELF first, and boxes the
+' result by the method's return kind. `rtArgs` is an array of boxes (native
+' array layout). Up to 5 explicit arguments.
+FUNCTION FissionRt_CallMethod(rtReceiver, rtName, rtArgs)
+    IF FissionRt_Tag(rtReceiver) != 6 THEN rtIgnored = FissionRt_Fail("cannot call method " + FISSION.AsString(rtName) + " on a " + FissionRt_KindName(FissionRt_Tag(rtReceiver)))
+    rtInstance = FissionRt_Payload(rtReceiver)
+    rtMethod = FissionRt_FindMethod(FissionRt_ClassOf(rtInstance), rtName)
+    IF rtMethod == 0 THEN rtIgnored = FissionRt_Fail("undefined method: " + FISSION.AsString(rtName))
+    rtCount = MEMORY.Read64(rtArgs)
+    IF rtCount != MEMORY.Read64(rtMethod + 8) THEN rtIgnored = FissionRt_Fail("wrong number of arguments for method " + FISSION.AsString(rtName))
+    IF rtCount > 5 THEN rtIgnored = FissionRt_Fail("dynamic method calls support at most 5 arguments")
+    rtData = MEMORY.Read64(rtArgs + 8)
+    rtA1 = 0
+    rtA2 = 0
+    rtA3 = 0
+    rtA4 = 0
+    rtA5 = 0
+    IF rtCount > 0 THEN rtA1 = FissionRt_UnboxTo(MEMORY.Read64(rtData), MEMORY.Read64(rtMethod + 24))
+    IF rtCount > 1 THEN rtA2 = FissionRt_UnboxTo(MEMORY.Read64(rtData + 8), MEMORY.Read64(rtMethod + 32))
+    IF rtCount > 2 THEN rtA3 = FissionRt_UnboxTo(MEMORY.Read64(rtData + 16), MEMORY.Read64(rtMethod + 40))
+    IF rtCount > 3 THEN rtA4 = FissionRt_UnboxTo(MEMORY.Read64(rtData + 24), MEMORY.Read64(rtMethod + 48))
+    IF rtCount > 4 THEN rtA5 = FissionRt_UnboxTo(MEMORY.Read64(rtData + 32), MEMORY.Read64(rtMethod + 56))
+    rtRaw = FISSION.CallAddress(MEMORY.Read64(rtMethod), rtInstance, rtA1, rtA2, rtA3, rtA4, rtA5)
+    RETURN FissionRt_BoxElement(MEMORY.Read64(rtMethod + 16), rtRaw)
+END FUNCTION
+
+' Array.Push/Add/Append: appends a raw element, growing the data buffer
+' geometrically (capacity doubles), so a sequence of pushes is amortized O(1)
+' each. Arrays use a 24-byte header {length, dataPointer, capacity}.
+FUNCTION FissionRt_ArrayPush(rtHeader, rtValue)
+    rtCount = MEMORY.Read64(rtHeader)
+    rtCapacity = MEMORY.Read64(rtHeader + 16)
+    rtData = MEMORY.Read64(rtHeader + 8)
+    IF rtCount >= rtCapacity THEN
+        rtNewCapacity = rtCapacity * 2
+        IF rtNewCapacity < 8 THEN rtNewCapacity = 8
+        rtNewData = FissionRt_Alloc(rtNewCapacity * 8)
+        rtIndex = 0
+        WHILE rtIndex < rtCount
+            rtIgnored = MEMORY.Write64(rtNewData + rtIndex * 8, MEMORY.Read64(rtData + rtIndex * 8))
+            rtIndex = rtIndex + 1
+        WEND
+        rtData = rtNewData
+        rtIgnored = MEMORY.Write64(rtHeader + 8, rtData)
+        rtIgnored = MEMORY.Write64(rtHeader + 16, rtNewCapacity)
+    END IF
+    rtIgnored = MEMORY.Write64(rtData + rtCount * 8, rtValue)
+    rtIgnored = MEMORY.Write64(rtHeader, rtCount + 1)
+    RETURN rtCount + 1
+END FUNCTION
+
+' Array.Push on a dynamic value: it must be an array; the value is stored in
+' the array's own element representation.
+FUNCTION FissionRt_DynPush(rtArrayBox, rtValue)
+    IF FissionRt_Tag(rtArrayBox) != 5 THEN rtIgnored = FissionRt_Fail("Array.Push needs an array, got " + FissionRt_KindName(FissionRt_Tag(rtArrayBox)))
+    RETURN FissionRt_ArrayPush(FissionRt_Payload(rtArrayBox), FissionRt_UnboxTo(rtValue, FissionRt_Aux(rtArrayBox)))
+END FUNCTION
+
+' Array.Join(array, separator) for any element kind: each element rendered
+' the way PRINT/String render it.
+FUNCTION FissionRt_JoinDynamic(rtArrayBox, rtSeparator)
+    IF FissionRt_Tag(rtArrayBox) != 5 THEN rtIgnored = FissionRt_Fail("Array.Join needs an array, got " + FissionRt_KindName(FissionRt_Tag(rtArrayBox)))
+    RETURN FISSION.AsString(FissionRt_JoinElements(FissionRt_Payload(rtArrayBox), FissionRt_Aux(rtArrayBox), rtSeparator))
+END FUNCTION
+
+' Each element rendered as text, `rtSeparator` between them: one allocation
+' for the result (repeated concatenation would copy the growing text each
+' time -- quadratic, and nothing is ever freed).
+FUNCTION FissionRt_JoinElements(rtArray, rtElementTag, rtSeparator)
+    rtCount = MEMORY.Read64(rtArray)
+    rtData = MEMORY.Read64(rtArray + 8)
+    IF rtCount == 0 THEN RETURN FissionRt_StrNew(0)
+    rtPieces = FissionRt_Alloc(rtCount * 8)
+    rtSeparatorLength = FissionRt_StrLen(rtSeparator)
+    rtTotal = rtSeparatorLength * (rtCount - 1)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtPiece = FISSION.Bits(FissionRt_ToString(FissionRt_BoxElement(rtElementTag, MEMORY.Read64(rtData + rtIndex * 8))))
+        rtIgnored = MEMORY.Write64(rtPieces + rtIndex * 8, rtPiece)
+        rtTotal = rtTotal + FissionRt_StrLen(rtPiece)
+        rtIndex = rtIndex + 1
+    WEND
+    rtResult = FissionRt_StrNew(rtTotal)
+    rtCursor = rtResult
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        IF rtIndex > 0 THEN
+            rtIgnored = FissionRt_CopyBytes(rtCursor, rtSeparator, rtSeparatorLength)
+            rtCursor = rtCursor + rtSeparatorLength
+        END IF
+        rtPiece = MEMORY.Read64(rtPieces + rtIndex * 8)
+        rtPieceLength = FissionRt_StrLen(rtPiece)
+        rtIgnored = FissionRt_CopyBytes(rtCursor, rtPiece, rtPieceLength)
+        rtCursor = rtCursor + rtPieceLength
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION

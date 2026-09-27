@@ -89,7 +89,8 @@ FUNCTION Fission_BytecodeLowerInstruction(module, fn, block, amirInstruction)
         RETURN
     END IF
     IF kind == "DeclareClass" THEN
-        ignored = block.Append(FissionBytecodeInstruction("DECLARE_CLASS").WithField("Name", amirInstruction.Field("Name")))
+        ignored = block.Append(FissionBytecodeInstruction("DECLARE_CLASS").WithField("Name", amirInstruction.Field("Name")).WithField("Extends", amirInstruction.Field("Extends")))
+        module.ClassParents[amirInstruction.Field("Name")] = amirInstruction.Field("Extends")
         RETURN
     END IF
     IF kind == "Array" THEN
@@ -120,6 +121,10 @@ FUNCTION Fission_BytecodeLowerInstruction(module, fn, block, amirInstruction)
         ignored = block.Append(FissionBytecodeInstruction("THROW").WithField("Value", amirInstruction.Field("Value")))
         RETURN
     END IF
+    IF kind == "Copy" THEN
+        ignored = block.Append(FissionBytecodeInstruction("COPY").WithField("Dest", amirInstruction.Field("Dest")).WithField("Value", amirInstruction.Field("Value")))
+        RETURN
+    END IF
     IF kind == "Addressof" THEN
         ignored = block.Append(FissionBytecodeInstruction("ADDRESSOF").WithField("Dest", amirInstruction.Field("Dest")).WithField("Name", amirInstruction.Field("Name")))
         RETURN
@@ -139,7 +144,48 @@ FUNCTION Fission_BytecodeLowerFunction(module, amirFunction)
             ignored = Fission_BytecodeLowerInstruction(module, fn, block, instruction)
         NEXT
     NEXT
+    ' A-MIR numbers temps across the whole module; the VM sizes every frame
+    ' of a function by its highest temp index, so a function late in a big
+    ' program would allocate thousands of slots per call. Renumber densely,
+    ' per function, in order of first use.
+    ' (A CONST's literal text is left alone: it is data, not an operand.)
+    tempMap = {}
+    tempCounter = {Next: 0}
+    FOR block IN fn.Blocks
+        FOR instruction IN block.Instructions
+            FOR fieldName IN instruction.FieldNames
+                IF fieldName != "Const" THEN instruction.Fields[fieldName] = Fission_BytecodeRenumberTemps(instruction.Fields[fieldName], tempMap, tempCounter)
+            NEXT
+        NEXT
+    NEXT
     RETURN fn
+END FUNCTION
+
+' `text` with every `%tN` replaced by its per-function number from tempMap
+' (new temps are numbered in order of first appearance).
+FUNCTION Fission_BytecodeRenumberTemps(text, tempMap, tempCounter)
+    IF String.Contains(text, "%t") == FALSE THEN RETURN text
+    result = ""
+    rest = text
+    WHILE String.Contains(rest, "%t")
+        at = String.IndexOf(rest, "%t")
+        result = result + String.Slice(rest, 0, at + 2)
+        rest = String.Slice(rest, at + 2, String.Length(rest) - at - 2)
+        digitCount = 0
+        WHILE digitCount < String.Length(rest) ANDALSO String.Contains("0123456789", String.Slice(rest, digitCount, 1))
+            digitCount = digitCount + 1
+        WEND
+        IF digitCount > 0 THEN
+            oldNumber = String.Slice(rest, 0, digitCount)
+            IF Object.Has(tempMap, oldNumber) == FALSE THEN
+                tempMap[oldNumber] = String(tempCounter.Next)
+                tempCounter.Next = tempCounter.Next + 1
+            END IF
+            result = result + tempMap[oldNumber]
+            rest = String.Slice(rest, digitCount, String.Length(rest) - digitCount)
+        END IF
+    WEND
+    RETURN result + rest
 END FUNCTION
 
 FUNCTION Fission_AmirToBytecode(amirModule)

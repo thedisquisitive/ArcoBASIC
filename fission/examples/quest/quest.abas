@@ -1,0 +1,43 @@
+' Quest: a small rules language for game designers, written with only the
+' Level 1 construction API. The language lists its statements as patterns and
+' says what each one means; Fission does the tokenizing, the expression
+' parsing (with precedence), the blocks and the error reporting.
+'
+'   damage = strength * 2 + weaponBonus
+'   show damage
+'   repeat 3 ... end
+'   if damage > 15 ... otherwise ... end
+'   # a comment
+#IMPORT "fission/core/fission.abas"
+
+FUNCTION Quest_Set(node, builder)
+    RETURN builder.AssignValue(node.Target, node.Value)
+END FUNCTION
+
+FUNCTION Quest_Show(node, builder)
+    RETURN builder.PrintValue(node.Value)
+END FUNCTION
+
+' node.Id is unique per statement, so nested repeats get their own counter.
+FUNCTION Quest_Repeat(node, builder)
+    RETURN builder.ForRangeLoop("__quest_round" + String(node.Id), builder.Literal("1"), node.Count, builder.Literal("1"), node.Body)
+END FUNCTION
+
+FUNCTION Quest_When(node, builder)
+    RETURN builder.Conditional(node.Condition, node.Body, node.ElseBody)
+END FUNCTION
+
+FUNCTION Quest_Register(host)
+    quest = host.LanguageKit().BeginnerCompiledLanguage("quest", ".quest")
+    ignored = quest.Comment("#")
+    ignored = quest.Statement("Set", "{Target:name} = {Value}")
+    ignored = quest.Statement("Show", "show {Value}")
+    ignored = quest.Block("Repeat", "repeat {Count}", "end")
+    ignored = quest.Block("When", "if {Condition}", "end")
+    ignored = quest.Alternative("When", "otherwise")
+    ignored = quest.On("Set", ADDRESSOF Quest_Set)
+    ignored = quest.On("Show", ADDRESSOF Quest_Show)
+    ignored = quest.On("Repeat", ADDRESSOF Quest_Repeat)
+    ignored = quest.On("When", ADDRESSOF Quest_When)
+    RETURN host.Register(quest)
+END FUNCTION

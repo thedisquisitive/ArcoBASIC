@@ -1,0 +1,16 @@
+' MEMORY.Read8/16/32/64 + MEMORY.Write8/16/32/64 (ArcoBASIC's own systems-level
+' memory access) and LINUX.Syscall (the runtime.linux primitive), lowered inline by
+' fission/amir/lower_x86_64.abas. Native-only: the hosted oracle has no LINUX.Syscall,
+' so tests/integration/fission_substrate_core_smoke.sh checks an explicit expected output.
+page = LINUX.Syscall(9, 0, 4096, 3, 34, -1, 0)
+PRINT page > 0
+ignored = MEMORY.Write64(page, 1234567890123)
+PRINT MEMORY.Read64(page)
+ignored = MEMORY.Write32(page + 8, 4294967295)
+PRINT MEMORY.Read32(page + 8)
+ignored = MEMORY.Write16(page + 16, 65535)
+PRINT MEMORY.Read16(page + 16)
+ignored = MEMORY.Write8(page + 24, 300)
+PRINT MEMORY.Read8(page + 24)
+PRINT MEMORY.Read8(page)
+PRINT MEMORY.Read16(page + 12)

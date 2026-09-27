@@ -1,0 +1,101 @@
+' The generic Fission build command, for any set of registered components:
+'
+'   build FILE [-o OUTPUT] [--target TARGET] [--language NAME] [--pipeline]
+'
+' The language comes from the file extension (or --language); the pipeline
+' from Source.<language> to the target's artifact type is resolved from the
+' registered components. Targets: bytecode, linux-x86_64 (default), and the
+' intermediate forms sir and amir (written as text).
+' A language package gets a complete compiler with:
+'
+'   host = Fission_New()
+'   ignored = Fission_RegisterBuiltinComponents(host)
+'   ... register the language ...
+'   ignored = Fission_RunBuildCli(host, Runtime.Args())
+#IMPORT "fission/components/builtin.abas"
+
+FUNCTION FissionBuildCli_Usage()
+    PRINT "usage: build FILE [-o OUTPUT] [--target bytecode|linux-x86_64|sir|amir] [--language NAME] [--pipeline]"
+    ignored = Exit(2)
+    RETURN 0
+END FUNCTION
+
+' Name of the registered language whose extension matches the path, or "".
+FUNCTION FissionBuildCli_LanguageFor(host, path)
+    FOR component IN host.Registry.Components
+        FOR key IN Object.Keys(component.Configuration)
+            IF String.StartsWith(key, "extension:") THEN
+                extension = String.Slice(key, 10, String.Length(key) - 10)
+                IF String.EndsWith(path, extension) THEN RETURN Object.Get(component.Configuration, "language:name", "")
+            END IF
+        NEXT
+    NEXT
+    RETURN ""
+END FUNCTION
+
+FUNCTION FissionBuildCli_ArtifactTypeFor(target)
+    IF target == "bytecode" THEN RETURN "Bytecode"
+    IF target == "linux-x86_64" ORELSE target == "native" THEN RETURN "Executable.linux-x86_64"
+    IF target == "sir" THEN RETURN "SIR"
+    IF target == "amir" THEN RETURN "A-MIR"
+    RETURN ""
+END FUNCTION
+
+FUNCTION Fission_RunBuildCli(host, appArgs)
+    IF LEN(appArgs) < 2 ORELSE appArgs[0] != "build" THEN RETURN FissionBuildCli_Usage()
+    sourcePath = appArgs[1]
+    outputPath = ""
+    target = "linux-x86_64"
+    languageName = ""
+    showPipeline = FALSE
+    index = 2
+    WHILE index < LEN(appArgs)
+        option = appArgs[index]
+        IF option == "--pipeline" THEN
+            showPipeline = TRUE
+            index = index + 1
+            CONTINUE WHILE
+        END IF
+        IF index + 1 >= LEN(appArgs) THEN RETURN FissionBuildCli_Usage()
+        IF option == "-o" THEN outputPath = appArgs[index + 1]
+        IF option == "--target" THEN target = appArgs[index + 1]
+        IF option == "--language" THEN languageName = appArgs[index + 1]
+        index = index + 2
+    WEND
+    IF languageName == "" THEN languageName = FissionBuildCli_LanguageFor(host, sourcePath)
+    IF languageName == "" THEN
+        PRINT "FISSION BUILD FAILED: no registered language handles " + sourcePath
+        ignored = Exit(1)
+    END IF
+    outputType = FissionBuildCli_ArtifactTypeFor(target)
+    IF outputType == "" THEN
+        PRINT "FISSION BUILD FAILED: unknown target " + target
+        ignored = Exit(1)
+    END IF
+    IF File.Exists(sourcePath) == FALSE THEN
+        PRINT "FISSION BUILD FAILED: no such file " + sourcePath
+        ignored = Exit(1)
+    END IF
+
+    request = host.Request().WithLanguage(languageName).ToArtifact(outputType)
+    request.Source = File.ReadText(sourcePath)
+    request.SourceName = sourcePath
+    result = host.Compiler().Compile(request)
+    IF showPipeline THEN PRINT result.Pipeline.Render()
+    IF result.Ok == FALSE THEN
+        PRINT "FISSION BUILD FAILED"
+        PRINT result.Diagnostics.Render()
+        ignored = Exit(1)
+    END IF
+    IF outputPath == "" THEN RETURN 0
+
+    value = result.Artifact.Value
+    IF outputType == "Executable.linux-x86_64" THEN
+        ignored = File.WriteBytes(outputPath, value.Bytes)
+        ignored = File.SetExecutable(outputPath)
+    ELSE
+        ignored = File.WriteText(outputPath, value.Render())
+    END IF
+    PRINT "FISSION BUILT " + outputPath + " (" + outputType + ")"
+    RETURN 0
+END FUNCTION

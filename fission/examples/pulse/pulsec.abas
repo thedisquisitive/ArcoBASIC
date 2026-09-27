@@ -1,0 +1,10 @@
+' A complete Pulse compiler: Fission's own components plus the Pulse language.
+'   pulsec build program.pulse -o program                 (native executable)
+'   pulsec build program.pulse -o program.arcof --target bytecode
+#IMPORT "fission/cli/build_cli.abas"
+#IMPORT "fission/examples/pulse/pulse.abas"
+
+host = Fission_New()
+ignored = Fission_RegisterBuiltinComponents(host)
+ignored = Pulse_Register(host)
+ignored = Fission_RunBuildCli(host, Runtime.Args())

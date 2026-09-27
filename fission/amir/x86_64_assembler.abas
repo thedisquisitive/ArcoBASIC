@@ -109,6 +109,17 @@ FUNCTION Fission_X86_64AsmParseRegisterToken(token)
     END IF
     plainIndex = Fission_X86_64AsmRegisterIndex(name)
     IF plainIndex >= 0 THEN RETURN {Index: plainIndex, IsByteReg: FALSE, IsXmm: FALSE}
+    ' 32-bit (%eax..%edi, %r8d..%r15d) and 16-bit (%ax..%di, %r8w..%r15w)
+    ' names -- the operand width itself is carried by the MNEMONIC
+    ' (movl/movw/movzwq), so only the register index matters here.
+    narrowTable = {eax: 0, ecx: 1, edx: 2, ebx: 3, esp: 4, ebp: 5, esi: 6, edi: 7,
+                   ax: 0, cx: 1, dx: 2, bx: 3, sp: 4, bp: 5, si: 6, di: 7}
+    narrowIndex = Object.Get(narrowTable, name, -1)
+    IF narrowIndex >= 0 THEN RETURN {Index: narrowIndex, IsByteReg: FALSE, IsXmm: FALSE}
+    IF String.StartsWith(name, "r") ANDALSO (String.EndsWith(name, "d") ORELSE String.EndsWith(name, "w")) THEN
+        extendedIndex = Fission_X86_64AsmRegisterIndex(String.Slice(name, 0, String.Length(name) - 1))
+        IF extendedIndex >= 8 THEN RETURN {Index: extendedIndex, IsByteReg: FALSE, IsXmm: FALSE}
+    END IF
     RETURN NULL
 END FUNCTION
 
@@ -643,6 +654,31 @@ FUNCTION Fission_X86_64AsmEncodeInstruction(buffer, fixups, diagnostics, mnemoni
         RETURN
     END IF
 
+    ' 32/16-bit memory moves, needed by MEMORY.Read32/Read16/Write32/Write16
+    ' (see fission/amir/lower_x86_64.abas). `movl` load (8B /r, no REX.W)
+    ' zero-extends into the full 64-bit register, as the ISA defines;
+    ' `movl`/`movw` stores are 89 /r (`movw` with the 66 operand-size
+    ' prefix, which must precede REX); `movzwq` is REX.W 0F B7 /r.
+    IF mnemonic == "movl" THEN
+        src = operands[0]
+        dst = operands[1]
+        IF dst.Kind == "reg" THEN
+            ignored = Fission_X86_64AsmEmitRegRm(buffer, 0, [139], dst.Index, src)
+        ELSE
+            ignored = Fission_X86_64AsmEmitRegRm(buffer, 0, [137], src.Index, dst)
+        END IF
+        RETURN
+    END IF
+    IF mnemonic == "movw" THEN
+        ignored = buffer.EmitByte(102)
+        ignored = Fission_X86_64AsmEmitRegRm(buffer, 0, [137], operands[0].Index, operands[1])
+        RETURN
+    END IF
+    IF mnemonic == "movzwq" THEN
+        ignored = Fission_X86_64AsmEmitRegRm(buffer, 1, [15, 183], operands[1].Index, operands[0])
+        RETURN
+    END IF
+
     IF mnemonic == "movzbq" THEN
         src = operands[0]
         dst = operands[1]
@@ -726,6 +762,17 @@ FUNCTION Fission_X86_64AsmEncodeInstruction(buffer, fixups, diagnostics, mnemoni
             ignored = buffer.EmitByte(80 + (operand.Index BITAND 7))
             RETURN
         END IF
+        ' push imm8 (6A ib) / push imm32 (68 id), sign-extended to 64 bits.
+        IF operand.Kind == "imm" THEN
+            IF operand.Value >= -128 ANDALSO operand.Value <= 127 THEN
+                ignored = buffer.EmitByte(106)
+                ignored = buffer.EmitByte(operand.Value BITAND 255)
+            ELSE
+                ignored = buffer.EmitByte(104)
+                ignored = buffer.EmitU32(operand.Value)
+            END IF
+            RETURN
+        END IF
         ' push m64 -- FF /6.
         rmBits = Fission_X86_64AsmRmIndexBits(operand)
         ignored = Fission_X86_64AsmEmitRex(buffer, 0, 0, -1, rmBits.Base)
@@ -797,6 +844,18 @@ FUNCTION Fission_X86_64AsmEncodeInstruction(buffer, fixups, diagnostics, mnemoni
         RETURN
     END IF
 
+    ' Indirect call through a register, `call *%reg` (FF /2): used by the
+    ' FISSION.CallAddress intrinsic for dynamic method dispatch.
+    ' `jmp *%reg` (FF /4) is the same shape: unwinding to a CATCH block.
+    IF (mnemonic == "call" ORELSE mnemonic == "jmp") ANDALSO operands[0].Kind == "label" ANDALSO String.StartsWith(operands[0].Name, "*%") THEN
+        target = Fission_X86_64AsmParseRegisterToken(String.Slice(operands[0].Name, 1, String.Length(operands[0].Name) - 1))
+        IF target.Index >= 8 THEN ignored = buffer.EmitByte(65)
+        ignored = buffer.EmitByte(255)
+        extension = 16
+        IF mnemonic == "jmp" THEN extension = 32
+        ignored = buffer.EmitByte(192 + extension + (target.Index MOD 8))
+        RETURN
+    END IF
     IF mnemonic == "jmp" ORELSE mnemonic == "call" THEN
         opcode = 233
         IF mnemonic == "call" THEN opcode = 232
@@ -808,7 +867,8 @@ FUNCTION Fission_X86_64AsmEncodeInstruction(buffer, fixups, diagnostics, mnemoni
     END IF
 
     jccOpcodes = {"je": 132, "jz": 132, "jne": 133, "jnz": 133, "jl": 140, "jle": 142,
-                  "jg": 143, "jge": 141, "js": 136, "jns": 137}
+                  "jg": 143, "jge": 141, "js": 136, "jns": 137,
+                  "jb": 130, "jae": 131, "jbe": 134, "ja": 135}
     IF Object.Has(jccOpcodes, mnemonic) THEN
         opcode = Object.Get(jccOpcodes, mnemonic, 132)
         ignored = buffer.EmitByte(15)
@@ -865,7 +925,11 @@ FUNCTION Fission_X86_64AsmUnescapeBytes(text)
                             IF nextCh == "r" THEN
                                 ignored = Array.Push(bytes, 13)
                             ELSE
-                                ignored = Array.Push(bytes, Fission_X86_64AsmCharCode(nextCh))
+                                IF nextCh == "0" THEN
+                                    ignored = Array.Push(bytes, 0)
+                                ELSE
+                                    ignored = Array.Push(bytes, Fission_X86_64AsmCharCode(nextCh))
+                                END IF
                             END IF
                         END IF
                     END IF
@@ -874,7 +938,10 @@ FUNCTION Fission_X86_64AsmUnescapeBytes(text)
             index = index + 2
             CONTINUE WHILE
         END IF
-        ignored = Array.Push(bytes, Fission_X86_64AsmCharCode(ch))
+        ' Any character, including non-ASCII (UTF-8) text, as its real bytes.
+        FOR charByte IN Bytes.FromText(ch)
+            ignored = Array.Push(bytes, charByte)
+        NEXT
         index = index + 1
     WEND
     RETURN bytes

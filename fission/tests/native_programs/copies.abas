@@ -1,0 +1,67 @@
+' Copy(value) is shallow: a new array/map/instance with the same elements.
+CLASS Pair
+    CONSTRUCTOR(a, b)
+        SELF.A = a
+        SELF.B = b
+    END CONSTRUCTOR
+END CLASS
+
+items = [1, 2, 3]
+twin = Copy(items)
+ignored = Array.Push(twin, 4)
+PRINT items
+PRINT twin
+settings = {Mode: "fast", Level: 2}
+other = Copy(settings)
+other.Mode = "slow"
+PRINT settings
+PRINT other
+p = Pair(1, "x")
+q = Copy(p)
+q.A = 9
+PRINT p.A
+PRINT q.A
+PRINT q.B
+PRINT (1 SHL 4) + (256 SHR 2)
+half = 4503599627370496 * 1.5
+PRINT half BITAND 4294967295
+PRINT half SHR 32
+
+FUNCTION Collect(first, second)
+    gathered = []
+    ignored = Array.Push(gathered, first)
+    ignored = Array.Push(gathered, second)
+    RETURN gathered
+END FUNCTION
+
+mixed = Collect(72, "i")
+bytes = Collect(72, 105)
+wrote = File.WriteBytes(".rivet/copies_test.bin", bytes)
+PRINT File.ReadText(".rivet/copies_test.bin")
+PRINT mixed
+
+FUNCTION Eight(a, b, c, d, e, f, g, h)
+    RETURN a + b + c + d + e + f + g * 100 + h * 1000
+END FUNCTION
+PRINT Eight(1, 2, 3, 4, 5, 6, 0, 300)
+
+FUNCTION SumAll(numbers)
+    total = 0
+    FOR n IN numbers
+        total = total + n
+    NEXT
+    RETURN total
+END FUNCTION
+dynamicNumbers = Collect(40, 2)
+PRINT SumAll(dynamicNumbers)
+PRINT SumAll([1, 2, 3])
+
+' One RETURN gives a plain string array, another a dynamic one.
+FUNCTION Pick(flag)
+    IF flag THEN RETURN ["literal", "strings"]
+    RETURN Collect(1, "two")
+END FUNCTION
+FOR picked IN Pick(TRUE)
+    PRINT picked
+NEXT
+PRINT Pick(FALSE)

@@ -1,0 +1,558 @@
+' Host functions for arrays, bytes and text splitting, in ArcoBASIC (formerly
+' C in fission/native_runtime/host_bridge.c). An array value is a pointer to
+' its 3-word header {length, data pointer, capacity}; elements are raw
+' 64-bit words (numbers, or pointers for strings/objects). Sorting is a
+' stable merge sort (the same order the old stable insertion sort gave).
+
+' A new array of `rtCount` zeroed elements.
+FUNCTION FissionRt_NewArray(rtCount)
+    rtHeader = FissionRt_Alloc(24)
+    rtIgnored = MEMORY.Write64(rtHeader, rtCount)
+    IF rtCount > 0 THEN rtIgnored = MEMORY.Write64(rtHeader + 8, FissionRt_Alloc(rtCount * 8))
+    rtIgnored = MEMORY.Write64(rtHeader + 16, rtCount)
+    RETURN rtHeader
+END FUNCTION
+
+FUNCTION FissionRt_ArrayData(rtArray)
+    RETURN MEMORY.Read64(rtArray + 8)
+END FUNCTION
+
+' Room for `rtNeeded` elements (geometric growth); returns the data pointer.
+FUNCTION FissionRt_ArrayReserve(rtHeader, rtNeeded)
+    rtCapacity = MEMORY.Read64(rtHeader + 16)
+    IF rtNeeded <= rtCapacity THEN RETURN MEMORY.Read64(rtHeader + 8)
+    rtNewCapacity = rtCapacity * 2
+    IF rtNewCapacity < 8 THEN rtNewCapacity = 8
+    IF rtNewCapacity < rtNeeded THEN rtNewCapacity = rtNeeded
+    rtNewData = FissionRt_Alloc(rtNewCapacity * 8)
+    rtIgnored = FissionRt_CopyBytes(rtNewData, MEMORY.Read64(rtHeader + 8), MEMORY.Read64(rtHeader) * 8)
+    rtIgnored = MEMORY.Write64(rtHeader + 8, rtNewData)
+    rtIgnored = MEMORY.Write64(rtHeader + 16, rtNewCapacity)
+    RETURN rtNewData
+END FUNCTION
+
+' Moves `rtCount` words at `rtFrom` to `rtTo` (overlap-safe either way).
+FUNCTION FissionRt_MoveWords(rtTo, rtFrom, rtCount)
+    IF rtTo > rtFrom THEN
+        rtIndex = rtCount - 1
+        WHILE rtIndex >= 0
+            rtIgnored = MEMORY.Write64(rtTo + rtIndex * 8, MEMORY.Read64(rtFrom + rtIndex * 8))
+            rtIndex = rtIndex - 1
+        WEND
+    ELSE
+        rtIndex = 0
+        WHILE rtIndex < rtCount
+            rtIgnored = MEMORY.Write64(rtTo + rtIndex * 8, MEMORY.Read64(rtFrom + rtIndex * 8))
+            rtIndex = rtIndex + 1
+        WEND
+    END IF
+    RETURN rtTo
+END FUNCTION
+
+FUNCTION arco_host_array_first(rtArray)
+    IF MEMORY.Read64(rtArray) == 0 THEN RETURN 0
+    RETURN MEMORY.Read64(FissionRt_ArrayData(rtArray))
+END FUNCTION
+
+FUNCTION arco_host_array_last(rtArray)
+    rtCount = MEMORY.Read64(rtArray)
+    IF rtCount == 0 THEN RETURN 0
+    RETURN MEMORY.Read64(FissionRt_ArrayData(rtArray) + (rtCount - 1) * 8)
+END FUNCTION
+
+FUNCTION arco_host_array_find_number(rtArray, rtValue)
+    rtCount = MEMORY.Read64(rtArray)
+    rtData = FissionRt_ArrayData(rtArray)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        IF MEMORY.Read64(rtData + rtIndex * 8) == rtValue THEN RETURN rtIndex
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN -1
+END FUNCTION
+
+FUNCTION arco_host_array_find_string(rtArray, rtValue)
+    rtCount = MEMORY.Read64(rtArray)
+    rtData = FissionRt_ArrayData(rtArray)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        IF FissionRt_StrEquals(MEMORY.Read64(rtData + rtIndex * 8), rtValue) == 1 THEN RETURN rtIndex
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN -1
+END FUNCTION
+
+FUNCTION arco_host_array_contains_number(rtArray, rtValue)
+    IF arco_host_array_find_number(rtArray, rtValue) >= 0 THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+FUNCTION arco_host_array_contains_string(rtArray, rtValue)
+    IF arco_host_array_find_string(rtArray, rtValue) >= 0 THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+FUNCTION arco_host_array_clear(rtArray)
+    rtIgnored = MEMORY.Write64(rtArray, 0)
+    RETURN 0
+END FUNCTION
+
+FUNCTION arco_host_array_pop(rtArray)
+    rtCount = MEMORY.Read64(rtArray)
+    IF rtCount == 0 THEN RETURN 0
+    rtIgnored = MEMORY.Write64(rtArray, rtCount - 1)
+    RETURN MEMORY.Read64(FissionRt_ArrayData(rtArray) + (rtCount - 1) * 8)
+END FUNCTION
+
+FUNCTION arco_host_array_remove_at(rtArray, rtIndex)
+    rtCount = MEMORY.Read64(rtArray)
+    IF rtIndex < 0 ORELSE rtIndex >= rtCount THEN RETURN 0
+    rtData = FissionRt_ArrayData(rtArray)
+    rtValue = MEMORY.Read64(rtData + rtIndex * 8)
+    rtIgnored = FissionRt_MoveWords(rtData + rtIndex * 8, rtData + (rtIndex + 1) * 8, rtCount - rtIndex - 1)
+    rtIgnored = MEMORY.Write64(rtArray, rtCount - 1)
+    RETURN rtValue
+END FUNCTION
+
+FUNCTION arco_host_array_shift(rtArray)
+    RETURN arco_host_array_remove_at(rtArray, 0)
+END FUNCTION
+
+FUNCTION arco_host_array_remove_number(rtArray, rtValue)
+    rtIndex = arco_host_array_find_number(rtArray, rtValue)
+    IF rtIndex < 0 THEN RETURN 0
+    rtIgnored = arco_host_array_remove_at(rtArray, rtIndex)
+    RETURN 1
+END FUNCTION
+
+FUNCTION arco_host_array_remove_string(rtArray, rtValue)
+    rtIndex = arco_host_array_find_string(rtArray, rtValue)
+    IF rtIndex < 0 THEN RETURN 0
+    rtIgnored = arco_host_array_remove_at(rtArray, rtIndex)
+    RETURN 1
+END FUNCTION
+
+FUNCTION arco_host_array_reverse(rtArray)
+    rtCount = MEMORY.Read64(rtArray)
+    rtResult = FissionRt_NewArray(rtCount)
+    rtFrom = FissionRt_ArrayData(rtArray)
+    rtTo = FissionRt_ArrayData(rtResult)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write64(rtTo + rtIndex * 8, MEMORY.Read64(rtFrom + (rtCount - 1 - rtIndex) * 8))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+' Whether word `rtA` sorts strictly before `rtB`. Modes: 0 numbers, 1
+' strings, 2 indexes into number keys, 3 indexes into string keys;
+' `rtDescending` flips the order.
+FUNCTION FissionRt_SortLess(rtA, rtB, rtMode, rtKeys, rtDescending)
+    IF rtMode == 0 ORELSE rtMode == 2 THEN
+        rtX = rtA
+        rtY = rtB
+        IF rtMode == 2 THEN
+            rtX = MEMORY.Read64(rtKeys + rtA * 8)
+            rtY = MEMORY.Read64(rtKeys + rtB * 8)
+        END IF
+        IF rtDescending == 0 THEN
+            IF rtX < rtY THEN RETURN 1
+            RETURN 0
+        END IF
+        IF rtX > rtY THEN RETURN 1
+        RETURN 0
+    END IF
+    rtS = rtA
+    rtT = rtB
+    IF rtMode == 3 THEN
+        rtS = MEMORY.Read64(rtKeys + rtA * 8)
+        rtT = MEMORY.Read64(rtKeys + rtB * 8)
+    END IF
+    rtOrder = FissionRt_StrCmp(rtS, rtT)
+    IF rtDescending == 0 THEN
+        IF rtOrder < 0 THEN RETURN 1
+        RETURN 0
+    END IF
+    IF rtOrder > 0 THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+' Stable bottom-up merge sort of `rtCount` words at `rtData`, in place.
+FUNCTION FissionRt_SortWords(rtData, rtCount, rtMode, rtKeys, rtDescending)
+    IF rtCount < 2 THEN RETURN 0
+    rtScratch = FissionRt_Alloc(rtCount * 8)
+    rtFrom = rtData
+    rtTo = rtScratch
+    rtWidth = 1
+    WHILE rtWidth < rtCount
+        rtLeft = 0
+        WHILE rtLeft < rtCount
+            rtMiddle = rtLeft + rtWidth
+            IF rtMiddle > rtCount THEN rtMiddle = rtCount
+            rtRight = rtLeft + rtWidth * 2
+            IF rtRight > rtCount THEN rtRight = rtCount
+            rtI = rtLeft
+            rtJ = rtMiddle
+            rtK = rtLeft
+            WHILE rtK < rtRight
+                rtTakeRight = 0
+                IF rtI >= rtMiddle THEN
+                    rtTakeRight = 1
+                ELSE
+                    IF rtJ < rtRight THEN rtTakeRight = FissionRt_SortLess(MEMORY.Read64(rtFrom + rtJ * 8), MEMORY.Read64(rtFrom + rtI * 8), rtMode, rtKeys, rtDescending)
+                END IF
+                IF rtTakeRight == 1 THEN
+                    rtIgnored = MEMORY.Write64(rtTo + rtK * 8, MEMORY.Read64(rtFrom + rtJ * 8))
+                    rtJ = rtJ + 1
+                ELSE
+                    rtIgnored = MEMORY.Write64(rtTo + rtK * 8, MEMORY.Read64(rtFrom + rtI * 8))
+                    rtI = rtI + 1
+                END IF
+                rtK = rtK + 1
+            WEND
+            rtLeft = rtRight
+        WEND
+        rtSwap = rtFrom
+        rtFrom = rtTo
+        rtTo = rtSwap
+        rtWidth = rtWidth * 2
+    WEND
+    IF rtFrom != rtData THEN rtIgnored = FissionRt_CopyBytes(rtData, rtFrom, rtCount * 8)
+    RETURN 0
+END FUNCTION
+
+FUNCTION FissionRt_SortedCopy(rtArray, rtMode)
+    rtCount = MEMORY.Read64(rtArray)
+    rtResult = FissionRt_NewArray(rtCount)
+    rtIgnored = FissionRt_CopyBytes(FissionRt_ArrayData(rtResult), FissionRt_ArrayData(rtArray), rtCount * 8)
+    rtIgnored = FissionRt_SortWords(FissionRt_ArrayData(rtResult), rtCount, rtMode, 0, 0)
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_array_sort_number(rtArray)
+    RETURN FissionRt_SortedCopy(rtArray, 0)
+END FUNCTION
+
+FUNCTION arco_host_array_sort_string(rtArray)
+    RETURN FissionRt_SortedCopy(rtArray, 1)
+END FUNCTION
+
+' Array of 0..count-1 ordered by the keys (SortBy).
+FUNCTION FissionRt_SortIndices(rtKeys, rtCount, rtDescending, rtMode)
+    rtResult = FissionRt_NewArray(rtCount)
+    rtData = FissionRt_ArrayData(rtResult)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write64(rtData + rtIndex * 8, rtIndex)
+        rtIndex = rtIndex + 1
+    WEND
+    rtFlag = 0
+    IF rtDescending != 0 THEN rtFlag = 1
+    rtIgnored = FissionRt_SortWords(rtData, rtCount, rtMode, rtKeys, rtFlag)
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_array_sort_indices_number(rtKeys, rtCount, rtDescending)
+    RETURN FissionRt_SortIndices(rtKeys, rtCount, rtDescending, 2)
+END FUNCTION
+
+FUNCTION arco_host_array_sort_indices_string(rtKeys, rtCount, rtDescending)
+    RETURN FissionRt_SortIndices(rtKeys, rtCount, rtDescending, 3)
+END FUNCTION
+
+FUNCTION arco_host_array_reorder(rtArray, rtIndices)
+    rtCount = MEMORY.Read64(rtIndices)
+    rtResult = FissionRt_NewArray(rtCount)
+    rtFrom = FissionRt_ArrayData(rtArray)
+    rtOrder = FissionRt_ArrayData(rtIndices)
+    rtTo = FissionRt_ArrayData(rtResult)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write64(rtTo + rtIndex * 8, MEMORY.Read64(rtFrom + MEMORY.Read64(rtOrder + rtIndex * 8) * 8))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+' Index of the smallest (or, with rtMaximum, largest) key; the first wins ties.
+FUNCTION FissionRt_ArgBest(rtKeys, rtCount, rtMaximum, rtMode)
+    IF rtCount == 0 THEN RETURN 0
+    rtFlag = 0
+    IF rtMaximum != 0 THEN rtFlag = 1
+    rtBest = 0
+    rtIndex = 1
+    WHILE rtIndex < rtCount
+        IF FissionRt_SortLess(rtIndex, rtBest, rtMode, rtKeys, rtFlag) == 1 THEN rtBest = rtIndex
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtBest
+END FUNCTION
+
+FUNCTION arco_host_array_argbest_number(rtKeys, rtCount, rtMaximum)
+    RETURN FissionRt_ArgBest(rtKeys, rtCount, rtMaximum, 2)
+END FUNCTION
+
+FUNCTION arco_host_array_argbest_string(rtKeys, rtCount, rtMaximum)
+    RETURN FissionRt_ArgBest(rtKeys, rtCount, rtMaximum, 3)
+END FUNCTION
+
+FUNCTION arco_host_array_element_at(rtArray, rtIndex)
+    RETURN MEMORY.Read64(FissionRt_ArrayData(rtArray) + rtIndex * 8)
+END FUNCTION
+
+FUNCTION arco_host_array_alloc_raw(rtCount)
+    RETURN FissionRt_NewArray(rtCount)
+END FUNCTION
+
+FUNCTION arco_host_array_empty(rtArray)
+    IF MEMORY.Read64(rtArray) == 0 THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+FUNCTION arco_host_array_new(rtCount, rtFill)
+    rtResult = FissionRt_NewArray(rtCount)
+    rtData = FissionRt_ArrayData(rtResult)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write64(rtData + rtIndex * 8, rtFill)
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_array_unshift(rtArray, rtValue)
+    RETURN arco_host_array_insert(rtArray, 0, rtValue)
+END FUNCTION
+
+FUNCTION arco_host_array_insert(rtArray, rtIndex, rtValue)
+    rtCount = MEMORY.Read64(rtArray)
+    IF rtIndex < 0 ORELSE rtIndex > rtCount THEN RETURN rtCount
+    rtData = FissionRt_ArrayReserve(rtArray, rtCount + 1)
+    rtIgnored = FissionRt_MoveWords(rtData + (rtIndex + 1) * 8, rtData + rtIndex * 8, rtCount - rtIndex)
+    rtIgnored = MEMORY.Write64(rtData + rtIndex * 8, rtValue)
+    rtIgnored = MEMORY.Write64(rtArray, rtCount + 1)
+    RETURN rtCount + 1
+END FUNCTION
+
+FUNCTION arco_host_array_extend(rtArray, rtOther)
+    rtCount = MEMORY.Read64(rtArray)
+    rtOtherCount = MEMORY.Read64(rtOther)
+    rtOtherData = FissionRt_ArrayData(rtOther)
+    rtData = FissionRt_ArrayReserve(rtArray, rtCount + rtOtherCount)
+    rtIgnored = FissionRt_CopyBytes(rtData + rtCount * 8, rtOtherData, rtOtherCount * 8)
+    rtIgnored = MEMORY.Write64(rtArray, rtCount + rtOtherCount)
+    RETURN rtCount + rtOtherCount
+END FUNCTION
+
+FUNCTION arco_host_array_resize(rtArray, rtSize, rtFill)
+    rtCount = MEMORY.Read64(rtArray)
+    rtNewCount = rtSize
+    IF rtNewCount < 0 THEN rtNewCount = 0
+    rtData = FissionRt_ArrayReserve(rtArray, rtNewCount)
+    rtIndex = rtCount
+    WHILE rtIndex < rtNewCount
+        rtIgnored = MEMORY.Write64(rtData + rtIndex * 8, rtFill)
+        rtIndex = rtIndex + 1
+    WEND
+    rtIgnored = MEMORY.Write64(rtArray, rtNewCount)
+    RETURN rtNewCount
+END FUNCTION
+
+' Join an array of strings (rtNumbers 0) or numbers (1).
+FUNCTION FissionRt_JoinRaw(rtArray, rtSeparator, rtNumbers)
+    rtCount = MEMORY.Read64(rtArray)
+    rtData = FissionRt_ArrayData(rtArray)
+    IF rtCount == 0 THEN RETURN FissionRt_StrNew(0)
+    rtPieces = rtData
+    IF rtNumbers == 1 THEN
+        rtPieces = FissionRt_Alloc(rtCount * 8)
+        rtIndex = 0
+        WHILE rtIndex < rtCount
+            rtIgnored = MEMORY.Write64(rtPieces + rtIndex * 8, arco_host_number_to_string(MEMORY.Read64(rtData + rtIndex * 8)))
+            rtIndex = rtIndex + 1
+        WEND
+    END IF
+    rtSeparatorLength = FissionRt_StrLen(rtSeparator)
+    rtTotal = rtSeparatorLength * (rtCount - 1)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtTotal = rtTotal + FissionRt_StrLen(MEMORY.Read64(rtPieces + rtIndex * 8))
+        rtIndex = rtIndex + 1
+    WEND
+    rtResult = FissionRt_StrNew(rtTotal)
+    rtCursor = rtResult
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        IF rtIndex > 0 THEN
+            rtIgnored = FissionRt_CopyBytes(rtCursor, rtSeparator, rtSeparatorLength)
+            rtCursor = rtCursor + rtSeparatorLength
+        END IF
+        rtPiece = MEMORY.Read64(rtPieces + rtIndex * 8)
+        rtPieceLength = FissionRt_StrLen(rtPiece)
+        rtIgnored = FissionRt_CopyBytes(rtCursor, rtPiece, rtPieceLength)
+        rtCursor = rtCursor + rtPieceLength
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_array_join_number(rtArray, rtSeparator)
+    RETURN FissionRt_JoinRaw(rtArray, rtSeparator, 1)
+END FUNCTION
+
+FUNCTION arco_host_array_join_string(rtArray, rtSeparator)
+    RETURN FissionRt_JoinRaw(rtArray, rtSeparator, 0)
+END FUNCTION
+
+FUNCTION arco_host_string_split(rtText, rtDelimiter)
+    rtLength = FissionRt_StrLen(rtText)
+    rtDelimiterLength = FissionRt_StrLen(rtDelimiter)
+    rtResult = FissionRt_NewArray(0)
+    rtFrom = 0
+    IF rtDelimiterLength > 0 THEN
+        rtAt = FissionRt_FindBytes(rtText, rtLength, rtDelimiter, rtDelimiterLength, 0)
+        WHILE rtAt >= 0
+            rtIgnored = FissionRt_ArrayPush(rtResult, FissionRt_SubString(rtText, rtFrom, rtAt - rtFrom))
+            rtFrom = rtAt + rtDelimiterLength
+            rtAt = FissionRt_FindBytes(rtText, rtLength, rtDelimiter, rtDelimiterLength, rtFrom)
+        WEND
+    END IF
+    rtIgnored = FissionRt_ArrayPush(rtResult, FissionRt_SubString(rtText, rtFrom, rtLength - rtFrom))
+    RETURN rtResult
+END FUNCTION
+
+' One string per UTF-8 character.
+FUNCTION arco_host_string_to_chars(rtText)
+    rtLength = FissionRt_StrLen(rtText)
+    rtResult = FissionRt_NewArray(0)
+    rtIndex = 0
+    WHILE rtIndex < rtLength
+        rtStart = rtIndex
+        rtIndex = rtIndex + 1
+        WHILE rtIndex < rtLength ANDALSO (MEMORY.Read8(rtText + rtIndex) BITAND 192) == 128
+            rtIndex = rtIndex + 1
+        WEND
+        rtIgnored = FissionRt_ArrayPush(rtResult, FissionRt_SubString(rtText, rtStart, rtIndex - rtStart))
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+' Lines without their "\n" / "\r\n" endings (no empty last line).
+FUNCTION arco_host_string_lines(rtText)
+    rtLength = FissionRt_StrLen(rtText)
+    rtResult = FissionRt_NewArray(0)
+    rtIndex = 0
+    WHILE rtIndex < rtLength
+        rtStart = rtIndex
+        WHILE rtIndex < rtLength ANDALSO MEMORY.Read8(rtText + rtIndex) != 10
+            rtIndex = rtIndex + 1
+        WEND
+        rtEnd = rtIndex
+        IF rtEnd > rtStart ANDALSO MEMORY.Read8(rtText + rtEnd - 1) == 13 THEN rtEnd = rtEnd - 1
+        rtIgnored = FissionRt_ArrayPush(rtResult, FissionRt_SubString(rtText, rtStart, rtEnd - rtStart))
+        IF rtIndex < rtLength THEN rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION FissionRt_ClampByte(rtValue)
+    IF rtValue < 0 THEN RETURN 0
+    IF rtValue > 255 THEN RETURN 255
+    RETURN rtValue
+END FUNCTION
+
+FUNCTION arco_host_bytes_new(rtSize, rtFill)
+    RETURN arco_host_array_new(rtSize, FissionRt_ClampByte(rtFill))
+END FUNCTION
+
+FUNCTION arco_host_bytes_get_u8(rtArray, rtIndex)
+    IF rtIndex < 0 ORELSE rtIndex >= MEMORY.Read64(rtArray) THEN RETURN 0
+    RETURN FissionRt_ClampByte(MEMORY.Read64(FissionRt_ArrayData(rtArray) + rtIndex * 8))
+END FUNCTION
+
+FUNCTION arco_host_bytes_set_u8(rtArray, rtIndex, rtValue)
+    IF rtIndex >= 0 ANDALSO rtIndex < MEMORY.Read64(rtArray) THEN rtIgnored = MEMORY.Write64(FissionRt_ArrayData(rtArray) + rtIndex * 8, FissionRt_ClampByte(rtValue))
+    RETURN rtArray
+END FUNCTION
+
+FUNCTION arco_host_bytes_from_text(rtText)
+    rtLength = FissionRt_StrLen(rtText)
+    rtResult = FissionRt_NewArray(rtLength)
+    rtData = FissionRt_ArrayData(rtResult)
+    rtIndex = 0
+    WHILE rtIndex < rtLength
+        rtIgnored = MEMORY.Write64(rtData + rtIndex * 8, MEMORY.Read8(rtText + rtIndex))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_bytes_to_text(rtArray)
+    rtCount = MEMORY.Read64(rtArray)
+    rtData = FissionRt_ArrayData(rtArray)
+    rtResult = FissionRt_StrNew(rtCount)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write8(rtResult + rtIndex, FissionRt_ClampByte(MEMORY.Read64(rtData + rtIndex * 8)))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION FissionRt_HexValue(rtByte)
+    IF rtByte >= 48 ANDALSO rtByte <= 57 THEN RETURN rtByte - 48
+    IF rtByte >= 97 ANDALSO rtByte <= 102 THEN RETURN rtByte - 87
+    IF rtByte >= 65 ANDALSO rtByte <= 70 THEN RETURN rtByte - 55
+    RETURN 0
+END FUNCTION
+
+' An odd-length text's first digit is a byte by itself.
+FUNCTION arco_host_hex_to_bytes(rtText)
+    rtLength = FissionRt_StrLen(rtText)
+    rtOdd = rtLength MOD 2
+    rtResult = FissionRt_NewArray(FISSION.Quotient(rtLength + rtOdd, 2))
+    rtData = FissionRt_ArrayData(rtResult)
+    rtPosition = 0
+    rtIndex = 0
+    IF rtOdd == 1 THEN
+        rtIgnored = MEMORY.Write64(rtData, FissionRt_HexValue(MEMORY.Read8(rtText)))
+        rtPosition = 1
+        rtIndex = 1
+    END IF
+    WHILE rtIndex < rtLength
+        rtIgnored = MEMORY.Write64(rtData + rtPosition * 8, (FissionRt_HexValue(MEMORY.Read8(rtText + rtIndex)) SHL 4) BITOR FissionRt_HexValue(MEMORY.Read8(rtText + rtIndex + 1)))
+        rtPosition = rtPosition + 1
+        rtIndex = rtIndex + 2
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_path_join(rtA, rtB)
+    rtBLength = FissionRt_StrLen(rtB)
+    IF rtBLength > 0 ANDALSO MEMORY.Read8(rtB) == 47 THEN RETURN FissionRt_SubString(rtB, 0, rtBLength)
+    rtALength = FissionRt_StrLen(rtA)
+    rtSeparator = 0
+    IF rtALength > 0 ANDALSO MEMORY.Read8(rtA + rtALength - 1) != 47 THEN rtSeparator = 1
+    rtResult = FissionRt_StrNew(rtALength + rtSeparator + rtBLength)
+    rtIgnored = FissionRt_CopyBytes(rtResult, rtA, rtALength)
+    IF rtSeparator == 1 THEN rtIgnored = MEMORY.Write8(rtResult + rtALength, 47)
+    rtIgnored = FissionRt_CopyBytes(rtResult + rtALength + rtSeparator, rtB, rtBLength)
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_range(rtStart, rtStop, rtStep)
+    rtCount = 0
+    IF rtStep > 0 ANDALSO rtStart < rtStop THEN rtCount = FISSION.Quotient(rtStop - rtStart + rtStep - 1, rtStep)
+    IF rtStep < 0 ANDALSO rtStart > rtStop THEN rtCount = FISSION.Quotient(rtStart - rtStop - rtStep - 1, 0 - rtStep)
+    rtResult = FissionRt_NewArray(rtCount)
+    rtData = FissionRt_ArrayData(rtResult)
+    rtValue = rtStart
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write64(rtData + rtIndex * 8, rtValue)
+        rtValue = rtValue + rtStep
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION

@@ -1,0 +1,7 @@
+m = {A: FALSE, B: TRUE}
+PRINT m
+x = FALSE
+PRINT x
+PRINT TYPEOF(m.A)
+arr = [TRUE, FALSE]
+PRINT arr

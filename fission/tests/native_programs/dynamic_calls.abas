@@ -1,0 +1,46 @@
+' Calls through callable values the compiler cannot type statically, plus
+' string/number concatenation, `<>`, TYPEOF, IndexOf with a start, bit
+' vectors and Process.Run.
+CLASS Pipeline
+    CONSTRUCTOR()
+        SELF.Handler = NULL
+    END CONSTRUCTOR
+    FUNCTION Use(callback)
+        SELF.Handler = callback
+        RETURN SELF
+    END FUNCTION
+    FUNCTION Apply(value, context)
+        IF SELF.Handler == NULL THEN RETURN "no handler"
+        handler = SELF.Handler
+        RETURN handler(value, context)
+    END FUNCTION
+END CLASS
+
+FUNCTION Shout(value, context)
+    RETURN Upper(value) + context
+END FUNCTION
+
+p = Pipeline()
+PRINT p.Apply("x", "!")
+ignored = p.Use(ADDRESSOF Shout)
+PRINT p.Apply("hello", "!")
+PRINT "n=" + 5
+PRINT 2.5 + " units"
+IF "a" <> "b" THEN PRINT "different"
+PRINT TYPEOF([1, 2])
+PRINT TYPEOF(p)
+PRINT TYPEOF({A: 1})
+PRINT String.IndexOf("banana", "an", 2)
+b = Bits.FromString("1011")
+PRINT b
+PRINT LEN(b)
+PRINT Bits.ToString(b)
+PRINT TYPEOF(b)
+result = Process.Run("echo native-process; exit 3")
+PRINT result.Output
+PRINT result.ExitCode
+PRINT result.Ok
+PRINT Object.Has(p, "Handler")
+PRINT Object.Has(p, "Missing")
+PRINT Object.Get(p, "__class", "?")
+PRINT Object.Keys(p)

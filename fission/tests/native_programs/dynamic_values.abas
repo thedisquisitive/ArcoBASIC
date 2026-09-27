@@ -1,0 +1,67 @@
+' Dynamic (Any) values: a variable, a function parameter and a method
+' parameter that receive values of different kinds at run time are boxed
+' (fission/runtime/dynamic.abas), with operators, comparisons, branches,
+' PRINT and String() dispatched by the runtime -- output must match the
+' legacy oracle exactly. Also covers Runtime.Args (LEN(Args)).
+x = 40
+PRINT x + 2
+IF x > 10 THEN PRINT "big"
+x = "forty"
+PRINT x
+PRINT x + "!"
+PRINT x == "forty"
+x = 1.5
+PRINT x * 4
+PRINT x < 2
+x = TRUE
+IF x THEN PRINT "truthy"
+x = 7
+y = x + 3
+PRINT y
+PRINT y MOD 4
+FUNCTION Describe(label, v)
+    RETURN label + ": " + String(v)
+END FUNCTION
+FUNCTION Twice(n)
+    RETURN n * 2
+END FUNCTION
+FUNCTION Show(v)
+    PRINT v
+    IF v == 3 THEN PRINT "three"
+END FUNCTION
+PRINT Describe("num", 5)
+PRINT Describe("str", "hello")
+PRINT Twice(21)
+ignored = Show(3)
+ignored = Show("text")
+ignored = Show(2.5)
+CLASS Node
+    CONSTRUCTOR(kind)
+        SELF.Kind = kind
+        SELF.Note = ""
+    END CONSTRUCTOR
+    FUNCTION WithNote(value)
+        SELF.Note = SELF.Kind + "=" + String(value)
+        RETURN SELF
+    END FUNCTION
+END CLASS
+CLASS Leaf EXTENDS Node
+    FUNCTION WithNote(value)
+        SELF.Note = "leaf:" + String(value)
+        RETURN SELF
+    END FUNCTION
+END CLASS
+n = Node("a")
+r = n.WithNote(5)
+PRINT r.Note
+r = n.WithNote("five")
+PRINT r.Note
+r = n.WithNote(2.5)
+PRINT r.Note
+IF LEN(Args) > 99 THEN
+    p = Node("b")
+ELSE
+    p = Leaf("c")
+END IF
+q = p.WithNote("poly")
+PRINT q.Note

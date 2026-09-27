@@ -1,0 +1,155 @@
+' Class metadata for dynamic dispatch in the Fission native runtime: calling
+' a method on, or reading/writing a field of, a class instance whose class is
+' only known at run time (a dynamic "Any" value). Compiled code registers
+' every class at start-up (compiler-generated calls to FissionRt_RegisterClass/
+' Field/Method/Param, see Fission_AmirToX86_64); an instance's first word is a
+' pointer to its class name, which is the registry key.
+'
+' Registry: a map (fission/runtime/map.abas) from class name to a class record,
+' kept at offset 16 of the runtime heap's state page (a runtime global written
+' inside a function would not propagate).
+'   class record (32 bytes): 0 name, 8 parent name (0 = none), 16 fields map,
+'                            24 methods map
+'   field record (16 bytes): 0 offset, 8 kind tag (dynamic.abas tags)
+'   method record: 0 address, 8 parameter count (without SELF), 16 return
+'                  kind tag, 24.. one kind tag per parameter
+' Requires heap.abas and map.abas (imported once by dynamic.abas).
+
+FUNCTION FissionRt_ClassRegistry()
+    rtRegistry = MEMORY.Read64(FissionRt_HeapState + 16)
+    IF rtRegistry == 0 THEN
+        rtRegistry = FissionRt_MapNew()
+        rtIgnored = MEMORY.Write64(FissionRt_HeapState + 16, rtRegistry)
+    END IF
+    RETURN rtRegistry
+END FUNCTION
+
+FUNCTION FissionRt_RegisterClass(rtName, rtParentName)
+    rtRecord = FissionRt_Alloc(32)
+    rtIgnored = MEMORY.Write64(rtRecord, rtName)
+    rtIgnored = MEMORY.Write64(rtRecord + 8, rtParentName)
+    rtIgnored = MEMORY.Write64(rtRecord + 16, FissionRt_MapNew())
+    rtIgnored = MEMORY.Write64(rtRecord + 24, FissionRt_MapNew())
+    rtIgnored = FissionRt_MapSet(FissionRt_ClassRegistry(), rtName, rtRecord)
+    RETURN rtRecord
+END FUNCTION
+
+FUNCTION FissionRt_RegisterField(rtClass, rtName, rtOffset, rtTag)
+    rtField = FissionRt_Alloc(16)
+    rtIgnored = MEMORY.Write64(rtField, rtOffset)
+    rtIgnored = MEMORY.Write64(rtField + 8, rtTag)
+    rtIgnored = FissionRt_MapSet(MEMORY.Read64(rtClass + 16), rtName, rtField)
+    RETURN rtField
+END FUNCTION
+
+FUNCTION FissionRt_RegisterMethod(rtClass, rtName, rtAddress, rtParamCount, rtReturnTag)
+    rtMethod = FissionRt_Alloc(24 + rtParamCount * 8)
+    rtIgnored = MEMORY.Write64(rtMethod, rtAddress)
+    rtIgnored = MEMORY.Write64(rtMethod + 8, rtParamCount)
+    rtIgnored = MEMORY.Write64(rtMethod + 16, rtReturnTag)
+    rtIgnored = FissionRt_MapSet(MEMORY.Read64(rtClass + 24), rtName, rtMethod)
+    RETURN rtMethod
+END FUNCTION
+
+FUNCTION FissionRt_RegisterParam(rtMethod, rtIndex, rtTag)
+    rtIgnored = MEMORY.Write64(rtMethod + 24 + rtIndex * 8, rtTag)
+    RETURN rtMethod
+END FUNCTION
+
+' Functions used as values: records like a method's ({address, parameter
+' count, return tag, parameter tags..., then the name}), listed in an array
+' at state page offset 2304 (a garbage-collection root). A callable value is
+' the function's name (ADDRESSOF), so lookups compare names.
+FUNCTION FissionRt_RegisterCallable(rtAddress, rtParamCount, rtReturnTag, rtName)
+    rtRecord = FissionRt_Alloc(32 + rtParamCount * 8)
+    rtIgnored = MEMORY.Write64(rtRecord + 24 + rtParamCount * 8, rtName)
+    rtIgnored = MEMORY.Write64(rtRecord, rtAddress)
+    rtIgnored = MEMORY.Write64(rtRecord + 8, rtParamCount)
+    rtIgnored = MEMORY.Write64(rtRecord + 16, rtReturnTag)
+    rtList = MEMORY.Read64(FissionRt_HeapState + 2304)
+    IF rtList == 0 THEN
+        rtList = FissionRt_NewArray(0)
+        rtIgnored = MEMORY.Write64(FissionRt_HeapState + 2304, rtList)
+    END IF
+    rtIgnored = FissionRt_ArrayPush(rtList, rtRecord)
+    RETURN rtRecord
+END FUNCTION
+
+' Calls the function a dynamic callable value holds with boxed arguments
+' (an array of boxes); the result comes back boxed.
+FUNCTION FissionRt_CallCallable(rtCallable, rtArgs)
+    IF rtCallable == 0 THEN rtIgnored = FissionRt_Fail("cannot call NULL")
+    IF FissionRt_Tag(rtCallable) != 8 THEN rtIgnored = FissionRt_Fail("value is not callable")
+    rtAddress = FissionRt_Payload(rtCallable)
+    ' (rtAddress is the callable's name string.)
+    rtList = MEMORY.Read64(FissionRt_HeapState + 2304)
+    rtRecord = 0
+    IF rtList != 0 THEN
+        rtIndex = 0
+        WHILE rtIndex < MEMORY.Read64(rtList) ANDALSO rtRecord == 0
+            rtCandidate = MEMORY.Read64(MEMORY.Read64(rtList + 8) + rtIndex * 8)
+            IF FissionRt_StrEquals(MEMORY.Read64(rtCandidate + 24 + MEMORY.Read64(rtCandidate + 8) * 8), rtAddress) == 1 THEN rtRecord = rtCandidate
+            rtIndex = rtIndex + 1
+        WEND
+    END IF
+    IF rtRecord == 0 THEN rtIgnored = FissionRt_Fail("unknown callable value")
+    rtCount = MEMORY.Read64(rtArgs)
+    IF rtCount != MEMORY.Read64(rtRecord + 8) THEN rtIgnored = FissionRt_Fail("wrong number of arguments for a callable")
+    IF rtCount > 6 THEN rtIgnored = FissionRt_Fail("dynamic calls support at most 6 arguments")
+    rtData = MEMORY.Read64(rtArgs + 8)
+    rtA1 = 0
+    rtA2 = 0
+    rtA3 = 0
+    rtA4 = 0
+    rtA5 = 0
+    rtA6 = 0
+    IF rtCount > 0 THEN rtA1 = FissionRt_UnboxTo(MEMORY.Read64(rtData), MEMORY.Read64(rtRecord + 24))
+    IF rtCount > 1 THEN rtA2 = FissionRt_UnboxTo(MEMORY.Read64(rtData + 8), MEMORY.Read64(rtRecord + 32))
+    IF rtCount > 2 THEN rtA3 = FissionRt_UnboxTo(MEMORY.Read64(rtData + 16), MEMORY.Read64(rtRecord + 40))
+    IF rtCount > 3 THEN rtA4 = FissionRt_UnboxTo(MEMORY.Read64(rtData + 24), MEMORY.Read64(rtRecord + 48))
+    IF rtCount > 4 THEN rtA5 = FissionRt_UnboxTo(MEMORY.Read64(rtData + 32), MEMORY.Read64(rtRecord + 56))
+    IF rtCount > 5 THEN rtA6 = FissionRt_UnboxTo(MEMORY.Read64(rtData + 40), MEMORY.Read64(rtRecord + 64))
+    rtRaw = FISSION.CallAddress(MEMORY.Read64(rtRecord), rtA1, rtA2, rtA3, rtA4, rtA5, rtA6)
+    RETURN FissionRt_BoxElement(MEMORY.Read64(rtRecord + 16), rtRaw)
+END FUNCTION
+
+' The class record of a class instance (its first word is its class name).
+FUNCTION FissionRt_ClassOf(rtInstance)
+    ' A 16-entry cache keyed by the class-name pointer (state page 2048..2303).
+    rtName = MEMORY.Read64(rtInstance)
+    rtSlot = FissionRt_HeapState + 2048 + ((rtName SHR 4) BITAND 15) * 16
+    IF MEMORY.Read64(rtSlot) == rtName ANDALSO rtName != 0 THEN RETURN MEMORY.Read64(rtSlot + 8)
+    rtRecord = FissionRt_MapGetOr(FissionRt_ClassRegistry(), rtName, 0)
+    IF rtRecord != 0 THEN
+        rtIgnored = MEMORY.Write64(rtSlot, rtName)
+        rtIgnored = MEMORY.Write64(rtSlot + 8, rtRecord)
+    END IF
+    IF rtRecord == 0 THEN rtIgnored = FissionRt_Fail("unknown class for a dynamic value")
+    RETURN rtRecord
+END FUNCTION
+
+' A method record found on the class or its ancestors, or 0.
+FUNCTION FissionRt_FindMethod(rtClass, rtName)
+    rtCurrent = rtClass
+    WHILE rtCurrent != 0
+        rtMethod = FissionRt_MapGetOr(MEMORY.Read64(rtCurrent + 24), rtName, 0)
+        IF rtMethod != 0 THEN RETURN rtMethod
+        rtParent = MEMORY.Read64(rtCurrent + 8)
+        rtCurrent = 0
+        IF rtParent != 0 THEN rtCurrent = FissionRt_MapGetOr(FissionRt_ClassRegistry(), rtParent, 0)
+    WEND
+    RETURN 0
+END FUNCTION
+
+' A field record found on the class or its ancestors, or 0.
+FUNCTION FissionRt_FindField(rtClass, rtName)
+    rtCurrent = rtClass
+    WHILE rtCurrent != 0
+        rtField = FissionRt_MapGetOr(MEMORY.Read64(rtCurrent + 16), rtName, 0)
+        IF rtField != 0 THEN RETURN rtField
+        rtParent = MEMORY.Read64(rtCurrent + 8)
+        rtCurrent = 0
+        IF rtParent != 0 THEN rtCurrent = FissionRt_MapGetOr(FissionRt_ClassRegistry(), rtParent, 0)
+    WEND
+    RETURN 0
+END FUNCTION

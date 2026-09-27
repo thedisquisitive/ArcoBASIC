@@ -1,0 +1,13 @@
+' Strings are byte sequences with a known length: NUL bytes and UTF-8 text
+' survive literals, concatenation, comparison, LEN and PRINT.
+zero = "a\0b"
+PRINT LEN(zero)
+joined = "a" + "\0" + "b"
+PRINT joined == zero
+PRINT joined == "a"
+PRINT LEN(joined + joined)
+accented = "héllo wörld"
+PRINT accented
+PRINT accented + "!"
+IF "\0" THEN PRINT "NUL-STRING-IS-TRUTHY"
+IF "" THEN PRINT "unexpected" ELSE PRINT "EMPTY-IS-FALSY"

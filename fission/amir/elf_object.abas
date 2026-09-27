@@ -319,7 +319,11 @@ FUNCTION Fission_ElfObjectParse(bytes)
             ' FINAL link time (not a named global symbol at all), a
             ' genuinely different resolution shape Fusion's own
             ' `globalSymbols` name->offset map has no way to express yet.
-            targetIsResolvable = relocSymType == 1 ORELSE relocSymType == 2
+            ' A named undefined symbol (SHN_UNDEF, e.g. a call into the
+            ' ArcoBASIC runtime) is resolved by name against the other
+            ' fragments at link time, like any other global.
+            targetIsExternal = relocSymbol.SectionIndex == 0 ANDALSO relocSymbol.Name != ""
+            targetIsResolvable = relocSymType == 1 ORELSE relocSymType == 2 ORELSE targetIsExternal
             IF targetIsResolvable == FALSE THEN
                 ignored = diagnostics.ReportError("FISSION_ELF_UNSUPPORTED_RELOCATION", "The Arcology Fusion Linker does not yet support a relocation against a symbol of this kind (expected a real named FUNC/OBJECT symbol, e.g. not an anonymous SECTION-relative static-data reference): " + relocSymbol.Name)
                 RETURN emptyResult

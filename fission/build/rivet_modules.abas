@@ -1,16 +1,6 @@
 #IMPORT "fission/core/module.abas"
+#IMPORT "fission/modules/arcobasic_frontend/module.abas"
 
-FUNCTION Fission_ArcoBasicFrontendModule()
-    module = FissionExecutableModule("fission.arcobasic.frontend")
-    ignored = module.WithEntry("fission/modules/arcobasic_frontend/main.abas")
-    ignored = module.WithOutputName("fission-arcobasic-frontend")
-    ignored = module.Capability("ARCOBASIC_FRONTEND")
-    language = module.Component("language.arcobasic", "Language")
-    ignored = language.Consume("Source.arcobasic")
-    ignored = language.Produce("SIR")
-    ignored = language.Capability("ARCOBASIC_FRONTEND")
-    RETURN module
-END FUNCTION
 
 FUNCTION Fission_RivetBuildModule(module, compilerTarget)
     target = BUILD.ArcoCapsule(module.OutputName)

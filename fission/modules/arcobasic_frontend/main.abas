@@ -1,4 +1,4 @@
-#IMPORT "fission/build/rivet_modules.abas"
+#IMPORT "fission/modules/arcobasic_frontend/module.abas"
 #IMPORT "fission/language/arcobasic/preprocess.abas"
 #IMPORT "fission/language/arcobasic/lower_sir.abas"
 #IMPORT "fission/language/arcobasic/semantic.abas"

@@ -1,0 +1,188 @@
+' Native strings for the Fission native runtime. A string value points at its
+' bytes, which are followed by a NUL (so C code can read them); the word just
+' before the bytes holds the byte length, so a string may itself contain NUL
+' bytes. A length of -1 means "unknown -- count up to the NUL" (strings made
+' by the C host bridge, which never contain NUL bytes). NULL (0) reads as
+' the empty string. The code generator's str_concat/str_equals/str_print are
+' shims onto the functions below. Written only with MEMORY.* and integer
+' arithmetic: string operators here would call back into these functions.
+' Requires fission/runtime/heap.abas (imported once by dynamic.abas).
+
+FUNCTION FissionRt_StrLen(rtText)
+    IF rtText == 0 THEN RETURN 0
+    rtLength = MEMORY.Read64(rtText - 8)
+    IF rtLength >= 0 THEN RETURN rtLength
+    rtLength = 0
+    WHILE MEMORY.Read8(rtText + rtLength) != 0
+        rtLength = rtLength + 1
+    WEND
+    RETURN rtLength
+END FUNCTION
+
+' A new string of `rtLength` bytes (contents to be filled in by the caller).
+FUNCTION FissionRt_StrNew(rtLength)
+    rtBase = FissionRt_Alloc(rtLength + 9)
+    rtIgnored = MEMORY.Write64(rtBase, rtLength)
+    rtIgnored = MEMORY.Write8(rtBase + 8 + rtLength, 0)
+    RETURN rtBase + 8
+END FUNCTION
+
+FUNCTION FissionRt_CopyBytes(rtDest, rtSource, rtCount)
+    rtIndex = 0
+    WHILE rtIndex + 8 <= rtCount
+        rtIgnored = MEMORY.Write64(rtDest + rtIndex, MEMORY.Read64(rtSource + rtIndex))
+        rtIndex = rtIndex + 8
+    WEND
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write8(rtDest + rtIndex, MEMORY.Read8(rtSource + rtIndex))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtDest
+END FUNCTION
+
+FUNCTION FissionRt_StrConcat(rtA, rtB)
+    rtLengthA = FissionRt_StrLen(rtA)
+    rtLengthB = FissionRt_StrLen(rtB)
+    rtResult = FissionRt_StrNew(rtLengthA + rtLengthB)
+    rtIgnored = FissionRt_CopyBytes(rtResult, rtA, rtLengthA)
+    rtIgnored = FissionRt_CopyBytes(rtResult + rtLengthA, rtB, rtLengthB)
+    RETURN rtResult
+END FUNCTION
+
+' 1 when both strings hold the same bytes, else 0.
+FUNCTION FissionRt_StrEquals(rtA, rtB)
+    IF rtA == rtB THEN RETURN 1
+    rtLength = FissionRt_StrLen(rtA)
+    IF FissionRt_StrLen(rtB) != rtLength THEN RETURN 0
+    rtIndex = 0
+    WHILE rtIndex + 8 <= rtLength
+        IF MEMORY.Read64(rtA + rtIndex) != MEMORY.Read64(rtB + rtIndex) THEN RETURN 0
+        rtIndex = rtIndex + 8
+    WEND
+    WHILE rtIndex < rtLength
+        IF MEMORY.Read8(rtA + rtIndex) != MEMORY.Read8(rtB + rtIndex) THEN RETURN 0
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Byte-wise ordering of two strings: -1, 0 or 1 (a prefix sorts first).
+FUNCTION FissionRt_StrCmp(rtA, rtB)
+    rtLengthA = FissionRt_StrLen(rtA)
+    rtLengthB = FissionRt_StrLen(rtB)
+    rtIndex = 0
+    WHILE rtIndex < rtLengthA ANDALSO rtIndex < rtLengthB
+        rtCa = MEMORY.Read8(rtA + rtIndex)
+        rtCb = MEMORY.Read8(rtB + rtIndex)
+        IF rtCa != rtCb THEN
+            IF rtCa < rtCb THEN RETURN -1
+            RETURN 1
+        END IF
+        rtIndex = rtIndex + 1
+    WEND
+    IF rtLengthA < rtLengthB THEN RETURN -1
+    IF rtLengthA > rtLengthB THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+' PRINT of a string: its bytes, then a newline.
+FUNCTION FissionRt_StrPrint(rtText)
+    IF rtText != 0 THEN rtIgnored = LINUX.Syscall(1, 1, rtText, FissionRt_StrLen(rtText))
+    rtIgnored = LINUX.Syscall(1, 1, FISSION.Bits("\n"), 1)
+    RETURN 0
+END FUNCTION
+
+' A string value copied from a NUL-terminated C string (argv).
+FUNCTION FissionRt_StrFromC(rtPointer)
+    rtLength = 0
+    WHILE MEMORY.Read8(rtPointer + rtLength) != 0
+        rtLength = rtLength + 1
+    WEND
+    rtResult = FissionRt_StrNew(rtLength)
+    rtIgnored = FissionRt_CopyBytes(rtResult, rtPointer, rtLength)
+    RETURN rtResult
+END FUNCTION
+
+' NUMBER(text): an integer when the text is one, else a double (a boxed
+' dynamic value either way). Decimal text with up to 15 significant digits
+' and a power-of-ten scale up to 22 converts exactly-rounded (both the
+' digits and the power are exact doubles, so one division/multiplication
+' rounds once); longer inputs are close but may differ in the last bit.
+' Unparseable text is 0, like the language.
+FUNCTION FissionRt_ParseNumber(rtText)
+    rtLength = FissionRt_StrLen(rtText)
+    rtIndex = 0
+    WHILE rtIndex < rtLength ANDALSO (MEMORY.Read8(rtText + rtIndex) == 32 ORELSE MEMORY.Read8(rtText + rtIndex) == 9)
+        rtIndex = rtIndex + 1
+    WEND
+    rtNegative = 0
+    IF rtIndex < rtLength ANDALSO MEMORY.Read8(rtText + rtIndex) == 45 THEN
+        rtNegative = 1
+        rtIndex = rtIndex + 1
+    ELSE
+        IF rtIndex < rtLength ANDALSO MEMORY.Read8(rtText + rtIndex) == 43 THEN rtIndex = rtIndex + 1
+    END IF
+    rtDigits = 0
+    rtDigitCount = 0
+    rtScale = 0
+    rtIsFloat = 0
+    rtSeenPoint = 0
+    WHILE rtIndex < rtLength
+        rtByte = MEMORY.Read8(rtText + rtIndex)
+        IF rtByte >= 48 ANDALSO rtByte <= 57 THEN
+            IF rtDigitCount < 18 THEN
+                rtDigits = rtDigits * 10 + (rtByte - 48)
+                IF rtDigits != 0 THEN rtDigitCount = rtDigitCount + 1
+                IF rtSeenPoint == 1 THEN rtScale = rtScale - 1
+            ELSE
+                IF rtSeenPoint == 0 THEN rtScale = rtScale + 1
+            END IF
+            rtIndex = rtIndex + 1
+        ELSE
+            IF rtByte == 46 ANDALSO rtSeenPoint == 0 THEN
+                rtSeenPoint = 1
+                rtIsFloat = 1
+                rtIndex = rtIndex + 1
+            ELSE
+                EXIT WHILE
+            END IF
+        END IF
+    WEND
+    IF rtIndex < rtLength ANDALSO (MEMORY.Read8(rtText + rtIndex) == 101 ORELSE MEMORY.Read8(rtText + rtIndex) == 69) THEN
+        rtIsFloat = 1
+        rtIndex = rtIndex + 1
+        rtExpNegative = 0
+        IF rtIndex < rtLength ANDALSO MEMORY.Read8(rtText + rtIndex) == 45 THEN
+            rtExpNegative = 1
+            rtIndex = rtIndex + 1
+        ELSE
+            IF rtIndex < rtLength ANDALSO MEMORY.Read8(rtText + rtIndex) == 43 THEN rtIndex = rtIndex + 1
+        END IF
+        rtExponent = 0
+        WHILE rtIndex < rtLength ANDALSO MEMORY.Read8(rtText + rtIndex) >= 48 ANDALSO MEMORY.Read8(rtText + rtIndex) <= 57
+            rtExponent = rtExponent * 10 + (MEMORY.Read8(rtText + rtIndex) - 48)
+            rtIndex = rtIndex + 1
+        WEND
+        IF rtExpNegative == 1 THEN rtExponent = 0 - rtExponent
+        rtScale = rtScale + rtExponent
+    END IF
+    IF rtIsFloat == 0 ANDALSO rtScale == 0 THEN
+        IF rtNegative == 1 THEN rtDigits = 0 - rtDigits
+        RETURN FissionRt_Box(1, rtDigits, 0)
+    END IF
+    rtValue = rtDigits * 1.0
+    rtPower = 1.0
+    rtSteps = rtScale
+    IF rtSteps < 0 THEN rtSteps = 0 - rtSteps
+    WHILE rtSteps > 0
+        rtPower = rtPower * 10.0
+        rtSteps = rtSteps - 1
+    WEND
+    IF rtScale < 0 THEN
+        rtValue = rtValue / rtPower
+    ELSE
+        rtValue = rtValue * rtPower
+    END IF
+    IF rtNegative == 1 THEN rtValue = 0.0 - rtValue
+    RETURN FissionRt_Box(2, FISSION.Bits(rtValue), 0)
+END FUNCTION

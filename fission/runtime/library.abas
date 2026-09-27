@@ -1,0 +1,42 @@
+' Builds (once) and loads the Fission native runtime (fission/runtime/*.abas,
+' ArcoBASIC) as a precompiled library fragment that every native program is
+' linked against -- instead of recompiling the runtime from source inside
+' every program. Cached under .rivet/fission-runtime/: runtime.frag (the
+' serialized fragment) next to runtime.src (the exact expanded runtime source
+' it was built from); a change to the runtime source rebuilds it.
+#IMPORT "fission/language/arcobasic/preprocess.abas"
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/amir/lower_x86_64.abas"
+#IMPORT "fission/amir/x86_64_assembler.abas"
+#IMPORT "fission/amir/x86_64_fragment.abas"
+
+FUNCTION Fission_NativeRuntimeLibrary()
+    cacheDirectory = ".rivet/fission-runtime"
+    IF File.Exists("fission/runtime/dynamic.abas") == FALSE THEN
+        sourceRoot = Fission_SourceRoot()
+        IF sourceRoot != "" THEN cacheDirectory = sourceRoot + "/.rivet/fission-runtime"
+    END IF
+    fragmentPath = cacheDirectory + "/runtime.frag"
+    sourcePath = cacheDirectory + "/runtime.src"
+    preprocessed = Fission_ArcoBasicPreprocess("#IMPORT \"fission/runtime/dynamic.abas\"\n", [])
+    IF preprocessed.Diagnostics.HasErrors() THEN RETURN {Fragment: NULL, Diagnostics: preprocessed.Diagnostics}
+    source = preprocessed.Source
+    IF File.Exists(fragmentPath) ANDALSO File.Exists(sourcePath) THEN
+        IF File.ReadText(sourcePath) == source THEN
+            cached = Fission_FragmentDeserialize(File.ReadBytes(fragmentPath))
+            IF cached.Diagnostics.HasErrors() == FALSE THEN RETURN {Fragment: cached.Fragment, Diagnostics: cached.Diagnostics}
+        END IF
+    END IF
+    ast = Fission_ArcoBasicParse(Fission_ArcoBasicLex(source), "fission/runtime")
+    IF ast.Diagnostics.HasErrors() THEN RETURN {Fragment: NULL, Diagnostics: ast.Diagnostics}
+    amir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(ast))
+    IF amir.Diagnostics.HasErrors() THEN RETURN {Fragment: NULL, Diagnostics: amir.Diagnostics}
+    program = Fission_AmirToX86_64Library(amir, "FissionRt_Init", "fissionrt_")
+    IF program.Diagnostics.HasErrors() THEN RETURN {Fragment: NULL, Diagnostics: program.Diagnostics}
+    assembled = Fission_X86_64AssembleFragment(program.Render())
+    IF assembled.Diagnostics.HasErrors() THEN RETURN {Fragment: NULL, Diagnostics: assembled.Diagnostics}
+    ignored = Directory.Create(cacheDirectory)
+    ignored = File.WriteBytes(fragmentPath, Fission_FragmentSerialize(assembled.Fragment))
+    ignored = File.WriteText(sourcePath, source)
+    RETURN {Fragment: assembled.Fragment, Diagnostics: assembled.Diagnostics}
+END FUNCTION

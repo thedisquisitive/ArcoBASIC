@@ -559,6 +559,13 @@ bytecode_object_try_run_output="$("$SOURCE_DIR/build-rivet/ArcoFission" run "$by
 expected_bytecode_object_try_run_output="$(printf 'b\nboom\nafter')"
 test "$bytecode_object_try_run_output" = "$expected_bytecode_object_try_run_output"
 
+# G1->G2 self-hosting bootstrap regressions (fission/tests/amir_gap_fixes_smoke.abas case 7): NULL
+# lowers to a real null constant distinct from 0, and a STRING literal spelled TRUE/FALSE/NULL stays
+# a string.
+gap_fixes_output="$("$SOURCE_DIR/build-rivet/fission/tests/amir_gap_fixes_smoke")"
+grep -q "^NULL-LITERAL-OK$" <<<"$gap_fixes_output"
+grep -q "^STRING-KEYWORD-LITERAL-OK$" <<<"$gap_fixes_output"
+
 bytecode_class_full_output="$("$SOURCE_DIR/build-rivet/fission/tests/amir_bytecode_class_smoke")"
 
 test "$(grep -c "^FALSE$" <<<"$bytecode_class_full_output")" = "3"
@@ -632,6 +639,12 @@ expected_hello_native_output="Hello, native!"
 test "$hello_native_output" = "$expected_hello_native_output"
 oracle_hello_native_output="$("$ARCOFISSION" compile-run "$SOURCE_DIR/fission/tests/native_programs/hello_native.abas")"
 test "$hello_native_output" = "$oracle_hello_native_output"
+
+# fission/tests/native_programs/memory_primitives.abas: MEMORY.Read/Write at every width plus
+# LINUX.Syscall (an anonymous mmap), the primitives the native runtime is written on top of.
+# Native-only (no hosted oracle for LINUX.Syscall), so checked against an explicit expected output.
+memory_primitives_output="$("$SOURCE_DIR/build/fission-native-programs/memory_primitives")"
+test "$memory_primitives_output" = "$(printf 'TRUE\n1234567890123\n4294967295\n65535\n44\n203\n0')"
 
 # fission/tests/native_programs/fizzbuzz.abas exercises native codegen's Phase 2 construct set
 # together (FOR-range, arithmetic, MOD, comparisons, nested IF, PRINT of both string literals and

@@ -11,6 +11,8 @@ CLASS FissionLanguageDefinition
         SELF.Expressions = []
         SELF.Operations = []
         SELF.SemanticHandlers = []
+        SELF.Comments = []
+        SELF.Operators = []
         ignored = SELF.Component.Produce("SIR")
     END CONSTRUCTOR
 
@@ -32,9 +34,46 @@ CLASS FissionLanguageDefinition
         RETURN SELF
     END FUNCTION
 
+    ' A one-line statement described by a pattern such as
+    ' "{Target:name} = {Value}" (see fission/language/api/grammar_compiler.abas).
     FUNCTION Statement(name, pattern)
-        item = {Name: name, Pattern: pattern}
+        item = {Name: name, Pattern: pattern, End: "", Else: ""}
         ignored = Array.Push(SELF.Statements, item)
+        RETURN SELF
+    END FUNCTION
+
+    ' A statement whose body is the following lines, up to a line that is
+    ' just `endWord`.
+    FUNCTION Block(name, pattern, endWord)
+        item = {Name: name, Pattern: pattern, End: endWord, Else: ""}
+        ignored = Array.Push(SELF.Statements, item)
+        RETURN SELF
+    END FUNCTION
+
+    ' Gives the block `name` an else part, introduced by a line that is just
+    ' `word`.
+    FUNCTION Alternative(name, word)
+        index = 0
+        WHILE index < LEN(SELF.Statements)
+            item = SELF.Statements[index]
+            IF item.Name == name THEN SELF.Statements[index] = {Name: item.Name, Pattern: item.Pattern, End: item.End, Else: word}
+            index = index + 1
+        WEND
+        RETURN SELF
+    END FUNCTION
+
+    ' Text from `prefix` to the end of the line is a comment.
+    FUNCTION Comment(prefix)
+        ignored = Array.Push(SELF.Comments, prefix)
+        RETURN SELF
+    END FUNCTION
+
+    ' A binary operator for expressions: `symbol` in the source, a higher
+    ' `precedence` binds tighter, `operatorName` is the SIR operator (+ - * /
+    ' MOD == != < <= > >= ...). Declaring any replaces the default set.
+    FUNCTION Infix(symbol, precedence, operatorName)
+        item = {Symbol: symbol, Precedence: precedence, Operator: operatorName}
+        ignored = Array.Push(SELF.Operators, item)
         RETURN SELF
     END FUNCTION
 
@@ -77,12 +116,24 @@ CLASS FissionLanguageDefinition
         RETURN SELF
     END FUNCTION
 
+    ' The simple way to write a language: `callback(sourceText, builder)`
+    ' reads the program text and appends SIR statements with the builder
+    ' (builder.PrintValue, builder.AssignValue, builder.WhileLoop, ...).
+    ' Every installed target (bytecode, native executables, ...) then works
+    ' for the language unchanged.
+    FUNCTION SourceToSir(callback)
+        SELF.Component.SourceHandler = callback
+        RETURN SELF
+    END FUNCTION
+
     FUNCTION TransformWith(callback)
         ignored = SELF.Component.TransformWith(callback)
         RETURN SELF
     END FUNCTION
 
     FUNCTION AsComponent()
+        IF SELF.Component.SourceHandler == NULL ANDALSO LEN(SELF.Statements) > 0 THEN SELF.Component.GrammarLanguage = {Name: SELF.Name, Statements: SELF.Statements, Comments: SELF.Comments, Operators: SELF.Operators, SemanticHandlers: SELF.SemanticHandlers}
+        IF SELF.Component.SourceHandler == NULL ANDALSO LEN(SELF.Statements) == 0 ANDALSO (LEN(SELF.Symbols) > 0 ORELSE LEN(SELF.Pairs) > 0) THEN SELF.Component.SymbolLanguage = {Name: SELF.Name, Symbols: SELF.Symbols, Pairs: SELF.Pairs, SemanticHandlers: SELF.SemanticHandlers}
         ignored = SELF.Component.Configure("language:name", SELF.Name)
         ignored = SELF.Component.Configure("language:extensions", Array.Join(SELF.Extensions, ","))
         ignored = SELF.Component.Configure("language:symbol-count", String(LEN(SELF.Symbols)))

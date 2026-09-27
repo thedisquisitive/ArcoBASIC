@@ -1,0 +1,42 @@
+' runtime.linux heap for programs compiled by the Fission native x86-64
+' backend -- the allocator behind every string, array, object and (later)
+' boxed dynamic value. Written in ArcoBASIC on top of MEMORY.Read64/Write64
+' and LINUX.Syscall; compiled by the same backend as part of every native
+' program (fission/cli/compile_to_x86_64.abas imports this module first, so
+' its top-level initialization runs before user code).
+'
+' Memory comes from anonymous mmap in 64 MiB chunks (larger requests get a
+' chunk of their own) and is handed out by a bump pointer, 16-byte aligned.
+' Nothing is freed yet: reclaiming memory is separate, later work.
+'
+' Runtime locals are all rt-prefixed: a script-scope global is visible inside
+' every FUNCTION that names it, so ordinary names here (`ignored`, `size`, ...)
+' would silently alias a user program's own top-level variables.
+'
+' State lives in a small mmap'd page rather than in ArcoBASIC globals,
+' because a script-scope global written inside a FUNCTION does not propagate
+' (the language's copy-in semantics): FissionRt_HeapState holds the page's
+' rtAddress, set once below; offset 0 = bump rtCursor, offset 8 = chunk rtLimit.
+
+FUNCTION FissionRt_MapAnonymous(rtBytes)
+    ' mmap(NULL, rtBytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    rtAddress = LINUX.Syscall(9, 0, rtBytes, 3, 34, -1, 0)
+    IF rtAddress < 0 THEN
+        ' Out of memory is fatal: report it, then exit_group(70).
+        PRINT "Fission runtime: out of memory"
+        rtIgnored = LINUX.Syscall(231, 70)
+    END IF
+    RETURN rtAddress
+END FUNCTION
+
+FUNCTION FissionRt_HeapInit()
+    rtState = FissionRt_MapAnonymous(4096)
+    rtIgnored = MEMORY.Write64(rtState, 0)
+    rtIgnored = MEMORY.Write64(rtState + 8, 0)
+    RETURN rtState
+END FUNCTION
+
+' Returns the rtAddress of `rtBytes` fresh rtBytes (zero-filled, since anonymous
+' mappings are zero-filled and nothing is ever reused).
+
+FissionRt_HeapState = FissionRt_HeapInit()

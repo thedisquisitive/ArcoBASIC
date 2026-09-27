@@ -1,0 +1,60 @@
+' Pulse: a language written with only the Level 1 construction API --
+' Symbol, Pair and On. There is no tokenizer and no parser here: Fission
+' reads the source, and each handler says what one symbol means by returning
+' a SIR statement built with the builder. Unlisted characters are comments.
+'
+'   +  add one to the pulse         *  double it
+'   -  subtract one                 ~  reset it to zero
+'   !  print it                     ( ... )  repeat while the pulse is above zero
+#IMPORT "fission/core/fission.abas"
+
+FUNCTION Pulse_Start(node, builder)
+    RETURN builder.AssignValue("pulse", builder.Literal("0"))
+END FUNCTION
+
+FUNCTION Pulse_Change(operatorName, amount, builder)
+    RETURN builder.AssignValue("pulse", builder.Binary(operatorName, builder.Variable("pulse"), builder.Literal(amount)))
+END FUNCTION
+
+FUNCTION Pulse_Up(node, builder)
+    RETURN Pulse_Change("+", "1", builder)
+END FUNCTION
+
+FUNCTION Pulse_Down(node, builder)
+    RETURN Pulse_Change("-", "1", builder)
+END FUNCTION
+
+FUNCTION Pulse_Double(node, builder)
+    RETURN Pulse_Change("*", "2", builder)
+END FUNCTION
+
+FUNCTION Pulse_Reset(node, builder)
+    RETURN Pulse_Start(node, builder)
+END FUNCTION
+
+FUNCTION Pulse_Show(node, builder)
+    RETURN builder.PrintValue(builder.Variable("pulse"))
+END FUNCTION
+
+' node.Body holds the statements already built for the symbols inside ( ).
+FUNCTION Pulse_Loop(node, builder)
+    RETURN builder.WhileLoop(builder.Binary(">", builder.Variable("pulse"), builder.Literal("0")), node.Body)
+END FUNCTION
+
+FUNCTION Pulse_Register(host)
+    pulse = host.LanguageKit().BeginnerCompiledLanguage("pulse", ".pulse")
+    ignored = pulse.Symbol("+", "Up")
+    ignored = pulse.Symbol("-", "Down")
+    ignored = pulse.Symbol("*", "Double")
+    ignored = pulse.Symbol("~", "Reset")
+    ignored = pulse.Symbol("!", "Show")
+    ignored = pulse.Pair("(", ")", "Loop")
+    ignored = pulse.On("Start", ADDRESSOF Pulse_Start)
+    ignored = pulse.On("Up", ADDRESSOF Pulse_Up)
+    ignored = pulse.On("Down", ADDRESSOF Pulse_Down)
+    ignored = pulse.On("Double", ADDRESSOF Pulse_Double)
+    ignored = pulse.On("Reset", ADDRESSOF Pulse_Reset)
+    ignored = pulse.On("Show", ADDRESSOF Pulse_Show)
+    ignored = pulse.On("Loop", ADDRESSOF Pulse_Loop)
+    RETURN host.Register(pulse)
+END FUNCTION

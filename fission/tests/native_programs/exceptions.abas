@@ -1,0 +1,20 @@
+' TRY/CATCH/THROW: thrown values and runtime errors arrive as {Message, Type}.
+FUNCTION Risky(n)
+    IF n > 2 THEN THROW "too big: " + String(n)
+    RETURN n * 10
+END FUNCTION
+FOR i = 1 TO 4
+    TRY
+        PRINT Risky(i)
+    CATCH err
+        PRINT "caught " + err
+    END TRY
+NEXT
+TRY
+    x = [1, 2]
+    PRINT x[5]
+CATCH e
+    PRINT e.Message
+    PRINT e.Type
+END TRY
+PRINT "end"

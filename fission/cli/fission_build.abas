@@ -1,0 +1,7 @@
+' The stock Fission build command: Fission's own components only (the
+' ArcoBASIC language and every built-in target). See build_cli.abas.
+#IMPORT "fission/cli/build_cli.abas"
+
+host = Fission_New()
+ignored = Fission_RegisterBuiltinComponents(host)
+ignored = Fission_RunBuildCli(host, Runtime.Args())

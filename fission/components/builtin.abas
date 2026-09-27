@@ -1,0 +1,82 @@
+' Fission's own compiler stages as ordinary components, so a pipeline is
+' resolved from artifact types instead of being hard-wired:
+'
+'   language.arcobasic     Source.arcobasic -> SIR
+'   lower.sir-to-amir      SIR -> A-MIR
+'   target.bytecode        A-MIR -> Bytecode              (the Fission VM)
+'   target.linux-x86_64    A-MIR -> Executable.linux-x86_64 (native ELF)
+'
+' A language package only has to produce SIR (see
+' fission/language/api/language.abas, SourceToSir): every target registered
+' here is then available to it unchanged.
+#IMPORT "fission/core/fission.abas"
+#IMPORT "fission/language/arcobasic/preprocess.abas"
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/amir/lower_bytecode.abas"
+#IMPORT "fission/amir/lower_x86_64.abas"
+#IMPORT "fission/amir/x86_64_assembler.abas"
+#IMPORT "fission/amir/elf_object.abas"
+#IMPORT "fission/amir/fusion_linker.abas"
+#IMPORT "fission/runtime/library.abas"
+
+FUNCTION FissionBuiltin_ArcoBasicToSir(artifact, context)
+    preprocessed = Fission_ArcoBasicPreprocess(artifact.Value, [])
+    ast = Fission_ArcoBasicParse(Fission_ArcoBasicLex(preprocessed.Source), artifact.Name)
+    sir = Fission_ArcoBasicAstToSir(ast)
+    ignored = sir.Diagnostics.AppendMany(preprocessed.Diagnostics)
+    RETURN FissionArtifact("SIR", artifact.Name, sir)
+END FUNCTION
+
+FUNCTION FissionBuiltin_SirToAmir(artifact, context)
+    RETURN FissionArtifact("A-MIR", artifact.Name, Fission_SirToAmir(artifact.Value))
+END FUNCTION
+
+FUNCTION FissionBuiltin_AmirToBytecode(artifact, context)
+    RETURN FissionArtifact("Bytecode", artifact.Name, Fission_AmirToBytecode(artifact.Value))
+END FUNCTION
+
+' A-MIR -> x86-64 assembly -> fragment, linked with the ArcoBASIC runtime
+' library into a Linux ELF64 executable. The value is {Bytes, Diagnostics}.
+FUNCTION FissionBuiltin_AmirToLinuxExecutable(artifact, context)
+    diagnostics = FissionDiagnosticBag()
+    result = {Bytes: [], Diagnostics: diagnostics}
+    program = Fission_AmirToX86_64WithOptions(artifact.Value, {LibraryInit: "", CallRuntimeInit: TRUE})
+    IF program.Diagnostics.HasErrors() THEN
+        ignored = diagnostics.AppendMany(program.Diagnostics)
+        RETURN FissionArtifact("Executable.linux-x86_64", artifact.Name, result)
+    END IF
+    assembled = Fission_X86_64AssembleFragment(program.Render())
+    IF assembled.Diagnostics.HasErrors() THEN
+        ignored = diagnostics.AppendMany(assembled.Diagnostics)
+        RETURN FissionArtifact("Executable.linux-x86_64", artifact.Name, result)
+    END IF
+    runtimeLibrary = Fission_NativeRuntimeLibrary()
+    IF runtimeLibrary.Diagnostics.HasErrors() THEN
+        ignored = diagnostics.AppendMany(runtimeLibrary.Diagnostics)
+        RETURN FissionArtifact("Executable.linux-x86_64", artifact.Name, result)
+    END IF
+    linked = Fission_FusionLink([assembled.Fragment, runtimeLibrary.Fragment], "_start")
+    IF linked.Diagnostics.HasErrors() THEN ignored = diagnostics.AppendMany(linked.Diagnostics)
+    result.Bytes = linked.Bytes
+    RETURN FissionArtifact("Executable.linux-x86_64", artifact.Name, result)
+END FUNCTION
+
+FUNCTION Fission_RegisterBuiltinComponents(host)
+    kit = host.LanguageKit()
+    arcobasic = kit.BeginnerCompiledLanguage("arcobasic", ".abas")
+    ignored = arcobasic.TransformWith(ADDRESSOF FissionBuiltin_ArcoBasicToSir)
+    ignored = host.Register(arcobasic)
+
+    lowering = host.Component("lower.sir-to-amir", "Lowering")
+    ignored = lowering.Consume("SIR").Produce("A-MIR").TransformWith(ADDRESSOF FissionBuiltin_SirToAmir)
+    ignored = host.Register(lowering)
+
+    bytecode = host.Target("bytecode")
+    ignored = bytecode.Consume("A-MIR").Produce("Bytecode").TransformWith(ADDRESSOF FissionBuiltin_AmirToBytecode)
+    ignored = host.Register(bytecode)
+
+    native = host.Target("linux-x86_64")
+    ignored = native.Consume("A-MIR").Produce("Executable.linux-x86_64").TransformWith(ADDRESSOF FissionBuiltin_AmirToLinuxExecutable)
+    ignored = host.Register(native)
+    RETURN host
+END FUNCTION

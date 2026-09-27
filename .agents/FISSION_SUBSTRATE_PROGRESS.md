@@ -3872,9 +3872,10 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
   substrate. `#STRICT` converts unresolved references into diagnostics.
 - Unsupported ArcoBASIC statements are now surfaced into the top-level compile
   result diagnostics.
-- No full G1/G2/G3 self-host BOOTSTRAP exists yet (this substrate has
-  never compiled one of Fission's OWN CLI entry points, i.e. itself, into
-  a working compiler). Real progress since this was first written: real
+- FIXED 2026-09-25: the G1/G2/G3 self-host bootstrap now reaches a
+  byte-identical fixpoint -- see Bootstrap Generation. (Original note: no
+  full bootstrap existed; this substrate had never compiled itself into a
+  working compiler.) Real progress since this was first written: real
   multi-file compilation (via real `#IMPORT` expansion) now works and is
   verified against genuine multi-file Fission programs -- see the
   "start on import" Completed Components entry for the current, precise
@@ -4129,9 +4130,42 @@ oracle (RFC section 41) -- structural/text comparison for A-MIR, real
 
 ## Bootstrap Generation
 
-- Current generation: G0 legacy C++ ArcoFission.
-- Target next generation: G1 ArcoBASIC Fission compiled by legacy C++
-  ArcoFission.
+**2026-09-25: G1 -> G2 -> G3 fixpoint reached (RFC section 60/63).**
+
+- G0 (legacy C++ ArcoFission) builds the AFCS drivers once:
+  `ArcoFission build fission/cli/compile_to_bytecode.abas -o g1_driver`
+  (and likewise `compile_to_x86_64.abas`).
+- G1 compiles `fission/cli/compile_to_bytecode.abas` -> G2 bytecode
+  (`ArcoFission package` makes it a standalone capsule; the legacy VM only
+  executes it). G2 compiles the same source -> G3. **G2 and G3 are
+  byte-identical** (649,509 bytes of bytecode).
+- G2 also compiles `fission/cli/compile_to_x86_64.abas`; that self-built
+  native driver compiles all 38 `fission/tests/native_programs/*.abas` to
+  real ELF64s whose output matches G0 `compile-run` (38/38).
+- Timings: G1->G2 ~19 min, G2->G3 ~3.5 min (AFCS-compiled bytecode runs the
+  compiler much faster than G0-compiled bytecode), native driver ~6 min.
+- Three real AFCS miscompiles blocked this, all in the shared SIR->A-MIR
+  lowering (`fission/sir/lower_amir.abas`), all fixed:
+  1. `NULL` lowered to `CONST 0`, so `0 != NULL` was FALSE in the bytecode
+     target. `FissionBytecodeFunction.SlotFor`'s `existing != NULL` lookup
+     then never found slot 0 (SELF), which was the root cause of the
+     G1->G2 "undefined bytecode local: __instance" failure on every CLASS.
+     Now `CONST null`, matching the oracle; the x86-64 backend maps it to 0
+     itself (`Fission_X86_64ConstValueText`).
+  2. The TRUE/FALSE/NULL keyword checks looked only at a literal's Value,
+     so the STRING literal `"FALSE"` lowered as boolean 0 (`value ==
+     "FALSE"` was TRUE for "0"). Found as a G1-vs-G2 bytecode difference.
+  3. ANDALSO/ORELSE were evaluated eagerly (a previously disclosed gap), so
+     `LEN(a) > 0 ANDALSO a[0] == x` raised "array index out of range". This
+     crashed the self-built native driver. They now short-circuit with the
+     oracle's own A-MIR shape (`__fission_shortcircuitN`,
+     ShortCircuitRhs/End blocks).
+- Regression checks: `fission/tests/amir_gap_fixes_smoke.abas` case 7
+  (checked by `tests/integration/fission_substrate_core_smoke.sh`).
+- Still open (not blocking the fixpoint): keyword TRUE/FALSE still lower to
+  raw 1/0 (so `PRINT FALSE` prints `0`, unlike the oracle); the Rivet build
+  still builds AFCS tools with G0 on every build rather than bootstrapping
+  once and then self-building.
 
 ## Files Changed
 
@@ -4673,3 +4707,290 @@ un-reprioritized backlog:**
    history) once the semantic-lookup and remaining large-file performance
    fixes land, to get a clean up-to-date completion number for the 19 files
    that previously could not be confirmed within a 240s cap.
+
+## Native self-compilation: dynamic value model (in progress, 2026-09-25)
+
+Goal: the native x86-64 backend compiles AFCS's own source (the RFC section
+61 "toolchain independence" milestone -- no G0 bytecode VM at run time).
+
+**Done so far:**
+- `MEMORY.Read8/16/32/64`, `MEMORY.Write8/16/32/64` (ArcoBASIC's existing
+  systems-level memory operations) and `LINUX.Syscall(number, args...)` (the
+  runtime.linux primitive; x86-64 Linux syscall convention) are lowered inline
+  by `fission/amir/lower_x86_64.abas`; the assembler gained `movl`/`movw`/
+  `movzwq` and 32/16-bit register names. Test:
+  `fission/tests/native_programs/memory_primitives.abas`.
+- `Copy(x)`/`COPY x` lowered through A-MIR and bytecode (oracle shape,
+  opcode 25) -- previously an A-MIR "Unsupported SIR expression", which
+  meant AFCS could not compile its own source once any file used Copy.
+- Native lowering performance: `Fission_X86_64InferSignatures` is now a
+  worklist fixed point (re-analyze a function only when its own params, a
+  callee's return kind, or a named field's kind changes) instead of
+  re-analyzing every function for up to N rounds; per-function kind/slot/
+  frame maps are updated in place instead of `Object.Set` (which copies the
+  whole map). Verified: byte-identical assembly + diagnostics on all 39
+  native_programs and on `fission/cli/fusion.abas`. Native lowering of the
+  whole `compile_to_bytecode.abas` module went from not finishing in 50+
+  minutes to ~4.5 minutes (150s signatures, ~2 min per-function lowering).
+
+**Gap catalog** (native lowering of `fission/cli/compile_to_bytecode.abas`,
+2,762 diagnostics, one root cause -- the backend's static, one-kind-per-value
+model; AFCS is ordinary dynamic ArcoBASIC):
+1029 parameter kind conflicts across call sites; 549 indexing a value not
+statically an array (dynamic objects / `Object.Get` results); 445 operators
+on a value not statically numeric; 251 unlowerable calls (`Object.Get`/`Set`
+89, method calls on receivers of statically-unknown class ~150); 146
+variables assigned conflicting kinds; the rest are mixed-kind fields/array
+elements and `LEN` on unknown values.
+
+**Design (all ArcoBASIC):**
+- A boxed **Any** kind: a pointer to a heap cell `{tag, payload}`. Kind
+  conflicts merge to Any instead of being diagnosed. Statically-kinded values
+  are boxed when they flow into an Any slot and unboxed (checked at run time)
+  where a specific kind is required; code that never mixes kinds is unchanged.
+- The runtime (heap allocator over `LINUX.Syscall` mmap, box/unbox, dynamic
+  operators, PRINT/String of Any, a string-keyed hash-map object type,
+  dynamic index/LEN/field access) is ArcoBASIC under `fission/runtime/`,
+  written with `MEMORY.*` on Number-kind addresses and compiled by the same
+  native backend alongside the program.
+- Method calls and field access on an Any receiver dispatch on the
+  instance's class tag through compiler-generated per-class tables.
+- Stages: (A) runtime heap + boxes + linking the runtime into native
+  programs; (B) Any kind: merge, box/unbox, PRINT, operators; (C) dynamic
+  map objects, Object.Get/Set/Has, member access; (D) Any arrays, dynamic
+  index/LEN; (E) dynamic method dispatch and instance field access by name.
+
+**Progress (2026-09-25, later):**
+- Script-scope globals now work in AFCS on both targets, with the legacy
+  oracle's copy-in semantics (`fission/sir/lower_amir.abas`:
+  `Fission_AmirCollectGlobals`; Main publishes each store with
+  `Runtime.SetGlobal`, functions copy referenced globals in with
+  `Runtime.GetGlobal` at entry). Native: one 8-byte `.bss` slot per global;
+  a global's kind flows through signature inference under "global:NAME".
+  Test: `fission/tests/native_programs/globals.abas`.
+- Bytecode self-hosting fixpoint re-verified after globals + Copy: G2 == G3
+  (687,803 bytes); G3 compiles globals/class/copy programs correctly.
+- Stage A done: `fission/runtime/heap.abas` (ArcoBASIC mmap-chunk bump
+  allocator) is imported first into every native program by
+  `fission/cli/compile_to_x86_64.abas`; `str_concat`/`array_alloc`/
+  `object_alloc` are now thin shims calling `FissionRt_Alloc` (the fixed
+  1 MiB `.bss` arena is gone). Runtime locals are rt-prefixed so they never
+  alias user globals. Test: `fission/tests/native_programs/heap_growth.abas`.
+- Stage B in progress: `fission/runtime/dynamic.abas` (boxes, checked unbox,
+  PRINT/String/truthiness, arithmetic and comparisons with the oracle's
+  semantics); compiler-internal reinterpretation intrinsics
+  `FISSION.Bits/AsString/AsFloat/AsBool`; backend: sticky Any kind
+  (variables with incompatible stores after convergence; parameters with
+  incompatible direct call sites, found by a post-pass on converged kinds),
+  boxing on Store/call, checked unboxing at calls, dynamic BinOp/compare/
+  Branch/PRINT/String(). Verified against the oracle on mixed-kind variables
+  and parameters.
+- TO DO (ArcoBASIC-first): `fission/native_runtime/host_bridge.c` is still C;
+  its functions should move into the ArcoBASIC runtime (`fission/runtime/`).
+- (2026-09-26) Precompiled runtime library: `fission/runtime/library.abas`
+  compiles `fission/runtime/*.abas` ONCE in library mode
+  (`Fission_AmirToX86_64Library`: top-level code becomes `FissionRt_Init`, no
+  `_start`, internal labels renamed `fissionrt_*` so Fusion sees no duplicate
+  symbols), caches it as `.rivet/fission-runtime/runtime.frag` keyed by the
+  exact expanded runtime source, and every native program links it and calls
+  `FissionRt_Init` from `_start`. (Hello-world compile with the AFCS-built
+  driver: ~19s, vs recompiling the runtime every time.)
+- Native `Runtime.Args` (`_start` saves argc/argv; `FissionRt_ArgsFrom`
+  builds the Array:String) -- needed by every AFCS CLI.
+- Any parameters for METHOD calls too (the conflict pass resolves
+  `receiver.Method` through the receiver's class/Poly candidates like
+  emission does); runtime functions callable as `FissionRt_*` externs.
+- Stage C: dynamic maps (`fission/runtime/map.abas`, sorted keys = the
+  language's object ordering): object literals outside class constructors,
+  `m.Key`/`m[key]` read+write, `Object.Get/Set/Has/Keys` (Set returns a copy),
+  PRINT; dynamic field access on Any values. Tests:
+  `fission/tests/native_programs/{dynamic_values,maps}.abas`.
+- Development builds follow the bootstrap rule: tools are built by the
+  AFCS-built compiler (G3), not G0.
+- (2026-09-26) Native self-compile gap catalog on
+  `fission/cli/compile_to_bytecode.abas`: 195 -> 7 (lowering time 1109s ->
+  571s with the AFCS-built tool). This round:
+  - dynamic method chains on any local receiver (`builder.Module.X(...)`);
+  - a real `Null` kind (NULL compares/stores into any pointer slot);
+  - 3-word array header `{length, data, capacity}` everywhere (codegen,
+    runtime, C bridge); `Array.Push` grows geometrically in ArcoBASIC
+    (`FissionRt_ArrayPush`), `FissionRt_DynPush` for dynamic arrays;
+  - `Array.Join` on any element kind / dynamic arrays
+    (`FissionRt_JoinDynamic`); bitwise `& | ^` on dynamic values
+    (`FissionRt_Arith` codes 6-8, integer result like the oracle);
+  - `Object.Get(m, k)` (default NULL), `String.Slice(s, start)` (rest);
+  - `Array:Bool` is a real element kind (literals keep Bool; stores accept
+    Bool/Number interchangeably via `Fission_X86_64ElementAccepts`);
+  - `String(...)`/PRINT on arrays, maps, objects and NULL through the runtime
+    (`FissionRt_ObjectToString`: fields incl. inherited + `__class`, sorted).
+  Tests: `fission/tests/native_programs/{dynamic_join_bits,object_strings}.abas`.
+- (2026-09-26, later) NATIVE SELF-COMPILE REACHED. The AFCS-built native
+  driver builds `fission/cli/compile_to_bytecode.abas` into a real x86-64
+  ELF (Fusion-linked, no C compiler involved). That native compiler:
+  - produces byte-identical bytecode to the bytecode-hosted AFCS compiler
+    for all 51 `fission/tests/native_programs/*.abas`;
+  - compiles AFCS's own source in ~9s; the output matches the bytecode
+    fixpoint on every line except one constant: the lexer's `"\0"` escape
+    literal (native strings are NUL-terminated, so a NUL character cannot
+    be represented). NEXT: length-carrying native strings.
+  Bytecode fixpoint re-verified (boot5 b == c, 557,684 bytes).
+- Performance: the G0 VM sizes every frame to the function's highest %tN
+  index + 1, and A-MIR numbered temps module-wide, so per-call cost grew
+  with program size. `Fission_BytecodeRenumberTemps`
+  (fission/amir/lower_bytecode.abas) renumbers temps per function:
+  self-compile 86s -> 9-17s, native driver build 345s -> ~45s, catalog
+  lowering 1100s -> ~130s.
+- `#IMPORT` is now import-once per compilation
+  (`Fission_ArcoBasicPreprocessOnce`): a module imported by several others
+  was expanded (and its functions defined) repeatedly -- fatal for a real
+  linker; bytecode shrank 644KB -> 558KB.
+- Frontend fix: class-body field initializers (`X = 1`, `Y AS T`) were
+  silently dropped; `__new` now evaluates them, ancestors first
+  (`Fission_AmirEmitFieldInitializers`), matching the oracle's output.
+- Native backend fixes found by running the native compiler: dynamic array
+  indexes are unboxed; `FissionRt_DynIndex/DynSetIndex` (arrays by number,
+  fields by string key); `Array:?` boxes as a dynamic array; return kinds
+  merge (a trailing `RETURN NULL` no longer turns an object-returning
+  function into Null); `FissionRt_Box` of a null reference is NULL; NULL
+  unboxes to any reference kind; dynamic method calls feed argument kinds
+  to every same-named method; `Array:?` arguments adopt the callee's
+  parameter kind (argback demands); inherited open field kinds refine.
+  New tests: dynamic_index, null_returns, inference_patterns,
+  class_field_initializers, object_strings, dynamic_join_bits.
+- (2026-09-26, night) FULL NATIVE SELF-HOSTING.
+  - The native driver (`fission/cli/compile_to_x86_64.abas`, built natively)
+    compiles itself into a byte-identical ELF (152s, 3.9 GB peak RSS), and
+    produces byte-identical ELFs to the bytecode-hosted driver for all 55
+    native test programs.
+  - The native bytecode compiler (built by the native driver) compiles AFCS
+    byte-identically to the bytecode fixpoint (boot6: b == c, 557,684 bytes).
+  - What it took:
+    - Length-prefixed native strings (fission/runtime/strings.abas); NUL
+      bytes and UTF-8 survive literals, concat, compare, LEN, PRINT.
+      str_concat/str_equals/str_print are shims onto the ArcoBASIC runtime.
+    - A conservative mark-and-sweep garbage collector in ArcoBASIC
+      (fission/runtime/gc.abas); the C bridge allocates on the same heap.
+      Each program carries a FissionRt_GcEnter stub, and `_start` records
+      the stack top.
+    - NUMBER returns an integer or a double (FissionRt_ParseNumber).
+    - Copy (shallow), shifts on dynamic values, and truncating bitwise ops
+      on Floats.
+    - Checked conversions between typed and dynamic arrays at host calls,
+      returns and arguments.
+    - The implicit return epilogue is always emitted, fixing fall-through
+      into the next function; `push $imm` encoding; external (SHN_UNDEF)
+      relocations in the Fusion ELF reader.
+    - A linear-time Array.Join.
+  - Dev tools used (scratchpad): symmap (address->symbol incl. runtime),
+    kinds (converged kinds per function), dumpsir, gdb frame-walk scripts.
+- (2026-09-26, late night) THE C HOST BRIDGE IS GONE.
+  - `fission/native_runtime/host_bridge.c` is deleted. Every host function
+    is ArcoBASIC under its old arco_host_* name:
+    - fission/runtime/host_strings.abas (strings, paths, bits);
+    - host_arrays.abas (arrays, split/lines/chars, bytes, sorting as a
+      stable merge sort, geometric growth);
+    - host_system.abas (files, directories, time, env, PCG32 random,
+      fmod, the double formatter).
+  - Double-taking functions go through per-program %xmm shims. The
+    FISSION.Quotient intrinsic (idiv) gives exact 64-bit division in the
+    runtime. Native programs are now linked from the program fragment plus
+    the ArcoBASIC runtime fragment only.
+  - Re-verified with no C anywhere in the chain:
+    - suite 55/55;
+    - native driver ELFs identical to the bytecode driver's (55/55);
+    - native driver self-compile identical (171s, 4.7 GB peak);
+    - bytecode fixpoint (boot7 b == c);
+    - the native bytecode compiler reproduces the fixpoint in 4s.
+  - Pitfall: an integer literal above 2^53 in runtime source is rounded when
+    the compiler is hosted on the double-based VM (the PCG32 multiplier is
+    now assembled from 32-bit halves).
+- (2026-09-27) EVERY AFCS TOOL BUILDS NATIVELY AND MATCHES ITS BYTECODE BUILD:
+  compile_to_bytecode, compile_to_x86_64, fission/cli/fission.abas,
+  fission/cli/fusion.abas and the ArcoBASIC frontend module
+  (fission/modules/arcobasic_frontend; transform output identical, and
+  identical to G0's own build of it).
+  - New in the native backend and runtime:
+    - TRY/CATCH/THROW (a handler chain; FissionRt_Unwind restores
+      %rsp/%rbp and jumps to the CATCH; runtime errors and THROW arrive as
+      {Message, Type}; returns drop the frame's handlers).
+    - Bounds-checked typed array access.
+    - Calls through dynamic callable values (a registry of ADDRESSOF
+      targets keyed by name; their arguments feed inference).
+    - Runtime dispatch when only some classes of a Poly receiver have the
+      method.
+    - Process.Run (fork/exec /bin/sh, output captured).
+    - Bits.FromString/ToString (bit vectors, tag 10).
+    - TYPEOF for all kinds; `<>`; String + non-String; IndexOf with a start.
+    - 16 scratch slots (calls with more than 8 converted arguments).
+    - Widening in the inference fixed point (a kind changing more than 8
+      times becomes Any), which guarantees termination.
+    - Demand-pinned variables are no longer overwritten by stores.
+    - Character-based String.Length/LEN/Slice, like the language.
+    - Uncaught errors are reported on stderr with exit status 1, like
+      packaged G0 programs.
+  - The verify cycle now also runs every test program through the bytecode
+    path (fixpoint compiler + VM) against G0. That found real AFCS bytecode
+    bugs, now fixed:
+    - TRUE/FALSE lowered to 1/0 (booleans printed as numbers);
+    - `<>` reached the VM unlowered;
+    - DECLARE_CLASS lost EXTENDS, and the CLASS_PARENTS section was missing,
+      so inherited methods failed.
+  - Frontend module description moved to
+    fission/modules/arcobasic_frontend/module.abas (no Rivet BUILD.* import).
+  - Suite: native 59/59, bytecode 59/59; fixpoint boot10 (564,316 bytes).
+- (2026-09-27) ROADMAP STEP 2 STARTED: swappable frontends and backends.
+  - fission/components/builtin.abas registers Fission's own stages as
+    components:
+    - language.arcobasic: Source.arcobasic -> SIR;
+    - lower.sir-to-amir: SIR -> A-MIR;
+    - target.bytecode: A-MIR -> Bytecode;
+    - target.linux-x86_64: A-MIR -> Executable.linux-x86_64.
+    The core resolver picks the route from artifact types.
+  - fission/cli/build_cli.abas is the generic
+    `build FILE [-o OUT] [--target bytecode|linux-x86_64|sir|amir]
+    [--language L] [--pipeline]` command; the language is chosen by file
+    extension. fission/cli/fission_build.abas is the stock driver.
+  - Language authoring: `language.SourceToSir(ADDRESSOF MyLang_Compile)`,
+    where Fission calls `MyLang_Compile(sourceText, builder)` with a SIR
+    builder (Fission_RunSourceHandler); builder.Error(message) reports
+    errors.
+  - Example: fission/examples/tally (a small line-based language, with no
+    target code) plus tallyc.abas (a 5-line compiler) and README.md (the
+    authoring guide). Tally compiles to bytecode and native with the same
+    output; tallyc itself also builds natively, with byte-identical output.
+    The verify cycle checks it.
+  - Native: Object.Get/Has/Keys work on class instances (dynamic runtime
+    variants).
+- (2026-09-27) LEVEL 1 LANGUAGE CONSTRUCTION API (RFC §6/§8): languages
+  without a parser.
+  - Symbol / Pair / On (fission/language/api/symbol_compiler.abas):
+    - Fission scans the declared symbols, longest match first.
+    - It matches pairs, including nested ones, and reports unbalanced pairs
+      with line and column.
+    - Each handler is `handler(node, builder)` and returns SIR (a statement,
+      an array of statements, or NULL).
+    - A Pair's handler gets node.Body. Start/Finish handlers are optional.
+    - Example: fission/examples/pulse.
+  - Statement / Block / Alternative / Comment / Infix + On
+    (fission/language/api/grammar_compiler.abas): one-line patterns such as
+    "{Target:name} = {Value}".
+    - Fission tokenizes and parses expressions (precedence, parentheses,
+      unary minus; default or declared Infix operators).
+    - It collects block bodies and else parts, and reports unknown
+      statements and unclosed blocks.
+    - Example: fission/examples/quest, the RFC's Test C
+      (`damage = strength * 2 + weaponBonus`).
+  - Pulse, Quest and Tally all compile to bytecode and native with correct
+    output; cycle2 checks all three.
+  - Language definitions reach components as plain snapshots
+    (Component.SymbolLanguage / GrammarLanguage). A back-reference from the
+    component to its definition made a cycle that crashed the G0 VM.
+  - Native codegen:
+    - indexing a value whose kind is only ever NULL goes through the dynamic
+      path;
+    - Array.Join/String.Join demand an array (a Number-default argument
+      becomes Any);
+    - every native codegen diagnostic names its function ("in F: ...").
+  - Fission_SourceRoot: $FISSION_HOME, else the nearest ancestor of $PWD
+    holding fission/runtime. `fission/...` imports and the runtime cache
+    resolve through it, so compilers such as tallyc work from any directory.

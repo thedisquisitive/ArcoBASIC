@@ -1,0 +1,10 @@
+' A complete Tally compiler: Fission's own components plus the Tally language.
+'   tallyc build program.tally -o program                 (native executable)
+'   tallyc build program.tally -o program.arcof --target bytecode
+#IMPORT "fission/cli/build_cli.abas"
+#IMPORT "fission/examples/tally/tally.abas"
+
+host = Fission_New()
+ignored = Fission_RegisterBuiltinComponents(host)
+ignored = Tally_Register(host)
+ignored = Fission_RunBuildCli(host, Runtime.Args())

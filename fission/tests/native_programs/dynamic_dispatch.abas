@@ -1,0 +1,28 @@
+' Dynamic method dispatch and field access on class instances whose class is
+' only known at run time (values taken out of a map): methods resolved through
+' the runtime class registry (fission/runtime/classes.abas), including a
+' chained receiver and a field write through a dynamic value.
+CLASS Pet
+    CONSTRUCTOR(n)
+        SELF.Name = n
+    END CONSTRUCTOR
+    FUNCTION Speak(times)
+        RETURN SELF.Name + " x" + String(times)
+    END FUNCTION
+END CLASS
+CLASS Robot
+    CONSTRUCTOR(id)
+        SELF.Id = id
+    END CONSTRUCTOR
+    FUNCTION Speak(times)
+        RETURN "beep " + String(SELF.Id * times)
+    END FUNCTION
+END CLASS
+things = {a: Pet("rex"), b: Robot(7)}
+PRINT things.a.Speak(2)
+x = things.b
+PRINT x.Speak(3)
+PRINT x.Id
+x.Id = 9
+PRINT x.Speak(1)
+PRINT things.a.Name

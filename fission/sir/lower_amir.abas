@@ -60,6 +60,13 @@ CLASS FissionAmirBuilder
         SELF.Module = FissionAmirModule(moduleName)
         SELF.TempCounter = 0
         SELF.BlockCounter = 0
+        SELF.ShortCircuitCounter = 0
+        ' Script-scope globals (see Fission_AmirCollectGlobals): ordered names
+        ' plus a membership set.
+        SELF.GlobalNames = []
+        SELF.GlobalSet = {}
+        ' Top-level CLASS nodes by name, for inherited field initializers.
+        SELF.ClassNodes = {}
         SELF.CurrentBlock = NULL
         ' Explicitly tracked rather than inferred as "the module's last
         ' function" -- a real bug caught by comparing against the legacy
@@ -133,6 +140,14 @@ CLASS FissionAmirBuilder
         RETURN name
     END FUNCTION
 
+    ' Named local holding an ANDALSO/ORELSE result across its branches --
+    ' same spelling and own counter as the legacy oracle's.
+    FUNCTION NewShortCircuitName()
+        name = "__fission_shortcircuit" + String(SELF.ShortCircuitCounter)
+        SELF.ShortCircuitCounter = SELF.ShortCircuitCounter + 1
+        RETURN name
+    END FUNCTION
+
     FUNCTION NewBlockName(prefix)
         name = prefix + String(SELF.BlockCounter)
         SELF.BlockCounter = SELF.BlockCounter + 1
@@ -140,7 +155,20 @@ CLASS FissionAmirBuilder
     END FUNCTION
 
     FUNCTION Emit(instruction)
-        RETURN SELF.CurrentBlock.Append(instruction)
+        appended = SELF.CurrentBlock.Append(instruction)
+        ' A top-level store to a script-scope global publishes the new value,
+        ' exactly like the legacy oracle: `STORE x, v` is followed by
+        ' `%t := LOAD x` and `CALL Runtime.SetGlobal "x" %t`.
+        IF instruction.Kind == "Store" ANDALSO SELF.CurrentFunction.Name == "Main" THEN
+            storedName = instruction.Field("Name")
+            IF Object.Has(SELF.GlobalSet, storedName) THEN
+                loaded = SELF.NewTemp()
+                ignored = SELF.CurrentBlock.Append(FissionAmirInstruction("Load").WithField("Dest", loaded).WithField("Name", storedName))
+                published = SELF.NewTemp()
+                ignored = SELF.CurrentBlock.Append(FissionAmirInstruction("Call").WithField("Dest", published).WithField("Callee", "Runtime.SetGlobal").WithField("Args", "\"" + storedName + "\" " + loaded))
+            END IF
+        END IF
+        RETURN appended
     END FUNCTION
 
     FUNCTION Unsupported(kind, detail)
@@ -216,24 +244,35 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
         literalKind = Object.Get(node.Fields, "LiteralKind", "")
         value = Object.Get(node.Fields, "Value", "")
         IF literalKind == "InterpolatedString" THEN RETURN Fission_AmirUnsupportedExpr(builder, "interpolated string literal")
-        IF value == "TRUE" THEN RETURN {Value: "1", Type: "BOOL"}
-        IF value == "FALSE" THEN RETURN {Value: "0", Type: "BOOL"}
-        ' The legacy oracle emits a dedicated `CONST null` for a real NULL
-        ' literal (confirmed via `ArcoFission reveal ... at A-MIR` on a
-        ' real `x = NULL` / `x == NULL` program) -- this lowers it as a
-        ' plain `CONST 0` instead, the same deliberate, disclosed
-        ' "semantically identical, not byte-identical" divergence already
-        ' used for TRUE/FALSE above: NULL is used purely as a sentinel
-        ' compared with `==`/`!=` (comparisons always use the typed
-        ' INT.CMP_* form regardless of operand type, per this function's
-        ' own comment below, so the untyped "" Type here costs nothing),
-        ' and every pointer-kind value (String/Array/Object) this backend
-        ' already represents IS a plain integer address, so 0 is a real,
-        ' safe, never-otherwise-used sentinel value in this substrate's
-        ' own memory model -- not an approximation.
-        IF value == "NULL" THEN
+        ' The TRUE/FALSE/NULL keyword checks below apply only to keyword
+        ' literals: a STRING literal whose text happens to be "TRUE", "FALSE"
+        ' or "NULL" is an ordinary string. Checking Value alone lowered
+        ' `x == "FALSE"` as a comparison against the boolean 0 -- a real
+        ' miscompile of Fission's own source (its Literal branch here compares
+        ' against exactly these strings), found as a G1-vs-G2 bytecode
+        ' difference during the self-hosting bootstrap.
+        isKeywordLiteral = literalKind != "String"
+        ' TRUE/FALSE are real boolean constants (`CONST true`/`CONST false`,
+        ' like the oracle); as bare 1/0 operands the bytecode VM saw numbers,
+        ' so `x = FALSE: PRINT x` printed 0.
+        IF isKeywordLiteral ANDALSO (value == "TRUE" ORELSE value == "FALSE") THEN
             temp = builder.NewTemp()
-            ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", temp).WithField("Value", "0"))
+            ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", temp).WithField("Value", Lower(value)))
+            RETURN {Value: temp, Type: "BOOL"}
+        END IF
+        ' A real NULL literal lowers to a dedicated `CONST null`, exactly
+        ' like the legacy oracle (confirmed via `ArcoFission reveal ... at
+        ' A-MIR`). It used to lower to `CONST 0` -- fine for the native
+        ' x86-64 backend's own pointer model (which still maps null to 0
+        ' itself, see Fission_X86_64ConstValueText), but WRONG in the
+        ' bytecode target, where 0 and NULL are different values: `0 !=
+        ' NULL` became FALSE. That broke FissionBytecodeFunction.SlotFor's
+        ' own `existing != NULL` lookup for slot 0 (SELF) and was the root
+        ' cause of the G1->G2 bootstrap failure ("undefined bytecode local:
+        ' __instance" when a Fission-compiled Fission compiled any CLASS).
+        IF isKeywordLiteral ANDALSO value == "NULL" THEN
+            temp = builder.NewTemp()
+            ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", temp).WithField("Value", "null"))
             RETURN {Value: temp, Type: ""}
         END IF
         temp = builder.NewTemp()
@@ -304,6 +343,9 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
     END IF
     IF node.Kind == "Binary" THEN
         operatorName = Object.Get(node.Fields, "Operator", "")
+        ' `<>` is `!=` (the oracle lowers both the same way).
+        IF operatorName == "<>" THEN operatorName = "!="
+        IF Fission_AmirIsShortCircuitOperator(operatorName) THEN RETURN Fission_AmirLowerShortCircuit(builder, node, operatorName)
         left = Fission_AmirLowerExpr(builder, node.Children[0])
         right = Fission_AmirLowerExpr(builder, node.Children[1])
         typedOp = Fission_AmirBinaryTypedOp(operatorName)
@@ -396,6 +438,14 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
     ' bytecode lowering), the first case in this whole file where the
     ' "compose from an existing instruction" shortcut genuinely doesn't
     ' apply.
+    ' `Copy(x)` / `COPY x` -- a shallow copy of an array/object, matching the
+    ' legacy oracle's own `%t := COPY %src` A-MIR (bytecode opcode 25).
+    IF node.Kind == "Copy" THEN
+        source = Fission_AmirLowerExpr(builder, node.Children[0])
+        dest = builder.NewTemp()
+        ignored = builder.Emit(FissionAmirInstruction("Copy").WithField("Dest", dest).WithField("Value", source.Value))
+        RETURN {Value: dest, Type: ""}
+    END IF
     IF node.Kind == "AddressOf" THEN
         dest = builder.NewTemp()
         ignored = builder.Emit(FissionAmirInstruction("Addressof").WithField("Dest", dest).WithField("Name", Object.Get(node.Fields, "Name", "")))
@@ -475,6 +525,42 @@ FUNCTION Fission_AmirLowerExpr(builder, node)
         RETURN {Value: dest, Type: ""}
     END IF
     RETURN Fission_AmirUnsupportedExpr(builder, node.Kind)
+END FUNCTION
+
+FUNCTION Fission_AmirIsShortCircuitOperator(operatorName)
+    RETURN operatorName == "ANDALSO" OR operatorName == "&&" OR operatorName == "ORELSE" OR operatorName == "||"
+END FUNCTION
+
+' ANDALSO/ORELSE short-circuit: the right operand is only evaluated when the
+' left one doesn't already decide the result. This used to lower as an
+' ordinary eager BinOp -- a real ArcoBASIC semantics change (the ledger had
+' disclosed it) that broke guards like `LEN(a) > 0 ANDALSO a[0] == x` with
+' "array index out of range", and with it Fission's own native x86-64
+' driver when compiled by Fission (found in the G2 self-hosting check).
+' Mirrors the legacy oracle's A-MIR shape exactly: the result lives in a
+' named `__fission_shortcircuitN` local across ShortCircuitRhs/End blocks.
+FUNCTION Fission_AmirLowerShortCircuit(builder, node, operatorName)
+    isAnd = operatorName == "ANDALSO" OR operatorName == "&&"
+    resultName = builder.NewShortCircuitName()
+    left = Fission_AmirLowerExpr(builder, node.Children[0])
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", resultName).WithField("Value", left.Value))
+    leftLoaded = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", leftLoaded).WithField("Name", resultName))
+    rhsName = builder.NewBlockName("ShortCircuitRhs")
+    endName = builder.NewBlockName("ShortCircuitEnd")
+    IF isAnd THEN
+        ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", leftLoaded).WithField("Then", rhsName).WithField("Else", endName))
+    ELSE
+        ignored = builder.Emit(FissionAmirInstruction("Branch").WithField("Condition", leftLoaded).WithField("Then", endName).WithField("Else", rhsName))
+    END IF
+    builder.CurrentBlock = builder.CurrentFunction.AddBlock(FissionAmirBlock(rhsName))
+    right = Fission_AmirLowerExpr(builder, node.Children[1])
+    ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", resultName).WithField("Value", right.Value))
+    ignored = builder.Emit(FissionAmirInstruction("Jump").WithField("Target", endName))
+    builder.CurrentBlock = builder.CurrentFunction.AddBlock(FissionAmirBlock(endName))
+    result = builder.NewTemp()
+    ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", result).WithField("Name", resultName))
+    RETURN {Value: result, Type: ""}
 END FUNCTION
 
 FUNCTION Fission_AmirUnsupportedExpr(builder, detail)
@@ -966,6 +1052,7 @@ FUNCTION Fission_AmirLowerClassMember(builder, className, memberNode, paramName,
     FOR param IN memberParams
         ignored = builder.Scope.Declare(param.Name, param.Type)
     NEXT
+    ignored = Fission_AmirEmitGlobalCopyIn(builder, memberNode, memberParams)
 
     FOR statement IN memberNode.Children
         ignored = Fission_AmirLowerStatement(builder, statement)
@@ -983,6 +1070,31 @@ END FUNCTION
 FUNCTION Fission_AmirUnwrapModifier(node)
     IF node.Kind == "Modifier" AND LEN(node.Children) > 0 THEN RETURN node.Children[0]
     RETURN node
+END FUNCTION
+
+' Class-body fields in declaration order, ancestors' first (the oracle
+' builds a subclass instance from its parent's): `Name = expr` evaluates its
+' initializer, `Name AS Type` starts as NULL. Stored into `__instance`.
+FUNCTION Fission_AmirEmitFieldInitializers(builder, classNode, depth)
+    parentName = Object.Get(classNode.Fields, "Extends", "")
+    IF parentName != "" ANDALSO depth < 64 ANDALSO Object.Has(builder.ClassNodes, parentName) THEN
+        ignored = Fission_AmirEmitFieldInitializers(builder, builder.ClassNodes[parentName], depth + 1)
+    END IF
+    FOR member IN classNode.Children
+        fieldNode = Fission_AmirUnwrapModifier(member)
+        IF fieldNode.Kind == "Assign" ORELSE fieldNode.Kind == "Declare" THEN
+            fieldKeyTemp = builder.NewTemp()
+            ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", fieldKeyTemp).WithField("Value", "\"" + Object.Get(fieldNode.Fields, "Name", "") + "\""))
+            IF LEN(fieldNode.Children) > 0 THEN
+                fieldValue = Fission_AmirLowerExpr(builder, fieldNode.Children[0]).Value
+            ELSE
+                fieldValue = builder.NewTemp()
+                ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", fieldValue).WithField("Value", "null"))
+            END IF
+            ignored = builder.Emit(FissionAmirInstruction("StoreIndex").WithField("Name", "__instance").WithField("Index", fieldKeyTemp).WithField("Value", fieldValue))
+        END IF
+    NEXT
+    RETURN TRUE
 END FUNCTION
 
 FUNCTION Fission_AmirLowerClass(builder, node)
@@ -1044,6 +1156,7 @@ FUNCTION Fission_AmirLowerClass(builder, node)
     classNameTemp = builder.NewTemp()
     ignored = builder.Emit(FissionAmirInstruction("Const").WithField("Dest", classNameTemp).WithField("Value", "\"" + className + "\""))
     ignored = builder.Emit(FissionAmirInstruction("StoreIndex").WithField("Name", "__instance").WithField("Index", classKeyTemp).WithField("Value", classNameTemp))
+    ignored = Fission_AmirEmitFieldInitializers(builder, node, 0)
     loadInstTemp = builder.NewTemp()
     ignored = builder.Emit(FissionAmirInstruction("Load").WithField("Dest", loadInstTemp).WithField("Name", "__instance"))
     ignored = builder.Emit(FissionAmirInstruction("Return").WithField("Type", "VALUE").WithField("Value", loadInstTemp))
@@ -1120,6 +1233,7 @@ FUNCTION Fission_AmirLowerFunctionDecl(builder, node)
     FOR param IN params
         ignored = builder.Scope.Declare(param.Name, param.Type)
     NEXT
+    ignored = Fission_AmirEmitGlobalCopyIn(builder, node, params)
 
     ' SIR "Function" nodes carry their body statements as direct children (see
     ' FissionSirBuilder.FunctionDecl -- there is no intermediate "Body" wrapper
@@ -1281,6 +1395,86 @@ FUNCTION Fission_AmirLowerStatement(builder, node)
     ignored = builder.Diagnostics.ReportError("FISSION_AMIR_UNSUPPORTED", "Unsupported SIR statement for A-MIR lowering: " + node.Kind)
 END FUNCTION
 
+' Script-scope globals, matching the legacy oracle: a name assigned by
+' top-level code AND referenced inside some FUNCTION/method body. Each such
+' function copies the global in at entry (Runtime.GetGlobal); a write inside a
+' function stays local to that call. Main publishes every store
+' (Runtime.SetGlobal, see FissionAmirBuilder.Emit). Returned in first-
+' assignment order.
+FUNCTION Fission_AmirCollectGlobals(statements)
+    topLevel = []
+    topLevelSet = {}
+    FOR statement IN statements
+        ignored = Fission_AmirCollectTopLevelNames(statement, topLevel, topLevelSet)
+    NEXT
+    referenced = {}
+    FOR statement IN statements
+        ignored = Fission_AmirCollectBodyReferences(statement, FALSE, referenced)
+    NEXT
+    result = []
+    FOR name IN topLevel
+        IF Object.Has(referenced, name) THEN ignored = Array.Push(result, name)
+    NEXT
+    RETURN result
+END FUNCTION
+
+FUNCTION Fission_AmirIsNameBindingNode(kind)
+    RETURN kind == "Assign" ORELSE kind == "Declare" ORELSE kind == "ForEach" ORELSE kind == "ForRange"
+END FUNCTION
+
+' Names bound by top-level statements (not inside FUNCTION/CLASS bodies).
+FUNCTION Fission_AmirCollectTopLevelNames(node, names, seen)
+    IF node.Kind == "Function" ORELSE node.Kind == "Class" ORELSE node.Kind == "Interface" THEN RETURN FALSE
+    IF Fission_AmirIsNameBindingNode(node.Kind) THEN
+        name = Object.Get(node.Fields, "Name", "")
+        IF name != "" ANDALSO Object.Has(seen, name) == FALSE THEN
+            seen[name] = TRUE
+            ignored = Array.Push(names, name)
+        END IF
+    END IF
+    FOR child IN node.Children
+        ignored = Fission_AmirCollectTopLevelNames(child, names, seen)
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
+' Names read or bound anywhere inside FUNCTION/CLASS bodies (insideBody
+' tracks whether `node` is already within one).
+FUNCTION Fission_AmirCollectBodyReferences(node, insideBody, referenced)
+    nowInside = insideBody ORELSE node.Kind == "Function" ORELSE node.Kind == "Class"
+    IF nowInside ANDALSO (node.Kind == "Read" ORELSE Fission_AmirIsNameBindingNode(node.Kind)) THEN
+        name = Object.Get(node.Fields, "Name", "")
+        IF name != "" THEN referenced[name] = TRUE
+    END IF
+    FOR child IN node.Children
+        ignored = Fission_AmirCollectBodyReferences(child, nowInside, referenced)
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
+' At a function/method entry: copy in every global its body references
+' (parameters shadow globals of the same name).
+FUNCTION Fission_AmirEmitGlobalCopyIn(builder, bodyNode, params)
+    IF LEN(builder.GlobalNames) == 0 THEN RETURN FALSE
+    referenced = {}
+    FOR child IN bodyNode.Children
+        ignored = Fission_AmirCollectBodyReferences(child, TRUE, referenced)
+    NEXT
+    paramSet = {}
+    FOR param IN params
+        paramSet[param.Name] = TRUE
+    NEXT
+    FOR globalName IN builder.GlobalNames
+        IF Object.Has(referenced, globalName) ANDALSO Object.Has(paramSet, globalName) == FALSE THEN
+            fetched = builder.NewTemp()
+            ignored = builder.Emit(FissionAmirInstruction("Call").WithField("Dest", fetched).WithField("Callee", "Runtime.GetGlobal").WithField("Args", "\"" + globalName + "\""))
+            ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", globalName).WithField("Value", fetched))
+            ignored = builder.Scope.Declare(globalName, "")
+        END IF
+    NEXT
+    RETURN TRUE
+END FUNCTION
+
 FUNCTION Fission_SirToAmir(sirModule)
     builder = FissionAmirBuilder(sirModule.Name)
     mainFunction = FissionAmirFunction("Main")
@@ -1296,6 +1490,15 @@ FUNCTION Fission_SirToAmir(sirModule)
     ' (confirmed via `ArcoFission reveal ... at A-MIR`) -- real programs (e.g.
     ' examples/arconote.abas) read `Args` directly, so this is required for
     ' functional equivalence, not just cosmetic.
+    builder.GlobalNames = Fission_AmirCollectGlobals(sirModule.Statements)
+    FOR globalName IN builder.GlobalNames
+        builder.GlobalSet[globalName] = TRUE
+    NEXT
+    FOR statement IN sirModule.Statements
+        classStatement = Fission_AmirUnwrapModifier(statement)
+        IF classStatement.Kind == "Class" THEN builder.ClassNodes[Object.Get(classStatement.Fields, "Name", "")] = classStatement
+    NEXT
+
     argsTemp = builder.NewTemp()
     ignored = builder.Emit(FissionAmirInstruction("Call").WithField("Dest", argsTemp).WithField("Callee", "Runtime.Args").WithField("Args", ""))
     ignored = builder.Emit(FissionAmirInstruction("Store").WithField("Name", "Args").WithField("Value", argsTemp))

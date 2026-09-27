@@ -37,6 +37,7 @@ FUNCTION Fission_BytecodeOpcodeNumber(mnemonic)
     IF mnemonic == "DECLARE_CLASS" THEN RETURN 18
     IF mnemonic == "RETURN" THEN RETURN 20
     IF mnemonic == "THROW" THEN RETURN 23
+    IF mnemonic == "COPY" THEN RETURN 25
     IF mnemonic == "ADDRESSOF" THEN RETURN 29
     RETURN -1
 END FUNCTION
@@ -75,7 +76,11 @@ CLASS FissionBytecodeInstruction
             RETURN opcode + " " + SELF.Field("Type") + " " + SELF.Field("Value")
         END IF
         IF SELF.Mnemonic == "DECLARE_FUNCTION" THEN RETURN opcode + " " + SELF.Field("Name") + " params=" + SELF.Field("Params") + " returns=" + SELF.Field("Returns")
-        IF SELF.Mnemonic == "DECLARE_CLASS" THEN RETURN opcode + " " + SELF.Field("Name")
+        ' The parent class lets the VM find inherited methods.
+        IF SELF.Mnemonic == "DECLARE_CLASS" THEN
+            IF SELF.Field("Extends") != "" THEN RETURN opcode + " " + SELF.Field("Name") + " EXTENDS " + SELF.Field("Extends")
+            RETURN opcode + " " + SELF.Field("Name")
+        END IF
         IF SELF.Mnemonic == "STORE_INDEX" THEN RETURN opcode + " " + SELF.Field("Local") + " " + SELF.Field("Index") + " " + SELF.Field("Value")
         IF SELF.Mnemonic == "ARRAY" THEN RETURN opcode + " " + SELF.Field("Dest") + Fission_BytecodeArgsSuffix(SELF.Field("Items"))
         IF SELF.Mnemonic == "INDEX" THEN RETURN opcode + " " + SELF.Field("Dest") + " " + SELF.Field("Base") + " " + SELF.Field("Index")
@@ -89,6 +94,7 @@ CLASS FissionBytecodeInstruction
         IF SELF.Mnemonic == "TRY_END" THEN RETURN opcode
         IF SELF.Mnemonic == "THROW" THEN RETURN opcode + " " + SELF.Field("Value")
         IF SELF.Mnemonic == "ADDRESSOF" THEN RETURN opcode + " " + SELF.Field("Dest") + " " + SELF.Field("Name")
+        IF SELF.Mnemonic == "COPY" THEN RETURN opcode + " " + SELF.Field("Dest") + " " + SELF.Field("Value")
         RETURN opcode + " " + String(SELF.Fields)
     END FUNCTION
 END CLASS
@@ -210,6 +216,9 @@ CLASS FissionBytecodeModule
         SELF.ConstantIndex = {}
         SELF.Functions = []
         SELF.Diagnostics = FissionDiagnosticBag()
+        ' Class name -> EXTENDS parent ("" for none): the VM's method lookup
+        ' walks it (the CLASS_PARENTS section).
+        SELF.ClassParents = {}
     END CONSTRUCTOR
 
     ' Deduped by rendered value text (matching the legacy oracle's own
@@ -220,7 +229,7 @@ CLASS FissionBytecodeModule
         IF existing != NULL THEN RETURN "K" + String(existing)
         index = LEN(SELF.Constants)
         ignored = Array.Push(SELF.Constants, valueText)
-        SELF.ConstantIndex = Object.Set(SELF.ConstantIndex, valueText, index)
+        SELF.ConstantIndex[valueText] = index
         RETURN "K" + String(index)
     END FUNCTION
 
@@ -243,6 +252,17 @@ CLASS FissionBytecodeModule
             ignored = Array.Push(lines, fn.Render())
             ignored = Array.Push(lines, "")
         NEXT
+        classNames = Object.Keys(SELF.ClassParents)
+        IF LEN(classNames) > 0 THEN
+            ignored = Array.Push(lines, "CLASS_PARENTS " + String(LEN(classNames)))
+            FOR className IN classNames
+                parentName = Object.Get(SELF.ClassParents, className, "")
+                IF parentName == "" THEN parentName = "-"
+                ignored = Array.Push(lines, "    " + className + " " + parentName)
+            NEXT
+            ignored = Array.Push(lines, "END CLASS_PARENTS")
+            ignored = Array.Push(lines, "")
+        END IF
         RETURN Array.Join(lines, "\n")
     END FUNCTION
 END CLASS

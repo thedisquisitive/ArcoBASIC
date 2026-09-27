@@ -1,0 +1,133 @@
+' Dynamic objects ("maps") for the Fission native runtime: string keys to
+' dynamic (Any) values, written in ArcoBASIC on MEMORY.* and the runtime heap.
+' Object literals outside class constructors, Object.Set/Get/Has/Keys, and
+' `m[key]` / `m.Key` reads and writes all use this representation.
+'
+' Keys are kept SORTED (binary search), matching the language's own object
+' semantics exactly: objects are ordered by key (PRINT shows {a: 1, b: 2},
+' Object.Keys returns sorted keys).
+'
+' Layout (32 bytes): 0 count, 8 capacity, 16 keys (array of NUL-terminated
+' string pointers), 24 values (array of Any boxes, see dynamic.abas).
+' Requires fission/runtime/heap.abas, imported once by fission/runtime/dynamic.abas
+' (the language expands a repeated #IMPORT again, so modules import it once).
+
+FUNCTION FissionRt_MapNew()
+    rtMap = FissionRt_Alloc(32)
+    rtIgnored = MEMORY.Write64(rtMap, 0)
+    rtIgnored = MEMORY.Write64(rtMap + 8, 4)
+    rtIgnored = MEMORY.Write64(rtMap + 16, FissionRt_Alloc(32))
+    rtIgnored = MEMORY.Write64(rtMap + 24, FissionRt_Alloc(32))
+    RETURN rtMap
+END FUNCTION
+
+FUNCTION FissionRt_MapCount(rtMap)
+    RETURN MEMORY.Read64(rtMap)
+END FUNCTION
+
+
+' Index of `rtKey` if present, otherwise -(insertionPoint + 1).
+FUNCTION FissionRt_MapFind(rtMap, rtKey)
+    rtLow = 0
+    rtHigh = MEMORY.Read64(rtMap) - 1
+    rtKeys = MEMORY.Read64(rtMap + 16)
+    WHILE rtLow <= rtHigh
+        rtMid = (rtLow + rtHigh) SHR 1
+        rtOrder = FissionRt_StrCmp(MEMORY.Read64(rtKeys + rtMid * 8), rtKey)
+        IF rtOrder == 0 THEN RETURN rtMid
+        IF rtOrder < 0 THEN
+            rtLow = rtMid + 1
+        ELSE
+            rtHigh = rtMid - 1
+        END IF
+    WEND
+    RETURN 0 - rtLow - 1
+END FUNCTION
+
+FUNCTION FissionRt_MapHas(rtMap, rtKey)
+    IF FissionRt_MapFind(rtMap, rtKey) >= 0 THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+' The value for `rtKey`, or `rtDefault` when it is absent.
+FUNCTION FissionRt_MapGetOr(rtMap, rtKey, rtDefault)
+    rtIndex = FissionRt_MapFind(rtMap, rtKey)
+    IF rtIndex < 0 THEN RETURN rtDefault
+    RETURN MEMORY.Read64(MEMORY.Read64(rtMap + 24) + rtIndex * 8)
+END FUNCTION
+
+' Sets `rtKey` to `rtValue` in place (the map is mutated).
+FUNCTION FissionRt_MapSet(rtMap, rtKey, rtValue)
+    rtIndex = FissionRt_MapFind(rtMap, rtKey)
+    IF rtIndex >= 0 THEN
+        rtIgnored = MEMORY.Write64(MEMORY.Read64(rtMap + 24) + rtIndex * 8, rtValue)
+        RETURN rtMap
+    END IF
+    rtInsert = 0 - rtIndex - 1
+    rtCount = MEMORY.Read64(rtMap)
+    rtCapacity = MEMORY.Read64(rtMap + 8)
+    IF rtCount == rtCapacity THEN
+        rtNewCapacity = rtCapacity * 2
+        rtNewKeys = FissionRt_Alloc(rtNewCapacity * 8)
+        rtNewValues = FissionRt_Alloc(rtNewCapacity * 8)
+        rtCopy = 0
+        WHILE rtCopy < rtCount
+            rtIgnored = MEMORY.Write64(rtNewKeys + rtCopy * 8, MEMORY.Read64(MEMORY.Read64(rtMap + 16) + rtCopy * 8))
+            rtIgnored = MEMORY.Write64(rtNewValues + rtCopy * 8, MEMORY.Read64(MEMORY.Read64(rtMap + 24) + rtCopy * 8))
+            rtCopy = rtCopy + 1
+        WEND
+        rtIgnored = MEMORY.Write64(rtMap + 8, rtNewCapacity)
+        rtIgnored = MEMORY.Write64(rtMap + 16, rtNewKeys)
+        rtIgnored = MEMORY.Write64(rtMap + 24, rtNewValues)
+    END IF
+    rtKeys = MEMORY.Read64(rtMap + 16)
+    rtValues = MEMORY.Read64(rtMap + 24)
+    rtShift = rtCount
+    WHILE rtShift > rtInsert
+        rtIgnored = MEMORY.Write64(rtKeys + rtShift * 8, MEMORY.Read64(rtKeys + (rtShift - 1) * 8))
+        rtIgnored = MEMORY.Write64(rtValues + rtShift * 8, MEMORY.Read64(rtValues + (rtShift - 1) * 8))
+        rtShift = rtShift - 1
+    WEND
+    rtIgnored = MEMORY.Write64(rtKeys + rtInsert * 8, rtKey)
+    rtIgnored = MEMORY.Write64(rtValues + rtInsert * 8, rtValue)
+    rtIgnored = MEMORY.Write64(rtMap, rtCount + 1)
+    RETURN rtMap
+END FUNCTION
+
+' A shallow copy (Copy(obj), and the copy Object.Set returns).
+FUNCTION FissionRt_MapCopy(rtMap)
+    ' The keys are already sorted: copy both arrays wholesale.
+    rtCount = MEMORY.Read64(rtMap)
+    rtCapacity = rtCount
+    IF rtCapacity < 4 THEN rtCapacity = 4
+    rtResult = FissionRt_Alloc(32)
+    rtIgnored = MEMORY.Write64(rtResult, rtCount)
+    rtIgnored = MEMORY.Write64(rtResult + 8, rtCapacity)
+    rtIgnored = MEMORY.Write64(rtResult + 16, FissionRt_Alloc(rtCapacity * 8))
+    rtIgnored = MEMORY.Write64(rtResult + 24, FissionRt_Alloc(rtCapacity * 8))
+    rtIgnored = FissionRt_CopyBytes(MEMORY.Read64(rtResult + 16), MEMORY.Read64(rtMap + 16), rtCount * 8)
+    rtIgnored = FissionRt_CopyBytes(MEMORY.Read64(rtResult + 24), MEMORY.Read64(rtMap + 24), rtCount * 8)
+    RETURN rtResult
+END FUNCTION
+
+' Object.Set(map, key, value): a NEW map with the key set -- the original is
+' untouched, exactly like the language's own Object.Set.
+FUNCTION FissionRt_MapWith(rtMap, rtKey, rtValue)
+    RETURN FissionRt_MapSet(FissionRt_MapCopy(rtMap), rtKey, rtValue)
+END FUNCTION
+
+' Object.Keys(map): the sorted keys as an Array:String (native array layout:
+' a 24-byte header {length, dataPointer, capacity}, then the elements).
+FUNCTION FissionRt_MapKeys(rtMap)
+    rtCount = MEMORY.Read64(rtMap)
+    rtHeader = FissionRt_Alloc(24 + rtCount * 8)
+    rtIgnored = MEMORY.Write64(rtHeader, rtCount)
+    rtIgnored = MEMORY.Write64(rtHeader + 8, rtHeader + 24)
+    rtIgnored = MEMORY.Write64(rtHeader + 16, rtCount)
+    rtIndex = 0
+    WHILE rtIndex < rtCount
+        rtIgnored = MEMORY.Write64(rtHeader + 24 + rtIndex * 8, MEMORY.Read64(MEMORY.Read64(rtMap + 16) + rtIndex * 8))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtHeader
+END FUNCTION

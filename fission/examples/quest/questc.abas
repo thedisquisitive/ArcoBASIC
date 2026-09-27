@@ -1,0 +1,10 @@
+' A complete Quest compiler: Fission's own components plus the Quest language.
+'   questc build rules.quest -o rules                     (native executable)
+'   questc build rules.quest -o rules.arcof --target bytecode
+#IMPORT "fission/cli/build_cli.abas"
+#IMPORT "fission/examples/quest/quest.abas"
+
+host = Fission_New()
+ignored = Fission_RegisterBuiltinComponents(host)
+ignored = Quest_Register(host)
+ignored = Fission_RunBuildCli(host, Runtime.Args())

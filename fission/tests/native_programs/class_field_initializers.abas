@@ -1,0 +1,19 @@
+' Class-body fields: initializers run in declaration order (ancestors
+' first), `Name AS Type` starts as NULL, and a map-valued initializer is a
+' map, not another instance.
+CLASS Base
+    Items = []
+    Count AS Number
+END CLASS
+
+CLASS Box EXTENDS Base
+    Tag = "t" + "x"
+    Nested = {A: 1}
+END CLASS
+
+b = Box()
+PRINT b
+ignored = Array.Push(b.Items, 5)
+PRINT b.Items
+PRINT b.Nested
+PRINT Base()

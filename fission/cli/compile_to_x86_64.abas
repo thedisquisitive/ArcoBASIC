@@ -34,6 +34,7 @@
 #IMPORT "fission/amir/x86_64_assembler.abas"
 #IMPORT "fission/amir/elf_object.abas"
 #IMPORT "fission/amir/fusion_linker.abas"
+#IMPORT "fission/runtime/library.abas"
 
 FUNCTION FissionNativeCli_Fail(stage, message)
     PRINT "FISSION NATIVE COMPILE FAILED at " + stage
@@ -66,7 +67,10 @@ sir = Fission_ArcoBasicAstToSir(ast)
 amir = Fission_SirToAmir(sir)
 IF amir.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("A-MIR", amir.Diagnostics.Render())
 
-program = Fission_AmirToX86_64(amir)
+' Every native program links the precompiled Fission runtime library
+' (fission/runtime/, ArcoBASIC; built once and cached by
+' Fission_NativeRuntimeLibrary) and calls its initializer first.
+program = Fission_AmirToX86_64WithOptions(amir, {LibraryInit: "", CallRuntimeInit: TRUE})
 IF program.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("X86_64", program.Diagnostics.Render())
 
 assembled = Fission_X86_64AssembleFragment(program.Render())
@@ -85,14 +89,11 @@ IF assembled.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("ASSEM
 ' doesn't actually call a host function -- one only ever fails, with a
 ' real "undefined symbol" diagnostic from Fusion itself, at the point it
 ' actually needed a host function this fragment can't provide.
-fragments = [assembled.Fragment]
-hostBridgePath = ".rivet/fission-native-runtime/host_bridge.o"
-IF File.Exists(hostBridgePath) THEN
-    hostBridgeBytes = File.ReadBytes(hostBridgePath)
-    hostBridgeParsed = Fission_ElfObjectParse(hostBridgeBytes)
-    IF hostBridgeParsed.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("HOST_BRIDGE", hostBridgeParsed.Diagnostics.Render())
-    ignored = Array.Push(fragments, hostBridgeParsed.Fragment)
-END IF
+runtimeLibrary = Fission_NativeRuntimeLibrary()
+IF runtimeLibrary.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("RUNTIME", runtimeLibrary.Diagnostics.Render())
+' The program and the ArcoBASIC runtime library (fission/runtime/) are the
+' whole program: no C host bridge object any more.
+fragments = [assembled.Fragment, runtimeLibrary.Fragment]
 
 linked = Fission_FusionLink(fragments, "_start")
 IF linked.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("FUSION", linked.Diagnostics.Render())

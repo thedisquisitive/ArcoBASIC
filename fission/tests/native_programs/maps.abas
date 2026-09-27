@@ -1,0 +1,26 @@
+' Dynamic objects (maps, fission/runtime/map.abas): object literals, member
+' read/write, Object.Get/Set/Has/Keys (Object.Set returns a copy), sorted-key
+' PRINT, and a map passed through a function -- must match the oracle.
+FUNCTION Describe(node)
+    RETURN node.Kind + "(" + String(node.Size) + ")"
+END FUNCTION
+info = {Kind: "leaf", Size: 3}
+PRINT info.Kind
+PRINT info.Size + 1
+info.Size = 10
+PRINT Describe(info)
+fields = {}
+fields = Object.Set(fields, "name", "Ada")
+fields = Object.Set(fields, "age", 36)
+PRINT Object.Get(fields, "name", "?")
+PRINT Object.Get(fields, "missing", "default")
+PRINT Object.Has(fields, "age")
+PRINT Object.Has(fields, "nope")
+PRINT Object.Keys(fields)
+PRINT fields
+before = fields
+after = Object.Set(fields, "zed", TRUE)
+PRINT before
+PRINT after
+fields["age"] = 37
+PRINT fields.age

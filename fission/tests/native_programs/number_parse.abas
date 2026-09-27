@@ -1,0 +1,12 @@
+' NUMBER(text) yields an integer or a double, as the text says.
+PRINT NUMBER("42") + 1
+PRINT NUMBER("-17") * 2
+PRINT NUMBER("1.5") * 2
+PRINT NUMBER("0.1") + NUMBER("0.2")
+PRINT NUMBER("2.5e3")
+PRINT NUMBER("  7")
+total = 0
+FOR piece IN String.Split("3,4.25,5", ",")
+    total = total + NUMBER(piece)
+NEXT
+PRINT total

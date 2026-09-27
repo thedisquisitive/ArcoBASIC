@@ -1,0 +1,343 @@
+' Host functions for strings, paths and bits, in ArcoBASIC (formerly C in
+' fission/native_runtime/host_bridge.c). The code generator calls these by
+' their arco_host_* names with raw values: a string is a pointer to its bytes
+' (fission/runtime/strings.abas), a number a 64-bit integer. Written with
+' MEMORY.* only -- string operators here would loop back into the runtime.
+' Like the language: String.Length/LEN and String.Slice count characters
+' (UTF-8 code points); IndexOf, Insert and Delete work in bytes.
+
+' A new string holding `rtLength` bytes of `rtText` from `rtStart`.
+FUNCTION FissionRt_SubString(rtText, rtStart, rtLength)
+    rtResult = FissionRt_StrNew(rtLength)
+    rtIgnored = FissionRt_CopyBytes(rtResult, rtText + rtStart, rtLength)
+    RETURN rtResult
+END FUNCTION
+
+' Index of `rtNeedle` in `rtHaystack` at or after `rtFrom`, or -1.
+FUNCTION FissionRt_FindBytes(rtHaystack, rtHaystackLength, rtNeedle, rtNeedleLength, rtFrom)
+    IF rtNeedleLength == 0 THEN RETURN rtFrom
+    rtIndex = rtFrom
+    WHILE rtIndex + rtNeedleLength <= rtHaystackLength
+        rtMatched = 0
+        WHILE rtMatched < rtNeedleLength ANDALSO MEMORY.Read8(rtHaystack + rtIndex + rtMatched) == MEMORY.Read8(rtNeedle + rtMatched)
+            rtMatched = rtMatched + 1
+        WEND
+        IF rtMatched == rtNeedleLength THEN RETURN rtIndex
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN -1
+END FUNCTION
+
+FUNCTION FissionRt_IsSpaceByte(rtByte)
+    IF rtByte == 32 ORELSE (rtByte >= 9 ANDALSO rtByte <= 13) THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+FUNCTION arco_host_string_length(rtText)
+    RETURN FissionRt_CharCount(rtText)
+END FUNCTION
+
+' Characters in the string: bytes that do not continue a UTF-8 sequence.
+FUNCTION FissionRt_CharCount(rtText)
+    rtLength = FissionRt_StrLen(rtText)
+    rtCount = 0
+    rtIndex = 0
+    WHILE rtIndex < rtLength
+        IF (MEMORY.Read8(rtText + rtIndex) BITAND 192) != 128 THEN rtCount = rtCount + 1
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtCount
+END FUNCTION
+
+' Byte offset of character `rtChars` (the byte length past the last one).
+FUNCTION FissionRt_CharOffset(rtText, rtLength, rtChars)
+    rtOffset = 0
+    rtSeen = 0
+    WHILE rtOffset < rtLength
+        IF (MEMORY.Read8(rtText + rtOffset) BITAND 192) != 128 THEN
+            IF rtSeen == rtChars THEN RETURN rtOffset
+            rtSeen = rtSeen + 1
+        END IF
+        rtOffset = rtOffset + 1
+    WEND
+    RETURN rtLength
+END FUNCTION
+
+FUNCTION arco_host_string_contains(rtHaystack, rtNeedle)
+    IF FissionRt_FindBytes(rtHaystack, FissionRt_StrLen(rtHaystack), rtNeedle, FissionRt_StrLen(rtNeedle), 0) >= 0 THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+FUNCTION arco_host_string_index_of(rtHaystack, rtNeedle)
+    RETURN FissionRt_FindBytes(rtHaystack, FissionRt_StrLen(rtHaystack), rtNeedle, FissionRt_StrLen(rtNeedle), 0)
+END FUNCTION
+
+FUNCTION arco_host_string_starts_with(rtText, rtPrefix)
+    rtPrefixLength = FissionRt_StrLen(rtPrefix)
+    IF rtPrefixLength > FissionRt_StrLen(rtText) THEN RETURN 0
+    IF FissionRt_FindBytes(rtText, rtPrefixLength, rtPrefix, rtPrefixLength, 0) == 0 THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+FUNCTION arco_host_string_ends_with(rtText, rtSuffix)
+    rtLength = FissionRt_StrLen(rtText)
+    rtSuffixLength = FissionRt_StrLen(rtSuffix)
+    IF rtSuffixLength > rtLength THEN RETURN 0
+    IF FissionRt_FindBytes(rtText, rtLength, rtSuffix, rtSuffixLength, rtLength - rtSuffixLength) == rtLength - rtSuffixLength THEN RETURN 1
+    RETURN 0
+END FUNCTION
+
+FUNCTION arco_host_string_trim(rtText)
+    rtEnd = FissionRt_StrLen(rtText)
+    rtStart = 0
+    WHILE rtStart < rtEnd ANDALSO FissionRt_IsSpaceByte(MEMORY.Read8(rtText + rtStart)) == 1
+        rtStart = rtStart + 1
+    WEND
+    WHILE rtEnd > rtStart ANDALSO FissionRt_IsSpaceByte(MEMORY.Read8(rtText + rtEnd - 1)) == 1
+        rtEnd = rtEnd - 1
+    WEND
+    RETURN FissionRt_SubString(rtText, rtStart, rtEnd - rtStart)
+END FUNCTION
+
+' Start and length in characters, clamped to the string.
+FUNCTION arco_host_string_slice(rtText, rtStart, rtLength)
+    rtTextLength = FissionRt_CharCount(rtText)
+    rtFrom = rtStart
+    IF rtFrom < 0 THEN rtFrom = 0
+    IF rtFrom > rtTextLength THEN rtFrom = rtTextLength
+    rtCount = rtLength
+    IF rtCount < 0 THEN rtCount = 0
+    IF rtFrom + rtCount > rtTextLength THEN rtCount = rtTextLength - rtFrom
+    rtBytes = FissionRt_StrLen(rtText)
+    rtFromByte = FissionRt_CharOffset(rtText, rtBytes, rtFrom)
+    rtToByte = FissionRt_CharOffset(rtText, rtBytes, rtFrom + rtCount)
+    RETURN FissionRt_SubString(rtText, rtFromByte, rtToByte - rtFromByte)
+END FUNCTION
+
+FUNCTION arco_host_number_to_string(rtValue)
+    IF rtValue == 0 THEN RETURN FissionRt_SubString(FISSION.Bits("0"), 0, 1)
+    ' Digits into a 24-byte scratch string, from the end.
+    rtScratch = FissionRt_StrNew(24)
+    rtPosition = 24
+    rtNegative = 0
+    rtRemaining = rtValue
+    IF rtRemaining < 0 THEN rtNegative = 1
+    WHILE rtRemaining != 0
+        rtDigit = rtRemaining MOD 10
+        IF rtDigit < 0 THEN rtDigit = 0 - rtDigit
+        rtPosition = rtPosition - 1
+        rtIgnored = MEMORY.Write8(rtScratch + rtPosition, 48 + rtDigit)
+        rtRemaining = FISSION.Quotient(rtRemaining, 10)
+    WEND
+    IF rtNegative == 1 THEN
+        rtPosition = rtPosition - 1
+        rtIgnored = MEMORY.Write8(rtScratch + rtPosition, 45)
+    END IF
+    RETURN FissionRt_SubString(rtScratch, rtPosition, 24 - rtPosition)
+END FUNCTION
+
+FUNCTION FissionRt_MapCase(rtText, rtLow, rtHigh, rtDelta)
+    rtLength = FissionRt_StrLen(rtText)
+    rtResult = FissionRt_StrNew(rtLength)
+    rtIndex = 0
+    WHILE rtIndex < rtLength
+        rtByte = MEMORY.Read8(rtText + rtIndex)
+        IF rtByte >= rtLow ANDALSO rtByte <= rtHigh THEN rtByte = rtByte + rtDelta
+        rtIgnored = MEMORY.Write8(rtResult + rtIndex, rtByte)
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_upper(rtText)
+    RETURN FissionRt_MapCase(rtText, 97, 122, -32)
+END FUNCTION
+
+FUNCTION arco_host_lower(rtText)
+    RETURN FissionRt_MapCase(rtText, 65, 90, 32)
+END FUNCTION
+
+FUNCTION arco_host_string_delete(rtText, rtStart, rtCount)
+    rtLength = FissionRt_StrLen(rtText)
+    rtFrom = rtStart
+    IF rtFrom < 0 THEN rtFrom = 0
+    IF rtFrom > rtLength THEN rtFrom = rtLength
+    rtRemove = rtCount
+    IF rtRemove < 0 THEN rtRemove = 0
+    IF rtFrom + rtRemove > rtLength THEN rtRemove = rtLength - rtFrom
+    rtResult = FissionRt_StrNew(rtLength - rtRemove)
+    rtIgnored = FissionRt_CopyBytes(rtResult, rtText, rtFrom)
+    rtIgnored = FissionRt_CopyBytes(rtResult + rtFrom, rtText + rtFrom + rtRemove, rtLength - rtFrom - rtRemove)
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_string_insert(rtText, rtIndex, rtInsert)
+    rtLength = FissionRt_StrLen(rtText)
+    rtInsertLength = FissionRt_StrLen(rtInsert)
+    rtAt = rtIndex
+    IF rtAt < 0 THEN rtAt = 0
+    IF rtAt > rtLength THEN rtAt = rtLength
+    rtResult = FissionRt_StrNew(rtLength + rtInsertLength)
+    rtIgnored = FissionRt_CopyBytes(rtResult, rtText, rtAt)
+    rtIgnored = FissionRt_CopyBytes(rtResult + rtAt, rtInsert, rtInsertLength)
+    rtIgnored = FissionRt_CopyBytes(rtResult + rtAt + rtInsertLength, rtText + rtAt, rtLength - rtAt)
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_string_replace(rtText, rtOld, rtNew)
+    rtLength = FissionRt_StrLen(rtText)
+    rtOldLength = FissionRt_StrLen(rtOld)
+    rtNewLength = FissionRt_StrLen(rtNew)
+    IF rtOldLength == 0 THEN RETURN FissionRt_SubString(rtText, 0, rtLength)
+    ' Count first, then build in one allocation.
+    rtMatches = 0
+    rtAt = FissionRt_FindBytes(rtText, rtLength, rtOld, rtOldLength, 0)
+    WHILE rtAt >= 0
+        rtMatches = rtMatches + 1
+        rtAt = FissionRt_FindBytes(rtText, rtLength, rtOld, rtOldLength, rtAt + rtOldLength)
+    WEND
+    rtResult = FissionRt_StrNew(rtLength + rtMatches * (rtNewLength - rtOldLength))
+    rtOut = rtResult
+    rtFrom = 0
+    rtAt = FissionRt_FindBytes(rtText, rtLength, rtOld, rtOldLength, 0)
+    WHILE rtAt >= 0
+        rtIgnored = FissionRt_CopyBytes(rtOut, rtText + rtFrom, rtAt - rtFrom)
+        rtOut = rtOut + rtAt - rtFrom
+        rtIgnored = FissionRt_CopyBytes(rtOut, rtNew, rtNewLength)
+        rtOut = rtOut + rtNewLength
+        rtFrom = rtAt + rtOldLength
+        rtAt = FissionRt_FindBytes(rtText, rtLength, rtOld, rtOldLength, rtFrom)
+    WEND
+    rtIgnored = FissionRt_CopyBytes(rtOut, rtText + rtFrom, rtLength - rtFrom)
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION arco_host_bytes_to_hex(rtText)
+    rtLength = FissionRt_StrLen(rtText)
+    rtResult = FissionRt_StrNew(rtLength * 2)
+    rtIndex = 0
+    WHILE rtIndex < rtLength
+        rtByte = MEMORY.Read8(rtText + rtIndex)
+        rtIgnored = MEMORY.Write8(rtResult + rtIndex * 2, FissionRt_HexDigit(rtByte SHR 4))
+        rtIgnored = MEMORY.Write8(rtResult + rtIndex * 2 + 1, FissionRt_HexDigit(rtByte BITAND 15))
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtResult
+END FUNCTION
+
+FUNCTION FissionRt_HexDigit(rtNibble)
+    IF rtNibble < 10 THEN RETURN 48 + rtNibble
+    RETURN 87 + rtNibble
+END FUNCTION
+
+' Index of the last `rtByte` in the string, or -1.
+FUNCTION FissionRt_LastByte(rtText, rtLength, rtByte)
+    rtIndex = rtLength - 1
+    WHILE rtIndex >= 0
+        IF MEMORY.Read8(rtText + rtIndex) == rtByte THEN RETURN rtIndex
+        rtIndex = rtIndex - 1
+    WEND
+    RETURN -1
+END FUNCTION
+
+FUNCTION arco_host_path_basename(rtPath)
+    rtLength = FissionRt_StrLen(rtPath)
+    rtStart = FissionRt_LastByte(rtPath, rtLength, 47) + 1
+    RETURN FissionRt_SubString(rtPath, rtStart, rtLength - rtStart)
+END FUNCTION
+
+FUNCTION arco_host_path_dirname(rtPath)
+    rtSlash = FissionRt_LastByte(rtPath, FissionRt_StrLen(rtPath), 47)
+    IF rtSlash < 0 THEN rtSlash = 0
+    RETURN FissionRt_SubString(rtPath, 0, rtSlash)
+END FUNCTION
+
+FUNCTION arco_host_path_extension(rtPath)
+    rtLength = FissionRt_StrLen(rtPath)
+    rtDot = FissionRt_LastByte(rtPath, rtLength, 46)
+    IF rtDot < 0 ORELSE rtDot < FissionRt_LastByte(rtPath, rtLength, 47) THEN RETURN FissionRt_StrNew(0)
+    RETURN FissionRt_SubString(rtPath, rtDot, rtLength - rtDot)
+END FUNCTION
+
+' --- Bits (64-bit two's complement; >> is arithmetic, like C's on signed).
+FUNCTION arco_host_bit_and(rtA, rtB)
+    RETURN rtA BITAND rtB
+END FUNCTION
+
+FUNCTION arco_host_bit_or(rtA, rtB)
+    RETURN rtA BITOR rtB
+END FUNCTION
+
+FUNCTION arco_host_bit_xor(rtA, rtB)
+    RETURN rtA BITXOR rtB
+END FUNCTION
+
+FUNCTION arco_host_bit_not(rtA)
+    RETURN rtA BITXOR -1
+END FUNCTION
+
+FUNCTION arco_host_bit_shift_left(rtA, rtN)
+    RETURN rtA SHL rtN
+END FUNCTION
+
+FUNCTION arco_host_bit_shift_right(rtA, rtN)
+    RETURN rtA SHR rtN
+END FUNCTION
+
+' Logical (unsigned) right shift.
+FUNCTION FissionRt_ShiftRightLogical(rtValue, rtN)
+    IF rtN <= 0 THEN RETURN rtValue
+    IF rtN >= 64 THEN RETURN 0
+    RETURN (rtValue SHR rtN) BITAND ((1 SHL (64 - rtN)) - 1)
+END FUNCTION
+
+FUNCTION arco_host_bit_count(rtA)
+    rtCount = 0
+    rtIndex = 0
+    WHILE rtIndex < 64
+        rtCount = rtCount + ((rtA SHR rtIndex) BITAND 1)
+        rtIndex = rtIndex + 1
+    WEND
+    RETURN rtCount
+END FUNCTION
+
+FUNCTION arco_host_set_bit(rtValue, rtIndex)
+    RETURN rtValue BITOR (1 SHL rtIndex)
+END FUNCTION
+
+FUNCTION arco_host_clear_bit(rtValue, rtIndex)
+    RETURN rtValue BITAND ((1 SHL rtIndex) BITXOR -1)
+END FUNCTION
+
+FUNCTION arco_host_toggle_bit(rtValue, rtIndex)
+    RETURN rtValue BITXOR (1 SHL rtIndex)
+END FUNCTION
+
+FUNCTION arco_host_test_bit(rtValue, rtIndex)
+    RETURN (rtValue SHR rtIndex) BITAND 1
+END FUNCTION
+
+FUNCTION arco_host_rotate_left(rtValue, rtN)
+    rtShift = rtN BITAND 63
+    IF rtShift == 0 THEN RETURN rtValue
+    RETURN (rtValue SHL rtShift) BITOR FissionRt_ShiftRightLogical(rtValue, 64 - rtShift)
+END FUNCTION
+
+FUNCTION arco_host_rotate_right(rtValue, rtN)
+    rtShift = rtN BITAND 63
+    IF rtShift == 0 THEN RETURN rtValue
+    RETURN FissionRt_ShiftRightLogical(rtValue, rtShift) BITOR (rtValue SHL (64 - rtShift))
+END FUNCTION
+
+FUNCTION arco_host_shift(rtValue, rtN)
+    IF rtN >= 0 THEN RETURN rtValue SHL rtN
+    RETURN rtValue SHR (0 - rtN)
+END FUNCTION
+
+FUNCTION arco_host_string_index_of_from(rtHaystack, rtNeedle, rtStart)
+    rtLength = FissionRt_StrLen(rtHaystack)
+    rtFrom = rtStart
+    IF rtFrom < 0 THEN rtFrom = 0
+    IF rtFrom > rtLength THEN RETURN -1
+    RETURN FissionRt_FindBytes(rtHaystack, rtLength, rtNeedle, FissionRt_StrLen(rtNeedle), rtFrom)
+END FUNCTION

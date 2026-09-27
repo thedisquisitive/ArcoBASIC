@@ -1,6 +1,9 @@
+#IMPORT "fission/sir/builder.abas"
 #IMPORT "fission/core/artifact.abas"
 #IMPORT "fission/core/diagnostics.abas"
 #IMPORT "fission/sir/serialize.abas"
+#IMPORT "fission/language/api/symbol_compiler.abas"
+#IMPORT "fission/language/api/grammar_compiler.abas"
 
 FUNCTION Fission_ShellQuote(value)
     text = STRING(value)
@@ -88,6 +91,14 @@ CLASS FissionComponent
         SELF.Compatibility = []
         SELF.Configuration = {}
         SELF.TransformHandler = NULL
+        ' A language's compile function (see FissionLanguageDefinition.SourceToSir).
+        SELF.SourceHandler = NULL
+        ' A language declared with Symbol/Pair/On (fission/language/api/
+        ' symbol_compiler.abas).
+        SELF.SymbolLanguage = NULL
+        ' A language declared with Statement/Block/On (fission/language/api/
+        ' grammar_compiler.abas).
+        SELF.GrammarLanguage = NULL
     END CONSTRUCTOR
 
     FUNCTION Versioned(version)
@@ -143,6 +154,9 @@ CLASS FissionComponent
     END FUNCTION
 
     FUNCTION TransformArtifact(artifact, context, outputType)
+        IF SELF.SourceHandler != NULL THEN RETURN Fission_RunSourceHandler(SELF.SourceHandler, artifact)
+        IF SELF.GrammarLanguage != NULL THEN RETURN Fission_RunGrammarLanguage(SELF.GrammarLanguage, artifact)
+        IF SELF.SymbolLanguage != NULL THEN RETURN Fission_RunSymbolLanguage(SELF.SymbolLanguage, artifact)
         IF SELF.TransformHandler == NULL THEN
             moduleOutput = Fission_ModuleTransformArtifact(SELF, artifact, context, outputType)
             IF moduleOutput != NULL THEN RETURN moduleOutput
@@ -155,3 +169,12 @@ CLASS FissionComponent
         RETURN handler(artifact, context)
     END FUNCTION
 END CLASS
+
+' Runs a language's compile function: `handler(sourceText, builder)` appends
+' SIR statements through the builder (fission/sir/builder.abas) and may
+' report problems with builder.Error(message). The result is the SIR artifact.
+FUNCTION Fission_RunSourceHandler(handler, artifact)
+    builder = FissionSirBuilder(artifact.Name)
+    ignored = handler(artifact.Value, builder)
+    RETURN FissionArtifact("SIR", artifact.Name, builder.Build())
+END FUNCTION

@@ -1,0 +1,136 @@
+' The Level 1 language construction API at work: a language declared only with
+' Language.Symbol / Language.Pair / Language.On (fission/language/api/
+' language.abas) needs no parser of its own. This compiler reads the source,
+' finds the declared symbols (the longest match wins; anything else is a
+' comment), and calls the semantic handler of each one:
+'
+'   handler(node, builder)
+'
+' node.Semantic is the declared semantic name, node.Symbol the source text,
+' node.Line/node.Column its position, and for a Pair node.Body holds the SIR
+' statements already built for the symbols between the open and close symbol.
+' The handler returns one SIR statement, an array of them, or NULL.
+'
+' Two optional semantics frame the program: "Start" runs before the first
+' symbol (declare the language's state there) and "Finish" after the last.
+#IMPORT "fission/sir/builder.abas"
+
+FUNCTION Fission_SymbolHandler(language, semantic)
+    FOR item IN language.SemanticHandlers
+        IF item.Name == semantic THEN RETURN item.Handler
+    NEXT
+    RETURN NULL
+END FUNCTION
+
+' Appends what a handler returned (a statement, an array, or NULL) to body.
+FUNCTION Fission_SymbolCollect(body, result)
+    IF result == NULL THEN RETURN body
+    IF TYPEOF(result) == "Array" THEN
+        FOR statement IN result
+            ignored = Array.Push(body, statement)
+        NEXT
+        RETURN body
+    END IF
+    ignored = Array.Push(body, result)
+    RETURN body
+END FUNCTION
+
+FUNCTION Fission_SymbolApply(language, node, builder, body)
+    handler = Fission_SymbolHandler(language, node.Semantic)
+    IF handler == NULL THEN
+        ignored = builder.Error("line " + String(node.Line) + ": no semantic handler for " + node.Semantic + " (Language.On(\"" + node.Semantic + "\", ...))")
+        RETURN body
+    END IF
+    RETURN Fission_SymbolCollect(body, handler(node, builder))
+END FUNCTION
+
+' The declared text starting at chars[index] (longest first), as
+' {Kind: "Symbol"|"Open"|"Close", Text, Semantic, Close}; NULL when none.
+FUNCTION Fission_SymbolMatch(language, chars, index)
+    best = NULL
+    FOR item IN language.Symbols
+        best = Fission_SymbolBetter(best, chars, index, item.Symbol, "Symbol", item.Semantic, "")
+    NEXT
+    FOR item IN language.Pairs
+        best = Fission_SymbolBetter(best, chars, index, item.Open, "Open", item.Semantic, item.Close)
+        best = Fission_SymbolBetter(best, chars, index, item.Close, "Close", item.Semantic, item.Close)
+    NEXT
+    RETURN best
+END FUNCTION
+
+FUNCTION Fission_SymbolBetter(best, chars, index, text, kind, semantic, closeText)
+    IF text == "" THEN RETURN best
+    IF best != NULL THEN
+        IF LEN(best.Text) >= LEN(text) THEN RETURN best
+    END IF
+    IF index + LEN(text) > LEN(chars) THEN RETURN best
+    offset = 0
+    WHILE offset < LEN(text)
+        IF chars[index + offset] != String.Slice(text, offset, 1) THEN RETURN best
+        offset = offset + 1
+    WEND
+    RETURN {Kind: kind, Text: text, Semantic: semantic, Close: closeText}
+END FUNCTION
+
+FUNCTION Fission_RunSymbolLanguage(language, artifact)
+    builder = FissionSirBuilder(artifact.Name)
+    chars = String.ToChars(artifact.Value)
+    ' One frame per open Pair: the statements built so far inside it.
+    frames = [{Body: [], Match: NULL, Line: 0, Column: 0}]
+    line = 1
+    column = 1
+    IF Fission_SymbolHandler(language, "Start") != NULL THEN
+        ignored = Fission_SymbolApply(language, {Semantic: "Start", Symbol: "", Line: 0, Column: 0, Body: []}, builder, frames[0].Body)
+    END IF
+    index = 0
+    WHILE index < LEN(chars)
+        found = Fission_SymbolMatch(language, chars, index)
+        IF found == NULL THEN
+            IF chars[index] == "\n" THEN
+                line = line + 1
+                column = 0
+            END IF
+            index = index + 1
+            column = column + 1
+            CONTINUE WHILE
+        END IF
+        IF found.Kind == "Symbol" THEN
+            node = {Semantic: found.Semantic, Symbol: found.Text, Line: line, Column: column, Body: []}
+            ignored = Fission_SymbolApply(language, node, builder, frames[LEN(frames) - 1].Body)
+        ELSE
+            ' A pair whose open and close text are equal toggles.
+            closing = found.Kind == "Close"
+            IF found.Kind == "Open" ANDALSO found.Text == found.Close ANDALSO LEN(frames) > 1 THEN closing = frames[LEN(frames) - 1].Match.Close == found.Text
+            IF found.Kind == "Open" ANDALSO found.Text == found.Close ANDALSO LEN(frames) == 1 THEN closing = FALSE
+            IF closing THEN
+                IF LEN(frames) == 1 THEN
+                    ignored = builder.Error("line " + String(line) + ", column " + String(column) + ": " + found.Text + " has no matching opening symbol")
+                    RETURN FissionArtifact("SIR", artifact.Name, builder.Build())
+                END IF
+                frame = Array.Pop(frames)
+                IF frame.Match.Close != found.Text THEN
+                    ignored = builder.Error("line " + String(line) + ", column " + String(column) + ": expected " + frame.Match.Close + " but found " + found.Text)
+                    RETURN FissionArtifact("SIR", artifact.Name, builder.Build())
+                END IF
+                node = {Semantic: frame.Match.Semantic, Symbol: frame.Match.Text, Line: frame.Line, Column: frame.Column, Body: frame.Body}
+                ignored = Fission_SymbolApply(language, node, builder, frames[LEN(frames) - 1].Body)
+            ELSE
+                ignored = Array.Push(frames, {Body: [], Match: found, Line: line, Column: column})
+            END IF
+        END IF
+        index = index + LEN(found.Text)
+        column = column + LEN(found.Text)
+    WEND
+    IF LEN(frames) > 1 THEN
+        frame = frames[LEN(frames) - 1]
+        ignored = builder.Error("line " + String(frame.Line) + ", column " + String(frame.Column) + ": " + frame.Match.Text + " is never closed with " + frame.Match.Close)
+        RETURN FissionArtifact("SIR", artifact.Name, builder.Build())
+    END IF
+    IF Fission_SymbolHandler(language, "Finish") != NULL THEN
+        ignored = Fission_SymbolApply(language, {Semantic: "Finish", Symbol: "", Line: line, Column: column, Body: []}, builder, frames[0].Body)
+    END IF
+    FOR statement IN frames[0].Body
+        ignored = builder.Append(statement)
+    NEXT
+    RETURN FissionArtifact("SIR", artifact.Name, builder.Build())
+END FUNCTION
