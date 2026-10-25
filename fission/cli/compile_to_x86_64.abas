@@ -56,7 +56,7 @@ outputPath = appArgs[1]
 ' real multi-file Fission program (anything starting with a real
 ' `#IMPORT "..."` line) could never actually compile through this
 ' backend at all.
-preprocessed = Fission_ArcoBasicPreprocess(File.ReadText(entryPath), [])
+preprocessed = Fission_ArcoBasicPreprocessAt(File.ReadText(entryPath), [], entryPath)
 IF preprocessed.Diagnostics.HasErrors() THEN ignored = FissionNativeCli_Fail("PREPROCESS", preprocessed.Diagnostics.Render())
 source = preprocessed.Source
 tokens = Fission_ArcoBasicLex(source)

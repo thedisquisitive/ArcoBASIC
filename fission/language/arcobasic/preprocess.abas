@@ -133,15 +133,24 @@ FUNCTION Fission_UserCacheDirectory()
     RETURN ""
 END FUNCTION
 
-' Resolves an #IMPORT name to a file the way the legacy compiler does: the
-' name itself, then (for a name without an extension) with .abas/.arc/.bas,
-' looked up relative to the working directory, its stdlib/ and ../stdlib/,
-' the Fission source root (for fission/... and its stdlib/), the installed
-' stdlib directories, and $ARCOBASIC_STDLIB. Returns the name unchanged when
-' nothing matches, so the caller reports "file not found" with the name the
-' program wrote.
-FUNCTION Fission_ResolveImportPath(name)
-    bases = ["", "stdlib/", "../stdlib/"]
+' Resolves an #IMPORT name to a file. Directories are tried in order: the
+' importing file's own directory (and its stdlib/), the working directory, its
+' stdlib/ and ../stdlib/, the Fission source root (for fission/... and its
+' stdlib/), the installed stdlib directories, and $ARCOBASIC_STDLIB. A name
+' without an extension also tries .abas/.arc/.bas, like the legacy compiler.
+' Returns the name unchanged when nothing matches, so the caller reports
+' "file not found" with the name the program wrote.
+FUNCTION Fission_ResolveImportPath(name, importerDirectory)
+    bases = []
+    ' A file's own directory wins, so a program can import its siblings from
+    ' any working directory.
+    IF importerDirectory != "" ANDALSO importerDirectory != "." THEN
+        ignored = Array.Push(bases, importerDirectory + "/")
+        ignored = Array.Push(bases, importerDirectory + "/stdlib/")
+    END IF
+    ignored = Array.Push(bases, "")
+    ignored = Array.Push(bases, "stdlib/")
+    ignored = Array.Push(bases, "../stdlib/")
     sourceRoot = Fission_SourceRoot()
     IF sourceRoot != "" THEN
         ignored = Array.Push(bases, sourceRoot + "/")
@@ -165,6 +174,15 @@ END FUNCTION
 
 FUNCTION Fission_ArcoBasicPreprocess(source, initialDefines)
     RETURN Fission_ArcoBasicPreprocessOnce(source, initialDefines, {})
+END FUNCTION
+
+' Like Fission_ArcoBasicPreprocess for source read from `sourcePath`: #IMPORT
+' names are also looked up in that file's directory (and, for imported files,
+' in their own directories), not only relative to the working directory.
+FUNCTION Fission_ArcoBasicPreprocessAt(source, initialDefines, sourcePath)
+    importedFiles = {}
+    importedFiles["<directory>"] = Path.DirName(sourcePath)
+    RETURN Fission_ArcoBasicPreprocessOnce(source, initialDefines, importedFiles)
 END FUNCTION
 
 ' `importedFiles` is shared by the whole compilation: each file is expanded
@@ -333,14 +351,17 @@ FUNCTION Fission_ArcoBasicPreprocessOnce(source, initialDefines, importedFiles)
             ignored = Array.Push(metadata.Imports, args)
             importPath = Fission_ArcoBasicUnquote(args)
             IF String.StartsWith(importPath, "./") THEN importPath = String.Slice(importPath, 2, String.Length(importPath) - 2)
-            importPath = Fission_ResolveImportPath(importPath)
+            importerDirectory = Object.Get(importedFiles, "<directory>", "")
+            importPath = Fission_ResolveImportPath(importPath, importerDirectory)
             IF Object.Has(importedFiles, importPath) THEN
                 ' Already expanded earlier in this compilation.
                 ignored = Array.Push(output, "")
             ELSE
                 IF File.Exists(importPath) THEN
                     importedFiles[importPath] = TRUE
+                    importedFiles["<directory>"] = Path.DirName(importPath)
                     imported = Fission_ArcoBasicPreprocessOnce(File.ReadText(importPath), defines, importedFiles)
+                    importedFiles["<directory>"] = importerDirectory
                     ignored = diagnostics.AppendMany(imported.Diagnostics)
                     FOR importedDefine IN imported.Defines
                         IF Fission_ListContains(defines, importedDefine) == FALSE THEN ignored = Array.Push(defines, importedDefine)

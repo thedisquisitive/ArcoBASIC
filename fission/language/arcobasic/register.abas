@@ -5,7 +5,7 @@
 #IMPORT "fission/language/arcobasic/semantic.abas"
 
 FUNCTION Fission_ArcoBasicSourceToSir(artifact, context)
-    preprocessed = Fission_ArcoBasicPreprocess(artifact.Value, [])
+    preprocessed = Fission_ArcoBasicPreprocessAt(artifact.Value, [], artifact.Name)
     tokens = Fission_ArcoBasicLex(preprocessed.Source)
     ast = Fission_ArcoBasicParse(tokens, artifact.Name)
     module = Fission_ArcoBasicAstToSir(ast)

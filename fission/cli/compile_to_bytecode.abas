@@ -39,7 +39,7 @@ outputPath = appArgs[1]
 ' first-party Fission source file) could never actually compile through
 ' this substrate's own codegen path at all, only ever a single
 ' self-contained file with no imports.
-preprocessed = Fission_ArcoBasicPreprocess(File.ReadText(entryPath), [])
+preprocessed = Fission_ArcoBasicPreprocessAt(File.ReadText(entryPath), [], entryPath)
 IF preprocessed.Diagnostics.HasErrors() THEN ignored = FissionCli_Fail("PREPROCESS", preprocessed.Diagnostics)
 source = preprocessed.Source
 tokens = Fission_ArcoBasicLex(source)

@@ -20,7 +20,7 @@
 #IMPORT "fission/runtime/library.abas"
 
 FUNCTION FissionBuiltin_ArcoBasicToSir(artifact, context)
-    preprocessed = Fission_ArcoBasicPreprocess(artifact.Value, [])
+    preprocessed = Fission_ArcoBasicPreprocessAt(artifact.Value, [], artifact.Name)
     ast = Fission_ArcoBasicParse(Fission_ArcoBasicLex(preprocessed.Source), artifact.Name)
     sir = Fission_ArcoBasicAstToSir(ast)
     ignored = sir.Diagnostics.AppendMany(preprocessed.Diagnostics)
