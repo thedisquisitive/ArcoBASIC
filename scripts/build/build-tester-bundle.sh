@@ -149,11 +149,14 @@ else
     echo "build-tester-bundle: dpkg-deb not found; skipping the .deb" >&2
 fi
 
-: > "$OUT_DIR/SHA256SUMS.bundle"
-for f in "$TGZ" ${DEB:+"$DEB"}; do (cd "$OUT_DIR" && sha256sum "$(basename "$f")" >> SHA256SUMS.bundle); done
+# SHA256SUMS: keep other packages' entries, replace the entries of the files built here.
 touch "$OUT_DIR/SHA256SUMS"
-cat "$OUT_DIR/SHA256SUMS" "$OUT_DIR/SHA256SUMS.bundle" | sort -u -k2 > "$OUT_DIR/SHA256SUMS.new"
-mv "$OUT_DIR/SHA256SUMS.new" "$OUT_DIR/SHA256SUMS"
-rm -f "$OUT_DIR/SHA256SUMS.bundle"
+for f in "$TGZ" ${DEB:+"$DEB"}; do
+    name="$(basename "$f")"
+    grep -v -F -- "  $name" "$OUT_DIR/SHA256SUMS" > "$OUT_DIR/SHA256SUMS.new" || true
+    mv "$OUT_DIR/SHA256SUMS.new" "$OUT_DIR/SHA256SUMS"
+    (cd "$OUT_DIR" && sha256sum "$name" >> SHA256SUMS)
+done
+sort -k2 "$OUT_DIR/SHA256SUMS" -o "$OUT_DIR/SHA256SUMS"
 echo "build-tester-bundle: wrote"
 ls -l "$TGZ" ${DEB:+"$DEB"} | awk '{print "  " $5 "  " $9}'
