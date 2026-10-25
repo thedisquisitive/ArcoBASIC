@@ -37,7 +37,7 @@ CLASS FissionLanguageDefinition
     ' A one-line statement described by a pattern such as
     ' "{Target:name} = {Value}" (see fission/language/api/grammar_compiler.abas).
     FUNCTION Statement(name, pattern)
-        item = {Name: name, Pattern: pattern, End: "", Else: ""}
+        item = {Name: name, Pattern: pattern, EndWord: "", ElseWord: ""}
         ignored = Array.Push(SELF.Statements, item)
         RETURN SELF
     END FUNCTION
@@ -45,7 +45,7 @@ CLASS FissionLanguageDefinition
     ' A statement whose body is the following lines, up to a line that is
     ' just `endWord`.
     FUNCTION Block(name, pattern, endWord)
-        item = {Name: name, Pattern: pattern, End: endWord, Else: ""}
+        item = {Name: name, Pattern: pattern, EndWord: endWord, ElseWord: ""}
         ignored = Array.Push(SELF.Statements, item)
         RETURN SELF
     END FUNCTION
@@ -56,7 +56,7 @@ CLASS FissionLanguageDefinition
         index = 0
         WHILE index < LEN(SELF.Statements)
             item = SELF.Statements[index]
-            IF item.Name == name THEN SELF.Statements[index] = {Name: item.Name, Pattern: item.Pattern, End: item.End, Else: word}
+            IF item.Name == name THEN SELF.Statements[index] = {Name: item.Name, Pattern: item.Pattern, EndWord: item.EndWord, ElseWord: word}
             index = index + 1
         WEND
         RETURN SELF

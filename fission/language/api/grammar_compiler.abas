@@ -242,10 +242,10 @@ FUNCTION Fission_GrammarIsWord(tokens, words)
 END FUNCTION
 
 ' The statements from state.Line up to a line that is one of `stops`; leaves
-' state.Line on that line and state.Stop set to it ("" at the end of input).
+' state.Line on that line and state.StopWord set to it ("" at the end of input).
 FUNCTION Fission_GrammarBlock(grammar, lines, state, builder, stops)
     statements = []
-    state.Stop = ""
+    state.StopWord = ""
     WHILE state.Line < LEN(lines)
         tokens = Fission_GrammarTokens(lines[state.Line], grammar.Symbols, grammar.Comments, FALSE)
         IF LEN(tokens) == 0 THEN
@@ -253,7 +253,7 @@ FUNCTION Fission_GrammarBlock(grammar, lines, state, builder, stops)
             CONTINUE WHILE
         END IF
         IF Fission_GrammarIsWord(tokens, stops) THEN
-            state.Stop = tokens[0].Text
+            state.StopWord = tokens[0].Text
             RETURN statements
         END IF
         lineNumber = state.Line + 1
@@ -269,16 +269,16 @@ FUNCTION Fission_GrammarBlock(grammar, lines, state, builder, stops)
                     node = Object.Set(node, "Id", state.Count)
                     node = Object.Set(node, "Body", [])
                     node = Object.Set(node, "ElseBody", [])
-                    IF pattern.End != "" THEN
-                        inner = [pattern.End]
-                        IF pattern.Else != "" THEN ignored = Array.Push(inner, pattern.Else)
+                    IF pattern.EndWord != "" THEN
+                        inner = [pattern.EndWord]
+                        IF pattern.ElseWord != "" THEN ignored = Array.Push(inner, pattern.ElseWord)
                         node = Object.Set(node, "Body", Fission_GrammarBlock(grammar, lines, state, builder, inner))
-                        IF state.Stop == pattern.Else ANDALSO pattern.Else != "" THEN
+                        IF state.StopWord == pattern.ElseWord ANDALSO pattern.ElseWord != "" THEN
                             state.Line = state.Line + 1
-                            node = Object.Set(node, "ElseBody", Fission_GrammarBlock(grammar, lines, state, builder, [pattern.End]))
+                            node = Object.Set(node, "ElseBody", Fission_GrammarBlock(grammar, lines, state, builder, [pattern.EndWord]))
                         END IF
-                        IF state.Stop != pattern.End THEN
-                            ignored = builder.Error("line " + String(lineNumber) + ": " + pattern.Name + " is never closed with " + pattern.End)
+                        IF state.StopWord != pattern.EndWord THEN
+                            ignored = builder.Error("line " + String(lineNumber) + ": " + pattern.Name + " is never closed with " + pattern.EndWord)
                             RETURN statements
                         END IF
                         state.Line = state.Line + 1
@@ -294,7 +294,7 @@ END FUNCTION
 
 ' Compiles a pattern text into {Name, Parts, End, Else}.
 FUNCTION Fission_GrammarPattern(name, text, endWord, elseWord, symbols)
-    RETURN {Name: name, Parts: Fission_GrammarTokens(text, symbols, [], TRUE), End: endWord, Else: elseWord}
+    RETURN {Name: name, Parts: Fission_GrammarTokens(text, symbols, [], TRUE), EndWord: endWord, ElseWord: elseWord}
 END FUNCTION
 
 FUNCTION Fission_RunGrammarLanguage(language, artifact)
@@ -312,13 +312,13 @@ FUNCTION Fission_RunGrammarLanguage(language, artifact)
     NEXT
     patterns = []
     FOR statement IN language.Statements
-        ignored = Array.Push(patterns, Fission_GrammarPattern(statement.Name, statement.Pattern, statement.End, statement.Else, symbols))
+        ignored = Array.Push(patterns, Fission_GrammarPattern(statement.Name, statement.Pattern, statement.EndWord, statement.ElseWord, symbols))
     NEXT
     grammar = {Symbols: symbols, Comments: language.Comments, Operators: operators, Patterns: patterns, SemanticHandlers: language.SemanticHandlers}
-    state = {Line: 0, Count: 0, Stop: ""}
+    state = {Line: 0, Count: 0, StopWord: ""}
     lines = String.Split(artifact.Value, "\n")
     body = Fission_GrammarBlock(grammar, lines, state, builder, [])
-    IF state.Line < LEN(lines) THEN ignored = builder.Error("line " + String(state.Line + 1) + ": " + state.Stop + " without a block to close")
+    IF state.Line < LEN(lines) THEN ignored = builder.Error("line " + String(state.Line + 1) + ": " + state.StopWord + " without a block to close")
     FOR statement IN body
         ignored = builder.Append(statement)
     NEXT

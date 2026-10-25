@@ -11067,6 +11067,44 @@ void prepare_bytecode_module(BytecodeModule& module) {
         function.param_default_calls.clear();
         function.temp_count = 0;
 
+        // Renumber this function's temporaries densely. The bytecode producer numbers temps
+        // module-wide, so without this every call frame is sized to the highest %tN index in the
+        // function -- thousands of slots per call in a large program (the Fission drivers made a
+        // bootstrap take hours). Per-call cost must not grow with the size of the program.
+        {
+            std::unordered_map<std::size_t, std::size_t> temp_renumber;
+            for (auto& block : function.blocks) {
+                for (auto& instruction : block.instructions) {
+                    for (auto& operand : instruction.operands) {
+                        // Temps appear both as whole operands ("%t5") and embedded in compound
+                        // operands (OBJECT's "Field:%t5"), so rewrite every %t<digits> occurrence.
+                        if (operand.find("%t") == std::string::npos) {
+                            continue;
+                        }
+                        std::string rewritten;
+                        rewritten.reserve(operand.size());
+                        std::size_t at = 0;
+                        while (at < operand.size()) {
+                            if (operand[at] == '%' && at + 2 < operand.size() && operand[at + 1] == 't' &&
+                                operand[at + 2] >= '0' && operand[at + 2] <= '9') {
+                                std::size_t end = at + 2;
+                                while (end < operand.size() && operand[end] >= '0' && operand[end] <= '9') {
+                                    ++end;
+                                }
+                                const std::size_t old_index = std::stoul(operand.substr(at + 2, end - at - 2));
+                                const auto inserted = temp_renumber.emplace(old_index, temp_renumber.size());
+                                rewritten += "%t" + std::to_string(inserted.first->second);
+                                at = end;
+                            } else {
+                                rewritten += operand[at++];
+                            }
+                        }
+                        operand = std::move(rewritten);
+                    }
+                }
+            }
+        }
+
         for (std::size_t local_index = 0; local_index < function.locals.size(); ++local_index) {
             function.local_refs_by_base.emplace(local_base_name(function.locals[local_index]), "L" + std::to_string(local_index));
         }

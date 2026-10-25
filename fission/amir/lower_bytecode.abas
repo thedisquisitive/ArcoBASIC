@@ -150,7 +150,7 @@ FUNCTION Fission_BytecodeLowerFunction(module, amirFunction)
     ' per function, in order of first use.
     ' (A CONST's literal text is left alone: it is data, not an operand.)
     tempMap = {}
-    tempCounter = {Next: 0}
+    tempCounter = {Value: 0}
     FOR block IN fn.Blocks
         FOR instruction IN block.Instructions
             FOR fieldName IN instruction.FieldNames
@@ -178,8 +178,8 @@ FUNCTION Fission_BytecodeRenumberTemps(text, tempMap, tempCounter)
         IF digitCount > 0 THEN
             oldNumber = String.Slice(rest, 0, digitCount)
             IF Object.Has(tempMap, oldNumber) == FALSE THEN
-                tempMap[oldNumber] = String(tempCounter.Next)
-                tempCounter.Next = tempCounter.Next + 1
+                tempMap[oldNumber] = String(tempCounter.Value)
+                tempCounter.Value = tempCounter.Value + 1
             END IF
             result = result + tempMap[oldNumber]
             rest = String.Slice(rest, digitCount, String.Length(rest) - digitCount)

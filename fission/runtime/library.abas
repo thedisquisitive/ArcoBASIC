@@ -10,23 +10,37 @@
 #IMPORT "fission/amir/x86_64_assembler.abas"
 #IMPORT "fission/amir/x86_64_fragment.abas"
 
+' Cache directories to try, in order. Inside the Fission tree the cache lives
+' in the tree (.rivet/fission-runtime). Outside it (an installed Fission) the
+' installed share directory may ship a prebuilt cache, and the per-user cache
+' directory is where a missing or stale one is rebuilt, since an install
+' directory is usually not writable.
+FUNCTION Fission_RuntimeCacheDirectories()
+    IF File.Exists("fission/runtime/dynamic.abas") THEN RETURN [".rivet/fission-runtime"]
+    directories = []
+    sourceRoot = Fission_SourceRoot()
+    IF sourceRoot != "" THEN ignored = Array.Push(directories, sourceRoot + "/.rivet/fission-runtime")
+    userDirectory = Fission_UserCacheDirectory()
+    IF userDirectory != "" THEN ignored = Array.Push(directories, userDirectory)
+    IF LEN(directories) == 0 THEN ignored = Array.Push(directories, ".rivet/fission-runtime")
+    RETURN directories
+END FUNCTION
+
 FUNCTION Fission_NativeRuntimeLibrary()
-    cacheDirectory = ".rivet/fission-runtime"
-    IF File.Exists("fission/runtime/dynamic.abas") == FALSE THEN
-        sourceRoot = Fission_SourceRoot()
-        IF sourceRoot != "" THEN cacheDirectory = sourceRoot + "/.rivet/fission-runtime"
-    END IF
-    fragmentPath = cacheDirectory + "/runtime.frag"
-    sourcePath = cacheDirectory + "/runtime.src"
+    cacheDirectories = Fission_RuntimeCacheDirectories()
     preprocessed = Fission_ArcoBasicPreprocess("#IMPORT \"fission/runtime/dynamic.abas\"\n", [])
     IF preprocessed.Diagnostics.HasErrors() THEN RETURN {Fragment: NULL, Diagnostics: preprocessed.Diagnostics}
     source = preprocessed.Source
-    IF File.Exists(fragmentPath) ANDALSO File.Exists(sourcePath) THEN
-        IF File.ReadText(sourcePath) == source THEN
-            cached = Fission_FragmentDeserialize(File.ReadBytes(fragmentPath))
-            IF cached.Diagnostics.HasErrors() == FALSE THEN RETURN {Fragment: cached.Fragment, Diagnostics: cached.Diagnostics}
+    FOR cacheDirectory IN cacheDirectories
+        fragmentPath = cacheDirectory + "/runtime.frag"
+        sourcePath = cacheDirectory + "/runtime.src"
+        IF File.Exists(fragmentPath) ANDALSO File.Exists(sourcePath) THEN
+            IF File.ReadText(sourcePath) == source THEN
+                cached = Fission_FragmentDeserialize(File.ReadBytes(fragmentPath))
+                IF cached.Diagnostics.HasErrors() == FALSE THEN RETURN {Fragment: cached.Fragment, Diagnostics: cached.Diagnostics}
+            END IF
         END IF
-    END IF
+    NEXT
     ast = Fission_ArcoBasicParse(Fission_ArcoBasicLex(source), "fission/runtime")
     IF ast.Diagnostics.HasErrors() THEN RETURN {Fragment: NULL, Diagnostics: ast.Diagnostics}
     amir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(ast))
@@ -35,8 +49,16 @@ FUNCTION Fission_NativeRuntimeLibrary()
     IF program.Diagnostics.HasErrors() THEN RETURN {Fragment: NULL, Diagnostics: program.Diagnostics}
     assembled = Fission_X86_64AssembleFragment(program.Render())
     IF assembled.Diagnostics.HasErrors() THEN RETURN {Fragment: NULL, Diagnostics: assembled.Diagnostics}
-    ignored = Directory.Create(cacheDirectory)
-    ignored = File.WriteBytes(fragmentPath, Fission_FragmentSerialize(assembled.Fragment))
-    ignored = File.WriteText(sourcePath, source)
+    serialized = Fission_FragmentSerialize(assembled.Fragment)
+    FOR cacheDirectory IN cacheDirectories
+        ignored = Directory.Create(cacheDirectory)
+        fragmentPath = cacheDirectory + "/runtime.frag"
+        sourcePath = cacheDirectory + "/runtime.src"
+        ignored = File.WriteBytes(fragmentPath, serialized)
+        ignored = File.WriteText(sourcePath, source)
+        ' Stop at the first directory that took both files (an install
+        ' directory may be read-only; then the per-user one is used).
+        IF File.Exists(fragmentPath) ANDALSO File.Exists(sourcePath) THEN EXIT FOR
+    NEXT
     RETURN {Fragment: assembled.Fragment, Diagnostics: assembled.Diagnostics}
 END FUNCTION
