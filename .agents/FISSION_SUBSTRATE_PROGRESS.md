@@ -4994,3 +4994,29 @@ elements and `LEN` on unknown values.
   - Fission_SourceRoot: $FISSION_HOME, else the nearest ancestor of $PWD
     holding fission/runtime. `fission/...` imports and the runtime cache
     resolve through it, so compilers such as tallyc work from any directory.
+
+- (2026-11-10) Overnight session (user asleep). Done and verified:
+  - `#IMPORT "x" AS Alias` (preprocess.abas): inlines the module and generates forwarding
+    `Alias.Leaf(...)` wrappers like the oracle's alias_import_wrappers. Test:
+    fission/tests/arcobasic_import_alias_smoke.abas. Verified natively (Text.Join via an alias).
+  - Default parameter values: the parser now keeps the default expression ASTs
+    (node.DefaultExprs, not a Field/Child, so AST goldens are unchanged); lower_sir pads omitted
+    trailing call arguments with them (builder.CallDefaults). A comma in a default string used to
+    corrupt the comma-joined Arguments text. Test: arcobasic_default_args_smoke.abas. Verified natively.
+  - A string literal spelled End/Else/Then no longer reads as a keyword (CheckText ignores String
+    tokens). Test: arcobasic_string_keyword_smoke.abas.
+  - Native host functions Chr, Console.Write, Curses.TerminalSize/ReadRawByteWithTimeout/
+    EnableRawMode/DisableRawMode (fission/runtime/host_terminal.abas). DisableRawMode restores
+    ICANON/ECHO rather than the exact saved termios (no global state; no atexit in native
+    programs, so the program must call it). Verified natively from a compiler built with them.
+  - arcology-commons removed. stdlib/curses.abas, stdlib/arcogui.abas and their selftests were
+    copied in from the port-onto-remote branch.
+  - The committed seed (packaging/fission/seed) contains the alias/defaults/keyword fixes but NOT
+    the terminal host functions: `scripts/build/refresh-fission-seed.sh` segfaulted three times
+    (gen1 build of fission_build.abas, always after several minutes; the same build succeeded
+    outside the script and under gdb, so it looks intermittent/memory-related -- the machine was
+    short of memory). Re-run the script when the machine is idle.
+  Still open for curses_selftest native: FLOOR(...) with non-Number-kind arguments in
+  Curses.RunMenu/RunSearchList. arcogui_selftest additionally needs WINDOW.*/SURFACE.*/POINTER.*/
+  KEYBOARD.*/CLIPBOARD.*/CURSOR.* (a GUI backend; not possible in a freestanding ELF without a
+  display-protocol client), SIN/COS, CLAMP/ABS argument kinds, and Array.Remove on non-Number arrays.
