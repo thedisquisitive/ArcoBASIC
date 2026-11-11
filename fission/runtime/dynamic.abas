@@ -24,6 +24,7 @@
 #IMPORT "fission/runtime/host_strings.abas"
 #IMPORT "fission/runtime/host_arrays.abas"
 #IMPORT "fission/runtime/host_system.abas"
+#IMPORT "fission/runtime/host_terminal.abas"
 #IMPORT "fission/runtime/map.abas"
 #IMPORT "fission/runtime/classes.abas"
 

@@ -1,0 +1,107 @@
+' Terminal host functions for the native runtime: Chr, Console.Write and the Curses.* primitives
+' stdlib/curses.abas is built on. Mirrors the C++ oracle (src/runtime/runtime.cpp) over raw Linux
+' syscalls: write(1), ioctl(TCGETS/TCSETSF/TIOCGWINSZ) and poll(2)+read(2).
+
+' Chr(code): the UTF-8 encoding of a Unicode code point.
+FUNCTION arco_host_chr(rtCode)
+    IF rtCode < 128 THEN
+        rtOut = FissionRt_StrNew(1)
+        rtIgnored = MEMORY.Write8(rtOut, rtCode)
+        RETURN rtOut
+    END IF
+    IF rtCode < 2048 THEN
+        rtOut = FissionRt_StrNew(2)
+        rtIgnored = MEMORY.Write8(rtOut, 192 BITOR (rtCode SHR 6))
+        rtIgnored = MEMORY.Write8(rtOut + 1, 128 BITOR (rtCode BITAND 63))
+        RETURN rtOut
+    END IF
+    IF rtCode < 65536 THEN
+        rtOut = FissionRt_StrNew(3)
+        rtIgnored = MEMORY.Write8(rtOut, 224 BITOR (rtCode SHR 12))
+        rtIgnored = MEMORY.Write8(rtOut + 1, 128 BITOR ((rtCode SHR 6) BITAND 63))
+        rtIgnored = MEMORY.Write8(rtOut + 2, 128 BITOR (rtCode BITAND 63))
+        RETURN rtOut
+    END IF
+    rtOut = FissionRt_StrNew(4)
+    rtIgnored = MEMORY.Write8(rtOut, 240 BITOR (rtCode SHR 18))
+    rtIgnored = MEMORY.Write8(rtOut + 1, 128 BITOR ((rtCode SHR 12) BITAND 63))
+    rtIgnored = MEMORY.Write8(rtOut + 2, 128 BITOR ((rtCode SHR 6) BITAND 63))
+    rtIgnored = MEMORY.Write8(rtOut + 3, 128 BITOR (rtCode BITAND 63))
+    RETURN rtOut
+END FUNCTION
+
+' Console.Write(text): text to stdout with no newline appended.
+FUNCTION arco_host_console_write(rtText)
+    rtLength = FissionRt_StrLen(rtText)
+    rtDone = 0
+    WHILE rtDone < rtLength
+        rtWrote = LINUX.Syscall(1, 1, rtText + rtDone, rtLength - rtDone)
+        IF rtWrote <= 0 THEN EXIT WHILE
+        rtDone = rtDone + rtWrote
+    WEND
+    RETURN 1
+END FUNCTION
+
+' Curses.TerminalSize() -> {Rows, Cols}; 24x80 when stdout is not a terminal.
+FUNCTION arco_host_curses_terminal_size()
+    rtBuffer = FissionRt_Alloc(16)
+    rtRows = 24
+    rtCols = 80
+    IF LINUX.Syscall(16, 1, 21523, rtBuffer) == 0 THEN
+        IF MEMORY.Read16(rtBuffer) != 0 ANDALSO MEMORY.Read16(rtBuffer + 2) != 0 THEN
+            rtRows = MEMORY.Read16(rtBuffer)
+            rtCols = MEMORY.Read16(rtBuffer + 2)
+        END IF
+    END IF
+    rtResult = FissionRt_MapNew()
+    rtIgnored = FissionRt_MapSet(rtResult, FISSION.Bits("Rows"), FissionRt_Box(1, rtRows, 0))
+    rtIgnored = FissionRt_MapSet(rtResult, FISSION.Bits("Cols"), FissionRt_Box(1, rtCols, 0))
+    RETURN rtResult
+END FUNCTION
+
+' Curses.ReadRawByteWithTimeout(ms): one byte as a 1-byte string, or "" on timeout/EOF.
+FUNCTION arco_host_curses_read_byte(rtTimeoutMs)
+    rtPoll = FissionRt_Alloc(16)
+    rtIgnored = MEMORY.Write32(rtPoll, 0)
+    rtIgnored = MEMORY.Write16(rtPoll + 4, 1)
+    rtIgnored = MEMORY.Write16(rtPoll + 6, 0)
+    IF LINUX.Syscall(7, rtPoll, 1, rtTimeoutMs) <= 0 THEN RETURN FissionRt_StrNew(0)
+    rtByte = FissionRt_StrNew(1)
+    IF LINUX.Syscall(0, 0, rtByte, 1) != 1 THEN RETURN FissionRt_StrNew(0)
+    RETURN rtByte
+END FUNCTION
+
+FUNCTION FissionRt_CursesStatus(rtOk, rtError)
+    rtResult = FissionRt_MapNew()
+    rtIgnored = FissionRt_MapSet(rtResult, FISSION.Bits("Ok"), FissionRt_Box(3, rtOk, 0))
+    rtIgnored = FissionRt_MapSet(rtResult, FISSION.Bits("Error"), FissionRt_Box(4, rtError, 0))
+    RETURN rtResult
+END FUNCTION
+
+' Curses.EnableRawMode(): cbreak mode (ICANON and ECHO off, ISIG left on so Ctrl-C still raises
+' SIGINT) -> {Ok, Error}. Native programs have no atexit hook, so the program (stdlib's
+' Curses.RunApp does) must call Curses.DisableRawMode before exiting.
+FUNCTION arco_host_curses_enable_raw_mode()
+    rtTermios = FissionRt_Alloc(64)
+    IF LINUX.Syscall(16, 0, 21505, rtTermios) != 0 THEN RETURN FissionRt_CursesStatus(0, FISSION.Bits("tcgetattr failed"))
+    rtLflag = MEMORY.Read32(rtTermios + 12)
+    rtIgnored = MEMORY.Write32(rtTermios + 12, rtLflag BITAND 4294967285)
+    rtIgnored = MEMORY.Write8(rtTermios + 17 + 6, 1)
+    rtIgnored = MEMORY.Write8(rtTermios + 17 + 5, 0)
+    IF LINUX.Syscall(16, 0, 21508, rtTermios) != 0 THEN RETURN FissionRt_CursesStatus(0, FISSION.Bits("tcsetattr failed"))
+    RETURN FissionRt_CursesStatus(1, FissionRt_StrNew(0))
+END FUNCTION
+
+' Curses.DisableRawMode(): restores canonical, echoing input. (The oracle restores the exact
+' attributes saved by EnableRawMode; this runtime keeps no global state, and EnableRawMode only
+' changes ICANON/ECHO/VMIN/VTIME, so it puts those back.) A no-op when the terminal is not in
+' cbreak mode.
+FUNCTION arco_host_curses_disable_raw_mode()
+    rtTermios = FissionRt_Alloc(64)
+    IF LINUX.Syscall(16, 0, 21505, rtTermios) != 0 THEN RETURN 0
+    rtLflag = MEMORY.Read32(rtTermios + 12)
+    IF (rtLflag BITAND 10) == 10 THEN RETURN 0
+    rtIgnored = MEMORY.Write32(rtTermios + 12, rtLflag BITOR 10)
+    rtIgnored = LINUX.Syscall(16, 0, 21508, rtTermios)
+    RETURN 0
+END FUNCTION

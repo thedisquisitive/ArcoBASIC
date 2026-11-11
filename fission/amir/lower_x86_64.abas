@@ -725,6 +725,19 @@ END FUNCTION
 ' The table is built once, at program start (see FissionX86_64HostTableCache
 ' below): building it copies the whole map for every entry (Object.Set), and
 ' kind collection used to rebuild it for every call instruction it saw.
+' Terminal host functions (fission/runtime/host_terminal.abas): Chr, Console.Write and the
+' Curses.* primitives stdlib/curses.abas is built on. A separate function so the main table builder
+' does not grow without bound (one huge function strains the native compiler).
+FUNCTION Fission_X86_64TerminalHostEntries(table)
+    table = Object.Set(table, "CHR", {Symbol: "arco_host_chr", ReturnKind: "String", ParamKinds: ["Number"]})
+    table = Object.Set(table, "CONSOLE.WRITE", {Symbol: "arco_host_console_write", ReturnKind: "Bool", ParamKinds: ["String"]})
+    table = Object.Set(table, "CURSES.TERMINALSIZE", {Symbol: "arco_host_curses_terminal_size", ReturnKind: "Map", ParamKinds: []})
+    table = Object.Set(table, "CURSES.READRAWBYTEWITHTIMEOUT", {Symbol: "arco_host_curses_read_byte", ReturnKind: "String", ParamKinds: ["Number"]})
+    table = Object.Set(table, "CURSES.ENABLERAWMODE", {Symbol: "arco_host_curses_enable_raw_mode", ReturnKind: "Map", ParamKinds: []})
+    table = Object.Set(table, "CURSES.DISABLERAWMODE", {Symbol: "arco_host_curses_disable_raw_mode", ReturnKind: "Bool", ParamKinds: []})
+    RETURN table
+END FUNCTION
+
 FUNCTION Fission_X86_64HostFunctionTable()
     RETURN FissionX86_64HostTableCache
 END FUNCTION
@@ -840,6 +853,7 @@ FUNCTION Fission_X86_64BuildHostFunctionTable()
     table = Object.Set(table, "OBJECT.GET#DYNAMIC", {Symbol: "FissionRt_ObjectGet", ReturnKind: "Any", ParamKinds: ["Any", "String", "Any"]})
     table = Object.Set(table, "OBJECT.HAS#DYNAMIC", {Symbol: "FissionRt_ObjectHas", ReturnKind: "Bool", ParamKinds: ["Any", "String"]})
     table = Object.Set(table, "OBJECT.KEYS#DYNAMIC", {Symbol: "FissionRt_ObjectKeys", ReturnKind: "Array:String", ParamKinds: ["Any"]})
+    table = Fission_X86_64TerminalHostEntries(table)
     RETURN table
 END FUNCTION
 
