@@ -75,14 +75,6 @@ ignored = RegisterCtestProbe(
 )
 
 ignored = RegisterCtestProbe(
-    "project.arcology-commons",
-    "arcology_commons_unit_tests",
-    ["arcology-commons"],
-    ["arcology-commons/"],
-    []
-)
-
-ignored = RegisterCtestProbe(
     "project.fissure",
     "fissure_tests|fissure_smoke|fissure_build_smoke",
     ["fissure"],
@@ -114,6 +106,6 @@ ignored = RegisterCommandProbe(
     "ctest --test-dir build --output-on-failure",
     ["full", "cmake"],
     ["CMakeLists.txt", "cmake/Testing.cmake", "cmake/Dependencies.cmake", "cmake/Install.cmake",
-     "arcology-os/cmake/Testing.cmake", "arcology-commons/cmake/Testing.cmake",
+     "arcology-os/cmake/Testing.cmake",
      "arcfs-utils/CMakeLists.txt", "fissure/CMakeLists.txt", "rivet/CMakeLists.txt"]
 )

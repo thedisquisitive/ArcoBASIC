@@ -109,7 +109,6 @@ arco_add_script_test(
 )
 
 include(arcology-os/cmake/Testing.cmake)
-include(arcology-commons/cmake/Testing.cmake)
 
 # Fissure (fissure/docs/fissure-rfc.md) -- guarded on TARGET fissure_core the same way arcfs-linux
 # above guards its own tests, since fissure/CMakeLists.txt returns early (no targets defined at
