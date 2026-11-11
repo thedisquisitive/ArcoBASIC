@@ -20,10 +20,25 @@ FUNCTION Fission_ArcoBasicAstExpressionToSir(builder, ast)
         callee = Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[0])
         args = []
         index = 1
+        hasNamedArgument = FALSE
         WHILE index < LEN(ast.Children)
+            IF ast.Children[index].Kind == "NamedArg" THEN hasNamedArgument = TRUE
             ignored = Array.Push(args, Fission_ArcoBasicAstExpressionToSir(builder, ast.Children[index]))
             index = index + 1
         WEND
+        ' Pad missing trailing arguments with the callee's declared defaults (see
+        ' Fission_ArcoBasicCollectDefaults): SIR and everything below it only ever sees explicit arguments.
+        IF hasNamedArgument == FALSE THEN
+            calleeName = Fission_ArcoBasicCalleeName(ast.Children[0])
+            IF calleeName != "" AND Object.Has(builder.CallDefaults, calleeName) THEN
+                entry = builder.CallDefaults[calleeName]
+                position = LEN(args)
+                WHILE position < entry.Count ANDALSO entry.Defaults[position] != NULL
+                    ignored = Array.Push(args, Fission_ArcoBasicAstExpressionToSir(builder, entry.Defaults[position]))
+                    position = position + 1
+                WEND
+            END IF
+        END IF
         RETURN builder.CallExpression(callee, args)
     END IF
     IF ast.Kind == "SuperCall" THEN
@@ -197,8 +212,45 @@ FUNCTION Fission_ArcoBasicAstStatementToSir(builder, ast)
     RETURN NULL
 END FUNCTION
 
+' The dotted name a call's callee spells (`Greet`, `Text.Join`), or "" for anything computed.
+FUNCTION Fission_ArcoBasicCalleeName(callee)
+    IF callee.Kind == "Read" THEN RETURN Object.Get(callee.Fields, "Name", "")
+    IF callee.Kind == "MemberRead" THEN
+        baseName = Fission_ArcoBasicCalleeName(callee.Children[0])
+        IF baseName == "" THEN RETURN ""
+        RETURN baseName + "." + Object.Get(callee.Fields, "Name", "")
+    END IF
+    RETURN ""
+END FUNCTION
+
+' Registers every FUNCTION in the tree that declares `param = default` parameters, so calls that
+' omit those trailing arguments can be padded with the real default expressions.
+FUNCTION Fission_ArcoBasicCollectDefaults(builder, node)
+    IF node.Kind == "Function" AND LEN(node.DefaultExprs) > 0 THEN
+        argsText = Object.Get(node.Fields, "Arguments", "")
+        count = LEN(String.Split(argsText, ","))
+        defaults = []
+        slot = 0
+        WHILE slot < count
+            ignored = Array.Push(defaults, NULL)
+            slot = slot + 1
+        WEND
+        FOR declared IN node.DefaultExprs
+            IF declared.Index < count THEN defaults[declared.Index] = declared.Expr
+        NEXT
+        builder.CallDefaults[Object.Get(node.Fields, "Name", "")] = {Count: count, Defaults: defaults}
+    END IF
+    FOR child IN node.Children
+        ignored = Fission_ArcoBasicCollectDefaults(builder, child)
+    NEXT
+    RETURN NULL
+END FUNCTION
+
 FUNCTION Fission_ArcoBasicAstToSir(astModule)
     builder = FissionSirBuilder(astModule.Name)
+    FOR declaration IN astModule.Statements
+        ignored = Fission_ArcoBasicCollectDefaults(builder, declaration)
+    NEXT
     FOR statement IN astModule.Statements
         sirStatement = Fission_ArcoBasicAstStatementToSir(builder, statement)
         IF sirStatement != NULL THEN ignored = builder.Append(sirStatement)

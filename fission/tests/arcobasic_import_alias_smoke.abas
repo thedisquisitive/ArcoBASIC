@@ -1,0 +1,34 @@
+#IMPORT "fission/language/arcobasic/preprocess.abas"
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/amir/lower_bytecode.abas"
+
+' `#IMPORT "name" AS Alias`: the imported module is inlined like a plain #IMPORT, then every
+' FUNCTION it declares gets a forwarding wrapper `Alias.Leaf(...)`, matching the oracle's
+' alias_import_wrappers (src/runtime/runtime.cpp).
+AliasSource = "#IMPORT \"text\" AS Txt\nPRINT Txt.Join([\"a\", \"b\"], \",\")"
+AliasPre = Fission_ArcoBasicPreprocess(AliasSource, [])
+PRINT AliasPre.Diagnostics.HasErrors()
+PRINT String.Contains(AliasPre.Source, "FUNCTION Text.Join(")
+PRINT String.Contains(AliasPre.Source, "FUNCTION Txt.Join(lines, delimiter = \"\\n\")")
+PRINT String.Contains(AliasPre.Source, "RETURN Text.Join(lines, delimiter)")
+PRINT String.Contains(AliasPre.Source, "#IMPORT")
+
+' It carries through the whole pipeline (parse -> SIR -> A-MIR -> bytecode) without errors.
+AliasAst = Fission_ArcoBasicParse(Fission_ArcoBasicLex(AliasPre.Source), "import-alias-smoke.abas")
+AliasSir = Fission_ArcoBasicAstToSir(AliasAst)
+AliasAmir = Fission_SirToAmir(AliasSir)
+AliasBc = Fission_AmirToBytecode(AliasAmir)
+PRINT AliasAst.Diagnostics.HasErrors()
+PRINT AliasAmir.Diagnostics.HasErrors()
+PRINT AliasBc.Diagnostics.HasErrors()
+
+' A second import of the same module under a different alias still gets its own wrappers.
+TwoSource = "#IMPORT \"text\" AS A1\n#IMPORT \"text\" AS B2\nPRINT 1"
+TwoPre = Fission_ArcoBasicPreprocess(TwoSource, [])
+PRINT String.Contains(TwoPre.Source, "FUNCTION A1.Join(")
+PRINT String.Contains(TwoPre.Source, "FUNCTION B2.Join(")
+
+' Malformed forms are diagnostics, not crashes.
+PRINT Fission_ArcoBasicPreprocess("#IMPORT \"text\" BOGUS x\nPRINT 1", []).Diagnostics.HasErrors()
+PRINT Fission_ArcoBasicPreprocess("#IMPORT \"text\" AS\nPRINT 1", []).Diagnostics.HasErrors()
+PRINT Fission_ArcoBasicPreprocess("#IMPORT \"text\" AS bad-name\nPRINT 1", []).Diagnostics.HasErrors()

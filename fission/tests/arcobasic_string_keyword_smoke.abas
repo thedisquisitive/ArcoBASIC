@@ -1,0 +1,13 @@
+#IMPORT "fission/language/arcobasic/preprocess.abas"
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/amir/lower_bytecode.abas"
+
+' A string literal whose text spells a keyword ("End", "Else", "Then") is still just a string:
+' `IF x THEN RETURN "End"` and `PRINT "else"` must parse, not read as END/ELSE.
+KeywordSource = "FUNCTION Pick(n)\nIF n == 1 THEN RETURN \"End\"\nIF n == 2 THEN RETURN \"Else\"\nRETURN \"Then\"\nEND FUNCTION\nPRINT Pick(1)\nPRINT Pick(2)\nPRINT Pick(3)"
+KeywordPre = Fission_ArcoBasicPreprocess(KeywordSource, [])
+KeywordAst = Fission_ArcoBasicParse(Fission_ArcoBasicLex(KeywordPre.Source), "string-keyword-smoke.abas")
+PRINT KeywordAst.Diagnostics.HasErrors()
+KeywordAmir = Fission_SirToAmir(Fission_ArcoBasicAstToSir(KeywordAst))
+PRINT KeywordAmir.Diagnostics.HasErrors()
+PRINT Fission_AmirToBytecode(KeywordAmir).Diagnostics.HasErrors()

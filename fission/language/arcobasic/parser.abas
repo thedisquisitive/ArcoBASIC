@@ -54,7 +54,14 @@ FUNCTION Fission_ArcoBasicCanonicalBinaryOperator(tokenText)
 END FUNCTION
 
 FUNCTION Fission_ArcoBasicArgumentDefaultText(node)
-    IF node.Kind == "Literal" THEN RETURN Object.Get(node.Fields, "Value", "")
+    IF node.Kind == "Literal" THEN
+        literalText = String(Object.Get(node.Fields, "Value", ""))
+        ' The argument list is one comma-joined text; a default that would break that
+        ' framing (`sep = ","`) is summarized by its node kind instead -- the real default
+        ' expression travels separately, in the declaring node's DefaultExprs.
+        IF String.Contains(literalText, ",") OR String.Contains(literalText, ":") OR String.Contains(literalText, "=") THEN RETURN node.Kind
+        RETURN literalText
+    END IF
     IF node.Kind == "Read" THEN RETURN Object.Get(node.Fields, "Name", "")
     RETURN node.Kind
 END FUNCTION
@@ -65,7 +72,16 @@ CLASS FissionArcoBasicAstNode
         SELF.Fields = {}
         SELF.FieldNames = []
         SELF.Children = []
+        ' [{Index, Expr}] for FUNCTION/CONSTRUCTOR parameters declared with `= default`: the real
+        ' default expression ASTs (the Arguments text only carries a lossy summary). Deliberately
+        ' not a Field or Child, so Render() and the existing AST goldens are unchanged.
+        SELF.DefaultExprs = []
     END CONSTRUCTOR
+
+    FUNCTION WithDefaults(defaults)
+        SELF.DefaultExprs = defaults
+        RETURN SELF
+    END FUNCTION
 
     FUNCTION WithField(name, value)
         IF Fission_ListContains(SELF.FieldNames, name) == FALSE THEN
@@ -120,6 +136,7 @@ CLASS FissionArcoBasicParser
         SELF.Tokens = tokens
         SELF.Index = 0
         SELF.Module = FissionArcoBasicAstModule(moduleName)
+        SELF.LastDefaults = []
     END CONSTRUCTOR
 
     FUNCTION Done()
@@ -144,7 +161,10 @@ CLASS FissionArcoBasicParser
     END FUNCTION
 
     FUNCTION CheckText(text)
-        RETURN Lower(SELF.PeekToken().Text) == Lower(text)
+        ' A string literal is never a keyword, however it spells: `RETURN "End"` must not read as END.
+        peeked = SELF.PeekToken()
+        IF peeked.Kind == "String" THEN RETURN FALSE
+        RETURN Lower(peeked.Text) == Lower(text)
     END FUNCTION
 
     FUNCTION CheckSymbol(text)
@@ -360,6 +380,7 @@ CLASS FissionArcoBasicParser
         ignored = SELF.ReadToken()
         name = SELF.ParseQualifiedName()
         args = SELF.ParseArgumentList()
+        declaredDefaults = SELF.LastDefaults
         returnType = ""
         IF SELF.MatchText("as") THEN returnType = SELF.ParseQualifiedName()
         ignored = SELF.SkipSeparators()
@@ -371,6 +392,7 @@ CLASS FissionArcoBasicParser
         WEND
         IF SELF.MatchText("end") THEN ignored = SELF.MatchText("function")
         node = FissionArcoBasicAstNode("Function")
+        ignored = node.WithDefaults(declaredDefaults)
         ignored = node.WithField("Name", name)
         ignored = node.WithField("Arguments", Array.Join(args, ","))
         IF returnType != "" THEN ignored = node.WithField("Returns", returnType)
@@ -381,6 +403,7 @@ CLASS FissionArcoBasicParser
     FUNCTION ParseConstructorStmt()
         ignored = SELF.ReadToken()
         args = SELF.ParseArgumentList()
+        declaredDefaults = SELF.LastDefaults
         ignored = SELF.SkipSeparators()
         body = FissionArcoBasicAstNode("Body")
         WHILE SELF.Done() == FALSE AND SELF.CheckText("end") == FALSE
@@ -390,6 +413,7 @@ CLASS FissionArcoBasicParser
         WEND
         IF SELF.MatchText("end") THEN ignored = SELF.MatchText("constructor")
         node = FissionArcoBasicAstNode("Constructor")
+        ignored = node.WithDefaults(declaredDefaults)
         ignored = node.WithField("Arguments", Array.Join(args, ","))
         ignored = node.AppendChild(body)
         RETURN node
@@ -453,6 +477,7 @@ CLASS FissionArcoBasicParser
 
     FUNCTION ParseArgumentList()
         args = []
+        SELF.LastDefaults = []
         IF SELF.MatchSymbol("(") THEN
             ignored = SELF.SkipExpressionNewlines()
             WHILE SELF.Done() == FALSE AND SELF.CheckSymbol(")") == FALSE
@@ -466,6 +491,7 @@ CLASS FissionArcoBasicParser
                     IF SELF.MatchSymbol("=") THEN
                         defaultValue = SELF.ParseExpression()
                         argText = argText + "=" + Fission_ArcoBasicArgumentDefaultText(defaultValue)
+                        ignored = Array.Push(SELF.LastDefaults, {Index: LEN(args), Expr: defaultValue})
                     END IF
                     ignored = Array.Push(args, argText)
                 END IF

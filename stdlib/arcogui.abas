@@ -1,0 +1,1227 @@
+' The Arcology GUI Library -- ArcoBASIC stdlib (RFC-0056 "The Arcology GUI Library").
+'
+' Built ENTIRELY on the RFC-0056 SS8 Host Platform Interface primitives (WINDOW.*/SURFACE.*/
+' POINTER.*/KEYBOARD.*/CLIPBOARD.*/CURSOR.*, include/arco/arcogui_host.hpp,
+' src/gui/arcogui_glfw.cpp) -- a NEW primitive surface, deliberately independent of the legacy
+' GUI.*/stdlib/gui.abas library (RFC-0056 S35.1: this does not extend that library, it establishes
+' its own). stdlib/gui.abas's own widget logic (hit-testing, caret/scroll math, hover/click
+' semantics) was read in full before writing this file and is real, legitimate behavioral
+' reference (RFC-0056 S35.3) -- nothing here is copied from it; every function below is a fresh
+' implementation against the new primitives and the new architecture (S7's layering: Application
+' State/Content/Context/Intents -> Arcology GUI Runtime -> Rendering/Surface Layer -> Host
+' Platform Interface).
+'
+' Sections below, in RFC-0056's own section order:
+'   ArcWindow            -- S12 Core Semantic Objects (thin, idiomatic wrapper over WINDOW.*)
+'   ArcColor              -- S23 Visual Styling
+'   VStack/HStack          -- S22 Layout (ported forward as pure functions, same shape as
+'                            stdlib/gui.abas's own -- genuinely stateless, nothing to reinvent)
+'   ArcContext             -- S15 Context System
+'   ArcIntent/IntentRegistry -- S13/S14/S16 Intent Object, Availability, Resolver
+'   Label/Button/Checkbox/TextInput -- S30 Phase 2 controls, built on SURFACE.DrawText/FillRect
+'                            and the WINDOW.PollEvent/WaitEvent event shape
+'   IntentRing             -- S19, a real radial presentation fed from
+'                            ArcIntentRegistry.Applicable(context)
+'
+' Command palette and Presentation Policies (S18) beyond the one default dark theme are real,
+' disclosed, NOT-yet-attempted future work. IntentRing is the one widget below that actually
+' consults the Intent registry for its own availability (re-checked at click time, not a stale
+' snapshot); Label/Button/Checkbox/TextInput remain plain, Intent-agnostic controls -- binding
+' THEM to a specific Intent (so a Button can render itself disabled with its Intent's own
+' UnavailableReason, say) is real, disclosed, unattempted future work.
+
+' ---------------------------------------------------------------------------------------------
+' Font configuration (RFC-0056 AP-0056-005) -- THE place to change which font text renders with.
+' ---------------------------------------------------------------------------------------------
+' SURFACE.SetFontPath (include/arco/arcogui_host.hpp, src/gui/arcogui_glfw.cpp) is deliberately a
+' pure mechanism with no opinion of its own: given one exact file path, it either loads that font
+' (via real FreeType, when this build has it) or it doesn't. Which real font to prefer, in what
+' order, and how a user overrides that choice is ordinary application policy, so it lives HERE,
+' in ArcoBASIC, not in the native host layer -- edit this function (or Process.Env's own
+' ARCO_ARCOGUI_FONT_PATH override at runtime, no rebuild needed) to change Aperture's, or any
+' other Arcology GUI Library application's, active font.
+FUNCTION ArcDefaultFontCandidates()
+    candidates = []
+    ignored = Array.Add(candidates, "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+    ignored = Array.Add(candidates, "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf")
+    ignored = Array.Add(candidates, "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf")
+    ignored = Array.Add(candidates, "/usr/share/fonts/opentype/urw-base35/NimbusMonoPS-Regular.otf")
+    RETURN candidates
+END FUNCTION
+
+' Resolves and activates the real text-rendering font: ARCO_ARCOGUI_FONT_PATH (an explicit
+' override -- a user's own font preference, or an automated test pinning a specific file) is tried
+' FIRST, ahead of ArcDefaultFontCandidates()'s own search list, which is tried next in order until
+' SURFACE.SetFontPath actually succeeds. Every attempt that fails leaves whatever font was
+' previously active untouched (SURFACE.SetFontPath's own contract), so trying several candidates
+' here is always safe. Returns FALSE, having tried and failed every candidate, when none load --
+' SURFACE.DrawText/MeasureText themselves fall back to the built-in 5x7 bitmap font in that case,
+' silently, so this is never a fatal condition, just a lower-quality one worth calling out to
+' whoever's watching (ArcWindow's own constructor below does not treat FALSE as an error).
+' How many pixels tall one `scale` unit renders as under the real FreeType path -- the OTHER half
+' of "how big is the active font", alongside which file it comes from above. SURFACE.
+' SetFontPixelsPerScale is, again, pure mechanism (a stored multiplier surface_draw_text/
+' measure_text read); this default, and ARCO_ARCOGUI_FONT_PIXELS_PER_SCALE's override, are the
+' actual policy, and both live here for the identical reason ArcDefaultFontCandidates() does.
+FUNCTION ArcDefaultFontPixelsPerScale()
+    RETURN 8
+END FUNCTION
+
+FUNCTION ArcConfigureFont()
+    override = Process.Env("ARCO_ARCOGUI_FONT_PATH")
+    fontLoaded = FALSE
+    IF override <> "" ANDALSO SURFACE.SetFontPath(override) THEN
+        fontLoaded = TRUE
+    ELSE
+        FOR candidate IN ArcDefaultFontCandidates()
+            IF SURFACE.SetFontPath(candidate) THEN
+                fontLoaded = TRUE
+                EXIT FOR
+            END IF
+        NEXT
+    END IF
+
+    sizeOverride = Process.Env("ARCO_ARCOGUI_FONT_PIXELS_PER_SCALE")
+    IF sizeOverride <> "" THEN
+        ignored = SURFACE.SetFontPixelsPerScale(NUMBER(sizeOverride))
+    ELSE
+        ignored = SURFACE.SetFontPixelsPerScale(ArcDefaultFontPixelsPerScale())
+    END IF
+
+    RETURN fontLoaded
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' ArcWindow -- S12 Core Semantic Objects
+' ---------------------------------------------------------------------------------------------
+' A thin, idiomatic wrapper over the raw WINDOW.*/SURFACE.* primitives -- callers MAY still use
+' those directly (every function here is a one-line pass-through), but real applications get a
+' single long-lived object to carry the window id around instead of threading a bare integer
+' through every call site.
+CLASS ArcWindow
+    Id AS Number = -1
+    Width AS Number = 0
+    Height AS Number = 0
+
+    CONSTRUCTOR(title AS String = "Arcology", width AS Number = 800, height AS Number = 600)
+        SELF.Id = WINDOW.Create(title, width, height)
+        SELF.Width = width
+        SELF.Height = height
+        ' Every real application creates at least one ArcWindow before drawing anything, so this
+        ' is the one place that guarantees ArcConfigureFont() actually runs -- an app never has to
+        ' remember to call it itself. SetFontPath is idempotent (a no-op if the same font is
+        ' already active), so re-running this for a second/third ArcWindow in the same process
+        ' costs nothing beyond the redundant check.
+        ignored = ArcConfigureFont()
+    END CONSTRUCTOR
+
+    FUNCTION Destroy()
+        ignored = WINDOW.Destroy(SELF.Id)
+    END FUNCTION
+
+    FUNCTION ShouldClose()
+        RETURN WINDOW.ShouldClose(SELF.Id)
+    END FUNCTION
+
+    FUNCTION RequestClose()
+        ignored = WINDOW.SetShouldClose(SELF.Id, TRUE)
+    END FUNCTION
+
+    FUNCTION SetTitle(title AS String)
+        ignored = WINDOW.SetTitle(SELF.Id, title)
+    END FUNCTION
+
+    ' Refreshes SELF.Width/Height from the real window (a "resize" event from PollEvent/WaitEvent
+    ' already carries the new size directly -- this exists for the rarer case of wanting to query
+    ' it on demand rather than tracking it from the event stream).
+    FUNCTION RefreshSize()
+        size = WINDOW.Size(SELF.Id)
+        SELF.Width = size.Width
+        SELF.Height = size.Height
+    END FUNCTION
+
+    FUNCTION PollEvent()
+        event = WINDOW.PollEvent()
+        SELF.TrackResize(event)
+        RETURN event
+    END FUNCTION
+
+    FUNCTION WaitEvent(timeoutSeconds AS Number = 0.05)
+        event = WINDOW.WaitEvent(timeoutSeconds)
+        SELF.TrackResize(event)
+        RETURN event
+    END FUNCTION
+
+    ' Every ArcWindow keeps its own Width/Height current automatically from the event stream, so
+    ' callers laying out widgets against SELF.Width/SELF.Height never read a stale size the frame
+    ' right after a real resize.
+    FUNCTION TrackResize(event AS ARRAY)
+        IF event.Type == "resize" THEN
+            SELF.Width = event.Width
+            SELF.Height = event.Height
+        END IF
+    END FUNCTION
+
+    FUNCTION Clear(color AS ArcColor)
+        ignored = SURFACE.Clear(SELF.Id, color.R, color.G, color.B, color.A)
+    END FUNCTION
+
+    FUNCTION FillRect(x AS Number, y AS Number, width AS Number, height AS Number, color AS ArcColor)
+        ignored = SURFACE.FillRect(SELF.Id, x, y, width, height, color.R, color.G, color.B, color.A)
+    END FUNCTION
+
+    FUNCTION SetPixel(x AS Number, y AS Number, color AS ArcColor)
+        ignored = SURFACE.SetPixel(SELF.Id, x, y, color.R, color.G, color.B, color.A)
+    END FUNCTION
+
+    FUNCTION DrawText(text AS String, x AS Number, y AS Number, scale AS Number, color AS ArcColor)
+        ignored = SURFACE.DrawText(SELF.Id, text, x, y, scale, color.R, color.G, color.B, color.A)
+    END FUNCTION
+
+    FUNCTION Present()
+        ignored = SURFACE.Present(SELF.Id)
+    END FUNCTION
+
+    FUNCTION ClipboardText()
+        RETURN CLIPBOARD.Read(SELF.Id)
+    END FUNCTION
+
+    FUNCTION SetClipboardText(text AS String)
+        ignored = CLIPBOARD.Write(SELF.Id, text)
+    END FUNCTION
+
+    FUNCTION SetCursor(name AS String)
+        ignored = CURSOR.Set(SELF.Id, name)
+    END FUNCTION
+
+    FUNCTION IsKeyDown(key AS String)
+        RETURN KEYBOARD.IsDown(SELF.Id, key)
+    END FUNCTION
+
+    FUNCTION PointerPosition()
+        RETURN POINTER.Position(SELF.Id)
+    END FUNCTION
+END CLASS
+
+' ---------------------------------------------------------------------------------------------
+' ArcColor -- S23 Visual Styling
+' ---------------------------------------------------------------------------------------------
+' Every SURFACE.*/ArcWindow drawing call above takes one of these instead of four separate R/G/B/A
+' numbers -- the same information, but named and reusable as a genuine Style value (S23/S24: "a
+' visual theme controls appearance", distinct from a widget's own layout/behavior).
+CLASS ArcColor
+    R AS Number = 0
+    G AS Number = 0
+    B AS Number = 0
+    A AS Number = 1
+
+    CONSTRUCTOR(r AS Number = 0, g AS Number = 0, b AS Number = 0, a AS Number = 1)
+        SELF.R = r
+        SELF.G = g
+        SELF.B = b
+        SELF.A = a
+    END CONSTRUCTOR
+END CLASS
+
+FUNCTION ArcColorRGB(r AS Number, g AS Number, b AS Number)
+    RETURN ArcColor(r, g, b, 1)
+END FUNCTION
+
+FUNCTION ArcColorWhite()
+    RETURN ArcColor(1, 1, 1, 1)
+END FUNCTION
+
+FUNCTION ArcColorBlack()
+    RETURN ArcColor(0, 0, 0, 1)
+END FUNCTION
+
+' A default dark-theme palette -- one place a future Presentation Policy/Theme system (S18/S24)
+' can override, rather than every widget below hardcoding its own colors the way
+' stdlib/gui.abas's individual widgets each do (a real, disclosed simplification kept here:
+' per-widget color OVERRIDES are still real future work, this is just the shared default).
+FUNCTION ArcThemeBackground()
+    RETURN ArcColor(0.09, 0.1, 0.13, 1)
+END FUNCTION
+
+FUNCTION ArcThemePanel()
+    RETURN ArcColor(0.14, 0.16, 0.21, 1)
+END FUNCTION
+
+FUNCTION ArcThemePanelHover()
+    RETURN ArcColor(0.19, 0.22, 0.29, 1)
+END FUNCTION
+
+FUNCTION ArcThemeAccent()
+    RETURN ArcColor(0.36, 0.68, 1.0, 1)
+END FUNCTION
+
+FUNCTION ArcThemeText()
+    RETURN ArcColor(0.92, 0.94, 0.98, 1)
+END FUNCTION
+
+FUNCTION ArcThemeMuted()
+    RETURN ArcColor(0.55, 0.6, 0.68, 1)
+END FUNCTION
+
+FUNCTION ArcThemeDanger()
+    RETURN ArcColor(0.95, 0.35, 0.35, 1)
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' Layout -- S22
+' ---------------------------------------------------------------------------------------------
+' Stateless on purpose, same shape and same reasoning as stdlib/gui.abas's own VStack/HStack
+' (S35.3: legitimate behavioral reference) -- apply the returned offsets to widgets' own
+' SetBounds/SetPosition yourself. A generic Stack/Flow/Grid/Dock/Overlay/Scroll container (S22's
+' fuller list) is real, disclosed future work; these two cover the common case Phase 2 needs today.
+FUNCTION VStack(startY AS Number, heights AS Array, spacing AS Number = 8)
+    offsets = []
+    y = startY
+    FOR i = 0 TO LEN(heights) - 1
+        ignored = Array.Add(offsets, y)
+        y = y + heights[i] + spacing
+    NEXT
+    RETURN offsets
+END FUNCTION
+
+FUNCTION HStack(startX AS Number, widths AS Array, spacing AS Number = 8)
+    offsets = []
+    x = startX
+    FOR i = 0 TO LEN(widths) - 1
+        ignored = Array.Add(offsets, x)
+        x = x + widths[i] + spacing
+    NEXT
+    RETURN offsets
+END FUNCTION
+
+' ---------------------------------------------------------------------------------------------
+' ArcContext -- S15 Context System
+' ---------------------------------------------------------------------------------------------
+' A plain key/value store describing "the situation intents are evaluated in" (S15's own words),
+' e.g. ArcContext().Set("selection.count", 3). Deliberately a real CLASS instance the application
+' owns and passes around (AppContext = ArcContext(), then AppContext.Set(...)/.Get(...)
+' everywhere) rather than hidden global state -- see this file's own module doc comment for why
+' user-level ArcoBASIC functions can't be named "CONTEXT.Set" the way a host function can; a
+' single shared instance's own methods are the idiomatic equivalent.
+CLASS ArcContextEntry
+    Key AS String = ""
+    Value = FALSE
+END CLASS
+
+CLASS ArcContext
+    Entries AS Array = []
+
+    FUNCTION FindEntry(key AS String)
+        FOR entry IN SELF.Entries
+            IF entry.Key == key THEN RETURN entry
+        NEXT
+        RETURN FALSE
+    END FUNCTION
+
+    FUNCTION Set(key AS String, value)
+        existing = SELF.FindEntry(key)
+        IF TYPEOF(existing) == "Boolean" THEN
+            entry = ArcContextEntry()
+            entry.Key = key
+            entry.Value = value
+            ignored = Array.Add(SELF.Entries, entry)
+        ELSE
+            existing.Value = value
+        END IF
+    END FUNCTION
+
+    FUNCTION Get(key AS String, defaultValue = FALSE)
+        existing = SELF.FindEntry(key)
+        IF TYPEOF(existing) == "Boolean" THEN RETURN defaultValue
+        RETURN existing.Value
+    END FUNCTION
+
+    FUNCTION HasKey(key AS String)
+        existing = SELF.FindEntry(key)
+        RETURN TYPEOF(existing) <> "Boolean"
+    END FUNCTION
+END CLASS
+
+' ---------------------------------------------------------------------------------------------
+' ArcIntent / IntentRegistry -- S13 Intent Object, S14 Availability, S16 Resolver
+' ---------------------------------------------------------------------------------------------
+' "An Intent represents something the user may ask the application to do" (S13). Availability
+' (S14) is driven by an optional Requirement callable -- a real ArcoBASIC function taking the
+' active ArcContext and returning TRUE/FALSE, e.g.:
+'
+'   FUNCTION HasSelection(context AS ArcContext)
+'       RETURN context.Get("selection.count", 0) > 0
+'   END FUNCTION
+'   ignored = registry.Register("selection.delete", "Delete", ADDRESSOF SelectionDelete)
+'   ignored = registry.Require("selection.delete", ADDRESSOF HasSelection)
+'   ignored = registry.SetUnavailableReason("selection.delete", "Select something first.")
+'
+' This is the S16 Resolver's own required determinism property directly: given the identical
+' ArcContext contents, IsAvailable(id, context) returns the identical answer every time -- it is a
+' pure function of the registry and the context, nothing else.
+CLASS ArcIntentRecord
+    Id AS String = ""
+    Label AS String = ""
+    Description AS String = ""
+    Category AS String = ""
+    Shortcut AS String = ""
+    HasHandlerFlag AS Bool = FALSE
+    Handler AS CALLABLE
+    HasRequirementFlag AS Bool = FALSE
+    Requirement AS CALLABLE
+    UnavailableReason AS String = ""
+    Hidden AS Bool = FALSE
+END CLASS
+
+CLASS ArcIntentRegistry
+    Intents AS Array = []
+
+    FUNCTION Find(id AS String)
+        FOR intent IN SELF.Intents
+            IF intent.Id == id THEN RETURN intent
+        NEXT
+        RETURN FALSE
+    END FUNCTION
+
+    ' Registers a new intent (or replaces an existing one with the same id, so re-registering
+    ' during development doesn't accumulate duplicates). label/handler are the two pieces every
+    ' intent needs at minimum; everything else (Require/SetUnavailableReason/SetDescription/...)
+    ' is set afterward via the id, matching S13's own worked example shape.
+    FUNCTION Register(id AS String, label AS String, handler AS CALLABLE)
+        record = ArcIntentRecord()
+        record.Id = id
+        record.Label = label
+        record.HasHandlerFlag = TRUE
+        record.Handler = handler
+        existing = SELF.Find(id)
+        IF TYPEOF(existing) == "Boolean" THEN
+            ignored = Array.Add(SELF.Intents, record)
+        ELSE
+            ignored = Array.Remove(SELF.Intents, existing)
+            ignored = Array.Add(SELF.Intents, record)
+        END IF
+        RETURN record
+    END FUNCTION
+
+    FUNCTION SetDescription(id AS String, description AS String)
+        record = SELF.Find(id)
+        IF TYPEOF(record) <> "Boolean" THEN record.Description = description
+    END FUNCTION
+
+    FUNCTION SetCategory(id AS String, category AS String)
+        record = SELF.Find(id)
+        IF TYPEOF(record) <> "Boolean" THEN record.Category = category
+    END FUNCTION
+
+    FUNCTION SetShortcut(id AS String, shortcut AS String)
+        record = SELF.Find(id)
+        IF TYPEOF(record) <> "Boolean" THEN record.Shortcut = shortcut
+    END FUNCTION
+
+    ' requirement AS CALLABLE, a FUNCTION(context AS ArcContext) -> Bool -- see this section's own
+    ' header comment for a worked example.
+    FUNCTION Require(id AS String, requirement AS CALLABLE)
+        record = SELF.Find(id)
+        IF TYPEOF(record) <> "Boolean" THEN
+            record.HasRequirementFlag = TRUE
+            record.Requirement = requirement
+        END IF
+    END FUNCTION
+
+    FUNCTION SetUnavailableReason(id AS String, reason AS String)
+        record = SELF.Find(id)
+        IF TYPEOF(record) <> "Boolean" THEN record.UnavailableReason = reason
+    END FUNCTION
+
+    ' S14: "An unavailable intent may remain visible if doing so improves discoverability" --
+    ' Hidden is the SEPARATE flag for the rarer case an intent shouldn't be listed at all
+    ' (IsAvailable/UnavailableReason are unaffected by it).
+    FUNCTION Hide(id AS String)
+        record = SELF.Find(id)
+        IF TYPEOF(record) <> "Boolean" THEN record.Hidden = TRUE
+    END FUNCTION
+
+    ' S16 Resolver: TRUE exactly when no Requirement was ever set, or the Requirement callable
+    ' returns TRUE for this context. Deterministic in `context` by construction -- the requirement
+    ' callable is an ordinary pure-in-practice ArcoBASIC function the application authored, and
+    ' this method itself holds no state of its own beyond the registry.
+    FUNCTION IsAvailable(id AS String, context AS ArcContext)
+        record = SELF.Find(id)
+        IF TYPEOF(record) == "Boolean" THEN RETURN FALSE
+        IF !record.HasRequirementFlag THEN RETURN TRUE
+        predicate = record.Requirement
+        RETURN predicate(context)
+    END FUNCTION
+
+    ' "" (empty string) when available OR when no reason was ever set -- callers distinguish
+    ' "unavailable with no stated reason" from "available" via IsAvailable itself, not this string.
+    FUNCTION UnavailableReason(id AS String)
+        record = SELF.Find(id)
+        IF TYPEOF(record) == "Boolean" THEN RETURN ""
+        RETURN record.UnavailableReason
+    END FUNCTION
+
+    ' Invokes the intent's handler unconditionally -- callers are expected to check IsAvailable
+    ' first (S14: availability and invocation are separate concerns); this does not re-check it,
+    ' matching how a real UI would already have hidden/disabled the control before a click could
+    ' ever reach here.
+    FUNCTION Invoke(id AS String)
+        record = SELF.Find(id)
+        IF TYPEOF(record) == "Boolean" THEN RETURN FALSE
+        IF !record.HasHandlerFlag THEN RETURN FALSE
+        handler = record.Handler
+        ignored = handler()
+        RETURN TRUE
+    END FUNCTION
+
+    ' S16's own resolver pipeline, made concrete: every intent whose IsAvailable(context) is TRUE
+    ' and whose Hidden flag is FALSE, in registration order (deterministic given a deterministic
+    ' Intents array) -- a Presentation Policy (S18, real future work) would consume exactly this
+    ' list to decide HOW to show each one; this only decides WHICH ones qualify.
+    FUNCTION Applicable(context AS ArcContext)
+        result = []
+        FOR intent IN SELF.Intents
+            IF !intent.Hidden ANDALSO SELF.IsAvailable(intent.Id, context) THEN
+                ignored = Array.Add(result, intent)
+            END IF
+        NEXT
+        RETURN result
+    END FUNCTION
+END CLASS
+
+' ---------------------------------------------------------------------------------------------
+' Controls -- S30 Phase 2 (Label, Button, Checkbox, TextInput)
+' ---------------------------------------------------------------------------------------------
+' Each control owns its own persistent state as class fields, drawn via Draw(window) and updated
+' via HandleEvent(window, event) -- the same per-frame contract stdlib/gui.abas's own widgets use
+' (S35.3), rebuilt here against SURFACE.DrawText/FillRect and this file's own ArcColor/ArcWindow
+' instead of GUI.Text/GUI.RoundedRectangle. None of these consult ArcIntentRegistry yet -- wiring
+' a control's own availability/click handling to a bound Intent is real, disclosed future work
+' (this file's own module doc comment says so), not attempted in this pass.
+
+CLASS Label
+    Text AS String = ""
+    X AS Number = 0
+    Y AS Number = 0
+    Scale AS Number = 2
+    Color AS ArcColor = FALSE
+
+    CONSTRUCTOR(text AS String = "", x AS Number = 0, y AS Number = 0, scale AS Number = 2)
+        SELF.Text = text
+        SELF.X = x
+        SELF.Y = y
+        SELF.Scale = scale
+        SELF.Color = ArcThemeText()
+    END CONSTRUCTOR
+
+    FUNCTION SetPosition(x AS Number, y AS Number)
+        SELF.X = x
+        SELF.Y = y
+    END FUNCTION
+
+    FUNCTION Draw(window AS ArcWindow)
+        ignored = window.DrawText(SELF.Text, SELF.X, SELF.Y, SELF.Scale, SELF.Color)
+    END FUNCTION
+END CLASS
+
+CLASS Button
+    Label AS String = ""
+    X AS Number = 0
+    Y AS Number = 0
+    Width AS Number = 140
+    Height AS Number = 36
+    Scale AS Number = 2
+    Hovered AS Bool = FALSE
+
+    CONSTRUCTOR(label AS String = "")
+        SELF.Label = label
+    END CONSTRUCTOR
+
+    FUNCTION SetBounds(x AS Number, y AS Number, width AS Number, height AS Number)
+        SELF.X = x
+        SELF.Y = y
+        SELF.Width = width
+        SELF.Height = height
+    END FUNCTION
+
+    FUNCTION ContainsPoint(px AS Number, py AS Number)
+        RETURN px >= SELF.X ANDALSO px < SELF.X + SELF.Width ANDALSO py >= SELF.Y ANDALSO py < SELF.Y + SELF.Height
+    END FUNCTION
+
+    FUNCTION Draw(window AS ArcWindow)
+        background = ArcThemePanel()
+        IF SELF.Hovered THEN background = ArcThemePanelHover()
+        ignored = window.FillRect(SELF.X, SELF.Y, SELF.Width, SELF.Height, background)
+        measured = SURFACE.MeasureText(SELF.Label, SELF.Scale)
+        textX = SELF.X + (SELF.Width - measured.Width) / 2
+        textY = SELF.Y + (SELF.Height - measured.Height) / 2
+        ignored = window.DrawText(SELF.Label, textX, textY, SELF.Scale, ArcThemeText())
+    END FUNCTION
+
+    ' TRUE the frame the button is released while the pointer is still over it -- press-and-drag-
+    ' off-then-release does NOT count, the same real fix over a press-only check
+    ' stdlib/gui.abas's own Button doc comment calls out (S35.3 behavioral reference).
+    FUNCTION HandleEvent(event AS ARRAY)
+        clicked = FALSE
+        IF event.Type == "pointer-move" THEN SELF.Hovered = SELF.ContainsPoint(event.X, event.Y)
+        IF event.Type == "pointer-button" ANDALSO event.Action == "release" ANDALSO event.Button == "left" THEN
+            IF SELF.ContainsPoint(event.X, event.Y) THEN clicked = TRUE
+        END IF
+        RETURN clicked
+    END FUNCTION
+END CLASS
+
+CLASS Checkbox
+    Label AS String = ""
+    Checked AS Bool = FALSE
+    X AS Number = 0
+    Y AS Number = 0
+    Size AS Number = 20
+    Scale AS Number = 2
+
+    CONSTRUCTOR(label AS String = "", checked AS Bool = FALSE)
+        SELF.Label = label
+        SELF.Checked = checked
+    END CONSTRUCTOR
+
+    FUNCTION SetPosition(x AS Number, y AS Number)
+        SELF.X = x
+        SELF.Y = y
+    END FUNCTION
+
+    FUNCTION ContainsPoint(px AS Number, py AS Number)
+        RETURN px >= SELF.X ANDALSO px < SELF.X + SELF.Size ANDALSO py >= SELF.Y ANDALSO py < SELF.Y + SELF.Size
+    END FUNCTION
+
+    FUNCTION Draw(window AS ArcWindow)
+        ignored = window.FillRect(SELF.X, SELF.Y, SELF.Size, SELF.Size, ArcThemePanel())
+        IF SELF.Checked THEN
+            inset = SELF.Size / 4
+            ignored = window.FillRect(SELF.X + inset, SELF.Y + inset, SELF.Size - inset * 2, SELF.Size - inset * 2, ArcThemeAccent())
+        END IF
+        IF SELF.Label <> "" THEN
+            ignored = window.DrawText(SELF.Label, SELF.X + SELF.Size + 8, SELF.Y, SELF.Scale, ArcThemeText())
+        END IF
+    END FUNCTION
+
+    ' TRUE the frame Checked actually flips.
+    FUNCTION HandleEvent(event AS ARRAY)
+        IF event.Type == "pointer-button" ANDALSO event.Action == "release" ANDALSO event.Button == "left" THEN
+            IF SELF.ContainsPoint(event.X, event.Y) THEN
+                SELF.Checked = !SELF.Checked
+                RETURN TRUE
+            END IF
+        END IF
+        RETURN FALSE
+    END FUNCTION
+END CLASS
+
+' A single-line text field. Real, disclosed limits (matching this file's own "grow vertically from
+' working applications" philosophy, RFC-0056 S5): no selection, no multi-line, no IME -- typing,
+' backspace/delete, left/right/home/end, and click-to-place-caret via the font's own fixed 5-column
+' cell width (real per-character measurement, not assumed monospacing beyond what the font already
+' guarantees).
+CLASS TextInput
+    Text AS String = ""
+    Caret AS Number = 0
+    X AS Number = 0
+    Y AS Number = 0
+    Width AS Number = 240
+    Height AS Number = 32
+    Scale AS Number = 2
+    Focused AS Bool = FALSE
+
+    CONSTRUCTOR(text AS String = "")
+        SELF.Text = text
+        SELF.Caret = String.Length(text)
+    END CONSTRUCTOR
+
+    FUNCTION SetBounds(x AS Number, y AS Number, width AS Number, height AS Number)
+        SELF.X = x
+        SELF.Y = y
+        SELF.Width = width
+        SELF.Height = height
+    END FUNCTION
+
+    FUNCTION ContainsPoint(px AS Number, py AS Number)
+        RETURN px >= SELF.X ANDALSO px < SELF.X + SELF.Width ANDALSO py >= SELF.Y ANDALSO py < SELF.Y + SELF.Height
+    END FUNCTION
+
+    FUNCTION InsertText(value AS String)
+        SELF.Text = String.Insert(SELF.Text, SELF.Caret, value)
+        SELF.Caret = SELF.Caret + String.Length(value)
+    END FUNCTION
+
+    FUNCTION DeleteBackward()
+        IF SELF.Caret > 0 THEN
+            SELF.Text = String.Delete(SELF.Text, SELF.Caret - 1, 1)
+            SELF.Caret = SELF.Caret - 1
+        END IF
+    END FUNCTION
+
+    FUNCTION DeleteForward()
+        IF SELF.Caret < String.Length(SELF.Text) THEN
+            SELF.Text = String.Delete(SELF.Text, SELF.Caret, 1)
+        END IF
+    END FUNCTION
+
+    FUNCTION MoveLeft()
+        IF SELF.Caret > 0 THEN SELF.Caret = SELF.Caret - 1
+    END FUNCTION
+
+    FUNCTION MoveRight()
+        IF SELF.Caret < String.Length(SELF.Text) THEN SELF.Caret = SELF.Caret + 1
+    END FUNCTION
+
+    FUNCTION MoveHome()
+        SELF.Caret = 0
+    END FUNCTION
+
+    FUNCTION MoveEnd()
+        SELF.Caret = String.Length(SELF.Text)
+    END FUNCTION
+
+    FUNCTION Draw(window AS ArcWindow)
+        background = ArcThemePanel()
+        IF SELF.Focused THEN background = ArcThemePanelHover()
+        ignored = window.FillRect(SELF.X, SELF.Y, SELF.Width, SELF.Height, background)
+        padding = 6
+        textY = SELF.Y + (SELF.Height - SURFACE.MeasureText("M", SELF.Scale).Height) / 2
+        ignored = window.DrawText(SELF.Text, SELF.X + padding, textY, SELF.Scale, ArcThemeText())
+        IF SELF.Focused THEN
+            caretText = String.Slice(SELF.Text, 0, SELF.Caret)
+            caretMeasured = SURFACE.MeasureText(caretText, SELF.Scale)
+            caretX = SELF.X + padding + caretMeasured.Width
+            ignored = window.FillRect(caretX, SELF.Y + 4, 2, SELF.Height - 8, ArcThemeAccent())
+        END IF
+    END FUNCTION
+
+    ' TRUE the frame Text actually changed. Focus is click-to-focus/click-away-to-unfocus, checked
+    ' on every pointer-button press regardless of whether it landed inside or outside this field.
+    FUNCTION HandleEvent(event AS ARRAY)
+        changed = FALSE
+        IF event.Type == "pointer-button" ANDALSO event.Action == "press" ANDALSO event.Button == "left" THEN
+            SELF.Focused = SELF.ContainsPoint(event.X, event.Y)
+        END IF
+        IF !SELF.Focused THEN RETURN FALSE
+
+        IF event.Type == "text" THEN
+            SELF.InsertText(event.Text)
+            changed = TRUE
+        END IF
+        IF event.Type == "key" ANDALSO (event.Action == "press" ORELSE event.Action == "repeat") THEN
+            IF event.Key == "left" THEN SELF.MoveLeft()
+            IF event.Key == "right" THEN SELF.MoveRight()
+            IF event.Key == "home" THEN SELF.MoveHome()
+            IF event.Key == "end" THEN SELF.MoveEnd()
+            IF event.Key == "backspace" THEN
+                SELF.DeleteBackward()
+                changed = TRUE
+            END IF
+            IF event.Key == "delete" THEN
+                SELF.DeleteForward()
+                changed = TRUE
+            END IF
+        END IF
+        RETURN changed
+    END FUNCTION
+END CLASS
+
+' A draggable horizontal value slider -- track + fill + round handle, value linearly mapped
+' between Min and Max. Grab-and-drag anywhere in a generous vertical hit band around the track
+' (not just the thin track itself), the same "forgiving hit region" choice Button/Checkbox make
+' with their own ContainsPoint (S35.3 behavioral reference: stdlib/gui.abas's own Slider makes this
+' exact choice for this exact reason). Mouse-wheel over the slider nudges the value by a small
+' fixed fraction of its range.
+CLASS Slider
+    Label AS String = ""
+    Value AS Number = 0
+    Min AS Number = 0
+    Max AS Number = 1
+    X AS Number = 0
+    Y AS Number = 0
+    Width AS Number = 160
+    Height AS Number = 18
+    Dragging AS Bool = FALSE
+    Scale AS Number = 1
+
+    CONSTRUCTOR(label AS String = "", value AS Number = 0, minimum AS Number = 0, maximum AS Number = 1)
+        SELF.Label = label
+        SELF.Value = value
+        SELF.Min = minimum
+        SELF.Max = maximum
+    END CONSTRUCTOR
+
+    FUNCTION SetBounds(x AS Number, y AS Number, width AS Number, height AS Number)
+        SELF.X = x
+        SELF.Y = y
+        SELF.Width = width
+        SELF.Height = height
+    END FUNCTION
+
+    FUNCTION Fraction()
+        span = SELF.Max - SELF.Min
+        IF span == 0 THEN RETURN 0
+        RETURN CLAMP((SELF.Value - SELF.Min) / span, 0, 1)
+    END FUNCTION
+
+    FUNCTION SetFraction(fraction AS Number)
+        SELF.Value = SELF.Min + CLAMP(fraction, 0, 1) * (SELF.Max - SELF.Min)
+    END FUNCTION
+
+    FUNCTION ContainsPoint(px AS Number, py AS Number)
+        withinX = px >= SELF.X ANDALSO px < SELF.X + SELF.Width
+        withinY = py >= SELF.Y - 8 ANDALSO py < SELF.Y + SELF.Height + 8
+        RETURN withinX ANDALSO withinY
+    END FUNCTION
+
+    FUNCTION Draw(window AS ArcWindow)
+        trackY = SELF.Y + SELF.Height / 2 - 2
+        ignored = window.FillRect(SELF.X, trackY, SELF.Width, 4, ArcThemePanel())
+        fraction = SELF.Fraction()
+        fillWidth = SELF.Width * fraction
+        IF fillWidth > 0 THEN
+            ignored = window.FillRect(SELF.X, trackY, fillWidth, 4, ArcThemeAccent())
+        END IF
+        handleX = SELF.X + fillWidth - 4
+        ignored = window.FillRect(handleX, SELF.Y, 8, SELF.Height, ArcThemeText())
+        IF SELF.Label <> "" THEN
+            ignored = window.DrawText(SELF.Label, SELF.X, SELF.Y - 16, SELF.Scale, ArcThemeMuted())
+        END IF
+    END FUNCTION
+
+    ' TRUE the frame Value actually changes.
+    FUNCTION HandleEvent(event AS ARRAY)
+        changed = FALSE
+        IF event.Type == "pointer-button" ANDALSO event.Button == "left" THEN
+            IF event.Action == "press" ANDALSO SELF.ContainsPoint(event.X, event.Y) THEN
+                SELF.Dragging = TRUE
+                before = SELF.Value
+                ignored = SELF.SetFraction((event.X - SELF.X) / SELF.Width)
+                IF SELF.Value <> before THEN changed = TRUE
+            END IF
+            IF event.Action == "release" THEN SELF.Dragging = FALSE
+        END IF
+        IF event.Type == "pointer-move" ANDALSO SELF.Dragging THEN
+            before = SELF.Value
+            ignored = SELF.SetFraction((event.X - SELF.X) / SELF.Width)
+            IF SELF.Value <> before THEN changed = TRUE
+        END IF
+        IF event.Type == "scroll" ANDALSO SELF.ContainsPoint(event.X, event.Y) THEN
+            before = SELF.Value
+            wheelStep = (SELF.Max - SELF.Min) * 0.0005
+            SELF.Value = CLAMP(SELF.Value - event.DeltaY * wheelStep, SELF.Min, SELF.Max)
+            IF SELF.Value <> before THEN changed = TRUE
+        END IF
+        RETURN changed
+    END FUNCTION
+END CLASS
+
+' ---------------------------------------------------------------------------------------------
+' IntentRing -- S19, "a first-class Arcology presentation mechanism, but not the Intent System
+' itself"
+' ---------------------------------------------------------------------------------------------
+' The actions displayed originate from ArcIntentRegistry.Applicable(context) (S16's own Resolver);
+' this widget only decides how to lay them out and draw them, and reports back which one (if any)
+' a click actually invoked -- exactly the separation S17 (Availability/Relevance/Presentation)
+' requires. Items are spaced evenly around CenterX/CenterY by real angle (SIN/COS), starting
+' straight up and going clockwise -- S19's own worked example (OPEN north, FILE center, COPY west,
+' RENAME east, DELETE south) is one specific case of this general layout, not a hardcoded 4/8-slot
+' compass.
+CLASS IntentRingItem
+    Intent = FALSE
+    X AS Number = 0
+    Y AS Number = 0
+END CLASS
+
+CLASS IntentRing
+    CenterX AS Number = 0
+    CenterY AS Number = 0
+    CenterLabel AS String = ""
+    Radius AS Number = 90
+    ItemWidth AS Number = 110
+    ItemHeight AS Number = 32
+    Scale AS Number = 2
+    Items AS Array = []
+    HoveredIndex AS Number = -1
+
+    CONSTRUCTOR(centerX AS Number = 0, centerY AS Number = 0, centerLabel AS String = "")
+        SELF.CenterX = centerX
+        SELF.CenterY = centerY
+        SELF.CenterLabel = centerLabel
+    END CONSTRUCTOR
+
+    ' intents AS ARRAY of ArcIntentRecord, typically straight from
+    ' ArcIntentRegistry.Applicable(context) -- laid out evenly around the center.
+    FUNCTION SetIntents(intents AS ARRAY)
+        SELF.Items = []
+        count = LEN(intents)
+        IF count == 0 THEN RETURN FALSE
+        angleStep = (2 * PI()) / count
+        i = 0
+        WHILE i < count
+            angle = angleStep * i - (PI() / 2)
+            item = IntentRingItem()
+            item.Intent = intents[i]
+            item.X = SELF.CenterX + COS(angle) * SELF.Radius
+            item.Y = SELF.CenterY + SIN(angle) * SELF.Radius
+            ignored = Array.Add(SELF.Items, item)
+            i = i + 1
+        WEND
+    END FUNCTION
+
+    FUNCTION Draw(window AS ArcWindow)
+        IF SELF.CenterLabel <> "" THEN
+            measured = SURFACE.MeasureText(SELF.CenterLabel, SELF.Scale)
+            ignored = window.DrawText(SELF.CenterLabel, SELF.CenterX - measured.Width / 2,
+                SELF.CenterY - measured.Height / 2, SELF.Scale, ArcThemeMuted())
+        END IF
+        i = 0
+        WHILE i < LEN(SELF.Items)
+            item = SELF.Items[i]
+            background = ArcThemePanel()
+            IF i == SELF.HoveredIndex THEN background = ArcThemePanelHover()
+            boxX = item.X - SELF.ItemWidth / 2
+            boxY = item.Y - SELF.ItemHeight / 2
+            ignored = window.FillRect(boxX, boxY, SELF.ItemWidth, SELF.ItemHeight, background)
+            measured = SURFACE.MeasureText(item.Intent.Label, SELF.Scale)
+            ignored = window.DrawText(item.Intent.Label, item.X - measured.Width / 2,
+                item.Y - measured.Height / 2, SELF.Scale, ArcThemeText())
+            i = i + 1
+        WEND
+    END FUNCTION
+
+    FUNCTION IndexAt(px AS Number, py AS Number)
+        i = 0
+        WHILE i < LEN(SELF.Items)
+            item = SELF.Items[i]
+            withinX = px >= item.X - SELF.ItemWidth / 2 ANDALSO px < item.X + SELF.ItemWidth / 2
+            withinY = py >= item.Y - SELF.ItemHeight / 2 ANDALSO py < item.Y + SELF.ItemHeight / 2
+            IF withinX ANDALSO withinY THEN
+                RETURN i
+            END IF
+            i = i + 1
+        WEND
+        RETURN -1
+    END FUNCTION
+
+    ' Named HandleRingEvent, not the same "HandleEvent" name Button/Checkbox/TextInput/Slider all
+    ' share -- a real, disclosed native x86-64 backend limitation (found while porting this stdlib
+    ' natively): instance-method dispatch resolves candidates by BARE METHOD NAME across every
+    ' class in the module, with no receiver-type/arity narrowing, so multiple UNRELATED classes
+    ' happening to share a method name but different arities (Button.HandleEvent(event) vs. what
+    ' would have been IntentRing.HandleEvent(event, registry, context)) fails to compile natively
+    ' ("expects 4 arguments, got 2") even though IntentRing is never used polymorphically with the
+    ' others. This is a real naming collision this stdlib itself is responsible for avoiding, not
+    ' a bug to work around by suppressing or ignoring the compiler's own error -- distinct classes
+    ' with genuinely different call shapes should not share a method name a compiler could
+    ' reasonably treat as one dispatch family. Proper receiver-type-aware resolution remains real,
+    ' disclosed, unattempted future compiler work.
+    '
+    ' Returns the invoked intent's own Id, or "" if nothing was invoked this event. Re-checks
+    ' registry.IsAvailable at click time (against the SAME registry/context the caller built
+    ' SELF.Items from via SetIntents) rather than trusting that the ring's own snapshot is still
+    ' current -- S14's availability and this widget's own invocation stay in sync even if context
+    ' changed between the last SetIntents call and this click.
+    FUNCTION HandleRingEvent(event AS ARRAY, registry AS ArcIntentRegistry, context AS ArcContext)
+        IF event.Type == "pointer-move" THEN
+            SELF.HoveredIndex = SELF.IndexAt(event.X, event.Y)
+        END IF
+        IF event.Type == "pointer-button" ANDALSO event.Action == "release" ANDALSO event.Button == "left" THEN
+            index = SELF.IndexAt(event.X, event.Y)
+            IF index >= 0 THEN
+                item = SELF.Items[index]
+                IF registry.IsAvailable(item.Intent.Id, context) THEN
+                    ignored = registry.Invoke(item.Intent.Id)
+                    RETURN item.Intent.Id
+                END IF
+            END IF
+        END IF
+        RETURN ""
+    END FUNCTION
+END CLASS
+
+' ---------------------------------------------------------------------------------------------
+' TerminalSurface -- RFC-0056 AP-0056-007, "The one Phase 1 deliverable RFC-0054 directly
+' consumes"
+' ---------------------------------------------------------------------------------------------
+' A fixed rows x cols grid of Cells (plain {Char, Fg, Bg} objects, not CLASS instances -- avoids a
+' constructor call per cell entirely, sidestepping both the per-call overhead and the pre-existing
+' native-backend constructor bug this project already disclosed elsewhere, though Aperture itself
+' currently ships as a bytecode capsule regardless). Owns cursor position and current SGR-style
+' colors; a VT/ANSI PARSER (Aperture's own domain, RFC-0054 S9 -- NOT part of this library) is
+' expected to translate escape sequences into calls on this class's own mutation methods
+' (WriteChar/LineFeed/CarriageReturn/Tab/Backspace/EraseInLine/EraseInDisplay/CursorTo/CursorMove/
+' SetColors) rather than reaching into SELF.Grid directly. Text rendering goes through
+' SURFACE.DrawText's own 5x7 font (RFC-0056 S35.2/AP-0056-005) -- one glyph column is 6*Scale
+' pixels wide (5 columns + 1 spacing column, matching that font's own fixed advance) and one row is
+' 7*Scale pixels tall.
+CLASS TerminalCursor
+    Row AS Number = 0
+    Col AS Number = 0
+END CLASS
+
+CLASS TerminalSurface
+    Window = FALSE
+    Cols AS Number = 80
+    Rows AS Number = 24
+    Scale AS Number = 2
+    CellWidth AS Number = 12
+    CellHeight AS Number = 14
+    Grid AS Array = []
+    Cursor = FALSE
+    CursorVisible AS Bool = TRUE
+    CurrentFg = FALSE
+    CurrentBg = FALSE
+    ' TRUE whenever a mutating method has changed anything RenderFrame's own output would reflect
+    ' (including a bare cursor move, since the cursor itself is part of what's drawn) -- callers
+    ' (Aperture's own RunInteractive) check this before spending a real render+present, instead of
+    ' redrawing unconditionally on every loop iteration regardless of whether the screen actually
+    ' changed. A real, measured performance fix, not a guess: a full RenderFrame() over a real
+    ' filled 80x24 grid was independently measured at ~9.6ms; redrawing that unconditionally on
+    ' every ~20ms WaitEvent poll (RunInteractive's own timeout) wastes roughly half of every idle
+    ' iteration's own time budget on a redraw nothing needed.
+    Dirty AS Bool = TRUE
+
+    CONSTRUCTOR(window AS ARRAY, cols AS Number = 80, rows AS Number = 24, scale AS Number = 2)
+        SELF.Window = window
+        SELF.Cols = cols
+        SELF.Rows = rows
+        SELF.Scale = scale
+        SELF.CellWidth = 6 * scale
+        SELF.CellHeight = 7 * scale
+        SELF.Cursor = TerminalCursor()
+        SELF.CurrentFg = ArcThemeText()
+        SELF.CurrentBg = FALSE
+        ignored = SELF.Reset()
+    END CONSTRUCTOR
+
+    FUNCTION BlankRow()
+        line = []
+        col = 0
+        WHILE col < SELF.Cols
+            ignored = Array.Add(line, {"Char": " ", "Fg": SELF.CurrentFg, "Bg": FALSE})
+            col = col + 1
+        WEND
+        RETURN line
+    END FUNCTION
+
+    FUNCTION Reset()
+        SELF.Grid = []
+        row = 0
+        WHILE row < SELF.Rows
+            ignored = Array.Add(SELF.Grid, SELF.BlankRow())
+            row = row + 1
+        WEND
+        SELF.Cursor.Row = 0
+        SELF.Cursor.Col = 0
+        SELF.Dirty = TRUE
+    END FUNCTION
+
+    ' Live pixel dimensions -- an ArcWindow resize (RFC-0054 S3's own "forward keyboard/resize"
+    ' goal) recomputes Cols/Rows from these against CellWidth/CellHeight and calls Resize below.
+    FUNCTION PixelWidth()
+        RETURN SELF.Cols * SELF.CellWidth
+    END FUNCTION
+
+    FUNCTION PixelHeight()
+        RETURN SELF.Rows * SELF.CellHeight
+    END FUNCTION
+
+    ' Resizes the grid in place, preserving whatever existing rows/columns still fit (top-left
+    ' anchored) rather than discarding all content on every resize -- new rows/columns are blank,
+    ' shrunk-away ones are simply dropped. Cursor position is clamped into the new bounds.
+    FUNCTION Resize(newCols AS Number, newRows AS Number)
+        IF newCols == SELF.Cols ANDALSO newRows == SELF.Rows THEN RETURN FALSE
+        oldGrid = SELF.Grid
+        oldCols = SELF.Cols
+        oldRows = SELF.Rows
+        SELF.Cols = newCols
+        SELF.Rows = newRows
+        SELF.Grid = []
+        row = 0
+        WHILE row < newRows
+            newLine = SELF.BlankRow()
+            IF row < oldRows THEN
+                oldLine = oldGrid[row]
+                col = 0
+                copyCols = oldCols
+                IF copyCols > newCols THEN copyCols = newCols
+                WHILE col < copyCols
+                    newLine[col] = oldLine[col]
+                    col = col + 1
+                WEND
+            END IF
+            ignored = Array.Add(SELF.Grid, newLine)
+            row = row + 1
+        WEND
+        IF SELF.Cursor.Row >= newRows THEN SELF.Cursor.Row = newRows - 1
+        IF SELF.Cursor.Col >= newCols THEN SELF.Cursor.Col = newCols - 1
+        SELF.Dirty = TRUE
+    END FUNCTION
+
+    FUNCTION SetColors(fg AS ARRAY, bg AS ARRAY)
+        SELF.CurrentFg = fg
+        SELF.CurrentBg = bg
+        SELF.Dirty = TRUE
+    END FUNCTION
+
+    FUNCTION ScrollUp()
+        ignored = Array.RemoveAt(SELF.Grid, 0)
+        ignored = Array.Add(SELF.Grid, SELF.BlankRow())
+        SELF.Dirty = TRUE
+    END FUNCTION
+
+    FUNCTION CursorTo(row AS Number, col AS Number)
+        targetRow = row
+        targetCol = col
+        IF targetRow < 0 THEN targetRow = 0
+        IF targetRow >= SELF.Rows THEN targetRow = SELF.Rows - 1
+        IF targetCol < 0 THEN targetCol = 0
+        IF targetCol >= SELF.Cols THEN targetCol = SELF.Cols - 1
+        SELF.Cursor.Row = targetRow
+        SELF.Cursor.Col = targetCol
+        SELF.Dirty = TRUE
+    END FUNCTION
+
+    FUNCTION CursorMove(deltaRow AS Number, deltaCol AS Number)
+        ignored = SELF.CursorTo(SELF.Cursor.Row + deltaRow, SELF.Cursor.Col + deltaCol)
+    END FUNCTION
+
+    FUNCTION LineFeed()
+        IF SELF.Cursor.Row == SELF.Rows - 1 THEN
+            ignored = SELF.ScrollUp()
+        ELSE
+            SELF.Cursor.Row = SELF.Cursor.Row + 1
+        END IF
+        SELF.Dirty = TRUE
+    END FUNCTION
+
+    FUNCTION CarriageReturn()
+        SELF.Cursor.Col = 0
+        SELF.Dirty = TRUE
+    END FUNCTION
+
+    FUNCTION Backspace()
+        IF SELF.Cursor.Col > 0 THEN SELF.Cursor.Col = SELF.Cursor.Col - 1
+        SELF.Dirty = TRUE
+    END FUNCTION
+
+    ' Advances to the next multiple-of-8 column (the conventional default tab stop every real
+    ' terminal uses absent an explicit tab-stop-setting sequence, which this RFC-0054 S26 initial
+    ' scope does not attempt).
+    FUNCTION Tab()
+        nextStop = (FLOOR(SELF.Cursor.Col / 8) + 1) * 8
+        IF nextStop >= SELF.Cols THEN nextStop = SELF.Cols - 1
+        SELF.Cursor.Col = nextStop
+        SELF.Dirty = TRUE
+    END FUNCTION
+
+    ' Writes one character at the cursor with the CURRENT SGR colors, then advances the cursor,
+    ' wrapping to the next line (scrolling if already on the last row) when it runs past the last
+    ' column -- the standard "autowrap" terminal behavior every VT100-compatible program assumes.
+    FUNCTION WriteChar(ch AS String)
+        IF SELF.Cursor.Col >= SELF.Cols THEN
+            ignored = SELF.CarriageReturn()
+            ignored = SELF.LineFeed()
+        END IF
+        cell = SELF.Grid[SELF.Cursor.Row][SELF.Cursor.Col]
+        cell.Char = ch
+        cell.Fg = SELF.CurrentFg
+        cell.Bg = SELF.CurrentBg
+        SELF.Cursor.Col = SELF.Cursor.Col + 1
+        SELF.Dirty = TRUE
+    END FUNCTION
+
+    ' mode: 0 = cursor to end of line, 1 = start of line to cursor (inclusive), 2 = whole line.
+    FUNCTION EraseInLine(mode AS Number)
+        startCol = 0
+        endCol = SELF.Cols - 1
+        IF mode == 0 THEN startCol = SELF.Cursor.Col
+        IF mode == 1 THEN endCol = SELF.Cursor.Col
+        col = startCol
+        WHILE col <= endCol
+            cell = SELF.Grid[SELF.Cursor.Row][col]
+            cell.Char = " "
+            cell.Fg = SELF.CurrentFg
+            cell.Bg = FALSE
+            col = col + 1
+        WEND
+        SELF.Dirty = TRUE
+    END FUNCTION
+
+    ' mode: 0 = cursor to end of screen, 1 = start of screen to cursor, 2 = whole screen.
+    FUNCTION EraseInDisplay(mode AS Number)
+        IF mode == 2 THEN
+            ignored = SELF.Reset()
+            RETURN FALSE
+        END IF
+        startRow = 0
+        endRow = SELF.Rows - 1
+        IF mode == 0 THEN startRow = SELF.Cursor.Row
+        IF mode == 1 THEN endRow = SELF.Cursor.Row
+        row = startRow
+        savedCursorRow = SELF.Cursor.Row
+        savedCursorCol = SELF.Cursor.Col
+        WHILE row <= endRow
+            SELF.Cursor.Row = row
+            IF mode == 0 ANDALSO row == startRow THEN
+                SELF.Cursor.Col = savedCursorCol
+                ignored = SELF.EraseInLine(0)
+            ELSE
+                IF mode == 1 ANDALSO row == endRow THEN
+                    SELF.Cursor.Col = savedCursorCol
+                    ignored = SELF.EraseInLine(1)
+                ELSE
+                    SELF.Cursor.Col = 0
+                    ignored = SELF.EraseInLine(2)
+                END IF
+            END IF
+            row = row + 1
+        WEND
+        SELF.Cursor.Row = savedCursorRow
+        SELF.Cursor.Col = savedCursorCol
+    END FUNCTION
+
+    ' Named RenderFrame, not "Draw" -- Label/Button/Checkbox/TextInput/IntentRing all share
+    ' Draw(window) (one arg: the window to render INTO), while this class owns SELF.Window
+    ' internally and takes none. Sharing the "Draw" name across a zero-arg and one-arg version hit
+    ' the exact same native x86-64 backend limitation HandleRingEvent's own comment documents
+    ' (cross-class method-name resolution has no receiver-type/arity narrowing) -- confirmed
+    ' directly: "call to IntentRing.Draw expects 2 arguments, got 1" while porting Aperture
+    ' natively. Renamed for the identical reason, not worked around.
+    '
+    ' Renders the whole grid plus a solid-block cursor (fg/bg inverted under it so the character
+    ' beneath stays legible, the conventional terminal cursor look) to SELF.Window. Does NOT call
+    ' SELF.Window.Present() itself -- callers batch this with anything else drawn that frame first.
+    FUNCTION RenderFrame()
+        ignored = SELF.Window.Clear(ArcThemeBackground())
+        row = 0
+        WHILE row < SELF.Rows
+            line = SELF.Grid[row]
+            col = 0
+            WHILE col < SELF.Cols
+                cell = line[col]
+                x = col * SELF.CellWidth
+                y = row * SELF.CellHeight
+                isCursor = FALSE
+                IF SELF.CursorVisible ANDALSO row == SELF.Cursor.Row ANDALSO col == SELF.Cursor.Col THEN isCursor = TRUE
+                IF isCursor THEN
+                    ignored = SELF.Window.FillRect(x, y, SELF.CellWidth, SELF.CellHeight, ArcThemeAccent())
+                ELSE
+                    IF TYPEOF(cell.Bg) <> "Boolean" THEN
+                        ignored = SELF.Window.FillRect(x, y, SELF.CellWidth, SELF.CellHeight, cell.Bg)
+                    END IF
+                END IF
+                IF cell.Char <> " " THEN
+                    textColor = cell.Fg
+                    IF isCursor THEN textColor = ArcThemeBackground()
+                    ignored = SELF.Window.DrawText(cell.Char, x, y, SELF.Scale, textColor)
+                END IF
+                col = col + 1
+            WEND
+            row = row + 1
+        WEND
+        SELF.Dirty = FALSE
+    END FUNCTION
+END CLASS

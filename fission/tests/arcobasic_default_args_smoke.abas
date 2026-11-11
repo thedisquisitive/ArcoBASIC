@@ -1,0 +1,19 @@
+#IMPORT "fission/language/arcobasic/preprocess.abas"
+#IMPORT "fission/language/arcobasic/lower_sir.abas"
+#IMPORT "fission/amir/lower_bytecode.abas"
+
+' `FUNCTION f(a, b = default)`: a call that omits trailing arguments is padded at the call site
+' with the declared default expressions (strings containing commas included), so SIR/A-MIR/native
+' only ever see explicit arguments. Previously the defaults were dropped entirely.
+DefaultSource = "FUNCTION Greet(name, sep = \",\", n AS Number = 2 + 3)\nRETURN name + sep\nEND FUNCTION\nPRINT Greet(\"a\")\nPRINT Greet(\"a\", \"-\")\nPRINT Greet(\"a\", \"-\", 9)"
+DefaultAst = Fission_ArcoBasicParse(Fission_ArcoBasicLex(DefaultSource), "default-args-smoke.abas")
+DefaultSir = Fission_ArcoBasicAstToSir(DefaultAst)
+DefaultAmir = Fission_SirToAmir(DefaultSir)
+PRINT DefaultAst.Diagnostics.HasErrors()
+PRINT DefaultAmir.Diagnostics.HasErrors()
+Rendered = DefaultAmir.Render()
+PRINT String.Contains(Rendered, "DECLARE_FUNCTION Greet params=name AS ,sep AS ,n AS Number returns=VOID")
+PRINT String.Contains(Rendered, "CONST \",\"")
+PRINT String.Contains(Rendered, "CALL Greet %t4 %t5 %t8")
+PRINT LEN(String.Split(Rendered, "CALL Greet ")) - 1
+PRINT Fission_AmirToBytecode(DefaultAmir).Diagnostics.HasErrors()

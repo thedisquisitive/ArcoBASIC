@@ -309,6 +309,18 @@ grep -q "^      NamedArg(Name=value)$" <<<"$named_defaults_output"
 grep -q "^      NamedArg(Name=maximum)$" <<<"$named_defaults_output"
 grep -q "^SIR named-defaults-smoke.abas v0.1$" <<<"$named_defaults_output"
 
+import_alias_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_import_alias_smoke")"
+# #IMPORT "name" AS Alias: wrappers generated, pipeline clean, malformed forms are diagnostics.
+test "$(tr '\n' ' ' <<<"$import_alias_output")" = "FALSE TRUE TRUE TRUE FALSE FALSE FALSE FALSE TRUE TRUE TRUE TRUE TRUE "
+
+string_keyword_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_string_keyword_smoke")"
+# A string literal spelled like a keyword ("End") is still a string.
+test "$(tr '\n' ' ' <<<"$string_keyword_output")" = "FALSE FALSE FALSE "
+
+default_args_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_default_args_smoke")"
+# Omitted trailing arguments are padded with the declared default expressions.
+test "$(tr '\n' ' ' <<<"$default_args_output")" = "FALSE FALSE TRUE TRUE TRUE 3 FALSE "
+
 single_line_if_output="$("$SOURCE_DIR/build-rivet/fission/tests/arcobasic_single_line_if_smoke")"
 
 test "$(grep -c "^FALSE$" <<<"$single_line_if_output")" = "2"

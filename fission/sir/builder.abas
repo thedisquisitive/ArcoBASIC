@@ -4,6 +4,10 @@
 CLASS FissionSirBuilder
     CONSTRUCTOR(moduleName)
         SELF.Module = FissionSirModule(moduleName)
+        ' Language front ends register call-site default arguments here: declared function name ->
+        ' {Count, Defaults}, Defaults[i] being the language's own default expression for parameter i
+        ' (or NULL). SIR itself always carries fully explicit call arguments.
+        SELF.CallDefaults = {}
     END CONSTRUCTOR
 
     FUNCTION Node(kind)

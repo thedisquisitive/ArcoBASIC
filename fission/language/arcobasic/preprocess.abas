@@ -44,6 +44,144 @@ FUNCTION Fission_ArcoBasicUnquote(value)
     RETURN trimmed
 END FUNCTION
 
+' ---- `#IMPORT "name" AS Alias` support (mirrors the oracle's parse_import_directive and
+' alias_import_wrappers, src/runtime/runtime.cpp): the imported source is inlined exactly like a
+' plain #IMPORT, and then for every FUNCTION it declares a thin wrapper `FUNCTION Alias.Leaf(...)`
+' that forwards to the original, so callers can write `Alias.Leaf(...)`.
+
+' Splits the argument text of an #IMPORT directive into {Path, Alias, Error}.
+FUNCTION Fission_ArcoBasicParseImport(args)
+    text = String.Trim(args)
+    IF String.Length(text) == 0 THEN RETURN {Path: "", Alias: "", Error: "#IMPORT expects a module name"}
+    path = ""
+    position = 0
+    IF String.Slice(text, 0, 1) == "\"" THEN
+        finish = 1
+        WHILE finish < String.Length(text)
+            IF String.Slice(text, finish, 1) == "\"" AND String.Slice(text, finish - 1, 1) != "\\" THEN
+                EXIT WHILE
+            END IF
+            finish = finish + 1
+        WEND
+        IF finish >= String.Length(text) THEN RETURN {Path: "", Alias: "", Error: "#IMPORT has an unterminated module name"}
+        path = String.Slice(text, 1, finish - 1)
+        position = finish + 1
+    ELSE
+        finish = 0
+        WHILE finish < String.Length(text)
+            ch = String.Slice(text, finish, 1)
+            IF ch == " " OR ch == "\t" THEN EXIT WHILE
+            finish = finish + 1
+        WEND
+        path = String.Slice(text, 0, finish)
+        position = finish
+    END IF
+    rest = String.Trim(String.Slice(text, position))
+    IF String.Length(rest) == 0 THEN RETURN {Path: path, Alias: "", Error: ""}
+    split = 0
+    WHILE split < String.Length(rest)
+        ch = String.Slice(rest, split, 1)
+        IF ch == " " OR ch == "\t" THEN EXIT WHILE
+        split = split + 1
+    WEND
+    IF Upper(String.Slice(rest, 0, split)) != "AS" THEN RETURN {Path: path, Alias: "", Error: "#IMPORT expected AS before alias"}
+    alias = String.Trim(String.Slice(rest, split))
+    IF String.Length(alias) == 0 THEN RETURN {Path: path, Alias: "", Error: "#IMPORT AS expects an alias"}
+    index = 0
+    WHILE index < String.Length(alias)
+        ch = String.Slice(alias, index, 1)
+        isIdentChar = String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.", ch)
+        IF isIdentChar == FALSE THEN RETURN {Path: path, Alias: "", Error: "#IMPORT alias must be an identifier"}
+        index = index + 1
+    WEND
+    RETURN {Path: path, Alias: alias, Error: ""}
+END FUNCTION
+
+' The parameter's bare name: drops any "= default" and any " AS Type".
+FUNCTION Fission_ArcoBasicBareParamName(param)
+    name = String.Trim(param)
+    equalsAt = String.IndexOf(name, "=")
+    IF equalsAt >= 0 THEN name = String.Trim(String.Slice(name, 0, equalsAt))
+    asAt = String.IndexOf(Upper(name), " AS ")
+    IF asAt >= 0 THEN name = String.Trim(String.Slice(name, 0, asAt))
+    RETURN name
+END FUNCTION
+
+' Splits a parameter list at top-level commas (ignoring commas inside brackets or strings).
+FUNCTION Fission_ArcoBasicSplitParams(text)
+    values = []
+    current = ""
+    depth = 0
+    inString = FALSE
+    index = 0
+    WHILE index < String.Length(text)
+        ch = String.Slice(text, index, 1)
+        IF ch == "\"" AND (index == 0 OR String.Slice(text, index - 1, 1) != "\\") THEN inString = inString == FALSE
+        IF inString == FALSE THEN
+            IF ch == "(" OR ch == "[" OR ch == "{" THEN
+                depth = depth + 1
+            ELSE
+                IF ch == ")" OR ch == "]" OR ch == "}" THEN
+                    depth = depth - 1
+                ELSE
+                    IF ch == "," AND depth == 0 THEN
+                        ignored = Array.Push(values, String.Trim(current))
+                        current = ""
+                        index = index + 1
+                        CONTINUE WHILE
+                    END IF
+                END IF
+            END IF
+        END IF
+        current = current + ch
+        index = index + 1
+    WEND
+    IF String.Length(String.Trim(current)) > 0 THEN ignored = Array.Push(values, String.Trim(current))
+    RETURN values
+END FUNCTION
+
+' Wrapper FUNCTIONs `Alias.Leaf(params)` forwarding to every FUNCTION declared in `source`.
+FUNCTION Fission_ArcoBasicAliasWrappers(source, alias)
+    IF String.Length(alias) == 0 THEN RETURN ""
+    wrappers = ""
+    FOR rawLine IN String.Split(source, "\n")
+        trimmed = String.Trim(rawLine)
+        IF String.Length(trimmed) < 8 THEN CONTINUE FOR
+        IF Upper(String.Slice(trimmed, 0, 8)) != "FUNCTION" THEN CONTINUE FOR
+        header = String.Trim(String.Slice(trimmed, 8))
+        openAt = String.IndexOf(header, "(")
+        IF openAt < 0 THEN CONTINUE FOR
+        closeAt = -1
+        scan = String.Length(header) - 1
+        WHILE scan > openAt AND closeAt < 0
+            IF String.Slice(header, scan, 1) == ")" THEN closeAt = scan
+            scan = scan - 1
+        WEND
+        IF closeAt < 0 THEN CONTINUE FOR
+        originalName = String.Trim(String.Slice(header, 0, openAt))
+        IF String.Length(originalName) == 0 THEN CONTINUE FOR
+        leaf = originalName
+        dotAt = String.Length(originalName) - 1
+        WHILE dotAt >= 0 AND String.Slice(originalName, dotAt, 1) != "."
+            dotAt = dotAt - 1
+        WEND
+        IF dotAt >= 0 THEN leaf = String.Slice(originalName, dotAt + 1)
+        wrapperName = alias + "." + leaf
+        IF Lower(wrapperName) == Lower(originalName) THEN CONTINUE FOR
+        paramText = String.Slice(header, openAt + 1, closeAt - openAt - 1)
+        argNames = ""
+        FOR param IN Fission_ArcoBasicSplitParams(paramText)
+            bare = Fission_ArcoBasicBareParamName(param)
+            IF String.Length(bare) > 0 THEN
+                IF String.Length(argNames) > 0 THEN argNames = argNames + ", "
+                argNames = argNames + bare
+            END IF
+        NEXT
+        wrappers = wrappers + "FUNCTION " + wrapperName + "(" + paramText + ")\nRETURN " + originalName + "(" + argNames + ")\nEND FUNCTION\n"
+    NEXT
+    RETURN wrappers
+END FUNCTION
+
 FUNCTION Fission_ArcoBasicNewMetadata()
     RETURN {
         Version: "",
@@ -349,24 +487,35 @@ FUNCTION Fission_ArcoBasicPreprocessOnce(source, initialDefines, importedFiles)
         ' -- a real, disclosed, narrower scope cut, not attempted here.
         IF name == "IMPORT" THEN
             ignored = Array.Push(metadata.Imports, args)
-            importPath = Fission_ArcoBasicUnquote(args)
+            parsedImport = Fission_ArcoBasicParseImport(args)
+            IF parsedImport.Error != "" THEN
+                ignored = diagnostics.ReportError("FISSION_ARCOBASIC_IMPORT_SYNTAX", parsedImport.Error)
+                ignored = Array.Push(output, "")
+                lineNumber = lineNumber + 1
+                CONTINUE FOR
+            END IF
+            importPath = parsedImport.Path
             IF String.StartsWith(importPath, "./") THEN importPath = String.Slice(importPath, 2, String.Length(importPath) - 2)
             importerDirectory = Object.Get(importedFiles, "<directory>", "")
             importPath = Fission_ResolveImportPath(importPath, importerDirectory)
             IF Object.Has(importedFiles, importPath) THEN
-                ' Already expanded earlier in this compilation.
+                ' Already expanded earlier in this compilation; an aliased re-import still needs its
+                ' own wrappers, generated from the already-expanded text.
                 ignored = Array.Push(output, "")
+                IF parsedImport.Alias != "" THEN ignored = Array.Push(output, Fission_ArcoBasicAliasWrappers(importedFiles[importPath], parsedImport.Alias))
             ELSE
                 IF File.Exists(importPath) THEN
-                    importedFiles[importPath] = TRUE
+                    importedFiles[importPath] = ""
                     importedFiles["<directory>"] = Path.DirName(importPath)
                     imported = Fission_ArcoBasicPreprocessOnce(File.ReadText(importPath), defines, importedFiles)
                     importedFiles["<directory>"] = importerDirectory
+                    importedFiles[importPath] = imported.Source
                     ignored = diagnostics.AppendMany(imported.Diagnostics)
                     FOR importedDefine IN imported.Defines
                         IF Fission_ListContains(defines, importedDefine) == FALSE THEN ignored = Array.Push(defines, importedDefine)
                     NEXT
                     ignored = Array.Push(output, imported.Source)
+                    IF parsedImport.Alias != "" THEN ignored = Array.Push(output, Fission_ArcoBasicAliasWrappers(imported.Source, parsedImport.Alias))
                 ELSE
                     ignored = diagnostics.ReportError("FISSION_ARCOBASIC_IMPORT_NOT_FOUND", "#IMPORT file not found: " + importPath)
                     ignored = Array.Push(output, "")

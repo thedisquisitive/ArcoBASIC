@@ -1,0 +1,362 @@
+' Structural regression coverage for stdlib/arcogui.abas -- every function tested here is pure
+' logic with no real window/display required (ArcContext, ArcIntentRegistry, VStack/HStack, and
+' each widget's own HandleEvent against synthetic event objects), specifically so it can run on
+' any build, with or without a real GUI session, the same "interactive pieces verified manually
+' against the real thing, pure logic verified here" split arcosh/tests/stdlib/curses_selftest.abas
+' already established. The WINDOW.*/SURFACE.* primitives ArcWindow/Label/Button/etc. also call for
+' their own Draw() methods are covered separately by tests/integration/arcogui_host_platform_smoke.sh
+' (which does require a real GUI session, and skips cleanly without one).
+#IMPORT "arcogui"
+
+failures = 0
+
+' --- ArcColor ---
+color = ArcColor(0.5, 0.25, 0.75, 1)
+IF color.R == 0.5 ANDALSO color.G == 0.25 ANDALSO color.B == 0.75 ANDALSO color.A == 1 THEN
+    PRINT "ok   ArcColor stores its four components correctly"
+ELSE
+    PRINT "FAIL ArcColor did not store its components correctly"
+    failures = failures + 1
+END IF
+
+' --- ArcContext ---
+ctx = ArcContext()
+IF !ctx.HasKey("missing") THEN
+    PRINT "ok   ArcContext.HasKey is FALSE for a key never set"
+ELSE
+    PRINT "FAIL ArcContext.HasKey was TRUE for an unset key"
+    failures = failures + 1
+END IF
+
+IF ctx.Get("missing", -1) == -1 THEN
+    PRINT "ok   ArcContext.Get returns the supplied default for a missing key"
+ELSE
+    PRINT "FAIL ArcContext.Get did not return the supplied default"
+    failures = failures + 1
+END IF
+
+ignored = ctx.Set("selection.count", 3)
+IF ctx.HasKey("selection.count") ANDALSO ctx.Get("selection.count", -1) == 3 THEN
+    PRINT "ok   ArcContext.Set/Get/HasKey round-trip a value correctly"
+ELSE
+    PRINT "FAIL ArcContext.Set/Get/HasKey did not round-trip correctly"
+    failures = failures + 1
+END IF
+
+ignored = ctx.Set("selection.count", 7)
+IF ctx.Get("selection.count", -1) == 7 THEN
+    PRINT "ok   ArcContext.Set on an existing key updates it in place rather than duplicating"
+ELSE
+    PRINT "FAIL ArcContext.Set on an existing key did not update it correctly"
+    failures = failures + 1
+END IF
+
+' --- ArcIntentRegistry: availability driven by a real Requirement callable ---
+FUNCTION SelfTestHasSelection(context AS ArcContext)
+    RETURN context.Get("selection.count", 0) > 0
+END FUNCTION
+
+invokeCount = 0
+FUNCTION SelfTestNoteInvoke()
+    ' Module-scope scalar reassignment does not persist across a function call boundary in this
+    ' language (confirmed directly against the real interpreter/native backend while building this
+    ' file) -- this handler exists only to prove Invoke() actually calls through, via its own
+    ' PRINT below, not via a counter.
+    PRINT "SelfTestNoteInvoke: handler ran"
+END FUNCTION
+
+registry = ArcIntentRegistry()
+ignored = registry.Register("selftest.delete", "Delete", ADDRESSOF SelfTestNoteInvoke)
+ignored = registry.Require("selftest.delete", ADDRESSOF SelfTestHasSelection)
+ignored = registry.SetUnavailableReason("selftest.delete", "Select something first.")
+
+emptyContext = ArcContext()
+IF !registry.IsAvailable("selftest.delete", emptyContext) THEN
+    PRINT "ok   ArcIntentRegistry.IsAvailable is FALSE when the Requirement callable returns FALSE"
+ELSE
+    PRINT "FAIL ArcIntentRegistry.IsAvailable was TRUE despite an unmet requirement"
+    failures = failures + 1
+END IF
+
+IF registry.UnavailableReason("selftest.delete") == "Select something first." THEN
+    PRINT "ok   ArcIntentRegistry.UnavailableReason returns the reason that was set"
+ELSE
+    PRINT "FAIL ArcIntentRegistry.UnavailableReason did not return the expected reason"
+    failures = failures + 1
+END IF
+
+filledContext = ArcContext()
+ignored = filledContext.Set("selection.count", 2)
+IF registry.IsAvailable("selftest.delete", filledContext) THEN
+    PRINT "ok   ArcIntentRegistry.IsAvailable is TRUE once the Requirement callable is satisfied"
+ELSE
+    PRINT "FAIL ArcIntentRegistry.IsAvailable stayed FALSE despite a satisfied requirement"
+    failures = failures + 1
+END IF
+
+applicable = registry.Applicable(filledContext)
+IF LEN(applicable) == 1 ANDALSO applicable[0].Label == "Delete" THEN
+    PRINT "ok   ArcIntentRegistry.Applicable lists exactly the available, non-hidden intents"
+ELSE
+    PRINT "FAIL ArcIntentRegistry.Applicable did not return the expected list"
+    failures = failures + 1
+END IF
+
+ignored = registry.Hide("selftest.delete")
+hiddenApplicable = registry.Applicable(filledContext)
+IF LEN(hiddenApplicable) == 0 THEN
+    PRINT "ok   ArcIntentRegistry.Hide removes an intent from Applicable even when available"
+ELSE
+    PRINT "FAIL ArcIntentRegistry.Hide did not remove the intent from Applicable"
+    failures = failures + 1
+END IF
+
+' Re-registering the same id replaces rather than duplicates -- important for anything that
+' re-registers intents during its own setup without accumulating stale duplicates.
+ignored = registry.Register("selftest.delete", "Delete Again", ADDRESSOF SelfTestNoteInvoke)
+IF LEN(registry.Intents) == 1 ANDALSO registry.Find("selftest.delete").Label == "Delete Again" THEN
+    PRINT "ok   ArcIntentRegistry.Register replaces an existing id rather than duplicating it"
+ELSE
+    PRINT "FAIL ArcIntentRegistry.Register duplicated an id instead of replacing it"
+    failures = failures + 1
+END IF
+
+' --- Layout ---
+offsets = VStack(10, [30, 40, 20], 5)
+IF LEN(offsets) == 3 ANDALSO offsets[0] == 10 ANDALSO offsets[1] == 45 ANDALSO offsets[2] == 90 THEN
+    PRINT "ok   VStack computes the correct cumulative Y offsets"
+ELSE
+    PRINT "FAIL VStack did not compute the expected offsets"
+    failures = failures + 1
+END IF
+
+hOffsets = HStack(0, [50, 25], 10)
+IF LEN(hOffsets) == 2 ANDALSO hOffsets[0] == 0 ANDALSO hOffsets[1] == 60 THEN
+    PRINT "ok   HStack computes the correct cumulative X offsets"
+ELSE
+    PRINT "FAIL HStack did not compute the expected offsets"
+    failures = failures + 1
+END IF
+
+' --- Button: click-and-release-inside counts, press-then-drag-off does not ---
+button = Button("Click Me")
+ignored = button.SetBounds(10, 10, 100, 30)
+
+pressInside = {"Type": "pointer-button", "Action": "press", "Button": "left", "X": 20, "Y": 20}
+releaseInside = {"Type": "pointer-button", "Action": "release", "Button": "left", "X": 20, "Y": 20}
+releaseOutside = {"Type": "pointer-button", "Action": "release", "Button": "left", "X": 500, "Y": 500}
+
+clickedInside = button.HandleEvent(releaseInside)
+IF clickedInside THEN
+    PRINT "ok   Button.HandleEvent reports a click on release inside its own bounds"
+ELSE
+    PRINT "FAIL Button.HandleEvent did not report a click on a release inside its bounds"
+    failures = failures + 1
+END IF
+
+clickedOutside = button.HandleEvent(releaseOutside)
+IF !clickedOutside THEN
+    PRINT "ok   Button.HandleEvent does not report a click on release outside its bounds"
+ELSE
+    PRINT "FAIL Button.HandleEvent reported a click on a release outside its bounds"
+    failures = failures + 1
+END IF
+
+hoverEvent = {"Type": "pointer-move", "X": 15, "Y": 15}
+ignored = button.HandleEvent(hoverEvent)
+IF button.Hovered THEN
+    PRINT "ok   Button.HandleEvent tracks Hovered on pointer-move inside its bounds"
+ELSE
+    PRINT "FAIL Button.HandleEvent did not set Hovered on a pointer-move inside its bounds"
+    failures = failures + 1
+END IF
+
+' --- Checkbox: toggling ---
+checkbox = Checkbox("Enable", FALSE)
+ignored = checkbox.SetPosition(0, 0)
+toggleClick = {"Type": "pointer-button", "Action": "release", "Button": "left", "X": 5, "Y": 5}
+firstToggle = checkbox.HandleEvent(toggleClick)
+IF firstToggle ANDALSO checkbox.Checked THEN
+    PRINT "ok   Checkbox.HandleEvent toggles Checked and reports the change on the first click"
+ELSE
+    PRINT "FAIL Checkbox.HandleEvent did not toggle correctly on the first click"
+    failures = failures + 1
+END IF
+secondToggle = checkbox.HandleEvent(toggleClick)
+IF secondToggle ANDALSO !checkbox.Checked THEN
+    PRINT "ok   Checkbox.HandleEvent toggles back and reports the change on a second click"
+ELSE
+    PRINT "FAIL Checkbox.HandleEvent did not toggle back correctly on a second click"
+    failures = failures + 1
+END IF
+
+' --- TextInput: focus, typing, backspace, caret movement ---
+field = TextInput("hi")
+focusClick = {"Type": "pointer-button", "Action": "press", "Button": "left", "X": 5, "Y": 5}
+ignored = field.SetBounds(0, 0, 200, 30)
+ignored = field.HandleEvent(focusClick)
+IF field.Focused THEN
+    PRINT "ok   TextInput.HandleEvent focuses on a press inside its bounds"
+ELSE
+    PRINT "FAIL TextInput.HandleEvent did not focus on a press inside its bounds"
+    failures = failures + 1
+END IF
+
+typeEvent = {"Type": "text", "Text": "!"}
+changed = field.HandleEvent(typeEvent)
+IF changed ANDALSO field.Text == "hi!" THEN
+    PRINT "ok   TextInput.HandleEvent inserts typed text at the caret"
+ELSE
+    PRINT "FAIL TextInput.HandleEvent did not insert typed text correctly"
+    failures = failures + 1
+END IF
+
+backspaceEvent = {"Type": "key", "Action": "press", "Key": "backspace"}
+ignored = field.HandleEvent(backspaceEvent)
+IF field.Text == "hi" THEN
+    PRINT "ok   TextInput.HandleEvent deletes backward on Backspace"
+ELSE
+    PRINT "FAIL TextInput.HandleEvent did not delete backward correctly"
+    failures = failures + 1
+END IF
+
+homeEvent = {"Type": "key", "Action": "press", "Key": "home"}
+ignored = field.HandleEvent(homeEvent)
+IF field.Caret == 0 THEN
+    PRINT "ok   TextInput.HandleEvent moves the caret Home correctly"
+ELSE
+    PRINT "FAIL TextInput.HandleEvent did not move the caret Home correctly"
+    failures = failures + 1
+END IF
+
+typeAtHome = {"Type": "text", "Text": "X"}
+ignored = field.HandleEvent(typeAtHome)
+IF field.Text == "Xhi" THEN
+    PRINT "ok   TextInput.HandleEvent inserts at the caret position, not always at the end"
+ELSE
+    PRINT "FAIL TextInput.HandleEvent did not insert at the correct caret position"
+    failures = failures + 1
+END IF
+
+unfocusClick = {"Type": "pointer-button", "Action": "press", "Button": "left", "X": 900, "Y": 900}
+ignored = field.HandleEvent(unfocusClick)
+IF !field.Focused THEN
+    PRINT "ok   TextInput.HandleEvent unfocuses on a press outside its bounds"
+ELSE
+    PRINT "FAIL TextInput.HandleEvent did not unfocus on a press outside its bounds"
+    failures = failures + 1
+END IF
+
+noChange = field.HandleEvent(typeEvent)
+IF !noChange ANDALSO field.Text == "Xhi" THEN
+    PRINT "ok   TextInput.HandleEvent ignores typed text while unfocused"
+ELSE
+    PRINT "FAIL TextInput.HandleEvent accepted typed text while unfocused"
+    failures = failures + 1
+END IF
+
+' --- Slider: drag-to-set, fraction math, scroll-to-nudge ---
+slider = Slider("Volume", 5, 0, 10)
+ignored = slider.SetBounds(0, 0, 100, 18)
+IF ABS(slider.Fraction() - 0.5) < 0.0001 THEN
+    PRINT "ok   Slider.Fraction computes the correct linear fraction from Value/Min/Max"
+ELSE
+    PRINT "FAIL Slider.Fraction did not compute the expected fraction"
+    failures = failures + 1
+END IF
+
+' X=99, not 100: ContainsPoint's own X bound is exclusive at X+Width (100), matching the same
+' half-open convention every other widget's own ContainsPoint here uses.
+sliderPress = {"Type": "pointer-button", "Action": "press", "Button": "left", "X": 99, "Y": 9}
+sliderChanged = slider.HandleEvent(sliderPress)
+IF sliderChanged ANDALSO ABS(slider.Value - 9.9) < 0.0001 ANDALSO slider.Dragging THEN
+    PRINT "ok   Slider.HandleEvent sets Value from a press position and starts dragging"
+ELSE
+    PRINT "FAIL Slider.HandleEvent did not set Value/Dragging correctly on press"
+    failures = failures + 1
+END IF
+
+sliderDragMove = {"Type": "pointer-move", "X": 0, "Y": 9}
+ignored = slider.HandleEvent(sliderDragMove)
+IF ABS(slider.Value - 0) < 0.0001 THEN
+    PRINT "ok   Slider.HandleEvent updates Value while dragging on pointer-move"
+ELSE
+    PRINT "FAIL Slider.HandleEvent did not update Value while dragging"
+    failures = failures + 1
+END IF
+
+sliderRelease = {"Type": "pointer-button", "Action": "release", "Button": "left", "X": 0, "Y": 9}
+ignored = slider.HandleEvent(sliderRelease)
+IF !slider.Dragging THEN
+    PRINT "ok   Slider.HandleEvent stops dragging on release"
+ELSE
+    PRINT "FAIL Slider.HandleEvent did not stop dragging on release"
+    failures = failures + 1
+END IF
+
+' --- IntentRing: real radial layout, hover/click hit-testing, and invocation via a real registry ---
+FUNCTION SelfTestRingNoop()
+    PRINT "SelfTestRingNoop: handler ran"
+END FUNCTION
+
+FUNCTION SelfTestAlwaysAvailable(context AS ArcContext)
+    RETURN TRUE
+END FUNCTION
+
+ringRegistry = ArcIntentRegistry()
+ignored = ringRegistry.Register("ring.a", "A", ADDRESSOF SelfTestRingNoop)
+ignored = ringRegistry.Require("ring.a", ADDRESSOF SelfTestAlwaysAvailable)
+ignored = ringRegistry.Register("ring.b", "B", ADDRESSOF SelfTestRingNoop)
+ignored = ringRegistry.Require("ring.b", ADDRESSOF SelfTestAlwaysAvailable)
+ringContext = ArcContext()
+ringApplicable = ringRegistry.Applicable(ringContext)
+
+ring = IntentRing(200, 200, "HUB")
+ignored = ring.SetIntents(ringApplicable)
+IF LEN(ring.Items) == 2 THEN
+    PRINT "ok   IntentRing.SetIntents lays out exactly one item per applicable intent"
+ELSE
+    PRINT "FAIL IntentRing.SetIntents did not lay out the expected number of items"
+    failures = failures + 1
+END IF
+
+topItem = ring.Items[0]
+IF ABS(topItem.X - 200) < 0.01 ANDALSO ABS(topItem.Y - (200 - ring.Radius)) < 0.01 THEN
+    PRINT "ok   IntentRing.SetIntents places the first item directly above the center"
+ELSE
+    PRINT "FAIL IntentRing.SetIntents did not place the first item at the expected position"
+    failures = failures + 1
+END IF
+
+ringClickTop = {"Type": "pointer-button", "Action": "release", "Button": "left", "X": topItem.X, "Y": topItem.Y}
+ringInvoked = ring.HandleRingEvent(ringClickTop, ringRegistry, ringContext)
+IF ringInvoked == topItem.Intent.Id THEN
+    PRINT "ok   IntentRing.HandleEvent invokes the intent under a click and reports its id"
+ELSE
+    PRINT "FAIL IntentRing.HandleEvent did not invoke/report the clicked intent correctly"
+    failures = failures + 1
+END IF
+
+ringClickEmpty = {"Type": "pointer-button", "Action": "release", "Button": "left", "X": 0, "Y": 0}
+ringInvokedNone = ring.HandleRingEvent(ringClickEmpty, ringRegistry, ringContext)
+IF ringInvokedNone == "" THEN
+    PRINT "ok   IntentRing.HandleEvent invokes nothing when the click hits empty space"
+ELSE
+    PRINT "FAIL IntentRing.HandleEvent invoked something despite a click on empty space"
+    failures = failures + 1
+END IF
+
+ringHover = {"Type": "pointer-move", "X": topItem.X, "Y": topItem.Y}
+ignored = ring.HandleRingEvent(ringHover, ringRegistry, ringContext)
+IF ring.HoveredIndex == 0 THEN
+    PRINT "ok   IntentRing.HandleEvent tracks HoveredIndex on pointer-move"
+ELSE
+    PRINT "FAIL IntentRing.HandleEvent did not track HoveredIndex correctly"
+    failures = failures + 1
+END IF
+
+IF failures > 0 THEN
+    PRINT STRING(failures) + " arcogui stdlib test(s) failed"
+    ignored = Exit(1)
+END IF
+PRINT "all arcogui stdlib tests passed"

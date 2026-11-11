@@ -984,14 +984,15 @@ FUNCTION Fission_AmirParseArguments(argsText)
     descriptors = []
     IF argsText == "" THEN RETURN descriptors
     FOR part IN String.Split(argsText, ",")
-        name = part
+        entry = part
+        IF String.Contains(entry, "=") THEN entry = String.Split(entry, "=")[0]
+        name = entry
         typeName = ""
-        IF String.Contains(part, ":") THEN
-            pieces = String.Split(part, ":")
+        IF String.Contains(entry, ":") THEN
+            pieces = String.Split(entry, ":")
             name = pieces[0]
             typeName = pieces[1]
         END IF
-        IF String.Contains(name, "=") THEN name = String.Split(name, "=")[0]
         ignored = Array.Push(descriptors, {Name: name, Type: typeName})
     NEXT
     RETURN descriptors
